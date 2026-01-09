@@ -136,6 +136,8 @@ from .distributed import (
     # Datacenter list query
     DatacenterListRequest as DatacenterListRequest,
     DatacenterListResponse as DatacenterListResponse,
+    WorkflowCancellationComplete as WorkflowCancellationComplete,
+    JobCancellationComplete as JobCancellationComplete,
 )
 
 # CRDTs for cross-datacenter synchronization

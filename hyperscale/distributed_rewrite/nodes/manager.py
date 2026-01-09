@@ -102,6 +102,7 @@ from hyperscale.distributed_rewrite.models import (
     WorkflowCancellationQuery,
     WorkflowCancellationResponse,
     WorkflowCancellationComplete,
+    JobCancellationComplete,
     WorkerDiscoveryBroadcast,
     ContextForward,
     ContextLayerSync,
@@ -6951,6 +6952,97 @@ class ManagerServer(HealthAwareServer):
             # Client unreachable - don't block
             pass
 
+    async def _push_cancellation_complete_to_origin(
+        self,
+        job_id: str,
+        success: bool,
+        errors: list[str],
+    ) -> None:
+        """
+        Push job cancellation completion notification to origin gate or client.
+
+        Called when all workflows in a job have reported cancellation completion.
+        If there were errors during cancellation, includes the aggregated error list.
+        Tries origin gate first, then falls back to client callback.
+        """
+        job = self._job_manager.get_job_by_id(job_id)
+
+        # Count workflows for the completion message
+        cancelled_workflow_count = 0
+        total_workflow_count = 0
+        if job:
+            total_workflow_count = len(job.sub_workflows)
+            cancelled_workflow_count = total_workflow_count - len(errors)
+
+        completion = JobCancellationComplete(
+            job_id=job_id,
+            success=success,
+            cancelled_workflow_count=cancelled_workflow_count,
+            total_workflow_count=total_workflow_count,
+            errors=errors,
+            cancelled_at=time.monotonic(),
+        )
+
+        # Try origin gate first
+        origin_gate = self._job_origin_gates.get(job_id)
+        if origin_gate:
+            await self._udp_logger.log(
+                ServerInfo(
+                    message=f"Pushing cancellation complete for job {job_id[:8]}... to gate {origin_gate}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            try:
+                await self.send_tcp(
+                    origin_gate,
+                    "receive_job_cancellation_complete",
+                    completion.dump(),
+                    timeout=2.0,
+                )
+                return
+            except Exception as e:
+                await self._udp_logger.log(
+                    ServerError(
+                        message=f"Failed to push cancellation complete to gate {origin_gate}: {e}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+
+        # Fallback to client callback
+        callback = self._job_callbacks.get(job_id)
+        if callback:
+            await self._udp_logger.log(
+                ServerInfo(
+                    message=f"Pushing cancellation complete for job {job_id[:8]}... to client {callback}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            try:
+                await self.send_tcp(
+                    callback,
+                    "receive_job_cancellation_complete",
+                    completion.dump(),
+                    timeout=2.0,
+                )
+            except Exception as e:
+                await self._udp_logger.log(
+                    ServerError(
+                        message=f"Failed to push cancellation complete to client {callback}: {e}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+
+        # Cleanup cancellation errors now that we've pushed the notification
+        self._cancellation_errors.pop(job_id, None)
+
     # =========================================================================
     # Peer Job State Sync
     # =========================================================================
@@ -7554,6 +7646,12 @@ class ManagerServer(HealthAwareServer):
         ]
         for wf_id in workflow_ids_to_remove:
             self._workflow_completion_events.pop(wf_id, None)
+
+        # Clean up cancellation tracking (AD-20)
+        self._cancellation_pending_workflows.pop(job_id, None)
+        self._cancellation_errors.pop(job_id, None)
+        self._cancellation_completion_events.pop(job_id, None)
+        self._cancellation_initiated_at.pop(job_id, None)
 
     async def _dead_node_reap_loop(self) -> None:
         """
@@ -8462,6 +8560,12 @@ class ManagerServer(HealthAwareServer):
             workers_notified: set[str] = set()
             errors: list[str] = []
 
+            # Initialize cancellation tracking for push notifications from workers
+            self._cancellation_initiated_at[job_id] = time.monotonic()
+            self._cancellation_completion_events[job_id] = asyncio.Event()
+            for sub_wf in job.sub_workflows.values():
+                self._cancellation_pending_workflows[job_id].add(sub_wf.workflow_id)
+
             for sub_wf in job.sub_workflows.values():
                 worker_id = sub_wf.worker_id
                 if worker_id and worker_id not in workers_notified:
@@ -8614,6 +8718,80 @@ class ManagerServer(HealthAwareServer):
                 error=str(e),
             )
             return response.dump()
+
+    @tcp.receive()
+    async def receive_workflow_cancellation_complete(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ) -> bytes:
+        """
+        Handle workflow cancellation completion push from worker (AD-20).
+
+        Workers push this notification after successfully (or unsuccessfully)
+        cancelling a workflow. The manager:
+        1. Tracks completion of all workflows in a job cancellation
+        2. Aggregates any errors from failed cancellations
+        3. When all workflows report, fires the completion event
+        4. Pushes aggregated result to origin gate/client
+        """
+        try:
+            completion = WorkflowCancellationComplete.load(data)
+            job_id = completion.job_id
+            workflow_id = completion.workflow_id
+
+            await self._udp_logger.log(
+                ServerInfo(
+                    message=f"Received workflow cancellation complete for {workflow_id[:8]}... "
+                            f"(job {job_id[:8]}..., success={completion.success})",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+
+            # Track this workflow as complete
+            if workflow_id in self._cancellation_pending_workflows.get(job_id, set()):
+                self._cancellation_pending_workflows[job_id].discard(workflow_id)
+
+                # Collect any errors
+                if not completion.success and completion.errors:
+                    for error in completion.errors:
+                        self._cancellation_errors[job_id].append(
+                            f"Workflow {workflow_id[:8]}...: {error}"
+                        )
+
+                # Check if all workflows for this job have reported
+                if not self._cancellation_pending_workflows[job_id]:
+                    # All workflows cancelled - fire completion event and push to origin
+                    event = self._cancellation_completion_events.get(job_id)
+                    if event:
+                        event.set()
+
+                    errors = self._cancellation_errors.get(job_id, [])
+                    success = len(errors) == 0
+
+                    # Push completion notification to origin gate/client
+                    self._task_runner.run(
+                        self._push_cancellation_complete_to_origin,
+                        job_id,
+                        success,
+                        errors,
+                    )
+
+                    # Cleanup tracking structures
+                    self._cancellation_pending_workflows.pop(job_id, None)
+                    self._cancellation_completion_events.pop(job_id, None)
+                    self._cancellation_initiated_at.pop(job_id, None)
+                    # Keep errors around briefly for debugging - cleaned up with job
+
+            # Acknowledge receipt
+            return b"OK"
+
+        except Exception as e:
+            await self.handle_exception(e, "receive_workflow_cancellation_complete")
+            return b"ERROR"
 
     # =========================================================================
     # TCP Handlers - Adaptive Healthcheck Extensions (AD-26)

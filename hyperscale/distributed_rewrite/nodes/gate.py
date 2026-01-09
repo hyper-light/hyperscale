@@ -69,6 +69,7 @@ from hyperscale.distributed_rewrite.models import (
     CancelAck,
     JobCancelRequest,
     JobCancelResponse,
+    JobCancellationComplete,
     DatacenterLease,
     LeaseTransfer,
     DatacenterHealth,
@@ -334,6 +335,12 @@ class GateServer(HealthAwareServer):
         # Client push notification callbacks
         # job_id -> callback address for push notifications
         self._job_callbacks: dict[str, tuple[str, int]] = {}
+
+        # Cancellation completion tracking (AD-20 push notifications from managers)
+        # job_id -> asyncio.Event (set when cancellation complete notification received)
+        self._cancellation_completion_events: dict[str, asyncio.Event] = {}
+        # job_id -> list of errors from cancelled workflows
+        self._cancellation_errors: dict[str, list[str]] = defaultdict(list)
 
         # Progress update callbacks (for streaming windowed stats)
         # job_id -> callback address for progress updates
@@ -4534,7 +4541,90 @@ class GateServer(HealthAwareServer):
                     cancelled=False,
                     error=str(e),
                 ).dump()
-    
+
+    @tcp.receive()
+    async def receive_job_cancellation_complete(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ) -> bytes:
+        """
+        Handle job cancellation completion push from manager (AD-20).
+
+        Managers push this notification after all workflows in a job have
+        reported cancellation completion. The gate:
+        1. Records any errors from failed cancellations
+        2. Fires the completion event for await_job_cancellation callers
+        3. Pushes notification to the client callback if registered
+        """
+        try:
+            completion = JobCancellationComplete.load(data)
+            job_id = completion.job_id
+
+            await self._udp_logger.log(
+                ServerInfo(
+                    message=f"Received job cancellation complete for {job_id[:8]}... "
+                            f"(success={completion.success}, errors={len(completion.errors)})",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+
+            # Store errors for await_job_cancellation
+            if completion.errors:
+                self._cancellation_errors[job_id].extend(completion.errors)
+
+            # Fire completion event
+            event = self._cancellation_completion_events.get(job_id)
+            if event:
+                event.set()
+
+            # Push notification to client callback if registered
+            callback = self._job_callbacks.get(job_id)
+            if callback:
+                self._task_runner.run(
+                    self._push_cancellation_complete_to_client,
+                    job_id,
+                    completion,
+                    callback,
+                )
+
+            return b"OK"
+
+        except Exception as e:
+            await self.handle_exception(e, "receive_job_cancellation_complete")
+            return b"ERROR"
+
+    async def _push_cancellation_complete_to_client(
+        self,
+        job_id: str,
+        completion: JobCancellationComplete,
+        callback: tuple[str, int],
+    ) -> None:
+        """Push job cancellation completion to client callback."""
+        try:
+            await self.send_tcp(
+                callback,
+                "receive_job_cancellation_complete",
+                completion.dump(),
+                timeout=2.0,
+            )
+        except Exception as e:
+            await self._udp_logger.log(
+                ServerError(
+                    message=f"Failed to push cancellation complete to client {callback}: {e}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+
+        # Cleanup tracking after push
+        self._cancellation_completion_events.pop(job_id, None)
+        self._cancellation_errors.pop(job_id, None)
+
     # =========================================================================
     # TCP Handlers - Lease Transfer (for Gate Scaling)
     # =========================================================================

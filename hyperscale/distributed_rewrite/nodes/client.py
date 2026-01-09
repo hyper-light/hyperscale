@@ -62,6 +62,7 @@ from hyperscale.distributed_rewrite.models import (
     # Cancellation (AD-20)
     JobCancelRequest,
     JobCancelResponse,
+    JobCancellationComplete,
     # Client result models
     ClientReporterResult,
     ClientWorkflowDCResult,
@@ -145,6 +146,14 @@ class HyperscaleClient(MercurySyncBaseServer):
         self._job_events: dict[str, asyncio.Event] = {}
         self._job_callbacks: dict[str, Callable[[JobStatusPush], None]] = {}
         self._job_targets: dict[str, tuple[str, int]] = {}  # job_id -> manager/gate that accepted
+
+        # Cancellation completion tracking (AD-20 push notifications)
+        # job_id -> asyncio.Event (set when cancellation complete notification received)
+        self._cancellation_events: dict[str, asyncio.Event] = {}
+        # job_id -> list of errors from cancelled workflows
+        self._cancellation_errors: dict[str, list[str]] = {}
+        # job_id -> bool indicating if cancellation was successful
+        self._cancellation_success: dict[str, bool] = {}
 
         # Reporter result callbacks (called when reporter submission completes)
         self._reporter_callbacks: dict[str, Callable[[ReporterResultPush], None]] = {}
@@ -1479,4 +1488,80 @@ class HyperscaleClient(MercurySyncBaseServer):
 
         except Exception:
             return b'error'
+
+    @tcp.receive()
+    async def receive_job_cancellation_complete(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ) -> bytes:
+        """
+        Handle job cancellation completion push from manager or gate (AD-20).
+
+        Called when all workflows in a job have been cancelled. The notification
+        includes success status and any errors encountered during cancellation.
+        """
+        try:
+            completion = JobCancellationComplete.load(data)
+            job_id = completion.job_id
+
+            # Store results for await_job_cancellation
+            self._cancellation_success[job_id] = completion.success
+            self._cancellation_errors[job_id] = completion.errors
+
+            # Fire the completion event
+            event = self._cancellation_events.get(job_id)
+            if event:
+                event.set()
+
+            return b"OK"
+
+        except Exception:
+            return b"ERROR"
+
+    async def await_job_cancellation(
+        self,
+        job_id: str,
+        timeout: float | None = None,
+    ) -> tuple[bool, list[str]]:
+        """
+        Wait for job cancellation to complete.
+
+        This method blocks until the job cancellation is fully complete and the
+        push notification is received from the manager/gate, or until timeout.
+
+        Args:
+            job_id: The job ID to wait for cancellation completion
+            timeout: Optional timeout in seconds. None means wait indefinitely.
+
+        Returns:
+            Tuple of (success, errors):
+            - success: True if all workflows were cancelled successfully
+            - errors: List of error messages from workflows that failed to cancel
+        """
+        # Create event if not exists (in case called before cancel_job)
+        if job_id not in self._cancellation_events:
+            self._cancellation_events[job_id] = asyncio.Event()
+
+        event = self._cancellation_events[job_id]
+
+        try:
+            if timeout is not None:
+                await asyncio.wait_for(event.wait(), timeout=timeout)
+            else:
+                await event.wait()
+        except asyncio.TimeoutError:
+            return (False, [f"Timeout waiting for cancellation completion after {timeout}s"])
+
+        # Get the results
+        success = self._cancellation_success.get(job_id, False)
+        errors = self._cancellation_errors.get(job_id, [])
+
+        # Cleanup tracking structures
+        self._cancellation_events.pop(job_id, None)
+        self._cancellation_success.pop(job_id, None)
+        self._cancellation_errors.pop(job_id, None)
+
+        return (success, errors)
 
