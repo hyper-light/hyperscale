@@ -52,48 +52,28 @@ async def guard_optimize_call(optimize_call: Coroutine[Any, Any, None]):
         pass
 
 
-async def cancel_pending(pend: asyncio.Task, timeout: float = 2.0) -> asyncio.Task:
+def cancel_and_release_task(pend: asyncio.Task) -> None:
     """
-    Cancel a pending task with bounded wait time.
+    Cancel a task and ensure its exception is retrieved to prevent leaks.
+
+    This is fire-and-forget: we inject CancelledError and retrieve any
+    exception from done tasks. The task will clean up when it next awaits.
 
     Args:
         pend: The asyncio.Task to cancel
-        timeout: Maximum seconds to wait for cancellation (default: 2.0)
-
-    Returns:
-        The task (may still be running if it didn't respond to cancellation)
     """
     try:
         if pend.done():
             # Retrieve exception to prevent "exception never retrieved" warnings
+            # This is critical - unretrieved exceptions keep task objects alive
             try:
                 pend.exception()
-            except (asyncio.CancelledError, asyncio.InvalidStateError):
+            except (asyncio.CancelledError, asyncio.InvalidStateError, Exception):
                 pass
-            return pend
-
-        pend.cancel()
-        try:
-            # Wait for the task to finish processing the cancellation
-            # No shield - we already cancelled it, just waiting for cleanup
-            await asyncio.wait_for(pend, timeout=timeout)
-        except asyncio.TimeoutError:
-            # Task didn't respond to cancellation in time - may be orphaned
-            pass
-        except asyncio.CancelledError:
-            # Task was successfully cancelled
-            pass
-        except Exception:
-            # Task raised during cancellation - that's fine
-            pass
-
-        return pend
-
+        else:
+            pend.cancel()
     except Exception:
-        # Catch any unexpected errors during the cancellation process
         pass
-
-    return pend
 
 
 def guard_result(result: asyncio.Task):
@@ -920,22 +900,15 @@ class WorkflowRunner:
         elapsed = time.monotonic() - start
 
         await asyncio.gather(*completed, return_exceptions=True)
-        await asyncio.gather(
-            *[
-                asyncio.create_task(
-                    cancel_pending(pend),
-                )
-                for pend in self._pending[run_id][workflow.name]
-            ],
-            return_exceptions=True,
-        )
 
-        if len(pending) > 0:
-            await asyncio.gather(*[
-                asyncio.create_task(
-                    cancel_pending(pend),
-                ) for pend in pending
-            ], return_exceptions=True)
+        # Cancel and release all pending tasks
+        for pend in self._pending[run_id][workflow.name]:
+            cancel_and_release_task(pend)
+        self._pending[run_id][workflow.name].clear()
+
+        # Cancel tasks from asyncio.wait that didn't complete
+        for pend in pending:
+            cancel_and_release_task(pend)
 
         if len(self._failed[run_id][workflow_name]) > 0:
             await asyncio.gather(
@@ -995,12 +968,10 @@ class WorkflowRunner:
 
         await asyncio.gather(*execution_results)
 
-        await asyncio.gather(
-            *[
-                asyncio.create_task(cancel_pending(pend))
-                for pend in self._pending[run_id][workflow_name]
-            ]
-        )
+        # Cancel and release all pending tasks
+        for pend in self._pending[run_id][workflow_name]:
+            cancel_and_release_task(pend)
+        self._pending[run_id][workflow_name].clear()
 
         if not self._is_cancelled.is_set():
             self._is_cancelled.set()
@@ -1278,29 +1249,12 @@ class WorkflowRunner:
                 )
             )
 
-            await asyncio.gather(
-                *[
-                    asyncio.create_task(
-                        cancel_pending(pend),
-                    )
-                    for run_id in self._pending
-                    for workflow_name in self._pending[run_id]
-                    for pend in self._pending[run_id][workflow_name]
-                ],
-                return_exceptions=True,
-            )
-
-            await asyncio.gather(
-                *[
-                    asyncio.create_task(
-                        cancel_pending(pend),
-                    )
-                    for run_id in self._pending
-                    for workflow_name in self._pending[run_id]
-                    for pend in self._pending[run_id][workflow_name]
-                ],
-                return_exceptions=True,
-            )
+            # Cancel and release all pending tasks across all runs/workflows
+            for run_id in self._pending:
+                for workflow_name in self._pending[run_id]:
+                    for pend in self._pending[run_id][workflow_name]:
+                        cancel_and_release_task(pend)
+                    self._pending[run_id][workflow_name].clear()
 
             for job in self._running_workflows.values():
                 for workflow in job.values():
@@ -1319,51 +1273,19 @@ class WorkflowRunner:
     def abort(self):
         self._logger.abort()
 
+        # Cancel and release all pending tasks
         for run_id in self._pending:
             for workflow_name in self._pending[run_id]:
                 for pend in self._pending[run_id][workflow_name]:
-                    try:
-                        pend.exception()
+                    cancel_and_release_task(pend)
+                self._pending[run_id][workflow_name].clear()
 
-                    except (
-                        asyncio.CancelledError,
-                        asyncio.InvalidStateError,
-                        Exception,
-                    ):
-                        pass
-
-                    try:
-                        pend.cancel()
-
-                    except (
-                        asyncio.CancelledError,
-                        asyncio.InvalidStateError,
-                        Exception,
-                    ):
-                        pass
-
+        # Cancel and release all failed tasks
         for run_id in self._failed:
             for workflow_name in self._failed[run_id]:
                 for pend in self._failed[run_id][workflow_name]:
-                    try:
-                        pend.exception()
-
-                    except (
-                        asyncio.CancelledError,
-                        asyncio.InvalidStateError,
-                        Exception,
-                    ):
-                        pass
-
-                    try:
-                        pend.cancel()
-
-                    except (
-                        asyncio.CancelledError,
-                        asyncio.InvalidStateError,
-                        Exception,
-                    ):
-                        pass
+                    cancel_and_release_task(pend)
+                self._failed[run_id][workflow_name].clear()
 
         for job in self._running_workflows.values():
             for workflow in job.values():
