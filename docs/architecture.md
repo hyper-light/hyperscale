@@ -2625,6 +2625,847 @@ if peer_unconfirmed_duration > 60.0:  # 1 minute
 
 ---
 
+### AD-30: Hierarchical Failure Detection for Multi-Job Distributed Systems
+
+**Decision**: Implement a two-layer hierarchical failure detection system that separates machine-level liveness (global layer) from job-specific responsiveness (job layer), solving timer starvation issues and enabling accurate result routing in multi-job environments.
+
+**Rationale**:
+The original SWIM + Lifeguard implementation suffered from **timer starvation** where rapid gossip confirmations caused suspicion timers to be continuously rescheduled before they could expire. In a globally distributed system with multiple concurrent jobs, we also need to distinguish between "machine is dead" (affects all jobs) and "node is slow for job X" (affects only that job).
+
+**Problem Statement - Timer Starvation**:
+
+```
+Original SuspicionManager flow with confirmation-based rescheduling:
+
+T=0.00: Node A fails probe to Node B → start_suspicion(B, timeout=5s)
+T=0.05: Node C gossips "B is suspect" → confirm_suspicion(B) → RESCHEDULE timer
+T=0.10: Node D gossips "B is suspect" → confirm_suspicion(B) → RESCHEDULE timer
+T=0.15: Node E gossips "B is suspect" → confirm_suspicion(B) → RESCHEDULE timer
+...
+T=4.95: Node Z gossips "B is suspect" → confirm_suspicion(B) → RESCHEDULE timer
+T=5.00: Timer should expire... but was just reset to 4.5s remaining!
+
+Result: Timer NEVER expires. Node B is never declared dead even though
+        it hasn't responded to probes for 5+ seconds.
+
+Root cause: Each confirmation cancels the old timer and creates a new one.
+            With gossip echo (O(log n) dissemination), confirmations arrive
+            faster than the (now shorter) timeout can elapse.
+```
+
+**Problem Statement - Multi-Job Routing**:
+
+```
+Scenario: Manager M1 runs jobs A, B, C simultaneously
+
+Job A: High CPU load (90%), responses slow
+Job B: Normal load (30%), responses normal
+Job C: Memory pressure (85%), responses slow
+
+With single-layer detection:
+- M1 is either "alive" or "dead" for ALL jobs
+- Can't route Job A results away from slow M1
+- Can't keep Job B results on healthy M1
+
+Need: Per-job suspicion that tracks "is this node responsive for THIS job?"
+```
+
+**Solution: Two-Layer Hierarchical Detection**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                   HIERARCHICAL FAILURE DETECTION                                 │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                  │
+│  ┌───────────────────────────────────────────────────────────────────────────┐  │
+│  │                      GLOBAL LAYER (TimingWheel)                            │  │
+│  │                                                                            │  │
+│  │   Question: "Is this MACHINE alive?"                                       │  │
+│  │                                                                            │  │
+│  │   Triggers: SWIM probe timeout (machine-level liveness)                    │  │
+│  │   Timeout: 5-30 seconds (configurable)                                     │  │
+│  │   Effect: Global death clears ALL job suspicions for that node             │  │
+│  │                                                                            │  │
+│  │   Implementation: Kafka-style hierarchical timing wheel                    │  │
+│  │   - O(1) timer insertion and removal                                       │  │
+│  │   - Single timer advancement (no per-suspicion timers)                     │  │
+│  │   - Confirmation updates state, NOT timer                                  │  │
+│  │                                                                            │  │
+│  │   ┌─────────────────────────────────────────────────────────────────┐     │  │
+│  │   │ Coarse Wheel (1s ticks)   │ Fine Wheel (100ms ticks)            │     │  │
+│  │   │ ┌─┬─┬─┬─┬─┬─┬─┬─┬─┬─┐    │ ┌─┬─┬─┬─┬─┬─┬─┬─┬─┬─┐              │     │  │
+│  │   │ │0│1│2│3│4│5│6│7│8│9│    │ │0│1│2│3│4│5│6│7│8│9│              │     │  │
+│  │   │ └─┴─┴─┴─┴─┴─┴─┴─┴─┴─┘    │ └─┴─┴─┴─┴─┴─┴─┴─┴─┴─┘              │     │  │
+│  │   │     ↑ current             │     ↑ current                       │     │  │
+│  │   │                           │                                     │     │  │
+│  │   │ Entries cascade from coarse to fine as they approach expiration │     │  │
+│  │   └─────────────────────────────────────────────────────────────────┘     │  │
+│  └───────────────────────────────────────────────────────────────────────────┘  │
+│                                    │                                             │
+│                                    │ Global death → Clear job suspicions         │
+│                                    ▼                                             │
+│  ┌───────────────────────────────────────────────────────────────────────────┐  │
+│  │                       JOB LAYER (JobSuspicionManager)                      │  │
+│  │                                                                            │  │
+│  │   Question: "Is this node RESPONSIVE for THIS JOB?"                        │  │
+│  │                                                                            │  │
+│  │   Triggers: Job-specific communication timeout                             │  │
+│  │   Timeout: 1-10 seconds (faster than global)                               │  │
+│  │   Effect: Job-specific routing decisions                                   │  │
+│  │                                                                            │  │
+│  │   Implementation: Adaptive polling with LHM integration                    │  │
+│  │   - Per (job_id, node) suspicion state                                     │  │
+│  │   - Poll interval adapts: far (1s) → medium (250ms) → near (50ms)         │  │
+│  │   - Confirmation updates state only (no timer reschedule)                  │  │
+│  │   - LHM multiplier extends polling under load                              │  │
+│  │                                                                            │  │
+│  │   ┌─────────────────────────────────────────────────────────────────┐     │  │
+│  │   │ Job A          │ Job B          │ Job C                         │     │  │
+│  │   │ ┌────────────┐ │ ┌────────────┐ │ ┌────────────┐               │     │  │
+│  │   │ │ Node1: OK  │ │ │ Node1: OK  │ │ │ Node1: SUSPECT            │     │  │
+│  │   │ │ Node2: SUSP│ │ │ Node2: OK  │ │ │ Node2: OK                 │     │  │
+│  │   │ │ Node3: OK  │ │ │ Node3: OK  │ │ │ Node3: SUSPECT            │     │  │
+│  │   │ └────────────┘ │ └────────────┘ │ └────────────┘               │     │  │
+│  │   │                │                │                               │     │  │
+│  │   │ Independent suspicion per (job_id, node) pair                   │     │  │
+│  │   └─────────────────────────────────────────────────────────────────┘     │  │
+│  └───────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                  │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Component Architecture**:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                      HierarchicalFailureDetector                                 │
+│                                                                                  │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐│
+│  │                              PUBLIC API                                      ││
+│  ├─────────────────────────────────────────────────────────────────────────────┤│
+│  │ start() / stop()              - Lifecycle management                        ││
+│  │ suspect_global(node, inc)     - Start global suspicion                      ││
+│  │ suspect_job(job, node, inc)   - Start job-specific suspicion                ││
+│  │ confirm_global/job(...)       - Add confirmation (NO timer reschedule)      ││
+│  │ refute_global/job(...)        - Clear suspicion (higher incarnation)        ││
+│  │ is_alive_global(node)         - Query: machine up?                          ││
+│  │ is_alive_for_job(job, node)   - Query: node responsive for job?             ││
+│  │ clear_job(job_id)             - Cleanup when job completes                  ││
+│  │ get_node_status(node)         - Comprehensive status query                  ││
+│  └─────────────────────────────────────────────────────────────────────────────┘│
+│                                    │                                             │
+│          ┌────────────────────────┴─────────────────────────┐                   │
+│          ▼                                                  ▼                   │
+│  ┌───────────────────┐                            ┌───────────────────┐         │
+│  │   TimingWheel     │                            │ JobSuspicionMgr   │         │
+│  │                   │                            │                   │         │
+│  │ • Coarse buckets  │                            │ • Per-job tracking│         │
+│  │ • Fine buckets    │                            │ • Adaptive polling│         │
+│  │ • Single tick     │                            │ • LHM integration │         │
+│  │ • O(1) ops        │                            │ • Resource limits │         │
+│  └───────────────────┘                            └───────────────────┘         │
+│          │                                                  │                   │
+│          │ on_expired(node, state)                          │ on_expired(job,   │
+│          ▼                                                  ▼  node, inc)       │
+│  ┌───────────────────────────────────────────────────────────────────────────┐ │
+│  │                         CALLBACK HANDLERS                                  │ │
+│  │                                                                            │ │
+│  │  _handle_global_expiration:           _handle_job_expiration:              │ │
+│  │  1. Mark node as globally dead        1. Record job-specific death         │ │
+│  │  2. Clear ALL job suspicions          2. Invoke on_job_death callback      │ │
+│  │  3. Invoke on_global_death callback   3. Update job routing state          │ │
+│  │  4. Record failure event                                                   │ │
+│  └───────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                  │
+│  ┌───────────────────────────────────────────────────────────────────────────┐ │
+│  │                        RECONCILIATION LOOP                                 │ │
+│  │                                                                            │ │
+│  │  Periodic (every 5s):                                                      │ │
+│  │  - Clear job suspicions for globally-dead nodes                            │ │
+│  │  - Detect inconsistencies between layers                                   │ │
+│  │  - Log/escalate anomalies                                                  │ │
+│  └───────────────────────────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Timing Wheel Design (Global Layer)**:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                           TIMING WHEEL INTERNALS                                 │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                  │
+│  Configuration:                                                                  │
+│  • coarse_tick_ms: 1000 (1 second per coarse bucket)                            │
+│  • fine_tick_ms: 100 (100ms per fine bucket)                                    │
+│  • coarse_buckets: 64 (64 seconds max timeout in coarse wheel)                  │
+│  • fine_buckets: 10 (1 second of fine-grained resolution)                       │
+│                                                                                  │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐│
+│  │                         COARSE WHEEL (1s resolution)                        ││
+│  │                                                                             ││
+│  │  Bucket 0    Bucket 1    Bucket 2    ...    Bucket 63                       ││
+│  │  ┌──────┐    ┌──────┐    ┌──────┐          ┌──────┐                        ││
+│  │  │Entry │    │      │    │Entry │          │      │                        ││
+│  │  │  A   │    │      │    │  C   │          │      │                        ││
+│  │  │Entry │    │      │    │      │          │      │                        ││
+│  │  │  B   │    │      │    │      │          │      │                        ││
+│  │  └──────┘    └──────┘    └──────┘          └──────┘                        ││
+│  │     ▲                                                                       ││
+│  │     │ current_coarse_idx                                                    ││
+│  │                                                                             ││
+│  │  When current bucket expires → cascade entries to fine wheel                ││
+│  └─────────────────────────────────────────────────────────────────────────────┘│
+│                                    │                                             │
+│                                    │ cascade                                     │
+│                                    ▼                                             │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐│
+│  │                          FINE WHEEL (100ms resolution)                      ││
+│  │                                                                             ││
+│  │  Bucket 0    Bucket 1    Bucket 2    ...    Bucket 9                        ││
+│  │  ┌──────┐    ┌──────┐    ┌──────┐          ┌──────┐                        ││
+│  │  │Entry │    │Entry │    │      │          │      │                        ││
+│  │  │  X   │    │  Y   │    │      │          │      │                        ││
+│  │  └──────┘    └──────┘    └──────┘          └──────┘                        ││
+│  │     ▲                                                                       ││
+│  │     │ current_fine_idx                                                      ││
+│  │                                                                             ││
+│  │  When fine bucket expires → fire expiration callbacks                       ││
+│  └─────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                  │
+│  TICK ADVANCEMENT (single task, runs every fine_tick_ms):                       │
+│                                                                                  │
+│  async def _tick():                                                              │
+│      # Advance fine wheel                                                        │
+│      fine_idx = (fine_idx + 1) % fine_buckets                                   │
+│      if fine_idx == 0:                                                           │
+│          # Wrapped around - advance coarse wheel                                 │
+│          coarse_idx = (coarse_idx + 1) % coarse_buckets                         │
+│          # Cascade coarse bucket entries to fine wheel                          │
+│          for entry in coarse_buckets[coarse_idx]:                               │
+│              fine_target = calculate_fine_bucket(entry.expiration)              │
+│              fine_buckets[fine_target].add(entry)                               │
+│                                                                                  │
+│      # Fire expired entries in current fine bucket                              │
+│      for entry in fine_buckets[fine_idx]:                                       │
+│          if entry.expiration <= now:                                            │
+│              on_expired(entry.node, entry.state)                                │
+│                                                                                  │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Adaptive Polling Design (Job Layer)**:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                       ADAPTIVE POLLING ALGORITHM                                 │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                  │
+│  Each JobSuspicion has a single polling task (NOT timer-per-suspicion):         │
+│                                                                                  │
+│  async def _poll_suspicion(suspicion):                                           │
+│      while not suspicion.cancelled and running:                                  │
+│          remaining = suspicion.time_remaining(n_members)                         │
+│                                                                                  │
+│          if remaining <= 0:                                                      │
+│              # EXPIRED - declare dead                                            │
+│              await _handle_expiration(suspicion)                                 │
+│              return                                                              │
+│                                                                                  │
+│          # Calculate adaptive poll interval                                      │
+│          poll_interval = _calculate_poll_interval(remaining)                     │
+│          sleep_time = min(poll_interval, remaining)                              │
+│                                                                                  │
+│          await asyncio.sleep(sleep_time)                                         │
+│          # Loop continues - if confirmations arrived, time_remaining shorter    │
+│                                                                                  │
+│  Poll Interval Selection:                                                        │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐│
+│  │                                                                             ││
+│  │  Time Remaining      Base Interval    After LHM (×2)                        ││
+│  │  ──────────────      ─────────────    ──────────────                        ││
+│  │  > 5 seconds         1000ms (far)     2000ms                                ││
+│  │  1-5 seconds         250ms (medium)   500ms                                 ││
+│  │  < 1 second          50ms (near)      100ms                                 ││
+│  │                                                                             ││
+│  │  ┌────────────────────────────────────────────────────────────────────┐    ││
+│  │  │                                                                    │    ││
+│  │  │  Poll    ┌─────┐   ┌────┐   ┌───┐  ┌──┐ ┌─┐┌─┐┌─┐┌─┐             │    ││
+│  │  │  Rate    │     │   │    │   │   │  │  │ │ ││ ││ ││ │ EXPIRE      │    ││
+│  │  │          │     │   │    │   │   │  │  │ │ ││ ││ ││ │   ↓         │    ││
+│  │  │  ────────┴─────┴───┴────┴───┴───┴──┴──┴─┴─┴┴─┴┴─┴┴─┴──────►     │    ││
+│  │  │  T=0          T=5s        T=9s   T=9.5s  T=10s                   │    ││
+│  │  │                                                                    │    ││
+│  │  │  Polls become more frequent as expiration approaches               │    ││
+│  │  └────────────────────────────────────────────────────────────────────┘    ││
+│  │                                                                             ││
+│  └─────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                  │
+│  KEY INSIGHT: Confirmations update suspicion STATE (confirmation_count).         │
+│               The poll loop naturally picks up the shorter timeout on next poll. │
+│               NO timer cancellation/rescheduling needed!                         │
+│                                                                                  │
+│  Before (timer starvation):           After (adaptive polling):                  │
+│  ─────────────────────────           ──────────────────────────                 │
+│  T=0: start_suspicion                 T=0: start_suspicion                       │
+│  T=0.1: confirm → CANCEL + NEW timer  T=0.1: confirm → update count              │
+│  T=0.2: confirm → CANCEL + NEW timer  T=0.2: confirm → update count              │
+│  ...timer never expires...            T=0.5: poll → remaining=4.0s, sleep        │
+│                                       T=1.0: poll → remaining=3.0s, sleep        │
+│                                       ...                                        │
+│                                       T=5.0: poll → remaining=0, EXPIRE          │
+│                                                                                  │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Node Status State Machine**:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                         NODE STATUS STATE MACHINE                                │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                  │
+│  NodeStatus enum:                                                                │
+│  ┌───────────────┐  ┌─────────────────────┐  ┌─────────────────┐                │
+│  │    ALIVE      │  │  SUSPECTED_GLOBAL   │  │  SUSPECTED_JOB  │                │
+│  │               │  │                     │  │                 │                │
+│  │ Not suspected │  │ Suspected at global │  │ Suspected for   │                │
+│  │ at any layer  │  │ layer (machine may  │  │ specific job(s) │                │
+│  │               │  │ be down)            │  │ but not global  │                │
+│  └───────┬───────┘  └──────────┬──────────┘  └────────┬────────┘                │
+│          │                     │                      │                          │
+│          │                     │                      │                          │
+│          │                     ▼                      ▼                          │
+│          │          ┌─────────────────────┐  ┌─────────────────┐                │
+│          │          │    DEAD_GLOBAL      │  │    DEAD_JOB     │                │
+│          │          │                     │  │                 │                │
+│          │          │ Declared dead at    │  │ Declared dead   │                │
+│          │          │ global level        │  │ for specific    │                │
+│          │          │ (machine is down)   │  │ job only        │                │
+│          │          └─────────────────────┘  └─────────────────┘                │
+│          │                     │                                                 │
+│          │                     │                                                 │
+│          └─────────────────────┼────────────────────────────────────────────────│
+│                                │                                                 │
+│                                ▼                                                 │
+│                    Global death clears all job suspicions                        │
+│                                                                                  │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                  │
+│  State Transitions:                                                              │
+│                                                                                  │
+│  ┌─────────┐    suspect_global()     ┌──────────────────┐                       │
+│  │  ALIVE  │ ──────────────────────► │ SUSPECTED_GLOBAL │                       │
+│  └─────────┘                          └────────┬─────────┘                       │
+│       ▲                                        │                                 │
+│       │ refute_global() or                     │ timeout without                 │
+│       │ clear_global_death()                   │ refutation                      │
+│       │                                        ▼                                 │
+│       │                               ┌──────────────────┐                       │
+│       └───────────────────────────────│   DEAD_GLOBAL    │                       │
+│         (node rejoins with            └──────────────────┘                       │
+│          higher incarnation)                   │                                 │
+│                                                │ triggers                        │
+│                                                ▼                                 │
+│                                    Clear all job suspicions                      │
+│                                    for this node                                 │
+│                                                                                  │
+│  ┌─────────┐      suspect_job()      ┌───────────────┐                          │
+│  │  ALIVE  │ ──────────────────────► │ SUSPECTED_JOB │                          │
+│  └─────────┘                          └───────┬───────┘                          │
+│       ▲                                       │                                  │
+│       │ refute_job()                          │ timeout without                  │
+│       │                                       │ refutation                       │
+│       │                                       ▼                                  │
+│       │                               ┌───────────────┐                          │
+│       └───────────────────────────────│   DEAD_JOB    │                          │
+│                                       └───────────────┘                          │
+│                                                                                  │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Lifecycle Diagram - HierarchicalFailureDetector**:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                    HIERARCHICAL DETECTOR LIFECYCLE                               │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                  │
+│  1. CONSTRUCTION                                                                 │
+│  ────────────────                                                                │
+│  detector = HierarchicalFailureDetector(                                         │
+│      config=HierarchicalConfig(...),                                             │
+│      on_global_death=handle_global_death,                                        │
+│      on_job_death=handle_job_death,                                              │
+│      get_n_members=lambda: len(active_nodes),                                    │
+│      get_job_n_members=lambda job: len(job_nodes[job]),                          │
+│      get_lhm_multiplier=lambda: local_health.get_multiplier(),                   │
+│  )                                                                               │
+│       │                                                                          │
+│       │ Creates TimingWheel and JobSuspicionManager                              │
+│       │ Initializes reconciliation state                                         │
+│       ▼                                                                          │
+│  ┌─────────────┐                                                                 │
+│  │  CREATED    │                                                                 │
+│  │             │                                                                 │
+│  │ Wheel: idle │                                                                 │
+│  │ Jobs: idle  │                                                                 │
+│  │ Reconcile:  │                                                                 │
+│  │   not run   │                                                                 │
+│  └──────┬──────┘                                                                 │
+│         │                                                                        │
+│         │ await detector.start()                                                 │
+│         ▼                                                                        │
+│  2. STARTUP                                                                      │
+│  ──────────                                                                      │
+│  ┌─────────────┐                                                                 │
+│  │  STARTING   │                                                                 │
+│  │             │─── timing_wheel.start()                                         │
+│  │             │    └── Creates tick advancement task                            │
+│  │             │                                                                 │
+│  │             │─── Starts reconciliation loop task                              │
+│  │             │                                                                 │
+│  └──────┬──────┘                                                                 │
+│         │                                                                        │
+│         │ _running = True                                                        │
+│         ▼                                                                        │
+│  ┌─────────────┐                                                                 │
+│  │   RUNNING   │                                                                 │
+│  │             │                                                                 │
+│  │ Wheel: tick │◄────────────────────────────────────────────────────┐          │
+│  │ Jobs: poll  │                                                     │          │
+│  │ Reconcile:  │    suspect_global()  ──► Add to timing wheel        │          │
+│  │   periodic  │    confirm_global()  ──► Update state (no reschedule)          │
+│  │             │    suspect_job()     ──► Create job suspicion       │          │
+│  │             │    confirm_job()     ──► Update confirmation count  │          │
+│  │             │                                                     │          │
+│  │             │    [Expiration]      ──► Callback + state update ───┘          │
+│  │             │                                                                 │
+│  └──────┬──────┘                                                                 │
+│         │                                                                        │
+│         │ await detector.stop()                                                  │
+│         ▼                                                                        │
+│  3. SHUTDOWN                                                                     │
+│  ───────────                                                                     │
+│  ┌─────────────┐                                                                 │
+│  │  STOPPING   │                                                                 │
+│  │             │─── _running = False                                             │
+│  │             │                                                                 │
+│  │             │─── Cancel reconciliation task                                   │
+│  │             │                                                                 │
+│  │             │─── timing_wheel.stop()                                          │
+│  │             │    └── Cancels tick task, clears buckets                        │
+│  │             │                                                                 │
+│  │             │─── job_manager.shutdown()                                       │
+│  │             │    └── Cancels all poll tasks, clears suspicions                │
+│  │             │                                                                 │
+│  └──────┬──────┘                                                                 │
+│         │                                                                        │
+│         ▼                                                                        │
+│  ┌─────────────┐                                                                 │
+│  │   STOPPED   │                                                                 │
+│  │             │                                                                 │
+│  │ All tasks   │                                                                 │
+│  │ cancelled   │                                                                 │
+│  │ All state   │                                                                 │
+│  │ cleared     │                                                                 │
+│  └─────────────┘                                                                 │
+│                                                                                  │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Integration with HealthAwareServer**:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                    HEALTHAWARESERVER INTEGRATION                                 │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                  │
+│  class HealthAwareServer(MercurySyncBaseServer):                                 │
+│      """Base SWIM server with optional hierarchical detection."""                │
+│                                                                                  │
+│      def __init__(self, ...):                                                    │
+│          ...                                                                     │
+│          # Optional hierarchical detector (initialized by subclasses)            │
+│          self._hierarchical_detector: HierarchicalFailureDetector | None = None │
+│                                                                                  │
+│      # ─────────────────────────────────────────────────────────────────────── #
+│      # Initialization (called by subclasses in their __init__)                  #
+│      # ─────────────────────────────────────────────────────────────────────── #
+│                                                                                  │
+│      def init_hierarchical_detector(                                             │
+│          self,                                                                   │
+│          config: HierarchicalConfig | None = None,                               │
+│          on_global_death: Callable[[tuple[str,int], int], None] | None = None,  │
+│          on_job_death: Callable[[str, tuple[str,int], int], None] | None = None,│
+│          get_job_n_members: Callable[[str], int] | None = None,                 │
+│      ) -> HierarchicalFailureDetector:                                           │
+│          """Initialize hierarchical detector with callbacks."""                  │
+│          self._hierarchical_detector = HierarchicalFailureDetector(              │
+│              config=config,                                                      │
+│              on_global_death=on_global_death,                                    │
+│              on_job_death=on_job_death,                                          │
+│              get_n_members=self._get_member_count,   # From SWIM membership     │
+│              get_job_n_members=get_job_n_members,                                │
+│              get_lhm_multiplier=self._get_lhm_multiplier,  # From LHM           │
+│          )                                                                       │
+│          return self._hierarchical_detector                                      │
+│                                                                                  │
+│      # ─────────────────────────────────────────────────────────────────────── #
+│      # Lifecycle (called by subclasses in start()/stop())                       #
+│      # ─────────────────────────────────────────────────────────────────────── #
+│                                                                                  │
+│      async def start_hierarchical_detector(self) -> None:                        │
+│          if self._hierarchical_detector:                                         │
+│              await self._hierarchical_detector.start()                           │
+│                                                                                  │
+│      async def stop_hierarchical_detector(self) -> None:                         │
+│          if self._hierarchical_detector:                                         │
+│              await self._hierarchical_detector.stop()                            │
+│                                                                                  │
+│      # ─────────────────────────────────────────────────────────────────────── #
+│      # Convenience methods (fail-open if detector not initialized)              #
+│      # ─────────────────────────────────────────────────────────────────────── #
+│                                                                                  │
+│      async def suspect_node_global(self, node, inc, from_node) -> bool           │
+│      async def suspect_node_for_job(self, job, node, inc, from_node) -> bool     │
+│      async def is_node_alive_global(self, node) -> bool                          │
+│      def is_node_alive_for_job(self, job, node) -> bool                          │
+│      async def clear_job_suspicions(self, job_id) -> int                         │
+│      async def get_node_hierarchical_status(self, node) -> NodeStatus | None     │
+│                                                                                  │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Example Implementation - Manager with Hierarchical Detection**:
+
+```python
+class ManagerServer(HealthAwareServer):
+    """Manager node with job-layer failure detection."""
+
+    def __init__(self, ...):
+        super().__init__(...)
+
+        # Initialize hierarchical detector for job-aware failure tracking
+        self.init_hierarchical_detector(
+            config=HierarchicalConfig(
+                # Longer global timeout for WAN latency
+                global_min_timeout=10.0,
+                global_max_timeout=60.0,
+                # Shorter job timeout for responsiveness
+                job_min_timeout=2.0,
+                job_max_timeout=15.0,
+            ),
+            on_global_death=self._on_worker_globally_dead,
+            on_job_death=self._on_worker_dead_for_job,
+            get_job_n_members=self._get_job_worker_count,
+        )
+
+    async def start(self) -> None:
+        await super().start()
+        # Start hierarchical detection after SWIM is running
+        await self.start_hierarchical_detector()
+
+    async def stop(self, ...) -> None:
+        # Stop hierarchical detection before SWIM shutdown
+        await self.stop_hierarchical_detector()
+        await super().stop(...)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Callbacks
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _on_worker_globally_dead(
+        self,
+        worker_addr: tuple[str, int],
+        incarnation: int,
+    ) -> None:
+        """Worker machine is dead - affects ALL jobs on that worker."""
+        worker_id = self._worker_addr_to_id.get(worker_addr)
+        if worker_id:
+            # Remove from all job assignments
+            self._job_manager.remove_worker_from_all_jobs(worker_id)
+            # Trigger workflow reassignment
+            self._task_runner.run(self._reassign_workflows_from_dead_worker, worker_id)
+
+    def _on_worker_dead_for_job(
+        self,
+        job_id: str,
+        worker_addr: tuple[str, int],
+        incarnation: int,
+    ) -> None:
+        """Worker is unresponsive for specific job - reroute that job only."""
+        worker_id = self._worker_addr_to_id.get(worker_addr)
+        if worker_id:
+            # Remove from this job's assignment only
+            self._job_manager.remove_worker_from_job(job_id, worker_id)
+            # Reroute pending workflows for this job
+            self._task_runner.run(self._reroute_job_workflows, job_id, worker_id)
+
+    def _get_job_worker_count(self, job_id: str) -> int:
+        """Get number of workers assigned to a job."""
+        return self._job_manager.get_worker_count(job_id)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Usage in workflow dispatch
+    # ─────────────────────────────────────────────────────────────────────────
+
+    async def _select_worker_for_workflow(
+        self,
+        job_id: str,
+        workflow: Workflow,
+    ) -> tuple[str, int] | None:
+        """Select a worker that's alive for this specific job."""
+        candidates = self._job_manager.get_job_workers(job_id)
+
+        for worker_id in candidates:
+            worker_addr = self._get_worker_addr(worker_id)
+
+            # Check job-specific liveness, not just global
+            if self.is_node_alive_for_job(job_id, worker_addr):
+                return worker_addr
+
+        return None  # No healthy workers for this job
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Starting job-layer suspicion
+    # ─────────────────────────────────────────────────────────────────────────
+
+    async def _on_workflow_response_timeout(
+        self,
+        job_id: str,
+        worker_addr: tuple[str, int],
+    ) -> None:
+        """Workflow response timed out - suspect worker for this job."""
+        # Get worker's current incarnation
+        incarnation = self._get_worker_incarnation(worker_addr)
+
+        # Start job-specific suspicion (not global - machine may be fine)
+        await self.suspect_node_for_job(
+            job_id=job_id,
+            node=worker_addr,
+            incarnation=incarnation,
+            from_node=self._get_self_udp_addr(),
+        )
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Cleanup when job completes
+    # ─────────────────────────────────────────────────────────────────────────
+
+    async def _on_job_completed(self, job_id: str) -> None:
+        """Job finished - clear all suspicions for that job."""
+        cleared = await self.clear_job_suspicions(job_id)
+        if cleared > 0:
+            await self._log(f"Cleared {cleared} suspicions for completed job {job_id}")
+```
+
+**Example Implementation - Gate with Cross-DC Detection**:
+
+```python
+class GateServer(HealthAwareServer):
+    """Gate node with datacenter-level failure detection."""
+
+    def __init__(self, ...):
+        super().__init__(...)
+
+        # Initialize for cross-DC manager detection
+        self.init_hierarchical_detector(
+            config=HierarchicalConfig(
+                # Very long timeout for WAN (cross-DC) latency
+                global_min_timeout=30.0,
+                global_max_timeout=120.0,
+                # Per-DC "job" timeout (treat each DC as a "job")
+                job_min_timeout=5.0,
+                job_max_timeout=30.0,
+            ),
+            on_global_death=self._on_manager_globally_dead,
+            on_job_death=self._on_manager_dead_for_dc,  # DC treated as "job"
+            get_job_n_members=self._get_dc_manager_count,
+        )
+
+    async def _on_manager_heartbeat_timeout(
+        self,
+        dc_id: str,
+        manager_addr: tuple[str, int],
+    ) -> None:
+        """Manager heartbeat timed out - suspect for this DC."""
+        incarnation = self._get_manager_incarnation(manager_addr)
+
+        # Suspect manager for this DC (job = DC)
+        await self.suspect_node_for_job(
+            job_id=dc_id,  # DC ID used as "job ID"
+            node=manager_addr,
+            incarnation=incarnation,
+            from_node=self._get_self_udp_addr(),
+        )
+
+    async def _select_manager_for_dc(self, dc_id: str) -> tuple[str, int] | None:
+        """Select a healthy manager for a datacenter."""
+        managers = self._dc_managers.get(dc_id, [])
+
+        for manager_addr in managers:
+            # Check DC-specific health
+            if self.is_node_alive_for_job(dc_id, manager_addr):
+                return manager_addr
+
+        return None
+```
+
+**Reconciliation Logic**:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                         RECONCILIATION SCENARIOS                                 │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                  │
+│  Scenario 1: Global death with lingering job suspicions                          │
+│  ───────────────────────────────────────────────────────                         │
+│                                                                                  │
+│  State BEFORE:                    State AFTER reconciliation:                    │
+│  ┌──────────────────────┐        ┌──────────────────────┐                       │
+│  │ Global Layer         │        │ Global Layer         │                       │
+│  │ Node A: DEAD         │        │ Node A: DEAD         │                       │
+│  │                      │        │                      │                       │
+│  │ Job Layer            │        │ Job Layer            │                       │
+│  │ Job1/NodeA: SUSPECT  │───────►│ Job1/NodeA: CLEARED  │                       │
+│  │ Job2/NodeA: SUSPECT  │        │ Job2/NodeA: CLEARED  │                       │
+│  └──────────────────────┘        └──────────────────────┘                       │
+│                                                                                  │
+│  Reason: If machine is dead, all jobs are implicitly affected.                   │
+│          Job suspicions are redundant and waste resources.                       │
+│                                                                                  │
+│  ────────────────────────────────────────────────────────────────────────────── │
+│                                                                                  │
+│  Scenario 2: Job death but global alive (job-specific issue)                     │
+│  ───────────────────────────────────────────────────────────                     │
+│                                                                                  │
+│  State:                                                                          │
+│  ┌──────────────────────┐                                                       │
+│  │ Global Layer         │                                                       │
+│  │ Node A: ALIVE        │  ◄── Machine is up (SWIM probes succeed)              │
+│  │                      │                                                       │
+│  │ Job Layer            │                                                       │
+│  │ Job1/NodeA: DEAD     │  ◄── But unresponsive for Job1 (CPU saturated)        │
+│  │ Job2/NodeA: ALIVE    │  ◄── Still responsive for Job2                        │
+│  └──────────────────────┘                                                       │
+│                                                                                  │
+│  Action: Route Job1 workflows away from Node A.                                  │
+│          Keep routing Job2 workflows to Node A.                                  │
+│                                                                                  │
+│  This is the KEY VALUE of hierarchical detection!                                │
+│                                                                                  │
+│  ────────────────────────────────────────────────────────────────────────────── │
+│                                                                                  │
+│  Scenario 3: Node rejoins (was globally dead)                                    │
+│  ────────────────────────────────────────────                                    │
+│                                                                                  │
+│  Timeline:                                                                       │
+│  T=0:   Node A marked DEAD_GLOBAL                                                │
+│  T=10:  Node A restarts, sends heartbeat with higher incarnation                 │
+│  T=10:  Receive heartbeat → clear_global_death(A)                                │
+│  T=10:  Node A now ALIVE at both layers                                          │
+│                                                                                  │
+│  No job suspicions to clear (they were cleared when node died globally).         │
+│                                                                                  │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Resource Limits and Bounds**:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                           RESOURCE LIMITS                                        │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                  │
+│  Global Layer (TimingWheel):                                                     │
+│  ───────────────────────────                                                     │
+│  • max_entries: 10,000 (default)                                                 │
+│  • Memory per entry: ~200 bytes (SuspicionState + wheel bookkeeping)             │
+│  • Max memory: ~2MB for 10K entries                                              │
+│  • Single tick task: O(bucket_size) per tick                                     │
+│                                                                                  │
+│  Job Layer (JobSuspicionManager):                                                │
+│  ────────────────────────────────                                                │
+│  • max_suspicions_per_job: 1,000 (default)                                       │
+│  • max_total_suspicions: 50,000 (default)                                        │
+│  • Memory per suspicion: ~300 bytes (JobSuspicion + polling state)               │
+│  • Max memory: ~15MB for 50K suspicions                                          │
+│  • One poll task per active suspicion (lightweight, mostly sleeping)             │
+│                                                                                  │
+│  Graceful Degradation:                                                           │
+│  ─────────────────────                                                           │
+│  When limits are reached:                                                        │
+│  • New suspicions are REJECTED (start_suspicion returns None/False)              │
+│  • Existing suspicions continue to be tracked                                    │
+│  • Cleanup runs periodically to remove expired entries                           │
+│  • Metrics/logs indicate limit reached                                           │
+│                                                                                  │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐│
+│  │  if len(suspicions) >= max_total_suspicions:                                ││
+│  │      # Try cleanup first                                                    ││
+│  │      cleanup_orphaned()                                                     ││
+│  │      if len(suspicions) >= max_total_suspicions:                            ││
+│  │          return None  # Reject - at capacity                                ││
+│  └─────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                  │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Files Modified/Created**:
+
+| File | Description |
+|------|-------------|
+| `hyperscale/distributed_rewrite/swim/detection/timing_wheel.py` | Kafka-style hierarchical timing wheel for O(1) timer operations |
+| `hyperscale/distributed_rewrite/swim/detection/job_suspicion_manager.py` | Per-job adaptive polling suspicion manager |
+| `hyperscale/distributed_rewrite/swim/detection/hierarchical_failure_detector.py` | Coordinator for global + job layers |
+| `hyperscale/distributed_rewrite/swim/detection/__init__.py` | Updated exports |
+| `hyperscale/distributed_rewrite/swim/health_aware_server.py` | Integration methods for subclasses |
+| `tests/integration/test_timing_wheel.py` | Comprehensive timing wheel tests |
+| `tests/integration/test_job_suspicion_manager.py` | Job suspicion manager tests |
+| `tests/integration/test_hierarchical_failure_detector.py` | End-to-end hierarchical detection tests |
+
+**Testing Strategy**:
+
+1. **Unit Tests** (per component):
+   - TimingWheel: bucket operations, tick advancement, cascade, expiration
+   - JobSuspicionManager: adaptive polling, confirmation handling, cleanup
+   - HierarchicalFailureDetector: layer coordination, reconciliation
+
+2. **Integration Tests**:
+   - Timer starvation scenario (rapid confirmations)
+   - Global death clears job suspicions
+   - Job-specific failure with global alive
+   - LHM adjustment propagation
+   - Concurrent operations (asyncio correctness)
+
+3. **Edge Cases**:
+   - Max limits reached (graceful rejection)
+   - Node rejoins after global death
+   - Job completion during active suspicion
+   - Network partition (some layers detect, others don't)
+
+**Alternatives Considered**:
+
+1. **Single Timer with Dynamic Timeout**: Simpler but still has reschedule overhead
+2. **Confirmation Debouncing**: Delays confirmation propagation, affects protocol correctness
+3. **Timeout Floor**: Minimum timeout regardless of confirmations, but wastes time when node is clearly dead
+4. **Batch Confirmation Processing**: Reduces reschedules but adds latency
+5. **Hierarchical Without Job Layer**: Loses per-job routing capability
+
+**Trade-offs**:
+
+| Aspect | Before | After |
+|--------|--------|-------|
+| Timer management | Per-suspicion timers | Single tick + adaptive polling |
+| Confirmation handling | Cancel + reschedule | State update only |
+| Memory overhead | Lower | Higher (two layers) |
+| Complexity | Simpler | More complex |
+| Job awareness | None | Full per-job tracking |
+| Timer starvation | Vulnerable | Immune |
+| Routing accuracy | Global only | Per-job granularity |
+
+---
+
 ## Architecture
 
 ### Node Types
