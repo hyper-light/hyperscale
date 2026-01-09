@@ -326,6 +326,24 @@ class MockServerInterface:
     def build_ack_with_state_for_addr(self, addr_slug: bytes) -> bytes:
         return b"ack>" + addr_slug
 
+    # === Cross-Cluster Methods ===
+
+    async def build_xprobe_response(
+        self,
+        source_addr: tuple[str, int],
+        probe_data: bytes,
+    ) -> bytes | None:
+        """Build response to cross-cluster probe. Returns None for xnack."""
+        return None  # Default: return xnack (not a DC leader)
+
+    async def handle_xack_response(
+        self,
+        source_addr: tuple[str, int],
+        response_data: bytes,
+    ) -> None:
+        """Handle cross-cluster health acknowledgment response."""
+        pass  # Default: no-op
+
     def get_embedded_state(self) -> bytes | None:
         return self._embedded_state
 
