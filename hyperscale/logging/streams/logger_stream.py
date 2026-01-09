@@ -142,8 +142,12 @@ class LoggerStream:
     async def initialize(self) -> asyncio.StreamWriter:
 
         async with self._init_lock:
-            
+
             if self._initialized:
+                return
+
+            if self._config.disabled:
+                self._initialized = True
                 return
 
             if self._compressor is None:
@@ -654,6 +658,8 @@ class LoggerStream:
         template: str | None = None,
         filter: Callable[[T], bool] | None=None,
     ):
+        if self._config.disabled:
+            return
 
         entry: Entry = None
         if isinstance(entry_or_log, Log):
@@ -738,7 +744,9 @@ class LoggerStream:
         retention_policy: RetentionPolicyConfig | None = None,
         filter: Callable[[T], bool] | None=None,
     ):
-        
+        if self._config.disabled:
+            return
+
         entry: Entry = None
         if isinstance(entry_or_log, Log):
             entry = entry_or_log.entry

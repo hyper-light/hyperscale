@@ -13,6 +13,7 @@ _global_disabled_loggers = contextvars.ContextVar("_global_disabled_loggers", de
 _global_level_map = contextvars.ContextVar("_global_level_map", default=LogLevelMap())
 _global_log_output_type = contextvars.ContextVar("_global_log_level_type", default=StreamType.STDOUT)
 _global_logging_directory = contextvars.ContextVar("_global_logging_directory", default=None)
+_global_logging_disabled = contextvars.ContextVar("_global_logging_disabled", default=False)
 
 
 class LoggingConfig:
@@ -57,6 +58,27 @@ class LoggingConfig:
         return logger_name not in disabled_loggers and (
             self._level_map[log_level] >= self._level_map[current_log_level]
         )
+    
+    def disable(self, logger_name: str | None = None):
+        """Disable a specific logger by name, or disable all logging if no name provided."""
+        if logger_name is None:
+            _global_logging_disabled.set(True)
+        else:
+            disabled_loggers = _global_disabled_loggers.get()
+            disabled_loggers.append(logger_name)
+
+            disabled_loggers = list(set(disabled_loggers))
+
+            _global_disabled_loggers.set(disabled_loggers)
+
+    def enable(self):
+        """Re-enable global logging."""
+        _global_logging_disabled.set(False)
+
+    @property
+    def disabled(self) -> bool:
+        """Check if logging is globally disabled."""
+        return _global_logging_disabled.get()
 
     @property
     def level(self):
