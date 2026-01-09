@@ -81,6 +81,7 @@ class HierarchicalConfig:
     extension_max_extensions: int = 5
     extension_warning_threshold: int = 1
     extension_grace_period: float = 10.0
+    max_extension_trackers: int = 10000  # Hard cap to prevent memory exhaustion
 
 
 @dataclass
@@ -194,6 +195,7 @@ class HierarchicalFailureDetector:
         self._extensions_granted: int = 0
         self._extensions_denied: int = 0
         self._extension_warnings_sent: int = 0
+        self._extension_trackers_cleaned: int = 0
 
     def _get_current_n_members(self) -> int:
         """Get current global member count."""
@@ -336,9 +338,16 @@ class HierarchicalFailureDetector:
     # AD-26: Adaptive Healthcheck Extensions
     # =========================================================================
 
-    def _get_or_create_extension_tracker(self, node: NodeAddress) -> ExtensionTracker:
-        """Get or create an ExtensionTracker for a node."""
+    def _get_or_create_extension_tracker(self, node: NodeAddress) -> ExtensionTracker | None:
+        """
+        Get or create an ExtensionTracker for a node.
+
+        Returns None if the maximum number of trackers has been reached.
+        """
         if node not in self._extension_trackers:
+            # Check resource limit to prevent memory exhaustion
+            if len(self._extension_trackers) >= self._config.max_extension_trackers:
+                return None
             worker_id = f"{node[0]}:{node[1]}"
             self._extension_trackers[node] = self._extension_tracker_config.create_tracker(
                 worker_id
@@ -385,6 +394,16 @@ class HierarchicalFailureDetector:
 
             # Get or create tracker for this node
             tracker = self._get_or_create_extension_tracker(node)
+
+            # Check if tracker creation was denied due to resource limit
+            if tracker is None:
+                self._extensions_denied += 1
+                return (
+                    False,
+                    0.0,
+                    f"Maximum extension trackers ({self._config.max_extension_trackers}) reached",
+                    False,
+                )
 
             # Request the extension
             granted, extension_seconds, denial_reason, is_warning = tracker.request_extension(
@@ -695,6 +714,23 @@ class HierarchicalFailureDetector:
                     await self._job_manager.refute_suspicion(job_id, node, 2**31)
                     self._job_suspicions_cleared_by_global += 1
 
+            # AD-26: Clean up extension trackers for nodes that are no longer suspected
+            # and have been reset (idle). This prevents memory leaks from accumulating
+            # trackers for nodes that have come and gone.
+            stale_tracker_nodes: list[NodeAddress] = []
+            for node, tracker in self._extension_trackers.items():
+                # Only remove if:
+                # 1. Node is not currently suspected (no active suspicion)
+                # 2. Tracker has been reset (extension_count == 0)
+                # 3. Node is not globally dead (those are cleaned up on death)
+                is_suspected = await self._global_wheel.contains(node)
+                if not is_suspected and tracker.extension_count == 0 and node not in self._globally_dead:
+                    stale_tracker_nodes.append(node)
+
+            for node in stale_tracker_nodes:
+                self._extension_trackers.pop(node, None)
+                self._extension_trackers_cleaned += 1
+
     # =========================================================================
     # LHM Integration
     # =========================================================================
@@ -751,6 +787,7 @@ class HierarchicalFailureDetector:
             "extensions_denied": self._extensions_denied,
             "extension_warnings_sent": self._extension_warnings_sent,
             "active_extension_trackers": len(self._extension_trackers),
+            "extension_trackers_cleaned": self._extension_trackers_cleaned,
         }
 
     def get_recent_events(self, limit: int = 10) -> list[FailureEvent]:
