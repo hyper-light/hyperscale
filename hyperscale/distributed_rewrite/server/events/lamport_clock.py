@@ -123,7 +123,7 @@ class LamportClock:
 EntityT = TypeVar('EntityT')
 
 
-@dataclass
+@dataclass(slots=True)
 class VersionedState(Generic[EntityT]):
     """
     State with a version number for staleness detection.

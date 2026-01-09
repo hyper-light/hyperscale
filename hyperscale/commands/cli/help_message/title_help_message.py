@@ -1,7 +1,7 @@
 import asyncio
 from typing import List
 
-from pydantic import BaseModel, StrictStr, StrictInt
+from pydantic import BaseModel, ConfigDict, StrictStr, StrictInt
 from hyperscale.commands.cli.arg_types import KeywordArg
 from hyperscale.ui.styling import stylize, get_style
 
@@ -14,13 +14,12 @@ def is_arg_descriptor(line: str):
 
 
 class TitleHelpMessage(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     command: StrictStr
     indentation: StrictInt = 0
     options: List[KeywordArg] | None = None
     styling: CLIStyle | None = None
-
-    class Config:
-        arbitrary_types_allowed = True
 
     async def to_message(
         self,

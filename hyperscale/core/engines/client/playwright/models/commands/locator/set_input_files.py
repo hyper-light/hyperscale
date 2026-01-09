@@ -6,12 +6,13 @@ try:
     from playwright.async_api import FilePayload
 
 except Exception:
-    
+
     class FilePayload:
         pass
 
 from pydantic import (
     BaseModel,
+    ConfigDict,
     StrictBool,
     StrictFloat,
     StrictInt,
@@ -20,6 +21,8 @@ from pydantic import (
 
 
 class SetInputFilesCommand(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     files: (
         StrictStr
         | Path
@@ -29,6 +32,3 @@ class SetInputFilesCommand(BaseModel):
     )
     no_wait_after: Optional[StrictBool] = None
     timeout: StrictInt | StrictFloat
-
-    class Config:
-        arbitrary_types_allowed = True

@@ -8,26 +8,23 @@ local use in the distributed_rewrite module.
 from hyperscale.core.jobs.protocols.replay_guard import (
     ReplayGuard as ReplayGuard,
     ReplayError as ReplayError,
-    DEFAULT_MAX_AGE_SECONDS,
-    DEFAULT_MAX_FUTURE_SECONDS,
-    DEFAULT_WINDOW_SIZE,
 )
 
+from hyperscale.distributed_rewrite.reliability import (
+    ServerRateLimiter as ServerRateLimiter,
+)
+from hyperscale.core.jobs.protocols.constants import (
+    MAX_MESSAGE_SIZE,
+    MAX_COMPRESSION_RATIO,
+    MAX_DECOMPRESSED_SIZE,
+)
 from hyperscale.core.jobs.protocols.rate_limiter import (
-    RateLimiter as RateLimiter,
     RateLimitExceeded as RateLimitExceeded,
-    TokenBucket as TokenBucket,
-    DEFAULT_REQUESTS_PER_SECOND,
-    DEFAULT_BURST_SIZE,
-    DEFAULT_MAX_SOURCES,
 )
 
 
 # Message size limits
 # Job submissions with workflow classes can be large when pickled
-MAX_MESSAGE_SIZE = 1 * 1024 * 1024  # 1MB - maximum compressed message size
-MAX_DECOMPRESSED_SIZE = 50 * 1024 * 1024  # 50MB - maximum decompressed size
-MAX_COMPRESSION_RATIO = 100  # Maximum decompression ratio (compression bomb protection)
 
 
 class MessageSizeError(Exception):

@@ -93,7 +93,6 @@ class LoggerStream:
         self._init_lock = asyncio.Lock()
         self._stream_writers: Dict[StreamType, asyncio.StreamWriter] = {}
         self._loop: asyncio.AbstractEventLoop | None = None
-        self._generator: SnowflakeGenerator | None = None
         self._compressor: zstandard.ZstdCompressor | None = None
 
         self._files: Dict[str, io.FileIO] = {}
@@ -143,14 +142,13 @@ class LoggerStream:
     async def initialize(self) -> asyncio.StreamWriter:
 
         async with self._init_lock:
-            
+
             if self._initialized:
                 return
 
-            if self._generator is None:
-                self._generator = SnowflakeGenerator(
-                    (uuid.uuid1().int + threading.get_native_id()) >> 64
-                )
+            if self._config.disabled:
+                self._initialized = True
+                return
 
             if self._compressor is None:
                 self._compressor = zstandard.ZstdCompressor()
@@ -660,6 +658,8 @@ class LoggerStream:
         template: str | None = None,
         filter: Callable[[T], bool] | None=None,
     ):
+        if self._config.disabled:
+            return
 
         entry: Entry = None
         if isinstance(entry_or_log, Log):
@@ -744,7 +744,9 @@ class LoggerStream:
         retention_policy: RetentionPolicyConfig | None = None,
         filter: Callable[[T], bool] | None=None,
     ):
-        
+        if self._config.disabled:
+            return
+
         entry: Entry = None
         if isinstance(entry_or_log, Log):
             entry = entry_or_log.entry

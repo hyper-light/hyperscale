@@ -25,7 +25,7 @@ class TestServer(MercurySyncBaseServer[Ctx]):
             (
                 host,
                 port,
-            ) for host, port in nodes if target_host != host and target_port != port
+            ) for host, port in list(nodes.keys()) if target_host != host and target_port != port
         ]
     
     async def send_if_ok(

@@ -7,11 +7,13 @@ try:
 except Exception:
     class Geolocation:
         pass
-    
-from pydantic import BaseModel, StrictStr
+
+from pydantic import BaseModel, ConfigDict, StrictStr
 
 
 class BrowserMetadata(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     browser_type: Optional[
         Literal["safari", "webkit", "firefox", "chrome", "chromium"]
     ] = None
@@ -20,6 +22,3 @@ class BrowserMetadata(BaseModel):
     geolocation: Optional[Geolocation] = None
     permissions: Optional[List[StrictStr]] = None
     color_scheme: Optional[StrictStr] = None
-
-    class Config:
-        arbitrary_types_allowed = True

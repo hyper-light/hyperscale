@@ -99,21 +99,43 @@ class Run:
             except (asyncio.InvalidStateError, asyncio.CancelledError):
                 pass
 
-    async def cancel(self):
-        try:
-            self._task.set_result(None)
+    async def cancel(self, timeout: float = 5.0):
+        """
+        Cancel the running task with a timeout to prevent indefinite hangs.
 
-        except Exception:
-            pass
+        Args:
+            timeout: Maximum seconds to wait for task cancellation. If the task
+                     doesn't respond within this time, we proceed anyway. The
+                     task may continue running as an orphan but status is updated.
+        """
+        if self._task and not self._task.done():
+            self._task.cancel()
+            try:
+                # Wait for task to handle cancellation, but don't hang forever
+                # No shield - we already cancelled it, just waiting for cleanup
+                await asyncio.wait_for(self._task, timeout=timeout)
+            except asyncio.TimeoutError:
+                # Task didn't respond to cancellation in time - it may be orphaned
+                # but we proceed with status update to avoid blocking the caller
+                pass
+            except asyncio.CancelledError:
+                # Task was successfully cancelled
+                pass
+            except Exception:
+                # Task raised during cancellation - that's fine, it's stopping
+                pass
 
+        # Always update status, even if timeout occurred
         self.status = RunStatus.CANCELLED
+        self.end = time.monotonic()
+        self.elapsed = self.end - self.start
 
     def abort(self):
-        try:
-            self._task.set_result(None)
-
-        except Exception:
-            pass
+        if self._task and not self._task.done():
+            try:
+                self._task.cancel()
+            except Exception:
+                pass
 
         self.status = RunStatus.CANCELLED
 

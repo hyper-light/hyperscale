@@ -53,12 +53,15 @@ except Exception:
 
 from pydantic import (
     BaseModel,
+    ConfigDict,
     StrictFloat,
     StrictInt,
 )
 
 
 class OnCommand(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     event: Literal[
         "close",
         "console",
@@ -102,6 +105,3 @@ class OnCommand(BaseModel):
         | Callable[[Worker], Awaitable[None] | None]
     )
     timeout: StrictInt | StrictFloat
-
-    class Config:
-        arbitrary_types_allowed = True

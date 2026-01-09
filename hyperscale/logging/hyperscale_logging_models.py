@@ -172,4 +172,21 @@ class StatusUpdate(Entry, kw_only=True):
     failed_count: int
     avg_cpu: float
     avg_mem_mb: float
-    level: LogLevel = LogLevel.DEBUG
+    level: LogLevel = LogLevel.TRACE  # TRACE level since this fires every 100ms
+
+
+class SilentDropStats(Entry, kw_only=True):
+    """Periodic summary of silently dropped messages for security monitoring."""
+    node_id: int
+    node_host: str
+    node_port: int
+    protocol: str  # "tcp" or "udp"
+    rate_limited_count: int
+    message_too_large_count: int
+    decompression_too_large_count: int
+    decryption_failed_count: int
+    malformed_message_count: int
+    load_shed_count: int = 0  # AD-32: Messages dropped due to priority-based load shedding
+    total_dropped: int
+    interval_seconds: float
+    level: LogLevel = LogLevel.WARN

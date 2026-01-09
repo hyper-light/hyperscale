@@ -16,6 +16,7 @@ This server provides:
 import asyncio
 import random
 import time
+from base64 import b64decode, b64encode
 from typing import Callable, Literal
 
 from hyperscale.distributed_rewrite.server import tcp, udp, task
@@ -60,22 +61,45 @@ from .core.error_handler import ErrorContext
 from .health.local_health_multiplier import LocalHealthMultiplier
 from .health.health_monitor import EventLoopHealthMonitor
 from .health.graceful_degradation import GracefulDegradation, DegradationLevel
+from .health.peer_health_awareness import PeerHealthAwareness, PeerHealthAwarenessConfig
 
 # Failure detection
-from .detection.incarnation_tracker import IncarnationTracker
+from .detection.incarnation_tracker import IncarnationTracker, MessageFreshness
 from .detection.suspicion_state import SuspicionState
-from .detection.suspicion_manager import SuspicionManager
+# SuspicionManager replaced by HierarchicalFailureDetector (AD-30)
 from .detection.indirect_probe_manager import IndirectProbeManager
 from .detection.probe_scheduler import ProbeScheduler
+from .detection.hierarchical_failure_detector import (
+    HierarchicalFailureDetector,
+    HierarchicalConfig,
+    NodeStatus,
+    FailureSource,
+)
 
 # Gossip
 from .gossip.gossip_buffer import GossipBuffer, MAX_UDP_PAYLOAD
+from .gossip.health_gossip_buffer import HealthGossipBuffer, HealthGossipBufferConfig
 
 # Leadership
 from .leadership.local_leader_election import LocalLeaderElection
 
 # State embedding (Serf-style)
 from .core.state_embedder import StateEmbedder, NullStateEmbedder
+
+# Message handling (handler-based architecture)
+from .message_handling import (
+    MessageDispatcher,
+    ServerAdapter,
+    register_default_handlers,
+)
+
+# Protocol version for SWIM (AD-25)
+# Used to detect incompatible nodes during join
+from hyperscale.distributed_rewrite.protocol.version import CURRENT_PROTOCOL_VERSION
+
+# SWIM protocol version prefix (included in join messages)
+# Format: "v{major}.{minor}" - allows detection of incompatible nodes
+SWIM_VERSION_PREFIX = f"v{CURRENT_PROTOCOL_VERSION.major}.{CURRENT_PROTOCOL_VERSION.minor}".encode()
 
 
 class HealthAwareServer(MercurySyncBaseServer[Ctx]):
@@ -97,8 +121,8 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
     """
 
     def __init__(
-        self, 
-        *args, 
+        self,
+        *args,
         dc_id: str = "default",
         priority: int = 50,
         # State embedding (Serf-style heartbeat in SWIM messages)
@@ -110,6 +134,9 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         rate_limit_cache_size: int = 500,  # Track at most 500 senders
         rate_limit_tokens: int = 100,      # Max tokens per sender
         rate_limit_refill: float = 10.0,   # Tokens per second
+        # Refutation rate limiting - prevents incarnation exhaustion attacks
+        refutation_rate_limit_tokens: int = 5,  # Max refutations per window
+        refutation_rate_limit_window: float = 10.0,  # Window duration in seconds
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -123,12 +150,39 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         # Initialize SWIM components
         self._local_health = LocalHealthMultiplier()
         self._incarnation_tracker = IncarnationTracker()
-        self._suspicion_manager = SuspicionManager()
         self._indirect_probe_manager = IndirectProbeManager()
+
+        # Direct probe ACK tracking - key is target addr, value is Future set when ACK received
+        self._pending_probe_acks: dict[tuple[str, int], asyncio.Future[bool]] = {}
+
         self._gossip_buffer = GossipBuffer()
         self._gossip_buffer.set_overflow_callback(self._on_gossip_overflow)
         self._probe_scheduler = ProbeScheduler()
-        
+
+        # Health gossip buffer for O(log n) health state dissemination (Phase 6.1)
+        self._health_gossip_buffer = HealthGossipBuffer(
+            config=HealthGossipBufferConfig(),
+        )
+
+        # Peer health awareness for adapting to peer load (Phase 6.2)
+        self._peer_health_awareness = PeerHealthAwareness(
+            config=PeerHealthAwarenessConfig(),
+        )
+        # Connect health gossip to peer awareness
+        self._health_gossip_buffer.set_health_update_callback(
+            self._peer_health_awareness.on_health_update
+        )
+
+        # Hierarchical failure detector for multi-layer detection (AD-30)
+        # - Global layer: Machine-level liveness (via timing wheel)
+        # - Job layer: Per-job responsiveness (via adaptive polling)
+        # Uses polling instead of cancel/reschedule to avoid timer starvation
+        self._hierarchical_detector = HierarchicalFailureDetector(
+            on_global_death=self._on_suspicion_expired,
+            get_n_members=self._get_member_count,
+            get_lhm_multiplier=self._get_lhm_multiplier,
+        )
+
         # Initialize leader election with configurable parameters from Env
         from hyperscale.distributed_rewrite.swim.leadership.leader_state import LeaderState
         from hyperscale.distributed_rewrite.swim.leadership.leader_eligibility import LeaderEligibility
@@ -165,6 +219,13 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         self._rate_limit_tokens: int = rate_limit_tokens
         self._rate_limit_refill: float = rate_limit_refill
         self._rate_limit_stats = {'accepted': 0, 'rejected': 0}
+
+        # Refutation rate limiting - prevent incarnation exhaustion attacks
+        # Configurable via init params or Env settings
+        self._refutation_rate_limit_tokens: int = refutation_rate_limit_tokens
+        self._refutation_rate_limit_window: float = refutation_rate_limit_window
+        self._last_refutation_time: float = 0.0
+        self._refutation_count_in_window: int = 0
         
         # Initialize error handler (logger set up after server starts)
         self._error_handler: ErrorHandler | None = None
@@ -195,14 +256,25 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         # Called when a node's status changes (e.g., becomes DEAD or rejoins)
         self._on_node_dead_callbacks: list[Callable[[tuple[str, int]], None]] = []
         self._on_node_join_callbacks: list[Callable[[tuple[str, int]], None]] = []
-        
-        # Set up suspicion manager callbacks
-        self._suspicion_manager.set_callbacks(
-            on_expired=self._on_suspicion_expired,
-            get_n_members=self._get_member_count,
-            get_lhm_multiplier=self._get_lhm_multiplier,
-        )
-    
+
+        # Peer confirmation tracking (AD-29: Protocol-Level Peer Confirmation)
+        # Failure detection only applies to peers we've successfully communicated with.
+        # This prevents false positives during cluster initialization.
+        self._confirmed_peers: set[tuple[str, int]] = set()  # Successfully reached at least once
+        self._unconfirmed_peers: set[tuple[str, int]] = set()  # Known but not yet reached
+        self._unconfirmed_peer_added_at: dict[tuple[str, int], float] = {}  # For stale detection
+        self._peer_confirmation_callbacks: list[Callable[[tuple[str, int]], None]] = []
+
+        # Hierarchical detector callbacks already set in __init__
+        # Debug: track port for logging
+        self._hierarchical_detector._node_port = self._udp_port
+
+        # Message dispatcher for handler-based message processing
+        # ServerAdapter wraps this server to implement ServerInterface protocol
+        self._server_adapter = ServerAdapter(self)
+        self._message_dispatcher = MessageDispatcher(self._server_adapter)
+        register_default_handlers(self._message_dispatcher, self._server_adapter)
+
     @property
     def node_id(self) -> NodeId:
         """Get this server's unique node identifier."""
@@ -270,14 +342,245 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
     ) -> None:
         """
         Register a callback to be invoked when a node joins or rejoins the cluster.
-        
+
         Use this to handle worker/peer recovery without overriding methods.
-        
+
         Args:
             callback: Function receiving the joining node's address.
         """
         self._on_node_join_callbacks.append(callback)
-    
+
+    def register_on_peer_confirmed(
+        self,
+        callback: Callable[[tuple[str, int]], None],
+    ) -> None:
+        """
+        Register a callback to be invoked when a peer is confirmed.
+
+        Confirmation occurs on the first successful communication with a peer.
+        Use this to add peers to active tracking only after confirmation.
+
+        Args:
+            callback: Function receiving the confirmed peer's address.
+        """
+        self._peer_confirmation_callbacks.append(callback)
+
+    # =========================================================================
+    # Peer Confirmation (AD-29)
+    # =========================================================================
+
+    def add_unconfirmed_peer(self, peer: tuple[str, int]) -> None:
+        """
+        Add a peer from configuration as unconfirmed.
+
+        Unconfirmed peers are probed but failure detection does NOT apply
+        until we successfully communicate with them at least once.
+
+        Args:
+            peer: The UDP address of the peer to track.
+        """
+        if peer == self._get_self_udp_addr():
+            return  # Don't track self
+
+        if peer in self._confirmed_peers:
+            return  # Already confirmed, no action needed
+
+        if peer not in self._unconfirmed_peers:
+            self._unconfirmed_peers.add(peer)
+            self._unconfirmed_peer_added_at[peer] = time.monotonic()
+
+    def confirm_peer(self, peer: tuple[str, int]) -> bool:
+        """
+        Mark a peer as confirmed after successful communication.
+
+        This transitions the peer from unconfirmed to confirmed state,
+        enabling failure detection for this peer.
+
+        Args:
+            peer: The UDP address of the peer to confirm.
+
+        Returns:
+            True if peer was newly confirmed, False if already confirmed.
+        """
+        if peer == self._get_self_udp_addr():
+            return False  # Don't confirm self
+
+        if peer in self._confirmed_peers:
+            return False  # Already confirmed
+
+        # Transition from unconfirmed to confirmed
+        was_unconfirmed = peer in self._unconfirmed_peers
+        self._unconfirmed_peers.discard(peer)
+        self._unconfirmed_peer_added_at.pop(peer, None)
+        self._confirmed_peers.add(peer)
+
+        # Invoke confirmation callbacks
+        for callback in self._peer_confirmation_callbacks:
+            try:
+                callback(peer)
+            except Exception as e:
+                self._task_runner.run(
+                    self.handle_exception, e, "on_peer_confirmed_callback"
+                )
+
+        return True
+
+    def is_peer_confirmed(self, peer: tuple[str, int]) -> bool:
+        """Check if a peer has been confirmed."""
+        return peer in self._confirmed_peers
+
+    def is_peer_unconfirmed(self, peer: tuple[str, int]) -> bool:
+        """Check if a peer is known but unconfirmed."""
+        return peer in self._unconfirmed_peers
+
+    def get_confirmed_peers(self) -> set[tuple[str, int]]:
+        """Get the set of confirmed peers."""
+        return self._confirmed_peers.copy()
+
+    def get_unconfirmed_peers(self) -> set[tuple[str, int]]:
+        """Get the set of unconfirmed peers."""
+        return self._unconfirmed_peers.copy()
+
+    def remove_peer_tracking(self, peer: tuple[str, int]) -> None:
+        """
+        Remove a peer from all confirmation tracking.
+
+        Use when a peer is intentionally removed from the cluster.
+        """
+        self._confirmed_peers.discard(peer)
+        self._unconfirmed_peers.discard(peer)
+        self._unconfirmed_peer_added_at.pop(peer, None)
+
+    # =========================================================================
+    # Hierarchical Failure Detection
+    # =========================================================================
+
+    def init_hierarchical_detector(
+        self,
+        config: HierarchicalConfig | None = None,
+        on_global_death: Callable[[tuple[str, int], int], None] | None = None,
+        on_job_death: Callable[[str, tuple[str, int], int], None] | None = None,
+        get_job_n_members: Callable[[str], int] | None = None,
+    ) -> HierarchicalFailureDetector:
+        """
+        Initialize the hierarchical failure detector for multi-layer detection.
+
+        This is optional - subclasses that need job-layer detection should call
+        this during their initialization.
+
+        Args:
+            config: Configuration for hierarchical detection.
+            on_global_death: Callback when node is declared dead at global level.
+            on_job_death: Callback when node is declared dead for specific job.
+            get_job_n_members: Callback to get member count for a job.
+
+        Returns:
+            The initialized HierarchicalFailureDetector.
+        """
+        self._hierarchical_detector = HierarchicalFailureDetector(
+            config=config,
+            on_global_death=on_global_death,
+            on_job_death=on_job_death,
+            get_n_members=self._get_member_count,
+            get_job_n_members=get_job_n_members,
+            get_lhm_multiplier=self._get_lhm_multiplier,
+        )
+        return self._hierarchical_detector
+
+    async def start_hierarchical_detector(self) -> None:
+        """Start the hierarchical failure detector if initialized."""
+        if self._hierarchical_detector:
+            await self._hierarchical_detector.start()
+
+    async def stop_hierarchical_detector(self) -> None:
+        """Stop the hierarchical failure detector if running."""
+        if self._hierarchical_detector:
+            await self._hierarchical_detector.stop()
+
+    def get_hierarchical_detector(self) -> HierarchicalFailureDetector | None:
+        """Get the hierarchical failure detector if initialized."""
+        return self._hierarchical_detector
+
+    async def suspect_node_global(
+        self,
+        node: tuple[str, int],
+        incarnation: int,
+        from_node: tuple[str, int],
+    ) -> bool:
+        """
+        Start or update a global (machine-level) suspicion.
+
+        Convenience method that delegates to the hierarchical detector.
+
+        Returns False if detector not initialized.
+        """
+        if not self._hierarchical_detector:
+            return False
+        return await self._hierarchical_detector.suspect_global(node, incarnation, from_node)
+
+    async def suspect_node_for_job(
+        self,
+        job_id: str,
+        node: tuple[str, int],
+        incarnation: int,
+        from_node: tuple[str, int],
+    ) -> bool:
+        """
+        Start or update a job-specific suspicion.
+
+        Convenience method that delegates to the hierarchical detector.
+
+        Returns False if detector not initialized.
+        """
+        if not self._hierarchical_detector:
+            return False
+        return await self._hierarchical_detector.suspect_job(
+            job_id, node, incarnation, from_node
+        )
+
+    async def is_node_alive_global(self, node: tuple[str, int]) -> bool:
+        """
+        Check if a node is alive at the global (machine) level.
+
+        Returns True if detector not initialized (fail-open).
+        """
+        if not self._hierarchical_detector:
+            return True
+        return await self._hierarchical_detector.is_alive_global(node)
+
+    def is_node_alive_for_job(self, job_id: str, node: tuple[str, int]) -> bool:
+        """
+        Check if a node is alive for a specific job.
+
+        Returns True if detector not initialized (fail-open).
+        """
+        if not self._hierarchical_detector:
+            return True
+        return self._hierarchical_detector.is_alive_for_job(job_id, node)
+
+    async def clear_job_suspicions(self, job_id: str) -> int:
+        """
+        Clear all suspicions for a completed job.
+
+        Returns 0 if detector not initialized.
+        """
+        if not self._hierarchical_detector:
+            return 0
+        return await self._hierarchical_detector.clear_job(job_id)
+
+    async def get_node_hierarchical_status(
+        self,
+        node: tuple[str, int],
+    ) -> NodeStatus | None:
+        """
+        Get comprehensive status of a node.
+
+        Returns None if detector not initialized.
+        """
+        if not self._hierarchical_detector:
+            return None
+        return await self._hierarchical_detector.get_node_status(node)
+
     def _get_lhm_multiplier(self) -> float:
         """Get the current LHM timeout multiplier."""
         return self._local_health.get_multiplier()
@@ -339,8 +642,8 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
     
     def _setup_task_runner_integration(self) -> None:
         """Integrate TaskRunner with SWIM components."""
-        # Pass task runner to suspicion manager for timer management
-        self._suspicion_manager.set_task_runner(self._task_runner)
+        # Hierarchical detector manages its own tasks via asyncio
+        pass
     
     def _setup_health_monitor(self) -> None:
         """Set up event loop health monitor with LHM integration."""
@@ -358,7 +661,8 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
     
     async def _on_event_loop_critical(self, lag_ratio: float) -> None:
         """Called when event loop is critically overloaded."""
-        # More aggressive LHM increment
+        # More aggressive LHM increment: +2 total for critical (vs +1 for lag)
+        # This helps the node back off faster when severely overloaded
         await self.increase_failure_detector('event_loop_critical')
         await self.increase_failure_detector('event_loop_critical')
         
@@ -410,7 +714,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         policy = self._degradation.get_current_policy()
         
         # Log TaskOverloadError for severe/critical degradation
-        if new_level.value >= DegradationLevel.SEVERE.value and new_level.value > old_level.value:
+        if new_level.value >= DegradationLevel.CRITICAL.value and new_level.value > old_level.value:
             self._task_runner.run(
                 self.handle_error,
                 TaskOverloadError(
@@ -478,8 +782,11 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
     # State embedding is handled via composition (StateEmbedder protocol).
     # Node types (Worker, Manager, Gate) inject their own embedder implementation.
     
-    # Separator for embedded state in messages
-    _STATE_SEPARATOR = b'#'
+    # Piggyback separators - all use consistent #|x pattern
+    # This avoids conflicts since we search for the full 3-byte marker
+    _STATE_SEPARATOR = b'#|s'      # State piggyback: #|sbase64...
+    _MEMBERSHIP_SEPARATOR = b'#|m'  # Membership piggyback: #|mtype:inc:host:port...
+    _HEALTH_SEPARATOR = b'#|h'      # Health piggyback: #|hentry1;entry2...
     
     def set_state_embedder(self, embedder: StateEmbedder) -> None:
         """
@@ -512,10 +819,10 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
     ) -> None:
         """
         Process embedded state received from another node.
-        
+
         Delegates to the injected StateEmbedder to handle heartbeat data
         from incoming SWIM messages.
-        
+
         Args:
             state_data: Serialized state bytes from the remote node.
             source_addr: The (host, port) of the node that sent the state.
@@ -567,32 +874,46 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
     
     def _build_ack_with_state(self) -> bytes:
         """
-        Build an ack response with embedded state.
-        
-        Format: ack>host:port#base64_state (if state available)
+        Build an ack response with embedded state (using self address).
+
+        Format: ack>host:port#|sbase64_state (if state available)
                 ack>host:port (if no state)
-        
+
         Returns:
             Ack message bytes with optional embedded state.
         """
-        import base64
-        
-        base_ack = b'ack>' + self._udp_addr_slug
-        
+        return self._build_ack_with_state_for_addr(self._udp_addr_slug)
+
+    def _build_ack_with_state_for_addr(self, addr_slug: bytes) -> bytes:
+        """
+        Build an ack response with embedded state for a specific address.
+
+        Format: ack>host:port#|sbase64_state#|mtype:inc:host:port#|hentry1;entry2
+
+        All piggyback uses consistent #|x pattern:
+        1. Serf-style embedded state (heartbeat) after #|s
+        2. Membership gossip piggyback after #|m
+        3. Health gossip piggyback after #|h
+
+        Args:
+            addr_slug: The address slug to include in the ack (e.g., b'127.0.0.1:9000')
+
+        Returns:
+            Ack message bytes with embedded state and gossip piggyback.
+        """
+        base_ack = b'ack>' + addr_slug
+
+        # Add Serf-style embedded state (heartbeat)
         state = self._get_embedded_state()
-        if state is None:
-            return base_ack
-        
-        # Encode state as base64 to avoid byte issues
-        encoded_state = base64.b64encode(state)
-        
-        # Check if adding state would exceed MTU
-        full_message = base_ack + self._STATE_SEPARATOR + encoded_state
-        if len(full_message) > MAX_UDP_PAYLOAD:
-            # State too large, skip it
-            return base_ack
-        
-        return full_message
+        if state is not None:
+            encoded_state = b64encode(state)
+            ack_with_state = base_ack + self._STATE_SEPARATOR + encoded_state
+            # Check if state fits
+            if len(ack_with_state) <= MAX_UDP_PAYLOAD:
+                base_ack = ack_with_state
+
+        # Add gossip piggyback (membership + health) - Phase 6.1 compliant
+        return self._add_piggyback_safe(base_ack)
     
     def _extract_embedded_state(
         self,
@@ -601,62 +922,124 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
     ) -> bytes:
         """
         Extract and process embedded state from an incoming message.
-        
+
         Separates the message content from any embedded state, processes
         the state if present, and returns the clean message.
-        
+
+        Wire format: msg_type>host:port#|sbase64_state#|mtype:inc:host:port#|hentry1;entry2
+
+        All piggyback uses consistent #|x pattern - parsing is unambiguous:
+        1. Strip health gossip (#|h...) - added last, strip first
+        2. Strip membership piggyback (#|m...) - added second, strip second
+        3. Extract state (#|s...) - part of base message
+
         Args:
-            message: Raw message that may contain embedded state.
+            message: Raw message that may contain embedded state and piggyback.
             source_addr: The (host, port) of the sender.
-        
+
         Returns:
-            The message with embedded state removed.
+            The message with embedded state and piggyback removed.
         """
-        import base64
-        
-        # Find state separator in the address portion
-        # Format: msg_type>host:port#base64_state
-        sep_idx = message.rfind(self._STATE_SEPARATOR)
-        if sep_idx < 0:
-            return message
-        
-        # Check if separator is after the '>' (in address portion)
-        addr_sep_idx = message.find(b'>')
-        if addr_sep_idx < 0 or sep_idx < addr_sep_idx:
-            # Separator is in message type, not state
-            return message
-        
+        # Track boundaries to avoid repeated slicing until the end
+        # msg_end marks where the core message ends (before any piggyback)
+        msg_end = len(message)
+        health_piggyback: bytes | None = None
+        membership_piggyback: bytes | None = None
+
+        # Step 1: Find health gossip piggyback (#|h...)
+        # Health is always appended last, so strip first
+        health_idx = message.find(self._HEALTH_SEPARATOR)
+        if health_idx > 0:
+            health_piggyback = message[health_idx:]
+            msg_end = health_idx
+
+        # Step 2: Find membership piggyback (#|m...) in the remaining portion
+        membership_idx = message.find(self._MEMBERSHIP_SEPARATOR, 0, msg_end)
+        if membership_idx > 0:
+            membership_piggyback = message[membership_idx:msg_end]
+            msg_end = membership_idx
+
+        # Step 3: Find message structure in core message only
+        # Format: msg_type>host:port#|sbase64_state
+        addr_sep_idx = message.find(b'>', 0, msg_end)
+        if addr_sep_idx < 0:
+            # No address separator - process piggyback and return
+            if health_piggyback:
+                self._health_gossip_buffer.decode_and_process_piggyback(health_piggyback)
+            if membership_piggyback:
+                self._task_runner.run(self.process_piggyback_data, membership_piggyback)
+            return message[:msg_end] if msg_end < len(message) else message
+
+        # Find state separator after '>' but before piggyback
+        state_sep_idx = message.find(self._STATE_SEPARATOR, addr_sep_idx, msg_end)
+
+        # Process piggyback data (can happen in parallel with state processing)
+        if health_piggyback:
+            self._health_gossip_buffer.decode_and_process_piggyback(health_piggyback)
+        if membership_piggyback:
+            self._task_runner.run(self.process_piggyback_data, membership_piggyback)
+
+        # No state separator - return clean message
+        if state_sep_idx < 0:
+            return message[:msg_end] if msg_end < len(message) else message
+
         # Extract and decode state
-        clean_message = message[:sep_idx]
-        encoded_state = message[sep_idx + 1:]
-        
+        # Slice once: encoded_state is between state_sep and msg_end
+        # Skip 3 bytes for '#|s' separator
+        encoded_state = message[state_sep_idx + 3:msg_end]
+
         try:
-            state_data = base64.b64decode(encoded_state)
+            state_data = b64decode(encoded_state)
             self._process_embedded_state(state_data, source_addr)
         except Exception:
             # Invalid base64 or processing error - ignore silently
             pass
-        
-        return clean_message
+
+        # Return message up to state separator (excludes state and all piggyback)
+        return message[:state_sep_idx]
     
     # === Message Size Helpers ===
     
     def _add_piggyback_safe(self, base_message: bytes) -> bytes:
         """
         Add piggybacked gossip updates to a message, respecting MTU limits.
-        
+
+        This adds both membership gossip and health gossip (Phase 6.1) to
+        outgoing messages for O(log n) dissemination of both membership
+        and health state.
+
         Args:
             base_message: The core message to send.
-        
+
         Returns:
             Message with piggybacked updates that fits within UDP MTU.
         """
         if len(base_message) >= MAX_UDP_PAYLOAD:
             # Base message already at limit, can't add piggyback
             return base_message
-        
-        piggyback = self._gossip_buffer.encode_piggyback_with_base(base_message)
-        return base_message + piggyback
+
+        # Add membership gossip (format: #|mtype:incarnation:host:port...)
+        membership_piggyback = self._gossip_buffer.encode_piggyback_with_base(base_message)
+        message_with_membership = base_message + membership_piggyback
+
+        # Calculate remaining space for health gossip
+        remaining = MAX_UDP_PAYLOAD - len(message_with_membership)
+        if remaining < 50:
+            # Not enough room for health piggyback
+            return message_with_membership
+
+        # Update local health state in the buffer before encoding
+        health_piggyback = self._state_embedder.get_health_piggyback()
+        if health_piggyback:
+            self._health_gossip_buffer.update_local_health(health_piggyback)
+
+        # Add health gossip (format: #|hentry1;entry2;...)
+        health_gossip = self._health_gossip_buffer.encode_piggyback(
+            max_count=5,
+            max_size=remaining,
+        )
+
+        return message_with_membership + health_gossip
     
     def _check_message_size(self, message: bytes) -> bool:
         """
@@ -701,9 +1084,9 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         async with ErrorContext(self._error_handler, "incarnation_cleanup"):
             stats['incarnation'] = await self._incarnation_tracker.cleanup()
         
-        # Cleanup suspicion manager (orphaned suspicions)
+        # Cleanup hierarchical detector (reconciliation)
         async with ErrorContext(self._error_handler, "suspicion_cleanup"):
-            stats['suspicion'] = await self._suspicion_manager.cleanup()
+            stats['suspicion'] = await self._hierarchical_detector.get_stats()
         
         # Cleanup indirect probe manager
         async with ErrorContext(self._error_handler, "indirect_probe_cleanup"):
@@ -729,7 +1112,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         """Get cleanup statistics from all components."""
         return {
             'incarnation': self._incarnation_tracker.get_stats(),
-            'suspicion': self._suspicion_manager.get_stats(),
+            'suspicion': self._hierarchical_detector.get_stats_sync(),
             'indirect_probe': self._indirect_probe_manager.get_stats(),
             'gossip': self._gossip_buffer.get_stats(),
         }
@@ -791,9 +1174,8 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         self_addr = self._get_self_udp_addr()
         base_timeout = self._context.read('current_timeout')
         timeout = self.get_lhm_adjusted_timeout(base_timeout)
-        
-        # Use list() to snapshot keys before iteration to prevent
-        # "dictionary changed size during iteration" errors
+
+        # Snapshot nodes to avoid dict mutation during iteration
         for node in list(nodes.keys()):
             if node != self_addr:
                 # Use task runner but schedule error-aware send
@@ -959,6 +1341,8 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
     
     def _on_suspicion_expired(self, node: tuple[str, int], incarnation: int) -> None:
         """Callback when a suspicion expires - mark node as DEAD."""
+        # DEBUG: Track when nodes are marked DEAD
+
         self._metrics.increment('suspicions_expired')
         self._audit_log.record(
             AuditEventType.NODE_CONFIRMED_DEAD,
@@ -966,9 +1350,9 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             incarnation=incarnation,
         )
         self._incarnation_tracker.update_node(
-            node, 
-            b'DEAD', 
-            incarnation, 
+            node,
+            b'DEAD',
+            incarnation,
             time.monotonic(),
         )
         # Queue the death notification for gossip
@@ -976,7 +1360,10 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         nodes: Nodes = self._context.read('nodes')
         if node in nodes:
             self._safe_queue_put_sync(nodes[node], (int(time.monotonic()), b'DEAD'), node)
-        
+
+        # Update probe scheduler to stop probing this dead node
+        self.update_probe_scheduler_membership()
+
         # Invoke registered callbacks (composition pattern)
         for callback in self._on_node_dead_callbacks:
             try:
@@ -1068,21 +1455,25 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         for update in updates:
             status_map = {
                 'alive': b'OK',
-                'join': b'OK', 
+                'join': b'OK',
                 'suspect': b'SUSPECT',
                 'dead': b'DEAD',
                 'leave': b'DEAD',
             }
             status = status_map.get(update.update_type, b'OK')
-            
+
             if self.is_message_fresh(update.node, update.incarnation, status):
-                self.update_node_state(
+                # Check previous state BEFORE updating (for callback invocation)
+                previous_state = self._incarnation_tracker.get_node_state(update.node)
+                was_dead = previous_state and previous_state.status == b'DEAD'
+
+                updated = self.update_node_state(
                     update.node,
                     status,
                     update.incarnation,
                     update.timestamp,
                 )
-                
+
                 if update.update_type == 'suspect':
                     self_addr = self._get_self_udp_addr()
                     if update.node != self_addr:
@@ -1093,7 +1484,33 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                         )
                 elif update.update_type == 'alive':
                     await self.refute_suspicion(update.node, update.incarnation)
-                
+
+                # Gossip-informed dead callback: if gossip tells us a node is dead
+                # and we didn't already know, invoke the callbacks so application
+                # layer can respond (e.g., update _active_gate_peers, trigger job
+                # leadership election). This is symmetric with recovery detection
+                # that's already in update_node_state for DEAD->OK transitions.
+                if updated and update.update_type in ('dead', 'leave') and not was_dead:
+                    self._metrics.increment('gossip_informed_deaths')
+                    self._audit_log.record(
+                        AuditEventType.NODE_CONFIRMED_DEAD,
+                        node=update.node,
+                        incarnation=update.incarnation,
+                        source='gossip',
+                    )
+
+                    # Update probe scheduler to stop probing this dead node
+                    self._probe_scheduler.remove_member(update.node)
+
+                    # Invoke registered callbacks (same pattern as _on_suspicion_expired)
+                    for callback in self._on_node_dead_callbacks:
+                        try:
+                            callback(update.node)
+                        except Exception as callback_error:
+                            self._task_runner.run(
+                                self.handle_exception, callback_error, "on_node_dead_callback (gossip)"
+                            )
+
                 self.queue_gossip_update(
                     update.update_type,
                     update.node,
@@ -1106,7 +1523,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         # Use list() to snapshot keys before iteration to prevent
         # "dictionary changed size during iteration" errors
         return [
-            (host, port) for host, port in list(nodes.keys())
+            (host, port) for host, port in list(nodes.keys()) 
             if target_host != host and target_port != port
         ]
     
@@ -1204,9 +1621,9 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         except asyncio.QueueEmpty:
             return False
         
-        if include_piggyback:
-            message = message + self.get_piggyback_data()
-        
+        # Note: Piggyback is added centrally in send() hook via _add_piggyback_safe()
+        # The include_piggyback parameter is kept for backwards compatibility but ignored
+
         # Track the send and log failures
         try:
             await self._send_with_retry(node, message, timeout)
@@ -1243,7 +1660,9 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             True if join succeeded, False if all retries exhausted
         """
         self_addr = self._get_self_udp_addr()
-        join_msg = b'join>' + f'{self_addr[0]}:{self_addr[1]}'.encode()
+        # Format: join>v{major}.{minor}|{host}:{port}
+        # Version prefix enables detecting incompatible nodes during join (AD-25)
+        join_msg = b'join>' + SWIM_VERSION_PREFIX + b'|' + f'{self_addr[0]}:{self_addr[1]}'.encode()
         
         async def attempt_join() -> bool:
             await self.send(seed_node, join_msg, timeout=timeout)
@@ -1279,20 +1698,22 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         # Ensure error handler is set up first
         if self._error_handler is None:
             self._setup_error_handler()
-        
+
         # Integrate task runner with SWIM components
         self._setup_task_runner_integration()
-        
+
+        # Start hierarchical failure detector (AD-30)
+        await self._hierarchical_detector.start()
+
         # Start health monitor for proactive CPU detection
         await self.start_health_monitor()
-        
+
         # Start cleanup task
         await self.start_cleanup()
         
         self._probe_scheduler._running = True
         nodes: Nodes = self._context.read('nodes')
         self_addr = self._get_self_udp_addr()
-        # Use list() to snapshot keys before iteration
         members = [node for node in list(nodes.keys()) if node != self_addr]
         self._probe_scheduler.update_members(members)
 
@@ -1310,83 +1731,126 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
     
     async def _run_probe_round(self) -> None:
         """Execute a single probe round in the SWIM protocol."""
+        # Exit early if we're shutting down - don't attempt probes during shutdown
+        if not self._running or not self._probe_scheduler._running:
+            return
+
         # Check circuit breaker - if too many network errors, back off
         if self._error_handler and self._error_handler.is_circuit_open(ErrorCategory.NETWORK):
             # Network circuit is open - skip this round to let things recover
             await asyncio.sleep(1.0)  # Brief pause before next attempt
             return
-        
+
         target = self._probe_scheduler.get_next_target()
         if target is None:
             return
-        
+
         if self.udp_target_is_self(target):
             return
-        
+
         # Use ErrorContext for consistent error handling throughout the probe
         async with ErrorContext(self._error_handler, f"probe_round_{target[0]}_{target[1]}") as ctx:
             node_state = self._incarnation_tracker.get_node_state(target)
             incarnation = node_state.incarnation if node_state else 0
-            
+
             base_timeout = self._context.read('current_timeout')
             timeout = self.get_lhm_adjusted_timeout(base_timeout)
-            
+
             target_addr = f'{target[0]}:{target[1]}'.encode()
-            probe_msg = b'probe>' + target_addr + self.get_piggyback_data()
-            
+            # Note: Piggyback is added centrally in send() hook via _add_piggyback_safe()
+            probe_msg = b'probe>' + target_addr
+
             response_received = await self._probe_with_timeout(target, probe_msg, timeout)
-            
+
+            # Exit early if shutting down
+            if not self._running:
+                return
+
             if response_received:
                 await self.decrease_failure_detector('successful_probe')
                 ctx.record_success(ErrorCategory.NETWORK)  # Help circuit breaker recover
                 return
-            
+
             await self.increase_failure_detector('probe_timeout')
             indirect_sent = await self.initiate_indirect_probe(target, incarnation)
-            
+
+            # Exit early if shutting down
+            if not self._running:
+                return
+
             if indirect_sent:
                 await asyncio.sleep(timeout)
+
+                # Exit early if shutting down
+                if not self._running:
+                    return
+
                 probe = self._indirect_probe_manager.get_pending_probe(target)
                 if probe and probe.is_completed():
                     await self.decrease_failure_detector('successful_probe')
                     ctx.record_success(ErrorCategory.NETWORK)
                     return
-            
+
+            # Don't start suspicions during shutdown
+            if not self._running:
+                return
+
             self_addr = self._get_self_udp_addr()
             await self.start_suspicion(target, incarnation, self_addr)
             await self.broadcast_suspicion(target, incarnation)
     
     async def _probe_with_timeout(
-        self, 
-        target: tuple[str, int], 
+        self,
+        target: tuple[str, int],
         message: bytes,
         timeout: float,
     ) -> bool:
         """
         Send a probe message with retries before falling back to indirect.
-        
+
         Uses PROBE_RETRY_POLICY for retry logic with exponential backoff.
-        Returns True if probe succeeded, False if all retries exhausted.
+        Returns True if probe succeeded (ACK received), False if all retries exhausted.
+
+        Uses Future-based ACK tracking: we wait for the actual ACK message to arrive,
+        not just checking cached node state which could be stale.
         """
         self._metrics.increment('probes_sent')
         attempt = 0
         max_attempts = PROBE_RETRY_POLICY.max_attempts + 1
-        
+
         while attempt < max_attempts:
+            # Exit early if shutting down
+            if not self._running:
+                return False
+
             try:
+                # Create a Future to wait for ACK from this specific probe
+                # Cancel any existing pending probe to the same target (stale)
+                existing_future = self._pending_probe_acks.pop(target, None)
+                if existing_future and not existing_future.done():
+                    existing_future.cancel()
+
+                ack_future: asyncio.Future[bool] = asyncio.get_event_loop().create_future()
+                self._pending_probe_acks[target] = ack_future
+
                 # Send probe
                 await self.send(target, message, timeout=timeout)
-                
-                # Wait for potential response (reduced time for retries)
+
+                # Wait for ACK with timeout (reduced time for retries)
                 wait_time = timeout * 0.5 if attempt < max_attempts - 1 else timeout * 0.8
-                await asyncio.sleep(wait_time)
-                
-                # Check if we got an ack (tracked via incarnation/node state)
-                node_state = self._incarnation_tracker.get_node_state(target)
-                if node_state and node_state.status == b'OK':
-                    self._metrics.increment('probes_received')  # Got response
+
+                try:
+                    await asyncio.wait_for(ack_future, timeout=wait_time)
+                    # Future completed means ACK was received
+                    self._metrics.increment('probes_received')
                     return True
-                
+                except asyncio.TimeoutError:
+                    # No ACK received within timeout, try again
+                    pass
+                finally:
+                    # Clean up the pending probe entry
+                    self._pending_probe_acks.pop(target, None)
+
                 attempt += 1
                 if attempt < max_attempts:
                     # Exponential backoff with jitter before retry
@@ -1395,24 +1859,25 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                     )
                     jitter = random.uniform(0, PROBE_RETRY_POLICY.jitter * backoff)
                     await asyncio.sleep(backoff + jitter)
-                    
-            except asyncio.TimeoutError:
-                attempt += 1
-                if attempt >= max_attempts:
-                    self._metrics.increment('probes_timeout')
-                    await self.handle_error(ProbeTimeoutError(target, timeout))
-                    return False
+
+            except asyncio.CancelledError:
+                # Clean up on cancellation
+                self._pending_probe_acks.pop(target, None)
+                raise
             except OSError as e:
                 # Network error - wrap with appropriate error type
+                self._pending_probe_acks.pop(target, None)
                 self._metrics.increment('probes_failed')
                 await self.handle_error(self._make_network_error(e, target, "Probe"))
                 return False
             except Exception as e:
+                self._pending_probe_acks.pop(target, None)
                 self._metrics.increment('probes_failed')
                 await self.handle_exception(e, f"probe_{target[0]}_{target[1]}")
                 return False
-        
-        self._metrics.increment('probes_failed')
+
+        self._metrics.increment('probes_timeout')
+        await self.handle_error(ProbeTimeoutError(target, timeout))
         return False
     
     def stop_probe_cycle(self) -> None:
@@ -1420,11 +1885,18 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         self._probe_scheduler.stop()
     
     def update_probe_scheduler_membership(self) -> None:
-        """Update the probe scheduler with current membership."""
+        """Update the probe scheduler with current membership, excluding DEAD nodes."""
         nodes: Nodes = self._context.read('nodes')
         self_addr = self._get_self_udp_addr()
-        # Use list() to snapshot keys before iteration
-        members = [node for node in list(nodes.keys()) if node != self_addr]
+        members = []
+        for node in list(nodes.keys()):
+            if node == self_addr:
+                continue
+            # Check if node is DEAD via incarnation tracker
+            node_state = self._incarnation_tracker.get_node_state(node)
+            if node_state and node_state.status == b'DEAD':
+                continue
+            members.append(node)
         self._probe_scheduler.update_members(members)
     
     async def start_leader_election(self) -> None:
@@ -1439,12 +1911,8 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         """Stop the leader election process."""
         await self._leader_election.stop()
 
-    async def shutdown(self):
-        await super().shutdown()
-
-        await self.stop()
     
-    async def graceful_shutdown(
+    async def _graceful_shutdown(
         self,
         drain_timeout: float = 5.0,
         broadcast_leave: bool = True,
@@ -1465,7 +1933,11 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         """
         self._running = False
         self_addr = self._get_self_udp_addr()
-        
+
+        # Signal to error handler that we're shutting down - suppress non-fatal errors
+        if self._error_handler:
+            self._error_handler.start_shutdown()
+
         # 1. Step down from leadership if we're the leader
         if self._leader_election.state.is_leader():
             try:
@@ -1482,7 +1954,6 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                 timeout = self.get_lhm_adjusted_timeout(1.0)
                 
                 send_failures = 0
-                # Use list() to snapshot keys before iteration
                 for node in list(nodes.keys()):
                     if node != self_addr:
                         try:
@@ -1513,15 +1984,30 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         # 3. Wait for drain period
         if drain_timeout > 0:
             await asyncio.sleep(drain_timeout)
+
+        
         
         # 4. Stop all background tasks in proper order
-        # Stop leader election first (stops sending heartbeats)
+        # Stop probe cycle first (stops probing other nodes)
+        try:
+            self.stop_probe_cycle()
+        except Exception as e:
+            if self._error_handler:
+                await self.handle_exception(e, "shutdown_stop_probe_cycle")
+
+        # Cancel all pending probe ACK futures
+        for future in self._pending_probe_acks.values():
+            if not future.done():
+                future.cancel()
+        self._pending_probe_acks.clear()
+
+        # Stop leader election (stops sending heartbeats)
         try:
             await self.stop_leader_election()
         except Exception as e:
             if self._error_handler:
                 await self.handle_exception(e, "shutdown_stop_election")
-        
+
         # Stop health monitor
         try:
             await self.stop_health_monitor()
@@ -1535,7 +2021,14 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         except Exception as e:
             if self._error_handler:
                 await self.handle_exception(e, "shutdown_stop_cleanup")
-        
+
+        # Stop hierarchical failure detector (AD-30)
+        try:
+            await self._hierarchical_detector.stop()
+        except Exception as e:
+            if self._error_handler:
+                await self.handle_exception(e, "shutdown_stop_hierarchical_detector")
+
         # 5. Log final audit event
         self._audit_log.record(
             AuditEventType.NODE_LEFT,
@@ -1543,14 +2036,19 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             reason='graceful_shutdown',
         )
     
-    async def stop(self) -> None:
+    async def stop(
+        self,
+        drain_timeout: float = 5,
+        broadcast_leave: bool = True
+    ) -> None:
         """
         Stop the server. Alias for graceful_shutdown with minimal drain time.
         
         For tests or quick shutdown, use this. For production, prefer
         graceful_shutdown() with appropriate drain_timeout.
         """
-        await self.graceful_shutdown(drain_timeout=0.1, broadcast_leave=False)
+        await self._graceful_shutdown(drain_timeout=drain_timeout, broadcast_leave=broadcast_leave)
+        await super().shutdown()
     
     def get_current_leader(self) -> tuple[str, int] | None:
         """Get the current leader, if known."""
@@ -1590,11 +2088,29 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         else:
             self._local_health.decrement()
     
-    def get_lhm_adjusted_timeout(self, base_timeout: float) -> float:
-        """Get timeout adjusted by Local Health Multiplier and degradation level."""
+    def get_lhm_adjusted_timeout(self, base_timeout: float, target_node_id: str | None = None) -> float:
+        """
+        Get timeout adjusted by Local Health Multiplier, degradation level, and peer health.
+
+        Phase 6.2: When probing a peer that we know is overloaded (via health gossip),
+        we extend the timeout to avoid false failure detection.
+
+        Args:
+            base_timeout: Base probe timeout in seconds
+            target_node_id: Optional node ID of the probe target for peer-aware adjustment
+
+        Returns:
+            Adjusted timeout in seconds
+        """
         lhm_multiplier = self._local_health.get_multiplier()
         degradation_multiplier = self._degradation.get_timeout_multiplier()
-        return base_timeout * lhm_multiplier * degradation_multiplier
+        base_adjusted = base_timeout * lhm_multiplier * degradation_multiplier
+
+        # Apply peer health-aware timeout adjustment (Phase 6.2)
+        if target_node_id:
+            return self._peer_health_awareness.get_probe_timeout(target_node_id, base_adjusted)
+
+        return base_adjusted
     
     def get_self_incarnation(self) -> int:
         """Get this node's current incarnation number."""
@@ -1750,19 +2266,71 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         incarnation: int,
         status: Status,
     ) -> bool:
-        """Check if a message about a node should be processed."""
-        is_fresh = self._incarnation_tracker.is_message_fresh(node, incarnation, status)
-        if not is_fresh:
-            # Log stale message for monitoring (don't await since this is sync)
+        """
+        Check if a message about a node should be processed.
+
+        Uses check_message_freshness to get detailed rejection reason,
+        then handles each case appropriately:
+        - FRESH: Process the message
+        - DUPLICATE: Silent ignore (normal in gossip protocols)
+        - STALE: Log as error (may indicate network issues)
+        - INVALID: Log as error (bug or corruption)
+        - SUSPICIOUS: Log as error (possible attack)
+        """
+        freshness = self._incarnation_tracker.check_message_freshness(node, incarnation, status)
+
+        if freshness == MessageFreshness.FRESH:
+            return True
+
+        # Get current state for logging context
+        current_incarnation = self._incarnation_tracker.get_node_incarnation(node)
+        current_state = self._incarnation_tracker.get_node_state(node)
+        current_status = current_state.status.decode() if current_state else "unknown"
+
+        if freshness == MessageFreshness.DUPLICATE:
+            # Duplicates are completely normal in gossip - debug log only, no error handler
             self._task_runner.run(
-                self.handle_error,
-                StaleMessageError(
-                    node,
-                    incarnation,
-                    self._incarnation_tracker.get_node_incarnation(node),
+                self._udp_logger.log,
+                ServerInfo(
+                    message=f"[DUPLICATE] {node[0]}:{node[1]} incarnation={incarnation} status={status.decode()} "
+                            f"(current: incarnation={current_incarnation} status={current_status})",
+                    node_host=self._host,
+                    node_port=self._udp_port,
+                    node_id=self._node_id.short,
                 ),
             )
-        return is_fresh
+        elif freshness == MessageFreshness.STALE:
+            # Stale messages may indicate delayed network or state drift
+            self._task_runner.run(
+                self.handle_error,
+                StaleMessageError(node, incarnation, current_incarnation),
+            )
+        elif freshness == MessageFreshness.INVALID:
+            # Invalid incarnation - log as protocol error
+            self._task_runner.run(
+                self.handle_error,
+                ProtocolError(
+                    f"Invalid incarnation {incarnation} from {node[0]}:{node[1]}",
+                    severity=ErrorSeverity.DEGRADED,
+                    node=node,
+                    incarnation=incarnation,
+                ),
+            )
+        elif freshness == MessageFreshness.SUSPICIOUS:
+            # Suspicious jump - possible attack or serious bug
+            self._task_runner.run(
+                self.handle_error,
+                ProtocolError(
+                    f"Suspicious incarnation jump to {incarnation} from {node[0]}:{node[1]} "
+                    f"(current: {current_incarnation})",
+                    severity=ErrorSeverity.DEGRADED,
+                    node=node,
+                    incarnation=incarnation,
+                    current_incarnation=current_incarnation,
+                ),
+            )
+
+        return False
     
     def _make_network_error(
         self,
@@ -1927,12 +2495,11 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         - Stale indirect probes interfering with new probes
         - Incarnation confusion from old state
         """
-        # Clear any active suspicion
-        if node in self._suspicion_manager.suspicions:
-            await self._suspicion_manager.refute_suspicion(
-                node,
-                self._incarnation_tracker.get_node_incarnation(node) + 1,
-            )
+        # Clear any active suspicion via hierarchical detector
+        await self._hierarchical_detector.refute_global(
+            node,
+            self._incarnation_tracker.get_node_incarnation(node) + 1,
+        )
         
         # Clear any pending indirect probes
         if self._indirect_probe_manager.get_pending_probe(node):
@@ -1964,8 +2531,43 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         incarnation: int,
         timestamp: float,
     ) -> bool:
-        """Update the state of a node. Returns True if state changed."""
-        return self._incarnation_tracker.update_node(node, status, incarnation, timestamp)
+        """
+        Update the state of a node. Returns True if state changed.
+
+        Also invokes _on_node_join_callbacks when a node transitions from
+        DEAD to OK/ALIVE (recovery detection).
+        """
+        # Get previous state before updating
+        previous_state = self._incarnation_tracker.get_node_state(node)
+        was_dead = previous_state and previous_state.status == b'DEAD'
+        prev_status = previous_state.status if previous_state else b'UNKNOWN'
+
+        # Perform the actual update
+        updated = self._incarnation_tracker.update_node(node, status, incarnation, timestamp)
+
+        # If node was DEAD and is now being set to OK/ALIVE, invoke join callbacks
+        # This handles recovery detection for nodes that come back after being marked dead
+        if updated and was_dead and status in (b'OK', b'ALIVE'):
+            self._metrics.increment('node_recoveries_detected')
+            self._audit_log.record(
+                AuditEventType.NODE_RECOVERED,
+                node=node,
+                incarnation=incarnation,
+            )
+
+            # Add back to probe scheduler
+            self._probe_scheduler.add_member(node)
+
+            # Invoke registered callbacks (composition pattern)
+            for callback in self._on_node_join_callbacks:
+                try:
+                    callback(node)
+                except Exception as e:
+                    self._task_runner.run(
+                        self.handle_exception, e, "on_node_join_callback (recovery)"
+                    )
+
+        return updated
     
     async def start_suspicion(
         self,
@@ -1973,7 +2575,18 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         incarnation: int,
         from_node: tuple[str, int],
     ) -> SuspicionState | None:
-        """Start suspecting a node or add confirmation to existing suspicion."""
+        """
+        Start suspecting a node or add confirmation to existing suspicion.
+
+        Per AD-29: Only confirmed peers can be suspected. If we've never
+        successfully communicated with a peer, we can't meaningfully suspect
+        them - they might just not be up yet during cluster formation.
+        """
+        # AD-29: Guard against suspecting unconfirmed peers
+        if not self.is_peer_confirmed(node):
+            self._metrics.increment('suspicions_skipped_unconfirmed')
+            return None
+
         self._metrics.increment('suspicions_started')
         self._audit_log.record(
             AuditEventType.NODE_SUSPECTED,
@@ -1987,7 +2600,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             incarnation,
             time.monotonic(),
         )
-        return await self._suspicion_manager.start_suspicion(node, incarnation, from_node)
+        return await self._hierarchical_detector.suspect_global(node, incarnation, from_node)
     
     async def confirm_suspicion(
         self,
@@ -1996,7 +2609,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         from_node: tuple[str, int],
     ) -> bool:
         """Add a confirmation to an existing suspicion."""
-        result = await self._suspicion_manager.confirm_suspicion(node, incarnation, from_node)
+        result = await self._hierarchical_detector.confirm_global(node, incarnation, from_node)
         if result:
             self._metrics.increment('suspicions_confirmed')
         return result
@@ -2007,7 +2620,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         incarnation: int,
     ) -> bool:
         """Refute a suspicion - the node proved it's alive."""
-        if await self._suspicion_manager.refute_suspicion(node, incarnation):
+        if await self._hierarchical_detector.refute_global(node, incarnation):
             self._metrics.increment('suspicions_refuted')
             self._audit_log.record(
                 AuditEventType.NODE_REFUTED,
@@ -2025,32 +2638,69 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
     
     def is_node_suspected(self, node: tuple[str, int]) -> bool:
         """Check if a node is currently under suspicion."""
-        return self._suspicion_manager.is_suspected(node)
-    
+        return self._hierarchical_detector.is_suspected_global(node)
+
     def get_suspicion_timeout(self, node: tuple[str, int]) -> float | None:
         """Get the remaining timeout for a suspicion, if any."""
-        state = self._suspicion_manager.get_suspicion(node)
-        return state.time_remaining() if state else None
+        return self._hierarchical_detector.get_time_remaining_global(node)
     
     def get_random_proxy_nodes(
-        self, 
-        target: tuple[str, int], 
+        self,
+        target: tuple[str, int],
         k: int = 3,
     ) -> list[tuple[str, int]]:
-        """Get k random nodes to use as proxies for indirect probing."""
+        """
+        Get k random nodes to use as proxies for indirect probing.
+
+        Phase 6.2: Prefers healthy nodes over stressed/overloaded ones.
+        We avoid using stressed peers as proxies because:
+        1. They may be slow to respond, causing indirect probe timeouts
+        2. We want to reduce load on already-stressed nodes
+        """
         nodes: Nodes = self._context.read('nodes')
         self_addr = self._get_self_udp_addr()
-        
-        # Use list() to snapshot items before iteration
-        candidates = [
+
+        # Snapshot nodes.items() to avoid dict mutation during iteration
+        all_candidates = [
             node for node, queue in list(nodes.items())
             if node != target and node != self_addr
         ]
-        
-        k = min(k, len(candidates))
+
+        if not all_candidates:
+            return []
+
+        # Phase 6.2: Filter to prefer healthy proxies
+        # We need node_id (string) but have (host, port) tuples
+        # For filtering, use addr-based lookup since health gossip uses node_id
+        healthy_candidates: list[tuple[str, int]] = []
+        stressed_candidates: list[tuple[str, int]] = []
+
+        for node in all_candidates:
+            # Convert to node_id format for health lookup
+            node_id = f"{node[0]}:{node[1]}"
+            if self._peer_health_awareness.should_use_as_proxy(node_id):
+                healthy_candidates.append(node)
+            else:
+                stressed_candidates.append(node)
+
+        # Prefer healthy nodes, but fall back to stressed if necessary
+        k = min(k, len(all_candidates))
         if k <= 0:
             return []
-        return random.sample(candidates, k)
+
+        if len(healthy_candidates) >= k:
+            return random.sample(healthy_candidates, k)
+        elif healthy_candidates:
+            # Use all healthy + some stressed to fill
+            result = healthy_candidates.copy()
+            remaining = k - len(result)
+            if remaining > 0 and stressed_candidates:
+                additional = random.sample(stressed_candidates, min(remaining, len(stressed_candidates)))
+                result.extend(additional)
+            return result
+        else:
+            # No healthy candidates, use stressed
+            return random.sample(stressed_candidates, min(k, len(stressed_candidates)))
     
     def _get_self_udp_addr(self) -> tuple[str, int]:
         """Get this server's UDP address as a tuple."""
@@ -2155,10 +2805,28 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
     async def broadcast_refutation(self) -> int:
         """
         Broadcast an alive message to refute any suspicions about this node.
-        
+
         Uses retry_with_backoff for each send since refutation is critical.
         Tracks send failures and logs them but doesn't fail the overall operation.
+
+        Rate limited to prevent incarnation exhaustion attacks - if an attacker
+        sends many probes/suspects about us, we don't want to burn through
+        all possible incarnation numbers.
         """
+        # Rate limiting check
+        now = time.monotonic()
+        window_elapsed = now - self._last_refutation_time
+
+        if window_elapsed >= self._refutation_rate_limit_window:
+            # Reset window
+            self._last_refutation_time = now
+            self._refutation_count_in_window = 1
+        else:
+            self._refutation_count_in_window += 1
+            if self._refutation_count_in_window > self._refutation_rate_limit_tokens:
+                # Rate limited - return current incarnation without incrementing
+                return self._incarnation_tracker.get_self_incarnation()
+
         new_incarnation = self.increment_incarnation()
         
         nodes: Nodes = self._context.read('nodes')
@@ -2172,8 +2840,8 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         
         successful = 0
         failed = 0
-
-        # Use list() to snapshot keys before iteration
+        
+        # Snapshot nodes to avoid dict mutation during iteration
         for node in list(nodes.keys()):
             if node != self_addr:
                 success = await self._send_with_retry(node, msg, timeout)
@@ -2181,7 +2849,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                     successful += 1
                 else:
                     failed += 1
-        
+
         # Log if we had failures but don't fail the operation
         if failed > 0 and self._error_handler:
             await self.handle_error(
@@ -2261,7 +2929,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         successful = 0
         failed = 0
 
-        # Use list() to snapshot keys before iteration
+        # Snapshot nodes to avoid dict mutation during iteration
         for node in list(nodes.keys()):
             if node != self_addr and node != target:
                 success = await self._send_broadcast_message(node, msg, timeout)
@@ -2269,7 +2937,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                     successful += 1
                 else:
                     failed += 1
-        
+
         if failed > 0 and self._error_handler:
             await self.handle_error(
                 NetworkError(
@@ -2356,7 +3024,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         
         # Get current node state before probe
         state_before = self._incarnation_tracker.get_node_state(target)
-        last_seen_before = state_before.last_seen if state_before else 0
+        last_seen_before = state_before.last_update_time if state_before else 0
         
         try:
             # Send probe with error handling
@@ -2369,7 +3037,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             state_after = self._incarnation_tracker.get_node_state(target)
             if state_after:
                 # Node was updated more recently than before our probe
-                if state_after.last_seen > last_seen_before:
+                if state_after.last_update_time > last_seen_before:
                     return state_after.status == b'OK'
                 # Node status is OK
                 if state_after.status == b'OK':
@@ -2394,9 +3062,18 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         message: bytes,
         timeout: int | None = None,
     ) -> bytes:
+        """
+        Prepare outgoing UDP message before sending.
+
+        This hook adds piggybacked gossip data (membership + health) to
+        outgoing messages for O(log n) dissemination.
+        """
+        # Add piggyback data (membership + health gossip) to outgoing messages
+        message_with_piggyback = self._add_piggyback_safe(message)
+
         return (
             addr,
-            message,
+            message_with_piggyback,
             timeout,
         )
     
@@ -2407,7 +3084,41 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         data: bytes,
         clock_time: int,
     ) -> Message:
-        return data
+        """
+        Process UDP response data before it's returned to the caller.
+
+        This hook intercepts responses from UDP sends (e.g., probe responses).
+        We extract any embedded state for Serf-style passive discovery.
+        """
+        if not data:
+            return data
+
+        # Check if this is an ACK response - need to complete pending probe future
+        msg_type = data.split(b'>', maxsplit=1)[0].split(b':', maxsplit=1)[0]
+
+        # Convert addr to tuple format for lookup - addr comes as bytes 'host:port'
+        # but _pending_probe_acks uses tuple (host, port) keys
+        addr_tuple: tuple[str, int] | None = None
+        if isinstance(addr, bytes):
+            try:
+                host, port_str = addr.decode().split(':', 1)
+                addr_tuple = (host, int(port_str))
+            except (ValueError, UnicodeDecodeError):
+                pass
+        elif isinstance(addr, tuple):
+            addr_tuple = addr
+
+        if msg_type == b'ack' and addr_tuple:
+            # Complete pending probe future for this address
+            pending_future = self._pending_probe_acks.get(addr_tuple)
+            if pending_future:
+                if not pending_future.done():
+                    pending_future.set_result(True)
+
+        # Extract embedded state from response (Serf-style)
+        # Response format: msg_type>host:port#|sbase64_state
+        clean_data = self._extract_embedded_state(data, addr)
+        return clean_data
 
     
     @udp.receive()
@@ -2450,508 +3161,49 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                 # Duplicate - still send ack but don't process
                 return b'ack>' + self._udp_addr_slug
             
-            # Extract any piggybacked membership updates first
-            piggyback_idx = data.find(b'|')
+            # Extract health gossip piggyback first (format: #|hentry1;entry2;...)
+            health_piggyback_idx = data.find(self._HEALTH_SEPARATOR)
+            if health_piggyback_idx > 0:
+                health_piggyback_data = data[health_piggyback_idx:]
+                data = data[:health_piggyback_idx]
+                self._health_gossip_buffer.decode_and_process_piggyback(health_piggyback_data)
+
+            # Extract membership piggyback (format: #|mtype:incarnation:host:port...)
+            piggyback_idx = data.find(self._MEMBERSHIP_SEPARATOR)
             if piggyback_idx > 0:
                 main_data = data[:piggyback_idx]
                 piggyback_data = data[piggyback_idx:]
                 await self.process_piggyback_data(piggyback_data)
                 data = main_data
 
-            parsed = data.split(b'>', maxsplit=1)
-            message = data
+            # Delegate to the message dispatcher for handler-based processing
+            return await self._message_dispatcher.dispatch(addr, data, clock_time)
 
-            target: tuple[str, int] | None = None
-            target_addr: bytes | None = None
-            source_addr = f'{addr[0]}:{addr[1]}'
-            
-            # Check for cross-cluster messages FIRST (xprobe/xack/xnack)
-            # These have binary data after > that shouldn't be parsed as host:port
-            if len(parsed) > 1:
-                msg_prefix = parsed[0]
-                if msg_prefix in (b'xprobe', b'xack', b'xnack'):
-                    # Cross-cluster message - data after > is pickled, not host:port
-                    message = msg_prefix
-                    target_addr = parsed[1]  # Keep as raw bytes for handler
-                    # Use source address as the target for response routing
-                    target = addr
-                else:
-                    message, target_addr = parsed
-                    
-                    # Extract embedded state from address portion (Serf-style)
-                    # Format: host:port#base64_state
-                    if self._STATE_SEPARATOR in target_addr:
-                        addr_part, state_part = target_addr.split(self._STATE_SEPARATOR, 1)
-                        target_addr = addr_part
-                        # Process embedded state from sender
-                        import base64
-                        try:
-                            state_data = base64.b64decode(state_part)
-                            self._process_embedded_state(state_data, addr)
-                        except Exception:
-                            pass  # Invalid state, ignore
-                    
-                    host, port = target_addr.decode().split(':', maxsplit=1)
-                    target = (host, int(port))
-            
-            # Extract message type (before first colon)
-            msg_type = message.split(b':', maxsplit=1)[0]
-
-            match msg_type:
-                case b'ack' | b'nack':
-                    # ack/nack may or may not have target
-                    if target:
-                        nodes: Nodes = self._context.read('nodes')
-                        if target not in nodes:
-                            await self.increase_failure_detector('missed_nack')
-                            return b'nack>' + self._udp_addr_slug
-                        await self.decrease_failure_detector('successful_nack')
-                    return b'ack>' + self._udp_addr_slug
-                
-                case b'join':
-                    self._metrics.increment('joins_received')
-                    if not await self._validate_target(target, b'join', addr):
-                        return b'nack>' + self._udp_addr_slug
-                    
-                    async with self._context.with_value(target):
-                        nodes: Nodes = self._context.read('nodes')
-
-                        if self.udp_target_is_self(target):
-                            return b'ack' + b'>' + self._udp_addr_slug
-                        
-                        # Check if this is a rejoin
-                        is_rejoin = target in nodes
-                        
-                        # Clear any stale state from previous membership
-                        await self._clear_stale_state(target)
-                        
-                        # Record audit event
-                        event_type = AuditEventType.NODE_REJOIN if is_rejoin else AuditEventType.NODE_JOINED
-                        self._audit_log.record(
-                            event_type,
-                            node=target,
-                            source=addr,
-                        )
-                        
-                        self._context.write(target, b'OK')
-
-                        others = self.get_other_nodes(target)
-                        base_timeout = self._context.read('current_timeout')
-                        gather_timeout = self.get_lhm_adjusted_timeout(base_timeout) * 2
-                        await self._gather_with_errors(
-                            [self.send_if_ok(node, b'join>' + target_addr) for node in others],
-                            operation="join_propagation",
-                            timeout=gather_timeout,
-                        )
-
-                        await self._safe_queue_put(nodes[target], (clock_time, b'OK'), target)
-                        
-                        self._probe_scheduler.add_member(target)
-                        
-                        # Invoke registered callbacks (composition pattern)
-                        for callback in self._on_node_join_callbacks:
-                            try:
-                                callback(target)
-                            except Exception as e:
-                                self._task_runner.run(
-                                    self.handle_exception, e, "on_node_join_callback"
-                                )
-                        self._incarnation_tracker.update_node(target, b'OK', 0, time.monotonic())
-
-                        # Include embedded state so new node learns our state
-                        return self._build_ack_with_state()
-
-                case b'leave':
-                    if not await self._validate_target(target, b'leave', addr):
-                        return b'nack>' + self._udp_addr_slug
-                    
-                    async with self._context.with_value(target):
-                        nodes: Nodes = self._context.read('nodes')
-
-                        if self.udp_target_is_self(target):
-                            return b'leave>' + self._udp_addr_slug
-
-                        if target not in nodes:
-                            await self.increase_failure_detector('missed_nack')
-                            return b'nack>' + self._udp_addr_slug
-                        
-                        # Record audit event
-                        self._audit_log.record(
-                            AuditEventType.NODE_LEFT,
-                            node=target,
-                            source=addr,
-                        )
-                        
-                        others = self.get_other_nodes(target)
-                        base_timeout = self._context.read('current_timeout')
-                        gather_timeout = self.get_lhm_adjusted_timeout(base_timeout) * 2
-                        await self._gather_with_errors(
-                            [self.send_if_ok(node, message + b'>' + target_addr) for node in others],
-                            operation="leave_propagation",
-                            timeout=gather_timeout,
-                        )
-
-                        await self._safe_queue_put(nodes[target], (clock_time, b'DEAD'), target)
-                        self._context.write('nodes', nodes)
-
-                        return b'ack>' + self._udp_addr_slug
-                
-                case b'probe':
-                    if not await self._validate_target(target, b'probe', addr):
-                        return b'nack>' + self._udp_addr_slug
-                    
-                    async with self._context.with_value(target):
-                        nodes: Nodes = self._context.read('nodes')
-
-                        if self.udp_target_is_self(target):
-                            await self.increase_failure_detector('refutation')
-                            new_incarnation = await self.broadcast_refutation()
-                            # Include embedded state when proving we're alive
-                            base = b'alive:' + str(new_incarnation).encode() + b'>' + self._udp_addr_slug
-                            state = self._get_embedded_state()
-                            if state:
-                                import base64
-                                return base + self._STATE_SEPARATOR + base64.b64encode(state)
-                            return base
-                        
-                        if target not in nodes:
-                            return b'nack>' + self._udp_addr_slug
-                        
-                        base_timeout = self._context.read('current_timeout')
-                        timeout = self.get_lhm_adjusted_timeout(base_timeout)
-
-                        self._task_runner.run(
-                            self.send,
-                            target,
-                            b'ack>' + source_addr.encode(),
-                            timeout=timeout,
-                        )
-                        
-                        others = self.get_other_nodes(target)
-                        gather_timeout = timeout * 2
-                        await self._gather_with_errors(
-                            [self.send_if_ok(node, message + b'>' + target_addr) for node in others],
-                            operation="probe_propagation",
-                            timeout=gather_timeout,
-                        )
-                            
-                        return b'ack'
-                
-                case b'xprobe':
-                    # Cross-cluster health probe from a gate/manager
-                    # target_addr contains pickled CrossClusterProbe
-                    # Subclasses (ManagerServer, GateServer) override _build_xprobe_response
-                    xack = await self._build_xprobe_response(addr, target_addr or b'')
-                    if xack:
-                        return b'xack>' + xack
-                    return b'xnack>' + self._udp_addr_slug
-                
-                case b'xack':
-                    # Cross-cluster health acknowledgment from a DC/gate leader
-                    # target_addr contains pickled CrossClusterAck
-                    # Subclasses (GateServer, ManagerServer) override _handle_xack_response
-                    await self._handle_xack_response(addr, target_addr or b'')
-                    return b''  # No response needed
-                
-                case b'xnack':
-                    # Cross-cluster probe was rejected (not a DC leader)
-                    # Ignore silently - probe will timeout and try next
-                    return b''
-                
-                case b'ping-req':
-                    async with self._context.with_value(target):
-                        nodes: Nodes = self._context.read('nodes')
-                        
-                        if target is None:
-                            return b'nack>' + self._udp_addr_slug
-                        
-                        if self.udp_target_is_self(target):
-                            # Include embedded state when responding to indirect probe
-                            base = b'ping-req-ack:alive>' + self._udp_addr_slug
-                            state = self._get_embedded_state()
-                            if state:
-                                import base64
-                                return base + self._STATE_SEPARATOR + base64.b64encode(state)
-                            return base
-                        
-                        if target not in nodes:
-                            return b'ping-req-ack:unknown>' + self._udp_addr_slug
-                        
-                        base_timeout = self._context.read('current_timeout')
-                        timeout = self.get_lhm_adjusted_timeout(base_timeout)
-                        
-                        try:
-                            result = await asyncio.wait_for(
-                                self._send_probe_and_wait(target),
-                                timeout=timeout,
-                            )
-                            if result:
-                                return b'ping-req-ack:alive>' + target_addr
-                            else:
-                                return b'ping-req-ack:dead>' + target_addr
-                        except asyncio.TimeoutError:
-                            return b'ping-req-ack:timeout>' + target_addr
-                
-                case b'ping-req-ack':
-                    # Verify we have a pending indirect probe for this target
-                    if target and not self._indirect_probe_manager.get_pending_probe(target):
-                        await self.handle_error(
-                            UnexpectedMessageError(
-                                msg_type=b'ping-req-ack',
-                                expected=None,  # Not expecting this at all
-                                source=addr,
-                            )
-                        )
-                        return b'ack>' + self._udp_addr_slug
-                    
-                    msg_parts = message.split(b':', maxsplit=1)
-                    if len(msg_parts) > 1:
-                        status_str = msg_parts[1]
-                        if status_str == b'alive' and target:
-                            await self.handle_indirect_probe_response(target, is_alive=True)
-                            await self.decrease_failure_detector('successful_probe')
-                            return b'ack>' + self._udp_addr_slug
-                        elif status_str in (b'dead', b'timeout', b'unknown') and target:
-                            await self.handle_indirect_probe_response(target, is_alive=False)
-                    return b'ack>' + self._udp_addr_slug
-                
-                case b'alive':
-                    msg_incarnation = await self._parse_incarnation_safe(message, addr)
-                    
-                    if target:
-                        if self.is_message_fresh(target, msg_incarnation, b'OK'):
-                            await self.refute_suspicion(target, msg_incarnation)
-                            self.update_node_state(
-                                target, 
-                                b'OK', 
-                                msg_incarnation, 
-                                time.monotonic(),
-                            )
-                            await self.decrease_failure_detector('successful_probe')
-                    
-                    return b'ack>' + self._udp_addr_slug
-                
-                case b'suspect':
-                    msg_incarnation = await self._parse_incarnation_safe(message, addr)
-                    
-                    if target:
-                        if self.udp_target_is_self(target):
-                            await self.increase_failure_detector('refutation')
-                            new_incarnation = await self.broadcast_refutation()
-                            # Include embedded state when refuting suspicion
-                            base = b'alive:' + str(new_incarnation).encode() + b'>' + self._udp_addr_slug
-                            state = self._get_embedded_state()
-                            if state:
-                                import base64
-                                return base + self._STATE_SEPARATOR + base64.b64encode(state)
-                            return base
-                        
-                        if self.is_message_fresh(target, msg_incarnation, b'SUSPECT'):
-                            await self.start_suspicion(target, msg_incarnation, addr)
-                            
-                            suspicion = self._suspicion_manager.get_suspicion(target)
-                            if suspicion and suspicion.should_regossip():
-                                suspicion.mark_regossiped()
-                                await self.broadcast_suspicion(target, msg_incarnation)
-                    
-                    return b'ack>' + self._udp_addr_slug
-                
-                # Leadership messages
-                case b'leader-claim':
-                    term, candidate_lhm = await self._parse_leadership_claim(message, addr)
-                    
-                    if target:
-                        vote_msg = self._leader_election.handle_claim(target, term, candidate_lhm)
-                        if vote_msg:
-                            self._task_runner.run(
-                                self.send,
-                                target,
-                                vote_msg,
-                                timeout=self.get_lhm_adjusted_timeout(
-                                    self._context.read('current_timeout')
-                                ),
-                            )
-                    
-                    return b'ack>' + self._udp_addr_slug
-                
-                case b'leader-vote':
-                    # Verify we're actually expecting votes (are we a candidate?)
-                    if not self._leader_election.state.is_candidate():
-                        await self.handle_error(
-                            UnexpectedMessageError(
-                                msg_type=b'leader-vote',
-                                expected=[b'probe', b'ack', b'leader-heartbeat'],
-                                source=addr,
-                            )
-                        )
-                        return b'ack>' + self._udp_addr_slug
-                    
-                    term = await self._parse_term_safe(message, addr)
-                    
-                    if self._leader_election.handle_vote(addr, term):
-                        self._leader_election.state.become_leader(term)
-                        self._leader_election.state.current_leader = self._get_self_udp_addr()
-                        
-                        self_addr = self._get_self_udp_addr()
-                        elected_msg = (
-                            b'leader-elected:' +
-                            str(term).encode() + b'>' +
-                            f'{self_addr[0]}:{self_addr[1]}'.encode()
-                        )
-                        self._broadcast_leadership_message(elected_msg)
-                    
-                    return b'ack>' + self._udp_addr_slug
-                
-                case b'leader-elected':
-                    term = await self._parse_term_safe(message, addr)
-                    
-                    if target:
-                        # Check if we received our own election announcement (shouldn't happen)
-                        self_addr = self._get_self_udp_addr()
-                        if target == self_addr:
-                            await self.handle_error(
-                                UnexpectedMessageError(
-                                    msg_type=b'leader-elected',
-                                    expected=None,
-                                    source=addr,
-                                )
-                            )
-                            return b'ack>' + self._udp_addr_slug
-                        
-                        await self._leader_election.handle_elected(target, term)
-                    
-                    return b'ack>' + self._udp_addr_slug
-                
-                case b'leader-heartbeat':
-                    self._metrics.increment('heartbeats_received')
-                    term = await self._parse_term_safe(message, addr)
-                    
-                    # Check if we received our own heartbeat (shouldn't happen)
-                    if target:
-                        self_addr = self._get_self_udp_addr()
-                        if target == self_addr and addr != self_addr:
-                            await self.handle_error(
-                                UnexpectedMessageError(
-                                    msg_type=b'leader-heartbeat',
-                                    expected=None,
-                                    source=addr,
-                                )
-                            )
-                            return b'ack>' + self._udp_addr_slug
-                    
-                    if target:
-                        self_addr = self._get_self_udp_addr()
-                        if self._leader_election.state.is_leader() and target != self_addr:
-                            should_yield = self._leader_election.handle_discovered_leader(target, term)
-
-                            self._udp_logger.log(
-                                ServerInfo(
-                                    message=f"[{self._node_id.short}] Received heartbeat from leader {target} term={term}, yield={should_yield}",
-                                    node_host=self._host,
-                                    node_port=self._udp_port,
-                                    node_id=self._node_id.short,
-                                )
-                            )
-
-                            if should_yield:
-                                self._udp_logger.log(
-                                    ServerInfo(
-                                        message=f"[SPLIT-BRAIN] Detected other leader {target} with term {term}, stepping down",
-                                        node_host=self._host,
-                                        node_port=self._udp_port,
-                                        node_id=self._node_id.short,
-                                    )
-                                )
-                                # Record split brain in audit log
-                                self_addr = self._get_self_udp_addr()
-                                self._audit_log.record(
-                                    AuditEventType.SPLIT_BRAIN_DETECTED,
-                                    node=self_addr,
-                                    other_leader=target,
-                                    self_term=self._leader_election.state.current_term,
-                                    other_term=term,
-                                )
-                                self._metrics.increment('split_brain_events')
-                                # Also log via error handler for monitoring
-                                await self.handle_error(
-                                    SplitBrainError(
-                                        self_addr,
-                                        target,
-                                        self._leader_election.state.current_term,
-                                        term,
-                                    )
-                                )
-                                self._task_runner.run(self._leader_election._step_down)
-                        
-                        await self._leader_election.handle_heartbeat(target, term)
-                    
-                    return b'ack>' + self._udp_addr_slug
-                
-                case b'leader-stepdown':
-                    term = await self._parse_term_safe(message, addr)
-                    
-                    if target:
-                        await self._leader_election.handle_stepdown(target, term)
-                    
-                    return b'ack>' + self._udp_addr_slug
-                
-                case b'pre-vote-req':
-                    term, candidate_lhm = await self._parse_leadership_claim(message, addr)
-                    
-                    if target:
-                        resp = self._leader_election.handle_pre_vote_request(
-                            candidate=target,
-                            term=term,
-                            candidate_lhm=candidate_lhm,
-                        )
-                        if resp:
-                            self._task_runner.run(
-                                self._send_to_addr,
-                                target,
-                                resp,
-                            )
-                    
-                    return b'ack>' + self._udp_addr_slug
-                
-                case b'pre-vote-resp':
-                    # Verify we're actually in a pre-voting phase
-                    if not self._leader_election.state.pre_voting_in_progress:
-                        await self.handle_error(
-                            UnexpectedMessageError(
-                                msg_type=b'pre-vote-resp',
-                                expected=None,  # Not expecting this
-                                source=addr,
-                            )
-                        )
-                        return b'ack>' + self._udp_addr_slug
-                    
-                    term, granted = await self._parse_pre_vote_response(message, addr)
-                    
-                    self._leader_election.handle_pre_vote_response(
-                        voter=addr,
-                        term=term,
-                        granted=granted,
-                    )
-                    
-                    return b'ack>' + self._udp_addr_slug
-                    
-                case _:
-                    # Unknown message type - log for monitoring
-                    await self.handle_error(
-                        ProtocolError(
-                            f"Unknown message type: {msg_type.decode(errors='replace')}",
-                            source=addr,
-                        )
-                    )
-                    return b'nack'
-                
-        except ValueError as e:
+        except ValueError as error:
             # Message parsing error
             await self.handle_error(
-                MalformedMessageError(data, str(e), addr)
+                MalformedMessageError(data, str(error), addr)
             )
             return b'nack'
-        except Exception as e:
-            await self.handle_exception(e, "receive")
+        except Exception as error:
+            await self.handle_exception(error, "receive")
             return b'nack'
+
+    # ==========================================================================
+    # Legacy receive() match statement - preserved for reference during testing
+    # This entire block will be removed after confirming handlers work correctly
+    # ==========================================================================
+    async def _legacy_receive_removed(self) -> None:
+        """Placeholder to mark where old receive() logic was removed."""
+        # The old receive() method contained a ~600 line match statement.
+        # It has been replaced by the message_handling module with separate
+        # handler classes for each message type:
+        #   - membership/: ack, nack, join, leave
+        #   - probing/: probe, ping-req, ping-req-ack
+        #   - suspicion/: alive, suspect
+        #   - leadership/: leader-claim, leader-vote, leader-elected, etc.
+        #   - cross_cluster/: xprobe, xack, xnack
+        #
+        # See hyperscale/distributed_rewrite/swim/message_handling/
+        pass
 

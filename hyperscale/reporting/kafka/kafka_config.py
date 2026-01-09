@@ -1,10 +1,12 @@
-from pydantic import BaseModel, StrictStr, StrictInt, StrictBool
+from pydantic import BaseModel, ConfigDict, StrictStr, StrictInt, StrictBool
 from typing import Any, Dict
 
 from hyperscale.reporting.common.types import ReporterTypes
 
 
 class KafkaConfig(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     host: StrictStr = "localhost"
     port: StrictInt = 9092
     client_id: StrictStr = "hyperscale"
@@ -17,6 +19,3 @@ class KafkaConfig(BaseModel):
     idempotent: StrictBool = True
     options: Dict[StrictStr, Any] = {}
     reporter_type: ReporterTypes = ReporterTypes.Kafka
-
-    class Config:
-        arbitrary_types_allowed = True

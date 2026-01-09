@@ -1,11 +1,13 @@
 from typing import Any, Dict
 
-from pydantic import BaseModel, StrictStr, StrictInt
+from pydantic import BaseModel, ConfigDict, StrictStr, StrictInt
 
 from hyperscale.reporting.common.types import ReporterTypes
 
 
 class PrometheusConfig(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     pushgateway_host: StrictStr = "localhost"
     pushgateway_port: StrictInt = 9091
     auth_request_method: StrictStr = "GET"
@@ -16,6 +18,3 @@ class PrometheusConfig(BaseModel):
     namespace: StrictStr = "hyperscale"
     job_name: StrictStr = "hyperscale"
     reporter_type: ReporterTypes = ReporterTypes.Prometheus
-
-    class Config:
-        arbitrary_types_allowed = True

@@ -1,13 +1,31 @@
 import asyncio
+import atexit
 import ctypes
 import functools
 import multiprocessing
 import signal
 import warnings
+import weakref
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from multiprocessing.context import SpawnContext
 from typing import Dict, List
+
+
+# Module-level weak reference set for atexit cleanup
+_active_pools: weakref.WeakSet["LocalServerPool"] = weakref.WeakSet()
+
+
+def _atexit_cleanup():
+    """Cleanup any remaining pools on interpreter exit."""
+    for pool in list(_active_pools):
+        try:
+            pool.abort()
+        except Exception:
+            pass
+
+
+atexit.register(_atexit_cleanup)
 
 from hyperscale.core.jobs.graphs.remote_graph_controller import (
     RemoteGraphController,
@@ -46,6 +64,7 @@ async def run_server(
     server: RemoteGraphController,
     cert_path: str | None = None,
     key_path: str | None = None,
+    enable_server_cleanup: bool = False,
 ):
     try:
         await server.start_server(
@@ -62,7 +81,10 @@ async def run_server(
             await server.close()
 
             return
-        
+
+        if enable_server_cleanup:
+            server.start_controller_cleanup()
+
         await server.run_forever()
         await server.close()
 
@@ -96,10 +118,24 @@ async def run_server(
             ):
                 pass
 
+    # Wait for tasks with a timeout to prevent hanging
     try:
-        await asyncio.gather(
-            *[task for task in tasks if task != current_task], return_exceptions=True
-        )
+        pending_tasks = [task for task in tasks if task != current_task]
+        if pending_tasks:
+            # Use asyncio.wait instead of gather+wait_for for better control
+            done, still_pending = await asyncio.wait(
+                pending_tasks,
+                timeout=5.0,
+                return_when=asyncio.ALL_COMPLETED,
+            )
+
+            # Force cancel any tasks that didn't complete in time
+            for task in still_pending:
+                task.cancel()
+
+            # Wait briefly for cancellation to propagate
+            if still_pending:
+                await asyncio.wait(still_pending, timeout=1.0)
 
     except Exception:
         pass
@@ -114,7 +150,9 @@ def run_thread(
     log_level: LogLevelName = "info",
     cert_path: str | None = None,
     key_path: str | None = None,
+    enable_server_cleanup: bool = False,
 ):
+    
     try:
         from hyperscale.logging import LoggingConfig
 
@@ -161,6 +199,7 @@ def run_thread(
                 server,
                 cert_path=cert_path,
                 key_path=key_path,
+                enable_server_cleanup=enable_server_cleanup,
             )
         )
 
@@ -186,6 +225,10 @@ class LocalServerPool:
         self._pool_task: asyncio.Task | None = None
         self._run_future: asyncio.Future | None = None
         self._logger = Logger()
+        self._cleaned_up = False
+
+        # Register for atexit cleanup
+        _active_pools.add(self)
 
     async def setup(self):
         self._context = multiprocessing.get_context("spawn")
@@ -210,14 +253,16 @@ class LocalServerPool:
 
             self._loop = asyncio.get_event_loop()
 
-            for signame in ("SIGINT", "SIGTERM", "SIG_IGN"):
-                self._loop.add_signal_handler(
-                    getattr(
-                        signal,
-                        signame,
-                    ),
-                    self.abort,
-                )
+            # Handle SIGINT, SIGTERM, and SIGHUP
+            for signame in ("SIGINT", "SIGTERM", "SIGHUP"):
+                try:
+                    self._loop.add_signal_handler(
+                        getattr(signal, signame),
+                        self.abort,
+                    )
+                except (ValueError, OSError):
+                    # Signal not available on this platform
+                    pass
 
             await ctx.log(
                 Entry(
@@ -233,6 +278,7 @@ class LocalServerPool:
         env: Env,
         cert_path: str | None = None,
         key_path: str | None = None,
+        enable_server_cleanup: bool = False,
     ):
         async with self._logger.context(
             name="local_server_pool",
@@ -265,6 +311,8 @@ class LocalServerPool:
                                 log_level=config.level.name.lower(),
                                 cert_path=cert_path,
                                 key_path=key_path,
+                                enable_server_cleanup=enable_server_cleanup,
+                                
                             ),
                         )
                         for idx, worker_ip in enumerate(worker_ips)
@@ -276,6 +324,11 @@ class LocalServerPool:
                 pass
 
     async def shutdown(self, wait: bool = True):
+        # Prevent double cleanup
+        if self._cleaned_up:
+            return
+        self._cleaned_up = True
+
         async with self._logger.context(
             name="local_server_pool",
             path="hyperscale.leader.log.json",
@@ -293,50 +346,32 @@ class LocalServerPool:
                 if self._pool_task and not self._pool_task.done():
                     self._pool_task.cancel()
                     try:
-                        await asyncio.wait_for(self._pool_task, timeout=2.0)
+                        await asyncio.wait_for(self._pool_task, timeout=0.25)
                     except (asyncio.CancelledError, asyncio.TimeoutError):
                         pass
 
             except (Exception, asyncio.CancelledError, asyncio.InvalidStateError):
                 pass
 
-            # Shutdown executor with wait=True to allow proper cleanup of semaphores
+            # Shutdown executor - do NOT use the executor to shut itself down
             try:
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore")
 
                     if self._executor and self._executor._processes:
-                        # First cancel futures
-                        await self._loop.run_in_executor(
-                            None,
-                            functools.partial(
-                                self._executor.shutdown,
-                                wait=False,
-                                cancel_futures=True,
-                            ),
-                        )
-                        
-                        # Give processes time to terminate gracefully
-                        await asyncio.sleep(0.5)
-                        
-                        # Force kill any remaining processes
-                        for pid, proc in list(self._executor._processes.items()):
-                            if proc.is_alive():
-                                try:
-                                    proc.terminate()
-                                except Exception:
-                                    pass
-                        
-                        # Wait briefly for termination
-                        await asyncio.sleep(0.2)
-                        
-                        # Kill any that didn't terminate
+                        # Kill processes immediately - no graceful termination needed
                         for pid, proc in list(self._executor._processes.items()):
                             if proc.is_alive():
                                 try:
                                     proc.kill()
                                 except Exception:
                                     pass
+
+                        # Now shutdown the executor (processes are already dead)
+                        self._executor.shutdown(wait=False, cancel_futures=True)
+
+                    # Clear executor reference to allow GC
+                    self._executor = None
 
             except (
                 Exception,
@@ -348,8 +383,12 @@ class LocalServerPool:
                 try:
                     if self._executor:
                         self._executor.shutdown(wait=False, cancel_futures=True)
+                        self._executor = None
                 except Exception:
                     pass
+
+            # Remove from active pools set
+            _active_pools.discard(self)
 
             await ctx.log(
                 Entry(
@@ -359,6 +398,11 @@ class LocalServerPool:
             )
 
     def abort(self):
+        # Prevent double cleanup
+        if self._cleaned_up:
+            return
+        self._cleaned_up = True
+
         try:
             if self._pool_task and not self._pool_task.done():
                 self._pool_task.cancel()
@@ -377,9 +421,15 @@ class LocalServerPool:
                                 proc.kill()
                         except Exception:
                             pass
-                    
+
                     # Shutdown executor
                     self._executor.shutdown(wait=False, cancel_futures=True)
 
+                # Clear executor reference to allow GC
+                self._executor = None
+
         except Exception:
             pass
+
+        # Remove from active pools set
+        _active_pools.discard(self)

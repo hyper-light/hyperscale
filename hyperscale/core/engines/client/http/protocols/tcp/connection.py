@@ -29,7 +29,7 @@ class TCPConnection:
         self.socket = socket.socket(family=family, type=type_, proto=proto)
         self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
-        await self.loop.run_in_executor(None, self.socket.connect, address)
+        await asyncio.to_thread(self.socket.connect, address)
 
         self.socket.setblocking(False)
 

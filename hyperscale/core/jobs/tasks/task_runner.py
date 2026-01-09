@@ -1,4 +1,5 @@
 import asyncio
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, Optional, Type, TypeVar
 
@@ -15,14 +16,14 @@ T = TypeVar("T")
 class TaskRunner:
     def __init__(self, instance_id: int, config: Env) -> None:
         self.tasks: Dict[str, Task[Any]] = {}
-        self.results: Dict[str, Any]
+        self.results: Dict[str, Any] = {}
         self._runner = ThreadPoolExecutor(
             max_workers=config.MERCURY_SYNC_TASK_RUNNER_MAX_THREADS
         )
         self._cleanup_interval = TimeParser(config.MERCURY_SYNC_CLEANUP_INTERVAL).time
         self._cleanup_task: Optional[asyncio.Task] = None
         self._run_cleanup: bool = False
-        self._snowflake_generator = SnowflakeGenerator(instance_id)
+        self.instance_id = instance_id
 
     def all_tasks(self):
         for task in self.tasks.values():
@@ -33,10 +34,10 @@ class TaskRunner:
         self._cleanup_task = asyncio.ensure_future(self._cleanup())
 
     def create_task_id(self):
-        return self._snowflake_generator.generate()
+        return uuid.uuid4().int>>64
 
     def add(self, task: Type[T]):
-        runnable = Task(task, self._snowflake_generator)
+        runnable = Task(task)
         self.tasks[runnable.name] = runnable
 
     def run(
@@ -84,10 +85,10 @@ class TaskRunner:
         if task := self.tasks.get(task_name):
             return await task.complete(run_id)
 
-    async def cancel(self, task_name: str, run_id: str):
+    async def cancel(self, task_name: str, run_id: str, timeout: float = 5.0):
         task = self.tasks.get(task_name)
         if task:
-            await task.cancel(run_id)
+            await task.cancel(run_id, timeout=timeout)
 
     async def cancel_schedule(
         self,
@@ -98,23 +99,30 @@ class TaskRunner:
             await task.cancel_schedule()
 
     async def shutdown(self):
-        for task in self.tasks.values():
+        # Snapshot to avoid dict mutation during iteration
+        for task in list(self.tasks.values()):
             task.abort()
 
         self._run_cleanup = False
-        self._cleanup_task.set_result(None)
+        if self._cleanup_task and not self._cleanup_task.done():
+            self._cleanup_task.cancel()
+            try:
+                await self._cleanup_task
+            except asyncio.CancelledError:
+                pass
 
     def abort(self):
-        for task in self.tasks.values():
+        # Snapshot to avoid dict mutation during iteration
+        for task in list(self.tasks.values()):
             task.abort()
 
         self._run_cleanup = False
 
-        try:
-            self._cleanup_task.set_result(None)
-
-        except Exception:
-            pass
+        if self._cleanup_task and not self._cleanup_task.done():
+            try:
+                self._cleanup_task.cancel()
+            except Exception:
+                pass
 
     async def _cleanup(self):
         while self._run_cleanup:
@@ -123,7 +131,8 @@ class TaskRunner:
 
     async def _cleanup_scheduled_tasks(self):
         try:
-            for task in self.tasks.values():
+            # Snapshot to avoid dict mutation during iteration
+            for task in list(self.tasks.values()):
                 await task.cleanup()
 
         except Exception:

@@ -36,7 +36,7 @@ class HealthSample:
         return self.lag_ratio > 0.5
 
 
-@dataclass
+@dataclass(slots=True)
 class EventLoopHealthMonitor:
     """
     Monitors event loop health by measuring sleep lag.

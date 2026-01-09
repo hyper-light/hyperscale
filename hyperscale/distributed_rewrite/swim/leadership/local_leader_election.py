@@ -18,7 +18,7 @@ from hyperscale.logging.hyperscale_logging_models import ServerDebug
 from ..core.protocols import LoggerProtocol, TaskRunnerProtocol
 
 
-@dataclass
+@dataclass(slots=True)
 class LocalLeaderElection:
     """
     Manages local (within-datacenter) leader election.

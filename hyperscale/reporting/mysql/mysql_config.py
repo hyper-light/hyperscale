@@ -1,9 +1,11 @@
-from pydantic import BaseModel, StrictStr, StrictInt
+from pydantic import BaseModel, ConfigDict, StrictStr, StrictInt
 
 from hyperscale.reporting.common.types import ReporterTypes
 
 
 class MySQLConfig(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     host: StrictStr = "localhost"
     port: StrictInt = 3306
     database: StrictStr = "hyperscale"
@@ -12,6 +14,3 @@ class MySQLConfig(BaseModel):
     worfklow_results_table_name: StrictStr = "hyperscale_workflow_results"
     step_results_table_name: StrictStr = "hyperscale_step_results"
     reporter_type: ReporterTypes = ReporterTypes.MySQL
-
-    class Config:
-        arbitrary_types_allowed = True

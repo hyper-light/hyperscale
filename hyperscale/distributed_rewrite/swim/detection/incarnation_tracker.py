@@ -4,14 +4,40 @@ Incarnation number tracking for SWIM protocol.
 
 import time
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Callable, Any
-from ..core.types import Status
-from ..core.node_state import NodeState
 
+from hyperscale.distributed_rewrite.swim.core.types import Status
+from hyperscale.distributed_rewrite.swim.core.node_state import NodeState
+from hyperscale.distributed_rewrite.swim.core.protocols import LoggerProtocol
 from hyperscale.logging.hyperscale_logging_models import ServerDebug
 
 
-from ..core.protocols import LoggerProtocol
+class MessageFreshness(Enum):
+    """
+    Result of checking message freshness.
+
+    Indicates whether a message should be processed and why it was
+    accepted or rejected. This enables appropriate handling per case.
+    """
+    FRESH = "fresh"
+    """Message has new information - process it."""
+
+    DUPLICATE = "duplicate"
+    """Same incarnation and same/lower status priority - silent ignore.
+    This is completely normal in gossip protocols where the same state
+    propagates via multiple paths."""
+
+    STALE = "stale"
+    """Lower incarnation than known - indicates delayed message or state drift.
+    Worth logging as it may indicate network issues."""
+
+    INVALID = "invalid"
+    """Incarnation number failed validation (negative or exceeds max).
+    Indicates bug or corruption."""
+
+    SUSPICIOUS = "suspicious"
+    """Incarnation jump is suspiciously large - possible attack or serious bug."""
 
 # Maximum valid incarnation number (2^31 - 1 for wide compatibility)
 MAX_INCARNATION = 2**31 - 1
@@ -200,47 +226,73 @@ class IncarnationTracker:
         """Get all known nodes and their states."""
         return list(self.node_states.items())
     
-    def is_message_fresh(
-        self, 
-        node: tuple[str, int], 
-        incarnation: int, 
+    def check_message_freshness(
+        self,
+        node: tuple[str, int],
+        incarnation: int,
         status: Status,
         validate: bool = True,
-    ) -> bool:
+    ) -> MessageFreshness:
         """
-        Check if a message about a node is fresh (should be processed).
-        
-        A message is fresh if:
-        - Incarnation number is valid (if validate=True)
-        - Jump is not suspiciously large (if validate=True)
-        - We don't know about the node yet
-        - It has a higher incarnation number
-        - Same incarnation but higher priority status
-        
+        Check if a message about a node is fresh and why.
+
+        Returns MessageFreshness indicating:
+        - FRESH: Message has new information, process it
+        - DUPLICATE: Same incarnation, same/lower status (normal in gossip)
+        - STALE: Lower incarnation than known
+        - INVALID: Incarnation failed validation
+        - SUSPICIOUS: Incarnation jump too large
+
         Args:
             node: Node address tuple.
             incarnation: Incarnation number from message.
             status: Status from message.
             validate: Whether to validate incarnation number.
-        
+
         Returns:
-            True if message should be processed, False otherwise.
+            MessageFreshness indicating result and reason.
         """
         if validate:
             if not self.is_valid_incarnation(incarnation):
-                return False
+                return MessageFreshness.INVALID
             if self.is_suspicious_jump(node, incarnation):
-                return False
-        
+                return MessageFreshness.SUSPICIOUS
+
         state = self.node_states.get(node)
         if state is None:
-            return True
+            return MessageFreshness.FRESH
         if incarnation > state.incarnation:
-            return True
+            return MessageFreshness.FRESH
         if incarnation == state.incarnation:
             status_priority = {b'OK': 0, b'JOIN': 0, b'SUSPECT': 1, b'DEAD': 2}
-            return status_priority.get(status, 0) > status_priority.get(state.status, 0)
-        return False
+            if status_priority.get(status, 0) > status_priority.get(state.status, 0):
+                return MessageFreshness.FRESH
+            return MessageFreshness.DUPLICATE
+        return MessageFreshness.STALE
+
+    def is_message_fresh(
+        self,
+        node: tuple[str, int],
+        incarnation: int,
+        status: Status,
+        validate: bool = True,
+    ) -> bool:
+        """
+        Check if a message about a node is fresh (should be processed).
+
+        This is a convenience wrapper around check_message_freshness()
+        that returns a simple boolean for backward compatibility.
+
+        Args:
+            node: Node address tuple.
+            incarnation: Incarnation number from message.
+            status: Status from message.
+            validate: Whether to validate incarnation number.
+
+        Returns:
+            True if message should be processed, False otherwise.
+        """
+        return self.check_message_freshness(node, incarnation, status, validate) == MessageFreshness.FRESH
     
     def set_eviction_callback(
         self,
@@ -258,9 +310,10 @@ class IncarnationTracker:
         """
         now = time.monotonic()
         cutoff = now - self.dead_node_retention_seconds
-        
+
         to_remove = []
-        for node, state in self.node_states.items():
+        # Snapshot to avoid dict mutation during iteration
+        for node, state in list(self.node_states.items()):
             if state.status == b'DEAD' and state.last_update_time < cutoff:
                 to_remove.append(node)
         
@@ -297,9 +350,10 @@ class IncarnationTracker:
         
         # Sort by (status_priority, last_update_time)
         status_priority = {b'DEAD': 0, b'SUSPECT': 1, b'OK': 2, b'JOIN': 2}
-        
+
+        # Snapshot to avoid dict mutation during iteration
         sorted_nodes = sorted(
-            self.node_states.items(),
+            list(self.node_states.items()),
             key=lambda x: (
                 status_priority.get(x[1].status, 2),
                 x[1].last_update_time,
@@ -341,7 +395,8 @@ class IncarnationTracker:
     def get_stats(self) -> dict[str, int]:
         """Get tracker statistics for monitoring."""
         status_counts = {b'OK': 0, b'SUSPECT': 0, b'DEAD': 0, b'JOIN': 0}
-        for state in self.node_states.values():
+        # Snapshot to avoid dict mutation during iteration
+        for state in list(self.node_states.values()):
             status_counts[state.status] = status_counts.get(state.status, 0) + 1
         
         return {

@@ -22,7 +22,7 @@ MAX_PIGGYBACK_SIZE = 1200  # Safe size for piggybacked data
 MAX_UDP_PAYLOAD = 1400  # Maximum total UDP payload
 
 
-@dataclass
+@dataclass(slots=True)
 class GossipBuffer:
     """
     Buffer for membership updates to be piggybacked on messages.
@@ -165,61 +165,68 @@ class GossipBuffer:
     
     # Maximum allowed max_count to prevent excessive iteration
     MAX_ENCODE_COUNT = 100
-    
+
+    # Membership piggyback marker - consistent with #|s (state) and #|h (health)
+    MEMBERSHIP_SEPARATOR = b"#|m"
+    # Entry separator within membership piggyback
+    ENTRY_SEPARATOR = b"|"
+
     def encode_piggyback(
-        self, 
-        max_count: int = 5, 
+        self,
+        max_count: int = 5,
         max_size: int | None = None,
     ) -> bytes:
         """
         Get piggybacked updates as bytes to append to a message.
-        Format: |update1|update2|update3
-        
+        Format: #|mupdate1|update2|update3
+        - Starts with '#|m' marker (consistent with #|s state, #|h health)
+        - Entries separated by '|'
+
         Args:
             max_count: Maximum number of updates to include (1-100).
             max_size: Maximum total size in bytes (defaults to max_piggyback_size).
-        
+
         Returns:
             Encoded piggyback data respecting size limits.
         """
         # Validate and bound max_count
         max_count = max(1, min(max_count, self.MAX_ENCODE_COUNT))
-        
+
         if max_size is None:
             max_size = self.max_piggyback_size
-        
+
         updates = self.get_updates_to_piggyback(max_count)
         if not updates:
             return b''
-        
+
         # Build result respecting size limit
         result_parts: list[bytes] = []
-        total_size = 0  # Not counting leading '|' yet
+        total_size = 3  # '#|m' prefix
         included_updates: list[PiggybackUpdate] = []
-        
+
         for update in updates:
             encoded = update.to_bytes()
             update_size = len(encoded) + 1  # +1 for separator '|'
-            
+
             # Check if individual update is too large
             if update_size > max_size:
                 self._oversized_updates_count += 1
                 continue
-            
+
             # Check if adding this update would exceed limit
             if total_size + update_size > max_size:
                 self._size_limited_count += 1
                 break
-            
+
             result_parts.append(encoded)
             total_size += update_size
             included_updates.append(update)
-        
+
         if not result_parts:
             return b''
-        
+
         self.mark_broadcasts(included_updates)
-        return b'|' + b'|'.join(result_parts)
+        return self.MEMBERSHIP_SEPARATOR + self.ENTRY_SEPARATOR.join(result_parts)
     
     def encode_piggyback_with_base(
         self,
@@ -247,27 +254,28 @@ class GossipBuffer:
     # Maximum updates to decode from a single piggyback message
     MAX_DECODE_UPDATES = 100
     
-    @staticmethod
-    def decode_piggyback(data: bytes, max_updates: int = 100) -> list[PiggybackUpdate]:
+    @classmethod
+    def decode_piggyback(cls, data: bytes, max_updates: int = 100) -> list[PiggybackUpdate]:
         """
         Decode piggybacked updates from message suffix.
-        
+
         Args:
-            data: Raw piggyback data starting with '|'.
+            data: Raw piggyback data starting with '#|m'.
             max_updates: Maximum updates to decode (default 100).
                         Prevents malicious messages with thousands of updates.
-        
+
         Returns:
             List of decoded updates (bounded by max_updates).
         """
-        if not data or data[0:1] != b'|':
+        if not data or not data.startswith(cls.MEMBERSHIP_SEPARATOR):
             return []
-        
+
         # Bound max_updates to prevent abuse
-        bounded_max = min(max_updates, GossipBuffer.MAX_DECODE_UPDATES)
-        
+        bounded_max = min(max_updates, cls.MAX_DECODE_UPDATES)
+
         updates = []
-        parts = data[1:].split(b'|')
+        # Remove '#|m' prefix then split on '|'
+        parts = data[3:].split(cls.ENTRY_SEPARATOR)
         for part in parts:
             if len(updates) >= bounded_max:
                 # Stop decoding - we've hit the limit

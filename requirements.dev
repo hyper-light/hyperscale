@@ -47,3 +47,5 @@ aiokafka
 haralyzer
 asyncpg
 xmltodict
+pytest-asyncio
+pytest

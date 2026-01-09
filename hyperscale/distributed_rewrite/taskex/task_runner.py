@@ -2,6 +2,7 @@ import asyncio
 import functools
 import shlex
 import signal
+import uuid
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from typing import (
     Any,
@@ -47,12 +48,12 @@ class TaskRunner:
         if config is None:
             config = Env()
 
+        self.instance_id = instance_id
         self.tasks: Dict[str, Task[Any]] = {}
-        self.results: Dict[str, Any]
+        self.results: Dict[str, Any] = {}
         self._cleanup_interval = TimeParser(config.MERCURY_SYNC_CLEANUP_INTERVAL).time
         self._cleanup_task: Optional[asyncio.Task] = None
         self._run_cleanup: bool = False
-        self._snowflake_generator = SnowflakeGenerator(instance_id)
 
         self._executor: ThreadPoolExecutor | ProcessPoolExecutor | None = None
         if executor_type == "thread":
@@ -65,14 +66,17 @@ class TaskRunner:
                 max_workers=config.MERCURY_SYNC_TASK_RUNNER_MAX_THREADS
             )
 
-        self._executor_sempahore = asyncio.Semaphore(
+        self._executor_semaphore = asyncio.Semaphore(
             value=config.MERCURY_SYNC_TASK_RUNNER_MAX_THREADS
         )
         self._loop = asyncio.get_event_loop()
 
+        # Skip list - tasks in this set will not be run or scheduled
+        self._skipped_tasks: set[str] = set()
 
     def all_tasks(self):
-        for task in self.tasks.values():
+        # Snapshot to avoid dict mutation during iteration
+        for task in list(self.tasks.values()):
             yield task
 
     def start_cleanup(self):
@@ -80,8 +84,38 @@ class TaskRunner:
         self._cleanup_task = asyncio.ensure_future(self._cleanup())
 
     def create_task_id(self):
-        return self._snowflake_generator.generate()
-    
+        return uuid.uuid4().int >> 64
+
+    def skip_tasks(self, task_names: list[str]) -> None:
+        """
+        Add tasks to the skip list. Skipped tasks will not be run or scheduled.
+
+        Also stops any running schedules for these tasks.
+
+        Args:
+            task_names: List of task names (or aliases) to skip
+        """
+        for name in task_names:
+            self._skipped_tasks.add(name)
+            # Stop any running schedules for this task
+            task = self.tasks.get(name)
+            if task:
+                task.stop_schedules()
+
+    def unskip_tasks(self, task_names: list[str]) -> None:
+        """
+        Remove tasks from the skip list, allowing them to run again.
+
+        Args:
+            task_names: List of task names (or aliases) to unskip
+        """
+        for name in task_names:
+            self._skipped_tasks.discard(name)
+
+    def is_skipped(self, task_name: str) -> bool:
+        """Check if a task is in the skip list."""
+        return task_name in self._skipped_tasks
+
     def bundle(
         self,
         call: Callable[..., Awaitable[T]],
@@ -122,14 +156,17 @@ class TaskRunner:
         elif command_name is None:
             command_name = call.__name__
 
+        # Check if task is skipped - return None without running
+        if command_name in self._skipped_tasks:
+            return None
+
         task = self.tasks.get(command_name)
         if task is None and call:
             task = Task(
-                self._snowflake_generator,
                 command_name,
                 call,
                 self._executor,
-                self._executor_sempahore,
+                self._executor_semaphore,
                 schedule=schedule,
                 trigger=trigger,
                 repeat=repeat,
@@ -139,9 +176,6 @@ class TaskRunner:
             )
 
             self.tasks[command_name] = task
-
-        if isinstance(timeout, str):
-            timeout = TimeParser(timeout).time
 
         if task and task.repeat == "NEVER":
             return task.run(
@@ -183,6 +217,10 @@ class TaskRunner:
         if command_name is None:
             command_name = command
 
+        # Check if task is skipped - return None without running
+        if command_name in self._skipped_tasks:
+            return None
+
         if isinstance(timeout, str):
             timeout = TimeParser(timeout).time
 
@@ -192,11 +230,10 @@ class TaskRunner:
         task = self.tasks.get(command_name)
         if task is None:
             task = Task(
-                self._snowflake_generator,
                 command_name,
                 command,
                 self._executor,
-                self._executor_sempahore,
+                self._executor_semaphore,
                 schedule=schedule,
                 trigger=trigger,
                 repeat=repeat,
@@ -229,14 +266,51 @@ class TaskRunner:
                 timeout=timeout,
             )
 
-    async def wait_all(self, tokens: list[str]):
+    async def wait_all(
+        self,
+        tokens: list[str],
+        timeout: float | None = None,
+    ):
+        """
+        Wait for multiple task runs to complete.
+
+        Args:
+            tokens: List of task run tokens.
+            timeout: Maximum time to wait for ALL tasks in seconds. None means wait forever.
+
+        Returns:
+            List of completed task run results.
+
+        Raises:
+            asyncio.TimeoutError: If timeout is exceeded before all tasks complete.
+        """
         return await asyncio.gather(
-            *[self.wait(token) for token in tokens],
+            *[self.wait(token, timeout=timeout) for token in tokens],
         )
 
-    async def wait(self, token: str) -> ShellProcess | TaskRun:
+    async def wait(
+        self,
+        token: str,
+        timeout: float | None = None,
+    ) -> ShellProcess | TaskRun:
+        """
+        Wait for a task run to complete.
+
+        Args:
+            token: The task run token (format: "task_name:run_id")
+            timeout: Maximum time to wait in seconds. None means wait forever.
+
+        Returns:
+            The completed task run result.
+
+        Raises:
+            asyncio.TimeoutError: If timeout is exceeded before task completes.
+            KeyError: If task or run doesn't exist.
+        """
         task_name, run_id_str = token.split(":", maxsplit=1)
         run_id = int(run_id_str)
+
+        start_time = asyncio.get_event_loop().time()
 
         update = await self.tasks[task_name].get_run_update(run_id)
         while update.status not in [
@@ -244,6 +318,13 @@ class TaskRunner:
             RunStatus.FAILED,
             RunStatus.CANCELLED,
         ]:
+            if timeout is not None:
+                elapsed = asyncio.get_event_loop().time() - start_time
+                if elapsed >= timeout:
+                    raise asyncio.TimeoutError(
+                        f"Timeout waiting for task {token} after {timeout}s"
+                    )
+
             await asyncio.sleep(self._cleanup_interval)
             update = await self.tasks[task_name].get_run_update(run_id)
 
@@ -297,11 +378,13 @@ class TaskRunner:
             await task.cancel_schedule(int(run_id))
 
     async def stop(self):
-        for task in self.tasks.values():
+        # Snapshot to avoid dict mutation during iteration
+        for task in list(self.tasks.values()):
             await task.shutdown()
 
     async def shutdown(self):
-        for task in self.tasks.values():
+        # Snapshot to avoid dict mutation during iteration
+        for task in list(self.tasks.values()):
             await task.shutdown()
 
         self._run_cleanup = False
@@ -312,7 +395,7 @@ class TaskRunner:
 
         except Exception:
             pass
-        
+
         if self._executor:
             try:
                 self._executor.shutdown(cancel_futures=True)
@@ -321,17 +404,18 @@ class TaskRunner:
                 pass
 
     def abort(self):
-        for task in self.tasks.values():
+        # Snapshot to avoid dict mutation during iteration
+        for task in list(self.tasks.values()):
             task.abort()
 
         self._run_cleanup = False
 
-        try:
-            self._cleanup_task.set_result(None)
+        if self._cleanup_task and not self._cleanup_task.done():
+            try:
+                self._cleanup_task.cancel()
+            except Exception:
+                pass
 
-        except Exception:
-            pass
-        
         if self._executor:
             try:
                 self._executor.shutdown(cancel_futures=True)
@@ -346,7 +430,8 @@ class TaskRunner:
 
     async def _cleanup_scheduled_tasks(self):
         try:
-            for task in self.tasks.values():
+            # Snapshot to avoid dict mutation during iteration
+            for task in list(self.tasks.values()):
                 await task.cleanup()
 
         except Exception:

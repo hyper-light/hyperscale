@@ -25,12 +25,33 @@ A high-performance, fault-tolerant distributed workflow execution system designe
   - [Failure Recovery Flows](#failure-recovery-flows)
   - [Network Partition Handling](#network-partition-handling)
   - [Cascading Failure Protection](#cascading-failure-protection)
+- [Zombie Job Prevention & Detection](#zombie-job-prevention--detection)
+  - [Zombie Job Lifecycle Diagram](#zombie-job-lifecycle-diagram)
+  - [Detection Mechanisms](#detection-mechanisms)
+  - [Prevention Mechanisms](#prevention-mechanisms)
+  - [Cleanup Mechanisms](#cleanup-mechanisms)
+  - [Cancellation Flow](#cancellation-flow-killing-zombie-jobs)
+  - [Complete Zombie Prevention State Machine](#complete-zombie-prevention-state-machine)
+  - [Known Gaps and Future Improvements](#known-gaps-and-future-improvements)
 - [Backpressure & Degradation](#backpressure--degradation)
 - [Scaling Operations](#scaling-operations)
 - [State Management](#state-management)
 - [Security](#security)
 - [Message Protocol Reference](#message-protocol-reference)
 - [Module Structure](#module-structure)
+- [Bootstrap & Service Discovery](#bootstrap--service-discovery)
+  - [Design Goals](#design-goals)
+  - [Architecture Decision](#architecture-decision)
+  - [Discovery Approaches Evaluated](#discovery-approaches-evaluated)
+  - [Chosen Solution: DNS + Seeds with Parallel Probing](#chosen-solution-dns--seeds-with-parallel-probing)
+  - [Bootstrap Protocol](#bootstrap-protocol)
+  - [DNS Resolution](#dns-resolution)
+  - [Peer Probing](#peer-probing)
+  - [Health-Aware Peer Cache](#health-aware-peer-cache)
+  - [Failure Scenarios](#failure-scenarios)
+  - [Configuration](#configuration)
+  - [Module Structure](#bootstrap-module-structure)
+  - [Example Implementations](#example-implementations)
 
 ---
 
@@ -491,6 +512,3922 @@ async def _dispatch_job_to_datacenters(
     # Dispatch with fallback support
     await self._dispatch_job_with_fallback(submission, primary_dcs, fallback_dcs)
 ```
+
+### AD-18: Hybrid Overload Detection (Delta + Absolute)
+
+**Decision**: Use delta-based detection with absolute safety bounds for overload detection.
+
+**Rationale**:
+- Fixed thresholds cause flapping and require per-workload tuning
+- Delta-based detection (rate of change) is self-calibrating
+- Pure delta misses absolute capacity limits and suffers baseline drift
+- Hybrid approach combines benefits of both
+
+**Detection Model**:
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Hybrid Overload Detection                    │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  Primary: Delta-based (% above EMA baseline + trend slope)     │
+│  ├─ Tracks latency/queue depth relative to baseline            │
+│  ├─ Uses Exponential Moving Average for baseline               │
+│  ├─ Calculates trend via linear regression on delta history    │
+│  └─ Self-calibrates to workload characteristics                │
+│                                                                 │
+│  Secondary: Absolute safety bounds (hard limits)               │
+│  ├─ Prevents baseline drift masking real problems              │
+│  ├─ Catches "stable but maxed out" scenarios                   │
+│  └─ Example: latency > 5000ms = overloaded regardless          │
+│                                                                 │
+│  Tertiary: Resource signals (CPU, memory, queue depth)         │
+│  ├─ Provides capacity awareness                                │
+│  └─ Catches "about to fail" before latency spikes              │
+│                                                                 │
+│  Final State = max(delta_state, absolute_state, resource_state)│
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**State Levels**:
+| State | Delta Threshold | Absolute Bound | Action |
+|-------|-----------------|----------------|--------|
+| healthy | < 20% above baseline | < 200ms | Normal operation |
+| busy | 20-50% above baseline | 200-500ms | Reduce new work |
+| stressed | 50-100% above baseline | 500-2000ms | Shed low-priority |
+| overloaded | > 100% above baseline OR rising trend | > 2000ms | Emergency shed |
+
+**Implementation**:
+```python
+@dataclass
+class OverloadConfig:
+    """Configuration for hybrid overload detection."""
+    # Delta detection
+    ema_alpha: float = 0.1  # Smoothing factor for baseline
+    current_window: int = 10  # Samples for current average
+    trend_window: int = 20  # Samples for trend calculation
+    delta_thresholds: tuple[float, float, float] = (0.2, 0.5, 1.0)  # busy/stressed/overloaded
+
+    # Absolute bounds (safety rails)
+    absolute_bounds: tuple[float, float, float] = (200.0, 500.0, 2000.0)
+
+    # Resource signals
+    cpu_thresholds: tuple[float, float, float] = (0.7, 0.85, 0.95)
+    memory_thresholds: tuple[float, float, float] = (0.7, 0.85, 0.95)
+
+class HybridOverloadDetector:
+    """Combines delta-based and absolute detection."""
+
+    def __init__(self, config: OverloadConfig | None = None):
+        self._config = config or OverloadConfig()
+        self._baseline_ema: float = 0.0
+        self._recent: deque[float] = deque(maxlen=self._config.current_window)
+        self._delta_history: deque[float] = deque(maxlen=self._config.trend_window)
+
+    def record_latency(self, latency_ms: float) -> None:
+        """Record a latency sample and update state."""
+        # Update baseline EMA
+        if self._baseline_ema == 0.0:
+            self._baseline_ema = latency_ms
+        else:
+            alpha = self._config.ema_alpha
+            self._baseline_ema = alpha * latency_ms + (1 - alpha) * self._baseline_ema
+
+        self._recent.append(latency_ms)
+
+        # Calculate delta (% above baseline)
+        if self._baseline_ema > 0:
+            current_avg = sum(self._recent) / len(self._recent)
+            delta = (current_avg - self._baseline_ema) / self._baseline_ema
+            self._delta_history.append(delta)
+
+    def get_state(self, cpu_percent: float = 0.0, memory_percent: float = 0.0) -> str:
+        """Get current overload state using hybrid detection."""
+        states = []
+
+        # Delta-based state
+        if len(self._recent) >= 3:
+            current_avg = sum(self._recent) / len(self._recent)
+            delta = (current_avg - self._baseline_ema) / max(self._baseline_ema, 1.0)
+            trend = self._calculate_trend()
+
+            if delta > self._config.delta_thresholds[2] or trend > 0.1:
+                states.append("overloaded")
+            elif delta > self._config.delta_thresholds[1]:
+                states.append("stressed")
+            elif delta > self._config.delta_thresholds[0]:
+                states.append("busy")
+            else:
+                states.append("healthy")
+
+        # Absolute bound state
+        if self._recent:
+            current_avg = sum(self._recent) / len(self._recent)
+            if current_avg > self._config.absolute_bounds[2]:
+                states.append("overloaded")
+            elif current_avg > self._config.absolute_bounds[1]:
+                states.append("stressed")
+            elif current_avg > self._config.absolute_bounds[0]:
+                states.append("busy")
+
+        # Resource state
+        cpu = cpu_percent / 100.0
+        if cpu > self._config.cpu_thresholds[2]:
+            states.append("overloaded")
+        elif cpu > self._config.cpu_thresholds[1]:
+            states.append("stressed")
+        elif cpu > self._config.cpu_thresholds[0]:
+            states.append("busy")
+
+        # Return worst state
+        state_order = {"healthy": 0, "busy": 1, "stressed": 2, "overloaded": 3}
+        return max(states, key=lambda s: state_order.get(s, 0)) if states else "healthy"
+```
+
+**Advantages**:
+- Self-calibrating: adapts to workload characteristics
+- Less configuration: works across different deployments
+- Catches both gradual degradation AND absolute limits
+- Trend detection provides early warning
+
+**Disadvantages**:
+- Warm-up period required (mitigated by absolute bounds)
+- More complex than simple thresholds
+- Baseline drift possible over long periods (mitigated by absolute bounds)
+
+### AD-19: Three-Signal Health Model (All Node Types)
+
+**Decision**: Separate node health into three independent signals: Liveness, Readiness, and Progress. Apply this model uniformly to Workers, Managers, and Gates.
+
+**Rationale**:
+- All node types run demanding workloads in a distributed system
+- Conflating "can't accept work" with "dead" causes premature eviction
+- Resource metrics alone are meaningless for heavy workloads
+- Progress (throughput) is ground truth for all node types
+- Uniform model simplifies reasoning and implementation
+
+**Health Model**:
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                 Three-Signal Worker Health Model                │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐             │
+│  │  LIVENESS   │  │  READINESS  │  │  PROGRESS   │             │
+│  │             │  │             │  │             │             │
+│  │ Can respond │  │ Can accept  │  │ Completing  │             │
+│  │ to probes?  │  │ new work?   │  │ workflows?  │             │
+│  │             │  │             │  │             │             │
+│  │ Binary:     │  │ Binary:     │  │ Rate-based: │             │
+│  │ yes/no      │  │ yes/no      │  │ completions │             │
+│  │             │  │             │  │ per interval│             │
+│  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘             │
+│         │                │                │                     │
+│         ▼                ▼                ▼                     │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                   Decision Matrix                        │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │ Liveness  Readiness  Progress   →  Action               │   │
+│  │ ────────  ─────────  ────────      ──────────────────── │   │
+│  │ YES       YES        NORMAL     →  HEALTHY (route work) │   │
+│  │ YES       NO         NORMAL     →  BUSY (drain only)    │   │
+│  │ YES       YES        LOW        →  SLOW (investigate)   │   │
+│  │ YES       NO         LOW        →  DEGRADED (drain)     │   │
+│  │ YES       *          ZERO       →  STUCK (drain+timer)  │   │
+│  │ NO        *          *          →  SUSPECT (begin evict)│   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Signal Definitions**:
+
+| Signal | Question | Measurement | Failure Threshold |
+|--------|----------|-------------|-------------------|
+| Liveness | Is process alive? | Ping/pong response | 3 consecutive misses, 30s timeout |
+| Readiness | Can accept work? | Self-reported + capacity | `accepting_work=false` OR `capacity=0` |
+| Progress | Is work completing? | Completions per interval | `actual_rate < expected_rate * 0.3` |
+
+**Implementation**:
+```python
+@dataclass
+class WorkerHealthState:
+    """Unified health state combining all three signals."""
+    worker_id: str
+
+    # Signal 1: Liveness
+    last_liveness_response: float  # timestamp
+    consecutive_liveness_failures: int
+
+    # Signal 2: Readiness
+    accepting_work: bool  # reported by worker
+    available_capacity: int
+
+    # Signal 3: Progress
+    workflows_assigned: int
+    completions_last_interval: int
+    expected_completion_rate: float
+
+    @property
+    def liveness(self) -> bool:
+        """Is the worker process alive and responsive?"""
+        time_since_response = time.monotonic() - self.last_liveness_response
+        return (
+            time_since_response < 30.0
+            and self.consecutive_liveness_failures < 3
+        )
+
+    @property
+    def readiness(self) -> bool:
+        """Can the worker accept new work?"""
+        return self.accepting_work and self.available_capacity > 0
+
+    @property
+    def progress_state(self) -> str:
+        """Is work completing at expected rate?"""
+        if self.workflows_assigned == 0:
+            return "idle"
+
+        actual_rate = self.completions_last_interval / max(self.workflows_assigned, 1)
+
+        if actual_rate >= self.expected_completion_rate * 0.8:
+            return "normal"
+        elif actual_rate >= self.expected_completion_rate * 0.3:
+            return "slow"
+        elif actual_rate > 0:
+            return "degraded"
+        else:
+            return "stuck"
+
+    def get_routing_decision(self) -> str:
+        """Determine action: route, drain, investigate, or evict."""
+        if not self.liveness:
+            return "evict"
+
+        progress = self.progress_state
+
+        if progress == "stuck" and self.workflows_assigned > 0:
+            return "evict"
+
+        if progress in ("slow", "degraded"):
+            return "investigate"
+
+        if not self.readiness:
+            return "drain"
+
+        return "route"
+```
+
+**Why This Model Is Correct**:
+| Alternative | Problem |
+|-------------|---------|
+| Single health score | Conflates independent failure modes |
+| Resource thresholds | Doesn't account for expected heavy usage |
+| Timeout-only | Can't distinguish slow from stuck |
+| Heartbeat-only | Process can heartbeat while frozen |
+
+#### Manager Health (Gate monitors Managers)
+
+Gates monitor manager health to make intelligent DC routing decisions.
+
+**Signal Definitions for Managers**:
+| Signal | Question | Measurement | Failure Threshold |
+|--------|----------|-------------|-------------------|
+| Liveness | Is manager responding? | SWIM probe response | 3 consecutive misses |
+| Readiness | Can accept jobs? | Has quorum + accepting jobs | `has_quorum=false` OR `accepting_jobs=false` |
+| Progress | Is work flowing? | Job throughput + dispatch rate | `dispatch_rate < expected * 0.3` |
+
+```python
+@dataclass
+class ManagerHealthState:
+    """Three-signal health state for managers (monitored by gates)."""
+    manager_id: str
+    datacenter_id: str
+
+    # Signal 1: Liveness
+    last_liveness_response: float
+    consecutive_liveness_failures: int
+
+    # Signal 2: Readiness
+    has_quorum: bool  # Can make authoritative decisions
+    accepting_jobs: bool  # Self-reported
+    active_worker_count: int  # Workers available for dispatch
+
+    # Signal 3: Progress
+    jobs_accepted_last_interval: int
+    workflows_dispatched_last_interval: int
+    expected_throughput: float  # Based on worker capacity
+
+    @property
+    def liveness(self) -> bool:
+        time_since_response = time.monotonic() - self.last_liveness_response
+        return (
+            time_since_response < 30.0
+            and self.consecutive_liveness_failures < 3
+        )
+
+    @property
+    def readiness(self) -> bool:
+        return (
+            self.has_quorum
+            and self.accepting_jobs
+            and self.active_worker_count > 0
+        )
+
+    @property
+    def progress_state(self) -> str:
+        if self.jobs_accepted_last_interval == 0:
+            return "idle"
+
+        actual_rate = self.workflows_dispatched_last_interval
+        if actual_rate >= self.expected_throughput * 0.8:
+            return "normal"
+        elif actual_rate >= self.expected_throughput * 0.3:
+            return "slow"
+        elif actual_rate > 0:
+            return "degraded"
+        else:
+            return "stuck"
+
+    def get_routing_decision(self) -> str:
+        """Determine whether gate should route jobs to this manager."""
+        if not self.liveness:
+            return "evict"  # Remove from DC's active managers
+
+        progress = self.progress_state
+
+        if progress == "stuck" and self.jobs_accepted_last_interval > 0:
+            return "evict"
+
+        if progress in ("slow", "degraded"):
+            return "investigate"
+
+        if not self.readiness:
+            return "drain"  # Don't send new jobs, let existing complete
+
+        return "route"
+```
+
+**Integration with DC Health Classification (AD-16)**:
+```
+DC Health = f(manager_health_states)
+
+If ALL managers NOT liveness → DC = UNHEALTHY
+If MAJORITY managers NOT readiness → DC = DEGRADED
+If ANY manager progress == "stuck" → DC = DEGRADED
+If ALL managers readiness but NO capacity → DC = BUSY
+Otherwise → DC = HEALTHY
+```
+
+#### Gate Health (Gates monitor peer Gates)
+
+Gates monitor peer gate health for leader election and job forwarding decisions.
+
+**Signal Definitions for Gates**:
+| Signal | Question | Measurement | Failure Threshold |
+|--------|----------|-------------|-------------------|
+| Liveness | Is gate responding? | SWIM probe response | 3 consecutive misses |
+| Readiness | Can handle jobs? | Has DC connectivity + not overloaded | `dc_connectivity=false` OR `overloaded=true` |
+| Progress | Is work flowing? | Job forwarding rate + stats aggregation | `forward_rate < expected * 0.3` |
+
+```python
+@dataclass
+class GateHealthState:
+    """Three-signal health state for gates (monitored by peer gates)."""
+    gate_id: str
+
+    # Signal 1: Liveness
+    last_liveness_response: float
+    consecutive_liveness_failures: int
+
+    # Signal 2: Readiness
+    has_dc_connectivity: bool  # Can reach at least one DC
+    connected_dc_count: int
+    overload_state: str  # From HybridOverloadDetector
+
+    # Signal 3: Progress
+    jobs_forwarded_last_interval: int
+    stats_aggregated_last_interval: int
+    expected_forward_rate: float
+
+    @property
+    def liveness(self) -> bool:
+        time_since_response = time.monotonic() - self.last_liveness_response
+        return (
+            time_since_response < 30.0
+            and self.consecutive_liveness_failures < 3
+        )
+
+    @property
+    def readiness(self) -> bool:
+        return (
+            self.has_dc_connectivity
+            and self.connected_dc_count > 0
+            and self.overload_state not in ("stressed", "overloaded")
+        )
+
+    @property
+    def progress_state(self) -> str:
+        if self.jobs_forwarded_last_interval == 0:
+            return "idle"
+
+        actual_rate = self.jobs_forwarded_last_interval
+        if actual_rate >= self.expected_forward_rate * 0.8:
+            return "normal"
+        elif actual_rate >= self.expected_forward_rate * 0.3:
+            return "slow"
+        elif actual_rate > 0:
+            return "degraded"
+        else:
+            return "stuck"
+
+    def get_routing_decision(self) -> str:
+        """Determine whether to forward jobs to this gate."""
+        if not self.liveness:
+            return "evict"  # Remove from peer list
+
+        progress = self.progress_state
+
+        if progress == "stuck" and self.jobs_forwarded_last_interval > 0:
+            return "evict"
+
+        if progress in ("slow", "degraded"):
+            return "investigate"
+
+        if not self.readiness:
+            return "drain"
+
+        return "route"
+
+    def should_participate_in_election(self) -> bool:
+        """Gates with poor health shouldn't become leaders."""
+        return (
+            self.liveness
+            and self.readiness
+            and self.progress_state in ("idle", "normal")
+        )
+```
+
+#### Generic Node Health Infrastructure
+
+```python
+from typing import Generic, TypeVar, Protocol
+
+class HealthSignals(Protocol):
+    """Protocol for health signal providers."""
+    @property
+    def liveness(self) -> bool: ...
+    @property
+    def readiness(self) -> bool: ...
+    @property
+    def progress_state(self) -> str: ...
+
+T = TypeVar("T", bound=HealthSignals)
+
+class NodeHealthTracker(Generic[T]):
+    """Generic health tracker for any node type."""
+
+    def __init__(self, node_type: str):
+        self._node_type = node_type
+        self._states: dict[str, T] = {}
+        self._history: dict[str, deque[str]] = {}  # node_id -> recent decisions
+
+    def update_state(self, node_id: str, state: T) -> None:
+        self._states[node_id] = state
+
+    def get_routing_decision(self, node_id: str) -> str:
+        if node_id not in self._states:
+            return "unknown"
+        return self._states[node_id].get_routing_decision()
+
+    def get_healthy_nodes(self) -> list[str]:
+        return [
+            node_id for node_id, state in self._states.items()
+            if state.liveness and state.readiness
+        ]
+
+    def should_evict(self, node_id: str) -> tuple[bool, str]:
+        """
+        Determine if node should be evicted with correlation check.
+        Returns (should_evict, reason).
+        """
+        if node_id not in self._states:
+            return False, "unknown node"
+
+        state = self._states[node_id]
+        decision = state.get_routing_decision()
+
+        if decision != "evict":
+            return False, "healthy"
+
+        # Correlation check: are many nodes failing?
+        total = len(self._states)
+        failing = sum(
+            1 for s in self._states.values()
+            if s.get_routing_decision() == "evict"
+        )
+
+        if failing > total * 0.5:
+            # More than half failing - likely systemic issue
+            return False, "systemic failure detected, holding eviction"
+
+        return True, "eviction criteria met"
+```
+
+#### SWIM Piggyback for Health State
+
+Health signals are piggybacked on SWIM protocol messages for protocol efficiency:
+
+```python
+@dataclass
+class HealthPiggyback:
+    """Health state embedded in SWIM messages."""
+    node_id: str
+    node_type: str  # "worker" | "manager" | "gate"
+
+    # Readiness signal
+    accepting_work: bool
+    capacity: int  # Available slots/cores
+
+    # Progress signal (last interval)
+    throughput: int  # Completions/dispatches/forwards
+    expected_throughput: int
+
+    # Overload signal (from AD-18)
+    overload_state: str  # "healthy" | "busy" | "stressed" | "overloaded"
+```
+
+### AD-20: Cancellation Propagation
+
+**Decision**: Implement four-phase cancellation: Client → Gate → Manager → Worker.
+
+**Rationale**:
+- Users need ability to stop long-running jobs
+- Resources should be freed promptly
+- Cancellation must be idempotent and handle partial failures
+- Each layer confirms cancellation before propagating
+
+**Cancellation Flow**:
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Cancellation Propagation                     │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  Client                Gate                Manager      Worker  │
+│    │                    │                    │            │     │
+│    │─ CancelJob(id) ───►│                    │            │     │
+│    │                    │─ CancelJob(id) ───►│            │     │
+│    │                    │                    │─ Cancel ──►│     │
+│    │                    │                    │◄── Ack ────│     │
+│    │                    │◄─── Ack ───────────│            │     │
+│    │◄─── Ack ───────────│                    │            │     │
+│    │                    │                    │            │     │
+│  Phase 1: Request    Phase 2: Forward     Phase 3: Execute     │
+│                      Phase 4: Confirm (reverse direction)       │
+│                                                                 │
+│  Timeout behavior:                                              │
+│  - If Worker doesn't ACK: Manager retries, then marks failed   │
+│  - If Manager doesn't ACK: Gate retries, then best-effort      │
+│  - Client receives "cancellation requested" immediately        │
+│  - Final status pushed when all DCs confirm                    │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Message Types**:
+```python
+@dataclass
+class JobCancelRequest:
+    job_id: str
+    requester_id: str  # For audit trail
+    timestamp: float
+    fence_token: int  # Must match current job epoch
+
+@dataclass
+class JobCancelResponse:
+    job_id: str
+    success: bool
+    cancelled_workflow_count: int
+    error: str | None = None
+```
+
+**Idempotency**: Cancellation requests are idempotent - repeated requests return success if job is already cancelled or cancelling.
+
+### AD-21: Unified Retry Framework with Jitter
+
+**Decision**: Implement a unified retry framework with exponential backoff and jitter for all network operations.
+
+**Rationale**:
+- Scattered retry implementations lead to inconsistency
+- Without jitter, retries cause thundering herd
+- Different jitter strategies suit different scenarios
+- Framework enables consistent timeout and backoff across codebase
+
+**Jitter Strategies**:
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                       Jitter Strategies                         │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  Full Jitter (default for most operations):                    │
+│  ├─ delay = random(0, min(cap, base * 2^attempt))              │
+│  ├─ Best for independent clients                               │
+│  └─ Maximum spread, minimum correlation                        │
+│                                                                 │
+│  Equal Jitter (for operations needing minimum delay):          │
+│  ├─ temp = min(cap, base * 2^attempt)                          │
+│  ├─ delay = temp/2 + random(0, temp/2)                         │
+│  └─ Guarantees minimum delay while spreading                   │
+│                                                                 │
+│  Decorrelated Jitter (for AWS-style retries):                  │
+│  ├─ delay = random(base, previous_delay * 3)                   │
+│  ├─ Each retry depends on previous                             │
+│  └─ Good spread with bounded growth                            │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Implementation**:
+```python
+class JitterStrategy(Enum):
+    FULL = "full"
+    EQUAL = "equal"
+    DECORRELATED = "decorrelated"
+
+@dataclass
+class RetryConfig:
+    """Configuration for retry behavior."""
+    max_attempts: int = 3
+    base_delay: float = 0.5  # seconds
+    max_delay: float = 30.0  # cap
+    jitter: JitterStrategy = JitterStrategy.FULL
+    retryable_exceptions: tuple[type[Exception], ...] = (
+        ConnectionError,
+        TimeoutError,
+        OSError,
+    )
+
+class RetryExecutor:
+    """Unified retry execution with jitter."""
+
+    def __init__(self, config: RetryConfig | None = None):
+        self._config = config or RetryConfig()
+        self._previous_delay: float = self._config.base_delay
+
+    def calculate_delay(self, attempt: int) -> float:
+        """Calculate delay with jitter for given attempt."""
+        base = self._config.base_delay
+        cap = self._config.max_delay
+
+        if self._config.jitter == JitterStrategy.FULL:
+            temp = min(cap, base * (2 ** attempt))
+            return random.uniform(0, temp)
+
+        elif self._config.jitter == JitterStrategy.EQUAL:
+            temp = min(cap, base * (2 ** attempt))
+            return temp / 2 + random.uniform(0, temp / 2)
+
+        elif self._config.jitter == JitterStrategy.DECORRELATED:
+            delay = random.uniform(base, self._previous_delay * 3)
+            delay = min(cap, delay)
+            self._previous_delay = delay
+            return delay
+
+        return base * (2 ** attempt)  # fallback: no jitter
+
+    async def execute(
+        self,
+        operation: Callable[[], Awaitable[T]],
+        operation_name: str = "operation",
+    ) -> T:
+        """Execute operation with retry and jitter."""
+        last_exception: Exception | None = None
+
+        for attempt in range(self._config.max_attempts):
+            try:
+                return await operation()
+            except self._config.retryable_exceptions as exc:
+                last_exception = exc
+                if attempt < self._config.max_attempts - 1:
+                    delay = self.calculate_delay(attempt)
+                    await asyncio.sleep(delay)
+
+        raise last_exception or RuntimeError(f"{operation_name} failed")
+```
+
+**Where Jitter Is Applied**:
+- Health check intervals
+- Retry delays
+- Heartbeat timing
+- State sync intervals
+- Leader election timeouts
+- Reconnection attempts
+
+### AD-22: Load Shedding with Priority Queues
+
+**Decision**: Implement load shedding using priority-based request classification.
+
+**Rationale**:
+- Under overload, processing all requests degrades all users
+- Shedding low-priority work protects critical operations
+- Priority should be explicit, not implicit
+- Graceful degradation is better than complete failure
+
+**Priority Levels**:
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Load Shedding Priority                       │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  Priority 0 (CRITICAL) - Never shed:                           │
+│  ├─ Health checks / liveness probes                            │
+│  ├─ Cancellation requests                                      │
+│  ├─ Final result delivery                                      │
+│  └─ Cluster membership (SWIM)                                  │
+│                                                                 │
+│  Priority 1 (HIGH) - Shed under severe overload:               │
+│  ├─ Job submissions                                            │
+│  ├─ Workflow dispatch                                          │
+│  └─ State sync requests                                        │
+│                                                                 │
+│  Priority 2 (NORMAL) - Shed under moderate overload:           │
+│  ├─ Progress updates                                           │
+│  ├─ Stats queries                                              │
+│  └─ Reconnection requests                                      │
+│                                                                 │
+│  Priority 3 (LOW) - Shed first:                                │
+│  ├─ Detailed stats                                             │
+│  ├─ Debug/diagnostic requests                                  │
+│  └─ Non-essential sync                                         │
+│                                                                 │
+│  Shedding Thresholds (based on overload state):                │
+│  ├─ healthy: shed nothing                                      │
+│  ├─ busy: shed Priority 3                                      │
+│  ├─ stressed: shed Priority 2-3                                │
+│  └─ overloaded: shed Priority 1-3 (only CRITICAL processed)   │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Implementation**:
+```python
+class RequestPriority(Enum):
+    CRITICAL = 0
+    HIGH = 1
+    NORMAL = 2
+    LOW = 3
+
+class LoadShedder:
+    """Determines whether to shed requests based on priority and load."""
+
+    def __init__(self, overload_detector: HybridOverloadDetector):
+        self._detector = overload_detector
+
+        # Map overload state to minimum priority processed
+        self._shed_thresholds: dict[str, int] = {
+            "healthy": 4,    # Process all (nothing shed)
+            "busy": 3,       # Shed LOW
+            "stressed": 2,   # Shed NORMAL and LOW
+            "overloaded": 1, # Only CRITICAL (shed HIGH, NORMAL, LOW)
+        }
+
+    def should_shed(self, priority: RequestPriority) -> bool:
+        """Return True if request should be shed."""
+        state = self._detector.get_state()
+        min_priority = self._shed_thresholds.get(state, 4)
+        return priority.value >= min_priority
+
+    def classify_request(self, message_type: str) -> RequestPriority:
+        """Classify request by message type."""
+        critical_types = {"ping", "cancel_job", "final_result", "swim_*"}
+        high_types = {"job_submit", "workflow_dispatch", "state_sync"}
+        normal_types = {"progress_update", "stats_query", "register_callback"}
+
+        if message_type in critical_types:
+            return RequestPriority.CRITICAL
+        elif message_type in high_types:
+            return RequestPriority.HIGH
+        elif message_type in normal_types:
+            return RequestPriority.NORMAL
+        else:
+            return RequestPriority.LOW
+```
+
+### AD-23: Backpressure for Stats Updates
+
+**Decision**: Implement tiered stats retention with backpressure signaling.
+
+**Rationale**:
+- Unbounded stats history causes memory exhaustion
+- Different retention needs for different data freshness
+- Upstream should slow down when downstream is overwhelmed
+- Explicit backpressure prevents silent data loss
+
+**Tiered Retention**:
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                  Tiered Stats Retention                         │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  HOT (0-60 seconds):                                           │
+│  ├─ Full resolution (every update)                             │
+│  ├─ In-memory ring buffer                                      │
+│  └─ Used for real-time dashboards                              │
+│                                                                 │
+│  WARM (1-60 minutes):                                          │
+│  ├─ 10-second aggregates                                       │
+│  ├─ Compressed in-memory                                       │
+│  └─ Used for recent history                                    │
+│                                                                 │
+│  COLD (1-24 hours):                                            │
+│  ├─ 1-minute aggregates                                        │
+│  ├─ Spill to disk if needed                                    │
+│  └─ Used for job post-mortems                                  │
+│                                                                 │
+│  ARCHIVE (> 24 hours):                                         │
+│  ├─ Final summary only                                         │
+│  └─ Persisted with job completion                              │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Backpressure Levels**:
+```python
+class BackpressureLevel(Enum):
+    NONE = 0       # Accept all updates
+    THROTTLE = 1   # Reduce update frequency
+    BATCH = 2      # Only accept batched updates
+    REJECT = 3     # Reject non-critical updates
+
+@dataclass
+class StatsBuffer:
+    """Bounded stats buffer with backpressure."""
+    max_hot_entries: int = 1000
+    max_warm_entries: int = 360  # 1 hour at 10s intervals
+    max_cold_entries: int = 1440  # 24 hours at 1m intervals
+
+    hot: deque[StatsEntry]
+    warm: deque[AggregatedStats]
+    cold: deque[AggregatedStats]
+
+    def get_backpressure_level(self) -> BackpressureLevel:
+        """Determine backpressure based on buffer fill."""
+        hot_fill = len(self.hot) / self.max_hot_entries
+
+        if hot_fill < 0.7:
+            return BackpressureLevel.NONE
+        elif hot_fill < 0.85:
+            return BackpressureLevel.THROTTLE
+        elif hot_fill < 0.95:
+            return BackpressureLevel.BATCH
+        else:
+            return BackpressureLevel.REJECT
+```
+
+### AD-24: Rate Limiting (Client and Server)
+
+**Decision**: Implement token bucket rate limiting at both client and server sides.
+
+**Rationale**:
+- Prevents any single client from overwhelming the system
+- Server-side is authoritative; client-side is cooperative
+- Token bucket allows bursts while enforcing average rate
+- Per-client tracking enables fair sharing
+
+**Implementation**:
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Rate Limiting Architecture                   │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  Client-Side (cooperative):                                     │
+│  ├─ Pre-flight check before sending                            │
+│  ├─ Respects server's rate limit headers                       │
+│  └─ Delays requests when approaching limit                     │
+│                                                                 │
+│  Server-Side (authoritative):                                   │
+│  ├─ Per-client token buckets                                   │
+│  ├─ Returns 429 with Retry-After when exceeded                 │
+│  └─ Different limits for different operation types             │
+│                                                                 │
+│  Token Bucket Parameters:                                       │
+│  ├─ bucket_size: Maximum burst capacity                        │
+│  ├─ refill_rate: Tokens added per second                       │
+│  └─ current_tokens: Available tokens                           │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+```python
+class TokenBucket:
+    """Token bucket rate limiter."""
+
+    def __init__(self, bucket_size: int, refill_rate: float):
+        self._bucket_size = bucket_size
+        self._refill_rate = refill_rate
+        self._tokens = float(bucket_size)
+        self._last_refill = time.monotonic()
+        self._lock = asyncio.Lock()
+
+    async def acquire(self, tokens: int = 1) -> bool:
+        """Try to acquire tokens. Returns False if rate limited."""
+        async with self._lock:
+            self._refill()
+            if self._tokens >= tokens:
+                self._tokens -= tokens
+                return True
+            return False
+
+    def _refill(self) -> None:
+        """Refill tokens based on elapsed time."""
+        now = time.monotonic()
+        elapsed = now - self._last_refill
+        self._tokens = min(
+            self._bucket_size,
+            self._tokens + elapsed * self._refill_rate
+        )
+        self._last_refill = now
+
+class ServerRateLimiter:
+    """Server-side rate limiter with per-client buckets."""
+
+    def __init__(self, default_config: RateLimitConfig):
+        self._config = default_config
+        self._buckets: dict[str, TokenBucket] = {}
+
+    def check_rate_limit(self, client_id: str, operation: str) -> tuple[bool, float]:
+        """Check if request is allowed. Returns (allowed, retry_after)."""
+        bucket = self._get_or_create_bucket(client_id, operation)
+        if bucket.acquire(1):
+            return True, 0.0
+        else:
+            retry_after = 1.0 / bucket._refill_rate
+            return False, retry_after
+```
+
+### AD-25: Version Skew Handling
+
+**Decision**: Support rolling upgrades via protocol versioning and capability negotiation.
+
+**Rationale**:
+- Zero-downtime upgrades require version compatibility
+- Nodes must handle messages from older/newer versions
+- Unknown fields should be ignored, not rejected
+- Capability advertisement enables gradual feature rollout
+
+**Protocol Versioning**:
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Version Skew Handling                        │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  Version Format: MAJOR.MINOR                                    │
+│  ├─ MAJOR: Breaking changes (must match)                       │
+│  └─ MINOR: Additive changes (newer can talk to older)          │
+│                                                                 │
+│  Handshake includes:                                            │
+│  ├─ protocol_version: "1.2"                                    │
+│  ├─ capabilities: ["cancellation", "batched_stats", ...]       │
+│  └─ node_version: "hyperscale-0.5.0" (informational)           │
+│                                                                 │
+│  Compatibility Rules:                                           │
+│  ├─ Same MAJOR: compatible                                     │
+│  ├─ Different MAJOR: reject connection                         │
+│  ├─ Newer MINOR → older: use older's feature set               │
+│  └─ Older MINOR → newer: newer ignores unknown capabilities    │
+│                                                                 │
+│  Message Handling:                                              │
+│  ├─ Unknown fields: ignore (forward compatibility)             │
+│  ├─ Missing optional fields: use defaults                      │
+│  └─ Missing required fields: reject with clear error           │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Implementation**:
+```python
+@dataclass
+class ProtocolVersion:
+    major: int
+    minor: int
+
+    def is_compatible_with(self, other: "ProtocolVersion") -> bool:
+        return self.major == other.major
+
+    def supports_feature(self, other: "ProtocolVersion", feature: str) -> bool:
+        """Check if feature is supported by both versions."""
+        # Feature was added in version X.Y
+        feature_versions = {
+            "cancellation": (1, 0),
+            "batched_stats": (1, 1),
+            "client_reconnection": (1, 2),
+            "fence_tokens": (1, 2),
+        }
+        required = feature_versions.get(feature, (999, 999))
+        return (
+            (self.major, self.minor) >= required
+            and (other.major, other.minor) >= required
+        )
+
+@dataclass
+class NodeCapabilities:
+    protocol_version: ProtocolVersion
+    capabilities: set[str]
+    node_version: str  # Informational
+
+    def negotiate(self, other: "NodeCapabilities") -> set[str]:
+        """Return capabilities supported by both nodes."""
+        return self.capabilities & other.capabilities
+```
+
+### AD-26: Adaptive Healthcheck Extensions
+
+**Decision**: Allow healthcheck deadline extensions with logarithmic grant reduction.
+
+**Rationale**:
+- Long-running operations may legitimately need more time
+- Unlimited extensions enable abuse
+- Logarithmic reduction discourages repeated requests
+- Extensions require active negotiation (not automatic)
+
+**Extension Protocol**:
+```
+┌─────────────────────────────────────────────────────────────────┐
+│              Adaptive Healthcheck Extensions                    │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  Base deadline: 30 seconds                                      │
+│                                                                 │
+│  Extension grants (logarithmic reduction):                      │
+│  ├─ 1st extension: +30s (100% of base)                         │
+│  ├─ 2nd extension: +15s (50% of base)                          │
+│  ├─ 3rd extension: +7.5s (25% of base)                         │
+│  ├─ 4th extension: +3.75s (12.5% of base)                      │
+│  └─ ...converges to minimum (1s)                               │
+│                                                                 │
+│  Formula: grant = max(min_grant, base / (2^extension_count))   │
+│                                                                 │
+│  Extension request must include:                                │
+│  ├─ reason: "long_workflow" | "gc_pause" | "resource_contention"│
+│  ├─ estimated_completion: timestamp                            │
+│  └─ current_progress: 0.0-1.0                                  │
+│                                                                 │
+│  Extension denied if:                                           │
+│  ├─ No progress since last extension                           │
+│  ├─ Total extensions exceed max (e.g., 5)                      │
+│  └─ Node is already marked suspect                             │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Implementation**:
+```python
+@dataclass
+class ExtensionTracker:
+    """Tracks healthcheck extensions for a worker."""
+    worker_id: str
+    base_deadline: float = 30.0
+    min_grant: float = 1.0
+    max_extensions: int = 5
+
+    extension_count: int = 0
+    last_progress: float = 0.0
+    total_extended: float = 0.0
+
+    def request_extension(
+        self,
+        reason: str,
+        current_progress: float,
+    ) -> tuple[bool, float]:
+        """
+        Request deadline extension.
+        Returns (granted, extension_seconds).
+        """
+        # Deny if too many extensions
+        if self.extension_count >= self.max_extensions:
+            return False, 0.0
+
+        # Deny if no progress
+        if current_progress <= self.last_progress and self.extension_count > 0:
+            return False, 0.0
+
+        # Calculate grant with logarithmic reduction
+        grant = max(
+            self.min_grant,
+            self.base_deadline / (2 ** self.extension_count)
+        )
+
+        self.extension_count += 1
+        self.last_progress = current_progress
+        self.total_extended += grant
+
+        return True, grant
+
+    def reset(self) -> None:
+        """Reset tracker when worker completes operation or recovers."""
+        self.extension_count = 0
+        self.last_progress = 0.0
+        self.total_extended = 0.0
+```
+
+**Message Types**:
+```python
+@dataclass
+class HealthcheckExtensionRequest:
+    """Worker requests more time before being marked unhealthy."""
+    worker_id: str
+    reason: str  # "long_workflow" | "gc_pause" | "resource_contention"
+    current_progress: float  # 0.0 to 1.0
+    estimated_completion: float  # Unix timestamp
+    active_workflow_count: int
+
+@dataclass
+class HealthcheckExtensionResponse:
+    """Manager response to extension request."""
+    granted: bool
+    extension_seconds: float  # 0.0 if not granted
+    new_deadline: float  # Unix timestamp of new deadline
+    remaining_extensions: int  # How many more can be requested
+    denial_reason: str | None = None  # If not granted
+```
+
+**Complete Protocol Flow Example**:
+```
+┌─────────────────────────────────────────────────────────────────┐
+│           Healthcheck Extension Protocol Flow                   │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  Worker                                    Manager              │
+│    │                                          │                 │
+│    │◄──── Healthcheck probe ─────────────────│ (deadline: 30s) │
+│    │                                          │                 │
+│    │  [Running long workflow, needs more time]│                 │
+│    │                                          │                 │
+│    │─── ExtensionRequest(progress=0.3) ─────►│                 │
+│    │                                          │                 │
+│    │    [Manager: extension_count=0]          │                 │
+│    │    [Grant: 30s / 2^0 = 30s]              │                 │
+│    │                                          │                 │
+│    │◄── ExtensionResponse(granted=True, 30s)─│ (deadline: 60s) │
+│    │                                          │                 │
+│    │  [Still working...]                      │                 │
+│    │                                          │                 │
+│    │─── ExtensionRequest(progress=0.6) ─────►│                 │
+│    │                                          │                 │
+│    │    [Manager: extension_count=1]          │                 │
+│    │    [Grant: 30s / 2^1 = 15s]              │                 │
+│    │                                          │                 │
+│    │◄── ExtensionResponse(granted=True, 15s)─│ (deadline: 75s) │
+│    │                                          │                 │
+│    │─── ExtensionRequest(progress=0.6) ─────►│ [NO PROGRESS!]  │
+│    │                                          │                 │
+│    │◄── ExtensionResponse(granted=False) ────│ (denied)        │
+│    │                                          │                 │
+│    │  [Worker marked SUSPECT after deadline] │                 │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Manager-Side Integration**:
+```python
+class WorkerHealthManager:
+    """Manages worker health with extension support."""
+
+    def __init__(self):
+        self._extension_trackers: dict[str, ExtensionTracker] = {}
+        self._worker_deadlines: dict[str, float] = {}
+
+    def handle_extension_request(
+        self,
+        request: HealthcheckExtensionRequest,
+    ) -> HealthcheckExtensionResponse:
+        """Process extension request from worker."""
+        tracker = self._extension_trackers.setdefault(
+            request.worker_id,
+            ExtensionTracker(worker_id=request.worker_id)
+        )
+
+        granted, extension_seconds = tracker.request_extension(
+            reason=request.reason,
+            current_progress=request.current_progress,
+        )
+
+        if granted:
+            current_deadline = self._worker_deadlines.get(
+                request.worker_id,
+                time.monotonic() + 30.0
+            )
+            new_deadline = current_deadline + extension_seconds
+            self._worker_deadlines[request.worker_id] = new_deadline
+
+            return HealthcheckExtensionResponse(
+                granted=True,
+                extension_seconds=extension_seconds,
+                new_deadline=new_deadline,
+                remaining_extensions=tracker.max_extensions - tracker.extension_count,
+            )
+        else:
+            denial_reason = self._get_denial_reason(tracker, request)
+            return HealthcheckExtensionResponse(
+                granted=False,
+                extension_seconds=0.0,
+                new_deadline=self._worker_deadlines.get(request.worker_id, 0.0),
+                remaining_extensions=max(0, tracker.max_extensions - tracker.extension_count),
+                denial_reason=denial_reason,
+            )
+
+    def _get_denial_reason(
+        self,
+        tracker: ExtensionTracker,
+        request: HealthcheckExtensionRequest,
+    ) -> str:
+        if tracker.extension_count >= tracker.max_extensions:
+            return f"Maximum extensions ({tracker.max_extensions}) exceeded"
+        if request.current_progress <= tracker.last_progress:
+            return f"No progress since last extension (was {tracker.last_progress}, now {request.current_progress})"
+        return "Extension denied"
+
+    def on_worker_healthy(self, worker_id: str) -> None:
+        """Reset extension tracker when worker completes successfully."""
+        if worker_id in self._extension_trackers:
+            self._extension_trackers[worker_id].reset()
+```
+
+**Grant Reduction Table**:
+| Extension # | Formula | Grant (base=30s) | Cumulative |
+|-------------|---------|------------------|------------|
+| 1 | 30 / 2^0 | 30.0s | 30.0s |
+| 2 | 30 / 2^1 | 15.0s | 45.0s |
+| 3 | 30 / 2^2 | 7.5s | 52.5s |
+| 4 | 30 / 2^3 | 3.75s | 56.25s |
+| 5 | 30 / 2^4 | 1.875s → 1.0s (min) | 57.25s |
+| 6+ | — | denied | — |
+
+**Key Properties**:
+- **Converging**: Total extension converges (geometric series)
+- **Progress-gated**: Must show forward progress to get more time
+- **Bounded**: Hard limit on extension count prevents indefinite delays
+- **Self-limiting**: Diminishing returns discourage dependency on extensions
+
+### AD-27: Gate Module Reorganization
+
+**Decision**: Reorganize gate-related code into focused modules following manager patterns.
+
+**Rationale**:
+- Current gate.py is monolithic and hard to maintain
+- Similar to manager refactoring already completed
+- One class per file improves testability
+- Clear module boundaries reduce coupling
+
+**Proposed Structure**:
+```
+hyperscale/distributed_rewrite/
+├── jobs/
+│   ├── gates/                    # Gate-side job management
+│   │   ├── __init__.py
+│   │   ├── gate_job_manager.py   # Per-job state and locking
+│   │   ├── job_forwarding.py     # Cross-gate job forwarding
+│   │   └── consistent_hash.py    # Per-job gate ownership
+│   │
+│   ├── managers/                 # Manager-side (existing)
+│   │   ├── __init__.py
+│   │   ├── job_manager.py
+│   │   ├── worker_pool.py
+│   │   └── workflow_dispatcher.py
+│   │
+│   └── __init__.py
+│
+├── datacenters/                  # DC-level coordination
+│   ├── __init__.py
+│   ├── datacenter_health.py      # DatacenterHealthManager
+│   ├── manager_dispatcher.py     # ManagerDispatcher
+│   └── lease_manager.py          # DC lease management
+│
+├── reliability/                  # Cross-cutting reliability
+│   ├── __init__.py
+│   ├── retry.py                  # RetryExecutor
+│   ├── circuit_breaker.py        # CircuitBreaker
+│   ├── load_shedding.py          # LoadShedder
+│   ├── backpressure.py           # BackpressureController
+│   ├── rate_limiting.py          # TokenBucket, RateLimiter
+│   ├── overload.py               # HybridOverloadDetector
+│   └── jitter.py                 # Jitter utilities
+│
+├── health/                       # Health checking
+│   ├── __init__.py
+│   ├── worker_health.py          # WorkerHealthState, three-signal model
+│   ├── extension_tracker.py      # Adaptive extensions
+│   └── probes.py                 # Liveness/Readiness probe implementations
+│
+└── swim/
+    └── gates/                    # Gate SWIM extensions
+        ├── __init__.py
+        └── peer_topology.py      # GatePeerTopology
+```
+
+**Migration Plan**:
+1. Create new module directories
+2. Extract classes one at a time (preserve behavior)
+3. Update imports in gate.py incrementally
+4. Add tests for each extracted class
+5. Final cleanup of gate.py
+
+---
+
+### AD-28: Enhanced DNS Discovery with Peer Selection
+
+**Decision**: Implement a robust, locality-aware peer discovery and selection system using Weighted Rendezvous Hashing combined with Adaptive EWMA-based selection, bounded connection pools, and comprehensive security validation.
+
+**Rationale**:
+- Current static seed approach doesn't scale for globally distributed deployments
+- Need to prevent accidental cross-cluster and cross-environment joins
+- Role-based security prevents workers from directly contacting gates or vice versa
+- Locality awareness reduces latency by preferring same-DC peers
+- Adaptive selection handles heterogeneous peer performance gracefully
+- Sticky connections reduce connection churn while allowing health-based eviction
+
+**Problem Statement**:
+In a globally distributed performance testing framework, peers can:
+1. Be in different datacenters with varying latencies (1ms same-DC vs 200ms cross-region)
+2. Experience temporary overload during test execution
+3. Crash and restart with different IPs (Kubernetes pod replacement)
+4. Be misconfigured to accidentally join wrong cluster/environment
+5. Attempt unauthorized role-based connections (worker→gate should be blocked)
+
+#### Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                     ENHANCED DNS DISCOVERY ARCHITECTURE                               │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                       │
+│  ┌─────────────────────────────────────────────────────────────────────────────────┐ │
+│  │                           LAYER 1: DNS RESOLUTION                                │ │
+│  │                                                                                   │ │
+│  │  ┌──────────────┐   ┌──────────────┐   ┌──────────────┐   ┌──────────────┐     │ │
+│  │  │   Static     │   │     DNS      │   │   Negative   │   │   Positive   │     │ │
+│  │  │   Seeds      │   │   Resolver   │   │    Cache     │   │    Cache     │     │ │
+│  │  │              │   │              │   │              │   │              │     │ │
+│  │  │ 10.0.1.5:9000│   │ SRV records  │   │ Failed hosts │   │ Resolved IPs │     │ │
+│  │  │ 10.0.1.6:9000│   │ + A records  │   │ (30s TTL)    │   │ (DNS TTL)    │     │ │
+│  │  └──────┬───────┘   └──────┬───────┘   └──────┬───────┘   └──────┬───────┘     │ │
+│  │         │                  │                  │                  │              │ │
+│  │         └──────────────────┴──────────────────┴──────────────────┘              │ │
+│  │                                   │                                              │ │
+│  │                                   ▼                                              │ │
+│  │                        ┌─────────────────────┐                                  │ │
+│  │                        │  Candidate Set      │                                  │ │
+│  │                        │  (all discovered)   │                                  │ │
+│  │                        └──────────┬──────────┘                                  │ │
+│  └───────────────────────────────────┼──────────────────────────────────────────────┘ │
+│                                      │                                                │
+│  ┌───────────────────────────────────┼──────────────────────────────────────────────┐ │
+│  │                           LAYER 2: SECURITY VALIDATION                           │ │
+│  │                                   │                                              │ │
+│  │                                   ▼                                              │ │
+│  │                        ┌─────────────────────┐                                  │ │
+│  │                        │  Cluster ID Check   │ ─── Reject if cluster_id ≠ ours  │ │
+│  │                        └──────────┬──────────┘                                  │ │
+│  │                                   │                                              │ │
+│  │                                   ▼                                              │ │
+│  │                        ┌─────────────────────┐                                  │ │
+│  │                        │ Environment Check   │ ─── Reject if env_id ≠ ours      │ │
+│  │                        └──────────┬──────────┘                                  │ │
+│  │                                   │                                              │ │
+│  │                                   ▼                                              │ │
+│  │                        ┌─────────────────────┐                                  │ │
+│  │                        │  Role Validation    │ ─── Check mTLS cert claims       │ │
+│  │                        └──────────┬──────────┘                                  │ │
+│  └───────────────────────────────────┼──────────────────────────────────────────────┘ │
+│                                      │                                                │
+│  ┌───────────────────────────────────┼──────────────────────────────────────────────┐ │
+│  │                           LAYER 3: LOCALITY FILTER                               │ │
+│  │                                   │                                              │ │
+│  │                                   ▼                                              │ │
+│  │     ┌─────────────────────────────────────────────────────────────────────┐    │ │
+│  │     │                      LOCALITY TIERS                                   │    │ │
+│  │     │                                                                       │    │ │
+│  │     │   Tier 0 (preferred): Same datacenter         (latency < 2ms)        │    │ │
+│  │     │   Tier 1 (fallback):  Same region             (latency < 50ms)       │    │ │
+│  │     │   Tier 2 (emergency): Global (any DC)         (latency varies)       │    │ │
+│  │     │                                                                       │    │ │
+│  │     │   Selection: Try Tier 0 first. If < min_peers, add Tier 1, etc.      │    │ │
+│  │     │                                                                       │    │ │
+│  │     └─────────────────────────────────────────────────────────────────────┘    │ │
+│  │                                   │                                              │ │
+│  │                                   ▼                                              │ │
+│  │                        ┌─────────────────────┐                                  │ │
+│  │                        │  Locality-Filtered  │                                  │ │
+│  │                        │   Candidate Set     │                                  │ │
+│  │                        └──────────┬──────────┘                                  │ │
+│  └───────────────────────────────────┼──────────────────────────────────────────────┘ │
+│                                      │                                                │
+│  ┌───────────────────────────────────┼──────────────────────────────────────────────┐ │
+│  │                           LAYER 4: PEER SELECTION                                │ │
+│  │                                   │                                              │ │
+│  │                                   ▼                                              │ │
+│  │     ┌─────────────────────────────────────────────────────────────────────┐    │ │
+│  │     │           WEIGHTED RENDEZVOUS HASH + POWER OF TWO CHOICES            │    │ │
+│  │     │                                                                       │    │ │
+│  │     │  Step 1: Rendezvous Hash produces deterministic candidate ranking    │    │ │
+│  │     │          score = hash(peer_id || selector_id || role) * health_weight│    │ │
+│  │     │          → Top K candidates (K=8)                                    │    │ │
+│  │     │                                                                       │    │ │
+│  │     │  Step 2: Power of Two Choices for load balancing                     │    │ │
+│  │     │          From K candidates, randomly sample 2                        │    │ │
+│  │     │          Compare their EWMA latency scores                           │    │ │
+│  │     │          Choose the one with lower latency                           │    │ │
+│  │     │                                                                       │    │ │
+│  │     │  Step 3: Maintain sticky primary (K=3) and backup (K=2) connections  │    │ │
+│  │     │          Only switch when health degrades significantly              │    │ │
+│  │     │                                                                       │    │ │
+│  │     └─────────────────────────────────────────────────────────────────────┘    │ │
+│  │                                   │                                              │ │
+│  │                                   ▼                                              │ │
+│  │                        ┌─────────────────────┐                                  │ │
+│  │                        │   Selected Peers    │                                  │ │
+│  │                        │   (3 primary +      │                                  │ │
+│  │                        │    2 backup)        │                                  │ │
+│  │                        └──────────┬──────────┘                                  │ │
+│  └───────────────────────────────────┼──────────────────────────────────────────────┘ │
+│                                      │                                                │
+│  ┌───────────────────────────────────┼──────────────────────────────────────────────┐ │
+│  │                           LAYER 5: CONNECTION POOL                               │ │
+│  │                                   │                                              │ │
+│  │                                   ▼                                              │ │
+│  │     ┌─────────────────────────────────────────────────────────────────────┐    │ │
+│  │     │                    STICKY CONNECTION POOL                             │    │ │
+│  │     │                                                                       │    │ │
+│  │     │  Primary Connections (3):                                            │    │ │
+│  │     │  ┌─────────┐  ┌─────────┐  ┌─────────┐                              │    │ │
+│  │     │  │ Peer A  │  │ Peer B  │  │ Peer C  │   Active connections        │    │ │
+│  │     │  │ EWMA:2ms│  │ EWMA:3ms│  │ EWMA:5ms│   Round-robin for requests  │    │ │
+│  │     │  └─────────┘  └─────────┘  └─────────┘                              │    │ │
+│  │     │                                                                       │    │ │
+│  │     │  Backup Connections (2):                                             │    │ │
+│  │     │  ┌─────────┐  ┌─────────┐                                           │    │ │
+│  │     │  │ Peer D  │  │ Peer E  │   Ready to promote on primary failure     │    │ │
+│  │     │  │ EWMA:8ms│  │EWMA:10ms│                                           │    │ │
+│  │     │  └─────────┘  └─────────┘                                           │    │ │
+│  │     │                                                                       │    │ │
+│  │     │  Eviction Policy:                                                    │    │ │
+│  │     │  - error_rate > 5%  OR                                               │    │ │
+│  │     │  - consecutive_failures > 3  OR                                      │    │ │
+│  │     │  - latency > p99_baseline * 3                                        │    │ │
+│  │     │                                                                       │    │ │
+│  │     │  On eviction: Promote backup → primary, replenish from candidates    │    │ │
+│  │     │                                                                       │    │ │
+│  │     └─────────────────────────────────────────────────────────────────────┘    │ │
+│  └──────────────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                       │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Security: Cluster ID and Environment ID
+
+Prevents accidental cross-cluster and cross-environment joins:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                     CLUSTER/ENVIRONMENT ISOLATION                                    │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                       │
+│  Problem: Misconfigured node in staging tries to join production cluster             │
+│                                                                                       │
+│  ┌────────────────────────────────────────────────────────────────────────────────┐ │
+│  │                                                                                  │ │
+│  │    STAGING NODE                        PRODUCTION CLUSTER                       │ │
+│  │    cluster_id: "hyperscale-staging"    cluster_id: "hyperscale-prod"           │ │
+│  │    env_id: "staging"                   env_id: "production"                    │ │
+│  │                                                                                  │ │
+│  │         │                                       │                               │ │
+│  │         │──── Registration Request ────────────▶│                               │ │
+│  │         │     cluster_id: "hyperscale-staging" │                               │ │
+│  │         │                                       │                               │ │
+│  │         │◀─── REJECT: cluster_id mismatch ─────│                               │ │
+│  │         │     expected: "hyperscale-prod"       │                               │ │
+│  │         │                                       │                               │ │
+│  └────────────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                       │
+│  Configuration:                                                                      │
+│  ```python                                                                           │
+│  @dataclass(slots=True)                                                             │
+│  class DiscoveryConfig:                                                             │
+│      cluster_id: str         # Required - unique cluster identifier                 │
+│      environment_id: str     # Required - prod/staging/dev                          │
+│      ...                                                                            │
+│  ```                                                                                │
+│                                                                                       │
+│  Wire Protocol Addition:                                                            │
+│  - All registration messages include cluster_id and environment_id                  │
+│  - Receiver validates BEFORE processing any other fields                            │
+│  - Mismatch results in immediate rejection with clear error message                 │
+│                                                                                       │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Security: Role-Based Connection Matrix
+
+mTLS certificate claims enforce which node types can communicate:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                        ROLE-BASED CONNECTION MATRIX                                  │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                       │
+│  Certificate Claim Format:                                                           │
+│  ┌────────────────────────────────────────────────────────────────────────────────┐ │
+│  │  Subject Alternative Name (SAN):                                                │ │
+│  │    URI: hyperscale://role/{worker|manager|gate|client}                         │ │
+│  │    URI: hyperscale://cluster/{cluster_id}                                      │ │
+│  │    URI: hyperscale://env/{environment_id}                                      │ │
+│  │    URI: hyperscale://dc/{datacenter_id}                                        │ │
+│  └────────────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                       │
+│  Connection Matrix:                                                                  │
+│  ┌────────────┬─────────────────────────────────────────────────────────────────┐  │
+│  │  Initiator │                        Can Connect To                            │  │
+│  ├────────────┼──────────┬──────────┬──────────┬──────────────────────────────────┤  │
+│  │            │  Worker  │  Manager │   Gate   │   Client                       │  │
+│  ├────────────┼──────────┼──────────┼──────────┼──────────────────────────────────┤  │
+│  │  Client    │    ❌    │    ❌    │    ✅    │      ❌                        │  │
+│  │            │          │          │ (submit) │                                │  │
+│  ├────────────┼──────────┼──────────┼──────────┼──────────────────────────────────┤  │
+│  │  Gate      │    ❌    │    ✅    │    ✅    │      ✅ (push)                 │  │
+│  │            │          │ (forward)│ (peer)   │                                │  │
+│  ├────────────┼──────────┼──────────┼──────────┼──────────────────────────────────┤  │
+│  │  Manager   │    ✅    │    ✅    │    ✅    │      ✅ (push)                 │  │
+│  │            │(dispatch)│  (peer)  │ (report) │                                │  │
+│  ├────────────┼──────────┼──────────┼──────────┼──────────────────────────────────┤  │
+│  │  Worker    │    ❌    │    ✅    │    ❌    │      ❌                        │  │
+│  │            │          │(progress)│          │                                │  │
+│  └────────────┴──────────┴──────────┴──────────┴──────────────────────────────────┘  │
+│                                                                                       │
+│  Example Rejection:                                                                  │
+│  ┌────────────────────────────────────────────────────────────────────────────────┐ │
+│  │  Worker (role=worker) attempts to connect to Gate (role=gate)                  │ │
+│  │                                                                                  │ │
+│  │  Gate extracts initiator role from mTLS cert: "worker"                         │ │
+│  │  Gate checks: is "worker" in allowed_initiators? NO                            │ │
+│  │  Gate rejects: "Connection denied: role 'worker' cannot connect to 'gate'"     │ │
+│  └────────────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                       │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Peer Selection Algorithm: Weighted Rendezvous Hash + Power of Two Choices
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                    PEER SELECTION ALGORITHM                                          │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                       │
+│  STEP 1: WEIGHTED RENDEZVOUS HASH (for deterministic candidate ranking)             │
+│  ─────────────────────────────────────────────────────────────────────────────────  │
+│                                                                                       │
+│  For each peer P in the locality-filtered candidate set:                            │
+│                                                                                       │
+│    base_score = hash(peer_id || selector_id || role)                                │
+│    health_weight = 1.0 - (error_rate * 2) - (latency_factor * 0.5)                 │
+│    weighted_score = base_score * max(0.1, health_weight)                            │
+│                                                                                       │
+│  Sort by weighted_score descending → Top K candidates (K=8)                         │
+│                                                                                       │
+│  Why Rendezvous Hash?                                                               │
+│  - Deterministic: same inputs always produce same ranking (debuggable)              │
+│  - Minimal disruption: adding/removing peer only affects that peer's connections    │
+│  - No central coordination needed                                                    │
+│                                                                                       │
+│  ─────────────────────────────────────────────────────────────────────────────────  │
+│  STEP 2: POWER OF TWO CHOICES (for load balancing among candidates)                 │
+│  ─────────────────────────────────────────────────────────────────────────────────  │
+│                                                                                       │
+│  From K candidates, to select one connection:                                       │
+│                                                                                       │
+│    candidate_a = random.choice(candidates)                                          │
+│    candidate_b = random.choice(candidates - {candidate_a})                          │
+│    chosen = candidate_a if ewma_latency[a] < ewma_latency[b] else candidate_b       │
+│                                                                                       │
+│  Why Power of Two?                                                                   │
+│  - Avoids thundering herd (not everyone picks the "best")                           │
+│  - Automatically load balances across peers                                         │
+│  - O(1) selection vs O(n) for finding global minimum                                │
+│                                                                                       │
+│  ─────────────────────────────────────────────────────────────────────────────────  │
+│  STEP 3: ADAPTIVE EWMA LATENCY TRACKING                                             │
+│  ─────────────────────────────────────────────────────────────────────────────────  │
+│                                                                                       │
+│  For each request to peer P:                                                        │
+│                                                                                       │
+│    measured_latency = response_time - request_time                                  │
+│    ewma[P] = α * measured_latency + (1 - α) * ewma[P]                              │
+│                                                                                       │
+│  Where α = 0.2 (balance between responsiveness and stability)                       │
+│                                                                                       │
+│  Benefits:                                                                           │
+│  - Smooths transient spikes (one slow request doesn't cause failover)               │
+│  - Adapts to persistent degradation                                                 │
+│  - Simple to compute and store                                                       │
+│                                                                                       │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Sticky Connections with Health-Based Eviction
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                    STICKY CONNECTION LIFECYCLE                                       │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                       │
+│  Initial State:                                                                      │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐   │
+│  │  PRIMARY (3)          BACKUP (2)           CANDIDATE POOL (K=8)            │   │
+│  │  [A, B, C]            [D, E]               [A, B, C, D, E, F, G, H]         │   │
+│  │  (active)             (warm standby)        (from rendezvous hash)          │   │
+│  └─────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                       │
+│  Request Routing:                                                                    │
+│  - Round-robin across PRIMARY connections                                           │
+│  - Track latency per request for EWMA                                               │
+│  - Track errors per connection                                                       │
+│                                                                                       │
+│  Health Monitoring (per connection):                                                │
+│  ┌────────────────────────────────────────────────────────────────────────────┐    │
+│  │  Metric               │  Threshold        │  Action                        │    │
+│  ├───────────────────────┼───────────────────┼─────────────────────────────────┤    │
+│  │  error_rate           │  > 5%             │  Mark DEGRADED                 │    │
+│  │  consecutive_failures │  > 3              │  Mark UNHEALTHY → evict        │    │
+│  │  ewma_latency         │  > p99 * 3        │  Mark SLOW → evict             │    │
+│  │  connection_age       │  > 1 hour         │  Consider refresh              │    │
+│  └────────────────────────────────────────────────────────────────────────────┘    │
+│                                                                                       │
+│  Eviction Sequence:                                                                  │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐   │
+│  │                                                                              │   │
+│  │  t=0   PRIMARY: [A, B, C]    BACKUP: [D, E]                                 │   │
+│  │        Peer B: consecutive_failures = 4 (threshold = 3)                     │   │
+│  │                                                                              │   │
+│  │  t=1   Evict B from PRIMARY                                                 │   │
+│  │        PRIMARY: [A, _, C]    BACKUP: [D, E]                                 │   │
+│  │                                                                              │   │
+│  │  t=2   Promote D to PRIMARY                                                 │   │
+│  │        PRIMARY: [A, D, C]    BACKUP: [_, E]                                 │   │
+│  │                                                                              │   │
+│  │  t=3   Replenish BACKUP from candidate pool (with jitter: 100-500ms)        │   │
+│  │        Select F using Power of Two Choices                                  │   │
+│  │        PRIMARY: [A, D, C]    BACKUP: [F, E]                                 │   │
+│  │                                                                              │   │
+│  └─────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                       │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Discovery Timing and Jitter
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                    TIMING CONFIGURATION                                              │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                       │
+│  DNS Resolution:                                                                     │
+│  ┌────────────────────────────────────────────────────────────────────────────┐    │
+│  │  dns_timeout:           2.0 seconds                                        │    │
+│  │  dns_cache_ttl:         Respect DNS TTL (or default 30s)                   │    │
+│  │  negative_cache_ttl:    30 seconds (don't hammer failed lookups)           │    │
+│  └────────────────────────────────────────────────────────────────────────────┘    │
+│                                                                                       │
+│  Peer Probing:                                                                       │
+│  ┌────────────────────────────────────────────────────────────────────────────┐    │
+│  │  probe_timeout:         500ms per probe                                    │    │
+│  │  max_concurrent_probes: 10 (prevent socket exhaustion)                     │    │
+│  │  probe_jitter:          0-100ms (prevent synchronized probing)             │    │
+│  └────────────────────────────────────────────────────────────────────────────┘    │
+│                                                                                       │
+│  Backoff (when all probes fail):                                                    │
+│  ┌────────────────────────────────────────────────────────────────────────────┐    │
+│  │  initial_backoff:       500ms                                              │    │
+│  │  max_backoff:           15 seconds                                         │    │
+│  │  backoff_multiplier:    2.0                                                │    │
+│  │  jitter_factor:         0.25 (25% randomization)                           │    │
+│  └────────────────────────────────────────────────────────────────────────────┘    │
+│                                                                                       │
+│  Discovery Refresh:                                                                  │
+│  ┌────────────────────────────────────────────────────────────────────────────┐    │
+│  │  refresh_interval:      60 seconds (re-evaluate candidate set)             │    │
+│  │  refresh_jitter:        0-5 seconds (prevent synchronized refresh)         │    │
+│  └────────────────────────────────────────────────────────────────────────────┘    │
+│                                                                                       │
+│  Connection Pool:                                                                    │
+│  ┌────────────────────────────────────────────────────────────────────────────┐    │
+│  │  promotion_jitter:      100-500ms (prevent synchronized recovery)          │    │
+│  │  connection_max_age:    3600 seconds (1 hour, then consider refresh)       │    │
+│  │  ewma_alpha:            0.2 (balance responsiveness vs stability)          │    │
+│  └────────────────────────────────────────────────────────────────────────────┘    │
+│                                                                                       │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Metrics and Observability
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                    DISCOVERY METRICS                                                 │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                       │
+│  DNS Metrics:                                                                        │
+│  ┌────────────────────────────────────────────────────────────────────────────┐    │
+│  │  discovery_dns_lookups_total{datacenter, result}                           │    │
+│  │    - result: "success" | "timeout" | "error" | "negative_cached"           │    │
+│  │                                                                              │    │
+│  │  discovery_dns_cache_hits_total{type}                                      │    │
+│  │    - type: "positive" | "negative"                                         │    │
+│  │                                                                              │    │
+│  │  discovery_dns_resolution_duration_ms{datacenter}                          │    │
+│  └────────────────────────────────────────────────────────────────────────────┘    │
+│                                                                                       │
+│  Selection Metrics:                                                                  │
+│  ┌────────────────────────────────────────────────────────────────────────────┐    │
+│  │  discovery_candidate_set_size{role, datacenter}                            │    │
+│  │  discovery_candidate_set_changes_total{reason}                             │    │
+│  │    - reason: "dns_update" | "health_change" | "peer_added" | "peer_removed"│    │
+│  │                                                                              │    │
+│  │  discovery_locality_tier_selected_total{tier}                              │    │
+│  │    - tier: "same_dc" | "same_region" | "global"                            │    │
+│  │                                                                              │    │
+│  │  discovery_selection_duration_ms                                           │    │
+│  └────────────────────────────────────────────────────────────────────────────┘    │
+│                                                                                       │
+│  Connection Pool Metrics:                                                            │
+│  ┌────────────────────────────────────────────────────────────────────────────┐    │
+│  │  discovery_pool_connections{state, role}                                   │    │
+│  │    - state: "primary" | "backup"                                           │    │
+│  │                                                                              │    │
+│  │  discovery_pool_promotions_total{from_state, to_state}                     │    │
+│  │  discovery_pool_evictions_total{reason}                                    │    │
+│  │    - reason: "error_rate" | "consecutive_failures" | "latency" | "stale"   │    │
+│  │                                                                              │    │
+│  │  discovery_peer_ewma_latency_ms{peer_id, datacenter}                       │    │
+│  │  discovery_peer_error_rate{peer_id}                                        │    │
+│  └────────────────────────────────────────────────────────────────────────────┘    │
+│                                                                                       │
+│  Security Metrics:                                                                   │
+│  ┌────────────────────────────────────────────────────────────────────────────┐    │
+│  │  discovery_cluster_id_rejections_total{expected, received}                 │    │
+│  │  discovery_environment_id_rejections_total{expected, received}             │    │
+│  │  discovery_role_rejections_total{initiator_role, target_role}              │    │
+│  └────────────────────────────────────────────────────────────────────────────┘    │
+│                                                                                       │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Configuration
+
+```python
+@dataclass(slots=True)
+class DiscoveryConfig:
+    """Configuration for enhanced peer discovery."""
+
+    # ===== Security (Required) =====
+    cluster_id: str              # Unique cluster identifier (e.g., "hyperscale-prod")
+    environment_id: str          # Environment (e.g., "production", "staging")
+
+    # ===== DNS Configuration =====
+    dns_names: list[str] = field(default_factory=list)  # SRV/A records to resolve
+    static_seeds: list[str] = field(default_factory=list)  # Fallback addresses
+    dns_timeout: float = 2.0
+    dns_cache_ttl: float = 30.0  # Override if DNS doesn't provide TTL
+    negative_cache_ttl: float = 30.0  # Don't re-resolve failed names
+
+    # ===== Locality =====
+    datacenter_id: str = ""      # This node's datacenter
+    region_id: str = ""          # This node's region (group of DCs)
+    prefer_same_dc: bool = True
+    prefer_same_region: bool = True
+    min_peers_per_tier: int = 3  # Minimum before falling back to next tier
+
+    # ===== Peer Selection =====
+    candidate_set_size: int = 8           # K for rendezvous hash
+    primary_connections: int = 3          # Active connections
+    backup_connections: int = 2           # Warm standby
+    ewma_alpha: float = 0.2               # Latency smoothing factor
+
+    # ===== Health Thresholds =====
+    error_rate_threshold: float = 0.05    # 5% errors → concern
+    consecutive_failure_limit: int = 3    # Hard failures → evict
+    latency_multiplier_threshold: float = 3.0  # 3x baseline → evict
+
+    # ===== Timing =====
+    probe_timeout: float = 0.5            # 500ms per probe
+    max_concurrent_probes: int = 10
+    initial_backoff: float = 0.5          # 500ms
+    max_backoff: float = 15.0             # 15 seconds
+    backoff_multiplier: float = 2.0
+    jitter_factor: float = 0.25           # 25% randomization
+    refresh_interval: float = 60.0        # Re-evaluate candidates
+    promotion_jitter: tuple[float, float] = (0.1, 0.5)  # 100-500ms
+```
+
+#### Module Structure
+
+```
+hyperscale/distributed_rewrite/discovery/
+├── __init__.py                    # Public exports
+├── discovery_service.py           # Main DiscoveryService orchestrator
+│
+├── dns/
+│   ├── __init__.py
+│   ├── resolver.py                # AsyncDNSResolver with caching
+│   └── negative_cache.py          # NegativeCache for failed lookups
+│
+├── locality/
+│   ├── __init__.py
+│   ├── locality_filter.py         # LocalityFilter (DC/region preference)
+│   └── locality_info.py           # LocalityInfo dataclass
+│
+├── selection/
+│   ├── __init__.py
+│   ├── rendezvous_hash.py         # WeightedRendezvousHash
+│   ├── power_of_two.py            # PowerOfTwoSelector
+│   └── ewma_tracker.py            # EWMALatencyTracker
+│
+├── pool/
+│   ├── __init__.py
+│   ├── connection_pool.py         # ConnectionPool with sticky connections
+│   ├── peer_health.py             # PeerHealthTracker
+│   └── promotion.py               # PromotionManager
+│
+├── security/
+│   ├── __init__.py
+│   ├── cluster_validator.py       # ClusterValidator (cluster_id/env_id)
+│   └── role_validator.py          # RoleValidator (mTLS cert claims)
+│
+├── metrics/
+│   ├── __init__.py
+│   └── discovery_metrics.py       # DiscoveryMetrics
+│
+└── models/
+    ├── __init__.py
+    ├── discovery_config.py        # DiscoveryConfig dataclass
+    ├── peer_info.py               # PeerInfo with health data
+    ├── candidate_set.py           # CandidateSet dataclass
+    └── connection_state.py        # ConnectionState enum
+```
+
+**Trade-offs**:
+- (+) Deterministic peer selection via rendezvous hash (debuggable)
+- (+) Load balancing via Power of Two Choices (avoids thundering herd)
+- (+) Locality awareness reduces cross-DC traffic
+- (+) Strong security boundaries prevent misconfiguration
+- (+) Sticky connections reduce churn overhead
+- (-) More complex than simple round-robin
+- (-) Requires certificate infrastructure for role validation
+- (-) EWMA requires per-peer state tracking
+
+**Alternatives Considered**:
+- Simple round-robin: Too naive, no health awareness
+- Consistent hashing: Good but disrupts more on topology changes
+- Central load balancer: Single point of failure, external dependency
+- Random selection: No locality awareness, unpredictable behavior
+
+---
+
+### AD-29: Protocol-Level Peer Confirmation for Robust Initialization
+
+**Decision**: Implement a "confirmed vs unconfirmed peer" model where failure detection only applies to peers we have successfully communicated with at least once. Peers from configuration start as "unconfirmed" and must receive a successful probe response, heartbeat, or other protocol message before they can transition to the failure detection state machine.
+
+**Rationale**:
+During cluster formation, nodes begin probing each other immediately. Due to network timing, async startup order, and other transient conditions, initial probes may fail even though all nodes are healthy. Without distinguishing "never reached" from "was reachable, now isn't", the SWIM failure detector triggers false positives, causing cascading "failures" that destabilize the cluster before it ever forms.
+
+**Problem Statement**:
+```
+Timeline without peer confirmation:
+
+T=0: Gate1, Gate2, Gate3 start simultaneously
+T=0.1: Gate1 sends probe to Gate2 (Gate2 not yet listening)
+T=1.1: Gate1 probe times out → Gate1 marks Gate2 as SUSPECT
+T=2.5: Gate1 indirect probes fail → Gate1 marks Gate2 as DEAD
+T=3.0: Gate2 finally ready, sends heartbeat to Gate1
+T=3.1: Gate1 receives heartbeat but already removed Gate2 from active peers
+
+Result: Cluster never stabilizes, continuous false failure detection
+```
+
+**Solution: Confirmed vs Unconfirmed Peers**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                     PEER STATE MACHINE                                           │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                  │
+│    ┌────────────────────┐                                                       │
+│    │                    │                                                       │
+│    │   UNCONFIRMED      │  ─── Peers from config, not yet reached              │
+│    │                    │                                                       │
+│    │  • No failure      │                                                       │
+│    │    detection       │                                                       │
+│    │  • Probe attempts  │                                                       │
+│    │    continue        │                                                       │
+│    │  • Not in active   │                                                       │
+│    │    peer set        │                                                       │
+│    │                    │                                                       │
+│    └─────────┬──────────┘                                                       │
+│              │                                                                   │
+│              │ Successful communication:                                         │
+│              │ • Probe ACK received                                              │
+│              │ • Heartbeat received                                              │
+│              │ • Any valid protocol message                                      │
+│              │                                                                   │
+│              ▼                                                                   │
+│    ┌────────────────────┐                                                       │
+│    │                    │                                                       │
+│    │    CONFIRMED       │  ─── Successfully communicated at least once         │
+│    │                    │                                                       │
+│    │  • Normal SWIM     │      ┌──────────────────────────────────────────┐    │
+│    │    failure         │      │                                          │    │
+│    │    detection       │      │  SWIM State Machine (per Lifeguard)      │    │
+│    │  • Added to        │      │                                          │    │
+│    │    active peers    │      │  ALIVE ──timeout──► SUSPECT              │    │
+│    │  • Participates    │      │    ▲                   │                 │    │
+│    │    in gossip       │      │    │                   │ no refutation   │    │
+│    │                    │      │    │ refutation        ▼                 │    │
+│    │                    │      │    └─────────────── DEAD                 │    │
+│    │                    │      │                                          │    │
+│    └────────────────────┘      └──────────────────────────────────────────┘    │
+│                                                                                  │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Implementation Details**:
+
+1. **Data Structures**:
+```python
+class HealthAwareServer:
+    # Peers we've successfully communicated with at least once
+    _confirmed_peers: set[tuple[str, int]]
+
+    # Peers we know about but haven't confirmed yet (from config)
+    _unconfirmed_peers: set[tuple[str, int]]
+```
+
+2. **Peer Addition** (from config or discovery):
+```python
+async def _add_peer(self, peer: tuple[str, int]):
+    """Peer from configuration starts as unconfirmed."""
+    if peer not in self._confirmed_peers:
+        self._unconfirmed_peers.add(peer)
+    # Begin probing to confirm
+```
+
+3. **Peer Confirmation** (on ANY successful communication):
+```python
+async def _confirm_peer(self, peer: tuple[str, int]):
+    """Mark peer as confirmed after successful communication."""
+    if peer in self._unconfirmed_peers:
+        self._unconfirmed_peers.discard(peer)
+        self._confirmed_peers.add(peer)
+        # NOW add to active peer tracking (e.g., _active_gate_peers)
+        await self._on_peer_confirmed(peer)
+```
+
+4. **Failure Detection Guard**:
+```python
+async def _on_probe_timeout(self, peer: tuple[str, int]):
+    if peer not in self._confirmed_peers:
+        # Never reached this peer - log but don't escalate
+        # Continue probing, eventually we'll reach them
+        return
+
+    # Confirmed peer didn't respond - THIS is meaningful
+    await self._start_suspicion(peer)
+```
+
+5. **Recovery Re-confirmation**:
+```python
+async def _on_node_join(self, peer: tuple[str, int]):
+    """Node rejoined - it's already confirmed from before."""
+    # No need to re-confirm, just update state
+    if peer in self._confirmed_peers:
+        await self._handle_peer_recovery(peer)
+```
+
+**Events That Confirm a Peer**:
+- Receiving an ACK to our probe
+- Receiving a heartbeat message
+- Receiving any valid protocol message (join, leave, alive, etc.)
+- Receiving a response to indirect probe request
+
+**Events That Do NOT Confirm**:
+- Adding peer from configuration
+- Receiving gossip ABOUT a peer from another node
+- DNS resolution returning the peer's address
+
+**Strict Lifeguard Compliance**:
+This approach works IN CONJUNCTION with proper Lifeguard suspicion protocol:
+
+1. Probe timeout → SUSPECT (never directly to DEAD)
+2. SUSPECT → Broadcast suspicion, request indirect probes
+3. SUSPECT + timeout without refutation → DEAD
+4. Refutation received → Back to ALIVE
+
+The key insight: **Suspicion only applies to CONFIRMED peers**. An unconfirmed peer cannot be "suspected" because we have no baseline expectation of their reachability.
+
+**Sequence Diagram - Correct Initialization**:
+
+```
+Gate1                    Gate2                    Gate3
+  │                        │                        │
+  │ T=0: Start             │ T=0: Start             │ T=0: Start
+  │                        │                        │
+  │──── probe ────────────►│ (not ready yet)        │
+  │     TIMEOUT            │                        │
+  │     [unconfirmed, no   │                        │
+  │      failure action]   │                        │
+  │                        │                        │
+  │                        │──── heartbeat ────────►│
+  │                        │                        │
+  │◄─────── heartbeat ─────│                        │
+  │  [Gate2 CONFIRMED!]    │                        │
+  │  [add to active peers] │                        │
+  │                        │                        │
+  │──── probe ────────────►│                        │
+  │◄────── ACK ────────────│                        │
+  │  [confirmed, ACK       │                        │
+  │   reinforces health]   │                        │
+  │                        │                        │
+  │◄──────────────────────────── heartbeat ─────────│
+  │  [Gate3 CONFIRMED!]    │                        │
+  │                        │                        │
+  ▼                        ▼                        ▼
+All peers confirmed, cluster stable
+```
+
+**Sequence Diagram - Failure After Confirmation**:
+
+```
+Gate1                    Gate2 (crashes)           Gate3
+  │                        │                        │
+  │ [Gate2 confirmed]      │                        │
+  │                        X crash                  │
+  │                        │                        │
+  │──── probe ────────────►│                        │
+  │     TIMEOUT            │                        │
+  │  [CONFIRMED peer       │                        │
+  │   failed - start       │                        │
+  │   SUSPICION]           │                        │
+  │                        │                        │
+  │──── ping-req ─────────────────────────────────►│
+  │  [indirect probe       │                        │
+  │   via Gate3]           │                        │──── probe ──►│ (dead)
+  │                        │                        │   TIMEOUT    │
+  │◄─────── NACK ──────────────────────────────────│
+  │                        │                        │
+  │  [no refutation after  │                        │
+  │   suspicion timeout]   │                        │
+  │                        │                        │
+  │  Gate2 → DEAD          │                        │
+  │  [remove from active]  │                        │
+```
+
+**Trade-offs**:
+- (+) No arbitrary timeouts - behavior based on actual protocol state
+- (+) Correct Lifeguard semantics - suspicion is meaningful
+- (+) Self-healing - if peer comes up later, we'll reach them and confirm
+- (+) No false positives during initialization
+- (+) Memory efficient - just two sets, not per-peer epoch tracking
+- (+) Works with any cluster size or topology
+- (-) Initial probe failures are "silent" - may delay detection of config errors
+- (-) Requires discipline to call _confirm_peer on all successful paths
+
+**Mitigation for Silent Failures**:
+Add logging/metrics for unconfirmed peers that remain unconfirmed after a threshold:
+```python
+if peer_unconfirmed_duration > 60.0:  # 1 minute
+    log.warning(f"Peer {peer} still unconfirmed after 60s - check configuration")
+```
+
+**Files to Modify**:
+- `hyperscale/distributed_rewrite/swim/health_aware_server.py` - Base SWIM implementation
+- `hyperscale/distributed_rewrite/nodes/gate.py` - Gate peer tracking
+- `hyperscale/distributed_rewrite/nodes/manager.py` - Manager peer tracking
+- `hyperscale/distributed_rewrite/nodes/worker.py` - Worker manager tracking
+
+**Alternatives Considered**:
+1. **Grace Period**: Arbitrary timeout, masks real failures during startup
+2. **Quorum-Based Init**: Deadlock potential if all nodes wait for quorum
+3. **Two-Phase Bootstrap**: Good but doesn't handle dynamic peer discovery
+4. **Epoch-Based Freshness**: More complex, higher memory overhead
+
+**Testing Strategy**:
+1. Unit tests for confirmed/unconfirmed state transitions
+2. Integration test: 3+ gates starting simultaneously, verify no false failures
+3. Integration test: Confirmed peer crash, verify proper SUSPECT→DEAD flow
+4. Integration test: Unconfirmed peer never reachable, verify no DEAD transition
+
+---
+
+### AD-30: Hierarchical Failure Detection for Multi-Job Distributed Systems
+
+**Decision**: Implement a two-layer hierarchical failure detection system that separates machine-level liveness (global layer) from job-specific responsiveness (job layer), solving timer starvation issues and enabling accurate result routing in multi-job environments.
+
+**Rationale**:
+The original SWIM + Lifeguard implementation suffered from **timer starvation** where rapid gossip confirmations caused suspicion timers to be continuously rescheduled before they could expire. In a globally distributed system with multiple concurrent jobs, we also need to distinguish between "machine is dead" (affects all jobs) and "node is slow for job X" (affects only that job).
+
+**Problem Statement - Timer Starvation**:
+
+```
+Original SuspicionManager flow with confirmation-based rescheduling:
+
+T=0.00: Node A fails probe to Node B → start_suspicion(B, timeout=5s)
+T=0.05: Node C gossips "B is suspect" → confirm_suspicion(B) → RESCHEDULE timer
+T=0.10: Node D gossips "B is suspect" → confirm_suspicion(B) → RESCHEDULE timer
+T=0.15: Node E gossips "B is suspect" → confirm_suspicion(B) → RESCHEDULE timer
+...
+T=4.95: Node Z gossips "B is suspect" → confirm_suspicion(B) → RESCHEDULE timer
+T=5.00: Timer should expire... but was just reset to 4.5s remaining!
+
+Result: Timer NEVER expires. Node B is never declared dead even though
+        it hasn't responded to probes for 5+ seconds.
+
+Root cause: Each confirmation cancels the old timer and creates a new one.
+            With gossip echo (O(log n) dissemination), confirmations arrive
+            faster than the (now shorter) timeout can elapse.
+```
+
+**Problem Statement - Multi-Job Routing**:
+
+```
+Scenario: Manager M1 runs jobs A, B, C simultaneously
+
+Job A: High CPU load (90%), responses slow
+Job B: Normal load (30%), responses normal
+Job C: Memory pressure (85%), responses slow
+
+With single-layer detection:
+- M1 is either "alive" or "dead" for ALL jobs
+- Can't route Job A results away from slow M1
+- Can't keep Job B results on healthy M1
+
+Need: Per-job suspicion that tracks "is this node responsive for THIS job?"
+```
+
+**Solution: Two-Layer Hierarchical Detection**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                   HIERARCHICAL FAILURE DETECTION                                 │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                  │
+│  ┌───────────────────────────────────────────────────────────────────────────┐  │
+│  │                      GLOBAL LAYER (TimingWheel)                            │  │
+│  │                                                                            │  │
+│  │   Question: "Is this MACHINE alive?"                                       │  │
+│  │                                                                            │  │
+│  │   Triggers: SWIM probe timeout (machine-level liveness)                    │  │
+│  │   Timeout: 5-30 seconds (configurable)                                     │  │
+│  │   Effect: Global death clears ALL job suspicions for that node             │  │
+│  │                                                                            │  │
+│  │   Implementation: Kafka-style hierarchical timing wheel                    │  │
+│  │   - O(1) timer insertion and removal                                       │  │
+│  │   - Single timer advancement (no per-suspicion timers)                     │  │
+│  │   - Confirmation updates state, NOT timer                                  │  │
+│  │                                                                            │  │
+│  │   ┌─────────────────────────────────────────────────────────────────┐     │  │
+│  │   │ Coarse Wheel (1s ticks)   │ Fine Wheel (100ms ticks)            │     │  │
+│  │   │ ┌─┬─┬─┬─┬─┬─┬─┬─┬─┬─┐    │ ┌─┬─┬─┬─┬─┬─┬─┬─┬─┬─┐              │     │  │
+│  │   │ │0│1│2│3│4│5│6│7│8│9│    │ │0│1│2│3│4│5│6│7│8│9│              │     │  │
+│  │   │ └─┴─┴─┴─┴─┴─┴─┴─┴─┴─┘    │ └─┴─┴─┴─┴─┴─┴─┴─┴─┴─┘              │     │  │
+│  │   │     ↑ current             │     ↑ current                       │     │  │
+│  │   │                           │                                     │     │  │
+│  │   │ Entries cascade from coarse to fine as they approach expiration │     │  │
+│  │   └─────────────────────────────────────────────────────────────────┘     │  │
+│  └───────────────────────────────────────────────────────────────────────────┘  │
+│                                    │                                             │
+│                                    │ Global death → Clear job suspicions         │
+│                                    ▼                                             │
+│  ┌───────────────────────────────────────────────────────────────────────────┐  │
+│  │                       JOB LAYER (JobSuspicionManager)                      │  │
+│  │                                                                            │  │
+│  │   Question: "Is this node RESPONSIVE for THIS JOB?"                        │  │
+│  │                                                                            │  │
+│  │   Triggers: Job-specific communication timeout                             │  │
+│  │   Timeout: 1-10 seconds (faster than global)                               │  │
+│  │   Effect: Job-specific routing decisions                                   │  │
+│  │                                                                            │  │
+│  │   Implementation: Adaptive polling with LHM integration                    │  │
+│  │   - Per (job_id, node) suspicion state                                     │  │
+│  │   - Poll interval adapts: far (1s) → medium (250ms) → near (50ms)         │  │
+│  │   - Confirmation updates state only (no timer reschedule)                  │  │
+│  │   - LHM multiplier extends polling under load                              │  │
+│  │                                                                            │  │
+│  │   ┌─────────────────────────────────────────────────────────────────┐     │  │
+│  │   │ Job A          │ Job B          │ Job C                         │     │  │
+│  │   │ ┌────────────┐ │ ┌────────────┐ │ ┌────────────┐               │     │  │
+│  │   │ │ Node1: OK  │ │ │ Node1: OK  │ │ │ Node1: SUSPECT            │     │  │
+│  │   │ │ Node2: SUSP│ │ │ Node2: OK  │ │ │ Node2: OK                 │     │  │
+│  │   │ │ Node3: OK  │ │ │ Node3: OK  │ │ │ Node3: SUSPECT            │     │  │
+│  │   │ └────────────┘ │ └────────────┘ │ └────────────┘               │     │  │
+│  │   │                │                │                               │     │  │
+│  │   │ Independent suspicion per (job_id, node) pair                   │     │  │
+│  │   └─────────────────────────────────────────────────────────────────┘     │  │
+│  └───────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                  │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Component Architecture**:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                      HierarchicalFailureDetector                                 │
+│                                                                                  │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐│
+│  │                              PUBLIC API                                      ││
+│  ├─────────────────────────────────────────────────────────────────────────────┤│
+│  │ start() / stop()              - Lifecycle management                        ││
+│  │ suspect_global(node, inc)     - Start global suspicion                      ││
+│  │ suspect_job(job, node, inc)   - Start job-specific suspicion                ││
+│  │ confirm_global/job(...)       - Add confirmation (NO timer reschedule)      ││
+│  │ refute_global/job(...)        - Clear suspicion (higher incarnation)        ││
+│  │ is_alive_global(node)         - Query: machine up?                          ││
+│  │ is_alive_for_job(job, node)   - Query: node responsive for job?             ││
+│  │ clear_job(job_id)             - Cleanup when job completes                  ││
+│  │ get_node_status(node)         - Comprehensive status query                  ││
+│  └─────────────────────────────────────────────────────────────────────────────┘│
+│                                    │                                             │
+│          ┌────────────────────────┴─────────────────────────┐                   │
+│          ▼                                                  ▼                   │
+│  ┌───────────────────┐                            ┌───────────────────┐         │
+│  │   TimingWheel     │                            │ JobSuspicionMgr   │         │
+│  │                   │                            │                   │         │
+│  │ • Coarse buckets  │                            │ • Per-job tracking│         │
+│  │ • Fine buckets    │                            │ • Adaptive polling│         │
+│  │ • Single tick     │                            │ • LHM integration │         │
+│  │ • O(1) ops        │                            │ • Resource limits │         │
+│  └───────────────────┘                            └───────────────────┘         │
+│          │                                                  │                   │
+│          │ on_expired(node, state)                          │ on_expired(job,   │
+│          ▼                                                  ▼  node, inc)       │
+│  ┌───────────────────────────────────────────────────────────────────────────┐ │
+│  │                         CALLBACK HANDLERS                                  │ │
+│  │                                                                            │ │
+│  │  _handle_global_expiration:           _handle_job_expiration:              │ │
+│  │  1. Mark node as globally dead        1. Record job-specific death         │ │
+│  │  2. Clear ALL job suspicions          2. Invoke on_job_death callback      │ │
+│  │  3. Invoke on_global_death callback   3. Update job routing state          │ │
+│  │  4. Record failure event                                                   │ │
+│  └───────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                  │
+│  ┌───────────────────────────────────────────────────────────────────────────┐ │
+│  │                        RECONCILIATION LOOP                                 │ │
+│  │                                                                            │ │
+│  │  Periodic (every 5s):                                                      │ │
+│  │  - Clear job suspicions for globally-dead nodes                            │ │
+│  │  - Detect inconsistencies between layers                                   │ │
+│  │  - Log/escalate anomalies                                                  │ │
+│  └───────────────────────────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Timing Wheel Design (Global Layer)**:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                           TIMING WHEEL INTERNALS                                 │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                  │
+│  Configuration:                                                                  │
+│  • coarse_tick_ms: 1000 (1 second per coarse bucket)                            │
+│  • fine_tick_ms: 100 (100ms per fine bucket)                                    │
+│  • coarse_buckets: 64 (64 seconds max timeout in coarse wheel)                  │
+│  • fine_buckets: 10 (1 second of fine-grained resolution)                       │
+│                                                                                  │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐│
+│  │                         COARSE WHEEL (1s resolution)                        ││
+│  │                                                                             ││
+│  │  Bucket 0    Bucket 1    Bucket 2    ...    Bucket 63                       ││
+│  │  ┌──────┐    ┌──────┐    ┌──────┐          ┌──────┐                        ││
+│  │  │Entry │    │      │    │Entry │          │      │                        ││
+│  │  │  A   │    │      │    │  C   │          │      │                        ││
+│  │  │Entry │    │      │    │      │          │      │                        ││
+│  │  │  B   │    │      │    │      │          │      │                        ││
+│  │  └──────┘    └──────┘    └──────┘          └──────┘                        ││
+│  │     ▲                                                                       ││
+│  │     │ current_coarse_idx                                                    ││
+│  │                                                                             ││
+│  │  When current bucket expires → cascade entries to fine wheel                ││
+│  └─────────────────────────────────────────────────────────────────────────────┘│
+│                                    │                                             │
+│                                    │ cascade                                     │
+│                                    ▼                                             │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐│
+│  │                          FINE WHEEL (100ms resolution)                      ││
+│  │                                                                             ││
+│  │  Bucket 0    Bucket 1    Bucket 2    ...    Bucket 9                        ││
+│  │  ┌──────┐    ┌──────┐    ┌──────┐          ┌──────┐                        ││
+│  │  │Entry │    │Entry │    │      │          │      │                        ││
+│  │  │  X   │    │  Y   │    │      │          │      │                        ││
+│  │  └──────┘    └──────┘    └──────┘          └──────┘                        ││
+│  │     ▲                                                                       ││
+│  │     │ current_fine_idx                                                      ││
+│  │                                                                             ││
+│  │  When fine bucket expires → fire expiration callbacks                       ││
+│  └─────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                  │
+│  TICK ADVANCEMENT (single task, runs every fine_tick_ms):                       │
+│                                                                                  │
+│  async def _tick():                                                              │
+│      # Advance fine wheel                                                        │
+│      fine_idx = (fine_idx + 1) % fine_buckets                                   │
+│      if fine_idx == 0:                                                           │
+│          # Wrapped around - advance coarse wheel                                 │
+│          coarse_idx = (coarse_idx + 1) % coarse_buckets                         │
+│          # Cascade coarse bucket entries to fine wheel                          │
+│          for entry in coarse_buckets[coarse_idx]:                               │
+│              fine_target = calculate_fine_bucket(entry.expiration)              │
+│              fine_buckets[fine_target].add(entry)                               │
+│                                                                                  │
+│      # Fire expired entries in current fine bucket                              │
+│      for entry in fine_buckets[fine_idx]:                                       │
+│          if entry.expiration <= now:                                            │
+│              on_expired(entry.node, entry.state)                                │
+│                                                                                  │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Adaptive Polling Design (Job Layer)**:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                       ADAPTIVE POLLING ALGORITHM                                 │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                  │
+│  Each JobSuspicion has a single polling task (NOT timer-per-suspicion):         │
+│                                                                                  │
+│  async def _poll_suspicion(suspicion):                                           │
+│      while not suspicion.cancelled and running:                                  │
+│          remaining = suspicion.time_remaining(n_members)                         │
+│                                                                                  │
+│          if remaining <= 0:                                                      │
+│              # EXPIRED - declare dead                                            │
+│              await _handle_expiration(suspicion)                                 │
+│              return                                                              │
+│                                                                                  │
+│          # Calculate adaptive poll interval                                      │
+│          poll_interval = _calculate_poll_interval(remaining)                     │
+│          sleep_time = min(poll_interval, remaining)                              │
+│                                                                                  │
+│          await asyncio.sleep(sleep_time)                                         │
+│          # Loop continues - if confirmations arrived, time_remaining shorter    │
+│                                                                                  │
+│  Poll Interval Selection:                                                        │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐│
+│  │                                                                             ││
+│  │  Time Remaining      Base Interval    After LHM (×2)                        ││
+│  │  ──────────────      ─────────────    ──────────────                        ││
+│  │  > 5 seconds         1000ms (far)     2000ms                                ││
+│  │  1-5 seconds         250ms (medium)   500ms                                 ││
+│  │  < 1 second          50ms (near)      100ms                                 ││
+│  │                                                                             ││
+│  │  ┌────────────────────────────────────────────────────────────────────┐    ││
+│  │  │                                                                    │    ││
+│  │  │  Poll    ┌─────┐   ┌────┐   ┌───┐  ┌──┐ ┌─┐┌─┐┌─┐┌─┐             │    ││
+│  │  │  Rate    │     │   │    │   │   │  │  │ │ ││ ││ ││ │ EXPIRE      │    ││
+│  │  │          │     │   │    │   │   │  │  │ │ ││ ││ ││ │   ↓         │    ││
+│  │  │  ────────┴─────┴───┴────┴───┴───┴──┴──┴─┴─┴┴─┴┴─┴┴─┴──────►     │    ││
+│  │  │  T=0          T=5s        T=9s   T=9.5s  T=10s                   │    ││
+│  │  │                                                                    │    ││
+│  │  │  Polls become more frequent as expiration approaches               │    ││
+│  │  └────────────────────────────────────────────────────────────────────┘    ││
+│  │                                                                             ││
+│  └─────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                  │
+│  KEY INSIGHT: Confirmations update suspicion STATE (confirmation_count).         │
+│               The poll loop naturally picks up the shorter timeout on next poll. │
+│               NO timer cancellation/rescheduling needed!                         │
+│                                                                                  │
+│  Before (timer starvation):           After (adaptive polling):                  │
+│  ─────────────────────────           ──────────────────────────                 │
+│  T=0: start_suspicion                 T=0: start_suspicion                       │
+│  T=0.1: confirm → CANCEL + NEW timer  T=0.1: confirm → update count              │
+│  T=0.2: confirm → CANCEL + NEW timer  T=0.2: confirm → update count              │
+│  ...timer never expires...            T=0.5: poll → remaining=4.0s, sleep        │
+│                                       T=1.0: poll → remaining=3.0s, sleep        │
+│                                       ...                                        │
+│                                       T=5.0: poll → remaining=0, EXPIRE          │
+│                                                                                  │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Node Status State Machine**:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                         NODE STATUS STATE MACHINE                                │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                  │
+│  NodeStatus enum:                                                                │
+│  ┌───────────────┐  ┌─────────────────────┐  ┌─────────────────┐                │
+│  │    ALIVE      │  │  SUSPECTED_GLOBAL   │  │  SUSPECTED_JOB  │                │
+│  │               │  │                     │  │                 │                │
+│  │ Not suspected │  │ Suspected at global │  │ Suspected for   │                │
+│  │ at any layer  │  │ layer (machine may  │  │ specific job(s) │                │
+│  │               │  │ be down)            │  │ but not global  │                │
+│  └───────┬───────┘  └──────────┬──────────┘  └────────┬────────┘                │
+│          │                     │                      │                          │
+│          │                     │                      │                          │
+│          │                     ▼                      ▼                          │
+│          │          ┌─────────────────────┐  ┌─────────────────┐                │
+│          │          │    DEAD_GLOBAL      │  │    DEAD_JOB     │                │
+│          │          │                     │  │                 │                │
+│          │          │ Declared dead at    │  │ Declared dead   │                │
+│          │          │ global level        │  │ for specific    │                │
+│          │          │ (machine is down)   │  │ job only        │                │
+│          │          └─────────────────────┘  └─────────────────┘                │
+│          │                     │                                                 │
+│          │                     │                                                 │
+│          └─────────────────────┼────────────────────────────────────────────────│
+│                                │                                                 │
+│                                ▼                                                 │
+│                    Global death clears all job suspicions                        │
+│                                                                                  │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                  │
+│  State Transitions:                                                              │
+│                                                                                  │
+│  ┌─────────┐    suspect_global()     ┌──────────────────┐                       │
+│  │  ALIVE  │ ──────────────────────► │ SUSPECTED_GLOBAL │                       │
+│  └─────────┘                          └────────┬─────────┘                       │
+│       ▲                                        │                                 │
+│       │ refute_global() or                     │ timeout without                 │
+│       │ clear_global_death()                   │ refutation                      │
+│       │                                        ▼                                 │
+│       │                               ┌──────────────────┐                       │
+│       └───────────────────────────────│   DEAD_GLOBAL    │                       │
+│         (node rejoins with            └──────────────────┘                       │
+│          higher incarnation)                   │                                 │
+│                                                │ triggers                        │
+│                                                ▼                                 │
+│                                    Clear all job suspicions                      │
+│                                    for this node                                 │
+│                                                                                  │
+│  ┌─────────┐      suspect_job()      ┌───────────────┐                          │
+│  │  ALIVE  │ ──────────────────────► │ SUSPECTED_JOB │                          │
+│  └─────────┘                          └───────┬───────┘                          │
+│       ▲                                       │                                  │
+│       │ refute_job()                          │ timeout without                  │
+│       │                                       │ refutation                       │
+│       │                                       ▼                                  │
+│       │                               ┌───────────────┐                          │
+│       └───────────────────────────────│   DEAD_JOB    │                          │
+│                                       └───────────────┘                          │
+│                                                                                  │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Lifecycle Diagram - HierarchicalFailureDetector**:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                    HIERARCHICAL DETECTOR LIFECYCLE                               │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                  │
+│  1. CONSTRUCTION                                                                 │
+│  ────────────────                                                                │
+│  detector = HierarchicalFailureDetector(                                         │
+│      config=HierarchicalConfig(...),                                             │
+│      on_global_death=handle_global_death,                                        │
+│      on_job_death=handle_job_death,                                              │
+│      get_n_members=lambda: len(active_nodes),                                    │
+│      get_job_n_members=lambda job: len(job_nodes[job]),                          │
+│      get_lhm_multiplier=lambda: local_health.get_multiplier(),                   │
+│  )                                                                               │
+│       │                                                                          │
+│       │ Creates TimingWheel and JobSuspicionManager                              │
+│       │ Initializes reconciliation state                                         │
+│       ▼                                                                          │
+│  ┌─────────────┐                                                                 │
+│  │  CREATED    │                                                                 │
+│  │             │                                                                 │
+│  │ Wheel: idle │                                                                 │
+│  │ Jobs: idle  │                                                                 │
+│  │ Reconcile:  │                                                                 │
+│  │   not run   │                                                                 │
+│  └──────┬──────┘                                                                 │
+│         │                                                                        │
+│         │ await detector.start()                                                 │
+│         ▼                                                                        │
+│  2. STARTUP                                                                      │
+│  ──────────                                                                      │
+│  ┌─────────────┐                                                                 │
+│  │  STARTING   │                                                                 │
+│  │             │─── timing_wheel.start()                                         │
+│  │             │    └── Creates tick advancement task                            │
+│  │             │                                                                 │
+│  │             │─── Starts reconciliation loop task                              │
+│  │             │                                                                 │
+│  └──────┬──────┘                                                                 │
+│         │                                                                        │
+│         │ _running = True                                                        │
+│         ▼                                                                        │
+│  ┌─────────────┐                                                                 │
+│  │   RUNNING   │                                                                 │
+│  │             │                                                                 │
+│  │ Wheel: tick │◄────────────────────────────────────────────────────┐          │
+│  │ Jobs: poll  │                                                     │          │
+│  │ Reconcile:  │    suspect_global()  ──► Add to timing wheel        │          │
+│  │   periodic  │    confirm_global()  ──► Update state (no reschedule)          │
+│  │             │    suspect_job()     ──► Create job suspicion       │          │
+│  │             │    confirm_job()     ──► Update confirmation count  │          │
+│  │             │                                                     │          │
+│  │             │    [Expiration]      ──► Callback + state update ───┘          │
+│  │             │                                                                 │
+│  └──────┬──────┘                                                                 │
+│         │                                                                        │
+│         │ await detector.stop()                                                  │
+│         ▼                                                                        │
+│  3. SHUTDOWN                                                                     │
+│  ───────────                                                                     │
+│  ┌─────────────┐                                                                 │
+│  │  STOPPING   │                                                                 │
+│  │             │─── _running = False                                             │
+│  │             │                                                                 │
+│  │             │─── Cancel reconciliation task                                   │
+│  │             │                                                                 │
+│  │             │─── timing_wheel.stop()                                          │
+│  │             │    └── Cancels tick task, clears buckets                        │
+│  │             │                                                                 │
+│  │             │─── job_manager.shutdown()                                       │
+│  │             │    └── Cancels all poll tasks, clears suspicions                │
+│  │             │                                                                 │
+│  └──────┬──────┘                                                                 │
+│         │                                                                        │
+│         ▼                                                                        │
+│  ┌─────────────┐                                                                 │
+│  │   STOPPED   │                                                                 │
+│  │             │                                                                 │
+│  │ All tasks   │                                                                 │
+│  │ cancelled   │                                                                 │
+│  │ All state   │                                                                 │
+│  │ cleared     │                                                                 │
+│  └─────────────┘                                                                 │
+│                                                                                  │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Integration with HealthAwareServer**:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                    HEALTHAWARESERVER INTEGRATION                                 │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                  │
+│  class HealthAwareServer(MercurySyncBaseServer):                                 │
+│      """Base SWIM server with optional hierarchical detection."""                │
+│                                                                                  │
+│      def __init__(self, ...):                                                    │
+│          ...                                                                     │
+│          # Optional hierarchical detector (initialized by subclasses)            │
+│          self._hierarchical_detector: HierarchicalFailureDetector | None = None │
+│                                                                                  │
+│      # ─────────────────────────────────────────────────────────────────────── #
+│      # Initialization (called by subclasses in their __init__)                  #
+│      # ─────────────────────────────────────────────────────────────────────── #
+│                                                                                  │
+│      def init_hierarchical_detector(                                             │
+│          self,                                                                   │
+│          config: HierarchicalConfig | None = None,                               │
+│          on_global_death: Callable[[tuple[str,int], int], None] | None = None,  │
+│          on_job_death: Callable[[str, tuple[str,int], int], None] | None = None,│
+│          get_job_n_members: Callable[[str], int] | None = None,                 │
+│      ) -> HierarchicalFailureDetector:                                           │
+│          """Initialize hierarchical detector with callbacks."""                  │
+│          self._hierarchical_detector = HierarchicalFailureDetector(              │
+│              config=config,                                                      │
+│              on_global_death=on_global_death,                                    │
+│              on_job_death=on_job_death,                                          │
+│              get_n_members=self._get_member_count,   # From SWIM membership     │
+│              get_job_n_members=get_job_n_members,                                │
+│              get_lhm_multiplier=self._get_lhm_multiplier,  # From LHM           │
+│          )                                                                       │
+│          return self._hierarchical_detector                                      │
+│                                                                                  │
+│      # ─────────────────────────────────────────────────────────────────────── #
+│      # Lifecycle (called by subclasses in start()/stop())                       #
+│      # ─────────────────────────────────────────────────────────────────────── #
+│                                                                                  │
+│      async def start_hierarchical_detector(self) -> None:                        │
+│          if self._hierarchical_detector:                                         │
+│              await self._hierarchical_detector.start()                           │
+│                                                                                  │
+│      async def stop_hierarchical_detector(self) -> None:                         │
+│          if self._hierarchical_detector:                                         │
+│              await self._hierarchical_detector.stop()                            │
+│                                                                                  │
+│      # ─────────────────────────────────────────────────────────────────────── #
+│      # Convenience methods (fail-open if detector not initialized)              #
+│      # ─────────────────────────────────────────────────────────────────────── #
+│                                                                                  │
+│      async def suspect_node_global(self, node, inc, from_node) -> bool           │
+│      async def suspect_node_for_job(self, job, node, inc, from_node) -> bool     │
+│      async def is_node_alive_global(self, node) -> bool                          │
+│      def is_node_alive_for_job(self, job, node) -> bool                          │
+│      async def clear_job_suspicions(self, job_id) -> int                         │
+│      async def get_node_hierarchical_status(self, node) -> NodeStatus | None     │
+│                                                                                  │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Example Implementation - Manager with Hierarchical Detection**:
+
+```python
+class ManagerServer(HealthAwareServer):
+    """Manager node with job-layer failure detection."""
+
+    def __init__(self, ...):
+        super().__init__(...)
+
+        # Initialize hierarchical detector for job-aware failure tracking
+        self.init_hierarchical_detector(
+            config=HierarchicalConfig(
+                # Longer global timeout for WAN latency
+                global_min_timeout=10.0,
+                global_max_timeout=60.0,
+                # Shorter job timeout for responsiveness
+                job_min_timeout=2.0,
+                job_max_timeout=15.0,
+            ),
+            on_global_death=self._on_worker_globally_dead,
+            on_job_death=self._on_worker_dead_for_job,
+            get_job_n_members=self._get_job_worker_count,
+        )
+
+    async def start(self) -> None:
+        await super().start()
+        # Start hierarchical detection after SWIM is running
+        await self.start_hierarchical_detector()
+
+    async def stop(self, ...) -> None:
+        # Stop hierarchical detection before SWIM shutdown
+        await self.stop_hierarchical_detector()
+        await super().stop(...)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Callbacks
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _on_worker_globally_dead(
+        self,
+        worker_addr: tuple[str, int],
+        incarnation: int,
+    ) -> None:
+        """Worker machine is dead - affects ALL jobs on that worker."""
+        worker_id = self._worker_addr_to_id.get(worker_addr)
+        if worker_id:
+            # Remove from all job assignments
+            self._job_manager.remove_worker_from_all_jobs(worker_id)
+            # Trigger workflow reassignment
+            self._task_runner.run(self._reassign_workflows_from_dead_worker, worker_id)
+
+    def _on_worker_dead_for_job(
+        self,
+        job_id: str,
+        worker_addr: tuple[str, int],
+        incarnation: int,
+    ) -> None:
+        """Worker is unresponsive for specific job - reroute that job only."""
+        worker_id = self._worker_addr_to_id.get(worker_addr)
+        if worker_id:
+            # Remove from this job's assignment only
+            self._job_manager.remove_worker_from_job(job_id, worker_id)
+            # Reroute pending workflows for this job
+            self._task_runner.run(self._reroute_job_workflows, job_id, worker_id)
+
+    def _get_job_worker_count(self, job_id: str) -> int:
+        """Get number of workers assigned to a job."""
+        return self._job_manager.get_worker_count(job_id)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Usage in workflow dispatch
+    # ─────────────────────────────────────────────────────────────────────────
+
+    async def _select_worker_for_workflow(
+        self,
+        job_id: str,
+        workflow: Workflow,
+    ) -> tuple[str, int] | None:
+        """Select a worker that's alive for this specific job."""
+        candidates = self._job_manager.get_job_workers(job_id)
+
+        for worker_id in candidates:
+            worker_addr = self._get_worker_addr(worker_id)
+
+            # Check job-specific liveness, not just global
+            if self.is_node_alive_for_job(job_id, worker_addr):
+                return worker_addr
+
+        return None  # No healthy workers for this job
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Starting job-layer suspicion
+    # ─────────────────────────────────────────────────────────────────────────
+
+    async def _on_workflow_response_timeout(
+        self,
+        job_id: str,
+        worker_addr: tuple[str, int],
+    ) -> None:
+        """Workflow response timed out - suspect worker for this job."""
+        # Get worker's current incarnation
+        incarnation = self._get_worker_incarnation(worker_addr)
+
+        # Start job-specific suspicion (not global - machine may be fine)
+        await self.suspect_node_for_job(
+            job_id=job_id,
+            node=worker_addr,
+            incarnation=incarnation,
+            from_node=self._get_self_udp_addr(),
+        )
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Cleanup when job completes
+    # ─────────────────────────────────────────────────────────────────────────
+
+    async def _on_job_completed(self, job_id: str) -> None:
+        """Job finished - clear all suspicions for that job."""
+        cleared = await self.clear_job_suspicions(job_id)
+        if cleared > 0:
+            await self._log(f"Cleared {cleared} suspicions for completed job {job_id}")
+```
+
+**Example Implementation - Gate with Cross-DC Detection**:
+
+```python
+class GateServer(HealthAwareServer):
+    """Gate node with datacenter-level failure detection."""
+
+    def __init__(self, ...):
+        super().__init__(...)
+
+        # Initialize for cross-DC manager detection
+        self.init_hierarchical_detector(
+            config=HierarchicalConfig(
+                # Very long timeout for WAN (cross-DC) latency
+                global_min_timeout=30.0,
+                global_max_timeout=120.0,
+                # Per-DC "job" timeout (treat each DC as a "job")
+                job_min_timeout=5.0,
+                job_max_timeout=30.0,
+            ),
+            on_global_death=self._on_manager_globally_dead,
+            on_job_death=self._on_manager_dead_for_dc,  # DC treated as "job"
+            get_job_n_members=self._get_dc_manager_count,
+        )
+
+    async def _on_manager_heartbeat_timeout(
+        self,
+        dc_id: str,
+        manager_addr: tuple[str, int],
+    ) -> None:
+        """Manager heartbeat timed out - suspect for this DC."""
+        incarnation = self._get_manager_incarnation(manager_addr)
+
+        # Suspect manager for this DC (job = DC)
+        await self.suspect_node_for_job(
+            job_id=dc_id,  # DC ID used as "job ID"
+            node=manager_addr,
+            incarnation=incarnation,
+            from_node=self._get_self_udp_addr(),
+        )
+
+    async def _select_manager_for_dc(self, dc_id: str) -> tuple[str, int] | None:
+        """Select a healthy manager for a datacenter."""
+        managers = self._dc_managers.get(dc_id, [])
+
+        for manager_addr in managers:
+            # Check DC-specific health
+            if self.is_node_alive_for_job(dc_id, manager_addr):
+                return manager_addr
+
+        return None
+```
+
+**Reconciliation Logic**:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                         RECONCILIATION SCENARIOS                                 │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                  │
+│  Scenario 1: Global death with lingering job suspicions                          │
+│  ───────────────────────────────────────────────────────                         │
+│                                                                                  │
+│  State BEFORE:                    State AFTER reconciliation:                    │
+│  ┌──────────────────────┐        ┌──────────────────────┐                       │
+│  │ Global Layer         │        │ Global Layer         │                       │
+│  │ Node A: DEAD         │        │ Node A: DEAD         │                       │
+│  │                      │        │                      │                       │
+│  │ Job Layer            │        │ Job Layer            │                       │
+│  │ Job1/NodeA: SUSPECT  │───────►│ Job1/NodeA: CLEARED  │                       │
+│  │ Job2/NodeA: SUSPECT  │        │ Job2/NodeA: CLEARED  │                       │
+│  └──────────────────────┘        └──────────────────────┘                       │
+│                                                                                  │
+│  Reason: If machine is dead, all jobs are implicitly affected.                   │
+│          Job suspicions are redundant and waste resources.                       │
+│                                                                                  │
+│  ────────────────────────────────────────────────────────────────────────────── │
+│                                                                                  │
+│  Scenario 2: Job death but global alive (job-specific issue)                     │
+│  ───────────────────────────────────────────────────────────                     │
+│                                                                                  │
+│  State:                                                                          │
+│  ┌──────────────────────┐                                                       │
+│  │ Global Layer         │                                                       │
+│  │ Node A: ALIVE        │  ◄── Machine is up (SWIM probes succeed)              │
+│  │                      │                                                       │
+│  │ Job Layer            │                                                       │
+│  │ Job1/NodeA: DEAD     │  ◄── But unresponsive for Job1 (CPU saturated)        │
+│  │ Job2/NodeA: ALIVE    │  ◄── Still responsive for Job2                        │
+│  └──────────────────────┘                                                       │
+│                                                                                  │
+│  Action: Route Job1 workflows away from Node A.                                  │
+│          Keep routing Job2 workflows to Node A.                                  │
+│                                                                                  │
+│  This is the KEY VALUE of hierarchical detection!                                │
+│                                                                                  │
+│  ────────────────────────────────────────────────────────────────────────────── │
+│                                                                                  │
+│  Scenario 3: Node rejoins (was globally dead)                                    │
+│  ────────────────────────────────────────────                                    │
+│                                                                                  │
+│  Timeline:                                                                       │
+│  T=0:   Node A marked DEAD_GLOBAL                                                │
+│  T=10:  Node A restarts, sends heartbeat with higher incarnation                 │
+│  T=10:  Receive heartbeat → clear_global_death(A)                                │
+│  T=10:  Node A now ALIVE at both layers                                          │
+│                                                                                  │
+│  No job suspicions to clear (they were cleared when node died globally).         │
+│                                                                                  │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Resource Limits and Bounds**:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                           RESOURCE LIMITS                                        │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                  │
+│  Global Layer (TimingWheel):                                                     │
+│  ───────────────────────────                                                     │
+│  • max_entries: 10,000 (default)                                                 │
+│  • Memory per entry: ~200 bytes (SuspicionState + wheel bookkeeping)             │
+│  • Max memory: ~2MB for 10K entries                                              │
+│  • Single tick task: O(bucket_size) per tick                                     │
+│                                                                                  │
+│  Job Layer (JobSuspicionManager):                                                │
+│  ────────────────────────────────                                                │
+│  • max_suspicions_per_job: 1,000 (default)                                       │
+│  • max_total_suspicions: 50,000 (default)                                        │
+│  • Memory per suspicion: ~300 bytes (JobSuspicion + polling state)               │
+│  • Max memory: ~15MB for 50K suspicions                                          │
+│  • One poll task per active suspicion (lightweight, mostly sleeping)             │
+│                                                                                  │
+│  Graceful Degradation:                                                           │
+│  ─────────────────────                                                           │
+│  When limits are reached:                                                        │
+│  • New suspicions are REJECTED (start_suspicion returns None/False)              │
+│  • Existing suspicions continue to be tracked                                    │
+│  • Cleanup runs periodically to remove expired entries                           │
+│  • Metrics/logs indicate limit reached                                           │
+│                                                                                  │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐│
+│  │  if len(suspicions) >= max_total_suspicions:                                ││
+│  │      # Try cleanup first                                                    ││
+│  │      cleanup_orphaned()                                                     ││
+│  │      if len(suspicions) >= max_total_suspicions:                            ││
+│  │          return None  # Reject - at capacity                                ││
+│  └─────────────────────────────────────────────────────────────────────────────┘│
+│                                                                                  │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Files Modified/Created**:
+
+| File | Description |
+|------|-------------|
+| `hyperscale/distributed_rewrite/swim/detection/timing_wheel.py` | Kafka-style hierarchical timing wheel for O(1) timer operations |
+| `hyperscale/distributed_rewrite/swim/detection/job_suspicion_manager.py` | Per-job adaptive polling suspicion manager |
+| `hyperscale/distributed_rewrite/swim/detection/hierarchical_failure_detector.py` | Coordinator for global + job layers |
+| `hyperscale/distributed_rewrite/swim/detection/__init__.py` | Updated exports |
+| `hyperscale/distributed_rewrite/swim/health_aware_server.py` | Integration methods for subclasses |
+| `tests/integration/test_timing_wheel.py` | Comprehensive timing wheel tests |
+| `tests/integration/test_job_suspicion_manager.py` | Job suspicion manager tests |
+| `tests/integration/test_hierarchical_failure_detector.py` | End-to-end hierarchical detection tests |
+
+**Testing Strategy**:
+
+1. **Unit Tests** (per component):
+   - TimingWheel: bucket operations, tick advancement, cascade, expiration
+   - JobSuspicionManager: adaptive polling, confirmation handling, cleanup
+   - HierarchicalFailureDetector: layer coordination, reconciliation
+
+2. **Integration Tests**:
+   - Timer starvation scenario (rapid confirmations)
+   - Global death clears job suspicions
+   - Job-specific failure with global alive
+   - LHM adjustment propagation
+   - Concurrent operations (asyncio correctness)
+
+3. **Edge Cases**:
+   - Max limits reached (graceful rejection)
+   - Node rejoins after global death
+   - Job completion during active suspicion
+   - Network partition (some layers detect, others don't)
+
+**Alternatives Considered**:
+
+1. **Single Timer with Dynamic Timeout**: Simpler but still has reschedule overhead
+2. **Confirmation Debouncing**: Delays confirmation propagation, affects protocol correctness
+3. **Timeout Floor**: Minimum timeout regardless of confirmations, but wastes time when node is clearly dead
+4. **Batch Confirmation Processing**: Reduces reschedules but adds latency
+5. **Hierarchical Without Job Layer**: Loses per-job routing capability
+
+**Trade-offs**:
+
+| Aspect | Before | After |
+|--------|--------|-------|
+| Timer management | Per-suspicion timers | Single tick + adaptive polling |
+| Confirmation handling | Cancel + reschedule | State update only |
+| Memory overhead | Lower | Higher (two layers) |
+| Complexity | Simpler | More complex |
+| Job awareness | None | Full per-job tracking |
+| Timer starvation | Vulnerable | Immune |
+| Routing accuracy | Global only | Per-job granularity |
+
+---
+
+### AD-31: Gossip-Informed Callbacks for Failure Propagation
+
+**Decision**: Invoke application-layer callbacks (`_on_node_dead_callbacks`) when SWIM gossip reports a node as dead, not just when direct failure detection occurs. This enables cluster-wide consistent failure response and proper job leadership transfer across all node relationships.
+
+**Rationale**:
+In a distributed system using SWIM protocol, failure detection can occur through two paths:
+1. **Direct detection**: Node A probes Node B, timeout expires, A marks B dead
+2. **Gossip propagation**: Node A learns from Node C's gossip that B is dead
+
+The original implementation only invoked `_on_node_dead_callbacks` for direct detection. This caused inconsistent cluster views where nodes that learned about failures via gossip didn't update their application state (e.g., `_active_gate_peers`, job leadership tracking).
+
+**Problem Statement - Inconsistent Failure Response**:
+
+```
+Scenario: 3-node gate cluster (Gate1, Gate2, Gate3)
+
+T=0.0: Gate3 crashes
+T=0.5: Gate1 directly detects Gate3 failure (probe timeout)
+       → _on_node_dead_callbacks invoked on Gate1
+       → Gate1._active_gate_peers removes Gate3 ✓
+       → Gate1 takes over Gate3's job leadership ✓
+
+T=0.6: Gate1 gossips "Gate3 is DEAD" to Gate2
+       → Gate2.process_piggyback_data() receives update
+       → Gate2 updates incarnation_tracker to DEAD
+       → ❌ _on_node_dead_callbacks NOT invoked on Gate2
+       → Gate2._active_gate_peers still contains Gate3!
+       → Gate2 doesn't know Gate3's jobs transferred to Gate1
+
+Result: Gate2 has stale view - may route requests to dead Gate3
+        or conflict with Gate1's job leadership takeover
+```
+
+**Solution: Gossip-Informed Callbacks**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    FAILURE DETECTION CALLBACK FLOW                           │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  PATH 1: DIRECT DETECTION                                                   │
+│  ────────────────────────                                                   │
+│                                                                              │
+│  SWIM Probe Timeout                                                          │
+│        │                                                                     │
+│        ▼                                                                     │
+│  start_suspicion(node)                                                       │
+│        │                                                                     │
+│        ▼                                                                     │
+│  [Suspicion timer expires in TimingWheel]                                   │
+│        │                                                                     │
+│        ▼                                                                     │
+│  _on_suspicion_expired(node)                                                │
+│        │                                                                     │
+│        ├─► update_node_state(node, DEAD)                                    │
+│        ├─► queue_gossip_update('dead', node)    ──► propagate to cluster    │
+│        └─► invoke _on_node_dead_callbacks(node)  ✓                          │
+│                                                                              │
+│  PATH 2: GOSSIP-INFORMED (NEW)                                              │
+│  ─────────────────────────────                                              │
+│                                                                              │
+│  Receive gossip: "node X is DEAD"                                           │
+│        │                                                                     │
+│        ▼                                                                     │
+│  process_piggyback_data(data)                                               │
+│        │                                                                     │
+│        ├─► Check: was node already DEAD?                                    │
+│        │          │                                                          │
+│        │          ├─► YES: skip (idempotent)                                │
+│        │          │                                                          │
+│        │          └─► NO: state transition detected                         │
+│        │                   │                                                 │
+│        ▼                   │                                                 │
+│  update_node_state(node, DEAD)                                              │
+│        │                   │                                                 │
+│        │                   ▼                                                 │
+│        │   invoke _on_node_dead_callbacks(node)  ✓ (NEW)                    │
+│        │                                                                     │
+│        └─► queue_gossip_update('dead', node)    ──► continue propagation    │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Key Implementation Details**:
+
+1. **Idempotency**: Only invoke callbacks when state actually changes (NOT-DEAD → DEAD)
+2. **Symmetry**: Mirrors existing DEAD→OK recovery detection in `update_node_state`
+3. **Incarnation respect**: Only process gossip with fresh incarnation numbers
+4. **Metrics**: Track `gossip_informed_deaths` separately from direct detections
+
+**Code Change** (in `process_piggyback_data`):
+
+```python
+# Check previous state BEFORE updating
+previous_state = self._incarnation_tracker.get_node_state(update.node)
+was_dead = previous_state and previous_state.status == b'DEAD'
+
+updated = self.update_node_state(update.node, status, update.incarnation, update.timestamp)
+
+# Gossip-informed callback: invoke when learning about death via gossip
+if updated and update.update_type in ('dead', 'leave') and not was_dead:
+    self._metrics.increment('gossip_informed_deaths')
+    self._probe_scheduler.remove_member(update.node)
+    for callback in self._on_node_dead_callbacks:
+        callback(update.node)
+```
+
+**Impact on Node Relationships**:
+
+| Relationship | Before AD-31 | After AD-31 |
+|--------------|--------------|-------------|
+| Gate ↔ Gate | Only detector updates `_active_gate_peers` | All gates update consistently |
+| Manager ↔ Manager | Only detector triggers job takeover | All managers see consistent state |
+| Gate ↔ Manager | Managers don't learn about gate failures quickly | Managers can react to gate deaths |
+| Manager ↔ Worker | Workers only react to direct detection | Workers respond to gossip too |
+
+**Job Leadership Transfer Cascade**:
+
+With gossip-informed callbacks, the failure propagation enables proper job leadership transfer:
+
+```
+Gate Failure → Job Leadership Transfer
+──────────────────────────────────────
+Gate1 (job leader) dies
+    │
+    ├─► Gate2 detects (direct or gossip)
+    │       └─► _on_node_dead callback
+    │               └─► _handle_gate_peer_failure
+    │                       └─► _handle_job_leader_failure
+    │                               └─► takeover_leadership(job_id)
+    │                               └─► _broadcast_job_leadership (to gates)
+    │                               └─► _notify_managers_of_leadership (NEW)
+    │
+    └─► Gate3 detects (gossip from Gate2)
+            └─► _on_node_dead callback
+                    └─► Updates _active_gate_peers
+                    └─► Sees Gate2 already took over (via broadcast)
+
+Manager Failure → Job Leadership Transfer
+────────────────────────────────────────
+Manager1 (job leader in DC) dies
+    │
+    ├─► Manager2 (cluster leader) detects
+    │       └─► _on_node_dead callback
+    │               └─► _handle_manager_peer_failure
+    │                       └─► _handle_job_leader_failure
+    │                               └─► Takes over job leadership
+    │                               └─► Propagates via heartbeat
+    │                               └─► _notify_gate_of_leadership (NEW)
+    │                               └─► _notify_workers_of_leadership (NEW)
+    │
+    ├─► Workers detect (gossip)
+    │       └─► _on_node_dead callback
+    │               └─► _handle_manager_failure
+    │                       └─► Selects new primary manager
+    │                       └─► Receives leadership update via heartbeat
+    │
+    └─► Origin Gate learns (via manager notification)
+            └─► Updates _job_dc_managers[job_id][dc_id]
+```
+
+**Safeguards**:
+
+1. **Incarnation checking**: Stale gossip with old incarnation is rejected
+2. **State transition check**: Only fire callback on actual NOT-DEAD → DEAD transition
+3. **Fencing tokens**: Job leadership uses monotonic tokens to prevent stale leaders
+4. **Idempotent handlers**: Application callbacks must handle duplicate invocations
+
+**Testing Strategy**:
+
+1. Unit test: Verify callbacks invoked for gossip-received deaths
+2. Integration test: 3 gates, kill one, verify all gates update `_active_gate_peers`
+3. Integration test: Job leadership transfers correctly when leader gate fails
+4. Integration test: Manager cluster leader takes over jobs when non-leader fails
+5. Integration test: Workers discover new job leader after manager failure
+
+**Files Modified**:
+
+- `hyperscale/distributed_rewrite/swim/health_aware_server.py`: Add gossip-informed callback invocation in `process_piggyback_data`
+- `hyperscale/distributed_rewrite/nodes/gate.py`: Add manager notification after job leadership takeover
+- `hyperscale/distributed_rewrite/nodes/manager.py`: Add gate and worker notification after job leadership takeover
+
+---
+
+### AD-32: Hybrid Bounded Execution with Priority Load Shedding
+
+**Decision**: Implement a hybrid approach for bounded pending responses optimized for a globally distributed performance testing framework:
+
+1. **Server-side (incoming requests)**: Priority-aware bounded immediate execution with load shedding
+2. **Client-side (outgoing requests)**: RobustMessageQueue per destination with graduated backpressure
+
+This prevents memory exhaustion while ensuring latency-critical messages (SWIM heartbeats) are never delayed by queue overhead, and slow destinations don't block fast ones.
+
+**Rationale - Why Hybrid?**
+
+In a globally distributed performance testing framework:
+- **Extreme latency** between datacenters (50-300ms RTT)
+- **Frequent stats updates** from workers (100+ updates/sec per worker)
+- **Busy workers** with high CPU/memory, making interval-based cleanup unreliable
+- **SWIM protocol** requires sub-millisecond response for accurate failure detection
+
+| Approach | Server-Side Problem | Client-Side Problem |
+|----------|--------------------|--------------------|
+| Queue-only | Consumer loop adds latency even at 0% load - deadly for SWIM | Works well |
+| Counter-only | Works well | Head-of-line blocking on slow destinations |
+| **Hybrid** | Immediate execution, priority discrimination | Per-destination isolation |
+
+---
+
+## Part 1: Server-Side Priority-Aware Bounded Immediate Execution
+
+**Problem Statement - Unbounded Hot Path Queues**:
+
+```
+Original Flow (Vulnerable):
+
+Incoming TCP/UDP Message (sync callback)
+        │
+        ▼
+self._pending_responses.append(        ◄── UNBOUNDED DEQUE
+    asyncio.ensure_future(
+        self.process_*_request(...)
+    )
+)
+
+Problem Scenarios:
+
+1. MANAGER under load:
+   - 1000 workers push stats at 100 updates/second each
+   - 100,000 tasks created per second
+   - Cleanup runs every 100ms → 10,000 tasks accumulate
+   - Memory grows linearly with load
+
+2. GATE under retry storm:
+   - 10 datacenters × 50 retries × 100 concurrent jobs
+   - 50,000 pending tasks during network partition recovery
+   - No bound → potential OOM
+
+3. WORKER under CPU pressure:
+   - High CPU utilization delays event loop
+   - Cleanup interval becomes unreliable
+   - Tasks accumulate faster than they're cleaned
+```
+
+**Solution: Priority-Aware InFlightTracker**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│           SERVER-SIDE: PRIORITY-AWARE BOUNDED IMMEDIATE EXECUTION                │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                  │
+│  Incoming Message (sync callback from protocol)                                  │
+│          │                                                                       │
+│          ▼                                                                       │
+│  ┌───────────────────────────────────────────────────────────────────────────┐  │
+│  │                     MESSAGE PRIORITY CLASSIFICATION                        │  │
+│  │                                                                            │  │
+│  │   CRITICAL (0) │ SWIM probe/ack, leadership, failure detection            │  │
+│  │   HIGH (1)     │ Job dispatch, workflow commands, state sync              │  │
+│  │   NORMAL (2)   │ Status updates, heartbeats (non-SWIM)                    │  │
+│  │   LOW (3)      │ Metrics, stats, telemetry, logs                          │  │
+│  └───────────────────────────────────────────────────────────────────────────┘  │
+│          │                                                                       │
+│          ▼                                                                       │
+│  ┌───────────────────────────────────────────────────────────────────────────┐  │
+│  │                     IN-FLIGHT TRACKER CHECK                                │  │
+│  │                                                                            │  │
+│  │   tracker.try_acquire(priority) → bool                                     │  │
+│  │                                                                            │  │
+│  │   Priority Limits (per-priority bounded):                                  │  │
+│  │   ┌──────────────────────────────────────────────────────────────────┐    │  │
+│  │   │ Priority   │ Limit │ Current │ Available │ Status              │    │  │
+│  │   ├──────────────────────────────────────────────────────────────────┤    │  │
+│  │   │ CRITICAL   │   ∞   │    5    │     ∞     │ Always allowed      │    │  │
+│  │   │ HIGH       │  500  │   480   │    20     │ ✓ Allowed           │    │  │
+│  │   │ NORMAL     │  300  │   300   │     0     │ ✗ At limit          │    │  │
+│  │   │ LOW        │  200  │   200   │     0     │ ✗ At limit, shed    │    │  │
+│  │   └──────────────────────────────────────────────────────────────────┘    │  │
+│  │                                                                            │  │
+│  │   Global Limit: 1000 (sum of all priorities)                              │  │
+│  └───────────────────────────────────────────────────────────────────────────┘  │
+│          │                           │                                          │
+│       ACQUIRED                    REJECTED                                      │
+│          │                           │                                          │
+│          ▼                           ▼                                          │
+│  ┌───────────────────┐    ┌───────────────────────────────────────────────────┐│
+│  │ Immediate Execute │    │              LOAD SHEDDING                         ││
+│  │                   │    │                                                    ││
+│  │ 1. Create task    │    │   Priority-based discrimination:                   ││
+│  │ 2. Add callback   │    │                                                    ││
+│  │ 3. Execute NOW    │    │   • LOW: Silent drop, increment counter           ││
+│  │                   │    │   • NORMAL: Drop if HIGH/CRITICAL pressure        ││
+│  │ No queue latency! │    │   • HIGH: Only drop if CRITICAL overwhelmed       ││
+│  │                   │    │   • CRITICAL: NEVER drop, always execute          ││
+│  └───────────────────┘    │                                                    ││
+│          │                │   Response varies by protocol:                     ││
+│          │                │   • UDP: Silent drop (no guarantee anyway)        ││
+│          │                │   • TCP: Error response with Retry-After          ││
+│          │                └───────────────────────────────────────────────────────┘│
+│          │                                                                       │
+│          ▼                                                                       │
+│  ┌───────────────────────────────────────────────────────────────────────────┐  │
+│  │                        TASK DONE CALLBACK                                  │  │
+│  │                                                                            │  │
+│  │  1. tracker.release(priority)  # Decrement priority-specific counter      │  │
+│  │  2. Retrieve exception (prevent memory leak)                              │  │
+│  │  3. Remove from tracking deque                                            │  │
+│  └───────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                  │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**State Diagram - Priority Load Shedding**:
+
+```
+                              ┌─────────────────────────────────────────────┐
+                              │              SYSTEM STATE                    │
+                              └─────────────────────────────────────────────┘
+                                                │
+        ┌───────────────────────────────────────┼───────────────────────────────────────┐
+        │                                       │                                       │
+        ▼                                       ▼                                       ▼
+┌───────────────────┐                ┌───────────────────┐                ┌───────────────────┐
+│     HEALTHY       │                │    PRESSURED      │                │    OVERLOADED     │
+│                   │                │                   │                │                   │
+│ All priorities    │                │ LOW at limit      │                │ NORMAL at limit   │
+│ have capacity     │                │ Others OK         │                │ Only HIGH+CRIT OK │
+│                   │                │                   │                │                   │
+│ Actions:          │                │ Actions:          │                │ Actions:          │
+│ • Accept all      │                │ • Shed LOW        │                │ • Shed LOW+NORMAL │
+│                   │                │ • Accept others   │                │ • Accept HIGH+CRIT│
+└───────────────────┘                └───────────────────┘                └───────────────────┘
+        │                                       │                                       │
+        │                                       │                                       │
+        ▼                                       ▼                                       ▼
+┌─────────────────────────────────────────────────────────────────────────────────────────────┐
+│                                      CRITICAL                                                │
+│                                                                                              │
+│  CRITICAL priority messages ALWAYS execute immediately, regardless of system state.         │
+│  This ensures SWIM probes/acks are never delayed, maintaining accurate failure detection.   │
+└─────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**InFlightTracker Implementation**:
+
+```python
+from enum import IntEnum
+from dataclasses import dataclass, field
+from typing import Dict
+import asyncio
+
+
+class MessagePriority(IntEnum):
+    """Priority levels for incoming messages."""
+    CRITICAL = 0  # SWIM probes/acks - NEVER shed
+    HIGH = 1      # Job dispatch, workflow commands
+    NORMAL = 2    # Status updates, non-SWIM heartbeats
+    LOW = 3       # Metrics, stats, telemetry
+
+
+@dataclass(slots=True)
+class PriorityLimits:
+    """Per-priority concurrency limits."""
+    critical: int = 0      # 0 = unlimited
+    high: int = 500
+    normal: int = 300
+    low: int = 200
+    global_limit: int = 1000
+
+
+@dataclass
+class InFlightTracker:
+    """
+    Tracks in-flight tasks by priority with bounded execution.
+
+    Thread-safety: All operations are sync-safe (GIL-protected integers).
+    Called from sync protocol callbacks.
+    """
+    limits: PriorityLimits = field(default_factory=PriorityLimits)
+
+    # Per-priority counters
+    _counts: Dict[MessagePriority, int] = field(default_factory=lambda: {
+        MessagePriority.CRITICAL: 0,
+        MessagePriority.HIGH: 0,
+        MessagePriority.NORMAL: 0,
+        MessagePriority.LOW: 0,
+    })
+
+    # Metrics
+    _acquired_total: Dict[MessagePriority, int] = field(default_factory=lambda: {
+        MessagePriority.CRITICAL: 0,
+        MessagePriority.HIGH: 0,
+        MessagePriority.NORMAL: 0,
+        MessagePriority.LOW: 0,
+    })
+    _shed_total: Dict[MessagePriority, int] = field(default_factory=lambda: {
+        MessagePriority.CRITICAL: 0,
+        MessagePriority.HIGH: 0,
+        MessagePriority.NORMAL: 0,
+        MessagePriority.LOW: 0,
+    })
+
+    def try_acquire(self, priority: MessagePriority) -> bool:
+        """
+        Try to acquire a slot for the given priority.
+
+        Returns True if acquired (execute immediately).
+        Returns False if rejected (apply load shedding).
+
+        CRITICAL priority ALWAYS succeeds.
+        """
+        # CRITICAL never shed
+        if priority == MessagePriority.CRITICAL:
+            self._counts[priority] += 1
+            self._acquired_total[priority] += 1
+            return True
+
+        # Check global limit
+        total = sum(self._counts.values())
+        if total >= self.limits.global_limit:
+            self._shed_total[priority] += 1
+            return False
+
+        # Check per-priority limit
+        limit = self._get_limit(priority)
+        if limit > 0 and self._counts[priority] >= limit:
+            self._shed_total[priority] += 1
+            return False
+
+        self._counts[priority] += 1
+        self._acquired_total[priority] += 1
+        return True
+
+    def release(self, priority: MessagePriority) -> None:
+        """Release a slot for the given priority."""
+        if self._counts[priority] > 0:
+            self._counts[priority] -= 1
+
+    def _get_limit(self, priority: MessagePriority) -> int:
+        """Get limit for priority. 0 means unlimited."""
+        if priority == MessagePriority.CRITICAL:
+            return self.limits.critical  # Usually 0 (unlimited)
+        elif priority == MessagePriority.HIGH:
+            return self.limits.high
+        elif priority == MessagePriority.NORMAL:
+            return self.limits.normal
+        else:  # LOW
+            return self.limits.low
+
+    @property
+    def total_in_flight(self) -> int:
+        """Total tasks currently in flight."""
+        return sum(self._counts.values())
+
+    def get_stats(self) -> dict:
+        """Get current stats for observability."""
+        return {
+            "in_flight": dict(self._counts),
+            "total_in_flight": self.total_in_flight,
+            "acquired_total": dict(self._acquired_total),
+            "shed_total": dict(self._shed_total),
+            "limits": {
+                "critical": self.limits.critical,
+                "high": self.limits.high,
+                "normal": self.limits.normal,
+                "low": self.limits.low,
+                "global": self.limits.global_limit,
+            }
+        }
+```
+
+**Integration with MercurySyncBaseServer**:
+
+```python
+class MercurySyncBaseServer:
+    def __init__(self, ...):
+        # ... existing init ...
+
+        # AD-32: Priority-aware bounded execution
+        self._tcp_tracker = InFlightTracker(
+            limits=PriorityLimits(
+                critical=0,  # Unlimited
+                high=env.PENDING_RESPONSE_HIGH_LIMIT,
+                normal=env.PENDING_RESPONSE_NORMAL_LIMIT,
+                low=env.PENDING_RESPONSE_LOW_LIMIT,
+                global_limit=env.PENDING_RESPONSE_MAX_CONCURRENT,
+            )
+        )
+        self._udp_tracker = InFlightTracker(limits=...)
+
+    def _spawn_tcp_response(
+        self,
+        coro: Coroutine,
+        priority: MessagePriority = MessagePriority.NORMAL
+    ) -> bool:
+        """
+        Spawn a TCP response task with priority-aware bounded execution.
+
+        Returns True if task spawned, False if shed.
+        Called from sync protocol callback.
+        """
+        if not self._tcp_tracker.try_acquire(priority):
+            # Load shedding - log and return
+            self._tcp_shed_count += 1
+            return False
+
+        task = asyncio.ensure_future(coro)
+        task.add_done_callback(
+            lambda t: self._on_tcp_task_done(t, priority)
+        )
+        self._pending_tcp_server_responses.append(task)
+        return True
+
+    def _on_tcp_task_done(
+        self,
+        task: asyncio.Task,
+        priority: MessagePriority
+    ) -> None:
+        """Done callback - release slot and cleanup."""
+        # Retrieve exception to prevent memory leak
+        try:
+            task.exception()
+        except (asyncio.CancelledError, asyncio.InvalidStateError):
+            pass
+        except Exception:
+            pass  # Logged elsewhere
+
+        # Release the priority slot
+        self._tcp_tracker.release(priority)
+```
+
+---
+
+## Part 2: Client-Side RobustMessageQueue for Slow Destinations
+
+**Problem Statement - Head-of-Line Blocking**:
+
+```
+Client sending to multiple destinations:
+
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                    PROBLEM: SINGLE QUEUE FOR ALL DESTINATIONS                    │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                  │
+│  Outgoing Messages:                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────────┐    │
+│  │  [DC-Asia:msg1] [DC-Asia:msg2] [DC-EU:msg1] [DC-US:msg1] [DC-Asia:msg3] │    │
+│  └─────────────────────────────────────────────────────────────────────────┘    │
+│                      ▲                                                          │
+│                      │                                                          │
+│              Asia DC has 300ms latency + packet loss                            │
+│              EU and US are fast (50ms)                                          │
+│                                                                                  │
+│  Result: All messages blocked behind slow Asia connection                       │
+│          Fast destinations starved                                              │
+│                                                                                  │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Solution: Per-Destination RobustMessageQueue**:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│              CLIENT-SIDE: PER-DESTINATION ROBUSTMESSAGEQUEUE                     │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                  │
+│  Outgoing Request Manager:                                                       │
+│                                                                                  │
+│  ┌─────────────────────────────────────────────────────────────────────────┐    │
+│  │                    PER-DESTINATION QUEUES                                │    │
+│  │                                                                          │    │
+│  │  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐       │    │
+│  │  │    DC-Asia       │  │     DC-EU        │  │     DC-US        │       │    │
+│  │  │  RobustQueue     │  │  RobustQueue     │  │  RobustQueue     │       │    │
+│  │  │                  │  │                  │  │                  │       │    │
+│  │  │ [msg1][msg2][m3] │  │ [msg1]           │  │ [msg1]           │       │    │
+│  │  │                  │  │                  │  │                  │       │    │
+│  │  │ State: THROTTLED │  │ State: HEALTHY   │  │ State: HEALTHY   │       │    │
+│  │  │ Consumer: slow   │  │ Consumer: fast   │  │ Consumer: fast   │       │    │
+│  │  └──────────────────┘  └──────────────────┘  └──────────────────┘       │    │
+│  │          │                     │                     │                   │    │
+│  │          ▼                     ▼                     ▼                   │    │
+│  │  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐       │    │
+│  │  │ Consumer Loop    │  │ Consumer Loop    │  │ Consumer Loop    │       │    │
+│  │  │ (per destination)│  │ (per destination)│  │ (per destination)│       │    │
+│  │  │                  │  │                  │  │                  │       │    │
+│  │  │ await send()     │  │ await send()     │  │ await send()     │       │    │
+│  │  │ (blocking on     │  │ (fast)           │  │ (fast)           │       │    │
+│  │  │  slow network)   │  │                  │  │                  │       │    │
+│  │  └──────────────────┘  └──────────────────┘  └──────────────────┘       │    │
+│  │                                                                          │    │
+│  └─────────────────────────────────────────────────────────────────────────┘    │
+│                                                                                  │
+│  Benefits:                                                                       │
+│  1. Slow DC doesn't block fast DCs                                              │
+│  2. Per-destination backpressure (THROTTLE → BATCH → OVERFLOW)                  │
+│  3. Overflow ring buffer preserves newest messages on burst                      │
+│  4. Metrics per destination for observability                                   │
+│                                                                                  │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**State Diagram - Per-Destination Queue States**:
+
+```
+                            ┌─────────────────────────────────────────┐
+                            │        ROBUSTMESSAGEQUEUE STATES        │
+                            └─────────────────────────────────────────┘
+                                            │
+        ┌───────────────────────────────────┼───────────────────────────────────────┐
+        │                                   │                                       │
+        ▼                                   ▼                                       ▼
+┌───────────────┐                  ┌───────────────┐                       ┌───────────────┐
+│   HEALTHY     │ fill < 70%       │  THROTTLED    │ 70% ≤ fill < 85%     │   BATCHING    │
+│               │ ─────────────────│               │ ─────────────────────│               │
+│ • No delay    │                  │ • 50ms delay  │                       │ • 200ms delay │
+│ • Full speed  │                  │ • Slow down   │                       │ • Batch only  │
+└───────────────┘                  └───────────────┘                       └───────────────┘
+        ▲                                   │                                       │
+        │                                   │                                       │
+        │  fill < 70%                       │ 85% ≤ fill < 95%                      │
+        └───────────────────────────────────┼───────────────────────────────────────┘
+                                            │
+                                            ▼
+                                   ┌───────────────┐
+                                   │   OVERFLOW    │ fill ≥ 95% or primary full
+                                   │               │
+                                   │ • 100ms delay │
+                                   │ • Using ring  │
+                                   │ • Drop oldest │
+                                   └───────────────┘
+                                            │
+                                            │ overflow also full
+                                            ▼
+                                   ┌───────────────┐
+                                   │   SATURATED   │
+                                   │               │
+                                   │ • 500ms delay │
+                                   │ • Reject new  │
+                                   │ • Critical    │
+                                   └───────────────┘
+```
+
+**OutgoingRequestManager Implementation**:
+
+```python
+from hyperscale.distributed_rewrite.reliability import (
+    RobustMessageQueue,
+    RobustQueueConfig,
+    QueueState,
+)
+from dataclasses import dataclass, field
+from typing import Dict, Tuple, Any, Callable, Awaitable
+import asyncio
+
+
+@dataclass(slots=True)
+class OutgoingRequest:
+    """Represents an outgoing request to a destination."""
+    destination: Tuple[str, int]
+    data: bytes
+    priority: MessagePriority = MessagePriority.NORMAL
+    created_at: float = field(default_factory=time.monotonic)
+
+
+class OutgoingRequestManager:
+    """
+    Manages outgoing requests with per-destination queuing.
+
+    Uses RobustMessageQueue per destination to:
+    1. Isolate slow destinations from fast ones
+    2. Provide graduated backpressure per destination
+    3. Preserve newest messages during overload
+
+    Usage:
+        manager = OutgoingRequestManager(send_func=self._send_to_destination)
+
+        # Enqueue a request
+        result = manager.enqueue(destination, data, priority)
+        if result.backpressure.level != BackpressureLevel.NONE:
+            # Sender should slow down for this destination
+            pass
+    """
+
+    def __init__(
+        self,
+        send_func: Callable[[Tuple[str, int], bytes], Awaitable[None]],
+        config: RobustQueueConfig | None = None,
+        max_destinations: int = 1000,
+    ):
+        self._send_func = send_func
+        self._config = config or RobustQueueConfig(
+            maxsize=500,
+            overflow_size=100,
+            throttle_threshold=0.70,
+            batch_threshold=0.85,
+            reject_threshold=0.95,
+        )
+        self._max_destinations = max_destinations
+
+        # Per-destination queues and consumers
+        self._queues: Dict[Tuple[str, int], RobustMessageQueue[OutgoingRequest]] = {}
+        self._consumers: Dict[Tuple[str, int], asyncio.Task] = {}
+        self._running = False
+
+        # LRU eviction for destinations
+        self._destination_access_order: list[Tuple[str, int]] = []
+
+    def enqueue(
+        self,
+        destination: Tuple[str, int],
+        data: bytes,
+        priority: MessagePriority = MessagePriority.NORMAL
+    ) -> QueuePutResult:
+        """
+        Enqueue a request to a destination.
+
+        Returns QueuePutResult with backpressure information.
+        Caller can use result.backpressure to decide whether to slow down.
+        """
+        queue = self._get_or_create_queue(destination)
+
+        request = OutgoingRequest(
+            destination=destination,
+            data=data,
+            priority=priority,
+        )
+
+        return queue.put_nowait(request)
+
+    def _get_or_create_queue(
+        self,
+        destination: Tuple[str, int]
+    ) -> RobustMessageQueue[OutgoingRequest]:
+        """Get or create queue for destination, with LRU eviction."""
+        if destination in self._queues:
+            # Update LRU order
+            if destination in self._destination_access_order:
+                self._destination_access_order.remove(destination)
+            self._destination_access_order.append(destination)
+            return self._queues[destination]
+
+        # Evict LRU if at capacity
+        while len(self._queues) >= self._max_destinations:
+            oldest = self._destination_access_order.pop(0)
+            self._evict_destination(oldest)
+
+        # Create new queue and consumer
+        queue = RobustMessageQueue[OutgoingRequest](self._config)
+        self._queues[destination] = queue
+        self._destination_access_order.append(destination)
+
+        # Start consumer for this destination
+        if self._running:
+            self._consumers[destination] = asyncio.create_task(
+                self._consume_destination(destination)
+            )
+
+        return queue
+
+    async def _consume_destination(self, destination: Tuple[str, int]) -> None:
+        """Consumer loop for a single destination."""
+        queue = self._queues.get(destination)
+        if not queue:
+            return
+
+        while self._running and destination in self._queues:
+            try:
+                request = await queue.get()
+                await self._send_func(request.destination, request.data)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                # Log and continue - don't let one failure stop the consumer
+                pass
+
+    async def start(self) -> None:
+        """Start all consumer loops."""
+        self._running = True
+        for destination in list(self._queues.keys()):
+            if destination not in self._consumers:
+                self._consumers[destination] = asyncio.create_task(
+                    self._consume_destination(destination)
+                )
+
+    async def stop(self) -> None:
+        """Stop all consumer loops gracefully."""
+        self._running = False
+        for task in self._consumers.values():
+            task.cancel()
+        await asyncio.gather(*self._consumers.values(), return_exceptions=True)
+        self._consumers.clear()
+
+    def _evict_destination(self, destination: Tuple[str, int]) -> None:
+        """Evict a destination (LRU cleanup)."""
+        if destination in self._consumers:
+            self._consumers[destination].cancel()
+            del self._consumers[destination]
+        if destination in self._queues:
+            del self._queues[destination]
+
+    def get_destination_stats(self, destination: Tuple[str, int]) -> dict | None:
+        """Get stats for a specific destination."""
+        queue = self._queues.get(destination)
+        if queue:
+            return queue.get_metrics()
+        return None
+
+    def get_all_stats(self) -> dict:
+        """Get stats for all destinations."""
+        return {
+            "destination_count": len(self._queues),
+            "destinations": {
+                f"{host}:{port}": queue.get_metrics()
+                for (host, port), queue in self._queues.items()
+            }
+        }
+```
+
+---
+
+## Part 3: Applicability Matrix
+
+| Component | Server-Side (Incoming) | Client-Side (Outgoing) | Notes |
+|-----------|------------------------|------------------------|-------|
+| **MercurySyncBaseServer** | ✅ InFlightTracker | ✅ OutgoingRequestManager | Both patterns apply |
+| **UDPProtocol (jobs)** | ✅ InFlightTracker | ✅ OutgoingRequestManager | Same pattern for job protocol |
+| **HealthAwareServer** | ✅ Inherits | ✅ Inherits | Extends MercurySyncBaseServer |
+| **RemoteGraphController** | ✅ Inherits | ✅ Inherits | Extends UDPProtocol |
+| **Gate** | ✅ Via inheritance | ✅ For DC communication | Cross-DC coordination |
+| **Manager** | ✅ Via inheritance | ✅ For worker communication | Stats from workers |
+| **Worker** | ✅ Via inheritance | ✅ For manager communication | Lower priority limits |
+| **WorkflowRunner** | ❌ | ❌ | Already has `_max_pending_workflows` |
+| **RemoteGraphManager** | ❌ | ❌ | Different pattern (workflow queuing) |
+
+---
+
+## Part 4: Configuration
+
+**Environment Variables (env.py)**:
+
+```python
+# AD-32: Priority-Aware Bounded Execution Settings
+PENDING_RESPONSE_MAX_CONCURRENT: StrictInt = 1000      # Global limit
+PENDING_RESPONSE_HIGH_LIMIT: StrictInt = 500           # HIGH priority limit
+PENDING_RESPONSE_NORMAL_LIMIT: StrictInt = 300         # NORMAL priority limit
+PENDING_RESPONSE_LOW_LIMIT: StrictInt = 200            # LOW priority limit (shed first)
+PENDING_RESPONSE_WARN_THRESHOLD: StrictFloat = 0.8     # Log warning at 80%
+
+# AD-32: Client-Side Queue Settings
+OUTGOING_QUEUE_SIZE: StrictInt = 500                   # Per-destination queue size
+OUTGOING_OVERFLOW_SIZE: StrictInt = 100                # Overflow ring buffer size
+OUTGOING_MAX_DESTINATIONS: StrictInt = 1000            # Max tracked destinations
+```
+
+**Per-Node Type Recommendations**:
+
+| Node Type | GLOBAL | HIGH | NORMAL | LOW | QUEUE_SIZE | Rationale |
+|-----------|--------|------|--------|-----|------------|-----------|
+| Gate | 2000 | 1000 | 600 | 400 | 1000 | Cross-DC coordination, high volume |
+| Manager | 5000 | 2500 | 1500 | 1000 | 500 | Highest load from worker stats |
+| Worker | 500 | 250 | 150 | 100 | 250 | Lower limit, focus on execution |
+
+---
+
+## Part 5: Observability
+
+**Logging Models**:
+
+```python
+@dataclass
+class PriorityLoadStats(ServerInfo):
+    """Tracks priority-aware load shedding stats."""
+    # Per-priority in-flight counts
+    critical_in_flight: int
+    high_in_flight: int
+    normal_in_flight: int
+    low_in_flight: int
+    total_in_flight: int
+
+    # Per-priority acquired totals
+    critical_acquired: int
+    high_acquired: int
+    normal_acquired: int
+    low_acquired: int
+
+    # Per-priority shed totals
+    critical_shed: int  # Should always be 0!
+    high_shed: int
+    normal_shed: int
+    low_shed: int
+
+    # Limits
+    global_limit: int
+    high_limit: int
+    normal_limit: int
+    low_limit: int
+
+
+@dataclass
+class DestinationQueueStats(ServerInfo):
+    """Tracks per-destination queue stats."""
+    destination_host: str
+    destination_port: int
+    primary_size: int
+    overflow_size: int
+    state: str  # HEALTHY, THROTTLED, BATCHING, OVERFLOW, SATURATED
+    total_enqueued: int
+    total_dropped: int
+    backpressure_level: str
+```
+
+**Alert Conditions**:
+
+```python
+# Critical: CRITICAL priority messages being shed (should never happen)
+if priority_stats.critical_shed > 0:
+    log.error("CRITICAL: SWIM messages being shed - cluster stability at risk!")
+
+# Warning: HIGH priority at limit
+if priority_stats.high_in_flight >= high_limit * 0.9:
+    log.warn(f"HIGH priority at {pct}% - job dispatch may be delayed")
+
+# Info: Destination in overflow
+if destination_stats.state in ("OVERFLOW", "SATURATED"):
+    log.warn(f"Destination {host}:{port} in {state} - slow connection")
+```
+
+---
+
+## Part 6: Testing Strategy
+
+**Server-Side (InFlightTracker)**:
+
+1. **Unit test**: CRITICAL always acquired regardless of load
+2. **Unit test**: LOW shed before NORMAL before HIGH
+3. **Unit test**: Per-priority limits enforced independently
+4. **Unit test**: Release correctly decrements counters
+5. **Integration test**: Manager under 10K updates/second sheds LOW, keeps CRITICAL
+6. **Chaos test**: SWIM probes never dropped even at 100% saturation
+
+**Client-Side (OutgoingRequestManager)**:
+
+1. **Unit test**: Per-destination queue isolation
+2. **Unit test**: LRU eviction when max destinations reached
+3. **Unit test**: Backpressure signals propagate correctly
+4. **Integration test**: Slow destination doesn't block fast destinations
+5. **Integration test**: Overflow preserves newest messages
+6. **Load test**: Memory bounded under sustained cross-DC traffic
+
+---
+
+## Part 7: Files Modified
+
+| File | Change |
+|------|--------|
+| `hyperscale/distributed_rewrite/server/server/mercury_sync_base_server.py` | Add InFlightTracker, _spawn_tcp_response, _spawn_udp_response |
+| `hyperscale/core/jobs/protocols/udp_protocol.py` | Add InFlightTracker for UDPProtocol._pending_responses |
+| `hyperscale/distributed_rewrite/env/env.py` | Add priority limit and queue configuration |
+| `hyperscale/distributed_rewrite/server/protocol/in_flight_tracker.py` | NEW: InFlightTracker, MessagePriority, PriorityLimits |
+| `hyperscale/distributed_rewrite/server/protocol/outgoing_request_manager.py` | NEW: OutgoingRequestManager using RobustMessageQueue |
+| `hyperscale/logging/hyperscale_logging_models.py` | Add PriorityLoadStats, DestinationQueueStats |
 
 ---
 
@@ -2473,6 +6410,711 @@ Hierarchical lease-based leadership with LHM (Local Health Multiplier) eligibili
 │  │                                                                         │ │
 │  │    Prevents: Leadership oscillation under unstable conditions          │ │
 │  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Zombie Job Prevention & Detection
+
+This section documents the mechanisms for detecting, preventing, and cleaning up "zombie" jobs - jobs that become stuck, orphaned, or fail to complete properly.
+
+### Zombie Job Lifecycle Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    ZOMBIE JOB LIFECYCLE & PREVENTION                         │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  What is a "Zombie Job"?                                                     │
+│  ───────────────────────                                                     │
+│  A job that:                                                                 │
+│  • Consumes resources without making progress                                │
+│  • Has no live owner/manager tracking it                                     │
+│  • Cannot be cancelled via normal means                                      │
+│  • Prevents completion of parent job                                         │
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │                    ZOMBIE CREATION SCENARIOS                           │ │
+│  │                                                                        │ │
+│  │  Scenario 1: Worker Dies Mid-Workflow                                  │ │
+│  │  ─────────────────────────────────────────                             │ │
+│  │  Worker ──[executing workflow]──► CRASH! ──► Workflow state lost       │ │
+│  │                                                                        │ │
+│  │  Scenario 2: Manager Dies After Dispatch                               │ │
+│  │  ─────────────────────────────────────────                             │ │
+│  │  Manager ──[dispatch]──► Worker ──► Manager CRASH ──► No result recv   │ │
+│  │                                                                        │ │
+│  │  Scenario 3: Network Partition                                         │ │
+│  │  ─────────────────────────────────────────                             │ │
+│  │  Manager ◄──X──► Worker   (both think workflow is running)             │ │
+│  │                                                                        │ │
+│  │  Scenario 4: Workflow Execution Hang                                   │ │
+│  │  ─────────────────────────────────────────                             │ │
+│  │  Worker ──[workflow.execute() hangs indefinitely]──► Never completes   │ │
+│  │                                                                        │ │
+│  │  Scenario 5: Result Delivery Failure                                   │ │
+│  │  ─────────────────────────────────────────                             │ │
+│  │  Worker ──► Result ──X──► Manager   (result lost, no retry)            │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Detection Mechanisms
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    ZOMBIE DETECTION MECHANISMS                               │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ 1. WORKFLOW TIMEOUT DETECTION (WorkflowDispatcher)                     │ │
+│  │                                                                        │ │
+│  │    Location: hyperscale/distributed_rewrite/jobs/workflow_dispatcher.py│ │
+│  │                                                                        │ │
+│  │    ┌─────────────────────────────────────────────────────────────────┐ │ │
+│  │    │                                                                  │ │ │
+│  │    │    WorkflowDispatcher.check_timeouts()                          │ │ │
+│  │    │           │                                                      │ │ │
+│  │    │           ▼                                                      │ │ │
+│  │    │    for pending in self._pending:                                │ │ │
+│  │    │        age = now - pending.registered_at                        │ │ │
+│  │    │        │                                                         │ │ │
+│  │    │        ├── if age > pending.timeout_seconds:                    │ │ │
+│  │    │        │       └── EVICT (reason: "timeout")                    │ │ │
+│  │    │        │                                                         │ │ │
+│  │    │        └── if pending.dispatch_attempts > max_attempts:         │ │ │
+│  │    │                └── EVICT (reason: "max_dispatch_attempts")       │ │ │
+│  │    │                                                                  │ │ │
+│  │    │    Default timeout_seconds: 300 (5 minutes)                     │ │ │
+│  │    │    Default max_dispatch_attempts: 5                             │ │ │
+│  │    │    Check interval: 30 seconds (via _job_cleanup_loop)            │ │ │
+│  │    │                                                                  │ │ │
+│  │    └─────────────────────────────────────────────────────────────────┘ │ │
+│  │                                                                        │ │
+│  │    Callbacks Invoked:                                                  │ │
+│  │    • on_workflow_evicted(job_id, workflow_id, reason)                 │ │
+│  │    • on_dispatch_failed(job_id, workflow_id)                          │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ 2. DEAD WORKER DETECTION (SWIM Protocol + Callbacks)                   │ │
+│  │                                                                        │ │
+│  │    Detection Flow:                                                     │ │
+│  │                                                                        │ │
+│  │    SWIM Probe ──► Timeout ──► Indirect Probe ──► Timeout               │ │
+│  │                                    │                                   │ │
+│  │                                    ▼                                   │ │
+│  │                           Enter SUSPECT state                          │ │
+│  │                                    │                                   │ │
+│  │                           No refutation (30s)                          │ │
+│  │                                    │                                   │ │
+│  │                                    ▼                                   │ │
+│  │                           Mark DEAD ──► _on_node_dead() callback       │ │
+│  │                                    │                                   │ │
+│  │                                    ▼                                   │ │
+│  │    Manager identifies all workflows assigned to dead worker            │ │
+│  │    │                                                                   │ │
+│  │    ├── Retry count < max: Re-dispatch to new worker                   │ │
+│  │    │       └── Failed worker added to exclusion set                   │ │
+│  │    │                                                                   │ │
+│  │    └── Retry count >= max: Mark workflow FAILED                       │ │
+│  │                                                                        │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ 3. PROGRESS-BASED HEALTH DETECTION (AD-19 Three-Signal Model)          │ │
+│  │                                                                        │ │
+│  │    Location: hyperscale/distributed_rewrite/health/                    │ │
+│  │                                                                        │ │
+│  │    ProgressState Assessment:                                           │ │
+│  │    ┌─────────────────────────────────────────────────────────────────┐ │ │
+│  │    │ State     │ Criteria                  │ Implication             │ │ │
+│  │    │───────────┼───────────────────────────┼─────────────────────────│ │ │
+│  │    │ IDLE      │ No active workflows       │ Normal - no work        │ │ │
+│  │    │ NORMAL    │ completion_rate >= expected │ Healthy operation     │ │ │
+│  │    │ SLOW      │ completion_rate < 50%     │ Possible contention     │ │ │
+│  │    │ DEGRADED  │ completion_rate < 25%     │ Significant slowdown    │ │ │
+│  │    │ STUCK     │ No progress for threshold │ Potential zombie        │ │ │
+│  │    └─────────────────────────────────────────────────────────────────┘ │ │
+│  │                                                                        │ │
+│  │    Routing Decision Based on Health:                                   │ │
+│  │    • ROUTE: Send new work                                              │ │
+│  │    • DRAIN: Stop sending work, let existing complete                   │ │
+│  │    • INVESTIGATE: Suspect issue, check more signals                    │ │
+│  │    • EVICT: Remove from routing, assume dead/zombie                    │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ 4. LEASE EXPIRY DETECTION (Gate Layer)                                 │ │
+│  │                                                                        │ │
+│  │    Location: hyperscale/distributed_rewrite/leases/job_lease.py        │ │
+│  │                                                                        │ │
+│  │    Job Lease Lifecycle:                                                │ │
+│  │                                                                        │ │
+│  │    Gate-1 acquires lease ──► lease.expires_at = now + 30s              │ │
+│  │          │                                                             │ │
+│  │          ├── Renew: lease.expires_at += renewal_period                 │ │
+│  │          │                                                             │ │
+│  │          └── Fail to renew (crash/partition):                          │ │
+│  │                  │                                                     │ │
+│  │                  ▼                                                     │ │
+│  │          Lease expires ──► Gate-2 can claim ──► fence_token++          │ │
+│  │                                   │                                    │ │
+│  │                                   ▼                                    │ │
+│  │          Old results with stale fence_token are REJECTED               │ │
+│  │                                                                        │ │
+│  │    Default lease_timeout: 30 seconds                                   │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Prevention Mechanisms
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    ZOMBIE PREVENTION MECHANISMS                              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ 1. FENCE TOKENS (At-Most-Once Dispatch Semantics)                      │ │
+│  │                                                                        │ │
+│  │    Location: Worker._workflow_fence_tokens                             │ │
+│  │                                                                        │ │
+│  │    Purpose: Prevent duplicate/stale dispatches from creating zombies   │ │
+│  │                                                                        │ │
+│  │    ┌────────────────────────────────────────────────────────────────┐  │ │
+│  │    │                                                                 │  │ │
+│  │    │  Worker receives WorkflowDispatch(workflow_id, fence_token=5)  │  │ │
+│  │    │              │                                                  │  │ │
+│  │    │              ▼                                                  │  │ │
+│  │    │  current = _workflow_fence_tokens.get(workflow_id, -1)         │  │ │
+│  │    │              │                                                  │  │ │
+│  │    │   ┌──────────┴──────────┐                                       │  │ │
+│  │    │   │                     │                                       │  │ │
+│  │    │   ▼                     ▼                                       │  │ │
+│  │    │ fence_token <= current  fence_token > current                  │  │ │
+│  │    │   │                     │                                       │  │ │
+│  │    │   ▼                     ▼                                       │  │ │
+│  │    │ REJECT (stale)        ACCEPT                                   │  │ │
+│  │    │ Return NACK            │                                       │  │ │
+│  │    │                        ▼                                       │  │ │
+│  │    │              _workflow_fence_tokens[workflow_id] = fence_token │  │ │
+│  │    │              Execute workflow                                  │  │ │
+│  │    │                                                                 │  │ │
+│  │    └────────────────────────────────────────────────────────────────┘  │ │
+│  │                                                                        │ │
+│  │    Prevents:                                                           │ │
+│  │    • Duplicate execution from retry storms                            │ │
+│  │    • Stale dispatches from recovered old manager                      │ │
+│  │    • Split-brain double execution                                      │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ 2. VERSIONED STATE CLOCK (Stale Update Rejection)                      │ │
+│  │                                                                        │ │
+│  │    Location: hyperscale/distributed_rewrite/swim/versioned_clock.py    │ │
+│  │                                                                        │ │
+│  │    Purpose: Reject out-of-order updates that could create             │ │
+│  │             inconsistent state                                         │ │
+│  │                                                                        │ │
+│  │    VersionedStateClock {                                               │ │
+│  │        _entity_versions: dict[str, (version, timestamp)]              │ │
+│  │                                                                        │ │
+│  │        is_entity_stale(entity_id, incoming_version) -> bool           │ │
+│  │        check_and_update(entity_id, incoming_version) -> bool          │ │
+│  │        cleanup_old_entities(max_age) -> None                          │ │
+│  │    }                                                                   │ │
+│  │                                                                        │ │
+│  │    Used at:                                                            │ │
+│  │    • Manager receiving WorkerHeartbeat                                │ │
+│  │    • Manager receiving WorkflowProgress                               │ │
+│  │    • Gate receiving ManagerHeartbeat                                  │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ 3. CANCELLATION POLLING (Fallback When Push Fails)                     │ │
+│  │                                                                        │ │
+│  │    Location: Worker._cancellation_poll_loop()                          │ │
+│  │                                                                        │ │
+│  │    Problem: Cancellation push from manager might not reach worker      │ │
+│  │    Solution: Worker periodically polls manager for cancellation status │ │
+│  │                                                                        │ │
+│  │    ┌────────────────────────────────────────────────────────────────┐  │ │
+│  │    │                                                                 │  │ │
+│  │    │  while running:                                                 │  │ │
+│  │    │      await sleep(poll_interval)  # Default: 5-10s              │  │ │
+│  │    │                                                                 │  │ │
+│  │    │      for workflow_id in active_workflows:                      │  │ │
+│  │    │          │                                                      │  │ │
+│  │    │          ▼                                                      │  │ │
+│  │    │      Send WorkflowCancellationQuery to manager                 │  │ │
+│  │    │          │                                                      │  │ │
+│  │    │          ▼                                                      │  │ │
+│  │    │      if response.is_cancelled:                                 │  │ │
+│  │    │          _cancel_workflow(workflow_id, "poll_detected")        │  │ │
+│  │    │                                                                 │  │ │
+│  │    └────────────────────────────────────────────────────────────────┘  │ │
+│  │                                                                        │ │
+│  │    Ensures: Cancellations are never "lost" due to network issues      │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ 4. ADAPTIVE HEALTHCHECK EXTENSIONS (AD-26)                             │ │
+│  │                                                                        │ │
+│  │    Location: hyperscale/distributed_rewrite/health/extension_tracker.py│ │
+│  │                                                                        │ │
+│  │    Problem: Long-running workflows might be killed as "stuck"         │ │
+│  │    Solution: Allow legitimate slow workers to request deadline extensions│
+│  │                                                                        │ │
+│  │    Extension Request Flow:                                             │ │
+│  │                                                                        │ │
+│  │    Worker ──► Heartbeat with extension_requested=True ──► Manager      │ │
+│  │                    │                                                   │ │
+│  │                    ▼                                                   │ │
+│  │    ExtensionTracker.request_extension(reason, current_progress)        │ │
+│  │                    │                                                   │ │
+│  │        ┌───────────┴───────────┐                                       │ │
+│  │        │                       │                                       │ │
+│  │        ▼                       ▼                                       │ │
+│  │    GRANTED                  DENIED                                     │ │
+│  │    (extension_seconds)      (denial_reason)                            │ │
+│  │                                                                        │ │
+│  │    Grant Decay (Logarithmic):                                          │ │
+│  │    ┌────────────────────────────────────────────────────────────────┐  │ │
+│  │    │ Grant # │ Formula        │ Example (base=30s) │                │  │ │
+│  │    │─────────┼────────────────┼────────────────────│                │  │ │
+│  │    │ 1       │ base / 2       │ 15s                │                │  │ │
+│  │    │ 2       │ base / 4       │ 7.5s               │                │  │ │
+│  │    │ 3       │ base / 8       │ 3.75s              │                │  │ │
+│  │    │ 4       │ base / 16      │ 1.875s             │                │  │ │
+│  │    │ 5       │ min_grant      │ 1s (capped)        │                │  │ │
+│  │    └────────────────────────────────────────────────────────────────┘  │ │
+│  │                                                                        │ │
+│  │    Denial Reasons:                                                     │ │
+│  │    • "max_extensions_exceeded" - Already used all extensions          │ │
+│  │    • "no_progress" - Progress same as last request (stuck)            │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Cleanup Mechanisms
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    ZOMBIE CLEANUP MECHANISMS                                 │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ 1. MANAGER JOB CLEANUP LOOP                                            │ │
+│  │                                                                        │ │
+│  │    Location: Manager._job_cleanup_loop() (manager.py:6225)             │ │
+│  │                                                                        │ │
+│  │    Interval: MERCURY_SYNC_CLEANUP_INTERVAL (default: 30s)              │ │
+│  │                                                                        │ │
+│  │    ┌────────────────────────────────────────────────────────────────┐  │ │
+│  │    │                                                                 │  │ │
+│  │    │  while running:                                                 │  │ │
+│  │    │      await sleep(cleanup_interval)                             │  │ │
+│  │    │                                                                 │  │ │
+│  │    │      # 1. Check workflow timeouts via dispatcher               │  │ │
+│  │    │      evicted = await _workflow_dispatcher.check_timeouts()     │  │ │
+│  │    │      for (job_id, workflow_id, reason) in evicted:             │  │ │
+│  │    │          mark_workflow_failed(job_id, workflow_id, reason)     │  │ │
+│  │    │                                                                 │  │ │
+│  │    │      # 2. Clean completed jobs after retention period          │  │ │
+│  │    │      for job_id, job in _jobs.items():                         │  │ │
+│  │    │          if job.status == COMPLETED:                           │  │ │
+│  │    │              if age > _completed_job_max_age:  # ~30 min       │  │ │
+│  │    │                  cleanup_job(job_id)                           │  │ │
+│  │    │                                                                 │  │ │
+│  │    │      # 3. Clean failed/cancelled/timeout jobs                  │  │ │
+│  │    │      for job_id, job in _jobs.items():                         │  │ │
+│  │    │          if job.status in [FAILED, CANCELLED, TIMEOUT]:        │  │ │
+│  │    │              if age > _failed_job_max_age:  # longer retention │  │ │
+│  │    │                  cleanup_job(job_id)                           │  │ │
+│  │    │                                                                 │  │ │
+│  │    └────────────────────────────────────────────────────────────────┘  │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ 2. DEAD NODE REAP LOOP                                                 │ │
+│  │                                                                        │ │
+│  │    Location: Manager._dead_node_reap_loop() (manager.py:6380)          │ │
+│  │                                                                        │ │
+│  │    ┌────────────────────────────────────────────────────────────────┐  │ │
+│  │    │                                                                 │  │ │
+│  │    │  Reap Intervals:                                                │  │ │
+│  │    │  ├── Dead workers: MANAGER_DEAD_WORKER_REAP_INTERVAL (~24h)    │  │ │
+│  │    │  ├── Dead peers:   MANAGER_DEAD_PEER_REAP_INTERVAL   (~24h)    │  │ │
+│  │    │  └── Dead gates:   MANAGER_DEAD_GATE_REAP_INTERVAL   (~24h)    │  │ │
+│  │    │                                                                 │  │ │
+│  │    │  For each dead node past reap interval:                        │  │ │
+│  │    │  ├── Remove from _dead_workers / _dead_peers / _dead_gates     │  │ │
+│  │    │  ├── Remove from all tracking structures                       │  │ │
+│  │    │  └── Free any resources/leases associated                      │  │ │
+│  │    │                                                                 │  │ │
+│  │    └────────────────────────────────────────────────────────────────┘  │ │
+│  │                                                                        │ │
+│  │    Note: 24h is conservative for debugging. In production,            │ │
+│  │    consider reducing to 1-2h via environment variables.               │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ 3. WORKER WORKFLOW CLEANUP (finally block)                             │ │
+│  │                                                                        │ │
+│  │    Location: Worker._execute_workflow() finally block                  │ │
+│  │                                                                        │ │
+│  │    ┌────────────────────────────────────────────────────────────────┐  │ │
+│  │    │                                                                 │  │ │
+│  │    │  async def _execute_workflow(...):                             │  │ │
+│  │    │      try:                                                       │  │ │
+│  │    │          # Execute workflow                                    │  │ │
+│  │    │          result = await remote_manager.execute(...)            │  │ │
+│  │    │                                                                 │  │ │
+│  │    │      except CancelledError:                                    │  │ │
+│  │    │          # Handle cancellation                                 │  │ │
+│  │    │                                                                 │  │ │
+│  │    │      except Exception:                                         │  │ │
+│  │    │          # Handle failure                                      │  │ │
+│  │    │                                                                 │  │ │
+│  │    │      finally:                                                   │  │ │
+│  │    │          # ALWAYS cleanup - prevents resource leaks            │  │ │
+│  │    │          await _core_allocator.free(workflow_id)  ◄── Free CPU │  │ │
+│  │    │          _workflow_tokens.pop(workflow_id)        ◄── Remove   │  │ │
+│  │    │          _workflow_cancel_events.pop(workflow_id) ◄── tracking │  │ │
+│  │    │          _active_workflows.pop(workflow_id)       ◄── state    │  │ │
+│  │    │          _workflow_fence_tokens.pop(workflow_id)  ◄── data     │  │ │
+│  │    │          _remote_manger.start_server_cleanup()    ◄── Cleanup  │  │ │
+│  │    │                                                                 │  │ │
+│  │    └────────────────────────────────────────────────────────────────┘  │ │
+│  │                                                                        │ │
+│  │    Guarantees: Workflow resources are ALWAYS freed, regardless of     │ │
+│  │    success, failure, or cancellation.                                 │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ 4. GATE LEASE CLEANUP LOOP                                             │ │
+│  │                                                                        │ │
+│  │    Location: Gate._lease_cleanup_loop()                                │ │
+│  │                                                                        │ │
+│  │    ┌────────────────────────────────────────────────────────────────┐  │ │
+│  │    │                                                                 │  │ │
+│  │    │  while running:                                                 │  │ │
+│  │    │      await sleep(cleanup_interval)                             │  │ │
+│  │    │                                                                 │  │ │
+│  │    │      for lease_key, lease in _leases.items():                  │  │ │
+│  │    │          if time.monotonic() > lease.expires_at:               │  │ │
+│  │    │              │                                                  │  │ │
+│  │    │              ▼                                                  │  │ │
+│  │    │          Mark job's DC as FAILED                               │  │ │
+│  │    │          │                                                      │  │ │
+│  │    │          ▼                                                      │  │ │
+│  │    │          Remove expired lease                                  │  │ │
+│  │    │          │                                                      │  │ │
+│  │    │          ▼                                                      │  │ │
+│  │    │          Notify client of partial failure                      │  │ │
+│  │    │                                                                 │  │ │
+│  │    └────────────────────────────────────────────────────────────────┘  │ │
+│  │                                                                        │ │
+│  │    Ensures: Jobs with dead datacenters don't hang forever             │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Cancellation Flow (Killing Zombie Jobs)
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    CANCELLATION PROPAGATION FLOW                             │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  User Request: client.cancel_job(job_id)                                     │
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────────┐ │
+│  │                                                                          │ │
+│  │  CLIENT                                                                  │ │
+│  │    │                                                                     │ │
+│  │    │ JobCancelRequest(job_id, fence_token, reason)                      │ │
+│  │    │                                                                     │ │
+│  │    ▼                                                                     │ │
+│  │  GATE                                                                    │ │
+│  │    │                                                                     │ │
+│  │    ├── Validate fence_token (reject stale)                              │ │
+│  │    ├── Check lease ownership (am I responsible?)                        │ │
+│  │    │                                                                     │ │
+│  │    │ FOR EACH datacenter with active workflows:                         │ │
+│  │    │    │                                                                │ │
+│  │    │    │ WorkflowCancelRequest(job_id, workflow_ids)                   │ │
+│  │    │    │                                                                │ │
+│  │    │    ▼                                                                │ │
+│  │  MANAGER                                                                 │ │
+│  │    │                                                                     │ │
+│  │    ├── Update job status to CANCELLING                                  │ │
+│  │    ├── Update workflow status to CANCELLED                              │ │
+│  │    │                                                                     │ │
+│  │    │ FOR EACH worker with workflow:                                     │ │
+│  │    │    │                                                                │ │
+│  │    │    │ WorkflowCancelRequest(workflow_id, fence_token)               │ │
+│  │    │    │                                                                │ │
+│  │    │    ▼                                                                │ │
+│  │  WORKER                                                                  │ │
+│  │    │                                                                     │ │
+│  │    ├── Set _workflow_cancel_events[workflow_id]                         │ │
+│  │    ├── TaskRunner.cancel(workflow_token)                                │ │
+│  │    ├── RemoteGraphManager.cancel_workflow(run_id)                       │ │
+│  │    │                                                                     │ │
+│  │    │ RESPONSE PROPAGATION (reverse):                                    │ │
+│  │    │                                                                     │ │
+│  │    ▼                                                                     │ │
+│  │  WorkflowCancelResponse(success=True, cancelled_count=N)                │ │
+│  │    │                                                                     │ │
+│  │    ▼                                                                     │ │
+│  │  JobCancelResponse(success=True, cancelled_workflow_count=M)            │ │
+│  │    │                                                                     │ │
+│  │    ▼                                                                     │ │
+│  │  CLIENT receives confirmation                                            │ │
+│  │                                                                          │ │
+│  └─────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  Fallback Mechanism (if push fails):                                         │ │
+│  ┌─────────────────────────────────────────────────────────────────────────┐ │
+│  │                                                                          │ │
+│  │  Worker._cancellation_poll_loop():                                       │ │
+│  │                                                                          │ │
+│  │    Every 5-10 seconds:                                                   │ │
+│  │    ├── For each active workflow                                          │ │
+│  │    │    │                                                                │ │
+│  │    │    │ WorkflowCancellationQuery(workflow_id)                        │ │
+│  │    │    │                                                                │ │
+│  │    │    ▼                                                                │ │
+│  │    │    Manager checks if cancelled ──► Response                        │ │
+│  │    │                                        │                            │ │
+│  │    │    ┌───────────────────────────────────┘                            │ │
+│  │    │    │                                                                │ │
+│  │    │    ├── is_cancelled=True → _cancel_workflow()                      │ │
+│  │    │    └── is_cancelled=False → continue execution                     │ │
+│  │    │                                                                     │ │
+│  │    Ensures: Even if manager→worker push is lost, worker will            │ │
+│  │    discover cancellation within poll_interval seconds                   │ │
+│  │                                                                          │ │
+│  └─────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Complete Zombie Prevention State Machine
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│               ZOMBIE PREVENTION STATE MACHINE (per workflow)                 │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│                                                                              │
+│                           ┌──────────────┐                                  │
+│                           │   PENDING    │                                  │
+│                           │   (queued)   │                                  │
+│                           └──────┬───────┘                                  │
+│                                  │                                          │
+│                    ┌─────────────┼─────────────┐                            │
+│                    │             │             │                            │
+│                    ▼             ▼             ▼                            │
+│           ┌────────────┐ ┌────────────┐ ┌────────────┐                      │
+│           │  TIMEOUT   │ │ DISPATCHED │ │ MAX_RETRY  │                      │
+│           │ (evicted)  │ │            │ │ (evicted)  │                      │
+│           └─────┬──────┘ └──────┬─────┘ └──────┬─────┘                      │
+│                 │               │              │                            │
+│                 │               ▼              │                            │
+│                 │        ┌────────────┐        │                            │
+│                 │        │  RUNNING   │        │                            │
+│                 │        │ (on worker)│        │                            │
+│                 │        └──────┬─────┘        │                            │
+│                 │               │              │                            │
+│        ┌────────┼───────────────┼──────────────┼────────┐                   │
+│        │        │               │              │        │                   │
+│        ▼        ▼               ▼              ▼        ▼                   │
+│  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐          │
+│  │ COMPLETED│ │  FAILED  │ │CANCELLED │ │ TIMEOUT  │ │WORKER_DIE│          │
+│  │          │ │(internal)│ │ (user)   │ │(runtime) │ │(detected)│          │
+│  └────┬─────┘ └────┬─────┘ └────┬─────┘ └────┬─────┘ └────┬─────┘          │
+│       │            │            │            │            │                 │
+│       │            │            │            │            │                 │
+│       │            │            │            │      ┌─────┴─────┐           │
+│       │            │            │            │      │           │           │
+│       │            │            │            │      ▼           ▼           │
+│       │            │            │            │  RETRY #N   MAX_RETRY        │
+│       │            │            │            │  (redispatch) (failed)       │
+│       │            │            │            │      │           │           │
+│       │            │            │            │      │           │           │
+│       ▼            ▼            ▼            ▼      ▼           ▼           │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │                        CLEANUP (always)                              │   │
+│  │  • Free cores: _core_allocator.free(workflow_id)                    │   │
+│  │  • Remove tracking: _workflow_tokens, _active_workflows, etc.       │   │
+│  │  • Send result/status to manager                                    │   │
+│  │  • RemoteGraphManager.start_server_cleanup()                        │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+│  Legend:                                                                     │
+│  ───────                                                                     │
+│  • Timeout paths prevent indefinite waiting                                 │
+│  • Worker death triggers immediate retry or failure                         │
+│  • All paths lead to CLEANUP (no resource leaks)                           │
+│  • Fence tokens prevent duplicate execution on retry                        │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Mechanism Summary Table
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    ZOMBIE PREVENTION MECHANISM SUMMARY                       │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌──────────────────────┬───────────────┬──────────────────────────────────┐│
+│  │ Mechanism            │ Location      │ Protects Against                 ││
+│  ├──────────────────────┼───────────────┼──────────────────────────────────┤│
+│  │ Workflow Timeout     │ Dispatcher    │ Hung pending workflows           ││
+│  │ (check_timeouts)     │               │ (default: 300s)                  ││
+│  ├──────────────────────┼───────────────┼──────────────────────────────────┤│
+│  │ SWIM Dead Detection  │ All nodes     │ Dead workers/managers/gates      ││
+│  │ (_on_node_dead)      │               │ (suspicion: ~30s)                ││
+│  ├──────────────────────┼───────────────┼──────────────────────────────────┤│
+│  │ Progress Health      │ Manager       │ Stuck workers without progress   ││
+│  │ (AD-19)              │               │ (STUCK state detection)          ││
+│  ├──────────────────────┼───────────────┼──────────────────────────────────┤│
+│  │ Lease Expiry         │ Gate          │ Jobs orphaned by gate failure    ││
+│  │ (job_lease)          │               │ (default: 30s)                   ││
+│  ├──────────────────────┼───────────────┼──────────────────────────────────┤│
+│  │ Fence Tokens         │ Worker        │ Duplicate/stale dispatches       ││
+│  │                      │               │ (at-most-once semantics)         ││
+│  ├──────────────────────┼───────────────┼──────────────────────────────────┤│
+│  │ Versioned Clock      │ Manager/Gate  │ Out-of-order state updates       ││
+│  │                      │               │ (stale update rejection)         ││
+│  ├──────────────────────┼───────────────┼──────────────────────────────────┤│
+│  │ Cancel Polling       │ Worker        │ Lost cancellation messages       ││
+│  │                      │               │ (poll interval: 5-10s)           ││
+│  ├──────────────────────┼───────────────┼──────────────────────────────────┤│
+│  │ Extension Tracking   │ Manager       │ Legitimate slow work killed      ││
+│  │ (AD-26)              │               │ (max 5 extensions, decay)        ││
+│  ├──────────────────────┼───────────────┼──────────────────────────────────┤│
+│  │ Job Cleanup Loop     │ Manager       │ Resource accumulation            ││
+│  │                      │               │ (interval: 30s)                  ││
+│  ├──────────────────────┼───────────────┼──────────────────────────────────┤│
+│  │ Dead Node Reaping    │ Manager       │ Stale dead node tracking         ││
+│  │                      │               │ (interval: ~24h)                 ││
+│  ├──────────────────────┼───────────────┼──────────────────────────────────┤│
+│  │ finally Cleanup      │ Worker        │ Resource leaks on any exit       ││
+│  │ (_execute_workflow)  │               │ (always runs)                    ││
+│  └──────────────────────┴───────────────┴──────────────────────────────────┘│
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Known Gaps and Future Improvements
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    KNOWN GAPS & FUTURE IMPROVEMENTS                          │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ GAP 1: NO RUNTIME EXECUTION TIMEOUT                                    │ │
+│  │                                                                        │ │
+│  │ Current: timeout_seconds only affects dispatch eligibility             │ │
+│  │ Problem: Workflow can run indefinitely if execution hangs             │ │
+│  │                                                                        │ │
+│  │ Recommendation: Add execution_timeout at RemoteGraphManager level     │ │
+│  │   • asyncio.wait_for() wrapper with hard timeout                      │ │
+│  │   • Separate from dispatch timeout (dispatch_timeout vs exec_timeout) │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ GAP 2: LONG DEAD NODE REAP INTERVAL                                    │ │
+│  │                                                                        │ │
+│  │ Current: 24h default for dead node reaping                            │ │
+│  │ Problem: Dead worker tracking accumulates memory                       │ │
+│  │                                                                        │ │
+│  │ Recommendation: Reduce to 1-2h in production                          │ │
+│  │   • Configure via MANAGER_DEAD_WORKER_REAP_INTERVAL                   │ │
+│  │   • Keep 24h for debugging/development only                           │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ GAP 3: NO HARD KILL SIGNAL                                             │ │
+│  │                                                                        │ │
+│  │ Current: Cancellation relies on workflow respecting cancel event       │ │
+│  │ Problem: Misbehaving workflow can ignore cancellation                  │ │
+│  │                                                                        │ │
+│  │ Recommendation: Add process-level kill capability                      │ │
+│  │   • Track workflow PID at execution start                             │ │
+│  │   • SIGKILL after grace period if cancel not acknowledged             │ │
+│  │   • May require process isolation (subprocess vs thread)              │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ GAP 4: NO ORPHAN JOB SCANNER                                           │ │
+│  │                                                                        │ │
+│  │ Current: Rely on timeout and heartbeat for detection                   │ │
+│  │ Problem: Jobs can be orphaned if all tracking state lost              │ │
+│  │                                                                        │ │
+│  │ Recommendation: Add periodic reconciliation scan                       │ │
+│  │   • Manager queries all workers for active workflow list              │ │
+│  │   • Compare with manager's tracking → find orphans                    │ │
+│  │   • Clean up or re-adopt orphaned workflows                           │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ GAP 5: EXTENSION EXHAUSTION HARD CUTOFF                                │ │
+│  │                                                                        │ │
+│  │ Current: After max extensions, no more time granted                    │ │
+│  │ Problem: Legitimate slow work killed abruptly                          │ │
+│  │                                                                        │ │
+│  │ Recommendation: Graceful degradation                                   │ │
+│  │   • Notify workflow of impending timeout                              │ │
+│  │   • Allow checkpoint/save before kill                                 │ │
+│  │   • Configurable behavior (kill vs pause vs notify)                   │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Configuration Reference
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    ZOMBIE PREVENTION CONFIGURATION                           │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Environment Variables:                                                      │
+│                                                                              │
+│  ┌────────────────────────────────────┬──────────┬────────────────────────┐ │
+│  │ Variable                           │ Default  │ Description            │ │
+│  ├────────────────────────────────────┼──────────┼────────────────────────┤ │
+│  │ MERCURY_SYNC_CLEANUP_INTERVAL      │ 30s      │ Job cleanup loop freq  │ │
+│  │ MANAGER_DEAD_WORKER_REAP_INTERVAL  │ 86400s   │ Dead worker reap (24h) │ │
+│  │ MANAGER_DEAD_PEER_REAP_INTERVAL    │ 86400s   │ Dead peer reap (24h)   │ │
+│  │ MANAGER_DEAD_GATE_REAP_INTERVAL    │ 86400s   │ Dead gate reap (24h)   │ │
+│  │ WORKER_CANCELLATION_POLL_INTERVAL  │ 5s       │ Cancel poll frequency  │ │
+│  │ SWIM_SUSPICION_TIMEOUT             │ 30s      │ Time before DEAD       │ │
+│  └────────────────────────────────────┴──────────┴────────────────────────┘ │
+│                                                                              │
+│  Per-Job Configuration:                                                      │
+│                                                                              │
+│  ┌────────────────────────────────────┬──────────┬────────────────────────┐ │
+│  │ Parameter                          │ Default  │ Description            │ │
+│  ├────────────────────────────────────┼──────────┼────────────────────────┤ │
+│  │ timeout_seconds                    │ 300s     │ Workflow dispatch time │ │
+│  │ max_dispatch_attempts              │ 5        │ Retries before fail    │ │
+│  │ max_extensions                     │ 5        │ Deadline extensions    │ │
+│  │ lease_timeout                      │ 30s      │ Gate job lease duration│ │
+│  └────────────────────────────────────┴──────────┴────────────────────────┘ │
 │                                                                              │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -5764,7 +10406,7 @@ This section documents how workflow results, context, and errors flow back throu
 │  │                                                                      │    │
 │  │      job_result = JobFinalResult(                                   │    │
 │  │          job_id=job_id,                                              │    │
-│  │          datacenter=self._dc_id,                                     │    │
+│  │          datacenter=self._node_id.datacenter,                        │    │
 │  │          status=status,                                              │    │
 │  │          workflow_results=workflow_results,                          │    │
 │  │          total_completed=total_completed,                            │    │
@@ -6939,11 +11581,11 @@ The architecture consists of five key components that work together:
 ├───────────────────────┬─────────────────────────────────────────────────────┤
 │  Component            │  Status         │  Description                      │
 ├───────────────────────┼─────────────────┼───────────────────────────────────┤
-│  1. Consistent Hashing│  UNIMPLEMENTED  │  Foundation for job distribution  │
-│  2. Lease-Based Owner │  UNIMPLEMENTED  │  Job ownership with TTL           │
-│  3. Direct DC Routing │  UNIMPLEMENTED  │  DC managers send to job leader   │
-│  4. Client Reconnect  │  UNIMPLEMENTED  │  Client computes job owner        │
-│  5. Fencing Tokens    │  UNIMPLEMENTED  │  Stale update protection          │
+│  1. Consistent Hashing│  IMPLEMENTED    │  Foundation for job distribution  │
+│  2. Lease-Based Owner │  IMPLEMENTED    │  Job ownership with TTL           │
+│  3. Direct DC Routing │  IMPLEMENTED    │  DC managers send to job leader   │
+│  4. Client Reconnect  │  IMPLEMENTED    │  Client computes job owner        │
+│  5. Fencing Tokens    │  IMPLEMENTED    │  Stale update protection          │
 └───────────────────────┴─────────────────┴───────────────────────────────────┘
 ```
 
@@ -6951,7 +11593,7 @@ The architecture consists of five key components that work together:
 
 ### Component 1: Consistent Hashing Ring
 
-**Status: UNIMPLEMENTED**
+**Status: IMPLEMENTED**
 
 **Decision**: Sophisticated approach - Use consistent hashing to deterministically map jobs to gates.
 
@@ -7051,7 +11693,7 @@ The architecture consists of five key components that work together:
 
 ### Component 2: Lease-Based Job Ownership
 
-**Status: UNIMPLEMENTED**
+**Status: IMPLEMENTED**
 
 **Decision**: Sophisticated approach - Jobs have leases with TTL that must be renewed.
 
@@ -7166,7 +11808,7 @@ The architecture consists of five key components that work together:
 
 ### Component 3: Direct DC-to-Job-Leader Result Routing
 
-**Status: UNIMPLEMENTED**
+**Status: IMPLEMENTED**
 
 **Decision**: Sophisticated approach - DC managers send results directly to job leader gate.
 
@@ -7254,7 +11896,7 @@ The architecture consists of five key components that work together:
 
 ### Component 4: Client Reconnection
 
-**Status: UNIMPLEMENTED**
+**Status: IMPLEMENTED**
 
 **Decision**: Sophisticated approach - Clients compute job owner deterministically.
 
@@ -7351,7 +11993,7 @@ The architecture consists of five key components that work together:
 
 ### Component 5: Fencing Tokens
 
-**Status: UNIMPLEMENTED**
+**Status: IMPLEMENTED**
 
 **Decision**: Simple approach - Monotonic fence tokens reject stale operations.
 
@@ -7496,269 +12138,6 @@ The architecture consists of five key components that work together:
 
 ---
 
-### Implementation Order
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                    IMPLEMENTATION ROADMAP                                    │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  Order  │ Component           │ Depends On       │ Status                   │
-│  ───────┼─────────────────────┼──────────────────┼────────────────────────  │
-│  1      │ Consistent Hashing  │ None             │ IMPLEMENTED ✓            │
-│  2      │ Lease-Based Owner   │ #1               │ UNIMPLEMENTED            │
-│  3      │ Fencing Tokens      │ #2               │ UNIMPLEMENTED            │
-│  4      │ Direct DC Routing   │ #1, #2, #3       │ UNIMPLEMENTED            │
-│  5      │ Client Reconnect    │ #1, #3           │ UNIMPLEMENTED            │
-│                                                                              │
-│  Each component will be:                                                     │
-│  1. Implemented                                                              │
-│  2. Tested with integration test                                             │
-│  3. Debugged and fixed                                                       │
-│  4. Committed                                                                │
-│  5. Marked as IMPLEMENTED in this document                                   │
-│  6. Committed again with documentation update                                │
-│                                                                              │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## Session Handoff: Implementation Continuation Guide
-
-This section provides all context needed for another AI session to resume implementation.
-
-### Current State (As of Last Session)
-
-#### What's Working ✓
-1. **Gate-to-Manager Federated Health Monitoring**: Implemented via `FederatedHealthMonitor`
-2. **Manager-to-Gate Symmetric Monitoring**: Managers also use federated health for gate monitoring
-3. **Cross-Cluster Probing Protocol**: `xprobe`/`xack` messages with namespaced incarnations
-4. **Gate Results Aggregation**: Working correctly - latency percentiles interpolated, per-DC stats preserved
-5. **TCP Length-Prefixed Framing**: Reliable message delivery implemented
-6. **Priority-Based Core Allocation**: Managers allocate cores based on `StagePriority`, not VUs
-7. **Context Consistency Protocol**: LWW with timestamps and source node tiebreakers
-8. **SWIM Configuration**: Externalized to `Env` class
-9. **Workflow Execution Pipeline**: Test workflows correctly report completion counts
-   - Fixed: `RemoteGraphManager.get_workflow_update()` now returns the update
-   - Fixed: Manager extracts counts from `WorkflowStats` for fast-completing workflows
-   - Note: Non-test workflows (no `CallResult` return type) correctly report zero counts
-
-#### What's Partially Working ⚠
-1. **Manager Cleanup on Shutdown**: `Manager stop failed` warnings during test cleanup
-
-#### What's Not Implemented ✗
-See "Remaining Components" below.
-
----
-
-### Remaining Components (In Implementation Order)
-
-#### Component 1: Consistent Hashing Ring ✓ IMPLEMENTED
-**Purpose**: Deterministic job-to-gate assignment for stable ownership
-
-**Location**: `hyperscale/distributed_rewrite/routing/consistent_hash.py`
-
-**Implementation**:
-```python
-class ConsistentHashRing:
-    def __init__(self, virtual_nodes: int = 150):
-        # 150 vnodes provides <10% CV distribution
-
-    def add_node(self, node_id: str) -> None:
-        # Idempotent, thread-safe
-
-    def remove_node(self, node_id: str) -> None:
-        # Idempotent, thread-safe
-
-    def get_node(self, key: str) -> str | None:
-        # O(log n) lookup via binary search
-
-    def get_backup(self, key: str) -> str | None:
-        # Returns different node from primary
-
-    def get_nodes_for_key(self, key: str, count: int) -> list[str]:
-        # For replication scenarios
-```
-
-**Key Properties**:
-- **Deterministic**: Same key always maps to same node
-- **Minimal redistribution**: ~23% keys move when adding 4th node
-- **Thread-safe**: RLock-protected operations
-- **Even distribution**: CV < 10% with 150 virtual nodes
-
-**Integration Points** (pending):
-- Gate uses hash ring in `job_submission` handler to determine initial owner
-- Client uses hash ring to find job owner for reconnection
-
-**Test File**: `examples/servers/test_consistent_hashing.py`
-- 9 test cases covering all functionality
-- Thread safety tested with 8000 concurrent ops
-
----
-
-#### Component 2: Lease-Based Job Ownership
-**Purpose**: Time-bounded ownership to prevent split-brain during failures
-
-**Implementation Plan**:
-```
-Location: hyperscale/distributed_rewrite/leases/job_lease.py
-
-@dataclass
-class JobLease:
-    job_id: str
-    owner_node: str
-    fence_token: int
-    expires_at: float  # monotonic time
-    lease_duration: float = 30.0
-    
-class LeaseManager:
-    def __init__(self, node_id: str):
-        self._leases: dict[str, JobLease] = {}
-        self._node_id = node_id
-        
-    def acquire(self, job_id: str) -> JobLease | None:
-        """Acquire lease if not held or expired"""
-        ...
-    
-    def renew(self, job_id: str) -> bool:
-        """Extend lease if still owner"""
-        ...
-    
-    def release(self, job_id: str) -> None:
-        """Explicitly release lease"""
-        ...
-    
-    def _cleanup_expired(self) -> None:
-        """Background task to clean expired leases"""
-        ...
-```
-
-**Integration Points**:
-- Gate acquires lease when becoming job owner (via hash ring or on job submission)
-- Lease renewal happens in background heartbeat loop
-- Backup gate monitors primary's lease via state sync
-
-**Test File**: `examples/servers/test_lease_ownership.py`
-```python
-# Test: lease acquisition succeeds for unclaimed job
-# Test: lease renewal extends expiry
-# Test: backup claims lease after primary expires
-# Test: fence token increments on each claim
-```
-
----
-
-#### Component 3: Fencing Tokens
-**Purpose**: Prevent stale updates from old owners
-
-**Implementation Plan**:
-```
-Location: Integrate into existing message models
-
-# Update JobFinalResult, JobStatusPush, etc.
-@dataclass  
-class JobFinalResult(Message):
-    ...
-    fence_token: int = 0  # Add to existing model
-    
-# Gate validation
-def validate_fence_token(self, job_id: str, received_token: int) -> bool:
-    current = self._job_fence_tokens.get(job_id, 0)
-    if received_token < current:
-        return False  # Stale update, reject
-    self._job_fence_tokens[job_id] = received_token
-    return True
-```
-
-**Integration Points**:
-- Gate includes fence_token in `JobDispatch` to managers
-- Managers include fence_token in `JobFinalResult` to gates
-- Gate validates fence_token before accepting results
-
-**Test File**: `examples/servers/test_fencing_tokens.py`
-```python
-# Test: stale result (old fence) rejected
-# Test: valid result (current fence) accepted
-# Test: new owner's results (higher fence) accepted
-```
-
----
-
-#### Component 4: Direct DC-to-Job-Leader Routing
-**Purpose**: Results go directly to job leader, not cluster leader
-
-**Implementation Plan**:
-```
-# In Manager.job_final_result handler:
-# Instead of sending to cluster leader, send to job leader
-
-def _send_job_final_result(self, job_id: str, result: JobFinalResult):
-    job_leader = self._job_leaders.get(job_id)
-    if job_leader == self._node_id.full:
-        # We are the job leader, aggregate locally
-        self._aggregate_and_forward_to_gate(result)
-    else:
-        # Forward to job leader
-        self.send_tcp(job_leader, "job_final_result", result.dump())
-
-# Similar pattern for gates forwarding to job-owning gate
-```
-
-**Integration Points**:
-- `JobDispatch` includes `job_leader_addr` field
-- DCs route results back to specified leader
-- If leader unreachable, use backup from hash ring
-
-**Test File**: `examples/servers/test_direct_routing.py`
-```python
-# Test: results route to job leader, not cluster leader
-# Test: failover to backup when leader unreachable
-```
-
----
-
-#### Component 5: Client Reconnection
-**Purpose**: Clients can reconnect after gate failure and resume job tracking
-
-**Implementation Plan**:
-```
-Location: hyperscale/distributed_rewrite/nodes/client.py
-
-class HyperscaleClient:
-    def __init__(self, gate_addrs: list[tuple[str, int]]):
-        self._hash_ring = ConsistentHashRing()
-        for addr in gate_addrs:
-            self._hash_ring.add_node(f"{addr[0]}:{addr[1]}")
-    
-    def reconnect(self, job_id: str) -> JobResult | None:
-        """Reconnect to job owner and get current status"""
-        owner = self._hash_ring.get_node(job_id)
-        backup = self._hash_ring.get_backup(job_id)
-        
-        # Try owner first, then backup
-        for gate_addr in [owner, backup]:
-            try:
-                return self._fetch_job_status(gate_addr, job_id)
-            except ConnectionError:
-                continue
-        raise AllGatesUnreachable()
-```
-
-**Integration Points**:
-- Client stores hash ring of known gates
-- On disconnect, client computes owner and reconnects
-- Gate's `job_status_request` handler returns current status
-
-**Test File**: `examples/servers/test_client_reconnection.py`
-```python
-# Test: client reconnects after gate failure
-# Test: client finds job on backup gate
-# Test: client receives missed status updates
-```
-
----
-
 ### Testing Approach
 
 All tests follow this pattern:
@@ -7803,7 +12182,7 @@ if __name__ == "__main__":
 ```
 
 **Debug Workflow**:
-1. Run test with `timeout 180 python examples/servers/test_<name>.py 2>&1 | tail -100`
+1. Let user test with `timeout 180 python examples/servers/test_<name>.py 2>&1 | tail -100`
 2. Watch for warnings/exceptions
 3. Kill test if error found
 4. Fix the issue
@@ -7831,21 +12210,1048 @@ if __name__ == "__main__":
 
 ---
 
+---
+
+## Implemented Feature Documentation
+
+This section documents features that have been implemented, including their architecture, configuration, and usage patterns.
+
+### Terminal UI Architecture
+
+The Terminal UI provides real-time visual feedback during test execution with workflow progress, metrics, and statistics.
+
+#### Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Terminal UI Architecture                      │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │                  HyperscaleInterface                      │  │
+│  │                                                           │  │
+│  │  • Coordinates UI components                              │  │
+│  │  • Cycles through active workflows                        │  │
+│  │  • Handles updates from InterfaceUpdatesController        │  │
+│  └────────────────────────┬─────────────────────────────────┘  │
+│                           │                                     │
+│                           ▼                                     │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │                      Terminal                             │  │
+│  │                                                           │  │
+│  │  • Raw terminal control (ANSI escape sequences)          │  │
+│  │  • Manages Canvas layout                                  │  │
+│  │  • Handles refresh rate and rendering                     │  │
+│  └────────────────────────┬─────────────────────────────────┘  │
+│                           │                                     │
+│                           ▼                                     │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │                       Canvas                              │  │
+│  │                                                           │  │
+│  │  • Contains Sections arranged in rows                     │  │
+│  │  • Handles resize and layout calculations                 │  │
+│  │  • Manages padding (horizontal/vertical)                  │  │
+│  └────────────────────────┬─────────────────────────────────┘  │
+│                           │                                     │
+│                           ▼                                     │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │                      Sections                             │  │
+│  │                                                           │  │
+│  │  • Group related components                               │  │
+│  │  • Support auto-width and fixed-width modes              │  │
+│  │  • Handle component visibility toggling                   │  │
+│  └────────────────────────┬─────────────────────────────────┘  │
+│                           │                                     │
+│                           ▼                                     │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │                     Components                            │  │
+│  │                                                           │  │
+│  │  • Header: ASCII art title with gradient colors           │  │
+│  │  • ProgressBar: Animated progress with fill/background    │  │
+│  │  • Spinner: Multiple animation styles (dots, bars, etc.)  │  │
+│  │  • Counter: Numeric display with formatting               │  │
+│  │  • TotalRate: Requests/second over entire run             │  │
+│  │  • WindowedRate: Recent requests/second (sliding window)  │  │
+│  │  • ScatterPlot: Plotille-based latency visualization      │  │
+│  │  • Table: Tabulated statistics display                    │  │
+│  │  • Text/MultilineText: Status messages                    │  │
+│  │  • Timer: Elapsed time display                            │  │
+│  │  • StatusBar/AnimatedStatusBar: Status indicators         │  │
+│  └──────────────────────────────────────────────────────────┘  │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+#### Component Hierarchy
+
+```python
+# Main interface entry point
+interface = HyperscaleInterface(updates_controller)
+interface.initialize(workflows, terminal_mode="full")
+await interface.run()
+
+# Terminal modes:
+# - "full": Complete TUI with all components
+# - "ci": Simplified output for CI environments
+# - "none": No UI output (headless)
+```
+
+#### Key Files
+
+| File | Purpose |
+|------|---------|
+| `hyperscale/ui/__init__.py` | Main exports (HyperscaleInterface, InterfaceUpdatesController) |
+| `hyperscale/ui/hyperscale_interface.py` | Interface orchestration, workflow cycling |
+| `hyperscale/ui/interface_updates_controller.py` | Async update queue management |
+| `hyperscale/ui/components/terminal/terminal.py` | Raw terminal control |
+| `hyperscale/ui/components/terminal/canvas.py` | Layout engine |
+| `hyperscale/ui/components/terminal/section.py` | Section container |
+| `hyperscale/ui/styling/` | Colors, attributes, stylization |
+
+#### Update Flow
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      UI Update Flow                              │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  Worker Progress  ──►  RemoteGraphManager  ──►  Updates Queue  │
+│       │                      │                       │          │
+│       │                      │                       ▼          │
+│       │               ┌──────┴──────┐    InterfaceUpdatesController
+│       │               │             │               │           │
+│       │               ▼             ▼               ▼           │
+│       │        Stats Update   Progress Update   Workflow List   │
+│       │               │             │               │           │
+│       │               └──────┬──────┘               │           │
+│       │                      │                      │           │
+│       │                      ▼                      ▼           │
+│       │              HyperscaleInterface._run() loop            │
+│       │                      │                                  │
+│       │                      ▼                                  │
+│       │              Set active components for                  │
+│       │              current workflow                           │
+│       │                      │                                  │
+│       │                      ▼                                  │
+│       │              Terminal.trigger_render()                  │
+│       │                      │                                  │
+│       └──────────────────────┴──────────────────────────────────│
+│                                                                 │
+│  Refresh rate: Configurable via _interval (default ~30fps)     │
+│  Workflow cycling: update_interval (default 3 seconds)         │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### Reporting Architecture
+
+Hyperscale supports exporting test results to numerous backends for analysis and visualization.
+
+#### Supported Backends
+
+| Category | Backends |
+|----------|----------|
+| **Time Series** | InfluxDB, TimescaleDB, AWS Timestream, Prometheus, Graphite |
+| **Cloud Storage** | S3, Google Cloud Storage, BigQuery, BigTable |
+| **Databases** | PostgreSQL, MySQL, SQLite, MongoDB, Cassandra, CosmosDB, Redis |
+| **Monitoring** | Datadog, NewRelic, Cloudwatch, Honeycomb, Netdata |
+| **Metrics** | StatsD, DogStatsD, Telegraf, Telegraf-StatsD |
+| **Message Queue** | Kafka |
+| **File Formats** | JSON, CSV, XML |
+| **Serverless** | AWS Lambda |
+| **Custom** | CustomReporter (user-defined) |
+
+#### Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Reporting Architecture                        │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │                      Reporter[T]                          │  │
+│  │                                                           │  │
+│  │  • Generic reporter with backend type parameter           │  │
+│  │  • Factory pattern for backend instantiation              │  │
+│  │  • Unified submit() interface                             │  │
+│  └────────────────────────┬─────────────────────────────────┘  │
+│                           │                                     │
+│                           ▼                                     │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │                    Backend Config                         │  │
+│  │                                                           │  │
+│  │  • PostgresConfig, InfluxDBConfig, S3Config, etc.        │  │
+│  │  • Connection parameters                                  │  │
+│  │  • Batching and retry settings                            │  │
+│  └────────────────────────┬─────────────────────────────────┘  │
+│                           │                                     │
+│                           ▼                                     │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │                  Metrics/Results                          │  │
+│  │                                                           │  │
+│  │  • WorkflowMetric: Per-workflow statistics                │  │
+│  │  • WorkflowMetricSet: Collection of workflow metrics      │  │
+│  │  • StepMetricSet: Per-step breakdown                      │  │
+│  │  • ResultSet: Final aggregated results                    │  │
+│  │  • MetricsSet: Timing and throughput metrics              │  │
+│  │  • CheckSet: Validation check results                     │  │
+│  └──────────────────────────────────────────────────────────┘  │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+#### Usage Example
+
+```python
+from hyperscale.reporting import Reporter, PostgresConfig, ReporterTypes
+
+# Configure backend
+config = PostgresConfig(
+    host="localhost",
+    port=5432,
+    database="hyperscale_results",
+    username="user",
+    password="password",
+)
+
+# Create reporter
+reporter = Reporter[PostgresConfig](
+    reporter_type=ReporterTypes.Postgres,
+    config=config,
+)
+
+# Submit results
+await reporter.connect()
+await reporter.submit(workflow_metrics)
+await reporter.close()
+```
+
+#### Key Files
+
+| File | Purpose |
+|------|---------|
+| `hyperscale/reporting/reporter.py` | Generic Reporter class, backend factory |
+| `hyperscale/reporting/results.py` | Result aggregation and merging |
+| `hyperscale/reporting/common/types.py` | ReporterTypes enum |
+| `hyperscale/reporting/common/results_types.py` | Metric data classes |
+| `hyperscale/reporting/<backend>/` | Per-backend implementation |
+
+---
+
+### Local Execution Mode
+
+Local mode enables single-machine testing without distributed infrastructure.
+
+#### Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Local Execution Mode                          │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │                     LocalRunner                           │  │
+│  │                                                           │  │
+│  │  • Entry point for local test execution                   │  │
+│  │  • Manages worker subprocess pool                         │  │
+│  │  • Coordinates UI and results collection                  │  │
+│  └────────────────────────┬─────────────────────────────────┘  │
+│                           │                                     │
+│            ┌──────────────┼──────────────┐                     │
+│            │              │              │                      │
+│            ▼              ▼              ▼                      │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐            │
+│  │LocalServer  │  │LocalServer  │  │LocalServer  │  ...       │
+│  │Pool Worker 1│  │Pool Worker 2│  │Pool Worker N│            │
+│  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘            │
+│         │                │                │                     │
+│         └────────────────┼────────────────┘                     │
+│                          │                                      │
+│                          ▼                                      │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │                  RemoteGraphManager                       │  │
+│  │                                                           │  │
+│  │  • Manages workflow dispatch to workers                   │  │
+│  │  • Collects results and progress                          │  │
+│  │  • Feeds InterfaceUpdatesController                       │  │
+│  └──────────────────────────────────────────────────────────┘  │
+│                                                                 │
+│  Worker Count: Auto-detected via psutil.cpu_count(logical=False)│
+│  Communication: In-process TCP (localhost bindings)             │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+#### Usage
+
+```python
+from hyperscale.core.jobs.runner.local_runner import LocalRunner
+from hyperscale.core.graph import Workflow
+
+# Create runner
+runner = LocalRunner(
+    host="localhost",
+    port=8080,
+    workers=4,  # Optional, defaults to CPU cores
+)
+
+# Define workflows
+workflows = [
+    (["tag1"], MyWorkflow()),
+]
+
+# Execute
+await runner.run(
+    test_name="my_test",
+    workflows=workflows,
+    terminal_mode="full",  # "full", "ci", or "none"
+    timeout="5m",
+)
+```
+
+#### Key Files
+
+| File | Purpose |
+|------|---------|
+| `hyperscale/core/jobs/runner/local_runner.py` | LocalRunner entry point |
+| `hyperscale/core/jobs/runner/local_server_pool.py` | Worker subprocess pool |
+| `hyperscale/core/jobs/graphs/remote_graph_manager.py` | Workflow dispatch |
+
+---
+
+### Rate Limiting Implementation (AD-24)
+
+Rate limiting prevents any single client from overwhelming the system while adapting behavior based on system health.
+
+#### Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                   Rate Limiting Architecture                     │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │              HybridOverloadDetector (AD-18)               │  │
+│  │                                                           │  │
+│  │  Provides health state: HEALTHY / BUSY / STRESSED /       │  │
+│  │  OVERLOADED based on latency, CPU, memory signals         │  │
+│  └────────────────────────┬─────────────────────────────────┘  │
+│                           │                                     │
+│                           ▼                                     │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │                 AdaptiveRateLimiter                       │  │
+│  │                                                           │  │
+│  │  Health-gated rate limiting:                              │  │
+│  │  • HEALTHY: Per-operation limits apply                    │  │
+│  │  • BUSY: LOW priority shed + per-operation limits         │  │
+│  │  • STRESSED: Per-client fair-share limiting               │  │
+│  │  • OVERLOADED: Only CRITICAL requests pass                │  │
+│  └────────────────────────┬─────────────────────────────────┘  │
+│                           │                                     │
+│            ┌──────────────┴──────────────┐                     │
+│            │                             │                      │
+│            ▼                             ▼                      │
+│  ┌─────────────────────┐      ┌─────────────────────┐         │
+│  │ SlidingWindowCounter│      │ Per-Client Stress   │         │
+│  │                     │      │ Counters            │         │
+│  │ Per-operation limits│      │                     │         │
+│  │ (100 req/10s for    │      │ Fair-share limits   │         │
+│  │ job_submit, etc.)   │      │ when stressed       │         │
+│  └─────────────────────┘      └─────────────────────┘         │
+│                                                                 │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │                   Request Priority                        │  │
+│  │                                                           │  │
+│  │  CRITICAL (0): Health checks, cancellation, final results│  │
+│  │  HIGH (1): Job submission, workflow dispatch             │  │
+│  │  NORMAL (2): Progress updates, stats queries             │  │
+│  │  LOW (3): Debug requests, non-essential sync             │  │
+│  └──────────────────────────────────────────────────────────┘  │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+#### SlidingWindowCounter
+
+The SlidingWindowCounter provides deterministic rate limiting without the edge cases of token bucket algorithms:
+
+```python
+effective_count = current_window_count + previous_window_count * (1 - window_progress)
+```
+
+Example:
+- Window size: 60 seconds
+- Previous window: 100 requests
+- Current window: 30 requests
+- 15 seconds into current window (25% progress)
+- Effective count = 30 + 100 * 0.75 = 105
+
+#### Configuration
+
+```python
+# Environment variables for rate limiting
+RATE_LIMIT_DEFAULT_BUCKET_SIZE: int = 100
+RATE_LIMIT_DEFAULT_REFILL_RATE: float = 10.0
+RATE_LIMIT_CLIENT_IDLE_TIMEOUT: float = 300.0
+RATE_LIMIT_CLEANUP_INTERVAL: float = 60.0
+RATE_LIMIT_MAX_RETRIES: int = 3
+RATE_LIMIT_MAX_TOTAL_WAIT: float = 60.0
+RATE_LIMIT_BACKOFF_MULTIPLIER: float = 1.5
+```
+
+#### Per-Operation Limits
+
+| Operation | Max Requests | Window (seconds) |
+|-----------|--------------|------------------|
+| stats_update | 500 | 10.0 |
+| heartbeat | 200 | 10.0 |
+| progress_update | 300 | 10.0 |
+| job_submit | 50 | 10.0 |
+| job_status | 100 | 10.0 |
+| workflow_dispatch | 100 | 10.0 |
+| cancel | 20 | 10.0 |
+| reconnect | 10 | 10.0 |
+
+#### Client-Side Cooperation
+
+The `CooperativeRateLimiter` enables clients to respect server rate limits:
+
+```python
+limiter = CooperativeRateLimiter()
+
+# Before sending request
+await limiter.wait_if_needed("job_submit")
+
+# After receiving 429 response
+if response.status == 429:
+    retry_after = float(response.headers.get("Retry-After", 1.0))
+    limiter.handle_rate_limit("job_submit", retry_after)
+```
+
+#### Key Files
+
+| File | Purpose |
+|------|---------|
+| `hyperscale/distributed_rewrite/reliability/rate_limiting.py` | All rate limiting components |
+| `hyperscale/distributed_rewrite/reliability/overload.py` | HybridOverloadDetector |
+| `hyperscale/distributed_rewrite/reliability/load_shedding.py` | RequestPriority enum |
+
+---
+
+### Three-Signal Health Detection (AD-19)
+
+The three-signal health model provides nuanced health tracking beyond simple alive/dead status.
+
+#### The Three Signals
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                   Three-Signal Health Model                      │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  ┌─────────────────────────────────────────────────────────────┐
+│  │ Signal 1: LIVENESS                                          │
+│  │                                                             │
+│  │ "Is the node alive and responsive?"                         │
+│  │                                                             │
+│  │ • UDP ping/ack from SWIM protocol                           │
+│  │ • Timeout: LIVENESS_PROBE_TIMEOUT (1.0s)                    │
+│  │ • Period: LIVENESS_PROBE_PERIOD (10.0s)                     │
+│  │ • Failure threshold: LIVENESS_PROBE_FAILURE_THRESHOLD (3)   │
+│  └─────────────────────────────────────────────────────────────┘
+│                                                                 │
+│  ┌─────────────────────────────────────────────────────────────┐
+│  │ Signal 2: READINESS                                         │
+│  │                                                             │
+│  │ "Can the node accept new work?"                             │
+│  │                                                             │
+│  │ • Capacity check (available cores/slots)                    │
+│  │ • Overload state from HybridOverloadDetector                │
+│  │ • Not accepting if: at capacity, overloaded, draining       │
+│  │ • Timeout: READINESS_PROBE_TIMEOUT (2.0s)                   │
+│  └─────────────────────────────────────────────────────────────┘
+│                                                                 │
+│  ┌─────────────────────────────────────────────────────────────┐
+│  │ Signal 3: PROGRESS                                          │
+│  │                                                             │
+│  │ "Is the node making forward progress?"                      │
+│  │                                                             │
+│  │ States:                                                     │
+│  │ • IDLE: No active work, but healthy                         │
+│  │ • PROGRESSING: Completing work (throughput > 0)             │
+│  │ • STALLED: Active work but no recent completions            │
+│  │ • STUCK: Extended period without progress                   │
+│  └─────────────────────────────────────────────────────────────┘
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+#### Routing Decisions
+
+The three signals combine to produce routing decisions:
+
+| Liveness | Readiness | Progress | Decision |
+|----------|-----------|----------|----------|
+| ✓ | ✓ | PROGRESSING/IDLE | **ROUTE** - Send work |
+| ✓ | ✗ | Any | **HOLD** - Don't send new work |
+| ✓ | ✓ | STALLED | **INVESTIGATE** - Probe further |
+| ✓ | Any | STUCK | **DRAIN** - Complete existing, no new |
+| ✗ | Any | Any | **EVICT** - Node is dead |
+
+#### Health State Protocol
+
+```python
+class HealthSignals(Protocol):
+    """Protocol defining the three-signal health interface."""
+
+    @property
+    def liveness(self) -> bool:
+        """Is the node alive and responsive?"""
+        ...
+
+    @property
+    def readiness(self) -> bool:
+        """Can the node accept work?"""
+        ...
+
+    @property
+    def progress_state(self) -> ProgressState:
+        """Is the node making progress?"""
+        ...
+
+    def get_routing_decision(self) -> RoutingDecision:
+        """Get routing decision based on combined signals."""
+        ...
+```
+
+#### Correlation Detection
+
+The NodeHealthTracker prevents cascade evictions when multiple nodes fail simultaneously (likely network issue):
+
+```python
+tracker = NodeHealthTracker[WorkerHealthState]()
+
+# Check if we should evict (with correlation detection)
+evict_decision = tracker.should_evict("worker-1")
+if evict_decision.should_evict:
+    if evict_decision.correlated_failures:
+        # Investigate network issue, don't evict
+        pass
+    else:
+        # Safe to evict
+        pass
+```
+
+#### Configuration
+
+```python
+# Health probe settings
+LIVENESS_PROBE_TIMEOUT: float = 1.0
+LIVENESS_PROBE_PERIOD: float = 10.0
+LIVENESS_PROBE_FAILURE_THRESHOLD: int = 3
+LIVENESS_PROBE_SUCCESS_THRESHOLD: int = 1
+
+READINESS_PROBE_TIMEOUT: float = 2.0
+READINESS_PROBE_PERIOD: float = 10.0
+READINESS_PROBE_FAILURE_THRESHOLD: int = 3
+READINESS_PROBE_SUCCESS_THRESHOLD: int = 1
+
+STARTUP_PROBE_TIMEOUT: float = 5.0
+STARTUP_PROBE_PERIOD: float = 5.0
+STARTUP_PROBE_FAILURE_THRESHOLD: int = 30  # Allow slow startups (150s)
+STARTUP_PROBE_SUCCESS_THRESHOLD: int = 1
+```
+
+#### SWIM Piggyback
+
+Health signals are piggybacked on SWIM protocol messages for efficiency:
+
+```python
+@dataclass
+class HealthPiggyback:
+    node_id: str
+    node_type: str  # "worker" | "manager" | "gate"
+    is_alive: bool = True
+    accepting_work: bool = True
+    capacity: int = 0
+    throughput: float = 0.0
+    expected_throughput: float = 0.0
+    overload_state: str = "healthy"
+    timestamp: float = field(default_factory=time.monotonic)
+```
+
+#### Key Files
+
+| File | Purpose |
+|------|---------|
+| `hyperscale/distributed_rewrite/health/tracker.py` | NodeHealthTracker, HealthSignals protocol |
+| `hyperscale/distributed_rewrite/health/worker_health.py` | WorkerHealthState implementation |
+| `hyperscale/distributed_rewrite/health/worker_health_manager.py` | Manager-side health tracking |
+
+---
+
+### Adaptive Healthcheck Extensions (AD-26)
+
+Allows workers to request deadline extensions for long-running operations with graceful exhaustion handling.
+
+#### Extension Grant Formula
+
+Extensions use logarithmic decay to prevent indefinite delays:
+
+```
+grant = max(min_grant, base_deadline / 2^(extension_count + 1))
+```
+
+| Extension # | Formula | Grant (base=30s) | Cumulative |
+|-------------|---------|------------------|------------|
+| 1 | 30 / 2^1 | 15.0s | 15.0s |
+| 2 | 30 / 2^2 | 7.5s | 22.5s |
+| 3 | 30 / 2^3 | 3.75s | 26.25s |
+| 4 | 30 / 2^4 | 1.875s | 28.125s |
+| 5 | 30 / 2^5 | 1.0s (min) | 29.125s |
+| 6+ | — | denied | — |
+
+#### Graceful Exhaustion
+
+When extensions run out, the system provides warning and grace period:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                Graceful Exhaustion Timeline                      │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  Extension 1  Extension 2  Extension 3  Extension 4  Extension 5│
+│      │            │            │            │            │      │
+│      ▼            ▼            ▼            ▼            ▼      │
+│  ┌──────┐    ┌──────┐    ┌──────┐    ┌──────┐    ┌──────┐     │
+│  │ 15s  │    │ 7.5s │    │3.75s │    │1.875s│    │ 1s   │     │
+│  │grant │    │grant │    │grant │    │grant │    │grant │     │
+│  └──────┘    └──────┘    └──────┘    └──────┘    └──┬───┘     │
+│                                                      │          │
+│                                           ┌──────────▼────────┐│
+│                                           │  WARNING SENT     ││
+│                                           │  (remaining <= 1) ││
+│                                           └──────────┬────────┘│
+│                                                      │          │
+│                                                      ▼          │
+│                                           ┌─────────────────┐  │
+│                                           │  EXHAUSTED      │  │
+│                                           │                 │  │
+│                                           │  Grace Period   │  │
+│                                           │  (10s default)  │  │
+│                                           │                 │  │
+│                                           │  Worker can:    │  │
+│                                           │  • Checkpoint   │  │
+│                                           │  • Save state   │  │
+│                                           │  • Clean up     │  │
+│                                           └────────┬────────┘  │
+│                                                    │            │
+│                                                    ▼            │
+│                                           ┌─────────────────┐  │
+│                                           │  EVICTION       │  │
+│                                           │  (after grace)  │  │
+│                                           └─────────────────┘  │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+#### Extension Tracker State
+
+```python
+@dataclass(slots=True)
+class ExtensionTracker:
+    worker_id: str
+    base_deadline: float = 30.0
+    min_grant: float = 1.0
+    max_extensions: int = 5
+    warning_threshold: int = 1      # Extensions remaining to trigger warning
+    grace_period: float = 10.0      # Seconds after exhaustion before kill
+
+    extension_count: int = 0
+    last_progress: float = 0.0
+    total_extended: float = 0.0
+    last_extension_time: float = field(default_factory=time.monotonic)
+    exhaustion_time: float | None = None
+    warning_sent: bool = False
+
+    def request_extension(
+        self,
+        reason: str,
+        current_progress: float,
+    ) -> tuple[bool, float, str | None, bool]:
+        """
+        Returns: (granted, extension_seconds, denial_reason, is_warning)
+        """
+        ...
+
+    @property
+    def is_exhausted(self) -> bool: ...
+
+    @property
+    def is_in_grace_period(self) -> bool: ...
+
+    @property
+    def grace_period_remaining(self) -> float: ...
+
+    @property
+    def should_evict(self) -> bool:
+        """True if exhausted AND grace period expired."""
+        ...
+```
+
+#### Extension Response Fields
+
+```python
+@dataclass
+class HealthcheckExtensionResponse:
+    granted: bool
+    extension_seconds: float
+    new_deadline: float
+    remaining_extensions: int
+    denial_reason: str | None = None
+    is_exhaustion_warning: bool = False    # True if about to exhaust
+    grace_period_remaining: float = 0.0    # Seconds remaining after exhaustion
+    in_grace_period: bool = False          # True if exhausted but within grace
+```
+
+#### Configuration
+
+```python
+# Environment variables
+EXTENSION_BASE_DEADLINE: float = 30.0
+EXTENSION_MIN_GRANT: float = 1.0
+EXTENSION_MAX_EXTENSIONS: int = 5
+EXTENSION_EVICTION_THRESHOLD: int = 3
+EXTENSION_EXHAUSTION_WARNING_THRESHOLD: int = 1
+EXTENSION_EXHAUSTION_GRACE_PERIOD: float = 10.0
+```
+
+#### Key Files
+
+| File | Purpose |
+|------|---------|
+| `hyperscale/distributed_rewrite/health/extension_tracker.py` | ExtensionTracker, ExtensionTrackerConfig |
+| `hyperscale/distributed_rewrite/health/worker_health_manager.py` | WorkerHealthManager integration |
+| `hyperscale/distributed_rewrite/models/distributed.py` | HealthcheckExtensionRequest/Response |
+
+---
+
+### Zombie Job Prevention & Detection
+
+Multiple mechanisms work together to detect and prevent zombie jobs (jobs that appear running but are actually stuck or orphaned).
+
+#### Detection Mechanisms
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                   Zombie Detection Mechanisms                    │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  1. TIMEOUT DETECTION                                           │
+│     ├─ Per-workflow timeout (user-configured)                   │
+│     ├─ Checked during progress updates                          │
+│     └─ Triggers workflow failure and cleanup                    │
+│                                                                 │
+│  2. SWIM DEAD DETECTION                                         │
+│     ├─ SWIM protocol detects unresponsive workers              │
+│     ├─ States: alive → suspect → dead                          │
+│     ├─ Dead workers trigger workflow reassignment              │
+│     └─ Reap interval: MANAGER_DEAD_WORKER_REAP_INTERVAL (15m)  │
+│                                                                 │
+│  3. PROGRESS HEALTH (AD-19)                                     │
+│     ├─ Three-signal model tracks progress state                │
+│     ├─ States: IDLE → PROGRESSING → STALLED → STUCK            │
+│     ├─ STUCK triggers investigation and potential eviction     │
+│     └─ Correlation detection prevents cascade evictions        │
+│                                                                 │
+│  4. LEASE EXPIRY                                                │
+│     ├─ Gates hold time-limited leases for jobs                 │
+│     ├─ Lease duration: configurable per-job                    │
+│     ├─ Expired leases allow other gates to take over           │
+│     └─ Prevents single-gate failures from blocking jobs        │
+│                                                                 │
+│  5. ORPHAN WORKFLOW SCANNER (New)                               │
+│     ├─ Manager periodically queries workers for active workflows│
+│     ├─ Compares against manager's workflow assignments          │
+│     ├─ Marks orphaned workflows as failed                       │
+│     ├─ Interval: ORPHAN_SCAN_INTERVAL (120s)                    │
+│     └─ Worker timeout: ORPHAN_SCAN_WORKER_TIMEOUT (5s)          │
+│                                                                 │
+│  6. EXTENSION EXHAUSTION (AD-26)                                │
+│     ├─ Workers have limited extension requests                  │
+│     ├─ Exhaustion triggers warning, then grace period           │
+│     ├─ Grace period expiry triggers eviction                    │
+│     └─ Prevents infinitely-extending stuck workflows            │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+#### Prevention Mechanisms
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                  Zombie Prevention Mechanisms                    │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  1. FENCE TOKENS                                                │
+│     ├─ Monotonically increasing token per job                  │
+│     ├─ Prevents stale updates from old job executions          │
+│     ├─ Gates reject results with outdated fence tokens         │
+│     └─ Incremented on: retry, failover, reassignment           │
+│                                                                 │
+│  2. VERSIONED CLOCK                                             │
+│     ├─ Per-entity Lamport timestamps                           │
+│     ├─ All state updates include clock version                 │
+│     ├─ Rejects updates with older clock values                 │
+│     └─ Ensures consistent ordering across DCs                  │
+│                                                                 │
+│  3. CANCELLATION POLLING                                        │
+│     ├─ Workers poll manager for job cancellation status        │
+│     ├─ Interval: WORKER_CANCELLATION_POLL_INTERVAL (5s)        │
+│     ├─ Catches cancellations even if push notification fails   │
+│     └─ Self-termination on discovering cancelled state         │
+│                                                                 │
+│  4. QUORUM CONFIRMATION                                         │
+│     ├─ Critical state changes require manager quorum           │
+│     ├─ Prevents split-brain scenarios                          │
+│     └─ Failed quorum blocks state transition                   │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+#### Orphan Workflow Scanner
+
+The orphan scanner runs periodically on managers to detect workflows that:
+- Are tracked by the manager but not running on any worker
+- Are running on workers but not tracked by the manager
+
+```python
+async def _orphan_workflow_scan_loop(self) -> None:
+    """Background loop that scans for orphaned workflows."""
+    while not self._shutdown_event.is_set():
+        try:
+            await asyncio.sleep(self._orphan_scan_interval)
+
+            # Get all known workflow IDs from manager state
+            known_workflow_ids = set(self._workflow_assignments.keys())
+
+            # Query each worker for active workflows
+            worker_workflows: dict[str, set[str]] = {}
+            for worker_id, registration in self._workers.items():
+                active_ids = await self._query_worker_workflows(
+                    worker_id,
+                    registration.address,
+                )
+                worker_workflows[worker_id] = active_ids
+
+            # Find orphans: known to manager but not on any worker
+            all_worker_workflows = set()
+            for workflows in worker_workflows.values():
+                all_worker_workflows.update(workflows)
+
+            orphaned = known_workflow_ids - all_worker_workflows
+
+            # Mark orphaned workflows as failed
+            for workflow_id in orphaned:
+                await self._mark_workflow_failed(
+                    workflow_id,
+                    "Orphaned - not found on any worker",
+                )
+```
+
+#### Configuration
+
+```python
+# Dead node reaping
+MANAGER_DEAD_WORKER_REAP_INTERVAL: float = 900.0  # 15 minutes
+MANAGER_DEAD_PEER_REAP_INTERVAL: float = 900.0
+MANAGER_DEAD_GATE_REAP_INTERVAL: float = 900.0
+WORKER_DEAD_MANAGER_REAP_INTERVAL: float = 900.0
+
+# Job cleanup
+COMPLETED_JOB_MAX_AGE: float = 300.0  # 5 minutes
+FAILED_JOB_MAX_AGE: float = 3600.0    # 1 hour
+JOB_CLEANUP_INTERVAL: float = 60.0
+
+# Orphan scanning
+ORPHAN_SCAN_INTERVAL: float = 120.0       # 2 minutes
+ORPHAN_SCAN_WORKER_TIMEOUT: float = 5.0
+
+# Cancellation polling
+WORKER_CANCELLATION_POLL_INTERVAL: float = 5.0
+```
+
+---
+
+### Per-Workflow Result Streaming
+
+Results are streamed from workers to managers to gates to clients as workflows complete, rather than waiting for entire jobs to finish.
+
+#### Streaming Flow
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│               Per-Workflow Result Streaming                      │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  Worker                Manager               Gate        Client │
+│    │                     │                    │            │    │
+│    │─ WorkflowResult ───►│                    │            │    │
+│    │  (wf-001 complete)  │                    │            │    │
+│    │                     │─ WorkflowResult ──►│            │    │
+│    │                     │  (aggregated)      │            │    │
+│    │                     │                    │─ Stream ──►│    │
+│    │                     │                    │  Result    │    │
+│    │                     │                    │            │    │
+│    │─ WorkflowResult ───►│                    │            │    │
+│    │  (wf-002 complete)  │                    │            │    │
+│    │                     │─ WorkflowResult ──►│            │    │
+│    │                     │                    │─ Stream ──►│    │
+│    │                     │                    │            │    │
+│    │                     │                    │            │    │
+│    │  [All workflows complete]                │            │    │
+│    │                     │                    │            │    │
+│    │                     │─ JobComplete ─────►│            │    │
+│    │                     │                    │─ Final ───►│    │
+│    │                     │                    │  Summary   │    │
+│                                                                 │
+│  Benefits:                                                      │
+│  • Real-time progress visibility                                │
+│  • Early failure detection                                      │
+│  • Lower latency for time-sensitive results                     │
+│  • Memory efficiency (results processed incrementally)          │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+#### Client API
+
+```python
+client = HyperscaleClient(gate_tcp_addrs=[...])
+await client.start()
+
+# Submit job
+job_id = await client.submit_job(submission)
+
+# Stream results as they arrive
+async for workflow_result in client.stream_workflow_results(job_id):
+    print(f"Workflow {workflow_result.workflow_id}: {workflow_result.status}")
+    # Process individual workflow results...
+
+# Or wait for all results
+final_result = await client.wait_for_completion(job_id)
+```
+
+---
+
+### Time Alignment for Cross-DC Aggregation
+
+When aggregating results across datacenters, clock skew must be handled to produce accurate timing metrics.
+
+#### Clock Synchronization
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│              Cross-DC Time Alignment                             │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  Problem: Different DCs have different wall-clock times         │
+│                                                                 │
+│  DC-West (PDT)        DC-East (EDT)        DC-EU (CET)         │
+│  10:00:00.000         13:00:00.050         19:00:00.120        │
+│       │                    │                    │               │
+│       │  Clock skew: 50ms  │  Clock skew: 70ms  │              │
+│       │                    │                    │               │
+│                                                                 │
+│  Solution: Versioned Clock with Lamport timestamps              │
+│                                                                 │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │ VersionedClock                                            │  │
+│  │                                                           │  │
+│  │ • Logical clock increments on each event                  │  │
+│  │ • Merged with received clock on message receipt           │  │
+│  │ • Provides total ordering without wall-clock dependency   │  │
+│  │                                                           │  │
+│  │ clock_value = max(local_clock, received_clock) + 1        │  │
+│  └──────────────────────────────────────────────────────────┘  │
+│                                                                 │
+│  For latency metrics:                                           │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │ Monotonic Time Basis                                      │  │
+│  │                                                           │  │
+│  │ • All timing within a node uses time.monotonic()          │  │
+│  │ • Cross-node timing uses relative deltas                  │  │
+│  │ • Aggregation preserves statistical properties            │  │
+│  │   (min, max, mean, percentiles all computed from deltas)  │  │
+│  └──────────────────────────────────────────────────────────┘  │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### Datacenter List Query
+
+Clients can query gates for the list of registered datacenters.
+
+#### API
+
+```python
+# Client-side
+client = HyperscaleClient(gate_tcp_addrs=[...])
+await client.start()
+
+# Query available datacenters
+datacenters = await client.get_datacenters()
+# Returns: ["us-west-1", "us-east-1", "eu-west-1", ...]
+
+# Submit job to specific datacenters
+submission = JobSubmission(
+    workflows=[...],
+    target_datacenters=["us-west-1", "us-east-1"],
+)
+```
+
+#### Message Types
+
+```python
+@dataclass
+class DatacenterListRequest:
+    """Request to list available datacenters."""
+    request_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+
+@dataclass
+class DatacenterListResponse:
+    """Response containing available datacenters."""
+    request_id: str
+    datacenters: list[str]
+    timestamp: float = field(default_factory=time.time)
+```
+
+#### Handler (Gate)
+
+```python
+@tcp.receive()
+async def datacenter_list(self, addr, data, clock_time):
+    """Handle datacenter list query from client."""
+    request = DatacenterListRequest.load(data)
+
+    # Collect datacenter IDs from known managers
+    datacenter_ids = list(self._datacenter_status.keys())
+
+    response = DatacenterListResponse(
+        request_id=request.request_id,
+        datacenters=datacenter_ids,
+    )
+
+    return response.dump()
+```
+
+---
+
 ### Known Issues to Investigate
-
-1. ~~**Workflow Execution Not Completing**~~ **RESOLVED**
-   - ~~Jobs return `PARTIAL` with `total_completed=0`~~
-   - **Root cause 1**: `RemoteGraphManager.get_workflow_update()` missing return statement
-   - **Root cause 2**: Manager used progress-based counts only, missing fast workflows
-   - **Fix**: Added return statement; extract counts from `WorkflowStats["stats"]`
-
-2. **Manager Shutdown Failures**
-   - `Manager stop failed` during cleanup
-   - May be race condition with background tasks
-
-3. **Circuit Breaker False Positives**
-   - `[CircuitBreakerOpen] ELECTION` errors during single-node tests
-   - Single-node clusters shouldn't have election circuit breaker issues
 
 ---
 
@@ -7873,3 +13279,1967 @@ git branch --show-current  # AL-distributed-wip
 
 See the main project LICENSE file.
 
+
+---
+
+## Worker → Manager Progress Update Architecture
+
+### Overview
+
+Workers collect progress updates from their local workflow execution (via `RemoteGraphManager`) and send them to the job leader Manager. This system is designed to be:
+
+1. **Lossless** - Every progress update is captured (no dropped samples)
+2. **Backpressure-aware** - Respects Manager overload signals
+3. **Lifecycle-immediate** - Status transitions (STARTED, COMPLETED, FAILED) are sent immediately
+4. **Rate-controlled** - Regular progress updates are batched to avoid Manager spam
+
+### Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    WORKER PROGRESS UPDATE FLOW                               │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Local Workflow Execution (Subprocess Pool)                                  │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │  RemoteGraphController (subprocess)                                   │   │
+│  │                                                                       │   │
+│  │  ┌─────────────────┐    ┌─────────────────┐                          │   │
+│  │  │ push_workflow_  │    │ aggregate_      │                          │   │
+│  │  │ status_update   │───►│ status_updates  │                          │   │
+│  │  │ (0.1s schedule) │    │ (0.05s schedule)│                          │   │
+│  │  └─────────────────┘    └────────┬────────┘                          │   │
+│  │                                  │                                    │   │
+│  │                     completion_state.status_update_queue              │   │
+│  │                                  │                                    │   │
+│  └──────────────────────────────────┼───────────────────────────────────┘   │
+│                                     │                                        │
+│  Worker (Main Process)              │                                        │
+│  ┌──────────────────────────────────┼───────────────────────────────────┐   │
+│  │                                  ▼                                    │   │
+│  │  ┌─────────────────────────────────────────────────────────────────┐ │   │
+│  │  │               RemoteGraphManager (Leader Process)               │ │   │
+│  │  │                                                                 │ │   │
+│  │  │  ┌───────────────────────┐    ┌──────────────────────────────┐ │ │   │
+│  │  │  │ _wait_for_workflow_   │    │ get_availability()           │ │ │   │
+│  │  │  │ completion loop       │    │ (sync, non-blocking)         │ │ │   │
+│  │  │  │                       │    │                              │ │ │   │
+│  │  │  │ • Poll status queue   │    │ Returns: (assigned,          │ │ │   │
+│  │  │  │ • Update stats        │    │           completed,         │ │ │   │
+│  │  │  │ • Call callback       │    │           available)         │ │ │   │
+│  │  │  └───────────┬───────────┘    └──────────────────────────────┘ │ │   │
+│  │  │              │                                                  │ │   │
+│  │  └──────────────┼──────────────────────────────────────────────────┘ │   │
+│  │                 │                                                     │   │
+│  │                 ▼                                                     │   │
+│  │  ┌─────────────────────────────────────────────────────────────────┐ │   │
+│  │  │               _monitor_workflow_progress()                       │ │   │
+│  │  │                                                                  │ │   │
+│  │  │  • Convert WorkflowStatusUpdate → WorkflowProgress              │ │   │
+│  │  │  • Add core allocation info from CoreAllocator                  │ │   │
+│  │  │  • Add CPU/memory metrics                                       │ │   │
+│  │  │  • Call _send_progress_update() [BUFFER]                        │ │   │
+│  │  │                                                                  │ │   │
+│  │  └───────────────────────────────┬─────────────────────────────────┘ │   │
+│  │                                  │                                    │   │
+│  │          ┌───────────────────────┴───────────────────────┐           │   │
+│  │          │                                               │           │   │
+│  │          ▼                                               ▼           │   │
+│  │  ┌───────────────────────┐                 ┌────────────────────────┐│   │
+│  │  │ _progress_buffer      │                 │ _transition_workflow_  ││   │
+│  │  │ (dict: workflow_id →  │                 │ status()               ││   │
+│  │  │  latest progress)     │                 │                        ││   │
+│  │  │                       │                 │ For: STARTED,          ││   │
+│  │  │ Latest-wins: only     │                 │      COMPLETED,        ││   │
+│  │  │ most recent per       │                 │      FAILED            ││   │
+│  │  │ workflow kept         │                 │                        ││   │
+│  │  └───────────┬───────────┘                 │ → Immediate send       ││   │
+│  │              │                             │   (bypass buffer)      ││   │
+│  │              │                             └───────────┬────────────┘│   │
+│  │              ▼                                         │             │   │
+│  │  ┌───────────────────────┐                             │             │   │
+│  │  │ _progress_flush_loop  │                             │             │   │
+│  │  │ (background task)     │                             │             │   │
+│  │  │                       │                             │             │   │
+│  │  │ • Sleep for interval  │                             │             │   │
+│  │  │   (50ms default)      │                             │             │   │
+│  │  │ • Check backpressure  │                             │             │   │
+│  │  │ • Clear buffer        │                             │             │   │
+│  │  │ • Send to job leader  │                             │             │   │
+│  │  └───────────┬───────────┘                             │             │   │
+│  │              │                                         │             │   │
+│  │              └─────────────────────┬───────────────────┘             │   │
+│  │                                    │                                  │   │
+│  └────────────────────────────────────┼─────────────────────────────────┘   │
+│                                       │                                      │
+│                                       ▼                                      │
+│                     ┌─────────────────────────────────────┐                 │
+│                     │   _send_progress_to_job_leader()    │                 │
+│                     │                                     │                 │
+│                     │ Routes to the Manager that          │                 │
+│                     │ dispatched this workflow (not       │                 │
+│                     │ necessarily primary manager)        │                 │
+│                     │                                     │                 │
+│                     │ Handles:                            │                 │
+│                     │ • Job leader discovery              │                 │
+│                     │ • Failover to new leader            │                 │
+│                     │ • Circuit breaker per manager       │                 │
+│                     └──────────────────┬──────────────────┘                 │
+│                                        │                                     │
+└────────────────────────────────────────┼─────────────────────────────────────┘
+                                         │
+                                         ▼
+                              ┌─────────────────────┐
+                              │   Manager (TCP)     │
+                              │                     │
+                              │ workflow_progress() │
+                              │ handler             │
+                              └─────────────────────┘
+```
+
+### Key Components
+
+#### 1. RemoteGraphManager State Tracking
+
+The `RemoteGraphManager` maintains core availability as simple state (not a queue):
+
+```python
+class RemoteGraphManager:
+    def __init__(self, ...):
+        # Latest core availability state (assigned, completed, available)
+        # Updated atomically - readers get current value immediately
+        self._latest_availability: tuple[int, int, int] = (0, 0, 0)
+
+    def get_availability(self) -> tuple[int, int, int]:
+        """
+        Get the current core availability state.
+
+        Returns (assigned, completed, available) tuple.
+        This is NON-BLOCKING and returns immediately.
+        """
+        return self._latest_availability
+
+    def _update_available_cores(self, assigned: int, completed: int):
+        """Update state atomically and notify if cores freed."""
+        available = self._threads - max(assigned - completed, 0)
+        self._latest_availability = (assigned, completed, available)
+
+        # Instant callback if cores became available
+        if self._on_cores_available and available > 0:
+            self._on_cores_available(available)
+```
+
+**Why state-based, not queue-based?**
+- Progress updates are cumulative (totals, not deltas)
+- We only care about the *current* state, not history
+- Queue-based `await queue.get()` blocked when empty, causing 5+ second delays
+- State-based reads are instant and non-blocking
+
+#### 2. Progress Buffer (Latest-Wins)
+
+The Worker maintains a simple buffer that keeps only the latest progress per workflow:
+
+```python
+class WorkerServer:
+    def __init__(self, ...):
+        self._progress_buffer: dict[str, WorkflowProgress] = {}
+        self._progress_buffer_lock = asyncio.Lock()
+        self._progress_flush_interval: float = env.WORKER_PROGRESS_FLUSH_INTERVAL  # 50ms
+
+    async def _send_progress_update(self, progress: WorkflowProgress) -> None:
+        """
+        Buffer a progress update for batched sending.
+
+        Instead of sending immediately, updates are collected in a buffer
+        and flushed periodically by _progress_flush_loop.
+        """
+        async with self._progress_buffer_lock:
+            # Latest-wins: only keep most recent per workflow
+            self._progress_buffer[progress.workflow_id] = progress
+```
+
+**Why latest-wins?**
+- Progress is cumulative (`completed_count` is total, not delta)
+- Old samples are superseded by newer ones
+- No need for complex aggregation
+- Memory bounded: O(active_workflows)
+
+#### 3. Flush Loop (Backpressure-Aware)
+
+```python
+async def _progress_flush_loop(self) -> None:
+    """Background loop that flushes buffered progress to manager."""
+    while self._running:
+        # Respect backpressure signals from managers
+        effective_interval = self._get_effective_flush_interval()
+        await asyncio.sleep(effective_interval)
+
+        # Drop updates under heavy backpressure
+        if self._get_max_backpressure_level() >= BackpressureLevel.REJECT:
+            async with self._progress_buffer_lock:
+                self._progress_buffer.clear()
+            continue
+
+        # Get and clear buffer atomically
+        async with self._progress_buffer_lock:
+            if not self._progress_buffer:
+                continue
+            updates_to_send = dict(self._progress_buffer)
+            self._progress_buffer.clear()
+
+        # Send to job leaders
+        if self._healthy_manager_ids:
+            for workflow_id, progress in updates_to_send.items():
+                await self._send_progress_to_job_leader(progress)
+
+def _get_effective_flush_interval(self) -> float:
+    """Increase interval when managers signal backpressure."""
+    base = self._progress_flush_interval  # 50ms
+    if self._backpressure_delay_ms > 0:
+        return base + (self._backpressure_delay_ms / 1000.0)
+    return base
+```
+
+#### 4. Lifecycle Events (Immediate Send)
+
+Status transitions bypass the buffer for immediate visibility:
+
+```python
+async def _transition_workflow_status(
+    self,
+    progress: WorkflowProgress,
+    new_status: WorkflowStatus,
+    start_time: float | None = None,
+) -> None:
+    """
+    Transition workflow to a new status with IMMEDIATE send.
+
+    This is the ONLY method that should change workflow status.
+    Lifecycle events (STARTED, COMPLETED, FAILED) are always sent
+    immediately to ensure visibility even for short workflows.
+    """
+    progress.status = new_status.value
+    progress.timestamp = time.monotonic()
+    progress.collected_at = time.time()
+
+    if start_time is not None:
+        progress.elapsed_seconds = time.monotonic() - start_time
+
+    # Always send lifecycle transitions immediately (bypass buffer)
+    if self._healthy_manager_ids:
+        await self._send_progress_update_direct(progress)
+```
+
+### Job Leader Routing
+
+Progress updates are routed to the Manager that dispatched the workflow:
+
+```python
+async def _send_progress_to_job_leader(
+    self,
+    progress: WorkflowProgress,
+) -> bool:
+    """
+    Send progress to the job leader for this workflow.
+
+    Routes to the manager that dispatched (job leader).
+    Handles failover if job leader becomes unhealthy.
+    """
+    workflow_id = progress.workflow_id
+    job_leader_addr = self._workflow_job_leader.get(workflow_id)
+
+    # Try job leader first
+    if job_leader_addr:
+        success = await self._try_send_progress_to_addr(progress, job_leader_addr)
+        if success:
+            return True
+
+        # Job leader failed - need to find new leader
+        # Query any healthy manager for the current leader
+
+    # Fallback: query healthy managers for job leader
+    for manager_id in list(self._healthy_manager_ids):
+        manager_info = self._known_managers.get(manager_id)
+        if manager_info:
+            success = await self._try_send_progress_to_addr(
+                progress,
+                (manager_info.host, manager_info.tcp_port)
+            )
+            if success:
+                # Ack includes current job leader address - update routing
+                return True
+
+    return False
+```
+
+### Configuration
+
+Environment variables in `Env`:
+
+```python
+# Worker progress update configuration
+WORKER_PROGRESS_UPDATE_INTERVAL: float = 0.1    # How often to poll status queue (100ms)
+WORKER_PROGRESS_FLUSH_INTERVAL: float = 0.05    # How often to flush buffer (50ms)
+
+# Backpressure (AD-23)
+# Managers can signal workers to slow down progress updates
+# by including BackpressureSignal in progress acks
+```
+
+### Flow Comparison: Before vs After
+
+**Before (Inline Rate-Limiting):**
+```
+[status update] → [rate limit check] → [send if time passed]
+                          ↓
+                   (DROP if too soon)
+```
+- Updates could be dropped
+- No backpressure awareness
+- Competed with flush loop
+
+**After (Buffer + Flush):**
+```
+[status update] → [_progress_buffer] → [flush loop] → [send]
+                   (latest-wins)       (controlled)
+```
+- No updates dropped (latest kept)
+- Backpressure-aware
+- Single unified mechanism
+- Lifecycle events bypass for immediacy
+
+### Integration with Windowed Stats
+
+This Worker → Manager flow feeds into the Manager's `WindowedStatsCollector`:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    END-TO-END PROGRESS FLOW                                  │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌────────────┐    ┌────────────┐                                           │
+│  │  Worker 1  │    │  Worker 2  │                                           │
+│  │            │    │            │                                           │
+│  │ [buffer]   │    │ [buffer]   │     Worker → Manager                      │
+│  │ [flush]    │    │ [flush]    │     (This section)                        │
+│  └─────┬──────┘    └─────┬──────┘                                           │
+│        │                 │                                                   │
+│        │ WorkflowProgress│                                                   │
+│        │ (50ms batched)  │                                                   │
+│        │                 │                                                   │
+│        └────────┬────────┘                                                   │
+│                 ▼                                                            │
+│  ┌─────────────────────────────────────────────────────────────────────────┐│
+│  │                    MANAGER                                               ││
+│  │                                                                          ││
+│  │  workflow_progress() ──► WindowedStatsCollector                          ││
+│  │         │                    │                                           ││
+│  │         │                    │ (time-bucketed windows)                   ││
+│  │         │                    │ (drift tolerance)                         ││
+│  │         │                    │ (aggregation)                             ││
+│  │         │                    ▼                                           ││
+│  │         │              [flush closed windows]                            ││
+│  │         │                    │                                           ││
+│  └─────────┼────────────────────┼───────────────────────────────────────────┘│
+│            │                    │                                            │
+│            │                    │ WindowedStatsPush                          │
+│            │                    │ (50ms aggregated)                          │
+│            ▼                    ▼                                            │
+│   ┌─────────────────┐    ┌─────────────────┐                                │
+│   │ Job tracking    │    │ Client/Gate     │     Manager → Client           │
+│   │ (internal)      │    │ (streaming)     │     (Next section)             │
+│   └─────────────────┘    └─────────────────┘                                │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Time-Windowed Streaming Stats System
+
+### Overview
+
+The streaming stats system provides real-time progress updates from workers to clients while:
+1. **Correlating stats across workers by time** - Stats from different workers within the same time window are aggregated together
+2. **Preventing client spam** - One aggregated push per window interval instead of per-worker updates
+3. **Bounding memory usage** - Windows are cleared after each push cycle
+4. **Supporting hierarchical aggregation** - Manager aggregates for direct clients; Gate aggregates across DCs
+
+### Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    TIME-WINDOWED STATS FLOW                                 │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  Workers (rapid updates ~1s)                                                │
+│  ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────┐                        │
+│  │Worker 1 │  │Worker 2 │  │Worker 3 │  │Worker N │                        │
+│  │ t=0.1s  │  │ t=0.15s │  │ t=0.12s │  │ t=0.18s │  ← collected_at        │
+│  └────┬────┘  └────┬────┘  └────┬────┘  └────┬────┘    (Unix timestamp)    │
+│       │            │            │            │                              │
+│       └────────────┴─────┬──────┴────────────┘                              │
+│                          ▼                                                  │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │                    MANAGER - WindowedStatsCollector                   │  │
+│  ├───────────────────────────────────────────────────────────────────────┤  │
+│  │                                                                       │  │
+│  │  Time Windows (100ms buckets):                                        │  │
+│  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐                   │  │
+│  │  │ Window T=0  │  │ Window T=1  │  │ Window T=2  │  ...              │  │
+│  │  │ [0ms-100ms) │  │[100ms-200ms)│  │[200ms-300ms)│                   │  │
+│  │  │             │  │             │  │             │                   │  │
+│  │  │ Worker1 ──┐ │  │ Worker2 ──┐ │  │ Worker1 ──┐ │                   │  │
+│  │  │ Worker3 ──┼─│  │ Worker4 ──┼─│  │ Worker2 ──┼─│                   │  │
+│  │  │ Worker2 ──┘ │  │ Worker1 ──┘ │  │ Worker3 ──┘ │                   │  │
+│  │  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘                   │  │
+│  │         │                │                │                           │  │
+│  │         ▼                ▼                ▼                           │  │
+│  │    [aggregate]      [aggregate]      [aggregate]                      │  │
+│  │         │                │                │                           │  │
+│  │         └────────────────┼────────────────┘                           │  │
+│  │                          │                                            │  │
+│  │  Flush Timer (100ms)     │                                            │  │
+│  │  ────────────────────────┼──────────────────────────────              │  │
+│  │                          ▼                                            │  │
+│  │              ┌───────────────────────┐                                │  │
+│  │              │  Closed windows only  │                                │  │
+│  │              │  (T < current - drift)│                                │  │
+│  │              └───────────┬───────────┘                                │  │
+│  │                          │                                            │  │
+│  └──────────────────────────┼────────────────────────────────────────────┘  │
+│                             │                                               │
+│          ┌──────────────────┴──────────────────┐                           │
+│          │                                     │                           │
+│          ▼                                     ▼                           │
+│  ┌───────────────────┐               ┌─────────────────────┐               │
+│  │  Direct Client    │               │       Gate          │               │
+│  │  (aggregated)     │               │   (unaggregated)    │               │
+│  │                   │               │                     │               │
+│  │  WindowedStatsPush│               │  WindowedStatsPush  │               │
+│  │  - window_start   │               │  - window_start     │               │
+│  │  - window_end     │               │  - window_end       │               │
+│  │  - aggregated:    │               │  - per_worker:      │               │
+│  │    completed,     │               │    [{worker_id,     │               │
+│  │    failed,        │               │      completed,     │               │
+│  │    rate,          │               │      failed, ...}]  │               │
+│  │    step_stats     │               │                     │               │
+│  └───────────────────┘               └──────────┬──────────┘               │
+│                                                 │                          │
+│                                                 ▼                          │
+│                                      ┌─────────────────────┐               │
+│                                      │  Gate Aggregation   │               │
+│                                      │  (same windowing)   │               │
+│                                      │                     │               │
+│                                      │  Correlates windows │               │
+│                                      │  across DCs         │               │
+│                                      └──────────┬──────────┘               │
+│                                                 │                          │
+│                                                 ▼                          │
+│                                      ┌─────────────────────┐               │
+│                                      │      Client         │               │
+│                                      │   (aggregated)      │               │
+│                                      └─────────────────────┘               │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Time Window Bucketing
+
+Stats are bucketed by their `collected_at` Unix timestamp into discrete windows:
+
+```python
+WINDOW_SIZE_MS = 100  # 100ms windows
+DRIFT_TOLERANCE_MS = 50  # Allow 50ms clock drift between workers
+
+def get_window_bucket(collected_at: float) -> int:
+    """Convert Unix timestamp to window bucket number."""
+    return int(collected_at * 1000 / WINDOW_SIZE_MS)
+
+def is_window_closed(bucket: int, now: float) -> bool:
+    """Check if a window can be flushed (all expected stats have arrived)."""
+    window_end_ms = (bucket + 1) * WINDOW_SIZE_MS
+    current_ms = now * 1000
+    # Window is closed when current time exceeds window_end + drift tolerance
+    return current_ms > window_end_ms + DRIFT_TOLERANCE_MS
+```
+
+### WindowedStatsCollector Class
+
+Located at `hyperscale/distributed_rewrite/jobs/windowed_stats_collector.py`:
+
+```python
+@dataclass
+class WindowBucket:
+    """Stats collected within a single time window."""
+    window_start: float  # Unix timestamp of window start
+    window_end: float    # Unix timestamp of window end
+    job_id: str
+    workflow_id: str
+    worker_stats: dict[str, WorkflowProgress]  # worker_id -> progress
+    created_at: float    # When this bucket was created (for cleanup)
+
+class WindowedStatsCollector:
+    """
+    Collects workflow progress updates into time-correlated windows.
+    
+    Thread-safe for concurrent progress updates from multiple workers.
+    """
+    
+    def __init__(
+        self,
+        window_size_ms: float = 100.0,
+        drift_tolerance_ms: float = 50.0,
+        max_window_age_ms: float = 5000.0,  # Cleanup windows older than 5s
+    ):
+        self._window_size_ms = window_size_ms
+        self._drift_tolerance_ms = drift_tolerance_ms
+        self._max_window_age_ms = max_window_age_ms
+        
+        # Buckets indexed by (job_id, workflow_id, bucket_number)
+        self._buckets: dict[tuple[str, str, int], WindowBucket] = {}
+        self._lock = asyncio.Lock()
+    
+    async def add_progress(
+        self,
+        worker_id: str,
+        progress: WorkflowProgress,
+    ) -> None:
+        """Add a progress update to the appropriate time window."""
+        bucket_num = self._get_bucket_number(progress.collected_at)
+        key = (progress.job_id, progress.workflow_id, bucket_num)
+        
+        async with self._lock:
+            if key not in self._buckets:
+                self._buckets[key] = WindowBucket(
+                    window_start=bucket_num * self._window_size_ms / 1000,
+                    window_end=(bucket_num + 1) * self._window_size_ms / 1000,
+                    job_id=progress.job_id,
+                    workflow_id=progress.workflow_id,
+                    worker_stats={},
+                    created_at=time.time(),
+                )
+            
+            self._buckets[key].worker_stats[worker_id] = progress
+    
+    async def flush_closed_windows(
+        self,
+        aggregate: bool = True,
+    ) -> list[WindowedStatsPush]:
+        """
+        Flush all closed windows and return them for pushing.
+        
+        Args:
+            aggregate: If True, aggregate stats within window.
+                      If False, return per-worker stats (for Gate forwarding).
+        
+        Returns:
+            List of WindowedStatsPush messages ready for client/gate.
+        """
+        now = time.time()
+        results = []
+        keys_to_remove = []
+        
+        async with self._lock:
+            for key, bucket in self._buckets.items():
+                _, _, bucket_num = key
+                
+                if self._is_window_closed(bucket_num, now):
+                    if aggregate:
+                        push = self._aggregate_bucket(bucket)
+                    else:
+                        push = self._unaggregated_bucket(bucket)
+                    results.append(push)
+                    keys_to_remove.append(key)
+                
+                # Also cleanup very old windows (missed or stuck)
+                elif (now - bucket.created_at) * 1000 > self._max_window_age_ms:
+                    keys_to_remove.append(key)
+            
+            for key in keys_to_remove:
+                del self._buckets[key]
+        
+        return results
+    
+    def _aggregate_bucket(self, bucket: WindowBucket) -> WindowedStatsPush:
+        """Aggregate all worker stats in a bucket into single stats."""
+        total_completed = 0
+        total_failed = 0
+        total_rate = 0.0
+        step_stats_by_name: dict[str, StepStats] = {}
+        
+        for progress in bucket.worker_stats.values():
+            total_completed += progress.completed_count
+            total_failed += progress.failed_count
+            total_rate += progress.rate_per_second
+            
+            for step in progress.step_stats:
+                if step.step_name in step_stats_by_name:
+                    existing = step_stats_by_name[step.step_name]
+                    step_stats_by_name[step.step_name] = StepStats(
+                        step_name=step.step_name,
+                        completed_count=existing.completed_count + step.completed_count,
+                        failed_count=existing.failed_count + step.failed_count,
+                        total_count=existing.total_count + step.total_count,
+                    )
+                else:
+                    step_stats_by_name[step.step_name] = step
+        
+        return WindowedStatsPush(
+            job_id=bucket.job_id,
+            workflow_id=bucket.workflow_id,
+            window_start=bucket.window_start,
+            window_end=bucket.window_end,
+            completed_count=total_completed,
+            failed_count=total_failed,
+            rate_per_second=total_rate,
+            step_stats=list(step_stats_by_name.values()),
+            worker_count=len(bucket.worker_stats),
+            is_aggregated=True,
+        )
+```
+
+### Message Types
+
+```python
+@dataclass(slots=True)
+class WindowedStatsPush(Message):
+    """
+    Time-windowed stats push to client or gate.
+    
+    When is_aggregated=True (for clients):
+        - Contains aggregated stats across all workers in window
+        - step_stats are merged by step name
+        
+    When is_aggregated=False (for gates):
+        - per_worker_stats contains individual worker progress
+        - Gate performs its own aggregation across DCs
+    """
+    job_id: str
+    workflow_id: str
+    workflow_name: str = ""
+    window_start: float = 0.0  # Unix timestamp
+    window_end: float = 0.0    # Unix timestamp
+    
+    # Aggregated stats (when is_aggregated=True)
+    completed_count: int = 0
+    failed_count: int = 0
+    rate_per_second: float = 0.0
+    step_stats: list[StepStats] = field(default_factory=list)
+    worker_count: int = 0
+    
+    # Per-worker stats (when is_aggregated=False, for gate forwarding)
+    per_worker_stats: list[WorkerWindowStats] = field(default_factory=list)
+    
+    is_aggregated: bool = True
+    datacenter: str = ""  # Set by manager when forwarding to gate
+
+
+@dataclass(slots=True)
+class WorkerWindowStats(Message):
+    """Individual worker stats within a time window."""
+    worker_id: str
+    completed_count: int = 0
+    failed_count: int = 0
+    rate_per_second: float = 0.0
+    step_stats: list[StepStats] = field(default_factory=list)
+```
+
+### Manager Integration
+
+The Manager integrates the WindowedStatsCollector into its workflow progress handling:
+
+```python
+class ManagerServer:
+    def __init__(self, ...):
+        ...
+        # Windowed stats for streaming to clients
+        self._windowed_stats = WindowedStatsCollector(
+            window_size_ms=env.STATS_WINDOW_SIZE_MS,      # Default: 100ms
+            drift_tolerance_ms=env.STATS_DRIFT_TOLERANCE_MS,  # Default: 50ms
+        )
+        
+    async def workflow_progress(self, addr, data, clock_time):
+        """Handle workflow progress update from worker."""
+        progress = WorkflowProgress.load(data)
+        
+        # Add to windowed collector for streaming
+        worker_id = self._resolve_worker_id_from_addr(addr)
+        await self._windowed_stats.add_progress(worker_id, progress)
+        
+        # ... existing progress handling ...
+    
+    async def _windowed_stats_push_loop(self):
+        """Background loop to flush and push windowed stats."""
+        interval = self._env.STATS_PUSH_INTERVAL  # Default: 100ms
+        
+        while self._running:
+            await asyncio.sleep(interval / 1000)
+            
+            # Determine if we're pushing to clients or gates
+            has_gates = bool(self._gate_addrs or self._known_gates)
+            
+            # Flush closed windows
+            pushes = await self._windowed_stats.flush_closed_windows(
+                aggregate=not has_gates  # Aggregate for clients, not for gates
+            )
+            
+            if not pushes:
+                continue
+            
+            if has_gates:
+                # Forward unaggregated to gates
+                for push in pushes:
+                    push.datacenter = self._node_id.datacenter
+                    await self._forward_stats_to_gates(push)
+            else:
+                # Push aggregated to clients
+                for push in pushes:
+                    await self._push_stats_to_client(push)
+```
+
+### Gate Integration
+
+Gates receive unaggregated windowed stats from managers and perform cross-DC aggregation:
+
+```python
+class GateServer:
+    def __init__(self, ...):
+        ...
+        # Collect stats from all DCs for cross-DC aggregation
+        self._dc_windowed_stats: dict[str, WindowedStatsCollector] = {}
+        
+    @tcp.receive()
+    async def windowed_stats_push(self, addr, data, clock_time):
+        """Receive windowed stats from a manager."""
+        push = WindowedStatsPush.load(data)
+        
+        # Store in per-DC collector
+        dc_id = push.datacenter
+        if dc_id not in self._dc_windowed_stats:
+            self._dc_windowed_stats[dc_id] = WindowedStatsCollector()
+        
+        # Re-add each worker's stats to preserve window alignment
+        for worker_stats in push.per_worker_stats:
+            # Create a synthetic progress for the collector
+            progress = WorkflowProgress(
+                job_id=push.job_id,
+                workflow_id=push.workflow_id,
+                collected_at=push.window_start,  # Use window start for alignment
+                completed_count=worker_stats.completed_count,
+                ...
+            )
+            await self._dc_windowed_stats[dc_id].add_progress(
+                f"{dc_id}:{worker_stats.worker_id}",
+                progress,
+            )
+        
+        return b'ok'
+    
+    async def _gate_windowed_stats_push_loop(self):
+        """Aggregate across DCs and push to clients."""
+        interval = self._env.STATS_PUSH_INTERVAL
+        
+        while self._running:
+            await asyncio.sleep(interval / 1000)
+            
+            # Collect and aggregate from all DCs
+            all_pushes: dict[tuple[str, str, float], list[WindowedStatsPush]] = {}
+            
+            for dc_id, collector in self._dc_windowed_stats.items():
+                pushes = await collector.flush_closed_windows(aggregate=True)
+                for push in pushes:
+                    key = (push.job_id, push.workflow_id, push.window_start)
+                    if key not in all_pushes:
+                        all_pushes[key] = []
+                    all_pushes[key].append(push)
+            
+            # Aggregate same-window stats across DCs
+            for key, dc_pushes in all_pushes.items():
+                aggregated = self._aggregate_dc_pushes(dc_pushes)
+                await self._push_stats_to_client(aggregated)
+```
+
+### Client Integration
+
+The client receives windowed stats via a new `on_progress_update` callback:
+
+```python
+class HyperscaleClient:
+    async def submit_job(
+        self,
+        workflows: list[type],
+        ...
+        on_status_update: Callable[[JobStatusPush], None] | None = None,
+        on_progress_update: Callable[[WindowedStatsPush], None] | None = None,  # NEW
+        on_workflow_result: Callable[[WorkflowResultPush], None] | None = None,
+        ...
+    ) -> str:
+        """
+        Submit a job for execution.
+        
+        Args:
+            ...
+            on_status_update: Callback for job status changes (started, completed, failed)
+            on_progress_update: Callback for streaming progress stats (time-windowed)
+            on_workflow_result: Callback for workflow completion results
+        """
+        ...
+        if on_progress_update:
+            self._progress_callbacks[job_id] = on_progress_update
+    
+    @tcp.receive()
+    async def windowed_stats_push(self, addr, data, clock_time):
+        """Handle windowed stats push from manager/gate."""
+        push = WindowedStatsPush.load(data)
+        
+        callback = self._progress_callbacks.get(push.job_id)
+        if callback:
+            try:
+                callback(push)
+            except Exception:
+                pass
+        
+        return b'ok'
+```
+
+### Client Rate Limiting (Stats Updates Only)
+
+The client applies rate limiting specifically to `windowed_stats_push` to prevent overwhelming the callback:
+
+```python
+class HyperscaleClient:
+    def __init__(self, ...):
+        ...
+        # Rate limit for progress updates (stats streaming)
+        self._progress_rate_limit = RateLimiter(
+            max_per_second=env.CLIENT_PROGRESS_RATE_LIMIT,  # Default: 20/sec
+            burst=env.CLIENT_PROGRESS_BURST,  # Default: 5
+        )
+    
+    @tcp.receive()
+    async def windowed_stats_push(self, addr, data, clock_time):
+        """Handle windowed stats push with rate limiting."""
+        # Apply rate limiting - drop if over limit
+        if not self._progress_rate_limit.try_acquire():
+            return b'rate_limited'
+        
+        push = WindowedStatsPush.load(data)
+        
+        callback = self._progress_callbacks.get(push.job_id)
+        if callback:
+            try:
+                callback(push)
+            except Exception:
+                pass
+        
+        return b'ok'
+```
+
+### Configuration
+
+New environment variables in `Env`:
+
+```python
+# Stats windowing
+STATS_WINDOW_SIZE_MS: float = 100.0        # Window bucket size
+STATS_DRIFT_TOLERANCE_MS: float = 50.0     # Clock drift tolerance
+STATS_PUSH_INTERVAL: float = 100.0         # How often to flush windows (ms)
+
+# Client rate limiting (progress updates only)
+CLIENT_PROGRESS_RATE_LIMIT: float = 20.0   # Max progress callbacks per second
+CLIENT_PROGRESS_BURST: int = 5             # Burst allowance
+```
+
+### Memory Management
+
+Windows are automatically cleaned up:
+
+1. **On flush**: Closed windows are removed after being pushed
+2. **Age-based cleanup**: Windows older than `max_window_age_ms` (default 5s) are dropped
+3. **Job completion**: All windows for a job are cleared when job completes
+
+```python
+async def cleanup_job_windows(self, job_id: str) -> None:
+    """Remove all windows for a completed job."""
+    async with self._lock:
+        keys_to_remove = [
+            key for key in self._buckets.keys()
+            if key[0] == job_id
+        ]
+        for key in keys_to_remove:
+            del self._buckets[key]
+```
+
+### Sequence Diagram
+
+```
+Worker1     Worker2     Manager           Gate           Client
+   │           │           │                │               │
+   │──progress─▶│          │                │               │
+   │  t=0.12s  │──progress─▶                │               │
+   │           │  t=0.15s  │                │               │
+   │           │           │                │               │
+   │           │      [bucket 0: W1, W2]    │               │
+   │           │           │                │               │
+   │           │      (100ms flush timer)   │               │
+   │           │           │                │               │
+   │           │      [window closed]       │               │
+   │           │           │                │               │
+   │           │           │──(unaggregated)─▶              │
+   │           │           │  WindowedStats  │              │
+   │           │           │                │              │
+   │           │           │                │──(aggregated)─▶
+   │           │           │                │ WindowedStats │
+   │           │           │                │               │
+   │           │           │                │     [callback]│
+```
+
+---
+
+## Bootstrap & Service Discovery
+
+### Design Goals
+
+The bootstrap system must satisfy these requirements:
+
+1. **Environment Agnostic**: Works identically on bare metal, VMs, containers, and Kubernetes
+2. **No External Dependencies**: No etcd, Consul, Zookeeper, or other coordination services
+3. **Fast Convergence**: New nodes join the cluster in sub-second time under normal conditions
+4. **Churn Resilient**: Handles frequent node restarts, rolling deployments, and autoscaling
+5. **Robust Under Failure**: Continues operating when some seeds are unavailable
+6. **Simple Configuration**: Minimal config required - just seed addresses or DNS name
+
+### Architecture Decision
+
+**Decision**: Hybrid DNS + Static Seeds with Parallel Probing
+
+After evaluating multiple approaches, we chose a hybrid strategy that:
+- Accepts static seed addresses (bare metal friendly)
+- Optionally accepts DNS names for dynamic discovery (Kubernetes friendly)
+- Probes all candidates in parallel with short timeouts
+- Succeeds on first response (any live peer is sufficient)
+- Hands off to SWIM gossip once joined
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         BOOTSTRAP ARCHITECTURE                               │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌──────────────┐     ┌──────────────┐     ┌──────────────┐                │
+│  │   Static     │     │     DNS      │     │   Health     │                │
+│  │   Seeds      │     │   Resolver   │     │    Cache     │                │
+│  │              │     │              │     │              │                │
+│  │ 10.0.1.5:9000│     │ managers.svc │     │ Recently     │                │
+│  │ 10.0.1.6:9000│     │ → [IP1, IP2] │     │ alive peers  │                │
+│  └──────┬───────┘     └──────┬───────┘     └──────┬───────┘                │
+│         │                    │                    │                         │
+│         └────────────────────┼────────────────────┘                         │
+│                              │                                              │
+│                              ▼                                              │
+│                    ┌─────────────────┐                                      │
+│                    │   Candidate     │                                      │
+│                    │   Aggregator    │                                      │
+│                    │                 │                                      │
+│                    │ Dedup + Merge   │                                      │
+│                    └────────┬────────┘                                      │
+│                             │                                               │
+│                             ▼                                               │
+│         ┌───────────────────────────────────────────┐                       │
+│         │           PARALLEL PROBER                  │                       │
+│         │                                            │                       │
+│         │  ┌─────┐  ┌─────┐  ┌─────┐  ┌─────┐      │                       │
+│         │  │Probe│  │Probe│  │Probe│  │Probe│      │                       │
+│         │  │ #1  │  │ #2  │  │ #3  │  │ #4  │ ...  │                       │
+│         │  └──┬──┘  └──┬──┘  └──┬──┘  └──┬──┘      │                       │
+│         │     │        │        │        │          │                       │
+│         │     └────────┴────┬───┴────────┘          │                       │
+│         │                   │                       │                       │
+│         │            First Success                  │                       │
+│         │            (cancel rest)                  │                       │
+│         └───────────────────┬───────────────────────┘                       │
+│                             │                                               │
+│                             ▼                                               │
+│                    ┌─────────────────┐                                      │
+│                    │  SWIM Cluster   │                                      │
+│                    │     Join        │                                      │
+│                    │                 │                                      │
+│                    │ Gossip takes    │                                      │
+│                    │ over from here  │                                      │
+│                    └─────────────────┘                                      │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Discovery Approaches Evaluated
+
+| Approach | Pros | Cons | Verdict |
+|----------|------|------|---------|
+| **Static Seeds** | Simple, predictable, works everywhere | Requires config updates when seeds change | ✅ Use as primary |
+| **DNS-Based** | Dynamic, K8s-native via headless services | TTL caching, stale records | ✅ Use as supplement |
+| **Multicast/Broadcast** | Zero config, auto-discovery | Blocked by cloud providers, no cross-subnet | ❌ Rejected |
+| **External Service (etcd/Consul)** | Feature-rich, proven | External dependency, operational burden | ❌ Rejected |
+| **Shared Storage** | Works with NFS/S3 | Latency, complexity, another dependency | ❌ Rejected |
+| **Port Scanning** | No config needed | Slow, looks malicious, security alerts | ❌ Rejected |
+
+### Chosen Solution: DNS + Seeds with Parallel Probing
+
+The key insight: **bootstrap is a one-time operation per node startup**. Once joined, SWIM handles all membership changes. We only need to find *one* live peer to join through.
+
+#### Why This Works Under Churn
+
+```
+Timeline showing node C crashing and replacement C' joining:
+─────────────────────────────────────────────────────────────────────────────
+t=0     Cluster healthy: [A, B, C, D, E] all running
+t=1     Pod C crashes, orchestrator starts replacement C'
+t=2     DNS still returns C's old IP (TTL not expired)
+t=3     New node F tries to join, resolves [A, B, C_old, D, E]
+t=4     F probes ALL in parallel with 500ms timeout
+t=5     A responds first (50ms) → F joins via A, cancels other probes
+t=6     C_old probe times out (ignored, F already joined)
+t=7     DNS updates, now returns [A, B, C', D, E]
+t=8     C' bootstrap probes, joins via any live peer
+t=9     SWIM gossip propagates C' membership to all nodes
+─────────────────────────────────────────────────────────────────────────────
+
+Key points:
+- Parallel probing means one dead node doesn't block join
+- 500ms timeout prevents long waits for unreachable hosts
+- First responder wins - we don't wait for all probes
+- SWIM handles ongoing membership after initial join
+```
+
+### Bootstrap Protocol
+
+#### State Machine
+
+```
+                              ┌─────────────┐
+                              │   INITIAL   │
+                              └──────┬──────┘
+                                     │
+                              resolve candidates
+                                     │
+                                     ▼
+                              ┌─────────────┐
+                     ┌───────▶│  RESOLVING  │◀───────┐
+                     │        └──────┬──────┘        │
+                     │               │               │
+                     │        candidates ready       │
+                     │               │               │
+                     │               ▼               │
+                     │        ┌─────────────┐        │
+                     │        │   PROBING   │        │
+                     │        └──────┬──────┘        │
+                     │               │               │
+                     │     ┌─────────┴─────────┐     │
+                     │     │                   │     │
+                     │  success             all fail │
+                     │     │                   │     │
+                     │     ▼                   ▼     │
+                     │ ┌────────┐      ┌───────────┐ │
+                     │ │ JOINED │      │  BACKOFF  │─┘
+                     │ └────────┘      └───────────┘
+                     │                       │
+                     │                  max retries
+                     │                       │
+                     │                       ▼
+                     │               ┌──────────────┐
+                     └───────────────│    FAILED    │
+                                     └──────────────┘
+```
+
+#### Sequence Diagram: Successful Join
+
+```
+    New Node              Seed A             Seed B (dead)         Seed C
+        │                    │                    │                    │
+        │──── resolve() ────▶│                    │                    │
+        │◀─── [A, B, C] ─────│                    │                    │
+        │                    │                    │                    │
+        ├─────── PING ──────▶│                    │                    │
+        ├─────── PING ───────┼───────────────────▶│                    │
+        ├─────── PING ───────┼────────────────────┼───────────────────▶│
+        │                    │                    │                    │
+        │◀────── PONG ───────│                    │     (timeout)      │
+        │                    │              (500ms)│                    │
+        │    [cancel B, C probes]                 │                    │
+        │                    │                    │                    │
+        │───── JOIN_REQ ────▶│                    │                    │
+        │◀──── JOIN_ACK ─────│                    │                    │
+        │                    │                    │                    │
+        │   [SWIM gossip begins]                  │                    │
+        │◀───── GOSSIP ──────│                    │                    │
+        │                    │                    │                    │
+     JOINED               ACTIVE              DEAD                  ACTIVE
+```
+
+#### Sequence Diagram: All Seeds Down, Retry with Backoff
+
+```
+    New Node              Seed A (down)      Seed B (down)      Seed C (down)
+        │                      │                  │                  │
+        │──── resolve() ──────▶│                  │                  │
+        │◀─── [A, B, C] ───────│                  │                  │
+        │                      │                  │                  │
+        ├─────── PING ────────▶│                  │                  │
+        ├─────── PING ─────────┼─────────────────▶│                  │
+        ├─────── PING ─────────┼──────────────────┼─────────────────▶│
+        │                      │                  │                  │
+        │                (500ms timeout)    (500ms timeout)   (500ms timeout)
+        │                      │                  │                  │
+        │   [all probes failed]│                  │                  │
+        │                      │                  │                  │
+        │   [backoff: 500ms]   │                  │                  │
+        │        ...           │                  │                  │
+        │                      │                  │                  │
+        │──── resolve() ──────▶│                  │                  │
+        │◀─── [A, B, C] ───────│ (A comes back up)│                  │
+        │                      │                  │                  │
+        ├─────── PING ────────▶│                  │                  │
+        │◀────── PONG ─────────│                  │                  │
+        │                      │                  │                  │
+        │───── JOIN_REQ ──────▶│                  │                  │
+        │◀──── JOIN_ACK ───────│                  │                  │
+        │                      │                  │                  │
+     JOINED                 ACTIVE             DOWN                DOWN
+```
+
+### DNS Resolution
+
+#### Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           DNS RESOLVER                                       │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌─────────────────┐                                                        │
+│  │  DNSConfig      │                                                        │
+│  │                 │                                                        │
+│  │  - name: str    │     ┌─────────────────────────────────────────┐       │
+│  │  - port: int    │────▶│            AsyncDNSResolver              │       │
+│  │  - timeout: 2.0 │     │                                          │       │
+│  │  - cache_ttl: 5 │     │  ┌──────────────────────────────────┐   │       │
+│  └─────────────────┘     │  │       Resolution Cache           │   │       │
+│                          │  │                                   │   │       │
+│                          │  │  name → (addresses, expiry_time) │   │       │
+│                          │  └──────────────────────────────────┘   │       │
+│                          │                                          │       │
+│                          │  resolve(name) → list[PeerAddress]      │       │
+│                          │                                          │       │
+│                          │  Uses asyncio.get_event_loop()          │       │
+│                          │       .getaddrinfo() for non-blocking   │       │
+│                          └─────────────────────────────────────────┘       │
+│                                                                              │
+│  Resolution Flow:                                                           │
+│  ┌────────┐    ┌─────────┐    ┌─────────┐    ┌──────────────┐             │
+│  │ Check  │───▶│ Cache   │───▶│ Return  │    │              │             │
+│  │ Cache  │    │ Valid?  │yes │ Cached  │    │   Resolve    │             │
+│  └────────┘    └────┬────┘    └─────────┘    │   via DNS    │             │
+│                     │ no                      │              │             │
+│                     └────────────────────────▶│ getaddrinfo  │             │
+│                                               └──────┬───────┘             │
+│                                                      │                      │
+│                                               ┌──────▼───────┐             │
+│                                               │ Update Cache │             │
+│                                               │ + Return     │             │
+│                                               └──────────────┘             │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### DNS TTL Considerations
+
+```
+Problem: DNS caching returns stale IPs for crashed pods
+
+┌──────────────────────────────────────────────────────────────────────────┐
+│                                                                           │
+│  Time    DNS Response         Actual Cluster       Issue                 │
+│  ────    ────────────         ──────────────       ─────                 │
+│  t=0     [A, B, C]            [A, B, C]            None                  │
+│  t=1     [A, B, C]            [A, B, C']           C crashed, C' started │
+│  t=2     [A, B, C] (cached)   [A, B, C']           Stale C in DNS        │
+│  t=3     [A, B, C'] (updated) [A, B, C']           Resolved              │
+│                                                                           │
+└──────────────────────────────────────────────────────────────────────────┘
+
+Solution: Parallel probing with short timeouts
+
+- Probe ALL resolved addresses simultaneously
+- Use 500ms timeout (not TCP default 30s)
+- Dead IPs timeout while live ones respond
+- First responder wins, cancel the rest
+- Stale DNS entries cause 500ms delay, not blocking failure
+```
+
+### Peer Probing
+
+#### Parallel Probe Strategy
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        PARALLEL PROBE EXECUTION                              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Input: candidates = [(10.0.1.5, 9000), (10.0.1.6, 9000), (10.0.1.7, 9000)] │
+│  Timeout: 500ms per probe                                                   │
+│  Max concurrent: 10 (configurable)                                          │
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │                                                                      │   │
+│  │  t=0ms    ┌──────┐   ┌──────┐   ┌──────┐                           │   │
+│  │           │Probe │   │Probe │   │Probe │   All start simultaneously│   │
+│  │           │ :5   │   │ :6   │   │ :7   │                           │   │
+│  │           └──┬───┘   └──┬───┘   └──┬───┘                           │   │
+│  │              │          │          │                                │   │
+│  │  t=50ms      │          │          │                                │   │
+│  │              ▼          │          │                                │   │
+│  │           ┌──────┐      │          │   :5 responds first!          │   │
+│  │           │ PONG │      │          │                                │   │
+│  │           └──────┘      │          │                                │   │
+│  │              │          │          │                                │   │
+│  │              │     ┌────┴────┐ ┌───┴───┐                           │   │
+│  │              │     │ CANCEL  │ │CANCEL │   Cancel remaining probes │   │
+│  │              │     └─────────┘ └───────┘                           │   │
+│  │              │                                                      │   │
+│  │              ▼                                                      │   │
+│  │        Return (10.0.1.5, 9000)                                     │   │
+│  │                                                                      │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+│  Worst case (all dead):                                                     │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │                                                                      │   │
+│  │  t=0ms    ┌──────┐   ┌──────┐   ┌──────┐                           │   │
+│  │           │Probe │   │Probe │   │Probe │                           │   │
+│  │           │ :5   │   │ :6   │   │ :7   │                           │   │
+│  │           └──┬───┘   └──┬───┘   └──┬───┘                           │   │
+│  │              │          │          │                                │   │
+│  │  t=500ms     ▼          ▼          ▼    All timeout together       │   │
+│  │          TIMEOUT    TIMEOUT    TIMEOUT                              │   │
+│  │                                                                      │   │
+│  │        Return None (trigger backoff + retry)                        │   │
+│  │                                                                      │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Probe Protocol
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           PROBE WIRE PROTOCOL                                │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Request (PING):                                                            │
+│  ┌────────────────────────────────────────────────────────────────────┐    │
+│  │  0                   1                   2                   3     │    │
+│  │  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1  │    │
+│  │ +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+  │    │
+│  │ |     'P'       |     'I'       |     'N'       |     'G'       |  │    │
+│  │ +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+  │    │
+│  └────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+│  Response (PONG):                                                           │
+│  ┌────────────────────────────────────────────────────────────────────┐    │
+│  │  0                   1                   2                   3     │    │
+│  │  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1  │    │
+│  │ +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+  │    │
+│  │ |     'P'       |     'O'       |     'N'       |     'G'       |  │    │
+│  │ +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+  │    │
+│  └────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+│  Simple 4-byte exchange:                                                    │
+│  - Fast to send/receive                                                     │
+│  - Easy to validate                                                         │
+│  - No serialization overhead                                                │
+│  - Works with any TCP implementation                                        │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Health-Aware Peer Cache
+
+To accelerate subsequent bootstrap attempts (e.g., after network blip), we cache recently-responsive peers:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         HEALTH-AWARE PEER CACHE                              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │                        PeerHealthCache                               │   │
+│  │                                                                      │   │
+│  │  ┌────────────────────────────────────────────────────────────┐    │   │
+│  │  │  (host, port)  │  last_seen   │  success_count  │  state   │    │   │
+│  │  ├────────────────┼──────────────┼─────────────────┼──────────┤    │   │
+│  │  │  10.0.1.5:9000 │  1704067200  │       47        │  HEALTHY │    │   │
+│  │  │  10.0.1.6:9000 │  1704067180  │       12        │  HEALTHY │    │   │
+│  │  │  10.0.1.7:9000 │  1704066000  │        0        │  EXPIRED │    │   │
+│  │  └────────────────┴──────────────┴─────────────────┴──────────┘    │   │
+│  │                                                                      │   │
+│  │  Methods:                                                            │   │
+│  │  - record_success(addr): Update last_seen, increment count          │   │
+│  │  - record_failure(addr): Decrement count, mark stale if zero        │   │
+│  │  - get_healthy_peers(): Return peers seen within TTL                │   │
+│  │  - evict_expired(): Remove entries older than cache_ttl             │   │
+│  │                                                                      │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+│  Usage in Candidate Aggregation:                                            │
+│                                                                              │
+│     1. Get candidates from DNS/seeds                                        │
+│     2. Get healthy peers from cache                                         │
+│     3. Prioritize: cached healthy → DNS/seeds → all others                 │
+│     4. Probe in priority order (still parallel, but start with likely-live) │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Failure Scenarios
+
+#### Scenario Matrix
+
+| Scenario | Behavior | Recovery Time |
+|----------|----------|---------------|
+| 1 of N seeds down | Parallel probe, others respond | < 100ms |
+| All seeds down temporarily | Backoff + retry until one recovers | backoff intervals |
+| DNS returns stale IPs | Stale IPs timeout, live ones respond | + 500ms worst case |
+| Network partition (split brain) | Nodes join different partitions | Requires SWIM partition healing |
+| Total cluster failure | Retry indefinitely with backoff | Until first node recovers |
+| DNS completely unavailable | Fall back to static seeds | Immediate if seeds configured |
+
+#### Backoff Strategy
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        EXPONENTIAL BACKOFF                                   │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Attempt    Base Delay    Jitter (0-25%)    Actual Delay    Cumulative     │
+│  ───────    ──────────    ──────────────    ────────────    ──────────     │
+│     1         500ms          0-125ms        500-625ms        ~560ms        │
+│     2        1000ms          0-250ms       1000-1250ms       ~1.7s         │
+│     3        2000ms          0-500ms       2000-2500ms       ~3.9s         │
+│     4        4000ms         0-1000ms       4000-5000ms       ~8.4s         │
+│     5        8000ms         0-2000ms       8000-10000ms     ~17.4s         │
+│     6       15000ms         0-3750ms      15000-18750ms     ~34.3s         │
+│    ...        ...             ...             ...             ...           │
+│    N       15000ms (cap)   0-3750ms      15000-18750ms       ...           │
+│                                                                              │
+│  Configuration:                                                             │
+│  - initial_backoff: 500ms                                                   │
+│  - max_backoff: 15000ms (15 seconds)                                        │
+│  - backoff_multiplier: 2.0                                                  │
+│  - jitter_factor: 0.25 (25% randomization)                                  │
+│                                                                              │
+│  Why jitter?                                                                │
+│  - Prevents thundering herd when multiple nodes retry simultaneously        │
+│  - Spreads load on recovering seeds                                         │
+│  - Reduces contention during cluster-wide restarts                          │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Configuration
+
+#### BootstrapConfig
+
+```python
+@dataclass(slots=True)
+class BootstrapConfig:
+    """Configuration for cluster bootstrap."""
+    
+    # Static seed addresses (tried first)
+    seeds: list[str] = field(default_factory=list)
+    
+    # DNS name for dynamic discovery (optional, supplements seeds)
+    dns_name: str | None = None
+    
+    # Default port when not specified in address
+    default_port: int = 9000
+    
+    # Probe timeout per candidate (short to enable fast failure detection)
+    probe_timeout: float = 0.5  # 500ms
+    
+    # Maximum concurrent probes (prevent socket exhaustion)
+    max_concurrent_probes: int = 10
+    
+    # Backoff configuration
+    initial_backoff: float = 0.5      # 500ms
+    max_backoff: float = 15.0         # 15 seconds
+    backoff_multiplier: float = 2.0
+    jitter_factor: float = 0.25       # 25% randomization
+    
+    # DNS resolution timeout
+    dns_timeout: float = 2.0
+    
+    # Health cache TTL (how long to remember responsive peers)
+    health_cache_ttl: float = 60.0    # 1 minute
+```
+
+#### Environment-Specific Examples
+
+```yaml
+# Bare Metal / Static IPs
+bootstrap:
+  seeds:
+    - "10.0.1.5:9000"
+    - "10.0.1.6:9000"
+    - "10.0.1.7:9000"
+
+# Kubernetes (Headless Service)
+bootstrap:
+  dns_name: "managers.hyperscale.svc.cluster.local"
+  default_port: 9000
+
+# Hybrid (DNS primary, static fallback)
+bootstrap:
+  dns_name: "managers.prod.internal"
+  seeds:
+    - "10.0.1.5:9000"  # Fallback if DNS fails
+  default_port: 9000
+```
+
+### Bootstrap Module Structure
+
+```
+hyperscale/distributed_rewrite/bootstrap/
+├── __init__.py                 # Public exports
+├── bootstrap.py                # Main Bootstrapper class
+├── dns/
+│   ├── __init__.py
+│   ├── resolver.py             # AsyncDNSResolver
+│   └── models/
+│       ├── __init__.py
+│       ├── dns_config.py       # DNSConfig dataclass
+│       └── dns_result.py       # DNSResult dataclass
+├── probing/
+│   ├── __init__.py
+│   ├── parallel_prober.py      # ParallelProber class
+│   └── models/
+│       ├── __init__.py
+│       ├── probe_config.py     # ProbeConfig dataclass
+│       └── probe_result.py     # ProbeResult dataclass
+├── cache/
+│   ├── __init__.py
+│   ├── peer_health_cache.py    # PeerHealthCache class
+│   └── models/
+│       ├── __init__.py
+│       └── peer_entry.py       # PeerCacheEntry dataclass
+└── models/
+    ├── __init__.py
+    ├── bootstrap_config.py     # BootstrapConfig dataclass
+    ├── bootstrap_result.py     # BootstrapResult dataclass
+    ├── bootstrap_state.py      # BootstrapState enum
+    └── peer_address.py         # PeerAddress dataclass
+```
+
+### Example Implementations
+
+#### Integration with ManagerServer
+
+```python
+class ManagerServer(HealthAwareServer):
+    def __init__(
+        self,
+        host: str,
+        tcp_port: int,
+        udp_port: int,
+        env: Env,
+        dc_id: str = "default",
+        # New: Bootstrap configuration (replaces seed_managers)
+        bootstrap_config: BootstrapConfig | None = None,
+        # Legacy: Still supported for backwards compatibility
+        seed_managers: list[tuple[str, int]] | None = None,
+        ...
+    ):
+        ...
+        
+        # Initialize bootstrapper
+        if bootstrap_config:
+            self._bootstrapper = Bootstrapper(bootstrap_config)
+        elif seed_managers:
+            # Legacy: Convert seed_managers to BootstrapConfig
+            self._bootstrapper = Bootstrapper(
+                BootstrapConfig(
+                    seeds=[f"{host}:{port}" for host, port in seed_managers]
+                )
+            )
+        else:
+            self._bootstrapper = None
+    
+    async def start(self) -> None:
+        await self.start_server(init_context=self.env.get_swim_init_context())
+        
+        # Bootstrap: discover peers before joining cluster
+        if self._bootstrapper:
+            bootstrap_result = await self._bootstrapper.bootstrap()
+            
+            if bootstrap_result.success:
+                # Join cluster via discovered peer
+                await self.join_cluster(bootstrap_result.peer.to_udp_addr())
+                
+                # Register with the peer to get full cluster topology
+                await self._register_with_peer(bootstrap_result.peer.to_tcp_addr())
+        
+        # Continue with normal startup...
+        await self._task_runner.run(self.start_probe_cycle)
+        ...
+```
+
+#### Integration with WorkerServer
+
+```python
+class WorkerServer(HealthAwareServer):
+    def __init__(
+        self,
+        host: str,
+        tcp_port: int,
+        udp_port: int,
+        env: Env,
+        dc_id: str = "default",
+        # New: Bootstrap configuration
+        bootstrap_config: BootstrapConfig | None = None,
+        # Legacy: Still supported
+        seed_managers: list[tuple[str, int]] | None = None,
+    ):
+        ...
+        
+        # Workers bootstrap to find managers
+        if bootstrap_config:
+            self._bootstrapper = Bootstrapper(bootstrap_config)
+        elif seed_managers:
+            self._bootstrapper = Bootstrapper(
+                BootstrapConfig(
+                    seeds=[f"{host}:{port}" for host, port in seed_managers]
+                )
+            )
+        else:
+            self._bootstrapper = None
+    
+    async def start(self, timeout: float | None = None) -> None:
+        await self.start_server(init_context=self.env.get_swim_init_context())
+        
+        # Bootstrap: find at least one manager
+        if self._bootstrapper:
+            result = await self._bootstrapper.bootstrap()
+            
+            if result.success:
+                # Register with discovered manager
+                success = await self._register_with_manager(result.peer.to_tcp_addr())
+                
+                if success:
+                    # Manager returns full topology in registration response
+                    # _known_managers populated by _register_with_manager
+                    pass
+            else:
+                raise RuntimeError(f"Failed to bootstrap: {result.error}")
+        
+        # Join SWIM cluster with all known managers
+        for manager in self._known_managers.values():
+            await self.join_cluster((manager.udp_host, manager.udp_port))
+        
+        # Continue with normal startup...
+```
+
+#### Integration with GateServer
+
+```python
+class GateServer(HealthAwareServer):
+    def __init__(
+        self,
+        host: str,
+        tcp_port: int,
+        udp_port: int,
+        env: Env,
+        dc_id: str = "global",
+        # New: Per-role bootstrap configs
+        gate_bootstrap: BootstrapConfig | None = None,
+        manager_bootstrap: dict[str, BootstrapConfig] | None = None,  # dc_id -> config
+        # Legacy
+        gate_peers: list[tuple[str, int]] | None = None,
+        datacenter_managers: dict[str, list[tuple[str, int]]] | None = None,
+        ...
+    ):
+        ...
+        
+        # Gate peer discovery
+        if gate_bootstrap:
+            self._gate_bootstrapper = Bootstrapper(gate_bootstrap)
+        elif gate_peers:
+            self._gate_bootstrapper = Bootstrapper(
+                BootstrapConfig(
+                    seeds=[f"{h}:{p}" for h, p in gate_peers]
+                )
+            )
+        else:
+            self._gate_bootstrapper = None
+        
+        # Per-datacenter manager discovery
+        self._dc_bootstrappers: dict[str, Bootstrapper] = {}
+        if manager_bootstrap:
+            for dc_id, config in manager_bootstrap.items():
+                self._dc_bootstrappers[dc_id] = Bootstrapper(config)
+        elif datacenter_managers:
+            for dc_id, addrs in datacenter_managers.items():
+                self._dc_bootstrappers[dc_id] = Bootstrapper(
+                    BootstrapConfig(
+                        seeds=[f"{h}:{p}" for h, p in addrs]
+                    )
+                )
+    
+    async def start(self) -> None:
+        await self.start_server(init_context=self.env.get_swim_init_context())
+        
+        # Bootstrap gate cluster
+        if self._gate_bootstrapper:
+            result = await self._gate_bootstrapper.bootstrap()
+            if result.success:
+                await self.join_cluster(result.peer.to_udp_addr())
+        
+        # Bootstrap per-datacenter manager connections
+        for dc_id, bootstrapper in self._dc_bootstrappers.items():
+            result = await bootstrapper.bootstrap()
+            if result.success:
+                # Store discovered manager for this DC
+                self._dc_primary_managers[dc_id] = result.peer.to_tcp_addr()
+        
+        # Continue with normal startup...
+```
+
+#### Bootstrapper Core Implementation
+
+```python
+class Bootstrapper:
+    """
+    Discovers and connects to cluster peers.
+    
+    Combines DNS resolution, static seeds, and health caching
+    to find live peers quickly. Uses parallel probing with short
+    timeouts for fast convergence even when some candidates are dead.
+    """
+    
+    def __init__(self, config: BootstrapConfig):
+        self._config = config
+        self._dns_resolver = AsyncDNSResolver(
+            timeout=config.dns_timeout,
+            cache_ttl=config.health_cache_ttl,
+        )
+        self._prober = ParallelProber(
+            timeout=config.probe_timeout,
+            max_concurrent=config.max_concurrent_probes,
+        )
+        self._health_cache = PeerHealthCache(ttl=config.health_cache_ttl)
+        self._state = BootstrapState.INITIAL
+    
+    async def bootstrap(self) -> BootstrapResult:
+        """
+        Discover and connect to a live peer.
+        
+        Returns BootstrapResult with the first responsive peer,
+        or an error if all candidates fail after retries.
+        """
+        backoff = self._config.initial_backoff
+        
+        while True:
+            self._state = BootstrapState.RESOLVING
+            candidates = await self._resolve_candidates()
+            
+            if not candidates:
+                self._state = BootstrapState.BACKOFF
+                await self._sleep_with_jitter(backoff)
+                backoff = min(backoff * self._config.backoff_multiplier, 
+                             self._config.max_backoff)
+                continue
+            
+            self._state = BootstrapState.PROBING
+            result = await self._prober.probe_first_success(candidates)
+            
+            if result.success:
+                self._state = BootstrapState.JOINED
+                self._health_cache.record_success(result.peer)
+                return BootstrapResult(success=True, peer=result.peer)
+            
+            # All probes failed - backoff and retry
+            self._state = BootstrapState.BACKOFF
+            await self._sleep_with_jitter(backoff)
+            backoff = min(backoff * self._config.backoff_multiplier,
+                         self._config.max_backoff)
+    
+    async def _resolve_candidates(self) -> list[PeerAddress]:
+        """Aggregate candidates from all sources."""
+        candidates: list[PeerAddress] = []
+        seen: set[tuple[str, int]] = set()
+        
+        # Priority 1: Recently healthy peers from cache
+        for peer in self._health_cache.get_healthy_peers():
+            key = (peer.host, peer.port)
+            if key not in seen:
+                candidates.append(peer)
+                seen.add(key)
+        
+        # Priority 2: Static seeds
+        for seed in self._config.seeds:
+            peer = PeerAddress.parse(seed, self._config.default_port)
+            key = (peer.host, peer.port)
+            if key not in seen:
+                candidates.append(peer)
+                seen.add(key)
+        
+        # Priority 3: DNS resolution
+        if self._config.dns_name:
+            dns_peers = await self._dns_resolver.resolve(
+                self._config.dns_name,
+                self._config.default_port,
+            )
+            for peer in dns_peers:
+                key = (peer.host, peer.port)
+                if key not in seen:
+                    candidates.append(peer)
+                    seen.add(key)
+        
+        return candidates
+    
+    async def _sleep_with_jitter(self, base_delay: float) -> None:
+        """Sleep with randomized jitter to prevent thundering herd."""
+        jitter = base_delay * self._config.jitter_factor * random.random()
+        await asyncio.sleep(base_delay + jitter)
+```
+
+---
+
+### AD-33: Federated Health Monitoring for Cross-DC Coordination
+
+**Problem**: Gates need to monitor health of remote datacenter manager clusters to make routing decisions. The existing SWIM protocol is designed for intra-cluster membership with low-latency assumptions (1-10ms RTT), but cross-DC links have high latency (50-300ms RTT) and don't need full membership semantics.
+
+**Solution**: FederatedHealthMonitor - a separate health monitoring layer that uses SWIM-style probe/ack but without gossip or membership.
+
+---
+
+## Part 1: Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         GATE CLUSTER                            │
+│  ┌─────────┐    ┌─────────┐    ┌─────────┐                     │
+│  │  Gate   │←──→│  Gate   │←──→│  Gate   │  ← SWIM membership  │
+│  │(leader) │    │         │    │         │    between gates    │
+│  └────┬────┘    └─────────┘    └─────────┘                     │
+│       │                                                         │
+│       │ FederatedHealthMonitor                                  │
+│       │ (xprobe/xack)                                           │
+│       ▼                                                         │
+├─────────────────────────────────────────────────────────────────┤
+│       │              │              │                           │
+│  ┌────┴────┐    ┌────┴────┐    ┌────┴────┐                     │
+│  │ DC-East │    │ DC-West │    │DC-Europe│   ← Remote DCs      │
+│  │ Leader  │    │ Leader  │    │ Leader  │                     │
+│  └─────────┘    └─────────┘    └─────────┘                     │
+│       ↑              ↑              ↑                           │
+│       │              │              │                           │
+│     SWIM           SWIM           SWIM       ← Each DC has its  │
+│   (managers)     (managers)     (managers)    own SWIM cluster  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Key Distinction**: FederatedHealthMonitor is NOT cluster membership - it's health monitoring using probe/ack.
+
+---
+
+## Part 2: Comparison with SWIM
+
+| Aspect | SWIM (Intra-cluster) | FederatedHealthMonitor (Cross-cluster) |
+|--------|---------------------|---------------------------------------|
+| **Scope** | Nodes within single DC cluster | Gates → DC leader managers across DCs |
+| **Protocol** | Full SWIM (ping, ping-req, suspect, dead) | Simple probe/ack only (`xprobe`/`xack`) |
+| **Gossip** | Yes - membership and state propagation | No - just health checking |
+| **Latency tolerance** | Low (local network, 1-10ms) | High (global network, 50-300ms) |
+| **Suspicion timeout** | Short (1.5-8 seconds) | Long (30 seconds default) |
+| **Purpose** | Cluster membership and failure detection | Cross-DC routing decisions |
+| **Incarnation** | Shared cluster incarnation | Separate external incarnation per DC |
+
+---
+
+## Part 3: Protocol Messages
+
+**CrossClusterProbe (xprobe)**: Sent from gates to DC leader managers.
+
+```python
+@dataclass(slots=True)
+class CrossClusterProbe(Message):
+    source_cluster_id: str  # Gate cluster ID
+    source_node_id: str     # Sending gate's node ID
+    source_addr: tuple[str, int]  # For response routing
+```
+
+**CrossClusterAck (xack)**: Response from DC leader with aggregate health.
+
+```python
+@dataclass(slots=True)
+class CrossClusterAck(Message):
+    # Identity
+    datacenter: str
+    node_id: str
+    incarnation: int  # External incarnation (separate from SWIM)
+
+    # Leadership
+    is_leader: bool
+    leader_term: int
+
+    # Cluster health (aggregate)
+    cluster_size: int       # Total managers in DC
+    healthy_managers: int   # Managers responding to SWIM
+
+    # Worker capacity
+    worker_count: int
+    healthy_workers: int
+    total_cores: int
+    available_cores: int
+
+    # Workload
+    active_jobs: int
+    active_workflows: int
+
+    # Self-reported health
+    dc_health: str  # "HEALTHY", "DEGRADED", "BUSY", "UNHEALTHY"
+    health_reason: str = ""
+```
+
+---
+
+## Part 4: State Machine
+
+**DCReachability States**:
+
+```
+                    ┌─────────────┐
+                    │ UNREACHABLE │ ◄── Initial state
+                    └──────┬──────┘
+                           │ First successful ack
+                           ▼
+                    ┌─────────────┐
+         ┌─────────►│  REACHABLE  │◄──────────────┐
+         │          └──────┬──────┘               │
+         │                 │ consecutive_failures │
+         │                 │ >= max_failures      │
+         │                 ▼                      │
+         │          ┌─────────────┐               │
+         │          │  SUSPECTED  │───────────────┘
+         │          └──────┬──────┘  ack received
+         │                 │ suspicion_timeout
+         │                 │ expired
+         │                 ▼
+         │          ┌─────────────┐
+         └──────────│ UNREACHABLE │
+    leader change   └─────────────┘
+```
+
+---
+
+## Part 5: Configuration
+
+**Environment Variables (env.py)**:
+
+```python
+# Federated Health Monitor Settings (Gate -> DC Leader probing)
+# Tuned for high-latency, globally distributed links
+FEDERATED_PROBE_INTERVAL: StrictFloat = 2.0      # Seconds between probes to each DC
+FEDERATED_PROBE_TIMEOUT: StrictFloat = 5.0       # Timeout for single probe (high for cross-DC)
+FEDERATED_SUSPICION_TIMEOUT: StrictFloat = 30.0  # Time before suspected -> unreachable
+FEDERATED_MAX_CONSECUTIVE_FAILURES: StrictInt = 5  # Failures before marking suspected
+```
+
+**Timing Rationale**:
+
+| Setting | Value | Rationale |
+|---------|-------|-----------|
+| `FEDERATED_PROBE_INTERVAL` | 2s | Reduce cross-DC traffic while maintaining freshness |
+| `FEDERATED_PROBE_TIMEOUT` | 5s | Accommodate 100-300ms RTT + processing time |
+| `FEDERATED_SUSPICION_TIMEOUT` | 30s | Tolerate transient network issues |
+| `FEDERATED_MAX_CONSECUTIVE_FAILURES` | 5 | ~10 seconds of failures before suspected |
+
+---
+
+## Part 6: Integration with Cross-DC Correlation
+
+FederatedHealthMonitor feeds into the Cross-DC Correlation system (Phase 7) to prevent cascade evictions:
+
+```python
+# Latency callback for correlation detection
+def _on_dc_latency(self, datacenter: str, latency_ms: float) -> None:
+    """Called with RTT for each successful probe."""
+    # Used by CrossDCCorrelationDetector to identify network issues
+    # High latency across multiple DCs suggests network problem, not DC failure
+    self._correlation_detector.record_latency(datacenter, latency_ms)
+
+# Health change callback
+def _on_dc_health_change(self, datacenter: str, new_health: str) -> None:
+    """Called when DC reachability or health changes."""
+    if new_health in ("SUSPECTED", "UNREACHABLE"):
+        # Check if multiple DCs failing simultaneously = network partition
+        correlation = self._correlation_detector.check_correlation()
+        if correlation.level >= CorrelationLevel.MEDIUM:
+            # Delay eviction - likely network issue, not actual DC failures
+            pass
+```
+
+---
+
+## Part 7: Usage in Gate
+
+```python
+class Gate:
+    def __init__(self, ...):
+        # SWIM for gate-to-gate membership
+        self._swim_server = HealthAwareServer(...)
+
+        # FederatedHealthMonitor for cross-DC health
+        fed_config = env.get_federated_health_config()
+        self._dc_health_monitor = FederatedHealthMonitor(
+            probe_interval=fed_config['probe_interval'],
+            probe_timeout=fed_config['probe_timeout'],
+            suspicion_timeout=fed_config['suspicion_timeout'],
+            max_consecutive_failures=fed_config['max_consecutive_failures'],
+        )
+
+    async def _route_job(self, job: Job) -> str:
+        """Route job to best DC."""
+        healthy_dcs = self._dc_health_monitor.get_healthy_datacenters()
+        if not healthy_dcs:
+            raise NoHealthyDatacentersError()
+
+        # Select based on capacity from xack
+        return self._select_best_dc(healthy_dcs)
+```
+
+---
+
+## Part 8: Key Design Decisions
+
+1. **No Gossip**: Cross-DC gossip would add latency and complexity. DC leaders already have aggregate health from their local SWIM cluster.
+
+2. **Separate Incarnation**: Each DC tracks its own external incarnation, independent of internal SWIM incarnations. This prevents cross-cluster incarnation conflicts.
+
+3. **Aggregate Health**: DC leaders report aggregate cluster health (healthy managers, available cores) rather than individual node states. This reduces message size and provides the information gates actually need.
+
+4. **Leader-Only Probing**: Gates probe DC leaders, not all managers. Leaders have authoritative cluster state and can respond with aggregate health.
+
+5. **High Latency Tolerance**: Default timeouts (5s probe, 30s suspicion) are 5-10x higher than SWIM defaults, appropriate for global networks.
+
+---
+
+## Part 9: Files
+
+| File | Purpose |
+|------|---------|
+| `swim/health/federated_health_monitor.py` | FederatedHealthMonitor, CrossClusterProbe, CrossClusterAck |
+| `nodes/gate.py` | Integration with gate routing |
+| `env/env.py` | Configuration settings |
+| `datacenters/cross_dc_correlation.py` | Integration with correlation detection |
+
+---

@@ -14,17 +14,16 @@ class HyperscaleConfig(BaseModel):
     terminal_mode: TerminalMode = "full"
 
     @model_validator(mode="after")
-    @classmethod
-    def validate_logs_directory(cls, config: HyperscaleConfig):
-        logs_directory_path = config.logs_directory
+    def validate_logs_directory(self) -> HyperscaleConfig:
+        logs_directory_path = self.logs_directory
         if isinstance(logs_directory_path, str):
-            logs_directory_path = pathlib.Path(config.logs_directory)
+            logs_directory_path = pathlib.Path(self.logs_directory)
 
         logs_directory_path = logs_directory_path.absolute().resolve()
 
         if not logs_directory_path.exists():
             logs_directory_path.mkdir()
 
-        config.logs_directory = str(logs_directory_path)
+        self.logs_directory = str(logs_directory_path)
 
-        return config
+        return self

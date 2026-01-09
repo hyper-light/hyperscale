@@ -4,6 +4,7 @@ import pickle
 import signal
 import socket
 import ssl
+import time
 import uuid
 from collections import defaultdict, deque
 from typing import (
@@ -25,6 +26,8 @@ from typing import (
 import cloudpickle
 import zstandard
 
+
+from .constants import MAX_DECOMPRESSED_SIZE
 from hyperscale.core.engines.client.time_parser import TimeParser
 from hyperscale.core.jobs.data_structures import LockedSet
 from hyperscale.core.jobs.hooks.hook_type import HookType
@@ -48,7 +51,6 @@ from .message_limits import (
     validate_decompressed_size,
     MessageSizeError,
 )
-from .rate_limiter import RateLimiter, RateLimitExceeded
 from .replay_guard import ReplayGuard, ReplayError
 from .restricted_unpickler import restricted_loads, SecurityError
 from .server_protocol import MercurySyncTCPServerProtocol
@@ -115,6 +117,7 @@ class TCPProtocol(Generic[T, K]):
         self._connect_timeout = TimeParser(env.MERCURY_SYNC_CONNECT_TIMEOUT).time
         self._retry_interval = TimeParser(env.MERCURY_SYNC_RETRY_INTERVAL).time
         self._shutdown_poll_rate = TimeParser(env.MERCURY_SYNC_SHUTDOWN_POLL_RATE).time
+        self._max_connect_time = TimeParser(env.MERCURY_SYNC_MAX_CONNECT_TIME).time
         self._retries = env.MERCURY_SYNC_SEND_RETRIES
 
         self._max_concurrency = env.MERCURY_SYNC_MAX_CONCURRENCY
@@ -131,13 +134,6 @@ class TCPProtocol(Generic[T, K]):
             max_age_seconds=300,  # 5 minutes
             max_future_seconds=60,  # 1 minute clock skew tolerance
             max_window_size=100000,
-        )
-        
-        # Rate limiting (per-source)
-        self._rate_limiter = RateLimiter(
-            requests_per_second=1000,
-            burst_size=100,
-            max_sources=10000,
         )
 
     @property
@@ -420,10 +416,30 @@ class TCPProtocol(Generic[T, K]):
                 key_path=key_path,
             )
 
-        run_start = True
         instance_id: int | None = None
+        start_time = time.monotonic()
+        attempt = 0
 
-        while run_start:
+        # Connect retry with exponential backoff
+        # Start with short timeout/interval, increase as processes may be slow to start
+        base_timeout = 2.0  # Initial per-attempt timeout
+        base_interval = 0.5  # Initial retry interval
+        max_timeout = 10.0  # Cap per-attempt timeout
+        max_interval = 5.0  # Cap retry interval
+
+        while True:
+            elapsed = time.monotonic() - start_time
+            if elapsed >= self._max_connect_time:
+                if self._connect_lock.locked():
+                    self._connect_lock.release()
+                raise TimeoutError(
+                    f"Failed to connect to {address} after {self._max_connect_time}s ({attempt} attempts)"
+                )
+
+            # Calculate timeouts with exponential backoff, capped at max values
+            attempt_timeout = min(base_timeout * (1.5 ** min(attempt, 5)), max_timeout)
+            retry_interval = min(base_interval * (1.5 ** min(attempt, 5)), max_interval)
+
             try:
                 if worker_socket is None:
                     tcp_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -432,7 +448,7 @@ class TCPProtocol(Generic[T, K]):
 
                     await asyncio.wait_for(
                         self._loop.run_in_executor(None, tcp_socket.connect, address),
-                        timeout=self._connect_timeout,
+                        timeout=attempt_timeout,
                     )
 
                     tcp_socket.setblocking(False)
@@ -446,7 +462,7 @@ class TCPProtocol(Generic[T, K]):
                         sock=tcp_socket,
                         ssl=self._client_ssl_context,
                     ),
-                    timeout=self._connect_timeout,
+                    timeout=attempt_timeout,
                 )
 
                 self._client_transports[address] = client_transport
@@ -458,7 +474,7 @@ class TCPProtocol(Generic[T, K]):
                         target_address=address,
                         request_type="connect",
                     ),
-                    timeout=self._connect_timeout,
+                    timeout=attempt_timeout,
                 )
 
                 shard_id, _ = result
@@ -470,18 +486,15 @@ class TCPProtocol(Generic[T, K]):
                 self._node_host_map[instance_id] = address
                 self._nodes.put_no_wait(instance_id)
 
-                run_start = False
+                # Successfully connected
+                break
 
-            except Exception:
-                pass
-
-            except OSError:
-                pass
-
-            except asyncio.CancelledError:
-                pass
-
-            await asyncio.sleep(1)
+            except (Exception, OSError, asyncio.CancelledError):
+                attempt += 1
+                # Don't sleep if we've exceeded the max time
+                remaining = self._max_connect_time - (time.monotonic() - start_time)
+                if remaining > 0:
+                    await asyncio.sleep(min(retry_interval, remaining))
 
         default_config = {
             "node_id": self._node_id_base,
@@ -819,14 +832,6 @@ class TCPProtocol(Generic[T, K]):
         data: bytes,
         transport: asyncio.Transport,
     ) -> None:
-        # Get peer address for rate limiting
-        try:
-            addr = transport.get_extra_info('peername')
-            if addr and not self._rate_limiter.check(addr, raise_on_limit=False):
-                return  # Rate limited - silently drop
-        except Exception:
-            pass  # Continue if we can't get address
-        
         # Validate compressed message size
         try:
             validate_compressed_size(data, raise_on_error=True)
@@ -837,7 +842,7 @@ class TCPProtocol(Generic[T, K]):
         decompressed = b""
         
         try:
-            decompressed = self._decompressor.decompress(data)
+            decompressed = self._decompressor.decompress(data, max_output_size=MAX_DECOMPRESSED_SIZE)
 
         except Exception:
             # Sanitized error - don't leak internal details
@@ -1122,66 +1127,54 @@ class TCPProtocol(Generic[T, K]):
         self._stream = False
         self._running = False
 
-        await self._shutdown_task
+        # Wait for shutdown task only if it exists and with a short timeout
+        if self._shutdown_task is not None:
+            try:
+                await asyncio.wait_for(self._shutdown_task, timeout=0.5)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                pass
 
         close_task = asyncio.current_task()
 
+        # Abort all client transports immediately
         for client in self._client_transports.values():
             client.abort()
 
         for tcp_socket in self._client_sockets.values():
             try:
                 tcp_socket.close()
-
             except Exception:
                 pass
 
         if self._server:
             try:
                 self._server.close()
-
             except Exception:
                 pass
 
         if self.server_socket:
             try:
                 self.server_socket.close()
-
             except Exception:
                 pass
 
-        if self._sleep_task:
-            try:
-                self._sleep_task.cancel()
-
-            except Exception:
-                pass
-
-            except asyncio.CancelledError:
-                pass
-
-        if self._cleanup_task:
-            try:
-                self._cleanup_task.cancel()
-
-            except Exception:
-                pass
-
-            except asyncio.CancelledError:
-                pass
+        # Cancel helper tasks
+        for task in [self._sleep_task, self._cleanup_task]:
+            if task is not None:
+                try:
+                    task.cancel()
+                except (Exception, asyncio.CancelledError):
+                    pass
 
         if self.tasks:
             self.tasks.abort()
 
-        for task in asyncio.all_tasks():
+        # Cancel all pending response tasks immediately (don't wait)
+        for task in list(self._pending_responses):
             try:
-                if task != close_task and task.cancelled() is False:
+                if not task.done():
                     task.cancel()
-
-            except Exception:
-                pass
-
-            except asyncio.CancelledError:
+            except (Exception, asyncio.CancelledError):
                 pass
 
         if self._run_future and (
@@ -1189,32 +1182,41 @@ class TCPProtocol(Generic[T, K]):
         ):
             try:
                 self._run_future.set_result(None)
-
-            except asyncio.InvalidStateError:
-                pass
-
-            except asyncio.CancelledError:
+            except (asyncio.InvalidStateError, asyncio.CancelledError):
                 pass
 
         self._pending_responses.clear()
+        self._client_transports.clear()
+        self._client_sockets.clear()
 
     def stop(self):
         self._shutdown_task = asyncio.ensure_future(self._shutdown())
 
     async def _shutdown(self):
-        for response in self._pending_responses:
-            await response
-
+        # Stop accepting new work first
         self._running = False
 
+        # Cancel pending response tasks
+        pending_tasks = list(self._pending_responses)
+        for task in pending_tasks:
+            if not task.done():
+                task.cancel()
+
+        # Wait briefly for cancelled tasks (0.25s is enough for graceful cleanup)
+        if pending_tasks:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*pending_tasks, return_exceptions=True),
+                    timeout=0.25,
+                )
+            except asyncio.TimeoutError:
+                pass
+
+        # Signal run_forever() to exit
         if self._run_future:
             try:
                 self._run_future.set_result(None)
-
-            except asyncio.InvalidStateError:
-                pass
-
-            except asyncio.CancelledError:
+            except (asyncio.InvalidStateError, asyncio.CancelledError):
                 pass
 
     def abort(self):
@@ -1227,9 +1229,9 @@ class TCPProtocol(Generic[T, K]):
             except Exception:
                 pass
 
-        if self._shutdown_task:
+        if self._shutdown_task and not self._shutdown_task.done():
             try:
-                self._shutdown_task.set_result(None)
+                self._shutdown_task.cancel()
 
             except Exception:
                 pass

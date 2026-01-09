@@ -11,7 +11,7 @@ from typing import Any
 from .protocols import LoggerProtocol
 
 
-@dataclass
+@dataclass(slots=True)
 class Metrics:
     """
     Simple metrics collector for SWIM protocol events.

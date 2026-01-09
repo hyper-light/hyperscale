@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from ..core.types import Status
 
 
-@dataclass
+@dataclass(slots=True)
 class LeaderEligibility:
     """
     Determines if a node can become or remain a leader.

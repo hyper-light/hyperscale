@@ -15,6 +15,7 @@ from collections import deque
 from enum import Enum, auto
 import asyncio
 import time
+import traceback
 from hyperscale.logging.hyperscale_logging_models import ServerError
 
 from .errors import (
@@ -40,7 +41,7 @@ class CircuitState(Enum):
 from .protocols import LoggerProtocol
 
 
-@dataclass
+@dataclass(slots=True)
 class ErrorStats:
     """
     Track error rates for circuit breaker decisions.
@@ -88,10 +89,26 @@ class ErrorStats:
                 self._circuit_opened_at = now
     
     def record_success(self) -> None:
-        """Record a successful operation (for half-open state)."""
+        """
+        Record a successful operation.
+
+        In HALF_OPEN state: Closes the circuit and clears error history.
+        In OPEN state: No effect (must wait for half_open_after timeout first).
+        In CLOSED state: Prunes old timestamps, helping prevent false opens.
+
+        IMPORTANT: When closing from HALF_OPEN, we clear the timestamps deque.
+        Without this, the circuit would immediately re-open on the next error
+        because old errors would still be counted in the window.
+        """
         if self._circuit_state == CircuitState.HALF_OPEN:
             self._circuit_state = CircuitState.CLOSED
             self._circuit_opened_at = None
+            # CRITICAL: Clear error history to allow real recovery
+            # Without this, circuit immediately re-opens on next error
+            self._timestamps.clear()
+        elif self._circuit_state == CircuitState.CLOSED:
+            # Prune old entries to keep window current
+            self._prune_old_entries(time.monotonic())
     
     def _prune_old_entries(self, now: float) -> None:
         """Remove entries outside the window."""
@@ -134,7 +151,7 @@ class ErrorStats:
         self._circuit_opened_at = None
 
 
-@dataclass
+@dataclass(slots=True)
 class ErrorHandler:
     """
     Centralized error handling with recovery actions.
@@ -197,7 +214,13 @@ class ErrorHandler:
     
     # Callbacks for fatal errors
     _fatal_callback: Callable[[SwimError], Awaitable[None]] | None = None
-    
+
+    # Shutdown flag - when True, suppress non-fatal errors
+    _shutting_down: bool = False
+
+    # Track last error per category for debugging (includes traceback)
+    _last_errors: dict[ErrorCategory, tuple[SwimError, str]] = field(default_factory=dict)
+
     def __post_init__(self):
         # Initialize stats for each category
         for category, settings in self.circuit_settings.items():
@@ -221,11 +244,15 @@ class ErrorHandler:
     ) -> None:
         """Set callback for fatal errors (e.g., graceful shutdown)."""
         self._fatal_callback = callback
-    
+
+    def start_shutdown(self) -> None:
+        """Signal that shutdown is in progress - suppress non-fatal errors."""
+        self._shutting_down = True
+
     async def handle(self, error: SwimError) -> None:
         """
         Handle an error with appropriate response.
-        
+
         Steps:
         1. Log with structured context
         2. Update error stats for circuit breaker
@@ -233,21 +260,40 @@ class ErrorHandler:
         4. Trigger recovery if circuit opens
         5. Escalate fatal errors
         """
+        # During shutdown, only handle fatal errors - suppress routine probe failures etc.
+        if self._shutting_down and error.severity != ErrorSeverity.FATAL:
+            return
+
+        # Capture traceback for debugging - get the last line of the traceback
+        tb_line = ""
+        if error.cause:
+            tb_lines = traceback.format_exception(type(error.cause), error.cause, error.cause.__traceback__)
+            if tb_lines:
+                # Get the last non-empty line (usually the actual error)
+                tb_line = "".join(tb_lines[-3:]).strip() if len(tb_lines) >= 3 else "".join(tb_lines).strip()
+
+        # Store last error with traceback for circuit breaker logging
+        self._last_errors[error.category] = (error, tb_line)
+
         # 1. Log with structured context
         await self._log_error(error)
-        
-        # 2. Update error stats
+
+        # 2. Update error stats - but only for non-TRANSIENT errors
+        # TRANSIENT errors (like stale messages) are expected in async distributed
+        # systems and should NOT trip the circuit breaker. They indicate normal
+        # protocol operation (e.g., incarnation changes during refutation).
         stats = self._get_stats(error.category)
-        stats.record_error()
-        
+        if error.severity != ErrorSeverity.TRANSIENT:
+            stats.record_error()
+
         # 3. Affect LHM based on error
         await self._update_lhm(error)
-        
+
         # 4. Check circuit breaker and trigger recovery
         if stats.is_circuit_open:
             await self._log_circuit_open(error.category, stats)
             await self._trigger_recovery(error.category)
-        
+
         # 5. Fatal errors need escalation
         if error.severity == ErrorSeverity.FATAL:
             await self._handle_fatal(error)
@@ -259,9 +305,16 @@ class ErrorHandler:
     ) -> None:
         """
         Wrap and handle a raw exception.
-        
+
         Converts standard exceptions to SwimError types.
+        System-level exceptions (KeyboardInterrupt, SystemExit, GeneratorExit)
+        are re-raised immediately without processing.
         """
+        # System-level exceptions must be re-raised immediately
+        # These signal process termination and should never be suppressed
+        if isinstance(exception, (KeyboardInterrupt, SystemExit, GeneratorExit)):
+            raise exception
+
         # Convert known exceptions to SwimError types
         if isinstance(exception, SwimError):
             await self.handle(exception)
@@ -277,6 +330,17 @@ class ErrorHandler:
             await self.handle(
                 NetworkError(
                     f"Connection error during {operation}",
+                    cause=exception,
+                    operation=operation,
+                )
+            )
+        elif isinstance(exception, OSError):
+            # OSError is the base class for many network errors:
+            # ConnectionRefusedError, BrokenPipeError, etc.
+            # Treat as TRANSIENT since network conditions can change
+            await self.handle(
+                NetworkError(
+                    f"OS/socket error during {operation}: {exception}",
                     cause=exception,
                     operation=operation,
                 )
@@ -327,7 +391,8 @@ class ErrorHandler:
                 'error_rate': stats.error_rate,
                 'circuit_state': stats.circuit_state.name,
             }
-            for cat, stats in self._stats.items()
+            # Snapshot to avoid dict mutation during iteration
+            for cat, stats in list(self._stats.items())
         }
     
     def reset_category(self, category: ErrorCategory) -> None:
@@ -336,7 +401,8 @@ class ErrorHandler:
     
     def reset_all(self) -> None:
         """Reset all error stats."""
-        for stats in self._stats.values():
+        # Snapshot to avoid dict mutation during iteration
+        for stats in list(self._stats.values()):
             stats.reset()
     
     def _get_stats(self, category: ErrorCategory) -> ErrorStats:
@@ -403,11 +469,20 @@ class ErrorHandler:
                     pass  # Logging is best-effort
     
     async def _log_circuit_open(self, category: ErrorCategory, stats: ErrorStats) -> None:
-        """Log circuit breaker opening."""
+        """Log circuit breaker opening with last error details."""
         message = (
             f"[CircuitBreakerOpen] Circuit breaker OPEN for {category.name}: "
             f"{stats.error_count} errors, rate={stats.error_rate:.2f}/s"
         )
+
+        # Include last error details if available
+        last_error_info = self._last_errors.get(category)
+        if last_error_info:
+            error, tb_line = last_error_info
+            message += f" | Last error: {error}"
+            if tb_line:
+                message += f" | Traceback: {tb_line}"
+
         if self.logger:
             try:
                 from hyperscale.logging.hyperscale_logging_models import ServerError
@@ -427,29 +502,42 @@ class ErrorHandler:
                     pass  # Logging is best-effort
     
     async def _update_lhm(self, error: SwimError) -> None:
-        """Update Local Health Multiplier based on error."""
+        """
+        Update Local Health Multiplier based on error.
+
+        IMPORTANT: This is intentionally conservative to avoid double-counting.
+        Most LHM updates happen via direct calls to increase_failure_detector()
+        at the point of the event (e.g., probe timeout, refutation needed).
+
+        The error handler only updates LHM for:
+        - FATAL errors (always serious)
+        - RESOURCE errors (indicate local node is struggling)
+
+        We explicitly DO NOT update LHM here for:
+        - NETWORK errors: Already handled by direct calls in probe logic
+        - PROTOCOL errors: Usually indicate remote issues, not local health
+        - ELECTION errors: Handled by election logic directly
+        - TRANSIENT errors: Expected behavior, not health issues
+        """
         if not self.increment_lhm:
             return
-        
-        # Map error types to LHM event types
+
+        # Only update LHM for errors that clearly indicate LOCAL node issues
         event_type: str | None = None
-        
-        if error.category == ErrorCategory.NETWORK:
-            if error.severity == ErrorSeverity.TRANSIENT:
-                event_type = 'probe_timeout'
-            else:
-                event_type = 'network_error'
-        
+
+        if error.severity == ErrorSeverity.FATAL:
+            # Fatal errors always affect health significantly
+            event_type = 'event_loop_critical'
+
         elif error.category == ErrorCategory.RESOURCE:
-            event_type = 'resource_pressure'
-        
-        elif error.category == ErrorCategory.ELECTION:
-            if 'split_brain' in error.message.lower():
-                event_type = 'refutation'
-        
-        elif error.severity == ErrorSeverity.FATAL:
-            event_type = 'fatal_error'
-        
+            # Resource exhaustion is a clear signal of local problems
+            event_type = 'event_loop_lag'
+
+        # Note: We intentionally skip NETWORK, PROTOCOL, ELECTION, and TRANSIENT
+        # errors here. They are either:
+        # 1. Already handled by direct increase_failure_detector() calls
+        # 2. Indicate remote node issues rather than local health problems
+
         if event_type:
             try:
                 await self.increment_lhm(event_type)
@@ -505,13 +593,25 @@ class ErrorContext:
     
     async def __aenter__(self) -> 'ErrorContext':
         return self
-    
+
     async def __aexit__(self, exc_type, exc_val, exc_tb) -> bool:
         if exc_val is not None:
+            # System-level exceptions must NEVER be suppressed
+            if isinstance(exc_val, (KeyboardInterrupt, SystemExit, GeneratorExit)):
+                return False  # Always propagate
+
+            # CancelledError is not an error - it's a normal signal for task cancellation
+            # Log at debug level for visibility but don't treat as error or update metrics
+            if isinstance(exc_val, asyncio.CancelledError):
+                await self.handler._log_internal(
+                    f"Operation '{self.operation}' cancelled (normal during shutdown)"
+                )
+                return False  # Don't suppress, let it propagate
+
             await self.handler.handle_exception(exc_val, self.operation)
             return not self.reraise  # Suppress exception unless reraise=True
         return False
-    
+
     def record_success(self, category: ErrorCategory) -> None:
         """Record successful operation for circuit breaker."""
         self.handler.record_success(category)

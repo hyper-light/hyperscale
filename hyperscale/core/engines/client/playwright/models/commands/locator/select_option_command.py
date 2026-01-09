@@ -14,6 +14,7 @@ except Exception:
 
 from pydantic import (
     BaseModel,
+    ConfigDict,
     StrictBool,
     StrictFloat,
     StrictInt,
@@ -22,6 +23,8 @@ from pydantic import (
 
 
 class SelectOptionCommand(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     value: Optional[StrictStr | Sequence[StrictStr]] = None
     index: Optional[StrictInt | Sequence[StrictInt]] = None
     label: Optional[StrictStr | Sequence[StrictStr]] = None
@@ -29,6 +32,3 @@ class SelectOptionCommand(BaseModel):
     no_wait_after: Optional[StrictBool] = None
     force: Optional[StrictBool] = None
     timeout: StrictInt | StrictFloat
-
-    class Config:
-        arbitrary_types_allowed = True

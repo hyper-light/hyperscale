@@ -8,14 +8,13 @@ except Exception:
     class Request:
         pass
 
-from pydantic import BaseModel, StrictFloat, StrictInt, StrictStr
+from pydantic import BaseModel, ConfigDict, StrictFloat, StrictInt, StrictStr
 
 
 class ExpectRequestCommand(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     url_or_predicate: Optional[StrictStr | Pattern[str] | Callable[[Request], bool]] = (
         None
     )
     timeout: StrictInt | StrictFloat
-
-    class Config:
-        arbitrary_types_allowed = True

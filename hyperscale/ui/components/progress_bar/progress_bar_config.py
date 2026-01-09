@@ -1,5 +1,5 @@
 import inspect
-from pydantic import BaseModel, StrictStr, StrictInt
+from pydantic import BaseModel, ConfigDict, StrictStr, StrictInt
 from hyperscale.ui.components.spinner.spinner_factory import SpinnerFactory
 from hyperscale.ui.components.spinner.spinner_types import SpinnerName
 from hyperscale.ui.config.mode import TerminalDisplayMode
@@ -15,6 +15,8 @@ BarTextPosition = Literal["left", "right"]
 
 
 class ProgressBarConfig(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     total: StrictInt
     active: SpinnerName | StrictStr = "dots"
     active_color: Colorizer | None = None
@@ -32,9 +34,6 @@ class ProgressBarConfig(BaseModel):
     incomplete_color: Colorizer | None = None
     incomplete_highlight: HighlightColorizer | None = None
     terminal_mode: TerminalDisplayMode = "compatability"
-
-    class Config:
-        arbitrary_types_allowed = True
 
     def get_static_chars(self):
         complete_char = FillChar.by_name(self.complete, default=self.complete)

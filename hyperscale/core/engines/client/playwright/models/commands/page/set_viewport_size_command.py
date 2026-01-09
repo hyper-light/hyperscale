@@ -7,14 +7,14 @@ except Exception:
     
 from pydantic import (
     BaseModel,
+    ConfigDict,
     StrictFloat,
     StrictInt,
 )
 
 
 class SetViewportSize(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     viewport_size: ViewportSize
     timeout: StrictInt | StrictFloat
-
-    class Config:
-        arbitrary_types_allowed = True

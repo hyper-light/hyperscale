@@ -18,8 +18,8 @@ from hyperscale.testing import URL, HTTPResponse, Headers
 #   -H 'user-agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
 
 class Test(Workflow):
-    vus = 2000
-    duration = "15s"
+    vus = 8000
+    duration = "1m"
 
     @step()
     async def get_httpbin(
@@ -33,19 +33,19 @@ class Test(Workflow):
         return 'test'
 
 
-@depends('Test')
-class TestTwo(Workflow):
-    vus = 2000
-    duration = "15s"
+# @depends('Test')
+# class TestTwo(Workflow):
+#     vus = 2000
+#     duration = "15s"
 
-    @state('Test')
-    def consume(self, value: str | None = None) -> Use[str]:
-        return value
+#     @state('Test')
+#     def consume(self, value: str | None = None) -> Use[str]:
+#         return value
 
-    @step()
-    async def get_httpbin(
-        self,
-        url: URL = 'https://httpbin.org/get',
-    ) -> HTTPResponse:
-        return await self.client.http.get(url)
+#     @step()
+#     async def get_httpbin(
+#         self,
+#         url: URL = 'https://httpbin.org/get',
+#     ) -> HTTPResponse:
+#         return await self.client.http.get(url)
         

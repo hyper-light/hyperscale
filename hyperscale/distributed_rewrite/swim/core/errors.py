@@ -79,7 +79,15 @@ class SwimError(Exception):
     
     def __str__(self) -> str:
         ctx = f" {self.context}" if self.context else ""
-        cause = f" (caused by: {self.cause})" if self.cause else ""
+        cause = ""
+        if self.cause:
+            # Include type name for better debugging, especially when str(cause) is empty
+            cause_str = str(self.cause)
+            cause_type = type(self.cause).__name__
+            if cause_str:
+                cause = f" (caused by {cause_type}: {cause_str})"
+            else:
+                cause = f" (caused by {cause_type})"
         return f"[{self.category.name}/{self.severity.name}] {self.message}{ctx}{cause}"
     
     def __repr__(self) -> str:

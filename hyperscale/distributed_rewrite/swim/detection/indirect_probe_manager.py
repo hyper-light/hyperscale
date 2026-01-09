@@ -9,7 +9,7 @@ from .pending_indirect_probe import PendingIndirectProbe
 from ..core.protocols import LoggerProtocol
 
 
-@dataclass
+@dataclass(slots=True)
 class IndirectProbeManager:
     """
     Manages indirect probe requests for SWIM protocol.
@@ -118,7 +118,8 @@ class IndirectProbeManager:
         """Get all probes that have timed out without an ack."""
         expired = []
         to_remove = []
-        for target, probe in self.pending_probes.items():
+        # Snapshot to avoid dict mutation during iteration
+        for target, probe in list(self.pending_probes.items()):
             if probe.is_expired():
                 expired.append(probe)
                 to_remove.append(target)
@@ -146,12 +147,13 @@ class IndirectProbeManager:
         """
         now = time.monotonic()
         cutoff = now - self.probe_ttl
-        
+
         to_remove = []
-        for target, probe in self.pending_probes.items():
+        # Snapshot to avoid dict mutation during iteration
+        for target, probe in list(self.pending_probes.items()):
             if probe.start_time < cutoff:
                 to_remove.append(target)
-        
+
         for target in to_remove:
             del self.pending_probes[target]
             self._expired_count += 1

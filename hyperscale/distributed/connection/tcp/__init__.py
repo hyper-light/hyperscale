@@ -1,2 +1,0 @@
-from .mercury_sync_tcp_connection import MercurySyncTCPConnection
-from .mercury_sync_http_connection import MercurySyncHTTPConnection

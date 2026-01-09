@@ -92,7 +92,7 @@ class DCLeaderAnnouncement(Message):
     timestamp: float = field(default_factory=time.time)
 
 
-@dataclass
+@dataclass(slots=True)
 class DCHealthState:
     """
     Gate's view of a datacenter's health.
@@ -141,7 +141,7 @@ class DCHealthState:
         return self.last_ack.dc_health in ("HEALTHY", "DEGRADED", "BUSY")
 
 
-@dataclass
+@dataclass(slots=True)
 class FederatedHealthMonitor:
     """
     Monitors external datacenter clusters using SWIM-style probes.
@@ -168,6 +168,7 @@ class FederatedHealthMonitor:
     # Callbacks (set by owner)
     _send_udp: Callable[[tuple[str, int], bytes], Awaitable[bool]] | None = None
     _on_dc_health_change: Callable[[str, str], None] | None = None  # (dc, new_health)
+    _on_dc_latency: Callable[[str, float], None] | None = None  # (dc, latency_ms) - Phase 7
     
     # State
     _dc_health: dict[str, DCHealthState] = field(default_factory=dict)
@@ -180,12 +181,24 @@ class FederatedHealthMonitor:
         cluster_id: str,
         node_id: str,
         on_dc_health_change: Callable[[str, str], None] | None = None,
+        on_dc_latency: Callable[[str, float], None] | None = None,
     ) -> None:
-        """Set callback functions."""
+        """
+        Set callback functions.
+
+        Args:
+            send_udp: Async function to send UDP packets.
+            cluster_id: This gate's cluster ID.
+            node_id: This gate's node ID.
+            on_dc_health_change: Called when DC health changes (dc, new_health).
+            on_dc_latency: Called with latency measurements (dc, latency_ms).
+                Used for cross-DC correlation to distinguish network issues.
+        """
         self._send_udp = send_udp
         self.cluster_id = cluster_id
         self.node_id = node_id
         self._on_dc_health_change = on_dc_health_change
+        self._on_dc_latency = on_dc_latency
     
     def add_datacenter(
         self,
@@ -261,8 +274,9 @@ class FederatedHealthMonitor:
     
     def get_healthy_datacenters(self) -> list[str]:
         """Get list of DCs that can accept jobs."""
+        # Snapshot to avoid dict mutation during iteration
         return [
-            dc for dc, state in self._dc_health.items()
+            dc for dc, state in list(self._dc_health.items())
             if state.is_healthy_for_jobs
         ]
     
@@ -364,30 +378,38 @@ class FederatedHealthMonitor:
         state = self._dc_health.get(ack.datacenter)
         if not state:
             return
-        
+
         # Check incarnation for staleness
         if ack.incarnation < state.incarnation:
             # Stale ack - ignore
             return
-        
+
         old_reachability = state.reachability
         old_health = state.effective_health
-        
+
+        now = time.monotonic()
+
+        # Calculate latency for cross-DC correlation (Phase 7)
+        # Latency = time between sending probe and receiving ack
+        if state.last_probe_sent > 0 and self._on_dc_latency:
+            latency_ms = (now - state.last_probe_sent) * 1000
+            self._on_dc_latency(ack.datacenter, latency_ms)
+
         # Update state
         state.incarnation = ack.incarnation
-        state.last_ack_received = time.monotonic()
+        state.last_ack_received = now
         state.last_ack = ack
         state.consecutive_failures = 0
         state.reachability = DCReachability.REACHABLE
-        
+
         # Update leader info from ack
         if ack.is_leader:
             state.leader_node_id = ack.node_id
             state.leader_term = ack.leader_term
-        
+
         # Notify on change
         new_health = state.effective_health
-        if (state.reachability != old_reachability or 
+        if (state.reachability != old_reachability or
             new_health != old_health) and self._on_dc_health_change:
             self._on_dc_health_change(state.datacenter, new_health)
 

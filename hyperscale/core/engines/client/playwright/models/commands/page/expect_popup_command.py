@@ -10,14 +10,14 @@ except Exception:
 
 from pydantic import (
     BaseModel,
+    ConfigDict,
     StrictFloat,
     StrictInt,
 )
 
 
 class ExpectPopupCommand(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     predicate: Optional[Callable[[Page], bool]] = None
     timeout: StrictInt | StrictFloat
-
-    class Config:
-        arbitrary_types_allowed = True

@@ -1,6 +1,7 @@
 import asyncio
 import pathlib
 import time
+import uuid
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from typing import (
@@ -25,7 +26,6 @@ T = TypeVar("T")
 class Task(Generic[T]):
     def __init__(
         self,
-        snowflake_generator: SnowflakeGenerator,
         name: str,
         task: Callable[[], T] | str,
         executor: ProcessPoolExecutor | ThreadPoolExecutor | None,
@@ -40,8 +40,7 @@ class Task(Generic[T]):
         keep_policy: Literal["COUNT", "AGE", "COUNT_AND_AGE"] = "COUNT",
         task_type: TaskType = TaskType.CALLABLE,
     ) -> None:
-        self._snowflake_generator = snowflake_generator
-        self.task_id = snowflake_generator.generate()
+        self.task_id = Task.generate_id()
         self.name: str = name
         self.args = args
         self.trigger: Literal["MANUAL", "ON_START"] = trigger
@@ -84,6 +83,10 @@ class Task(Generic[T]):
             return run.status
 
         return RunStatus.IDLE
+    
+    @classmethod
+    def generate_id(cls):
+        return uuid.uuid4().int >> 64
 
     async def get_run_update(self, run_id: int):
         return await self._runs[run_id].get_run_update()
@@ -114,39 +117,44 @@ class Task(Generic[T]):
         if run := self._runs.get(run_id) and self._schedules.get(run_id):
             self._schedule_running_statuses[run_id] = False
 
-            try:
-                self._schedules[run_id].set_result(None)
-
-            except Exception:
-                pass
+            schedule = self._schedules.get(run_id)
+            if schedule and not schedule.done():
+                try:
+                    schedule.cancel()
+                except Exception:
+                    pass
 
             await run.cancel()
 
     async def shutdown(self):
-        for run in self._runs.values():
+        # Snapshot to avoid dict mutation during iteration
+        for run in list(self._runs.values()):
             await run.cancel()
 
-            if self._schedules.get(run.run_id):
+            schedule = self._schedules.get(run.run_id)
+            if schedule:
                 self._schedule_running_statuses[run.run_id] = False
 
-                try:
-                    self._schedules[run.run_id].set_result(None)
-
-                except Exception:
-                    pass
+                if not schedule.done():
+                    try:
+                        schedule.cancel()
+                    except Exception:
+                        pass
 
     def abort(self):
-        for run in self._runs.values():
+        # Snapshot to avoid dict mutation during iteration
+        for run in list(self._runs.values()):
             run.abort()
 
-            if self._schedules.get(run.run_id):
+            schedule = self._schedules.get(run.run_id)
+            if schedule:
                 self._schedule_running_statuses[run.run_id] = False
 
-                try:
-                    self._schedules[run.run_id].set_result(None)
-
-                except Exception:
-                    pass
+                if not schedule.done():
+                    try:
+                        schedule.cancel()
+                    except Exception:
+                        pass
 
     async def cleanup(self):
         match self.keep_policy:
@@ -203,7 +211,7 @@ class Task(Generic[T]):
             timeout = self.timeout
 
         if run_id is None:
-            run_id = self._snowflake_generator.generate()
+            run_id = Task.generate_id()
 
         run = Run(
             run_id,
@@ -238,7 +246,7 @@ class Task(Generic[T]):
             timeout = self.timeout
 
         if run_id is None:
-            run_id = self._snowflake_generator.generate()
+            run_id = Task.generate_id()
 
         run = Run(
             run_id,
@@ -257,7 +265,8 @@ class Task(Generic[T]):
         return run
 
     def stop_schedules(self):
-        for run_id in self._schedule_running_statuses:
+        # Snapshot keys to avoid dict mutation during iteration
+        for run_id in list(self._schedule_running_statuses.keys()):
             self._schedule_running_statuses[run_id] = False
 
     def run_schedule(
@@ -268,7 +277,7 @@ class Task(Generic[T]):
         **kwargs,
     ):
         if run_id is None:
-            run_id = self._snowflake_generator.generate()
+            run_id = Task.generate_id()
 
         if timeout is None:
             timeout = self.timeout
@@ -307,7 +316,7 @@ class Task(Generic[T]):
         poll_interval: int | float = 0.5,
     ):
         if run_id is None:
-            run_id = self._snowflake_generator.generate()
+            run_id = Task.generate_id()
 
         if timeout is None:
             timeout = self.timeout
@@ -351,7 +360,7 @@ class Task(Generic[T]):
 
                 await asyncio.sleep(self.schedule)
                 run = Run(
-                    self._snowflake_generator.generate(),
+                    Task.generate_id(),
                     self.name,
                     self.call,
                     self._executor,
@@ -372,7 +381,7 @@ class Task(Generic[T]):
 
                 await asyncio.sleep(self.schedule)
                 run = Run(
-                    self._snowflake_generator.generate(),
+                    Task.generate_id(),
                     self.name,
                     self.call,
                     self._executor,
@@ -406,7 +415,7 @@ class Task(Generic[T]):
 
                 await asyncio.sleep(self.schedule)
                 run = Run(
-                    self._snowflake_generator.generate(),
+                    Task.generate_id(),
                     self.name,
                     self.call,
                     self._executor,
@@ -432,7 +441,7 @@ class Task(Generic[T]):
 
                 await asyncio.sleep(self.schedule)
                 run = Run(
-                    self._snowflake_generator.generate(),
+                    Task.generate_id(),
                     self.name,
                     self.call,
                     self._executor,

@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
-@dataclass
+@dataclass(slots=True)
 class GCounter:
     """
     Grow-only Counter (G-Counter) CRDT.
@@ -105,7 +105,7 @@ class GCounter:
         return cls(counts=dict(data))
 
 
-@dataclass
+@dataclass(slots=True)
 class LWWRegister:
     """
     Last-Writer-Wins Register (LWW-Register) CRDT.
@@ -216,7 +216,7 @@ class LWWRegister:
         )
 
 
-@dataclass
+@dataclass(slots=True)
 class LWWMap:
     """
     Last-Writer-Wins Map (LWW-Map) CRDT.
@@ -309,7 +309,7 @@ class LWWMap:
         return cls(_entries=entries)
 
 
-@dataclass
+@dataclass(slots=True)
 class JobStatsCRDT:
     """
     CRDT-based job statistics for cross-datacenter aggregation.
