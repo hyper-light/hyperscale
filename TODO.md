@@ -92,7 +92,8 @@ async def cancel(self, timeout: float = 5.0):
     if self._task and not self._task.done():
         self._task.cancel()
         try:
-            await asyncio.wait_for(asyncio.shield(self._task), timeout=timeout)
+            # No shield - we already cancelled it, just waiting for cleanup
+            await asyncio.wait_for(self._task, timeout=timeout)
         except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
             pass
     # Always update status, even if timeout occurred

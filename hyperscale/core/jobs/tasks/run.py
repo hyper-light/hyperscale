@@ -112,10 +112,8 @@ class Run:
             self._task.cancel()
             try:
                 # Wait for task to handle cancellation, but don't hang forever
-                await asyncio.wait_for(
-                    asyncio.shield(self._task),
-                    timeout=timeout,
-                )
+                # No shield - we already cancelled it, just waiting for cleanup
+                await asyncio.wait_for(self._task, timeout=timeout)
             except asyncio.TimeoutError:
                 # Task didn't respond to cancellation in time - it may be orphaned
                 # but we proceed with status update to avoid blocking the caller

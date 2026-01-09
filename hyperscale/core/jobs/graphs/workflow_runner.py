@@ -74,7 +74,9 @@ async def cancel_pending(pend: asyncio.Task, timeout: float = 2.0) -> asyncio.Ta
 
         pend.cancel()
         try:
-            await asyncio.wait_for(asyncio.shield(pend), timeout=timeout)
+            # Wait for the task to finish processing the cancellation
+            # No shield - we already cancelled it, just waiting for cleanup
+            await asyncio.wait_for(pend, timeout=timeout)
         except asyncio.TimeoutError:
             # Task didn't respond to cancellation in time - may be orphaned
             pass
