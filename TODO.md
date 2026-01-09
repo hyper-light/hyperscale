@@ -633,6 +633,129 @@ This implementation must be race-condition proof in the asyncio environment:
 
 ---
 
+## 7. Gate Job Leadership Takeover Handling
+
+**Problem**: When a manager that is the job leader fails, gates need to handle the transition:
+1. Gates track which manager is the job leader for each job via `_job_leader_addrs`
+2. When job leader manager fails, gates receive `JobLeaderGateTransfer` from the new leader
+3. Gates need to handle edge cases: concurrent failures, delayed transfers, stale state
+
+**Solution**: Similar to Section 1's approach for managers, gates need orphaned job scanning when they become aware of manager failures.
+
+### Tasks
+
+- [ ] **7.1** Add `_dead_job_leaders` tracking set to GateServer
+  - Track managers confirmed dead that were job leaders
+  - Populate when SWIM detects manager death via `_on_node_dead`
+  - Clear entries when transfer received via `job_leader_gate_transfer`
+
+- [ ] **7.2** Add `_orphaned_jobs` tracking to GateServer
+  ```python
+  _orphaned_jobs: dict[str, float]  # job_id -> orphan_timestamp
+  ```
+  - Track jobs whose leader is in `_dead_job_leaders`
+  - Add timestamp when orphaned detected
+
+- [ ] **7.3** Add `_scan_for_orphaned_jobs()` method to GateServer
+  - Called when gate detects manager failure
+  - For each job in `_job_leader_addrs`, check if leader is dead
+  - Mark matching jobs as orphaned with current timestamp
+  - Do NOT cancel jobs immediately (wait for transfer)
+
+- [ ] **7.4** Add grace period handling for orphaned jobs
+  - `GATE_ORPHAN_GRACE_PERIOD` env var (default: 10.0 seconds)
+  - Grace period should be longer than manager election + takeover time
+  - Periodic checker (or integrate with existing task) monitors orphaned jobs
+  - If grace expires without transfer → mark job as failed
+
+- [ ] **7.5** Update `job_leader_gate_transfer` handler
+  - Clear job from `_orphaned_jobs` if present
+  - Clear old leader from `_dead_job_leaders` for this job
+  - Update `_job_leader_addrs` with new leader
+  - Log successful transfer
+
+- [ ] **7.6** Handle concurrent manager failures
+  - If new job leader also fails during transfer
+  - Gate should handle multiple transfer notifications
+  - Use fencing tokens/incarnation to determine latest valid leader
+
+- [ ] **7.7** Add `_handle_job_orphan_timeout()` method
+  - Called when grace period expires
+  - Notify client of job failure (push notification)
+  - Clean up job state from gate
+  - Log detailed failure information
+
+### Files
+- `hyperscale/distributed_rewrite/nodes/gate.py`
+- `hyperscale/distributed_rewrite/env.py` (for `GATE_ORPHAN_GRACE_PERIOD`)
+
+---
+
+## 8. Worker Robust Response to Job Leadership Takeover
+
+**Problem**: When a job leader manager fails and a new manager takes over, workers must robustly handle the `JobLeaderWorkerTransfer` message. Current implementation may have edge cases:
+1. Race between transfer message and ongoing workflow operations
+2. Multiple transfers in rapid succession (cascading failures)
+3. Transfer arriving for unknown workflow (stale message)
+4. Transfer validation (is the new leader legitimate?)
+
+**Solution**: Add comprehensive validation, state machine handling, and race condition protection.
+
+### Tasks
+
+- [ ] **8.1** Add `_job_leader_transfer_locks` to WorkerServer
+  ```python
+  _job_leader_transfer_locks: dict[str, asyncio.Lock]  # job_id -> lock
+  ```
+  - Per-job locks to prevent race conditions during transfer
+  - Acquire lock before processing transfer or workflow operations
+
+- [ ] **8.2** Add transfer validation in `job_leader_worker_transfer` handler
+  - Verify job_id exists in `_workflow_job_leader`
+  - Verify fencing token is newer than current (prevent stale transfers)
+  - Verify new leader is in known managers list
+  - Reject invalid transfers with detailed error response
+
+- [ ] **8.3** Add `_pending_transfers` tracking
+  ```python
+  _pending_transfers: dict[str, PendingTransfer]  # job_id -> transfer info
+  ```
+  - Track transfers that arrived before job was known (late arrival handling)
+  - Check pending transfers when new job is assigned
+  - Clean up stale pending transfers periodically
+
+- [ ] **8.4** Add transfer acknowledgment flow
+  - After processing transfer, send explicit `JobLeaderTransferAck` to new leader
+  - Include worker's current workflow state for the job
+  - New leader can verify all workers acknowledged
+
+- [ ] **8.5** Handle in-flight operations during transfer
+  - If workflow operation is in progress when transfer arrives
+  - Queue transfer, apply after operation completes
+  - Prevent partial state updates
+
+- [ ] **8.6** Add transfer metrics
+  - `worker_job_transfers_received` counter
+  - `worker_job_transfers_accepted` counter
+  - `worker_job_transfers_rejected` counter (with reason labels)
+  - `worker_job_transfer_latency` histogram
+
+- [ ] **8.7** Add detailed logging for transfer events
+  - Log old leader, new leader, job_id, fencing token
+  - Log rejection reasons clearly
+  - Log time between job leader death detection and transfer receipt
+
+- [ ] **8.8** Update `_on_node_dead` for defensive handling
+  - When manager dies, don't immediately assume it's job leader
+  - Wait for explicit transfer or orphan timeout
+  - Handle case where dead node was NOT the job leader
+
+### Files
+- `hyperscale/distributed_rewrite/nodes/worker.py`
+- `hyperscale/distributed_rewrite/models/distributed.py` (for `JobLeaderTransferAck`)
+
+---
+
 ## Dependencies
 
 - Item 1 can be done independently
@@ -641,6 +764,8 @@ This implementation must be race-condition proof in the asyncio environment:
 - Item 4 depends on Items 1, 2, 3
 - Item 5 can be done after Item 2 (uses event-driven cancellation completion)
 - Item 6 builds on Item 5's push notification chain
+- Item 7 (gate takeover) can be done after Item 1 (follows same pattern)
+- Item 8 (worker robust response) can be done after Item 3, integrates with Item 7
 
 ---
 
