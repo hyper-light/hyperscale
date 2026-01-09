@@ -22,6 +22,10 @@ from typing import Callable
 from .timing_wheel import TimingWheel, TimingWheelConfig
 from .job_suspicion_manager import JobSuspicionManager, JobSuspicionConfig
 from .suspicion_state import SuspicionState
+from hyperscale.distributed_rewrite.health.extension_tracker import (
+    ExtensionTracker,
+    ExtensionTrackerConfig,
+)
 
 
 # Type aliases
@@ -70,6 +74,13 @@ class HierarchicalConfig:
     max_global_suspicions: int = 10000
     max_job_suspicions_per_job: int = 1000
     max_total_job_suspicions: int = 50000
+
+    # AD-26: Adaptive healthcheck extension settings
+    extension_base_deadline: float = 30.0
+    extension_min_grant: float = 1.0
+    extension_max_extensions: int = 5
+    extension_warning_threshold: int = 1
+    extension_grace_period: float = 10.0
 
 
 @dataclass
@@ -167,6 +178,22 @@ class HierarchicalFailureDetector:
         self._job_deaths: int = 0
         self._reconciliations: int = 0
         self._job_suspicions_cleared_by_global: int = 0
+
+        # AD-26: Per-node extension trackers for adaptive healthcheck extensions
+        self._extension_trackers: dict[NodeAddress, ExtensionTracker] = {}
+        self._extension_tracker_config = ExtensionTrackerConfig(
+            base_deadline=config.extension_base_deadline,
+            min_grant=config.extension_min_grant,
+            max_extensions=config.extension_max_extensions,
+            warning_threshold=config.extension_warning_threshold,
+            grace_period=config.extension_grace_period,
+        )
+
+        # Extension stats
+        self._extensions_requested: int = 0
+        self._extensions_granted: int = 0
+        self._extensions_denied: int = 0
+        self._extension_warnings_sent: int = 0
 
     def _get_current_n_members(self) -> int:
         """Get current global member count."""
@@ -288,6 +315,8 @@ class HierarchicalFailureDetector:
             state = await self._global_wheel.get_state(node)
             if state and incarnation > state.incarnation:
                 await self._global_wheel.remove(node)
+                # Reset extension tracker - node is healthy again (AD-26)
+                self.reset_extension_tracker(node)
                 return True
             return False
 
@@ -302,6 +331,128 @@ class HierarchicalFailureDetector:
                 self._globally_dead.discard(node)
                 return True
             return False
+
+    # =========================================================================
+    # AD-26: Adaptive Healthcheck Extensions
+    # =========================================================================
+
+    def _get_or_create_extension_tracker(self, node: NodeAddress) -> ExtensionTracker:
+        """Get or create an ExtensionTracker for a node."""
+        if node not in self._extension_trackers:
+            worker_id = f"{node[0]}:{node[1]}"
+            self._extension_trackers[node] = self._extension_tracker_config.create_tracker(
+                worker_id
+            )
+        return self._extension_trackers[node]
+
+    async def request_extension(
+        self,
+        node: NodeAddress,
+        reason: str,
+        current_progress: float,
+    ) -> tuple[bool, float, str | None, bool]:
+        """
+        Request a deadline extension for a suspected node (AD-26).
+
+        Workers can request extensions when busy with legitimate work.
+        Extensions are granted with logarithmic decay: max(min_grant, base / 2^n).
+        Progress must be demonstrated to get an extension.
+
+        Args:
+            node: The node requesting an extension.
+            reason: Reason for requesting extension (for logging).
+            current_progress: Current progress metric (must increase to show progress).
+
+        Returns:
+            Tuple of (granted, extension_seconds, denial_reason, is_warning).
+            - granted: True if extension was granted
+            - extension_seconds: Amount of time granted (0 if denied)
+            - denial_reason: Reason for denial, or None if granted
+            - is_warning: True if this is a warning about impending exhaustion
+        """
+        self._extensions_requested += 1
+
+        async with self._lock:
+            # Check if node is actually suspected at global level
+            state = await self._global_wheel.get_state(node)
+            if state is None:
+                return (
+                    False,
+                    0.0,
+                    "Node is not currently suspected",
+                    False,
+                )
+
+            # Get or create tracker for this node
+            tracker = self._get_or_create_extension_tracker(node)
+
+            # Request the extension
+            granted, extension_seconds, denial_reason, is_warning = tracker.request_extension(
+                reason=reason,
+                current_progress=current_progress,
+            )
+
+            if granted:
+                self._extensions_granted += 1
+
+                # Extend the suspicion timer in the timing wheel
+                current_expiration = state.start_time + state.calculate_timeout()
+                new_expiration = tracker.get_new_deadline(
+                    current_deadline=current_expiration,
+                    grant=extension_seconds,
+                )
+                await self._global_wheel.update_expiration(node, new_expiration)
+
+                if is_warning:
+                    self._extension_warnings_sent += 1
+            else:
+                self._extensions_denied += 1
+
+            return (granted, extension_seconds, denial_reason, is_warning)
+
+    def reset_extension_tracker(self, node: NodeAddress) -> None:
+        """
+        Reset the extension tracker for a node.
+
+        Call this when:
+        - A node becomes healthy again (suspicion cleared)
+        - A new workflow/job starts on the node
+        """
+        if node in self._extension_trackers:
+            self._extension_trackers[node].reset()
+
+    def remove_extension_tracker(self, node: NodeAddress) -> None:
+        """
+        Remove the extension tracker for a node.
+
+        Call this when a node is declared dead to clean up resources.
+        """
+        self._extension_trackers.pop(node, None)
+
+    def get_extension_tracker(self, node: NodeAddress) -> ExtensionTracker | None:
+        """Get the extension tracker for a node (for debugging/monitoring)."""
+        return self._extension_trackers.get(node)
+
+    def get_extension_status(self, node: NodeAddress) -> dict[str, float | int | bool] | None:
+        """
+        Get extension status for a node.
+
+        Returns None if no tracker exists for the node.
+        """
+        tracker = self._extension_trackers.get(node)
+        if tracker is None:
+            return None
+
+        return {
+            "extension_count": tracker.extension_count,
+            "remaining_extensions": tracker.get_remaining_extensions(),
+            "total_extended": tracker.total_extended,
+            "is_exhausted": tracker.is_exhausted,
+            "is_in_grace_period": tracker.is_in_grace_period,
+            "grace_period_remaining": tracker.grace_period_remaining,
+            "should_evict": tracker.should_evict,
+            "warning_sent": tracker.warning_sent,
+        }
 
     # =========================================================================
     # Job Layer Operations
@@ -441,9 +592,13 @@ class HierarchicalFailureDetector:
 
         This is called synchronously by the timing wheel.
         """
+        print(f"[DEBUG HierarchicalDetector] EXPIRATION: node={node}, incarnation={state.incarnation}")
         # Mark as globally dead
         self._globally_dead.add(node)
         self._global_deaths += 1
+
+        # Clean up extension tracker for this node (AD-26)
+        self.remove_extension_tracker(node)
 
         # Record event
         event = FailureEvent(
@@ -589,6 +744,13 @@ class HierarchicalFailureDetector:
             "wheel_entries_added": global_stats["entries_added"],
             "wheel_entries_expired": global_stats["entries_expired"],
             "wheel_cascade_count": global_stats["cascade_count"],
+
+            # AD-26: Extension stats
+            "extensions_requested": self._extensions_requested,
+            "extensions_granted": self._extensions_granted,
+            "extensions_denied": self._extensions_denied,
+            "extension_warnings_sent": self._extension_warnings_sent,
+            "active_extension_trackers": len(self._extension_trackers),
         }
 
     def get_recent_events(self, limit: int = 10) -> list[FailureEvent]:
