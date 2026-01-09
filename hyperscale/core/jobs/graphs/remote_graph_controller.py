@@ -163,6 +163,11 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
         self._expected_workers: int = 0
         self._workers_ready_event: asyncio.Event | None = None
 
+        # Event-driven cancellation completion tracking
+        # Tracks expected nodes and fires event when all report terminal cancellation status
+        self._cancellation_completion_events: Dict[int, Dict[str, asyncio.Event]] = defaultdict(dict)
+        self._cancellation_expected_nodes: Dict[int, Dict[str, set[int]]] = defaultdict(lambda: defaultdict(set))
+
     async def start_server(
         self,
         cert_path: str | None = None,
@@ -454,6 +459,10 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
                 if status == WorkflowStatus.RUNNING
             ]
 
+            # Set up event-driven cancellation completion tracking
+            self._cancellation_expected_nodes[run_id][workflow_name] = set(expected_nodes)
+            self._cancellation_completion_events[run_id][workflow_name] = asyncio.Event()
+
             initial_cancellation_updates = await asyncio.gather(*[
                 self.request_workflow_cancellation(
                     run_id,
@@ -490,6 +499,44 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
                 expected_nodes,
             )
 
+    async def await_workflow_cancellation(
+        self,
+        run_id: int,
+        workflow_name: str,
+        timeout: float | None = None,
+    ) -> bool:
+        """
+        Wait for all nodes to report terminal cancellation status.
+
+        This is an event-driven wait that fires when all nodes assigned to the
+        workflow have reported either CANCELLED or FAILED status via
+        receive_cancellation_update.
+
+        Args:
+            run_id: The run ID of the workflow
+            workflow_name: The name of the workflow
+            timeout: Optional timeout in seconds. If None, waits indefinitely.
+
+        Returns:
+            True if all nodes reported terminal status, False if timeout occurred.
+        """
+        completion_event = self._cancellation_completion_events.get(run_id, {}).get(workflow_name)
+
+        if completion_event is None:
+            # No cancellation was initiated for this workflow
+            return True
+
+        if completion_event.is_set():
+            return True
+
+        try:
+            if timeout is not None:
+                await asyncio.wait_for(completion_event.wait(), timeout=timeout)
+            else:
+                await completion_event.wait()
+            return True
+        except asyncio.TimeoutError:
+            return False
 
     async def wait_for_workers(
         self,
@@ -991,14 +1038,33 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
 
             run_id = cancellation.run_id
             workflow_name = cancellation.data.workflow_name
+            status = cancellation.data.status
 
             async with self._cancellation_write_lock[run_id][workflow_name][node_id]:
                 self._cancellations[run_id][workflow_name][node_id] = cancellation.data
 
+            # Check if this is a terminal status (CANCELLED or FAILED)
+            terminal_statuses = {
+                WorkflowCancellationStatus.CANCELLED.value,
+                WorkflowCancellationStatus.FAILED.value,
+            }
+
+            if status in terminal_statuses:
+                # Remove this node from expected set
+                expected_nodes = self._cancellation_expected_nodes.get(run_id, {}).get(workflow_name)
+                if expected_nodes is not None:
+                    expected_nodes.discard(node_id)
+
+                    # If all expected nodes have reported terminal status, fire the event
+                    if len(expected_nodes) == 0:
+                        completion_event = self._cancellation_completion_events.get(run_id, {}).get(workflow_name)
+                        if completion_event is not None and not completion_event.is_set():
+                            completion_event.set()
+
             return JobContext(
                 data=WorkflowCancellationUpdate(
                     workflow_name=workflow_name,
-                    status=cancellation.data.status,
+                    status=status,
                 ),
                 run_id=run_id,
             )
@@ -1160,11 +1226,10 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
         timeout: int,
     ):
         try:
+
+            self._workflows.request_cancellation()
             await asyncio.wait_for(
-                self.tasks.cancel(
-                    "run_workflow",
-                    workflow_run_id,
-                ),
+                self._workflows.await_cancellation(),
                 timeout=timeout,
             )
 
@@ -1504,6 +1569,8 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
                     self._memory_usage_stats,
                     self._completion_write_lock,
                     self._cancellation_write_lock,
+                    self._cancellation_completion_events,
+                    self._cancellation_expected_nodes,
                 ]
 
                 # Data structures keyed only by run_id (cleaned when all workflows done)

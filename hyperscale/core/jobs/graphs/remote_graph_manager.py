@@ -770,7 +770,7 @@ class RemoteGraphManager:
                         failed_workflows.append(pending.workflow_name)
 
         return failed_workflows
-
+    
     async def execute_workflow(
         self,
         run_id: int,
@@ -1464,6 +1464,33 @@ class RemoteGraphManager:
             workflow_name=workflow,
             cancellation_status_counts=cancellation_status_counts,
             expected_cancellations=expected_nodes,
+        )
+
+    async def await_workflow_cancellation(
+        self,
+        run_id: int,
+        workflow: str,
+        timeout: float | None = None,
+    ) -> bool:
+        """
+        Wait for all nodes to report terminal cancellation status.
+
+        This is an event-driven wait that fires when all nodes assigned to the
+        workflow have reported either CANCELLED or FAILED status. Use this after
+        calling cancel_workflow() to wait for complete cancellation.
+
+        Args:
+            run_id: The run ID of the workflow
+            workflow: The name of the workflow
+            timeout: Optional timeout in seconds. If None, waits indefinitely.
+
+        Returns:
+            True if all nodes reported terminal status, False if timeout occurred.
+        """
+        return await self._controller.await_workflow_cancellation(
+            run_id,
+            workflow,
+            timeout=timeout,
         )
 
     async def get_cancelation_update(
