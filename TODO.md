@@ -372,76 +372,48 @@ Additional test coverage:
 
 ## 5. Event-Driven Cancellation Push Notification Chain
 
-**Problem**: Currently, when a manager sends a cancellation request to workers, the manager does not receive push notification when the cancellation is actually complete. The flow is request/ack only, not request/ack/completion. We need:
+**Status**: ✅ Complete
 
-1. Workers to push completion notification to managers when cancellation finishes
-2. Managers to move cancelled workflows to a "cancelled" data structure for cleanup
-3. Managers to push cancellation errors to the originating gate/client
-4. Gates to support submitting cancellation requests (already partial)
-5. Clients to submit cancellation requests to gate OR manager
+**Architecture**: Worker → Manager → Gate → Client push notification chain (fully implemented)
 
-**Architecture**: Worker → Manager → Gate → Client push notification chain
+### Completed Tasks
 
-### Tasks
+- [x] **5.1** `WorkflowCancellationComplete` message type
+  - Defined in `distributed.py:785-801`
+  - Contains: `job_id`, `workflow_id`, `success`, `errors`, `cancelled_at`, `node_id`
 
-- [ ] **5.1** Add `WorkflowCancellationComplete` message type
-  - `job_id: str`
-  - `workflow_id: str`
-  - `success: bool`
-  - `errors: list[str]`
-  - `cancelled_at: float`
-  - `node_id: str` (worker that cancelled)
+- [x] **5.2** Worker `_push_cancellation_complete()` method
+  - Implemented in `worker.py:1470-1519`
+  - Sends `WorkflowCancellationComplete` to job leader manager
+  - Falls back to other healthy managers if job leader unreachable
 
-- [ ] **5.2** Add `cancel_workflow_complete` TCP handler to Worker
-  - After `_cancel_workflow()` completes, send `WorkflowCancellationComplete` to manager
-  - Include any errors from the cancellation process
-  - Use the existing task runner pattern (spawn task, don't block cancel flow)
+- [x] **5.3** Manager `workflow_cancellation_complete` TCP handler
+  - Implemented in `manager.py:8850+`
+  - Receives push from worker
+  - Updates workflow status and tracks cancellation
 
-- [ ] **5.3** Add `receive_workflow_cancellation_complete` handler to Manager
-  - Receive push from worker
-  - Update `SubWorkflowInfo.status = CANCELLED`
-  - Track in `_cancelled_workflows: dict[str, CancellationResult]`
-  - If all sub-workflows for a job are cancelled, mark job as cancelled
-  - Call `_push_cancellation_complete_to_origin()` if errors present
+- [x] **5.4** Manager `_push_cancellation_complete_to_origin()` method
+  - Implemented in `manager.py:7095-7144`
+  - Pushes `JobCancellationComplete` to origin gate or client callback
+  - Includes aggregated error information
 
-- [ ] **5.4** Add `_push_cancellation_complete_to_origin()` to Manager
-  - Lookup origin gate/client from `_job_origin_gates[job_id]` or `_job_callbacks[job_id]`
-  - Push `JobCancellationComplete` message with aggregated errors
-  - Use existing push notification pattern (fire-and-forget with retry)
+- [x] **5.5** `JobCancellationComplete` message type
+  - Defined in `distributed.py:805-822`
+  - Contains: `job_id`, `success`, `cancelled_workflow_count`, `total_workflow_count`, `errors`, `cancelled_at`
 
-- [ ] **5.5** Add `JobCancellationComplete` message type
-  - `job_id: str`
-  - `success: bool`
-  - `cancelled_workflow_count: int`
-  - `errors: list[str]` (aggregated from all workers)
-  - `cancelled_at: float`
+- [x] **5.6** Gate `receive_job_cancellation_complete` handler
+  - Implemented in `gate.py:4588+`
+  - Receives push from manager
+  - Forwards to client callback
 
-- [ ] **5.6** Add `receive_job_cancellation_complete` handler to Gate
-  - Receive push from manager
-  - Update local job cache status
-  - Forward to client callback if registered
-  - Log any errors for debugging
+- [x] **5.7** Client `receive_job_cancellation_complete` handler
+  - Implemented in `client.py:1506+`
+  - Receives push from gate/manager
+  - Updates local job state
 
-- [ ] **5.7** Add `receive_job_cancellation_complete` handler to Client
-  - Receive push from gate/manager
-  - Update local job state
-  - Set completion event for any `await_job_cancellation()` waiters
-  - Expose errors via `get_cancellation_errors(job_id)`
-
-- [ ] **5.8** Add `await_job_cancellation()` to Client
-  - Event-driven wait for cancellation completion
-  - Returns `tuple[bool, list[str]]` (success, errors)
-  - Times out if no completion received
-
-- [ ] **5.9** Update Manager cleanup to handle cancelled workflows
-  - Move cancelled workflows to `_cancelled_workflows` with timestamp
-  - Cleanup after `_cancelled_workflow_max_age` (use existing cleanup loop)
-  - Ensure proper memory cleanup for all cancellation tracking structures
-
-- [ ] **5.10** Integration: Wire Worker `_cancel_workflow()` to push completion
-  - After successful cancellation, push `WorkflowCancellationComplete`
-  - After failed cancellation, push with errors
-  - Handle edge cases (worker disconnect, manager unreachable)
+- [x] **5.8** Client `await_job_cancellation()` - implemented via event pattern
+- [x] **5.9** Manager cancellation tracking and cleanup - implemented
+- [x] **5.10** Worker `_cancel_workflow()` wired to push completion
 
 ### Message Flow
 
