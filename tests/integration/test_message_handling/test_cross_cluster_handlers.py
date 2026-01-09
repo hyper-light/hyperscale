@@ -68,21 +68,22 @@ class TestXProbeHandlerHappyPath:
 
 
 class TestXProbeHandlerCustomResponder:
-    """Tests for XProbeHandler with custom responder."""
+    """Tests for XProbeHandler with custom server responder."""
 
     @pytest.mark.asyncio
     async def test_handle_xprobe_custom_response(
         self, mock_server: MockServerInterface
     ) -> None:
-        """XProbeHandler can be subclassed for custom xack response."""
+        """XProbeHandler uses server's build_xprobe_response for custom xack response."""
+        # Configure mock server to return custom response
+        async def custom_build_xprobe_response(
+            source_addr: tuple[str, int], probe_data: bytes
+        ) -> bytes | None:
+            return b"custom_ack_data"
 
-        class CustomXProbeHandler(XProbeHandler):
-            async def _build_xprobe_response(
-                self, source_addr: tuple[str, int], probe_data: bytes
-            ) -> bytes | None:
-                return b"custom_ack_data"
+        mock_server.build_xprobe_response = custom_build_xprobe_response
 
-        handler = CustomXProbeHandler(mock_server)
+        handler = XProbeHandler(mock_server)
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
             target=("127.0.0.1", 9000),
@@ -175,22 +176,24 @@ class TestXAckHandlerHappyPath:
 
 
 class TestXAckHandlerCustomProcessor:
-    """Tests for XAckHandler with custom processor."""
+    """Tests for XAckHandler with custom server processor."""
 
     @pytest.mark.asyncio
     async def test_handle_xack_custom_processing(
         self, mock_server: MockServerInterface
     ) -> None:
-        """XAckHandler can be subclassed for custom processing."""
+        """XAckHandler uses server's handle_xack_response for custom processing."""
         processed_data = []
 
-        class CustomXAckHandler(XAckHandler):
-            async def _handle_xack_response(
-                self, source_addr: tuple[str, int], ack_data: bytes
-            ) -> None:
-                processed_data.append((source_addr, ack_data))
+        # Configure mock server to capture processed data
+        async def custom_handle_xack_response(
+            source_addr: tuple[str, int], response_data: bytes
+        ) -> None:
+            processed_data.append((source_addr, response_data))
 
-        handler = CustomXAckHandler(mock_server)
+        mock_server.handle_xack_response = custom_handle_xack_response
+
+        handler = XAckHandler(mock_server)
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
             target=("127.0.0.1", 9000),
