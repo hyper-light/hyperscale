@@ -61,6 +61,7 @@ The minimal-impact bool flag approach has been implemented:
 - [x] **2.0g** Fix `Run.cancel()` to use timeout and always update status
 - [x] **2.0h** Add event-driven workflow completion signaling
 - [x] **2.0i** Fix `cancel_pending()` to use timeout and consistent return type
+- [x] **2.0j** Add done callback to prevent memory leaks in hung task cancellation
 
 **Files modified**:
 - `hyperscale/core/jobs/graphs/workflow_runner.py`
@@ -125,6 +126,48 @@ cancel_workflow_background()
             │
             └─► Event fires when _execute_*_workflow completes
 ```
+
+### Completed: Memory-Leak-Free Task Cancellation
+
+**Problem**: Fire-and-forget task cancellation could leak memory when tasks are stuck in syscalls (SSL, network operations). Python's asyncio keeps task objects alive if their exception is never retrieved. This is critical when cancelling millions of hung network requests.
+
+**Solution**: Use `add_done_callback` to ensure exception retrieval even for stuck tasks.
+
+```python
+def _retrieve_task_exception(task: asyncio.Task) -> None:
+    """
+    Done callback to retrieve a task's exception and prevent memory leaks.
+    """
+    try:
+        task.exception()
+    except (asyncio.CancelledError, asyncio.InvalidStateError, Exception):
+        pass
+
+
+def cancel_and_release_task(pend: asyncio.Task) -> None:
+    """
+    Cancel a task and guarantee no memory leaks, even for hung tasks.
+    """
+    try:
+        if pend.done():
+            # Task already finished - retrieve exception now
+            try:
+                pend.exception()
+            except (asyncio.CancelledError, asyncio.InvalidStateError, Exception):
+                pass
+        else:
+            # Task still running - cancel and add callback for when it finishes
+            # The callback ensures exception is retrieved even if task is stuck
+            pend.add_done_callback(_retrieve_task_exception)
+            pend.cancel()
+    except Exception:
+        pass
+```
+
+**Key insight**: The done callback fires when the task eventually finishes (even if stuck for a long time), ensuring:
+1. Exception is retrieved → no "exception never retrieved" warnings
+2. Task object can be garbage collected → no memory leaks
+3. Works even for tasks stuck in SSL/network syscalls
 
 ### Current Architecture Documentation
 
