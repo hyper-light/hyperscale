@@ -32,7 +32,6 @@ class TestAliveHandlerHappyPath:
         handler = AliveHandler(mock_server)
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=("192.168.1.2", 9001),
             target_addr_bytes=b"192.168.1.2:9001",
             message_type=b"alive",
@@ -55,7 +54,6 @@ class TestAliveHandlerHappyPath:
 
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=("192.168.1.2", 9001),
             target_addr_bytes=b"192.168.1.2:9001",
             message_type=b"alive",
@@ -76,7 +74,6 @@ class TestAliveHandlerHappyPath:
         handler = AliveHandler(mock_server)
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=("192.168.1.2", 9001),
             target_addr_bytes=b"192.168.1.2:9001",
             message_type=b"alive",
@@ -96,7 +93,6 @@ class TestAliveHandlerHappyPath:
         handler = AliveHandler(mock_server)
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=("192.168.1.2", 9001),
             target_addr_bytes=b"192.168.1.2:9001",
             message_type=b"alive",
@@ -125,7 +121,6 @@ class TestAliveHandlerNegativePath:
         handler = AliveHandler(mock_server)
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=("192.168.1.2", 9001),
             target_addr_bytes=b"192.168.1.2:9001",
             message_type=b"alive",
@@ -146,7 +141,6 @@ class TestAliveHandlerNegativePath:
         handler = AliveHandler(mock_server)
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=None,
             target_addr_bytes=None,
             message_type=b"alive",
@@ -175,7 +169,6 @@ class TestAliveHandlerEdgeCases:
 
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=("192.168.1.2", 9001),
             target_addr_bytes=b"192.168.1.2:9001",
             message_type=b"alive",
@@ -195,7 +188,6 @@ class TestAliveHandlerEdgeCases:
         handler = AliveHandler(mock_server)
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=("192.168.1.2", 9001),
             target_addr_bytes=b"192.168.1.2:9001",
             message_type=b"alive",
@@ -228,7 +220,6 @@ class TestSuspectHandlerHappyPath:
         handler = SuspectHandler(mock_server)
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=("192.168.1.2", 9001),
             target_addr_bytes=b"192.168.1.2:9001",
             message_type=b"suspect",
@@ -248,7 +239,6 @@ class TestSuspectHandlerHappyPath:
         handler = SuspectHandler(mock_server)
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=("192.168.1.2", 9001),
             target_addr_bytes=b"192.168.1.2:9001",
             message_type=b"suspect",
@@ -268,7 +258,6 @@ class TestSuspectHandlerHappyPath:
         handler = SuspectHandler(mock_server)
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=("127.0.0.1", 9000),  # Self
             target_addr_bytes=b"127.0.0.1:9000",
             message_type=b"suspect",
@@ -295,7 +284,6 @@ class TestSuspectHandlerNegativePath:
         handler = SuspectHandler(mock_server)
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=("192.168.1.2", 9001),
             target_addr_bytes=b"192.168.1.2:9001",
             message_type=b"suspect",
@@ -315,7 +303,6 @@ class TestSuspectHandlerNegativePath:
         handler = SuspectHandler(mock_server)
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=None,
             target_addr_bytes=None,
             message_type=b"suspect",
@@ -340,7 +327,6 @@ class TestSuspectHandlerEdgeCases:
         handler = SuspectHandler(mock_server)
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=("127.0.0.1", 9000),
             target_addr_bytes=b"127.0.0.1:9000",
             message_type=b"suspect",
@@ -361,7 +347,6 @@ class TestSuspectHandlerEdgeCases:
         handler = SuspectHandler(mock_server)
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=("192.168.1.2", 9001),
             target_addr_bytes=b"192.168.1.2:9001",
             message_type=b"suspect",
@@ -383,7 +368,6 @@ class TestSuspectHandlerEdgeCases:
         handler = SuspectHandler(mock_server)
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=("192.168.1.2", 9001),
             target_addr_bytes=b"192.168.1.2:9001",
             message_type=b"suspect",
@@ -419,7 +403,6 @@ class TestSuspicionHandlersConcurrency:
         async def handle_alive(index: int) -> None:
             context = MessageContext(
                 source_addr=("192.168.1.1", 8000 + index),
-                source_addr_string=f"192.168.1.1:{8000 + index}",
                 target=("192.168.1.2", 9001),
                 target_addr_bytes=b"192.168.1.2:9001",
                 message_type=b"alive",
@@ -444,7 +427,6 @@ class TestSuspicionHandlersConcurrency:
         async def handle_suspect(index: int) -> None:
             context = MessageContext(
                 source_addr=("192.168.1.1", 8000 + index),
-                source_addr_string=f"192.168.1.1:{8000 + index}",
                 target=("192.168.1.2", 9001),
                 target_addr_bytes=b"192.168.1.2:9001",
                 message_type=b"suspect",
@@ -472,7 +454,6 @@ class TestSuspicionHandlersFailureModes:
         # First call
         context1 = MessageContext(
             source_addr=("192.168.1.1", 8001),
-            source_addr_string="192.168.1.1:8001",
             target=("192.168.1.2", 9001),
             target_addr_bytes=b"192.168.1.2:9001",
             message_type=b"alive",
@@ -484,7 +465,6 @@ class TestSuspicionHandlersFailureModes:
         # Second call
         context2 = MessageContext(
             source_addr=("192.168.1.1", 8002),
-            source_addr_string="192.168.1.1:8002",
             target=("192.168.1.3", 9002),
             target_addr_bytes=b"192.168.1.3:9002",
             message_type=b"alive",

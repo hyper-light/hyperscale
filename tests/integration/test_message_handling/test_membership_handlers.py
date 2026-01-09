@@ -35,7 +35,6 @@ class TestAckHandlerHappyPath:
         handler = AckHandler(mock_server)
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=("127.0.0.1", 9000),
             target_addr_bytes=b"127.0.0.1:9000",
             message_type=b"ack",
@@ -56,7 +55,6 @@ class TestAckHandlerHappyPath:
         handler = AckHandler(mock_server)
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=None,
             target_addr_bytes=None,
             message_type=b"ack",
@@ -81,7 +79,6 @@ class TestAckHandlerHappyPath:
 
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=None,
             target_addr_bytes=None,
             message_type=b"ack",
@@ -102,7 +99,6 @@ class TestAckHandlerHappyPath:
         handler = AckHandler(mock_server)
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=None,
             target_addr_bytes=None,
             message_type=b"ack",
@@ -126,7 +122,6 @@ class TestAckHandlerNegativePath:
         handler = AckHandler(mock_server)
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=("192.168.1.99", 9000),
             target_addr_bytes=b"192.168.1.99:9000",
             message_type=b"ack",
@@ -147,7 +142,6 @@ class TestAckHandlerNegativePath:
         handler = AckHandler(mock_server)
         context = MessageContext(
             source_addr=("192.168.1.99", 8000),
-            source_addr_string="192.168.1.99:8000",
             target=None,
             target_addr_bytes=None,
             message_type=b"ack",
@@ -176,7 +170,6 @@ class TestAckHandlerEdgeCases:
 
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=None,
             target_addr_bytes=None,
             message_type=b"ack",
@@ -209,7 +202,6 @@ class TestNackHandlerHappyPath:
         handler = NackHandler(mock_server)
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=None,
             target_addr_bytes=None,
             message_type=b"nack",
@@ -230,7 +222,6 @@ class TestNackHandlerHappyPath:
         handler = NackHandler(mock_server)
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=None,
             target_addr_bytes=None,
             message_type=b"nack",
@@ -252,7 +243,6 @@ class TestNackHandlerHappyPath:
         handler = NackHandler(mock_server)
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=None,
             target_addr_bytes=None,
             message_type=b"nack",
@@ -289,7 +279,6 @@ class TestJoinHandlerHappyPath:
         handler = JoinHandler(mock_server)
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=("192.168.1.2", 9001),
             target_addr_bytes=b"v1.0|192.168.1.2:9001",
             message_type=b"join",
@@ -309,7 +298,6 @@ class TestJoinHandlerHappyPath:
         handler = JoinHandler(mock_server)
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=("192.168.1.2", 9001),
             target_addr_bytes=b"v1.0|192.168.1.2:9001",
             message_type=b"join",
@@ -334,7 +322,6 @@ class TestJoinHandlerNegativePath:
         handler = JoinHandler(mock_server)
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=("192.168.1.2", 9001),
             target_addr_bytes=b"192.168.1.2:9001",  # No version prefix
             message_type=b"join",
@@ -356,7 +343,6 @@ class TestJoinHandlerNegativePath:
         handler = JoinHandler(mock_server)
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=("192.168.1.2", 9001),
             target_addr_bytes=b"v1.0|192.168.1.2:9001",
             message_type=b"join",
@@ -378,7 +364,6 @@ class TestJoinHandlerEdgeCases:
         handler = JoinHandler(mock_server)
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=("127.0.0.1", 9000),  # Self address
             target_addr_bytes=b"v1.0|127.0.0.1:9000",
             message_type=b"join",
@@ -413,7 +398,6 @@ class TestLeaveHandlerHappyPath:
         handler = LeaveHandler(mock_server)
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=("192.168.1.2", 9001),
             target_addr_bytes=b"192.168.1.2:9001",
             message_type=b"leave",
@@ -438,7 +422,6 @@ class TestLeaveHandlerNegativePath:
         handler = LeaveHandler(mock_server)
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=("192.168.1.2", 9001),
             target_addr_bytes=b"192.168.1.2:9001",
             message_type=b"leave",
@@ -458,7 +441,6 @@ class TestLeaveHandlerNegativePath:
         handler = LeaveHandler(mock_server)
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=("192.168.1.99", 9001),  # Not in nodes
             target_addr_bytes=b"192.168.1.99:9001",
             message_type=b"leave",
@@ -480,7 +462,6 @@ class TestLeaveHandlerEdgeCases:
         handler = LeaveHandler(mock_server)
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=("127.0.0.1", 9000),  # Self address
             target_addr_bytes=b"127.0.0.1:9000",
             message_type=b"leave",
@@ -515,7 +496,6 @@ class TestMembershipHandlersConcurrency:
         async def handle_ack(index: int) -> None:
             context = MessageContext(
                 source_addr=("192.168.1.1", 8000 + index),
-                source_addr_string=f"192.168.1.1:{8000 + index}",
                 target=None,
                 target_addr_bytes=None,
                 message_type=b"ack",
@@ -540,7 +520,6 @@ class TestMembershipHandlersConcurrency:
         async def handle_join(index: int) -> None:
             context = MessageContext(
                 source_addr=("192.168.1.1", 8000),
-                source_addr_string="192.168.1.1:8000",
                 target=("127.0.0.1", 9000),  # Self join for simplicity
                 target_addr_bytes=b"v1.0|127.0.0.1:9000",
                 message_type=b"join",

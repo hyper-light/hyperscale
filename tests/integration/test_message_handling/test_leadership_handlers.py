@@ -46,7 +46,6 @@ class TestLeaderClaimHandlerHappyPath:
         handler = LeaderClaimHandler(mock_server)
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=("192.168.1.2", 9001),
             target_addr_bytes=b"192.168.1.2:9001",
             message_type=b"leader-claim",
@@ -68,7 +67,6 @@ class TestLeaderClaimHandlerHappyPath:
         handler = LeaderClaimHandler(mock_server)
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=None,
             target_addr_bytes=None,
             message_type=b"leader-claim",
@@ -102,7 +100,6 @@ class TestLeaderVoteHandlerHappyPath:
         handler = LeaderVoteHandler(mock_server)
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=None,
             target_addr_bytes=None,
             message_type=b"leader-vote",
@@ -127,7 +124,6 @@ class TestLeaderVoteHandlerNegativePath:
         handler = LeaderVoteHandler(mock_server)
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=None,
             target_addr_bytes=None,
             message_type=b"leader-vote",
@@ -162,7 +158,6 @@ class TestLeaderElectedHandlerHappyPath:
         handler = LeaderElectedHandler(mock_server)
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=("192.168.1.2", 9001),
             target_addr_bytes=b"192.168.1.2:9001",
             message_type=b"leader-elected",
@@ -186,7 +181,6 @@ class TestLeaderElectedHandlerNegativePath:
         handler = LeaderElectedHandler(mock_server)
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=("127.0.0.1", 9000),  # Self
             target_addr_bytes=b"127.0.0.1:9000",
             message_type=b"leader-elected",
@@ -221,7 +215,6 @@ class TestLeaderHeartbeatHandlerHappyPath:
         handler = LeaderHeartbeatHandler(mock_server)
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=("192.168.1.2", 9001),
             target_addr_bytes=b"192.168.1.2:9001",
             message_type=b"leader-heartbeat",
@@ -246,7 +239,6 @@ class TestLeaderHeartbeatHandlerNegativePath:
         handler = LeaderHeartbeatHandler(mock_server)
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),  # Different from self
-            source_addr_string="192.168.1.1:8000",
             target=("127.0.0.1", 9000),  # Self
             target_addr_bytes=b"127.0.0.1:9000",
             message_type=b"leader-heartbeat",
@@ -281,7 +273,6 @@ class TestLeaderHeartbeatHandlerEdgeCases:
         handler = LeaderHeartbeatHandler(mock_server)
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=("192.168.1.2", 9001),  # Different leader
             target_addr_bytes=b"192.168.1.2:9001",
             message_type=b"leader-heartbeat",
@@ -315,7 +306,6 @@ class TestLeaderStepdownHandlerHappyPath:
         handler = LeaderStepdownHandler(mock_server)
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=("192.168.1.2", 9001),
             target_addr_bytes=b"192.168.1.2:9001",
             message_type=b"leader-stepdown",
@@ -335,7 +325,6 @@ class TestLeaderStepdownHandlerHappyPath:
         handler = LeaderStepdownHandler(mock_server)
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=None,
             target_addr_bytes=None,
             message_type=b"leader-stepdown",
@@ -368,7 +357,6 @@ class TestPreVoteReqHandlerHappyPath:
         handler = PreVoteReqHandler(mock_server)
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=("192.168.1.2", 9001),
             target_addr_bytes=b"192.168.1.2:9001",
             message_type=b"pre-vote-req",
@@ -390,7 +378,6 @@ class TestPreVoteReqHandlerHappyPath:
         handler = PreVoteReqHandler(mock_server)
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=None,
             target_addr_bytes=None,
             message_type=b"pre-vote-req",
@@ -424,7 +411,6 @@ class TestPreVoteRespHandlerHappyPath:
         handler = PreVoteRespHandler(mock_server)
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=None,
             target_addr_bytes=None,
             message_type=b"pre-vote-resp",
@@ -449,7 +435,6 @@ class TestPreVoteRespHandlerNegativePath:
         handler = PreVoteRespHandler(mock_server)
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=None,
             target_addr_bytes=None,
             message_type=b"pre-vote-resp",
@@ -486,7 +471,6 @@ class TestLeadershipHandlersConcurrency:
         async def handle_heartbeat(index: int) -> None:
             context = MessageContext(
                 source_addr=("192.168.1.1", 8000 + index),
-                source_addr_string=f"192.168.1.1:{8000 + index}",
                 target=("192.168.1.2", 9001),
                 target_addr_bytes=b"192.168.1.2:9001",
                 message_type=b"leader-heartbeat",
@@ -511,7 +495,6 @@ class TestLeadershipHandlersConcurrency:
         async def handle_claim(index: int) -> None:
             context = MessageContext(
                 source_addr=("192.168.1.1", 8000),
-                source_addr_string="192.168.1.1:8000",
                 target=("192.168.1.2", 9001),
                 target_addr_bytes=b"192.168.1.2:9001",
                 message_type=b"leader-claim",
@@ -540,7 +523,6 @@ class TestLeadershipHandlersFailureModes:
         for i in range(5):
             context = MessageContext(
                 source_addr=("192.168.1.1", 8000 + i),
-                source_addr_string=f"192.168.1.1:{8000 + i}",
                 target=("192.168.1.2", 9001),
                 target_addr_bytes=b"192.168.1.2:9001",
                 message_type=b"leader-heartbeat",
@@ -561,7 +543,6 @@ class TestLeadershipHandlersFailureModes:
         handler = LeaderVoteHandler(mock_server)
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=None,
             target_addr_bytes=None,
             message_type=b"leader-vote",

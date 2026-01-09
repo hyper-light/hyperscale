@@ -34,7 +34,6 @@ class TestProbeHandlerHappyPath:
         handler = ProbeHandler(mock_server)
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=("192.168.1.2", 9001),
             target_addr_bytes=b"192.168.1.2:9001",
             message_type=b"probe",
@@ -55,7 +54,6 @@ class TestProbeHandlerHappyPath:
         handler = ProbeHandler(mock_server)
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=("192.168.1.2", 9001),
             target_addr_bytes=b"192.168.1.2:9001",
             message_type=b"probe",
@@ -73,7 +71,6 @@ class TestProbeHandlerHappyPath:
         handler = ProbeHandler(mock_server)
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=("127.0.0.1", 9000),  # Self address
             target_addr_bytes=b"127.0.0.1:9000",
             message_type=b"probe",
@@ -99,7 +96,6 @@ class TestProbeHandlerNegativePath:
         handler = ProbeHandler(mock_server)
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=("192.168.1.2", 9001),
             target_addr_bytes=b"192.168.1.2:9001",
             message_type=b"probe",
@@ -119,7 +115,6 @@ class TestProbeHandlerNegativePath:
         handler = ProbeHandler(mock_server)
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=("192.168.1.99", 9001),  # Unknown node
             target_addr_bytes=b"192.168.1.99:9001",
             message_type=b"probe",
@@ -145,7 +140,6 @@ class TestProbeHandlerEdgeCases:
         handler = ProbeHandler(mock_server)
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=("127.0.0.1", 9000),
             target_addr_bytes=b"127.0.0.1:9000",
             message_type=b"probe",
@@ -180,7 +174,6 @@ class TestPingReqHandlerHappyPath:
         handler = PingReqHandler(mock_server)
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=("192.168.1.2", 9001),
             target_addr_bytes=b"192.168.1.2:9001",
             message_type=b"ping-req",
@@ -200,7 +193,6 @@ class TestPingReqHandlerHappyPath:
         handler = PingReqHandler(mock_server)
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=("127.0.0.1", 9000),  # Self
             target_addr_bytes=b"127.0.0.1:9000",
             message_type=b"ping-req",
@@ -224,7 +216,6 @@ class TestPingReqHandlerNegativePath:
         handler = PingReqHandler(mock_server)
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=None,
             target_addr_bytes=None,
             message_type=b"ping-req",
@@ -245,7 +236,6 @@ class TestPingReqHandlerNegativePath:
         handler = PingReqHandler(mock_server)
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=("192.168.1.99", 9001),  # Unknown
             target_addr_bytes=b"192.168.1.99:9001",
             message_type=b"ping-req",
@@ -270,7 +260,6 @@ class TestPingReqHandlerEdgeCases:
         handler = PingReqHandler(mock_server)
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=("127.0.0.1", 9000),
             target_addr_bytes=b"127.0.0.1:9000",
             message_type=b"ping-req",
@@ -305,7 +294,6 @@ class TestPingReqAckHandlerHappyPath:
         handler = PingReqAckHandler(mock_server)
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=("192.168.1.2", 9001),
             target_addr_bytes=b"192.168.1.2:9001",
             message_type=b"ping-req-ack",
@@ -326,7 +314,6 @@ class TestPingReqAckHandlerHappyPath:
         handler = PingReqAckHandler(mock_server)
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=("192.168.1.2", 9001),
             target_addr_bytes=b"192.168.1.2:9001",
             message_type=b"ping-req-ack",
@@ -347,7 +334,6 @@ class TestPingReqAckHandlerHappyPath:
         handler = PingReqAckHandler(mock_server)
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=("192.168.1.2", 9001),
             target_addr_bytes=b"192.168.1.2:9001",
             message_type=b"ping-req-ack",
@@ -371,7 +357,6 @@ class TestPingReqAckHandlerNegativePath:
         handler = PingReqAckHandler(mock_server)
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=("192.168.1.2", 9001),
             target_addr_bytes=b"192.168.1.2:9001",
             message_type=b"ping-req-ack",
@@ -398,7 +383,6 @@ class TestPingReqAckHandlerEdgeCases:
         handler = PingReqAckHandler(mock_server)
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=("192.168.1.2", 9001),
             target_addr_bytes=b"192.168.1.2:9001",
             message_type=b"ping-req-ack",
@@ -472,7 +456,6 @@ class TestProbingHandlersConcurrency:
         async def handle_probe(index: int) -> None:
             context = MessageContext(
                 source_addr=("192.168.1.1", 8000 + index),
-                source_addr_string=f"192.168.1.1:{8000 + index}",
                 target=("192.168.1.2", 9001),
                 target_addr_bytes=b"192.168.1.2:9001",
                 message_type=b"probe",
@@ -497,7 +480,6 @@ class TestProbingHandlersConcurrency:
         async def handle_ping_req(index: int) -> None:
             context = MessageContext(
                 source_addr=("192.168.1.1", 8000),
-                source_addr_string="192.168.1.1:8000",
                 target=("127.0.0.1", 9000),  # Self
                 target_addr_bytes=b"127.0.0.1:9000",
                 message_type=b"ping-req",
@@ -523,7 +505,6 @@ class TestProbingHandlersFailureModes:
         handler = ProbeHandler(mock_server)
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=("192.168.1.2", 9001),
             target_addr_bytes=b"192.168.1.2:9001",
             message_type=b"probe",

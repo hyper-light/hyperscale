@@ -33,7 +33,6 @@ class TestXProbeHandlerHappyPath:
         handler = XProbeHandler(mock_server)
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=("127.0.0.1", 9000),
             target_addr_bytes=b"\x80\x04\x95\x10\x00",  # Binary pickle data
             message_type=b"xprobe",
@@ -55,7 +54,6 @@ class TestXProbeHandlerHappyPath:
         binary_data = bytes([0x80, 0x04, 0x95, 0x10, 0x00, 0xff, 0xfe])
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=("127.0.0.1", 9000),
             target_addr_bytes=binary_data,
             message_type=b"xprobe",
@@ -87,7 +85,6 @@ class TestXProbeHandlerCustomResponder:
         handler = CustomXProbeHandler(mock_server)
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=("127.0.0.1", 9000),
             target_addr_bytes=b"probe_data",
             message_type=b"xprobe",
@@ -112,7 +109,6 @@ class TestXProbeHandlerEdgeCases:
         handler = XProbeHandler(mock_server)
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=("127.0.0.1", 9000),
             target_addr_bytes=None,
             message_type=b"xprobe",
@@ -145,7 +141,6 @@ class TestXAckHandlerHappyPath:
         handler = XAckHandler(mock_server)
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=("127.0.0.1", 9000),
             target_addr_bytes=b"\x80\x04\x95\x20\x00",  # Binary pickle data
             message_type=b"xack",
@@ -167,7 +162,6 @@ class TestXAckHandlerHappyPath:
         binary_data = bytes([0x80, 0x04, 0x95, 0x20, 0x00, 0xff, 0xfe])
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=("127.0.0.1", 9000),
             target_addr_bytes=binary_data,
             message_type=b"xack",
@@ -199,7 +193,6 @@ class TestXAckHandlerCustomProcessor:
         handler = CustomXAckHandler(mock_server)
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=("127.0.0.1", 9000),
             target_addr_bytes=b"ack_data",
             message_type=b"xack",
@@ -224,7 +217,6 @@ class TestXAckHandlerEdgeCases:
         handler = XAckHandler(mock_server)
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=("127.0.0.1", 9000),
             target_addr_bytes=None,
             message_type=b"xack",
@@ -257,7 +249,6 @@ class TestXNackHandlerHappyPath:
         handler = XNackHandler(mock_server)
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=("127.0.0.1", 9000),
             target_addr_bytes=b"127.0.0.1:9000",
             message_type=b"xnack",
@@ -277,7 +268,6 @@ class TestXNackHandlerHappyPath:
         handler = XNackHandler(mock_server)
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=None,
             target_addr_bytes=None,
             message_type=b"xnack",
@@ -318,7 +308,6 @@ class TestCrossClusterHandlersConcurrency:
         async def handle_xprobe(index: int) -> bytes:
             context = MessageContext(
                 source_addr=("192.168.1.1", 8000 + index),
-                source_addr_string=f"192.168.1.1:{8000 + index}",
                 target=("127.0.0.1", 9000),
                 target_addr_bytes=f"probe_{index}".encode(),
                 message_type=b"xprobe",
@@ -344,7 +333,6 @@ class TestCrossClusterHandlersConcurrency:
         async def handle_xack(index: int) -> bytes:
             context = MessageContext(
                 source_addr=("192.168.1.1", 8000 + index),
-                source_addr_string=f"192.168.1.1:{8000 + index}",
                 target=("127.0.0.1", 9000),
                 target_addr_bytes=f"ack_{index}".encode(),
                 message_type=b"xack",
@@ -370,7 +358,6 @@ class TestCrossClusterHandlersConcurrency:
         async def handle_xnack(index: int) -> bytes:
             context = MessageContext(
                 source_addr=("192.168.1.1", 8000 + index),
-                source_addr_string=f"192.168.1.1:{8000 + index}",
                 target=("127.0.0.1", 9000),
                 target_addr_bytes=f"nack_{index}".encode(),
                 message_type=b"xnack",
@@ -399,7 +386,6 @@ class TestCrossClusterHandlersFailureModes:
         large_data = bytes(range(256)) * 100  # 25.6KB of binary data
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=("127.0.0.1", 9000),
             target_addr_bytes=large_data,
             message_type=b"xprobe",
@@ -420,7 +406,6 @@ class TestCrossClusterHandlersFailureModes:
         null_data = b"data\x00with\x00nulls\x00"
         context = MessageContext(
             source_addr=("192.168.1.1", 8000),
-            source_addr_string="192.168.1.1:8000",
             target=("127.0.0.1", 9000),
             target_addr_bytes=null_data,
             message_type=b"xack",
@@ -445,7 +430,6 @@ class TestCrossClusterHandlersFailureModes:
         for i in range(5):
             probe_ctx = MessageContext(
                 source_addr=("192.168.1.1", 8000 + i),
-                source_addr_string=f"192.168.1.1:{8000 + i}",
                 target=("127.0.0.1", 9000),
                 target_addr_bytes=f"data_{i}".encode(),
                 message_type=b"xprobe",
@@ -454,7 +438,6 @@ class TestCrossClusterHandlersFailureModes:
             )
             ack_ctx = MessageContext(
                 source_addr=("192.168.1.2", 8000 + i),
-                source_addr_string=f"192.168.1.2:{8000 + i}",
                 target=("127.0.0.1", 9000),
                 target_addr_bytes=f"ack_{i}".encode(),
                 message_type=b"xack",
@@ -463,7 +446,6 @@ class TestCrossClusterHandlersFailureModes:
             )
             nack_ctx = MessageContext(
                 source_addr=("192.168.1.3", 8000 + i),
-                source_addr_string=f"192.168.1.3:{8000 + i}",
                 target=("127.0.0.1", 9000),
                 target_addr_bytes=f"nack_{i}".encode(),
                 message_type=b"xnack",
