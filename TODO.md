@@ -462,6 +462,177 @@ Client                Gate                  Manager               Worker
 
 ---
 
+## 6. Workflow-Level Cancellation from Gates (Single Workflow Cancellation)
+
+**Problem**: Currently, cancellation is at the job level. We need fine-grained workflow-level cancellation where:
+1. Clients can request cancellation of a specific workflow (not entire job)
+2. Gates dispatch to ALL datacenters with matching job
+3. Managers check workflow state (pending, running, not found)
+4. ALL dependent workflows are also cancelled
+5. Cancellation is race-condition safe with proper locking
+6. Peer notification ensures consistency across cluster
+
+### Architecture Overview
+
+```
+Client                Gate                  Manager               Worker
+  |                    |                      |                     |
+  |--CancelWorkflow--->|                      |                     |
+  |                    |--CancelWorkflow----->| (to all DCs)        |
+  |                    |                      |                     |
+  |                    |   (notify peers)     |--CancelWorkflow---->|
+  |                    |      |               |<--CancelAck---------|
+  |                    |      v               |                     |
+  |                    | Gate Peers           | Manager Peers       |
+  |                    | (register for        | (move workflow+deps |
+  |                    |  failover)           |  to cancelled bucket)|
+  |                    |                      |                     |
+  |                    |                      | (wait ALL workers)  |
+  |                    |<--CancellationResult-|                     |
+  |<--CancellationResult (aggregate all DCs) |                     |
+```
+
+### Tasks
+
+#### 6.1 Message Types
+
+- [ ] **6.1.1** Add `SingleWorkflowCancelRequest` message type
+  - `job_id: str`
+  - `workflow_id: str`
+  - `origin_gate_id: str | None` (for result push)
+  - `origin_client_id: str | None`
+  - `cancel_dependents: bool = True`
+  - `request_id: str` (for deduplication and tracking)
+
+- [ ] **6.1.2** Add `SingleWorkflowCancelResponse` message type
+  - `job_id: str`
+  - `workflow_id: str`
+  - `status: WorkflowCancellationStatus` (CANCELLED, NOT_FOUND, PENDING_CANCELLED, etc.)
+  - `cancelled_dependents: list[str]` (workflow IDs of cancelled dependents)
+  - `errors: list[str]`
+  - `request_id: str`
+
+- [ ] **6.1.3** Add `WorkflowCancellationPeerNotification` message type
+  - For gate-to-gate and manager-to-manager peer sync
+  - `job_id: str`
+  - `workflow_id: str`
+  - `cancelled_workflows: list[str]` (workflow + all dependents)
+  - `request_id: str`
+  - `origin_node_id: str`
+
+#### 6.2 Manager Cancellation Handler
+
+- [ ] **6.2.1** Add `receive_cancel_workflow` handler to Manager
+  - Check if workflow is PENDING (in queue): remove from queue, mark cancelled
+  - Check if workflow is RUNNING: dispatch cancellation to workers
+  - Check if NOT FOUND: return empty response with message
+  - Acquire per-workflow lock before any state mutation
+
+- [ ] **6.2.2** Add workflow dependency graph traversal
+  - Use existing `_workflow_dependencies` structure
+  - Recursively find ALL dependent workflows
+  - Cancel entire dependency subtree atomically
+
+- [ ] **6.2.3** Add `_cancelled_workflows` bucket
+  ```python
+  _cancelled_workflows: dict[str, CancelledWorkflowInfo] = {}
+  # CancelledWorkflowInfo contains: job_id, workflow_id, cancelled_at, dependents
+  ```
+  - Cleanup at `Env.CANCELLED_WORKFLOW_CLEANUP_INTERVAL` (configurable)
+  - TTL: `Env.CANCELLED_WORKFLOW_TTL` (default: 1 hour)
+
+- [ ] **6.2.4** Add pre-dispatch cancellation check
+  - Before dispatching ANY workflow, check `_cancelled_workflows`
+  - If workflow_id in bucket, reject dispatch immediately
+  - This prevents "resurrection" of cancelled workflows
+
+- [ ] **6.2.5** Add per-workflow asyncio.Lock for race safety
+  ```python
+  _workflow_cancellation_locks: dict[str, asyncio.Lock] = {}
+  ```
+  - Acquire lock before checking/modifying workflow state
+  - Prevents race between cancellation and dispatch
+
+#### 6.3 Manager Peer Notification
+
+- [ ] **6.3.1** Add manager peer notification on cancellation
+  - When cancellation received, immediately notify ALL manager peers
+  - Use existing peer TCP connections
+
+- [ ] **6.3.2** Add `receive_workflow_cancellation_peer_notification` handler
+  - Manager peers receive notification
+  - Move workflow + ALL dependents to `_cancelled_workflows` bucket (atomic)
+  - Use same per-workflow lock pattern
+
+- [ ] **6.3.3** Ensure atomic bucket updates
+  - All dependents must be added to cancelled bucket in one operation
+  - No partial cancellation states
+
+#### 6.4 Gate Cancellation Handler
+
+- [ ] **6.4.1** Add `cancel_workflow` to Gate
+  - Receive request from client
+  - Dispatch to ALL datacenters with matching job
+  - Track pending responses per datacenter
+
+- [ ] **6.4.2** Add gate peer notification
+  - When cancellation received, notify ALL gate peers
+  - Gate peers register the cancellation request
+
+- [ ] **6.4.3** Add gate peer failover handling
+  - If job leader gate fails, peer gates have the cancellation registered
+  - Re-dispatch cancellation request to datacenters if leader fails mid-cancellation
+
+- [ ] **6.4.4** Gates push cancellation results to clients
+  - Once ALL datacenters respond, aggregate results
+  - Push `SingleWorkflowCancelResponse` to originating client
+  - Include all cancelled dependents across all datacenters
+
+#### 6.5 Worker Completion Await
+
+- [ ] **6.5.1** Manager waits for ALL workers before pushing result
+  - Use existing event-driven completion tracking pattern
+  - Track expected workers for the workflow
+  - Only push result to gate when ALL workers confirm
+
+- [ ] **6.5.2** Handle worker timeout/failure during cancellation
+  - If worker doesn't respond within timeout, mark as failed
+  - Include in error list pushed to gate/client
+
+#### 6.6 Client Multi-Datacenter Handling
+
+- [ ] **6.6.1** Clients wait for all datacenters to return cancellation results
+  - Track pending datacenters
+  - Aggregate results from all DCs
+  - Fire completion event when ALL DCs respond
+
+- [ ] **6.6.2** Add `await_workflow_cancellation` to Client
+  - Event-driven wait for all DC responses
+  - Returns aggregated `(success, cancelled_workflows, errors)`
+
+### Files
+
+| File | Changes |
+|------|---------|
+| `hyperscale/distributed_rewrite/models/distributed.py` | New message types (6.1) |
+| `hyperscale/distributed_rewrite/nodes/manager.py` | Cancellation handler, peer notification, cancelled bucket (6.2, 6.3) |
+| `hyperscale/distributed_rewrite/nodes/gate.py` | Cancel workflow handler, peer notification, result aggregation (6.4) |
+| `hyperscale/distributed_rewrite/nodes/worker.py` | Worker completion push (already exists, verify integration) |
+| `hyperscale/distributed_rewrite/nodes/client.py` | Multi-DC await (6.6) |
+| `hyperscale/distributed_rewrite/env.py` | `CANCELLED_WORKFLOW_CLEANUP_INTERVAL`, `CANCELLED_WORKFLOW_TTL` |
+
+### Race Condition Protection
+
+This implementation must be race-condition proof in the asyncio environment:
+
+1. **Per-workflow locks**: Each workflow has its own `asyncio.Lock`
+2. **Atomic bucket updates**: All dependents added in single operation
+3. **Pre-dispatch checks**: Always check cancelled bucket before dispatch
+4. **Peer sync before response**: Wait for peer acknowledgment before confirming to caller
+5. **Request deduplication**: Use `request_id` to prevent duplicate processing
+
+---
+
 ## Dependencies
 
 - Item 1 can be done independently
@@ -469,6 +640,7 @@ Client                Gate                  Manager               Worker
 - Item 3 depends on Item 2 for the cancellation mechanism
 - Item 4 depends on Items 1, 2, 3
 - Item 5 can be done after Item 2 (uses event-driven cancellation completion)
+- Item 6 builds on Item 5's push notification chain
 
 ---
 

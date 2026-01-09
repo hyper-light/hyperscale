@@ -187,13 +187,21 @@ class DiscoveryConfig:
     node_role: str = "manager"
     """This node's role ('client', 'gate', 'manager', 'worker')."""
 
+    allow_dynamic_registration: bool = False
+    """Allow discovery without initial seeds (peers register dynamically).
+
+    When True, the requirement for dns_names or static_seeds is relaxed.
+    Use this for manager->worker discovery where workers register themselves
+    rather than being discovered from seeds.
+    """
+
     def __post_init__(self) -> None:
         """Validate configuration after initialization."""
         if not self.cluster_id:
             raise ValueError("cluster_id is required")
         if not self.environment_id:
             raise ValueError("environment_id is required")
-        if not self.dns_names and not self.static_seeds:
+        if not self.allow_dynamic_registration and not self.dns_names and not self.static_seeds:
             raise ValueError("At least one of dns_names or static_seeds is required")
         if self.candidate_set_size < 1:
             raise ValueError("candidate_set_size must be at least 1")

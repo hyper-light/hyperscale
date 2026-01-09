@@ -775,6 +775,7 @@ class Env(BaseModel):
         environment_id: str = "default",
         node_role: str = "worker",
         static_seeds: list[str] | None = None,
+        allow_dynamic_registration: bool = False,
     ):
         """
         Get discovery service configuration (AD-28).
@@ -787,6 +788,7 @@ class Env(BaseModel):
             environment_id: Environment identifier
             node_role: Role of the local node ('worker', 'manager', etc.)
             static_seeds: Static seed addresses in "host:port" format
+            allow_dynamic_registration: Allow empty seeds (peers register dynamically)
         """
         from hyperscale.distributed_rewrite.discovery.models.discovery_config import (
             DiscoveryConfig,
@@ -832,4 +834,6 @@ class Env(BaseModel):
             latency_multiplier_threshold=self.DISCOVERY_LATENCY_MULTIPLIER_THRESHOLD,
             min_peers_per_tier=self.DISCOVERY_MIN_PEERS_PER_TIER,
             max_concurrent_probes=self.DISCOVERY_MAX_CONCURRENT_PROBES,
+            # Dynamic registration mode
+            allow_dynamic_registration=allow_dynamic_registration,
         )

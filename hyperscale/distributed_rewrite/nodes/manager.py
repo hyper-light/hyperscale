@@ -530,9 +530,11 @@ class ManagerServer(HealthAwareServer):
 
         # Discovery service for adaptive worker selection (AD-28)
         # Provides locality-aware, EWMA-based worker selection
+        # Workers register dynamically via heartbeats, so we don't need initial seeds
         worker_discovery_config = env.get_discovery_config(
             node_role="manager",
-            static_seeds=[],  # Workers register dynamically
+            static_seeds=[],
+            allow_dynamic_registration=True,
         )
         self._worker_discovery = DiscoveryService(worker_discovery_config)
 
