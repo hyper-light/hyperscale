@@ -44,6 +44,9 @@ from hyperscale.distributed_rewrite.discovery.dns.resolver import (
     AsyncDNSResolver,
     DNSError,
 )
+from hyperscale.distributed_rewrite.discovery.dns.security import (
+    DNSSecurityValidator,
+)
 from hyperscale.distributed_rewrite.discovery.selection.adaptive_selector import (
     AdaptiveEWMASelector,
     PowerOfTwoConfig,
@@ -123,11 +126,28 @@ class DiscoveryService:
 
     def __post_init__(self) -> None:
         """Initialize internal components."""
+        # DNS security validator (if any security settings are configured)
+        security_validator: DNSSecurityValidator | None = None
+        if (
+            self.config.dns_allowed_cidrs
+            or self.config.dns_block_private_for_public
+            or self.config.dns_detect_ip_changes
+        ):
+            security_validator = DNSSecurityValidator(
+                allowed_cidrs=self.config.dns_allowed_cidrs,
+                block_private_for_public=self.config.dns_block_private_for_public,
+                detect_ip_changes=self.config.dns_detect_ip_changes,
+                max_ip_changes_per_window=self.config.dns_max_ip_changes_per_window,
+                ip_change_window_seconds=self.config.dns_ip_change_window_seconds,
+            )
+
         # DNS resolver
         self._resolver = AsyncDNSResolver(
             default_ttl_seconds=self.config.dns_cache_ttl,
             resolution_timeout_seconds=self.config.dns_timeout,
             max_concurrent_resolutions=self.config.max_concurrent_probes,
+            security_validator=security_validator,
+            reject_on_security_violation=self.config.dns_reject_on_security_violation,
         )
 
         # Adaptive selector with power of two choices
