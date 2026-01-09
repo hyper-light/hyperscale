@@ -337,33 +337,36 @@ The WorkflowRunner doesn't have explicit cancellation handling. Cancellation wor
 
 ## 4. Integration Testing
 
-- [ ] **4.1** Test: SWIM leader + job leader fails
-  - Start 3 managers, submit job to leader
-  - Kill leader manager
-  - Verify new leader takes over job
-  - Verify workers receive transfer notification
-  - Verify job completes successfully
+**Status**: ✅ Complete
 
-- [ ] **4.2** Test: Job leader fails (not SWIM leader)
-  - Start 3 managers, submit job to non-leader
-  - Kill job leader manager
-  - Verify SWIM leader takes over job
-  - Verify gate receives transfer notification
+Integration tests implemented using mocks for all networking, covering:
 
-- [ ] **4.3** Test: Worker orphan grace period
-  - Start manager + worker, submit job
-  - Kill manager before new leader elected
-  - Verify worker waits grace period
-  - Verify cancellation if no transfer received
+- [x] **4.1** Test: SWIM leader + job leader fails
+  - `TestIntegrationManagerAndWorker::test_full_flow_swim_leader_job_leader_fails`
+  - Verifies full flow from manager failure → workflow orphaned → transfer → workflow rescued
 
-- [ ] **4.4** Test: Worker receives transfer before grace expires
-  - Start manager + worker, submit job
-  - Kill manager, new leader takes over quickly
-  - Verify worker receives transfer
-  - Verify workflow continues (not cancelled)
+- [x] **4.2** Test: Job leader fails (not SWIM leader)
+  - Covered in Section 1 tests (`test_job_leadership_takeover.py`)
+  - `TestFailoverScenarios::test_non_leader_job_leader_fails_scenario`
+
+- [x] **4.3** Test: Worker orphan grace period
+  - `TestWorkerOrphanGracePeriod::test_orphaned_workflow_cancelled_after_grace_period`
+  - `TestIntegrationManagerAndWorker::test_full_flow_no_transfer_workflow_cancelled`
+  - Verifies workflow cancelled after grace period expires without transfer
+
+- [x] **4.4** Test: Worker receives transfer before grace expires
+  - `TestWorkerReceivesTransferBeforeGrace::test_workflow_continues_after_transfer`
+  - `TestWorkerReceivesTransferBeforeGrace::test_transfer_clears_orphaned_workflow`
+  - Verifies transfer rescues workflow from orphan state
+
+Additional test coverage:
+- Cascading failures (multiple managers fail)
+- Partial transfers (only some workflows)
+- Edge cases (workflow completes naturally, empty orphan dict, unknown workflows)
 
 ### Files
-- `tests/integration/test_job_leader_failover.py` (new)
+- `tests/integration/test_job_leader_failover.py`
+- `tests/integration/test_job_leadership_takeover.py` (Section 1 tests)
 
 ---
 

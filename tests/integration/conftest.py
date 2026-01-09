@@ -18,13 +18,6 @@ def pytest_configure(config):
         "markers", "asyncio: mark test as async"
     )
 
-
-@pytest.fixture(scope="session")
-def event_loop_policy():
-    """Use the default event loop policy."""
-    return asyncio.get_event_loop_policy()
-
-
 @pytest.fixture(scope="function")
 def event_loop():
     """Create an event loop for each test function."""

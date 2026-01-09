@@ -7486,27 +7486,14 @@ class ManagerServer(HealthAwareServer):
         Used for retry logic to avoid workers that have already failed.
         Also skips workers with open circuit breakers.
         """
-        eligible = []
-        for worker in self._worker_pool.iter_workers():
-            node_id = worker.node_id
-
-            if node_id in exclude_workers:
-                continue
-
-            # Check circuit breaker - skip workers with open circuits
-            if self._is_worker_circuit_open(node_id):
-                continue
-
-            # Check capacity (available minus already reserved)
-            effective_available = worker.available_cores - worker.reserved_cores
-            if effective_available < vus_needed:
-                continue
-
-            # Check health via WorkerPool
-            if not self._worker_pool.is_worker_healthy(node_id):
-                continue
-
-            eligible.append(node_id)
+        eligible = [
+            worker.node_id
+            for worker in self._worker_pool.iter_workers()
+            if worker.node_id not in exclude_workers
+            and not self._is_worker_circuit_open(worker.node_id)
+            and (worker.available_cores - worker.reserved_cores) >= vus_needed
+            and self._worker_pool.is_worker_healthy(worker.node_id)
+        ]
 
         if not eligible:
             return None
@@ -7535,11 +7522,12 @@ class ManagerServer(HealthAwareServer):
         self._worker_circuits.pop(worker_node_id, None)
 
         # Find all workflows assigned to this worker via JobManager
-        workflows_to_retry: list[str] = []
-        for job in self._job_manager.iter_jobs():
-            for sub_wf in job.sub_workflows.values():
-                if sub_wf.worker_id == worker_node_id and sub_wf.result is None:
-                    workflows_to_retry.append(str(sub_wf.token))
+        workflows_to_retry = [
+            str(sub_wf.token)
+            for job in self._job_manager.iter_jobs()
+            for sub_wf in job.sub_workflows.values()
+            if sub_wf.worker_id == worker_node_id and sub_wf.result is None
+        ]
         
         if not workflows_to_retry:
             return
@@ -7554,18 +7542,15 @@ class ManagerServer(HealthAwareServer):
             )
         )
         
+        workflow_to_job_id = {
+            wf_info.token.workflow_id: job.job_id
+            for job in self._job_manager.iter_jobs()
+            for wf_info in job.workflows.values()
+        }
+
         # Mark each workflow as needing retry
         for workflow_id in workflows_to_retry:
-            # Get the job for this workflow by searching all jobs
-            job_id = None
-            for job in self._job_manager.iter_jobs():
-                for wf_info in job.workflows.values():
-                    if wf_info.token.workflow_id == workflow_id:
-                        job_id = job.job_id
-                        break
-                if job_id:
-                    break
-
+            job_id = workflow_to_job_id.get(workflow_id)
             if not job_id:
                 self._task_runner.run(
                     self._udp_logger.log,
@@ -7580,7 +7565,8 @@ class ManagerServer(HealthAwareServer):
             
             # Dispatch bytes should have been stored when workflow was dispatched
             # via _dispatch_single_workflow. If not present, we cannot retry.
-            if workflow_id not in self._workflow_retries:
+            retry_entry = self._workflow_retries.get(workflow_id)
+            if not retry_entry:
                 self._task_runner.run(
                     self._udp_logger.log,
                     ServerError(
@@ -7593,7 +7579,7 @@ class ManagerServer(HealthAwareServer):
                 continue
             
             # Update failed workers set
-            count, data, failed = self._workflow_retries[workflow_id]
+            count, data, failed = retry_entry
             if not data:
                 # Dispatch bytes are empty - cannot retry
                 self._task_runner.run(
