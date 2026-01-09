@@ -77,6 +77,9 @@ from .distributed import (
     # Job leader gate transfer (direct DC-to-Job-Leader routing)
     JobLeaderGateTransfer as JobLeaderGateTransfer,
     JobLeaderGateTransferAck as JobLeaderGateTransferAck,
+    # Job leader manager transfer (AD-31: manager failure notification to gate)
+    JobLeaderManagerTransfer as JobLeaderManagerTransfer,
+    JobLeaderManagerTransferAck as JobLeaderManagerTransferAck,
     # Client push notifications
     JobStatusPush as JobStatusPush,
     DCStats as DCStats,

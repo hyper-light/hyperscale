@@ -111,6 +111,8 @@ from hyperscale.distributed_rewrite.models import (
     JobStateSyncAck,
     JobLeaderGateTransfer,
     JobLeaderGateTransferAck,
+    JobLeaderManagerTransfer,
+    JobLeaderManagerTransferAck,
     ManagerToWorkerRegistration,
     ManagerToWorkerRegistrationAck,
     PingRequest,
@@ -1151,6 +1153,96 @@ class ManagerServer(HealthAwareServer):
 
             # Note: Job leadership will propagate via UDP heartbeats (Serf-style)
             # The heartbeat includes job_leaderships with fencing tokens
+
+            # AD-31: Notify origin gate of job leadership transfer
+            await self._notify_gate_of_leadership_transfer(job_id, old_leader)
+
+    async def _notify_gate_of_leadership_transfer(
+        self,
+        job_id: str,
+        old_manager_id: str | None,
+    ) -> None:
+        """
+        Notify the origin gate that job leadership has transferred to this manager.
+
+        Part of AD-31: When a manager takes over job leadership from a failed manager,
+        the origin gate needs to be informed so it can:
+        1. Update its tracking of which manager leads this job in this DC
+        2. Route any new instructions to the correct manager
+
+        Args:
+            job_id: The job whose leadership transferred
+            old_manager_id: Node ID of the previous leader (if known)
+        """
+        # Get the origin gate for this job
+        origin_gate_addr = self._job_origin_gates.get(job_id)
+        if not origin_gate_addr:
+            # No origin gate recorded - job may have been submitted directly
+            return
+
+        fence_token = self._job_fencing_tokens.get(job_id, 0)
+        datacenter_id = self.env.DATACENTER_ID
+
+        transfer_msg = JobLeaderManagerTransfer(
+            job_id=job_id,
+            datacenter_id=datacenter_id,
+            new_manager_id=self._node_id.full,
+            new_manager_addr=(self._host, self._tcp_port),
+            fence_token=fence_token,
+            old_manager_id=old_manager_id,
+        )
+
+        try:
+            response, _ = await self.send_tcp(
+                origin_gate_addr,
+                action='job_leader_manager_transfer',
+                data=transfer_msg.dump(),
+                timeout=2.0,
+            )
+
+            if response and isinstance(response, bytes) and response != b'error':
+                ack = JobLeaderManagerTransferAck.load(response)
+                if ack.accepted:
+                    self._task_runner.run(
+                        self._udp_logger.log,
+                        ServerInfo(
+                            message=f"Gate {ack.gate_id[:8]}... acknowledged job {job_id[:8]}... leadership transfer",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
+                else:
+                    self._task_runner.run(
+                        self._udp_logger.log,
+                        ServerWarning(
+                            message=f"Gate {ack.gate_id[:8]}... rejected job {job_id[:8]}... leadership transfer",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
+            else:
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerWarning(
+                        message=f"No valid response from gate for job {job_id[:8]}... leadership transfer",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+
+        except Exception as error:
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerWarning(
+                    message=f"Failed to notify gate at {origin_gate_addr} of job {job_id[:8]}... leadership transfer: {error}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
 
     async def _sync_state_from_workers(self) -> None:
         """

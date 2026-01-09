@@ -21,6 +21,7 @@ Supporting types:
 - WorkflowStateMachine: State machine for workflow transitions
 - AllocationResult: Core allocation result container
 - JobLeadership: Leadership info for a single job
+- DCManagerLeadership: Per-DC manager leadership info (for gates)
 
 Logging models:
 - WorkerPoolTrace/Debug/Info/Warning/Error/Critical
@@ -59,6 +60,7 @@ from hyperscale.distributed_rewrite.jobs.windowed_stats_collector import (
 from hyperscale.distributed_rewrite.jobs.job_leadership_tracker import (
     JobLeadershipTracker as JobLeadershipTracker,
     JobLeadership as JobLeadership,
+    DCManagerLeadership as DCManagerLeadership,
 )
 from hyperscale.distributed_rewrite.jobs.logging_models import (
     WorkerPoolTrace as WorkerPoolTrace,

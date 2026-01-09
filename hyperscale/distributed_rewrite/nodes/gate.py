@@ -94,6 +94,10 @@ from hyperscale.distributed_rewrite.models import (
     WorkflowDCResult,
     JobLeadershipAnnouncement,
     JobLeadershipAck,
+    JobLeaderGateTransfer,
+    JobLeaderGateTransferAck,
+    JobLeaderManagerTransfer,
+    JobLeaderManagerTransferAck,
     restricted_loads,
 )
 from hyperscale.distributed_rewrite.swim.core import (
@@ -1095,12 +1099,19 @@ class GateServer(HealthAwareServer):
 
         # Take over leadership for each orphaned job
         for job_id in orphaned_jobs:
+            # Get old leader ID before takeover (for manager notification)
+            old_gate_id = self._job_leadership_tracker.get_leader(job_id)
+
             # Use tracker's takeover method (handles fencing token increment)
             target_dc_count = len(self._job_target_dcs.get(job_id, set()))
             self._job_leadership_tracker.takeover_leadership(job_id, metadata=target_dc_count)
 
             # Broadcast new leadership to peer gates
             await self._broadcast_job_leadership(job_id, target_dc_count)
+
+            # AD-31: Notify managers of the leadership transfer so they update
+            # their _job_origin_gates mapping and route results to new leader
+            await self._notify_managers_of_leadership_transfer(job_id, old_gate_id)
 
             self._task_runner.run(
                 self._udp_logger.log,
@@ -1170,6 +1181,91 @@ class GateServer(HealthAwareServer):
                         node_id=self._node_id.short,
                     )
                 )
+
+    async def _notify_managers_of_leadership_transfer(
+        self,
+        job_id: str,
+        old_gate_id: str | None,
+    ) -> None:
+        """
+        Notify all managers assigned to a job that leadership has transferred to this gate.
+
+        Part of AD-31: When a gate takes over job leadership from a failed gate,
+        managers need to update their _job_origin_gates mapping so they route
+        job results to the new leader gate.
+
+        Args:
+            job_id: The job whose leadership transferred
+            old_gate_id: Node ID of the previous leader (if known)
+        """
+        # Get managers assigned to this job
+        dc_managers = self._job_dc_managers.get(job_id, {})
+        if not dc_managers:
+            return
+
+        fence_token = self._job_leadership_tracker.get_fencing_token(job_id)
+
+        transfer_msg = JobLeaderGateTransfer(
+            job_id=job_id,
+            new_gate_id=self._node_id.full,
+            new_gate_addr=(self._host, self._tcp_port),
+            fence_token=fence_token,
+            old_gate_id=old_gate_id,
+        )
+
+        notified_count = 0
+        failed_count = 0
+
+        # Notify each manager in each DC assigned to this job
+        for datacenter_id, manager_addr in dc_managers.items():
+            try:
+                response, _ = await self.send_tcp(
+                    manager_addr,
+                    action='job_leader_gate_transfer',
+                    data=transfer_msg.dump(),
+                    timeout=2.0,
+                )
+
+                if response and isinstance(response, bytes) and response != b'error':
+                    ack = JobLeaderGateTransferAck.load(response)
+                    if ack.accepted:
+                        notified_count += 1
+                    else:
+                        failed_count += 1
+                        self._task_runner.run(
+                            self._udp_logger.log,
+                            ServerWarning(
+                                message=f"Manager {ack.manager_id[:8]}... rejected job {job_id[:8]}... leadership transfer",
+                                node_host=self._host,
+                                node_port=self._tcp_port,
+                                node_id=self._node_id.short,
+                            )
+                        )
+                else:
+                    failed_count += 1
+
+            except Exception as e:
+                failed_count += 1
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerWarning(
+                        message=f"Failed to notify manager at {manager_addr} of job {job_id[:8]}... leadership transfer: {e}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+
+        if notified_count > 0 or failed_count > 0:
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerInfo(
+                    message=f"Job {job_id[:8]}... leadership transfer notifications: {notified_count} accepted, {failed_count} failed",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
 
     def _get_state_snapshot(self) -> GateStateSnapshot:
         """Get a complete state snapshot for state sync."""
@@ -2717,9 +2813,9 @@ class GateServer(HealthAwareServer):
         for attempt in range(max_retries):
             try:
                 request = StateSyncRequest(
-                    node_id=self._node_id.full,
-                    datacenter=self._node_id.datacenter,
-                    current_version=self._state_version,
+                    requester_id=self._node_id.full,
+                    requester_role=NodeRole.GATE.value,
+                    since_version=self._state_version,
                 )
                 
                 result, _ = await self.send_tcp(
@@ -5751,6 +5847,114 @@ class GateServer(HealthAwareServer):
                 accepted=False,
                 responder_id=self._node_id.full,
                 error=str(e),
+            ).dump()
+
+    @tcp.receive()
+    async def job_leader_manager_transfer(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ):
+        """
+        Handle job leadership manager transfer notification from manager (AD-31).
+
+        When a manager takes over job leadership from a failed manager within a DC,
+        it notifies the origin gate so the gate can update its tracking of which
+        manager leads the job in that datacenter.
+
+        This ensures the gate routes subsequent job instructions to the correct manager.
+        Uses JobLeadershipTracker.update_dc_manager_async for asyncio-safe updates
+        with fencing token consistency.
+        """
+        try:
+            transfer = JobLeaderManagerTransfer.load(data)
+
+            # Verify this is for a job we're tracking (check both old dict and tracker)
+            # Note: During migration, we check both. After full migration, only tracker is needed.
+            job_known = (
+                transfer.job_id in self._job_dc_managers or
+                transfer.job_id in self._job_leadership_tracker
+            )
+            if not job_known:
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerWarning(
+                        message=f"Received manager transfer for unknown job {transfer.job_id[:8]}... from {transfer.new_manager_id[:8]}...",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+                return JobLeaderManagerTransferAck(
+                    job_id=transfer.job_id,
+                    gate_id=self._node_id.full,
+                    accepted=False,
+                ).dump()
+
+            # Get current manager address for logging
+            old_manager_addr = self._job_leadership_tracker.get_dc_manager(
+                transfer.job_id, transfer.datacenter_id
+            )
+            # Also check legacy dict
+            if old_manager_addr is None and transfer.job_id in self._job_dc_managers:
+                old_manager_addr = self._job_dc_managers[transfer.job_id].get(transfer.datacenter_id)
+
+            # Use tracker's async method - handles fencing token checks internally
+            accepted = await self._job_leadership_tracker.update_dc_manager_async(
+                job_id=transfer.job_id,
+                dc_id=transfer.datacenter_id,
+                manager_id=transfer.new_manager_id,
+                manager_addr=transfer.new_manager_addr,
+                fencing_token=transfer.fence_token,
+            )
+
+            if not accepted:
+                current_fence = self._job_leadership_tracker.get_dc_manager_fencing_token(
+                    transfer.job_id, transfer.datacenter_id
+                )
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerDebug(
+                        message=f"Rejected stale manager transfer for job {transfer.job_id[:8]}... (fence {transfer.fence_token} <= {current_fence})",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+                return JobLeaderManagerTransferAck(
+                    job_id=transfer.job_id,
+                    gate_id=self._node_id.full,
+                    accepted=False,
+                ).dump()
+
+            # Also update legacy dict for backwards compatibility during migration
+            if transfer.job_id not in self._job_dc_managers:
+                self._job_dc_managers[transfer.job_id] = {}
+            self._job_dc_managers[transfer.job_id][transfer.datacenter_id] = transfer.new_manager_addr
+
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerInfo(
+                    message=f"Updated job {transfer.job_id[:8]}... DC {transfer.datacenter_id} manager: {old_manager_addr} -> {transfer.new_manager_addr}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+
+            return JobLeaderManagerTransferAck(
+                job_id=transfer.job_id,
+                gate_id=self._node_id.full,
+                accepted=True,
+            ).dump()
+
+        except Exception as error:
+            await self.handle_exception(error, "job_leader_manager_transfer")
+            return JobLeaderManagerTransferAck(
+                job_id="unknown",
+                gate_id=self._node_id.full,
+                accepted=False,
             ).dump()
 
     @tcp.receive()
