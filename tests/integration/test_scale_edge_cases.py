@@ -1365,7 +1365,8 @@ class TestClockSkewTimeBased:
         # Should still calculate correctly (even if result is in past)
         assert new_deadline == past_deadline + extension_seconds
 
-    def test_probe_handles_very_short_periods(self):
+    @pytest.mark.asyncio
+    async def test_probe_handles_very_short_periods(self):
         """Test probe with extremely short period doesn't cause issues."""
         check_count = 0
 
@@ -1384,13 +1385,8 @@ class TestClockSkewTimeBased:
         )
 
         # Single check should work
-        import asyncio
-
-        async def run_test():
-            await probe.check()
-            assert check_count == 1
-
-        asyncio.get_event_loop().run_until_complete(run_test())
+        await probe.check()
+        assert check_count == 1
 
     def test_cooperative_limiter_retry_after_zero(self):
         """Test cooperative limiter with zero retry_after."""
@@ -1532,7 +1528,8 @@ class TestDataStructureInvariants:
         assert metrics["total_requests"] == 100
         assert metrics["rate_limited_requests"] <= metrics["total_requests"]
 
-    def test_probe_state_consistency(self):
+    @pytest.mark.asyncio
+    async def test_probe_state_consistency(self):
         """Test probe state remains internally consistent."""
 
         async def variable_check():
@@ -1544,22 +1541,17 @@ class TestDataStructureInvariants:
             config=ProbeConfig(failure_threshold=3, success_threshold=2),
         )
 
-        import asyncio
+        for _ in range(100):
+            await probe.check()
 
-        async def run_checks():
-            for _ in range(100):
-                await probe.check()
-
-                state = probe.get_state()
-                # Invariants
-                assert state.consecutive_successes >= 0
-                assert state.consecutive_failures >= 0
-                # Can't have both consecutive successes and failures
-                assert not (
-                    state.consecutive_successes > 0 and state.consecutive_failures > 0
-                )
-
-        asyncio.get_event_loop().run_until_complete(run_checks())
+            state = probe.get_state()
+            # Invariants
+            assert state.consecutive_successes >= 0
+            assert state.consecutive_failures >= 0
+            # Can't have both consecutive successes and failures
+            assert not (
+                state.consecutive_successes > 0 and state.consecutive_failures > 0
+            )
 
 
 # =============================================================================
@@ -1570,7 +1562,8 @@ class TestDataStructureInvariants:
 class TestPartialFailureSplitBrain:
     """Tests for partial failure and split-brain scenarios."""
 
-    def test_composite_probe_partial_failure(self):
+    @pytest.mark.asyncio
+    async def test_composite_probe_partial_failure(self):
         """Test composite probe with some probes failing."""
         healthy_probe_calls = 0
         unhealthy_probe_calls = 0
@@ -1584,8 +1577,6 @@ class TestPartialFailureSplitBrain:
             nonlocal unhealthy_probe_calls
             unhealthy_probe_calls += 1
             return False, "Failed"
-
-        import asyncio
 
         healthy_probe = HealthProbe(
             name="healthy",
@@ -1602,15 +1593,12 @@ class TestPartialFailureSplitBrain:
         composite.add_probe(healthy_probe)
         composite.add_probe(unhealthy_probe)
 
-        async def run_test():
-            await composite.check_all()
+        await composite.check_all()
 
-            # Composite should be unhealthy if any probe is unhealthy
-            assert composite.is_healthy() is False
-            assert "unhealthy" in composite.get_unhealthy_probes()
-            assert "healthy" not in composite.get_unhealthy_probes()
-
-        asyncio.get_event_loop().run_until_complete(run_test())
+        # Composite should be unhealthy if any probe is unhealthy
+        assert composite.is_healthy() is False
+        assert "unhealthy" in composite.get_unhealthy_probes()
+        assert "healthy" not in composite.get_unhealthy_probes()
 
     def test_rate_limiter_client_isolation(self):
         """Test rate limiting isolation between clients."""
@@ -1984,7 +1972,8 @@ class TestErrorMessageQuality:
         assert reason is not None
         assert "30" in reason or "50" in reason  # Should mention the values
 
-    def test_probe_timeout_message_includes_duration(self):
+    @pytest.mark.asyncio
+    async def test_probe_timeout_message_includes_duration(self):
         """Test probe timeout message includes timeout duration."""
 
         async def slow_check():
@@ -1997,13 +1986,8 @@ class TestErrorMessageQuality:
             config=ProbeConfig(timeout_seconds=0.1),
         )
 
-        import asyncio
-
-        async def run_test():
-            response = await probe.check()
-            assert "0.1" in response.message  # Should mention timeout value
-
-        asyncio.get_event_loop().run_until_complete(run_test())
+        response = await probe.check()
+        assert "0.1" in response.message  # Should mention timeout value
 
     def test_worker_eviction_reason_descriptive(self):
         """Test worker eviction reason is descriptive."""
@@ -2302,7 +2286,8 @@ class TestDiagnosticsObservability:
         for field in required_fields:
             assert field in metrics, f"Missing field: {field}"
 
-    def test_probe_state_complete(self):
+    @pytest.mark.asyncio
+    async def test_probe_state_complete(self):
         """Test probe state includes all expected fields."""
 
         async def check():
@@ -2310,22 +2295,17 @@ class TestDiagnosticsObservability:
 
         probe = HealthProbe(name="test", check=check)
 
-        import asyncio
+        await probe.check()
+        state = probe.get_state()
 
-        async def run_test():
-            await probe.check()
-            state = probe.get_state()
-
-            assert hasattr(state, "healthy")
-            assert hasattr(state, "consecutive_successes")
-            assert hasattr(state, "consecutive_failures")
-            assert hasattr(state, "last_check")
-            assert hasattr(state, "last_result")
-            assert hasattr(state, "last_message")
-            assert hasattr(state, "total_checks")
-            assert hasattr(state, "total_failures")
-
-        asyncio.get_event_loop().run_until_complete(run_test())
+        assert hasattr(state, "healthy")
+        assert hasattr(state, "consecutive_successes")
+        assert hasattr(state, "consecutive_failures")
+        assert hasattr(state, "last_check")
+        assert hasattr(state, "last_result")
+        assert hasattr(state, "last_message")
+        assert hasattr(state, "total_checks")
+        assert hasattr(state, "total_failures")
 
     def test_composite_probe_status_complete(self):
         """Test composite probe status includes all probes."""
