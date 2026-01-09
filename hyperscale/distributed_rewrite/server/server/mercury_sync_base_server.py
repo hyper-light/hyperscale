@@ -1605,23 +1605,17 @@ class MercurySyncBaseServer(Generic[T]):
     async def shutdown(self) -> None:
         self._running = False
 
-        print('SHUTDOWN TASK RUNNER')
-
         await self._task_runner.shutdown()
 
         for client in self._tcp_client_transports.values():
             client.abort()
-
-        print('CLOSE TCP CLIENT')
 
         # Close UDP transport to stop receiving datagrams
         if self._udp_transport is not None:
             self._udp_transport.close()
             self._udp_transport = None
             self._udp_connected = False
-
-        print('CLOSE UDP')
-
+            
         # Close TCP server to stop accepting connections
         if self._tcp_server is not None:
             self._tcp_server.abort_clients()

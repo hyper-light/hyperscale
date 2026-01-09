@@ -1405,6 +1405,117 @@ class PendingTransfer:
 
 
 # =============================================================================
+# Section 9: Client Leadership Tracking Models
+# =============================================================================
+
+@dataclass(slots=True)
+class GateLeaderInfo:
+    """
+    Information about a gate acting as job leader for a specific job (Section 9.1.1).
+
+    Used by clients to track which gate is the authoritative source
+    for a job's status and control operations.
+    """
+    gate_addr: tuple[str, int]   # (host, port) of the gate
+    fence_token: int             # Fencing token for ordering
+    last_updated: float          # time.monotonic() when last updated
+
+
+@dataclass(slots=True)
+class ManagerLeaderInfo:
+    """
+    Information about a manager acting as job leader (Section 9.2.1).
+
+    Tracks manager leadership per datacenter for multi-DC deployments.
+    """
+    manager_addr: tuple[str, int]  # (host, port) of the manager
+    fence_token: int               # Fencing token for ordering
+    datacenter_id: str             # Which datacenter this manager serves
+    last_updated: float            # time.monotonic() when last updated
+
+
+@dataclass(slots=True)
+class OrphanedJobInfo:
+    """
+    Information about a job whose leaders are unknown/failed (Section 9.5.1).
+
+    Tracks jobs in orphan state pending either leader discovery or timeout.
+    """
+    job_id: str
+    orphan_timestamp: float              # When job became orphaned
+    last_known_gate: tuple[str, int] | None
+    last_known_manager: tuple[str, int] | None
+    datacenter_id: str = ""
+
+
+@dataclass(slots=True)
+class LeadershipRetryPolicy:
+    """
+    Configurable retry behavior for leadership changes (Section 9.3.3).
+
+    Controls how clients retry operations when leadership changes occur.
+    """
+    max_retries: int = 3
+    retry_delay: float = 0.5
+    exponential_backoff: bool = True
+    max_delay: float = 5.0
+
+
+@dataclass(slots=True)
+class GateJobLeaderTransfer(Message):
+    """
+    Notification to client that gate job leadership has transferred (Section 9.1.2).
+
+    Sent from new gate leader to client when taking over job leadership.
+    """
+    job_id: str
+    new_gate_id: str
+    new_gate_addr: tuple[str, int]
+    fence_token: int
+    old_gate_id: str | None = None
+    old_gate_addr: tuple[str, int] | None = None
+
+
+@dataclass(slots=True)
+class GateJobLeaderTransferAck(Message):
+    """
+    Acknowledgment of gate job leader transfer notification.
+    """
+    job_id: str
+    client_id: str
+    accepted: bool = True
+    rejection_reason: str = ""
+
+
+@dataclass(slots=True)
+class ManagerJobLeaderTransfer(Message):
+    """
+    Notification to client that manager job leadership has transferred (Section 9.2.2).
+
+    Typically forwarded by gate to client when a manager job leader changes.
+    """
+    job_id: str
+    new_manager_id: str
+    new_manager_addr: tuple[str, int]
+    fence_token: int
+    datacenter_id: str
+    old_manager_id: str | None = None
+    old_manager_addr: tuple[str, int] | None = None
+
+
+@dataclass(slots=True)
+class ManagerJobLeaderTransferAck(Message):
+    """
+    Acknowledgment of manager job leader transfer notification.
+    """
+    job_id: str
+    client_id: str
+    datacenter_id: str
+    accepted: bool = True
+    rejection_reason: str = ""
+
+
+# =============================================================================
 # Client Push Notifications
 # =============================================================================
 
