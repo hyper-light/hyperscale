@@ -1504,7 +1504,7 @@ class MercurySyncBaseServer(Generic[T]):
 
     async def _cleanup_tcp_server_tasks(self):
         while self._running:
-            self._tcp_server_sleep_task = asyncio.create_task(
+            self._tcp_server_sleep_task = asyncio.ensure_future(
                 asyncio.sleep(self._cleanup_interval)
             )
 
@@ -1526,7 +1526,7 @@ class MercurySyncBaseServer(Generic[T]):
 
     async def _cleanup_udp_server_tasks(self):
         while self._running:
-            self._udp_server_sleep_task = asyncio.create_task(
+            self._udp_server_sleep_task = asyncio.ensure_future(
                 asyncio.sleep(self._cleanup_interval)
             )
 
@@ -1623,6 +1623,7 @@ class MercurySyncBaseServer(Generic[T]):
 
         # Close TCP server to stop accepting connections
         if self._tcp_server is not None:
+            self._tcp_server.abort_clients()
             self._tcp_server.close()
             try:
                 await self._tcp_server.wait_closed()
@@ -1643,37 +1644,19 @@ class MercurySyncBaseServer(Generic[T]):
 
         print('CLOSE DROP STATS')
 
-        await asyncio.gather(*[
-            self._cleanup_tcp_server_tasks(),
-            self._cleanup_udp_server_tasks(),
-        ])
-
-        print('CLOSE CLEANUP')
-
-    async def _cleanup_tcp_server_tasks(self):
+        if self._tcp_server_sleep_task:
+            self._tcp_server_sleep_task.set_result(None)
 
         if self._tcp_server_cleanup_task:
-            self._tcp_server_sleep_task.set_result(None)
             self._tcp_server_cleanup_task.set_result(None)
 
-    async def _cleanup_udp_server_tasks(self):
+        if self._udp_server_sleep_task:
+            self._udp_server_sleep_task.set_result(None)
 
         if self._udp_server_cleanup_task:
-            self._udp_server_cleanup_task.cancel()
-            if self._udp_server_cleanup_task.cancelled() is False:
-                try:
-                    self._udp_server_sleep_task.cancel()
-                    if not self._udp_server_sleep_task.cancelled():
-                        await self._udp_server_sleep_task
+            self._udp_server_cleanup_task.set_result(None)
 
-                except (Exception, socket.error):
-                    pass
-
-                try:
-                    await self._udp_server_cleanup_task
-
-                except Exception:
-                    pass
+        print('CLOSE CLEANUP')
 
     def abort(self) -> None:
         self._running = False
@@ -1700,53 +1683,14 @@ class MercurySyncBaseServer(Generic[T]):
                 pass
         self._tcp_client_transports.clear()
 
+        if self._tcp_server_sleep_task:
+            self._tcp_server_sleep_task.set_result(None)
+
         if self._tcp_server_cleanup_task:
-            try:
-                self._tcp_server_sleep_task.cancel()
+            self._tcp_server_cleanup_task.set_result(None)
 
-            except (
-                asyncio.CancelledError,
-                asyncio.InvalidStateError,
-                asyncio.TimeoutError,
-                Exception,
-                socket.error,
-            ):
-                pass
-
-            try:
-                self._tcp_server_cleanup_task.cancel()
-
-            except (
-                asyncio.CancelledError,
-                asyncio.InvalidStateError,
-                asyncio.TimeoutError,
-                Exception,
-                socket.error,
-            ):
-                pass
+        if self._udp_server_sleep_task:
+            self._udp_server_sleep_task.set_result(None)
 
         if self._udp_server_cleanup_task:
-            try:
-                self._udp_server_sleep_task.cancel()
-
-            except (
-                asyncio.CancelledError,
-                asyncio.InvalidStateError,
-                asyncio.TimeoutError,
-                Exception,
-                socket.error,
-            ):
-                pass
-
-            try:
-                self._udp_server_cleanup_task.cancel()
-
-            except (
-                asyncio.CancelledError,
-                asyncio.InvalidStateError,
-                asyncio.TimeoutError,
-                Exception,
-                socket.error,
-            ):
-                pass
-
+            self._udp_server_cleanup_task.set_result(None)

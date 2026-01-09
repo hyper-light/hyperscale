@@ -3321,12 +3321,9 @@ class ManagerServer(HealthAwareServer):
         # Set _running to False early to stop all background loops
         self._running = False
 
-        print('A')
         # Shutdown WorkflowDispatcher to cancel all dispatch loop tasks
         if self._workflow_dispatcher:
             await self._workflow_dispatcher.shutdown()
-
-        print('B')
 
         # Cancel dead node reap loop
         if self._dead_node_reap_task and not self._dead_node_reap_task.done():
@@ -3336,30 +3333,21 @@ class ManagerServer(HealthAwareServer):
                 await self._dead_node_reap_task
             except asyncio.CancelledError:
                 pass
-
-        print('C')
     
         # Cancel discovery maintenance loop (AD-28)
         if self._discovery_maintenance_task and not self._discovery_maintenance_task.done():
-            print('CC')
             self._discovery_maintenance_task.cancel()
             try:
                 await self._discovery_maintenance_task
             except asyncio.CancelledError:
                 pass
 
-        print('D')
-
         # Stop federated health monitor
         await self._gate_health_monitor.stop()
-
-        print('E')
         await super().stop(
             drain_timeout=drain_timeout,
             broadcast_leave=broadcast_leave,
         )
-
-        print('F')
     
     async def _send_xprobe_to_gate(self, target: tuple[str, int], data: bytes) -> bool:
         """

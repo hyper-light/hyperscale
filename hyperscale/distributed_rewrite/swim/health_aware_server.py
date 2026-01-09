@@ -1053,7 +1053,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
     async def start_cleanup(self) -> None:
         """Start the periodic cleanup task."""
         if self._cleanup_task is None or self._cleanup_task.done():
-            self._cleanup_task = asyncio.create_task(self._run_cleanup_loop())
+            self._cleanup_task = asyncio.ensure_future(self._run_cleanup_loop())
     
     async def stop_cleanup(self) -> None:
         """Stop the periodic cleanup task."""
@@ -1086,7 +1086,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         
         # Cleanup hierarchical detector (reconciliation)
         async with ErrorContext(self._error_handler, "suspicion_cleanup"):
-            stats['suspicion'] = await self._hierarchical_detector.get_stats()
+            stats['suspicion'] = self._hierarchical_detector.get_stats()
         
         # Cleanup indirect probe manager
         async with ErrorContext(self._error_handler, "indirect_probe_cleanup"):
@@ -2047,13 +2047,14 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         For tests or quick shutdown, use this. For production, prefer
         graceful_shutdown() with appropriate drain_timeout.
         """
-        print('EE')
         await self._graceful_shutdown(drain_timeout=drain_timeout, broadcast_leave=broadcast_leave)
+        
+        try:
+            await super().shutdown()
 
-        print('EEE')
-        await super().shutdown()
-
-        print('EEEEE')
+        except Exception:
+            import traceback
+            print(traceback.format_exc())
     
     def get_current_leader(self) -> tuple[str, int] | None:
         """Get the current leader, if known."""

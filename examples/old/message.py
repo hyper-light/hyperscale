@@ -1073,7 +1073,7 @@ class HealthAwareServerOld(MercurySyncBaseServer[Ctx]):
         
         # Cleanup hierarchical detector (reconciliation)
         async with ErrorContext(self._error_handler, "suspicion_cleanup"):
-            stats['suspicion'] = await self._hierarchical_detector.get_stats()
+            stats['suspicion'] = self._hierarchical_detector.get_stats()
         
         # Cleanup indirect probe manager
         async with ErrorContext(self._error_handler, "indirect_probe_cleanup"):

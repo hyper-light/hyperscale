@@ -377,6 +377,16 @@ class GateServer(HealthAwareServer):
         # job_id -> highest fence_token seen for this job
         self._job_fence_tokens: dict[str, int] = {}
 
+        # Section 7: Gate job leadership takeover handling
+        # Track managers confirmed dead that were job leaders
+        self._dead_job_leaders: set[tuple[str, int]] = set()  # {(host, port), ...}
+        # Track jobs whose leader is dead - job_id -> orphan_timestamp
+        self._orphaned_jobs: dict[str, float] = {}
+        # Grace period before marking orphaned jobs as failed
+        self._orphan_grace_period: float = env.GATE_ORPHAN_GRACE_PERIOD
+        self._orphan_check_interval: float = env.GATE_ORPHAN_CHECK_INTERVAL
+        self._orphan_check_task: asyncio.Task | None = None
+
         # State versioning (local gate state version)
         self._state_version = 0
         
@@ -6129,6 +6139,9 @@ class GateServer(HealthAwareServer):
                 self._job_dc_managers[transfer.job_id] = {}
             self._job_dc_managers[transfer.job_id][transfer.datacenter_id] = transfer.new_manager_addr
 
+            # Section 7: Clear orphaned status if this job was orphaned
+            self._clear_orphaned_job(transfer.job_id, transfer.new_manager_addr)
+
             self._task_runner.run(
                 self._udp_logger.log,
                 ServerInfo(
@@ -6386,3 +6399,212 @@ class GateServer(HealthAwareServer):
             peer_id: The peer that failed
         """
         self._peer_discovery.record_failure(peer_id)
+
+    # =========================================================================
+    # Section 7: Gate Job Leadership Takeover Handling
+    # =========================================================================
+
+    async def _handle_manager_death_for_jobs(
+        self,
+        manager_addr: tuple[str, int],
+        datacenter_id: str,
+    ) -> None:
+        """
+        Handle a job leader manager's death for job tracking (Section 7).
+
+        Called when we detect a manager has failed. Marks jobs as orphaned
+        if this manager was the job leader for them.
+
+        Args:
+            manager_addr: TCP address of the dead manager
+            datacenter_id: Datacenter the manager belonged to
+        """
+        # Track this manager as dead for job leadership purposes
+        self._dead_job_leaders.add(manager_addr)
+
+        # Scan for jobs whose leader was this manager
+        await self._scan_for_orphaned_jobs(manager_addr, datacenter_id)
+
+        await self._udp_logger.log(
+            ServerInfo(
+                message=f"Manager at {manager_addr} in DC {datacenter_id} marked dead, "
+                        f"scanned for orphaned jobs",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+
+    async def _scan_for_orphaned_jobs(
+        self,
+        dead_manager_addr: tuple[str, int],
+        datacenter_id: str,
+    ) -> None:
+        """
+        Scan for jobs whose leader manager has died (Section 7).
+
+        Jobs are marked as orphaned but NOT immediately failed.
+        We wait for potential JobLeaderManagerTransfer from new leader.
+
+        Args:
+            dead_manager_addr: Address of the dead manager
+            datacenter_id: Datacenter where manager failed
+        """
+        current_time = time.monotonic()
+        orphaned_count = 0
+
+        # Check jobs in _job_dc_managers
+        for job_id, dc_managers in list(self._job_dc_managers.items()):
+            manager_addr = dc_managers.get(datacenter_id)
+            if manager_addr == dead_manager_addr:
+                # This job's manager in this DC is dead
+                if job_id not in self._orphaned_jobs:
+                    self._orphaned_jobs[job_id] = current_time
+                    orphaned_count += 1
+
+        # Also check the leadership tracker
+        for job_id in self._job_leadership_tracker.list_jobs():
+            manager_addr = self._job_leadership_tracker.get_dc_manager(job_id, datacenter_id)
+            if manager_addr == dead_manager_addr:
+                if job_id not in self._orphaned_jobs:
+                    self._orphaned_jobs[job_id] = current_time
+                    orphaned_count += 1
+
+        if orphaned_count > 0:
+            await self._udp_logger.log(
+                ServerInfo(
+                    message=f"Marked {orphaned_count} jobs as orphaned due to manager {dead_manager_addr} failure",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+
+    def _clear_orphaned_job(self, job_id: str, new_manager_addr: tuple[str, int]) -> None:
+        """
+        Clear a job's orphaned status when transfer is received (Section 7).
+
+        Called when we receive JobLeaderManagerTransfer for an orphaned job.
+
+        Args:
+            job_id: The job to clear
+            new_manager_addr: Address of the new job leader manager
+        """
+        if job_id in self._orphaned_jobs:
+            del self._orphaned_jobs[job_id]
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerInfo(
+                    message=f"Job {job_id[:8]}... rescued from orphan state, new leader: {new_manager_addr}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+
+    async def _orphan_check_loop(self) -> None:
+        """
+        Background loop checking for orphaned jobs whose grace period expired (Section 7).
+
+        Jobs that remain orphaned past the grace period are marked as failed
+        and clients are notified.
+        """
+        while self._running:
+            try:
+                await asyncio.sleep(self._orphan_check_interval)
+
+                current_time = time.monotonic()
+                jobs_to_fail: list[str] = []
+
+                # Find jobs whose grace period has expired
+                for job_id, orphan_timestamp in list(self._orphaned_jobs.items()):
+                    elapsed = current_time - orphan_timestamp
+                    if elapsed >= self._orphan_grace_period:
+                        jobs_to_fail.append(job_id)
+
+                # Handle expired orphaned jobs
+                for job_id in jobs_to_fail:
+                    self._orphaned_jobs.pop(job_id, None)
+                    await self._handle_job_orphan_timeout(job_id)
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                await self._udp_logger.log(
+                    ServerError(
+                        message=f"Error in orphan check loop: {e}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+
+    async def _handle_job_orphan_timeout(self, job_id: str) -> None:
+        """
+        Handle a job whose orphan grace period has expired (Section 7).
+
+        Notifies the client that the job has failed and cleans up state.
+
+        Args:
+            job_id: The job whose grace period expired
+        """
+        await self._udp_logger.log(
+            ServerWarning(
+                message=f"Job {job_id[:8]}... orphan grace period expired - marking as failed",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+
+        # Notify client if callback registered
+        callback = self._job_callbacks.get(job_id)
+        if callback:
+            try:
+                # Create a failure notification
+                failure_result = JobFinalResult(
+                    job_id=job_id,
+                    success=False,
+                    errors=["Job leader manager failed and no replacement took over within grace period"],
+                    completed_at=time.monotonic(),
+                )
+                await self.send_tcp(
+                    callback,
+                    "receive_job_result",
+                    failure_result.dump(),
+                    timeout=2.0,
+                )
+            except Exception as e:
+                await self._udp_logger.log(
+                    ServerError(
+                        message=f"Failed to notify client of job {job_id[:8]}... failure: {e}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+
+        # Update job status to failed
+        job_info = self._jobs.get(job_id)
+        if job_info:
+            job_info.status = JobStatus.FAILED.value
+            job_info.error = "Job leader manager failed, no replacement within grace period"
+
+        # Clean up callbacks
+        self._job_callbacks.pop(job_id, None)
+        self._progress_callbacks.pop(job_id, None)
+
+    def start_orphan_check_loop(self) -> None:
+        """Start the orphan check background task (Section 7)."""
+        if self._orphan_check_task is None or self._orphan_check_task.done():
+            self._orphan_check_task = asyncio.create_task(self._orphan_check_loop())
+
+    async def stop_orphan_check_loop(self) -> None:
+        """Stop the orphan check background task (Section 7)."""
+        if self._orphan_check_task:
+            self._orphan_check_task.cancel()
+            try:
+                await self._orphan_check_task
+            except asyncio.CancelledError:
+                pass
+            self._orphan_check_task = None

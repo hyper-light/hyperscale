@@ -147,6 +147,12 @@ class Env(BaseModel):
     GATE_TCP_TIMEOUT_STANDARD: StrictFloat = 5.0  # Standard timeout for job dispatch, result forwarding
     GATE_TCP_TIMEOUT_FORWARD: StrictFloat = 3.0  # Timeout for forwarding to peers
 
+    # Gate Orphan Job Grace Period Settings (Section 7)
+    # Grace period before marking orphaned jobs as failed when job leader manager dies
+    # Should be longer than expected election + takeover time
+    GATE_ORPHAN_GRACE_PERIOD: StrictFloat = 10.0  # Seconds to wait for JobLeaderGateTransfer
+    GATE_ORPHAN_CHECK_INTERVAL: StrictFloat = 2.0  # Seconds between orphan grace period checks
+
     # ==========================================================================
     # Overload Detection Settings (AD-18)
     # ==========================================================================
@@ -441,6 +447,9 @@ class Env(BaseModel):
             "GATE_TCP_TIMEOUT_SHORT": float,
             "GATE_TCP_TIMEOUT_STANDARD": float,
             "GATE_TCP_TIMEOUT_FORWARD": float,
+            # Gate orphan grace period settings (Section 7)
+            "GATE_ORPHAN_GRACE_PERIOD": float,
+            "GATE_ORPHAN_CHECK_INTERVAL": float,
             # Overload detection settings (AD-18)
             "OVERLOAD_EMA_ALPHA": float,
             "OVERLOAD_CURRENT_WINDOW": int,
