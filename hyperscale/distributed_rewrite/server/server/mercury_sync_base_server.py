@@ -174,7 +174,7 @@ class MercurySyncBaseServer(Generic[T]):
         # Drop counters for silent drop monitoring
         self._tcp_drop_counter = DropCounter()
         self._udp_drop_counter = DropCounter()
-        self._drop_stats_task: asyncio.Task | None = None
+        self._drop_stats_task: asyncio.Future | None = None
         self._drop_stats_interval = 60.0  # Log drop stats every 60 seconds
 
         # AD-32: Priority-aware bounded execution trackers
@@ -196,11 +196,11 @@ class MercurySyncBaseServer(Generic[T]):
         self._compressor: zstandard.ZstdCompressor | None = None
         self._decompressor: zstandard.ZstdDecompressor| None = None
 
-        self._tcp_server_cleanup_task: asyncio.Task | None = None
-        self._tcp_server_sleep_task: asyncio.Task | None = None
+        self._tcp_server_cleanup_task: asyncio.Future | None = None
+        self._tcp_server_sleep_task: asyncio.Future | None = None
 
-        self._udp_server_cleanup_task: asyncio.Task | None = None
-        self._udp_server_sleep_task: asyncio.Task | None = None
+        self._udp_server_cleanup_task: asyncio.Future | None = None
+        self._udp_server_sleep_task: asyncio.Future | None = None
 
         self.tcp_client_waiting_for_data: asyncio.Event = None
         self.tcp_server_waiting_for_data: asyncio.Event = None
@@ -391,13 +391,13 @@ class MercurySyncBaseServer(Generic[T]):
         )
 
         if self._tcp_server_cleanup_task is None:
-            self._tcp_server_cleanup_task = self._loop.create_task(self._cleanup_tcp_server_tasks())
+            self._tcp_server_cleanup_task = asyncio.ensure_future(self._cleanup_tcp_server_tasks())
 
         if self._udp_server_cleanup_task is None:
-            self._udp_server_cleanup_task = self._loop.create_task(self._cleanup_udp_server_tasks())
+            self._udp_server_cleanup_task = asyncio.ensure_future(self._cleanup_udp_server_tasks())
 
         if self._drop_stats_task is None:
-            self._drop_stats_task = self._loop.create_task(self._log_drop_stats_periodically())
+            self._drop_stats_task = asyncio.ensure_future(self._log_drop_stats_periodically())
 
         
         for task_name, task in self._tasks.items():
@@ -1604,16 +1604,22 @@ class MercurySyncBaseServer(Generic[T]):
     async def shutdown(self) -> None:
         self._running = False
 
+        print('SHUTDOWN TASK RUNNER')
+
         await self._task_runner.shutdown()
 
         for client in self._tcp_client_transports.values():
             client.abort()
+
+        print('CLOSE TCP CLIENT')
 
         # Close UDP transport to stop receiving datagrams
         if self._udp_transport is not None:
             self._udp_transport.close()
             self._udp_transport = None
             self._udp_connected = False
+
+        print('CLOSE UDP')
 
         # Close TCP server to stop accepting connections
         if self._tcp_server is not None:
@@ -1625,37 +1631,30 @@ class MercurySyncBaseServer(Generic[T]):
             self._tcp_server = None
             self._tcp_connected = False
 
+        print('CLOSE TCP SERVER')
+
         # Cancel drop stats task
         if self._drop_stats_task is not None:
-            self._drop_stats_task.cancel()
+            self._drop_stats_task.set_result(None)
             try:
                 await self._drop_stats_task
             except (asyncio.CancelledError, Exception):
                 pass
+
+        print('CLOSE DROP STATS')
 
         await asyncio.gather(*[
             self._cleanup_tcp_server_tasks(),
             self._cleanup_udp_server_tasks(),
         ])
 
+        print('CLOSE CLEANUP')
+
     async def _cleanup_tcp_server_tasks(self):
 
         if self._tcp_server_cleanup_task:
-            self._tcp_server_cleanup_task.cancel()
-            if self._tcp_server_cleanup_task.cancelled() is False:
-                try:
-                    self._tcp_server_sleep_task.cancel()
-                    if not self._tcp_server_sleep_task.cancelled():
-                        await self._tcp_server_sleep_task
-
-                except (Exception, socket.error):
-                    pass
-
-                try:
-                    await self._tcp_server_cleanup_task
-
-                except Exception:
-                    pass
+            self._tcp_server_sleep_task.set_result(None)
+            self._tcp_server_cleanup_task.set_result(None)
 
     async def _cleanup_udp_server_tasks(self):
 

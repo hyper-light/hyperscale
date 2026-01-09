@@ -2047,8 +2047,13 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         For tests or quick shutdown, use this. For production, prefer
         graceful_shutdown() with appropriate drain_timeout.
         """
+        print('EE')
         await self._graceful_shutdown(drain_timeout=drain_timeout, broadcast_leave=broadcast_leave)
+
+        print('EEE')
         await super().shutdown()
+
+        print('EEEEE')
     
     def get_current_leader(self) -> tuple[str, int] | None:
         """Get the current leader, if known."""

@@ -822,6 +822,93 @@ class JobCancellationComplete(Message):
 
 
 # =============================================================================
+# Workflow-Level Cancellation (Section 6)
+# =============================================================================
+
+
+class WorkflowCancellationStatus(str, Enum):
+    """Status result for workflow cancellation request."""
+    CANCELLED = "cancelled"              # Successfully cancelled
+    PENDING_CANCELLED = "pending_cancelled"  # Was pending, now cancelled
+    ALREADY_CANCELLED = "already_cancelled"  # Was already cancelled
+    ALREADY_COMPLETED = "already_completed"  # Already finished, can't cancel
+    NOT_FOUND = "not_found"              # Workflow not found
+    CANCELLING = "cancelling"            # Cancellation in progress
+
+
+@dataclass(slots=True)
+class SingleWorkflowCancelRequest(Message):
+    """
+    Request to cancel a specific workflow (Section 6).
+
+    Can be sent from:
+    - Client -> Gate (cross-DC workflow cancellation)
+    - Gate -> Manager (DC-specific workflow cancellation)
+    - Client -> Manager (direct DC workflow cancellation)
+
+    If cancel_dependents is True, all workflows that depend on this one
+    will also be cancelled recursively.
+    """
+    job_id: str                          # Parent job ID
+    workflow_id: str                     # Specific workflow to cancel
+    request_id: str                      # Unique request ID for tracking/dedup
+    requester_id: str                    # Who requested cancellation
+    timestamp: float                     # When request was made
+    cancel_dependents: bool = True       # Also cancel dependent workflows
+    origin_gate_addr: tuple[str, int] | None = None  # For result push
+    origin_client_addr: tuple[str, int] | None = None  # For direct client push
+
+
+@dataclass(slots=True)
+class SingleWorkflowCancelResponse(Message):
+    """
+    Response to a single workflow cancellation request (Section 6).
+
+    Contains the status of the cancellation and any dependents that
+    were also cancelled as a result.
+    """
+    job_id: str                          # Parent job ID
+    workflow_id: str                     # Requested workflow
+    request_id: str                      # Echoed request ID
+    status: str                          # WorkflowCancellationStatus value
+    cancelled_dependents: list[str] = field(default_factory=list)  # IDs of cancelled deps
+    errors: list[str] = field(default_factory=list)  # Any errors during cancellation
+    datacenter: str = ""                 # Responding datacenter
+
+
+@dataclass(slots=True)
+class WorkflowCancellationPeerNotification(Message):
+    """
+    Peer notification for workflow cancellation (Section 6).
+
+    Sent from manager-to-manager or gate-to-gate to synchronize
+    cancellation state across the cluster. Ensures all peers mark
+    the workflow (and dependents) as cancelled to prevent resurrection.
+    """
+    job_id: str                          # Parent job ID
+    workflow_id: str                     # Primary workflow cancelled
+    request_id: str                      # Original request ID
+    origin_node_id: str                  # Node that initiated cancellation
+    cancelled_workflows: list[str] = field(default_factory=list)  # All cancelled (incl deps)
+    timestamp: float = 0.0               # When cancellation occurred
+
+
+@dataclass(slots=True)
+class CancelledWorkflowInfo:
+    """
+    Tracking info for a cancelled workflow (Section 6).
+
+    Stored in manager's _cancelled_workflows bucket to prevent
+    resurrection of cancelled workflows.
+    """
+    job_id: str                          # Parent job ID
+    workflow_id: str                     # Cancelled workflow ID
+    cancelled_at: float                  # When cancelled
+    request_id: str                      # Original request ID
+    dependents: list[str] = field(default_factory=list)  # Cancelled dependents
+
+
+# =============================================================================
 # Adaptive Healthcheck Extensions (AD-26)
 # =============================================================================
 

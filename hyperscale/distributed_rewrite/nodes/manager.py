@@ -103,6 +103,11 @@ from hyperscale.distributed_rewrite.models import (
     WorkflowCancellationResponse,
     WorkflowCancellationComplete,
     JobCancellationComplete,
+    WorkflowCancellationStatus,
+    SingleWorkflowCancelRequest,
+    SingleWorkflowCancelResponse,
+    WorkflowCancellationPeerNotification,
+    CancelledWorkflowInfo,
     WorkerDiscoveryBroadcast,
     ContextForward,
     ContextLayerSync,
@@ -376,6 +381,15 @@ class ManagerServer(HealthAwareServer):
         self._cancellation_completion_events: dict[str, asyncio.Event] = {}
         # job_id -> timestamp when cancellation was initiated
         self._cancellation_initiated_at: dict[str, float] = {}
+
+        # Cancelled workflow tracking (Section 6)
+        # workflow_id -> CancelledWorkflowInfo (prevents resurrection of cancelled workflows)
+        self._cancelled_workflows: dict[str, CancelledWorkflowInfo] = {}
+        # workflow_id -> asyncio.Lock (for race-safe cancellation)
+        self._workflow_cancellation_locks: dict[str, asyncio.Lock] = {}
+        # Cleanup settings for cancelled workflows
+        self._cancelled_workflow_ttl: float = env.CANCELLED_WORKFLOW_TTL
+        self._cancelled_workflow_cleanup_interval: float = env.CANCELLED_WORKFLOW_CLEANUP_INTERVAL
 
         # Job submissions for eager dispatch (need access to submission params)
         self._job_submissions: dict[str, JobSubmission] = {}  # job_id -> submission
@@ -3307,32 +3321,45 @@ class ManagerServer(HealthAwareServer):
         # Set _running to False early to stop all background loops
         self._running = False
 
+        print('A')
         # Shutdown WorkflowDispatcher to cancel all dispatch loop tasks
         if self._workflow_dispatcher:
             await self._workflow_dispatcher.shutdown()
 
+        print('B')
+
         # Cancel dead node reap loop
         if self._dead_node_reap_task and not self._dead_node_reap_task.done():
+            print('BB')
             self._dead_node_reap_task.cancel()
             try:
                 await self._dead_node_reap_task
             except asyncio.CancelledError:
                 pass
 
+        print('C')
+    
         # Cancel discovery maintenance loop (AD-28)
         if self._discovery_maintenance_task and not self._discovery_maintenance_task.done():
+            print('CC')
             self._discovery_maintenance_task.cancel()
             try:
                 await self._discovery_maintenance_task
             except asyncio.CancelledError:
                 pass
 
+        print('D')
+
         # Stop federated health monitor
         await self._gate_health_monitor.stop()
+
+        print('E')
         await super().stop(
             drain_timeout=drain_timeout,
             broadcast_leave=broadcast_leave,
         )
+
+        print('F')
     
     async def _send_xprobe_to_gate(self, target: tuple[str, int], data: bytes) -> bool:
         """
@@ -4235,18 +4262,31 @@ class ManagerServer(HealthAwareServer):
         - Attempt 1: immediate
         - Attempt 2: 0.3s delay
         - Attempt 3: 0.6s delay
-        
+
         Checks and updates the per-worker circuit breaker.
-        
+
         Args:
             worker_node_id: Target worker node ID
             dispatch: Workflow dispatch message
             max_retries: Maximum retry attempts (default 2)
             base_delay: Base delay for exponential backoff (default 0.3s)
-            
+
         Returns:
             WorkflowDispatchAck if accepted, None otherwise
         """
+        # Check if workflow was cancelled before dispatch (Section 6)
+        workflow_id = str(dispatch.workflow_token)
+        if workflow_id in self._cancelled_workflows:
+            await self._udp_logger.log(
+                ServerInfo(
+                    message=f"Skipping dispatch of cancelled workflow {workflow_id[:8]}... to worker {worker_node_id}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            return None
+
         # Check circuit breaker first
         if self._is_worker_circuit_open(worker_node_id):
             self._task_runner.run(
@@ -8907,6 +8947,316 @@ class ManagerServer(HealthAwareServer):
         except Exception as e:
             await self.handle_exception(e, "receive_workflow_cancellation_complete")
             return b"ERROR"
+
+    @tcp.receive()
+    async def receive_cancel_single_workflow(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ) -> bytes:
+        """
+        Handle single workflow cancellation request (Section 6).
+
+        Cancels a specific workflow and optionally all its dependents.
+        This handler:
+        1. Acquires per-workflow lock to prevent race with dispatch
+        2. Checks if workflow is pending (removes from queue) or running (cancels on workers)
+        3. Recursively cancels dependent workflows if requested
+        4. Notifies peer managers to prevent resurrection
+        5. Returns aggregated result to gate/client
+        """
+        try:
+            request = SingleWorkflowCancelRequest.load(data)
+
+            # Rate limit check
+            client_id = f"{addr[0]}:{addr[1]}"
+            allowed, retry_after = self._check_rate_limit_for_operation(client_id, "cancel_workflow")
+            if not allowed:
+                return RateLimitResponse(
+                    operation="cancel_workflow",
+                    retry_after_seconds=retry_after,
+                ).dump()
+
+            # Check if already cancelled (idempotency via request_id)
+            if request.workflow_id in self._cancelled_workflows:
+                existing = self._cancelled_workflows[request.workflow_id]
+                return SingleWorkflowCancelResponse(
+                    job_id=request.job_id,
+                    workflow_id=request.workflow_id,
+                    request_id=request.request_id,
+                    status=WorkflowCancellationStatus.ALREADY_CANCELLED.value,
+                    cancelled_dependents=existing.dependents,
+                    datacenter=self._datacenter,
+                ).dump()
+
+            job = self._job_manager.get_job_by_id(request.job_id)
+            if not job:
+                return SingleWorkflowCancelResponse(
+                    job_id=request.job_id,
+                    workflow_id=request.workflow_id,
+                    request_id=request.request_id,
+                    status=WorkflowCancellationStatus.NOT_FOUND.value,
+                    errors=["Job not found"],
+                    datacenter=self._datacenter,
+                ).dump()
+
+            # Acquire per-workflow lock
+            lock = self._workflow_cancellation_locks.setdefault(
+                request.workflow_id, asyncio.Lock()
+            )
+
+            async with lock:
+                # Find the workflow
+                target_sub_wf = None
+                for sub_wf in job.sub_workflows.values():
+                    if str(sub_wf.token) == request.workflow_id:
+                        target_sub_wf = sub_wf
+                        break
+
+                if target_sub_wf is None:
+                    # Not found in job's sub_workflows
+                    return SingleWorkflowCancelResponse(
+                        job_id=request.job_id,
+                        workflow_id=request.workflow_id,
+                        request_id=request.request_id,
+                        status=WorkflowCancellationStatus.NOT_FOUND.value,
+                        errors=["Workflow not found in job"],
+                        datacenter=self._datacenter,
+                    ).dump()
+
+                # Check if already completed
+                if target_sub_wf.progress and target_sub_wf.progress.status in (
+                    WorkflowStatus.COMPLETED.value,
+                    WorkflowStatus.AGGREGATED.value,
+                ):
+                    return SingleWorkflowCancelResponse(
+                        job_id=request.job_id,
+                        workflow_id=request.workflow_id,
+                        request_id=request.request_id,
+                        status=WorkflowCancellationStatus.ALREADY_COMPLETED.value,
+                        datacenter=self._datacenter,
+                    ).dump()
+
+                # Collect all workflows to cancel (target + dependents if requested)
+                workflows_to_cancel = [request.workflow_id]
+                cancelled_dependents: list[str] = []
+
+                if request.cancel_dependents:
+                    dependents = self._find_dependent_workflows(request.job_id, request.workflow_id)
+                    workflows_to_cancel.extend(dependents)
+                    cancelled_dependents = dependents
+
+                # Cancel workflows
+                errors: list[str] = []
+                status = WorkflowCancellationStatus.CANCELLED.value
+
+                for wf_id in workflows_to_cancel:
+                    # Add to cancelled bucket
+                    self._cancelled_workflows[wf_id] = CancelledWorkflowInfo(
+                        job_id=request.job_id,
+                        workflow_id=wf_id,
+                        cancelled_at=time.monotonic(),
+                        request_id=request.request_id,
+                        dependents=cancelled_dependents if wf_id == request.workflow_id else [],
+                    )
+
+                    # Find the sub-workflow to cancel
+                    sub_wf_to_cancel = None
+                    for sub_wf in job.sub_workflows.values():
+                        if str(sub_wf.token) == wf_id:
+                            sub_wf_to_cancel = sub_wf
+                            break
+
+                    if sub_wf_to_cancel is None:
+                        continue
+
+                    # Check if pending (in queue) or running (on worker)
+                    if sub_wf_to_cancel.progress is None or sub_wf_to_cancel.progress.status == WorkflowStatus.PENDING.value:
+                        # Pending - just mark as cancelled
+                        if sub_wf_to_cancel.progress:
+                            sub_wf_to_cancel.progress.status = WorkflowStatus.CANCELLED.value
+                        if wf_id == request.workflow_id:
+                            status = WorkflowCancellationStatus.PENDING_CANCELLED.value
+                    elif sub_wf_to_cancel.progress.status == WorkflowStatus.RUNNING.value:
+                        # Running on worker - dispatch cancellation
+                        worker_id = sub_wf_to_cancel.worker_id
+                        if worker_id:
+                            worker_addr = self._get_worker_tcp_addr(worker_id)
+                            if worker_addr:
+                                try:
+                                    cancel_req = WorkflowCancelRequest(
+                                        job_id=request.job_id,
+                                        workflow_id=wf_id,
+                                        requester_id=request.requester_id,
+                                        timestamp=request.timestamp,
+                                    )
+                                    await self.send_tcp(
+                                        worker_addr,
+                                        "cancel_workflow",
+                                        cancel_req.dump(),
+                                        timeout=5.0,
+                                    )
+                                except Exception as e:
+                                    errors.append(f"Failed to cancel {wf_id[:8]}... on worker: {e}")
+
+                # Notify peer managers
+                self._task_runner.run(
+                    self._notify_peers_of_workflow_cancellation,
+                    request.job_id,
+                    request.workflow_id,
+                    request.request_id,
+                    workflows_to_cancel,
+                )
+
+                return SingleWorkflowCancelResponse(
+                    job_id=request.job_id,
+                    workflow_id=request.workflow_id,
+                    request_id=request.request_id,
+                    status=status,
+                    cancelled_dependents=cancelled_dependents,
+                    errors=errors,
+                    datacenter=self._datacenter,
+                ).dump()
+
+        except Exception as e:
+            await self.handle_exception(e, "receive_cancel_single_workflow")
+            return SingleWorkflowCancelResponse(
+                job_id="unknown",
+                workflow_id="unknown",
+                request_id="unknown",
+                status=WorkflowCancellationStatus.NOT_FOUND.value,
+                errors=[str(e)],
+                datacenter=self._datacenter,
+            ).dump()
+
+    @tcp.receive()
+    async def receive_workflow_cancellation_peer_notification(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ) -> bytes:
+        """
+        Handle workflow cancellation peer notification (Section 6).
+
+        Peer managers receive this to synchronize their cancelled workflow bucket.
+        This prevents resurrection of cancelled workflows on any manager.
+        """
+        try:
+            notification = WorkflowCancellationPeerNotification.load(data)
+
+            await self._udp_logger.log(
+                ServerInfo(
+                    message=f"Received workflow cancellation peer notification for {notification.workflow_id[:8]}... "
+                            f"({len(notification.cancelled_workflows)} workflows)",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+
+            # Add all cancelled workflows to our bucket
+            for wf_id in notification.cancelled_workflows:
+                if wf_id not in self._cancelled_workflows:
+                    self._cancelled_workflows[wf_id] = CancelledWorkflowInfo(
+                        job_id=notification.job_id,
+                        workflow_id=wf_id,
+                        cancelled_at=notification.timestamp or time.monotonic(),
+                        request_id=notification.request_id,
+                        dependents=[],
+                    )
+
+            return b"OK"
+
+        except Exception as e:
+            await self.handle_exception(e, "receive_workflow_cancellation_peer_notification")
+            return b"ERROR"
+
+    def _find_dependent_workflows(self, job_id: str, workflow_id: str) -> list[str]:
+        """
+        Find all workflows that depend on the given workflow.
+
+        Recursively traverses the dependency graph to find ALL dependents
+        (direct and transitive).
+        """
+        dependents: list[str] = []
+        job = self._job_manager.get_job_by_id(job_id)
+        if not job:
+            return dependents
+
+        # Build reverse dependency map (workflow -> workflows that depend on it)
+        reverse_deps: dict[str, list[str]] = {}
+        for sub_wf in job.sub_workflows.values():
+            wf_id = str(sub_wf.token)
+            # Dependencies would be stored in the workflow's metadata
+            # For now, we check if this workflow has dependencies
+            if hasattr(sub_wf, 'dependencies') and sub_wf.dependencies:
+                for dep in sub_wf.dependencies:
+                    if dep not in reverse_deps:
+                        reverse_deps[dep] = []
+                    reverse_deps[dep].append(wf_id)
+
+        # BFS to find all dependents
+        queue = [workflow_id]
+        visited: set[str] = set()
+
+        while queue:
+            current = queue.pop(0)
+            if current in visited:
+                continue
+            visited.add(current)
+
+            for dependent in reverse_deps.get(current, []):
+                if dependent not in visited:
+                    dependents.append(dependent)
+                    queue.append(dependent)
+
+        return dependents
+
+    async def _notify_peers_of_workflow_cancellation(
+        self,
+        job_id: str,
+        workflow_id: str,
+        request_id: str,
+        cancelled_workflows: list[str],
+    ) -> None:
+        """
+        Notify peer managers of workflow cancellation (Section 6).
+
+        Sends WorkflowCancellationPeerNotification to all known peer managers
+        so they add the workflows to their cancelled bucket.
+        """
+        notification = WorkflowCancellationPeerNotification(
+            job_id=job_id,
+            workflow_id=workflow_id,
+            request_id=request_id,
+            origin_node_id=self._node_id.short,
+            cancelled_workflows=cancelled_workflows,
+            timestamp=time.monotonic(),
+        )
+
+        for peer_id, peer_addr in list(self._known_manager_peers.items()):
+            if peer_id == self._node_id.short:
+                continue
+
+            try:
+                await self.send_tcp(
+                    peer_addr,
+                    "receive_workflow_cancellation_peer_notification",
+                    notification.dump(),
+                    timeout=2.0,
+                )
+            except Exception:
+                # Best-effort notification - peer will eventually learn via state sync
+                pass
+
+    def _get_worker_tcp_addr(self, worker_id: str) -> tuple[str, int] | None:
+        """Get TCP address for a worker by ID."""
+        for status in self._worker_pool._workers.values():
+            if status.worker_id == worker_id and status.registration:
+                return (status.registration.node.host, status.registration.node.port)
+        return None
 
     # =========================================================================
     # TCP Handlers - Adaptive Healthcheck Extensions (AD-26)

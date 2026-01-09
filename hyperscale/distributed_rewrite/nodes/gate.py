@@ -70,6 +70,9 @@ from hyperscale.distributed_rewrite.models import (
     JobCancelRequest,
     JobCancelResponse,
     JobCancellationComplete,
+    SingleWorkflowCancelRequest,
+    SingleWorkflowCancelResponse,
+    WorkflowCancellationStatus,
     DatacenterLease,
     LeaseTransfer,
     DatacenterHealth,
@@ -4650,6 +4653,122 @@ class GateServer(HealthAwareServer):
         # Cleanup tracking after push
         self._cancellation_completion_events.pop(job_id, None)
         self._cancellation_errors.pop(job_id, None)
+
+    @tcp.receive()
+    async def receive_cancel_single_workflow(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ) -> bytes:
+        """
+        Handle single workflow cancellation request from client (Section 6).
+
+        Gates forward workflow cancellation requests to all datacenters
+        that have the job, then aggregate responses.
+        """
+        try:
+            request = SingleWorkflowCancelRequest.load(data)
+
+            # Rate limit check
+            client_id = f"{addr[0]}:{addr[1]}"
+            allowed, retry_after = self._check_rate_limit_for_operation(client_id, "cancel_workflow")
+            if not allowed:
+                return RateLimitResponse(
+                    operation="cancel_workflow",
+                    retry_after_seconds=retry_after,
+                ).dump()
+
+            await self._udp_logger.log(
+                ServerInfo(
+                    message=f"Received workflow cancellation request for {request.workflow_id[:8]}... "
+                            f"(job {request.job_id[:8]}...)",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+
+            # Find all datacenters with this job
+            job_info = self._jobs.get(request.job_id)
+            if not job_info:
+                return SingleWorkflowCancelResponse(
+                    job_id=request.job_id,
+                    workflow_id=request.workflow_id,
+                    request_id=request.request_id,
+                    status=WorkflowCancellationStatus.NOT_FOUND.value,
+                    errors=["Job not found"],
+                ).dump()
+
+            # Get datacenters to forward to
+            target_dcs: list[tuple[str, tuple[str, int]]] = []
+            for dc_name, dc_info in self._datacenter_managers.items():
+                if dc_info and dc_info.tcp_addr:
+                    target_dcs.append((dc_name, dc_info.tcp_addr))
+
+            if not target_dcs:
+                return SingleWorkflowCancelResponse(
+                    job_id=request.job_id,
+                    workflow_id=request.workflow_id,
+                    request_id=request.request_id,
+                    status=WorkflowCancellationStatus.NOT_FOUND.value,
+                    errors=["No datacenters available"],
+                ).dump()
+
+            # Forward to all datacenters and collect responses
+            aggregated_dependents: list[str] = []
+            aggregated_errors: list[str] = []
+            final_status = WorkflowCancellationStatus.NOT_FOUND.value
+            responses_received = 0
+
+            for dc_name, dc_addr in target_dcs:
+                try:
+                    response_data, _ = await self.send_tcp(
+                        dc_addr,
+                        "receive_cancel_single_workflow",
+                        request.dump(),
+                        timeout=5.0,
+                    )
+
+                    if response_data:
+                        response = SingleWorkflowCancelResponse.load(response_data)
+                        responses_received += 1
+
+                        # Aggregate results
+                        aggregated_dependents.extend(response.cancelled_dependents)
+                        aggregated_errors.extend(response.errors)
+
+                        # Use the best status (CANCELLED > PENDING_CANCELLED > others)
+                        if response.status == WorkflowCancellationStatus.CANCELLED.value:
+                            final_status = WorkflowCancellationStatus.CANCELLED.value
+                        elif response.status == WorkflowCancellationStatus.PENDING_CANCELLED.value:
+                            if final_status == WorkflowCancellationStatus.NOT_FOUND.value:
+                                final_status = WorkflowCancellationStatus.PENDING_CANCELLED.value
+                        elif response.status == WorkflowCancellationStatus.ALREADY_CANCELLED.value:
+                            if final_status == WorkflowCancellationStatus.NOT_FOUND.value:
+                                final_status = WorkflowCancellationStatus.ALREADY_CANCELLED.value
+
+                except Exception as e:
+                    aggregated_errors.append(f"DC {dc_name}: {e}")
+
+            return SingleWorkflowCancelResponse(
+                job_id=request.job_id,
+                workflow_id=request.workflow_id,
+                request_id=request.request_id,
+                status=final_status,
+                cancelled_dependents=list(set(aggregated_dependents)),  # Deduplicate
+                errors=aggregated_errors,
+            ).dump()
+
+        except Exception as e:
+            await self.handle_exception(e, "receive_cancel_single_workflow")
+            return SingleWorkflowCancelResponse(
+                job_id="unknown",
+                workflow_id="unknown",
+                request_id="unknown",
+                status=WorkflowCancellationStatus.NOT_FOUND.value,
+                errors=[str(e)],
+            ).dump()
 
     # =========================================================================
     # TCP Handlers - Lease Transfer (for Gate Scaling)

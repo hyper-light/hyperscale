@@ -53,6 +53,12 @@ from .distributed import (
     JobCancelResponse as JobCancelResponse,
     WorkflowCancelRequest as WorkflowCancelRequest,
     WorkflowCancelResponse as WorkflowCancelResponse,
+    # Workflow-level cancellation (Section 6)
+    WorkflowCancellationStatus as WorkflowCancellationStatus,
+    SingleWorkflowCancelRequest as SingleWorkflowCancelRequest,
+    SingleWorkflowCancelResponse as SingleWorkflowCancelResponse,
+    WorkflowCancellationPeerNotification as WorkflowCancellationPeerNotification,
+    CancelledWorkflowInfo as CancelledWorkflowInfo,
     # Adaptive healthcheck extensions (AD-26)
     HealthcheckExtensionRequest as HealthcheckExtensionRequest,
     HealthcheckExtensionResponse as HealthcheckExtensionResponse,
