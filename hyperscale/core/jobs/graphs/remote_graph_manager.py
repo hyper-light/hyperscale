@@ -1471,7 +1471,7 @@ class RemoteGraphManager:
         run_id: int,
         workflow: str,
         timeout: float | None = None,
-    ) -> bool:
+    ) -> tuple[bool, list[str]]:
         """
         Wait for all nodes to report terminal cancellation status.
 
@@ -1485,7 +1485,9 @@ class RemoteGraphManager:
             timeout: Optional timeout in seconds. If None, waits indefinitely.
 
         Returns:
-            True if all nodes reported terminal status, False if timeout occurred.
+            Tuple of (success, errors):
+            - success: True if all nodes reported terminal status, False if timeout occurred.
+            - errors: List of error messages from nodes that reported FAILED status.
         """
         return await self._controller.await_workflow_cancellation(
             run_id,
