@@ -147,6 +147,9 @@ class WorkflowRunner:
         self._memory_monitor = MemoryMonitor(env)
         self._logger = Logger()
 
+        # Cancellation flag - checked by generators to stop spawning new VUs
+        self._cancelled: bool = False
+
     def setup(self):
         if self._workflows_sem is None:
             self._workflows_sem = asyncio.Semaphore(self._max_running_workflows)
@@ -155,6 +158,23 @@ class WorkflowRunner:
             self._run_check_lock = asyncio.Lock()
 
         self._clear()
+
+    def request_cancellation(self) -> None:
+        """
+        Request graceful cancellation of the current workflow.
+
+        This sets a flag that causes the VU generators (_generate, _generate_constant)
+        to stop yielding new VUs. Already-spawned tasks complete normally, and the
+        standard cleanup path runs without throwing exceptions.
+
+        Thread-safe: GIL ensures atomic bool write.
+        """
+        self._cancelled = True
+
+    @property
+    def is_cancelled(self) -> bool:
+        """Check if cancellation has been requested."""
+        return self._cancelled
 
     @property
     def pending(self):
@@ -259,6 +279,9 @@ class WorkflowRunner:
         Exception | None,
         WorkflowStatus,
     ]:
+        # Reset cancellation flag for new workflow run
+        self._cancelled = False
+
         default_config = {
             "node_id": self._node_id,
             "workflow": workflow.name,
@@ -1051,7 +1074,7 @@ class WorkflowRunner:
         elapsed = 0
 
         start = time.monotonic()
-        while elapsed < duration:
+        while elapsed < duration and not self._cancelled:
             try:
                 remaining = duration - elapsed
 
@@ -1110,7 +1133,7 @@ class WorkflowRunner:
         generated = 0
 
         start = time.monotonic()
-        while elapsed < duration:
+        while elapsed < duration and not self._cancelled:
             try:
                 remaining = duration - elapsed
 
