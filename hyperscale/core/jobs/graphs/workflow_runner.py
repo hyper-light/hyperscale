@@ -52,34 +52,46 @@ async def guard_optimize_call(optimize_call: Coroutine[Any, Any, None]):
         pass
 
 
-async def cancel_pending(pend: asyncio.Task):
+async def cancel_pending(pend: asyncio.Task, timeout: float = 2.0) -> asyncio.Task:
+    """
+    Cancel a pending task with bounded wait time.
+
+    Args:
+        pend: The asyncio.Task to cancel
+        timeout: Maximum seconds to wait for cancellation (default: 2.0)
+
+    Returns:
+        The task (may still be running if it didn't respond to cancellation)
+    """
     try:
         if pend.done():
-            pend.exception()
-
+            # Retrieve exception to prevent "exception never retrieved" warnings
+            try:
+                pend.exception()
+            except (asyncio.CancelledError, asyncio.InvalidStateError):
+                pass
             return pend
 
         pend.cancel()
-        await asyncio.sleep(0)
-        if not pend.cancelled():
-            await pend
+        try:
+            await asyncio.wait_for(asyncio.shield(pend), timeout=timeout)
+        except asyncio.TimeoutError:
+            # Task didn't respond to cancellation in time - may be orphaned
+            pass
+        except asyncio.CancelledError:
+            # Task was successfully cancelled
+            pass
+        except Exception:
+            # Task raised during cancellation - that's fine
+            pass
 
         return pend
 
-    except asyncio.CancelledError as cancelled_error:
-        return cancelled_error
-
-    except asyncio.TimeoutError as timeout_error:
-        return timeout_error
-
-    except asyncio.InvalidStateError as invalid_state:
-        return invalid_state
-
     except Exception:
+        # Catch any unexpected errors during the cancellation process
         pass
 
-    except socket.error:
-        pass
+    return pend
 
 
 def guard_result(result: asyncio.Task):

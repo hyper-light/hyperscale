@@ -60,6 +60,7 @@ The minimal-impact bool flag approach has been implemented:
 - [x] **2.0f** `RemoteGraphController.cancel_workflow_background()` calls `request_cancellation()` before task cancel
 - [x] **2.0g** Fix `Run.cancel()` to use timeout and always update status
 - [x] **2.0h** Add event-driven workflow completion signaling
+- [x] **2.0i** Fix `cancel_pending()` to use timeout and consistent return type
 
 **Files modified**:
 - `hyperscale/core/jobs/graphs/workflow_runner.py`
