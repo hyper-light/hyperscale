@@ -1451,21 +1451,25 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         for update in updates:
             status_map = {
                 'alive': b'OK',
-                'join': b'OK', 
+                'join': b'OK',
                 'suspect': b'SUSPECT',
                 'dead': b'DEAD',
                 'leave': b'DEAD',
             }
             status = status_map.get(update.update_type, b'OK')
-            
+
             if self.is_message_fresh(update.node, update.incarnation, status):
-                self.update_node_state(
+                # Check previous state BEFORE updating (for callback invocation)
+                previous_state = self._incarnation_tracker.get_node_state(update.node)
+                was_dead = previous_state and previous_state.status == b'DEAD'
+
+                updated = self.update_node_state(
                     update.node,
                     status,
                     update.incarnation,
                     update.timestamp,
                 )
-                
+
                 if update.update_type == 'suspect':
                     self_addr = self._get_self_udp_addr()
                     if update.node != self_addr:
@@ -1476,7 +1480,34 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                         )
                 elif update.update_type == 'alive':
                     await self.refute_suspicion(update.node, update.incarnation)
-                
+
+                # Gossip-informed dead callback: if gossip tells us a node is dead
+                # and we didn't already know, invoke the callbacks so application
+                # layer can respond (e.g., update _active_gate_peers, trigger job
+                # leadership election). This is symmetric with recovery detection
+                # that's already in update_node_state for DEAD->OK transitions.
+                if updated and update.update_type in ('dead', 'leave') and not was_dead:
+                    print(f"[DEBUG SWIM {self._udp_port}] Gossip-informed death: {update.node} (type={update.update_type})")
+                    self._metrics.increment('gossip_informed_deaths')
+                    self._audit_log.record(
+                        AuditEventType.NODE_CONFIRMED_DEAD,
+                        node=update.node,
+                        incarnation=update.incarnation,
+                        source='gossip',
+                    )
+
+                    # Update probe scheduler to stop probing this dead node
+                    self._probe_scheduler.remove_member(update.node)
+
+                    # Invoke registered callbacks (same pattern as _on_suspicion_expired)
+                    for callback in self._on_node_dead_callbacks:
+                        try:
+                            callback(update.node)
+                        except Exception as callback_error:
+                            self._task_runner.run(
+                                self.handle_exception, callback_error, "on_node_dead_callback (gossip)"
+                            )
+
                 self.queue_gossip_update(
                     update.update_type,
                     update.node,
