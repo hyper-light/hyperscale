@@ -161,9 +161,10 @@ class WorkflowRunner:
         self._memory_monitor = MemoryMonitor(env)
         self._logger = Logger()
         self._is_cancelled: asyncio.Event = asyncio.Event()
+        self._is_stopped: asyncio.Event = asyncio.Event()
 
         # Cancellation flag - checked by generators to stop spawning new VUs
-        self._cancelled: bool = False
+        self._running: bool = False
 
     def setup(self):
         if self._workflows_sem is None:
@@ -194,12 +195,16 @@ class WorkflowRunner:
 
         Thread-safe: GIL ensures atomic bool write.
         """
-        self._cancelled = True
+        self._running = False
+
+    async def await_stop(self) -> None:
+        return await self._is_stopped.wait()
+        
 
     @property
     def is_cancelled(self) -> bool:
         """Check if cancellation has been requested."""
-        return self._cancelled
+        return self._running is False
 
     @property
     def pending(self):
@@ -305,7 +310,7 @@ class WorkflowRunner:
         WorkflowStatus,
     ]:
         # Reset cancellation state for new workflow run
-        self._cancelled = False
+        self._running = True
         self._is_cancelled.clear()
 
         default_config = {
@@ -919,6 +924,9 @@ class WorkflowRunner:
 
         elapsed = time.monotonic() - start
 
+        if not self._is_stopped.set():
+            self._is_stopped.set()
+
         await asyncio.gather(*completed, return_exceptions=True)
 
         # Cancel and release all pending tasks
@@ -987,6 +995,9 @@ class WorkflowRunner:
         )
 
         await asyncio.gather(*execution_results)
+
+        if not self._is_stopped.set():
+            self._is_stopped.set()
 
         # Cancel and release all pending tasks
         for pend in self._pending[run_id][workflow_name]:
@@ -1097,7 +1108,7 @@ class WorkflowRunner:
         elapsed = 0
 
         start = time.monotonic()
-        while elapsed < duration and not self._cancelled:
+        while elapsed < duration and self._running:
             try:
                 remaining = duration - elapsed
 
@@ -1121,16 +1132,6 @@ class WorkflowRunner:
                         )
                     except asyncio.TimeoutError:
                         pass
-
-                elif self._cpu_monitor.check_lock(
-                    self._cpu_monitor.get_moving_median,
-                    run_id,
-                    workflow_name,
-                ):
-                    await self._cpu_monitor.lock(
-                        run_id,
-                        workflow_name,
-                    )
 
             except Exception:
                 pass
@@ -1156,7 +1157,7 @@ class WorkflowRunner:
         generated = 0
 
         start = time.monotonic()
-        while elapsed < duration and not self._cancelled:
+        while elapsed < duration and self._running:
             try:
                 remaining = duration - elapsed
 
@@ -1186,16 +1187,6 @@ class WorkflowRunner:
                         )
                     except asyncio.TimeoutError:
                         pass
-
-                elif self._cpu_monitor.check_lock(
-                    self._cpu_monitor.get_moving_median,
-                    run_id,
-                    workflow_name,
-                ):
-                    await self._cpu_monitor.lock(
-                        run_id,
-                        workflow_name,
-                    )
 
             except Exception:
                 pass

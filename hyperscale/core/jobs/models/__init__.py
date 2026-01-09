@@ -17,3 +17,4 @@ from .workflow_completion_state import WorkflowCompletionState as WorkflowComple
 from .workflow_job import WorkflowJob as WorkflowJob
 from .workflow_results import WorkflowResults as WorkflowResults
 from .workflow_status_update import WorkflowStatusUpdate as WorkflowStatusUpdate
+from .workflow_stop_signal import WorkflowStopSignal as WorkflowStopSignal

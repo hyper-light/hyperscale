@@ -27,6 +27,7 @@ from hyperscale.core.jobs.models import (
     WorkflowJob,
     WorkflowResults,
     WorkflowStatusUpdate,
+    WorkflowStopSignal
 )
 from hyperscale.core.jobs.models.workflow_status import WorkflowStatus
 from hyperscale.core.jobs.protocols import UDPProtocol
@@ -47,7 +48,7 @@ from hyperscale.logging.hyperscale_logging_models import (
     ServerWarning,
 )
 from hyperscale.reporting.common.results_types import WorkflowStats
-from hyperscale.ui.actions import update_active_workflow_message
+from hyperscale.ui.actions import update_active_workflow_message, update_workflow_run_timer, update_workflow_executions_total_rate
 
 from .workflow_runner import WorkflowRunner
 
@@ -96,7 +97,6 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
 
         self._results: NodeData[WorkflowResult] = defaultdict(lambda: defaultdict(dict))
         self._errors: NodeData[Exception] = defaultdict(lambda: defaultdict(dict))
-        self._cancellations: NodeData[WorkflowCancellationUpdate] = defaultdict(lambda: defaultdict(dict))
 
         self._run_workflow_run_id_map: NodeData[int] = defaultdict(
             lambda: defaultdict(dict)
@@ -150,7 +150,7 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
             defaultdict(lambda: defaultdict(lambda: defaultdict(asyncio.Lock)))
         )
 
-        self._cancellation_write_lock: NodeData[asyncio.Lock] = (
+        self._stop_write_lock: NodeData[asyncio.Lock] = (
             defaultdict(lambda: defaultdict(lambda: defaultdict(asyncio.Lock)))
         )
 
@@ -162,6 +162,10 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
         # Event-driven worker start tracking
         self._expected_workers: int = 0
         self._workers_ready_event: asyncio.Event | None = None
+
+
+        self._stop_completion_events: Dict[int, Dict[str, asyncio.Event]] = defaultdict(dict)
+        self._stop_expected_nodes: Dict[int, Dict[str, set[int]]] = defaultdict(lambda: defaultdict(set))
 
         # Event-driven cancellation completion tracking
         # Tracks expected nodes and fires event when all report terminal cancellation status
@@ -416,6 +420,16 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
                 run_id=task_id,
             )
 
+
+            self._stop_expected_nodes[run_id][workflow.name] = set(node_ids)
+            self._stop_completion_events[run_id][workflow.name] = asyncio.Event()
+
+            self.tasks.run(
+                "wait_stop_signal",
+                run_id,
+                workflow.name,
+            )
+
             # If explicit node_ids provided, target specific nodes
             # Otherwise fall back to round-robin (for backward compatibility)
             results = await asyncio.gather(
@@ -436,18 +450,24 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
         self,
         run_id: int,
         workflow_name: str,
-        update_callback: Callable[
-            [
-                int,
-                str,
-                dict[WorkflowCancellationStatus, list[WorkflowCancellationUpdate]],
-                int,
-            ],
-            Awaitable[None],
-        ],
         timeout: str = "1m",
-        rate: str = "0.25s",
-    ):
+    ) -> tuple[dict[WorkflowCancellationStatus, list[WorkflowCancellationUpdate]], list[int]]:
+        """
+        Submit cancellation requests to all nodes running the workflow.
+
+        This is event-driven - use await_workflow_cancellation() to wait for
+        all nodes to report terminal status.
+
+        Args:
+            run_id: The run ID of the workflow
+            workflow_name: The name of the workflow
+            timeout: Graceful timeout for workers to complete in-flight work
+
+        Returns:
+            Tuple of (initial_status_counts, expected_nodes):
+            - initial_status_counts: Initial responses from cancellation requests
+            - expected_nodes: List of node IDs that were sent cancellation requests
+        """
         async with self._logger.context(
             name=f"workflow_run_{run_id}",
         ) as ctx:
@@ -464,7 +484,7 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
             # Set up event-driven cancellation completion tracking
             self._cancellation_expected_nodes[run_id][workflow_name] = set(expected_nodes)
             self._cancellation_completion_events[run_id][workflow_name] = asyncio.Event()
-            self._cancellation_errors[run_id][workflow_name] = []  # Clear any previous errors
+            self._cancellation_errors[run_id][workflow_name] = []
 
             initial_cancellation_updates = await asyncio.gather(*[
                 self.request_workflow_cancellation(
@@ -475,27 +495,15 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
                 ) for node_id in expected_nodes
             ])
 
-            cancellation_status_counts = defaultdict(list)
-
-            self.tasks.run(
-                "get_latest_cancelled_status",
-                run_id,
-                workflow_name,
-                update_callback,
-                timeout,
-                rate,
-            )
+            cancellation_status_counts: dict[WorkflowCancellationStatus, list[WorkflowCancellationUpdate]] = defaultdict(list)
 
             for _, res in initial_cancellation_updates:
-
                 update = res.data
 
-                if update.error or update.status in WorkflowCancellationStatus.FAILED.value:
+                if update.error or update.status == WorkflowCancellationStatus.FAILED.value:
                     cancellation_status_counts[WorkflowCancellationStatus.FAILED].append(update)
-
                 else:
                     cancellation_status_counts[update.status].append(update)
-
 
             return (
                 cancellation_status_counts,
@@ -526,6 +534,49 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
             - errors: List of error messages from nodes that reported FAILED status.
         """
         completion_event = self._cancellation_completion_events.get(run_id, {}).get(workflow_name)
+
+        if completion_event is None:
+            # No cancellation was initiated for this workflow
+            return (True, [])
+
+        timed_out = False
+        if not completion_event.is_set():
+            try:
+                if timeout is not None:
+                    await asyncio.wait_for(completion_event.wait(), timeout=timeout)
+                else:
+                    await completion_event.wait()
+            except asyncio.TimeoutError:
+                timed_out = True
+
+        # Collect any errors that were reported
+        errors = self._cancellation_errors.get(run_id, {}).get(workflow_name, [])
+
+        return (not timed_out, list(errors))
+    
+    async def await_workflow_stop(
+        self,
+        run_id: int,
+        workflow_name: str,
+        timeout: float | None = None,
+    ) -> tuple[bool, list[str]]:
+        """
+        Wait for all nodes to report terminal cancellation status.
+
+        This is an event-driven wait that fires when all nodes assigned to the
+        workflow have reported stopped receive_stop.
+
+        Args:
+            run_id: The run ID of the workflow
+            workflow_name: The name of the workflow
+            timeout: Optional timeout in seconds. If None, waits indefinitely.
+
+        Returns:
+            Tuple of (success, errors):
+            - success: True if all nodes reported terminal status, False if timeout occurred.
+            - errors: List of error messages from nodes that reported FAILED status.
+        """
+        completion_event = self._stop_completion_events.get(run_id, {}).get(workflow_name)
 
         if completion_event is None:
             # No cancellation was initiated for this workflow
@@ -962,6 +1013,13 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
             )
 
             self.tasks.run(
+                "await_stop",
+                context.run_id,
+                node_id,
+                context.data.workflow.name,
+            )
+
+            self.tasks.run(
                 "run_workflow",
                 node_id,
                 context.run_id,
@@ -1039,43 +1097,43 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
         shard_id: int,
         cancellation: JobContext[WorkflowCancellationUpdate]
     ) -> JobContext[WorkflowCancellationUpdate]:
+        node_id = cancellation.node_id
+        run_id = cancellation.run_id
+        workflow_name = cancellation.data.workflow_name
+        status = cancellation.data.status
+
         try:
 
-            # Use full 64-bit node_id from JobContext instead of 10-bit snowflake instance
-            node_id = cancellation.node_id
-
-            run_id = cancellation.run_id
-            workflow_name = cancellation.data.workflow_name
-            status = cancellation.data.status
-
-            async with self._cancellation_write_lock[run_id][workflow_name][node_id]:
-                self._cancellations[run_id][workflow_name][node_id] = cancellation.data
-
-            # Check if this is a terminal status (CANCELLED or FAILED)
             terminal_statuses = {
                 WorkflowCancellationStatus.CANCELLED.value,
                 WorkflowCancellationStatus.FAILED.value,
             }
 
-            if status in terminal_statuses:
-                # Collect any errors from FAILED status
-                if status == WorkflowCancellationStatus.FAILED.value:
-                    error_message = cancellation.data.error
-                    if error_message:
-                        errors_list = self._cancellation_errors.get(run_id, {}).get(workflow_name)
-                        if errors_list is not None:
-                            errors_list.append(f"Node {node_id}: {error_message}")
+            if status not in terminal_statuses:
+                return JobContext(
+                    data=WorkflowCancellationUpdate(
+                        workflow_name=workflow_name,
+                        status=status,
+                    ),
+                    run_id=run_id,
+                )
 
-                # Remove this node from expected set
-                expected_nodes = self._cancellation_expected_nodes.get(run_id, {}).get(workflow_name)
-                if expected_nodes is not None:
-                    expected_nodes.discard(node_id)
+            # Terminal status - collect errors if failed
+            if status == WorkflowCancellationStatus.FAILED.value:
+                error_message = cancellation.data.error
+                if error_message:
+                    self._cancellation_errors[run_id][workflow_name].append(
+                        f"Node {node_id}: {error_message}"
+                    )
 
-                    # If all expected nodes have reported terminal status, fire the event
-                    if len(expected_nodes) == 0:
-                        completion_event = self._cancellation_completion_events.get(run_id, {}).get(workflow_name)
-                        if completion_event is not None and not completion_event.is_set():
-                            completion_event.set()
+            # Remove node from expected set and check for completion
+            expected_nodes = self._cancellation_expected_nodes[run_id][workflow_name]
+            expected_nodes.discard(node_id)
+
+            if len(expected_nodes) == 0:
+                completion_event = self._cancellation_completion_events[run_id].get(workflow_name)
+                if completion_event is not None and not completion_event.is_set():
+                    completion_event.set()
 
             return JobContext(
                 data=WorkflowCancellationUpdate(
@@ -1095,7 +1153,50 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
                 run_id=run_id,
             )
 
+    @receive()
+    async def receive_stop(
+        self,
+        shard_id: int,
+        stop_signal: JobContext[WorkflowStopSignal]
+    ) -> JobContext[WorkflowStopSignal]:
+        try:
 
+            # Use full 64-bit node_id from JobContext instead of 10-bit snowflake instance
+            node_id = stop_signal.node_id
+
+            run_id = stop_signal.run_id
+            workflow_name = stop_signal.data.workflow
+
+            # Remove node from expected set and check for completion
+            expected_nodes = self._stop_expected_nodes[run_id][workflow_name]
+            expected_nodes.discard(node_id)
+
+            if len(expected_nodes) == 0:
+                completion_event = self._stop_completion_events[run_id].get(workflow_name)
+                if completion_event is not None and not completion_event.is_set():
+                    completion_event.set()
+                    workflow_slug = workflow_name.lower()
+
+                    await update_workflow_executions_total_rate(workflow_slug, None, False)
+
+
+
+            return JobContext(
+                data=WorkflowStopSignal(
+                    workflow_name=workflow_name,
+                    node_id=node_id,
+                ),
+                run_id=run_id,
+            )
+
+        except Exception as err:
+            return JobContext(
+                data=WorkflowStopSignal(
+                    workflow_name=workflow_name,
+                    node_id=node_id,
+                ),
+                run_id=run_id,
+            )
 
     @receive()
     async def receive_status_update(
@@ -1284,6 +1385,50 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
             os.getenv("HYPERSCALE_MAX_JOBS", 10),
         ),
         trigger="MANUAL",
+        repeat="NEVER",
+        max_age="1m",
+        keep_policy="COUNT_AND_AGE",          
+    )
+    async def wait_stop_signal(
+        self,
+        run_id: str,
+        workflow_name: str,
+    ):
+        await self._stop_completion_events[run_id][workflow_name].wait()
+
+    @task(
+        keep=int(
+            os.getenv("HYPERSCALE_MAX_JOBS", 10),
+        ),
+        trigger="MANUAL",
+        repeat="NEVER",
+        max_age="1m",
+        keep_policy="COUNT_AND_AGE",
+    )
+    async def await_stop(
+        self,
+        run_id: str,
+        node_id: str,
+        workflow_name: str,
+    ):
+        await self._workflows.await_stop()
+        await self.send(
+            "receive_stop",
+            JobContext(
+                WorkflowStopSignal(
+                    workflow_name,
+                    node_id,
+                ),
+                run_id=run_id,
+            ),
+            node_id=node_id,
+        )
+
+    @task(
+        keep=int(
+            os.getenv("HYPERSCALE_MAX_JOBS", 10),
+        ),
+        trigger="MANUAL",
         repeat="ALWAYS",
         schedule="0.1s",
         max_age="1m",
@@ -1445,105 +1590,6 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
                 self.tasks.stop("aggregate_status_updates")
 
     @task(
-        keep=int(
-            os.getenv("HYPERSCALE_MAX_JOBS", 10),
-        ),
-        trigger="MANUAL",
-        repeat="NEVER",
-        keep_policy="COUNT",
-    )
-    async def get_latest_cancelled_status(
-        self,
-        run_id: int,
-        workflow_name: str,
-        update_callback: Callable[
-            [
-                int,
-                str,
-                dict[WorkflowCancellationStatus, list[WorkflowCancellationUpdate]],
-                int,
-            ],
-            Awaitable[None],
-        ],
-        timeout: str,
-        rate: str,
-    ):
-
-        async with self._logger.context(
-            name=f"workflow_run_{run_id}",
-        ) as ctx:
-
-            timeout_seconds = TimeParser(timeout).time
-            rate_seconds = TimeParser(rate).time
-
-            start = time.monotonic()
-
-            while (time.monotonic() - start) < timeout_seconds:
-
-                await ctx.log_prepared(
-                    message=f"Node {self._node_id_base} at {self.host}:{self.port} updating cancellation status for Workflow {workflow_name} run {run_id}",
-                    name="debug",
-                )
-
-                updates: list[WorkflowCancellationUpdate] = []
-
-                # Count the number of nodes we have actually assigned the workflow to.
-                expected_cancellations = len([
-                    node_id for node_id, status in self._statuses[run_id][workflow_name].items()
-                    if status == WorkflowStatus.RUNNING
-                ])
-
-                for node_id in self._nodes:
-                    async with self._cancellation_write_lock[run_id][workflow_name][node_id]:
-                        if update := self._cancellations[run_id][workflow_name].get(node_id):
-                            updates.append(
-                                update,
-                            )
-
-                cancellation_status_counts = defaultdict(list)
-
-                for update in updates:
-                    if update.error or update.status in WorkflowCancellationStatus.FAILED.value:
-                        cancellation_status_counts[WorkflowCancellationStatus.FAILED].append(update)
-
-                    else:
-                        cancellation_status_counts[update.status].append(update)
-
-                cancelled = len(cancellation_status_counts[WorkflowCancellationStatus.CANCELLED])
-                requested = len(cancellation_status_counts[WorkflowCancellationStatus.REQUESTED])
-                in_progress = len(cancellation_status_counts[WorkflowCancellationStatus.IN_PROGRESS])
-                failed = len(cancellation_status_counts[WorkflowCancellationStatus.FAILED])
-
-                await ctx.log_prepared(
-                    message=f"Node {self._node_id_base} at {self.host}:{self.port} for Workflow {workflow_name} run {run_id} - Requested: {requested}",
-                    name="debug",
-                )
-
-                await ctx.log_prepared(
-                    message=f"Node {self._node_id_base} at {self.host}:{self.port} for Workflow {workflow_name} run {run_id} - In Progress: {in_progress}",
-                    name="debug",
-                )
-
-                await ctx.log_prepared(
-                    message=f"Node {self._node_id_base} at {self.host}:{self.port} for Workflow {workflow_name} run {run_id} - Cancelled: {cancelled}",
-                    name="debug",
-                )
-
-                await ctx.log_prepared(
-                    message=f"Node {self._node_id_base} at {self.host}:{self.port} for Workflow {workflow_name} run {run_id} - Failed: {failed}",
-                    name="debug",
-                )
-
-                update_callback(
-                    run_id,
-                    workflow_name,
-                    cancellation_status_counts,
-                    expected_cancellations,
-                )
-
-                await asyncio.sleep(rate_seconds)
-
-    @task(
         trigger="MANUAL",
         max_age="5m",
         keep_policy="COUNT_AND_AGE",
@@ -1573,7 +1619,6 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
                 workflow_level_data: list[NodeData[Any]] = [
                     self._results,
                     self._errors,
-                    self._cancellations,
                     self._run_workflow_run_id_map,
                     self._statuses,
                     self._run_workflow_expected_nodes,
@@ -1584,7 +1629,6 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
                     self._cpu_usage_stats,
                     self._memory_usage_stats,
                     self._completion_write_lock,
-                    self._cancellation_write_lock,
                     self._cancellation_completion_events,
                     self._cancellation_expected_nodes,
                     self._cancellation_errors,

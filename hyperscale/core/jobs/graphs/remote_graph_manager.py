@@ -1059,9 +1059,7 @@ class RemoteGraphManager:
                 await update_active_workflow_message(
                     workflow_slug, f"Processing results - {workflow.name}"
                 )
-
-                await update_workflow_executions_total_rate(workflow_slug, None, False)
-
+    
                 await ctx.log_prepared(
                     message=f"Processing {len(results)} results sets for Workflow {workflow.name} run {run_id}",
                     name="debug",
@@ -1445,18 +1443,20 @@ class RemoteGraphManager:
         run_id: int,
         workflow: str,
         timeout: str = "1m",
-        update_rate: str = "0.25s",
-    ):
+    ) -> CancellationUpdate:
+        """
+        Submit cancellation requests to all nodes running the workflow.
 
+        This is event-driven - use await_workflow_cancellation() to wait for
+        all nodes to report terminal status.
+        """
         (
             cancellation_status_counts,
             expected_nodes,
         ) = await self._controller.submit_workflow_cancellation(
             run_id,
             workflow,
-            self._update_cancellation,
             timeout=timeout,
-            rate=update_rate,
         )
 
         return CancellationUpdate(
@@ -1631,20 +1631,6 @@ class RemoteGraphManager:
                 self._on_cores_available(available_cores)
             except Exception:
                 pass  # Don't let callback errors affect core execution
-
-    def _update_cancellation(
-        self,
-        run_id: int,
-        workflow_name: str,
-        cancellation_status_counts: dict[WorkflowCancellationStatus, list[WorkflowCancellationUpdate]],
-        expected_cancellations: int,
-    ):
-        self._cancellation_updates[run_id][workflow_name].put_nowait(CancellationUpdate(
-            run_id=run_id,
-            workflow_name=workflow_name,
-            cancellation_status_counts=cancellation_status_counts,
-            expected_cancellations=expected_cancellations,
-        ))
 
     def _provision(
         self,
