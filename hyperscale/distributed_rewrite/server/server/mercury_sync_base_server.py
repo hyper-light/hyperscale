@@ -61,6 +61,7 @@ from hyperscale.distributed_rewrite.server.hooks.task import (
 from hyperscale.distributed_rewrite.taskex import TaskRunner
 from hyperscale.distributed_rewrite.taskex.run import Run
 from hyperscale.core.jobs.protocols.constants import MAX_DECOMPRESSED_SIZE, MAX_MESSAGE_SIZE
+from hyperscale.core.utils.cancel_and_release_task import cancel_and_release_task
 from hyperscale.logging import Logger
 from hyperscale.logging.config import LoggingConfig
 from hyperscale.logging.hyperscale_logging_models import ServerWarning, SilentDropStats
@@ -174,7 +175,7 @@ class MercurySyncBaseServer(Generic[T]):
         # Drop counters for silent drop monitoring
         self._tcp_drop_counter = DropCounter()
         self._udp_drop_counter = DropCounter()
-        self._drop_stats_task: asyncio.Future | None = None
+        self._drop_stats_task: asyncio.Task | None = None
         self._drop_stats_interval = 60.0  # Log drop stats every 60 seconds
 
         # AD-32: Priority-aware bounded execution trackers
@@ -196,8 +197,8 @@ class MercurySyncBaseServer(Generic[T]):
         self._compressor: zstandard.ZstdCompressor | None = None
         self._decompressor: zstandard.ZstdDecompressor| None = None
 
-        self._tcp_server_cleanup_task: asyncio.Future | None = None
-        self._tcp_server_sleep_task: asyncio.Future | None = None
+        self._tcp_server_cleanup_task: asyncio.Task | None = None
+        self._tcp_server_sleep_task: asyncio.Task | None = None
 
         self._udp_server_cleanup_task: asyncio.Future | None = None
         self._udp_server_sleep_task: asyncio.Future | None = None
@@ -391,13 +392,13 @@ class MercurySyncBaseServer(Generic[T]):
         )
 
         if self._tcp_server_cleanup_task is None:
-            self._tcp_server_cleanup_task = asyncio.ensure_future(self._cleanup_tcp_server_tasks())
+            self._tcp_server_cleanup_task = asyncio.create_task(self._cleanup_tcp_server_tasks())
 
         if self._udp_server_cleanup_task is None:
-            self._udp_server_cleanup_task = asyncio.ensure_future(self._cleanup_udp_server_tasks())
+            self._udp_server_cleanup_task = asyncio.create_task(self._cleanup_udp_server_tasks())
 
         if self._drop_stats_task is None:
-            self._drop_stats_task = asyncio.ensure_future(self._log_drop_stats_periodically())
+            self._drop_stats_task = asyncio.create_task(self._log_drop_stats_periodically())
 
         
         for task_name, task in self._tasks.items():
@@ -1504,7 +1505,7 @@ class MercurySyncBaseServer(Generic[T]):
 
     async def _cleanup_tcp_server_tasks(self):
         while self._running:
-            self._tcp_server_sleep_task = asyncio.ensure_future(
+            self._tcp_server_sleep_task = asyncio.create_task(
                 asyncio.sleep(self._cleanup_interval)
             )
 
@@ -1526,7 +1527,7 @@ class MercurySyncBaseServer(Generic[T]):
 
     async def _cleanup_udp_server_tasks(self):
         while self._running:
-            self._udp_server_sleep_task = asyncio.ensure_future(
+            self._udp_server_sleep_task = asyncio.create_task(
                 asyncio.sleep(self._cleanup_interval)
             )
 
@@ -1632,31 +1633,11 @@ class MercurySyncBaseServer(Generic[T]):
             self._tcp_server = None
             self._tcp_connected = False
 
-        print('CLOSE TCP SERVER')
-
-        # Cancel drop stats task
-        if self._drop_stats_task is not None:
-            self._drop_stats_task.set_result(None)
-            try:
-                await self._drop_stats_task
-            except (asyncio.CancelledError, Exception):
-                pass
-
-        print('CLOSE DROP STATS')
-
-        if self._tcp_server_sleep_task:
-            self._tcp_server_sleep_task.set_result(None)
-
-        if self._tcp_server_cleanup_task:
-            self._tcp_server_cleanup_task.set_result(None)
-
-        if self._udp_server_sleep_task:
-            self._udp_server_sleep_task.set_result(None)
-
-        if self._udp_server_cleanup_task:
-            self._udp_server_cleanup_task.set_result(None)
-
-        print('CLOSE CLEANUP')
+        cancel_and_release_task(self._drop_stats_task)
+        cancel_and_release_task(self._tcp_server_sleep_task)
+        cancel_and_release_task(self._tcp_server_cleanup_task)
+        cancel_and_release_task(self._udp_server_sleep_task)
+        cancel_and_release_task(self._udp_server_cleanup_task)
 
     def abort(self) -> None:
         self._running = False
@@ -1683,14 +1664,8 @@ class MercurySyncBaseServer(Generic[T]):
                 pass
         self._tcp_client_transports.clear()
 
-        if self._tcp_server_sleep_task:
-            self._tcp_server_sleep_task.set_result(None)
-
-        if self._tcp_server_cleanup_task:
-            self._tcp_server_cleanup_task.set_result(None)
-
-        if self._udp_server_sleep_task:
-            self._udp_server_sleep_task.set_result(None)
-
-        if self._udp_server_cleanup_task:
-            self._udp_server_cleanup_task.set_result(None)
+        cancel_and_release_task(self._drop_stats_task)
+        cancel_and_release_task(self._tcp_server_sleep_task)
+        cancel_and_release_task(self._tcp_server_cleanup_task)
+        cancel_and_release_task(self._udp_server_sleep_task)
+        cancel_and_release_task(self._udp_server_cleanup_task)

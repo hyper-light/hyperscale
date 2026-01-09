@@ -89,6 +89,8 @@ from .distributed import (
     # Job leader worker transfer (AD-31: manager failure notification to workers)
     JobLeaderWorkerTransfer as JobLeaderWorkerTransfer,
     JobLeaderWorkerTransferAck as JobLeaderWorkerTransferAck,
+    # Section 8: Worker robust response to job leadership takeover
+    PendingTransfer as PendingTransfer,
     # Client push notifications
     JobStatusPush as JobStatusPush,
     DCStats as DCStats,

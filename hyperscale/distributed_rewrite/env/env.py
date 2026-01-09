@@ -106,6 +106,10 @@ class Env(BaseModel):
     WORKER_ORPHAN_GRACE_PERIOD: StrictFloat = 5.0  # Seconds to wait for JobLeaderWorkerTransfer
     WORKER_ORPHAN_CHECK_INTERVAL: StrictFloat = 1.0  # Seconds between orphan grace period checks
 
+    # Worker Job Leadership Transfer Settings (Section 8)
+    # TTL for pending transfers that arrive before workflows are known
+    WORKER_PENDING_TRANSFER_TTL: StrictFloat = 60.0  # Seconds to retain pending transfers
+
     # Manager Startup and Dispatch Settings
     MANAGER_STARTUP_SYNC_DELAY: StrictFloat = 2.0  # Seconds to wait for leader election before state sync
     MANAGER_STATE_SYNC_TIMEOUT: StrictFloat = 5.0  # Timeout for state sync request to leader
@@ -415,6 +419,8 @@ class Env(BaseModel):
             # Worker orphan grace period settings
             "WORKER_ORPHAN_GRACE_PERIOD": float,
             "WORKER_ORPHAN_CHECK_INTERVAL": float,
+            # Worker job leadership transfer settings (Section 8)
+            "WORKER_PENDING_TRANSFER_TTL": float,
             # Manager startup and dispatch settings
             "MANAGER_STARTUP_SYNC_DELAY": float,
             "MANAGER_STATE_SYNC_TIMEOUT": float,

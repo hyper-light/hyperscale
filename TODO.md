@@ -602,6 +602,8 @@ This implementation must be race-condition proof in the asyncio environment:
 
 ## 8. Worker Robust Response to Job Leadership Takeover
 
+**Status**: ✅ Complete
+
 **Problem**: When a job leader manager fails and a new manager takes over, workers must robustly handle the `JobLeaderWorkerTransfer` message. Current implementation may have edge cases:
 1. Race between transfer message and ongoing workflow operations
 2. Multiple transfers in rapid succession (cascading failures)
@@ -612,20 +614,19 @@ This implementation must be race-condition proof in the asyncio environment:
 
 ### Tasks
 
-- [ ] **8.1** Add `_job_leader_transfer_locks` to WorkerServer
+- [x] **8.1** Add `_job_leader_transfer_locks` to WorkerServer
   ```python
   _job_leader_transfer_locks: dict[str, asyncio.Lock]  # job_id -> lock
   ```
   - Per-job locks to prevent race conditions during transfer
   - Acquire lock before processing transfer or workflow operations
 
-- [ ] **8.2** Add transfer validation in `job_leader_worker_transfer` handler
-  - Verify job_id exists in `_workflow_job_leader`
+- [x] **8.2** Add transfer validation in `job_leader_worker_transfer` handler
   - Verify fencing token is newer than current (prevent stale transfers)
   - Verify new leader is in known managers list
   - Reject invalid transfers with detailed error response
 
-- [ ] **8.3** Add `_pending_transfers` tracking
+- [x] **8.3** Add `_pending_transfers` tracking
   ```python
   _pending_transfers: dict[str, PendingTransfer]  # job_id -> transfer info
   ```
@@ -633,35 +634,37 @@ This implementation must be race-condition proof in the asyncio environment:
   - Check pending transfers when new job is assigned
   - Clean up stale pending transfers periodically
 
-- [ ] **8.4** Add transfer acknowledgment flow
+- [x] **8.4** Add transfer acknowledgment flow
   - After processing transfer, send explicit `JobLeaderTransferAck` to new leader
   - Include worker's current workflow state for the job
   - New leader can verify all workers acknowledged
 
-- [ ] **8.5** Handle in-flight operations during transfer
+- [x] **8.5** Handle in-flight operations during transfer
   - If workflow operation is in progress when transfer arrives
   - Queue transfer, apply after operation completes
-  - Prevent partial state updates
+  - Prevent partial state updates (via per-job locks)
 
-- [ ] **8.6** Add transfer metrics
+- [x] **8.6** Add transfer metrics
   - `worker_job_transfers_received` counter
   - `worker_job_transfers_accepted` counter
   - `worker_job_transfers_rejected` counter (with reason labels)
   - `worker_job_transfer_latency` histogram
 
-- [ ] **8.7** Add detailed logging for transfer events
+- [x] **8.7** Add detailed logging for transfer events
   - Log old leader, new leader, job_id, fencing token
   - Log rejection reasons clearly
   - Log time between job leader death detection and transfer receipt
 
-- [ ] **8.8** Update `_on_node_dead` for defensive handling
+- [x] **8.8** Update `_on_node_dead` for defensive handling
   - When manager dies, don't immediately assume it's job leader
   - Wait for explicit transfer or orphan timeout
   - Handle case where dead node was NOT the job leader
 
 ### Files
 - `hyperscale/distributed_rewrite/nodes/worker.py`
-- `hyperscale/distributed_rewrite/models/distributed.py` (for `JobLeaderTransferAck`)
+- `hyperscale/distributed_rewrite/models/distributed.py` (for `JobLeaderTransferAck`, `PendingTransfer`)
+- `hyperscale/distributed_rewrite/env/env.py` (for `WORKER_PENDING_TRANSFER_TTL`)
+- `tests/integration/test_worker_robust_transfer.py`
 
 ---
 

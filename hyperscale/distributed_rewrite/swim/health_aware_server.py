@@ -1058,11 +1058,8 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
     async def stop_cleanup(self) -> None:
         """Stop the periodic cleanup task."""
         if self._cleanup_task and not self._cleanup_task.done():
-            self._cleanup_task.cancel()
-            try:
-                await self._cleanup_task
-            except asyncio.CancelledError:
-                pass
+            self._cleanup_task.set_result(None)
+            
             self._cleanup_task = None
     
     async def _run_cleanup_loop(self) -> None:

@@ -81,6 +81,8 @@ from hyperscale.distributed_rewrite.models import (
     # AD-31: Job leadership transfer notifications
     JobLeaderWorkerTransfer,
     JobLeaderWorkerTransferAck,
+    # Section 8: Worker robust response to job leadership takeover
+    PendingTransfer,
     restricted_loads,
 )
 from hyperscale.distributed_rewrite.env import Env
@@ -242,6 +244,25 @@ class WorkerServer(HealthAwareServer):
         self._orphan_grace_period: float = env.WORKER_ORPHAN_GRACE_PERIOD
         self._orphan_check_interval: float = env.WORKER_ORPHAN_CHECK_INTERVAL
         self._orphan_check_task: asyncio.Task | None = None
+
+        # Section 8: Worker robust response to job leadership takeover
+        # Per-job locks to prevent race conditions during transfer processing (8.1)
+        self._job_leader_transfer_locks: dict[str, asyncio.Lock] = {}  # job_id -> lock
+
+        # Track highest fence token seen per job to reject stale transfers (8.2)
+        self._job_fence_tokens: dict[str, int] = {}  # job_id -> highest fence token seen
+
+        # Pending transfers that arrived before job/workflow was known (8.3)
+        # These are checked when new workflows are dispatched
+        self._pending_transfers: dict[str, PendingTransfer] = {}  # job_id -> pending transfer
+        self._pending_transfer_ttl: float = env.WORKER_PENDING_TRANSFER_TTL if hasattr(env, 'WORKER_PENDING_TRANSFER_TTL') else 60.0
+
+        # Transfer metrics (8.6)
+        self._transfer_metrics_received: int = 0
+        self._transfer_metrics_accepted: int = 0
+        self._transfer_metrics_rejected_stale_token: int = 0
+        self._transfer_metrics_rejected_unknown_manager: int = 0
+        self._transfer_metrics_rejected_other: int = 0
 
         # State versioning (Lamport clock extension)
         self._state_version = 0
@@ -616,6 +637,125 @@ class WorkerServer(HealthAwareServer):
             self._manager_state_locks[manager_id] = asyncio.Lock()
         return self._manager_state_locks[manager_id]
 
+    def _get_job_transfer_lock(self, job_id: str) -> asyncio.Lock:
+        """
+        Get or create a lock for job leadership transfers (Section 8.1).
+
+        Per-job locks prevent race conditions when processing transfer messages
+        concurrently with workflow operations for the same job.
+        """
+        if job_id not in self._job_leader_transfer_locks:
+            self._job_leader_transfer_locks[job_id] = asyncio.Lock()
+        return self._job_leader_transfer_locks[job_id]
+
+    def _validate_transfer_fence_token(self, job_id: str, new_fence_token: int) -> tuple[bool, str]:
+        """
+        Validate a transfer's fence token against known tokens (Section 8.2).
+
+        Returns (is_valid, rejection_reason).
+        A transfer is valid if its fence token is greater than any previously seen token.
+        """
+        current_token = self._job_fence_tokens.get(job_id, -1)
+        if new_fence_token <= current_token:
+            return (
+                False,
+                f"Stale fence token: received {new_fence_token}, current {current_token}"
+            )
+        return (True, "")
+
+    def _validate_transfer_manager(self, new_manager_id: str) -> tuple[bool, str]:
+        """
+        Validate that the new manager is in our known managers list (Section 8.2).
+
+        Returns (is_valid, rejection_reason).
+        """
+        if new_manager_id not in self._known_managers:
+            return (
+                False,
+                f"Unknown manager: {new_manager_id} not in known managers"
+            )
+        return (True, "")
+
+    async def _check_pending_transfer_for_job(self, job_id: str, workflow_id: str) -> None:
+        """
+        Check if there's a pending transfer for a job when a new workflow arrives (Section 8.3).
+
+        Called after a workflow is dispatched to see if a leadership transfer
+        arrived before the workflow did.
+        """
+        pending = self._pending_transfers.get(job_id)
+        if pending is None:
+            return
+
+        # Check if the transfer has expired
+        current_time = time.monotonic()
+        if current_time - pending.received_at > self._pending_transfer_ttl:
+            # Transfer expired, remove it
+            del self._pending_transfers[job_id]
+            await self._udp_logger.log(
+                ServerDebug(
+                    message=f"Expired pending transfer for job {job_id[:8]}... (age: {current_time - pending.received_at:.1f}s)",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            return
+
+        # Check if this workflow is in the pending transfer
+        if workflow_id in pending.workflow_ids:
+            # Apply the pending transfer
+            job_lock = self._get_job_transfer_lock(job_id)
+            async with job_lock:
+                # Update job leader for this workflow
+                self._workflow_job_leader[workflow_id] = pending.new_manager_addr
+                # Update fence token
+                self._job_fence_tokens[job_id] = pending.fence_token
+
+                await self._udp_logger.log(
+                    ServerInfo(
+                        message=f"Applied pending transfer for workflow {workflow_id[:8]}... to job {job_id[:8]}...",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+
+            # Check if all workflows in the transfer have been seen
+            # Remove from pending if no more workflows need this transfer
+            remaining_workflows = [
+                wf_id for wf_id in pending.workflow_ids
+                if wf_id not in self._active_workflows and wf_id != workflow_id
+            ]
+            if not remaining_workflows:
+                del self._pending_transfers[job_id]
+
+    async def _cleanup_stale_pending_transfers(self) -> None:
+        """
+        Clean up pending transfers that have exceeded their TTL.
+
+        Called periodically to prevent memory leaks from abandoned transfers.
+        """
+        current_time = time.monotonic()
+        stale_job_ids = []
+
+        for job_id, pending in self._pending_transfers.items():
+            if current_time - pending.received_at > self._pending_transfer_ttl:
+                stale_job_ids.append(job_id)
+
+        for job_id in stale_job_ids:
+            del self._pending_transfers[job_id]
+
+        if stale_job_ids:
+            await self._udp_logger.log(
+                ServerDebug(
+                    message=f"Cleaned up {len(stale_job_ids)} stale pending transfers",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+
     def _on_node_dead(self, node_addr: tuple[str, int]) -> None:
         """
         Called when a node is marked as DEAD via SWIM.
@@ -652,6 +792,12 @@ class WorkerServer(HealthAwareServer):
         - When a job leader manager fails, workflows are marked as orphaned
         - If JobLeaderWorkerTransfer arrives before grace period, workflow continues
         - If grace period expires without transfer, workflow is cancelled
+
+        Section 8.8: Defensive handling:
+        - Don't immediately assume dead manager was a job leader
+        - Only mark workflows orphaned if dead manager was ACTUALLY their job leader
+        - Wait for explicit transfer or orphan timeout
+        - Handle case where dead node was NOT a job leader (no orphan action needed)
         """
         manager_lock = self._get_manager_state_lock(manager_id)
         async with manager_lock:
@@ -674,7 +820,8 @@ class WorkerServer(HealthAwareServer):
             )
         )
 
-        # Mark workflows as orphaned if this manager was their job leader (Section 2.7)
+        # Section 8.8: Mark workflows as orphaned ONLY if this manager was their job leader
+        # Don't immediately assume dead node was a job leader - check explicitly
         await self._mark_workflows_orphaned_for_manager(manager_id)
 
         # If this was our primary manager, select a new one
@@ -683,19 +830,33 @@ class WorkerServer(HealthAwareServer):
 
     async def _mark_workflows_orphaned_for_manager(self, manager_id: str) -> None:
         """
-        Mark workflows as orphaned when their job leader manager fails.
+        Mark workflows as orphaned when their job leader manager fails (Section 8.8).
 
         Workflows are added to _orphaned_workflows with a timestamp.
         The orphan grace period checker will cancel them if no
         JobLeaderWorkerTransfer arrives before the grace period expires.
+
+        Section 8.8: Defensive handling:
+        - Only marks workflows as orphaned if dead manager was ACTUALLY their job leader
+        - Does NOT mark workflows whose job leader is a different (still healthy) manager
+        - Logs clearly when no workflows were affected (dead node wasn't a job leader for us)
         """
         # Get the dead manager's TCP address
         manager_info = self._known_managers.get(manager_id)
         if not manager_info:
+            await self._udp_logger.log(
+                ServerDebug(
+                    message=f"Manager {manager_id} not in known managers - no workflows to orphan",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
             return
 
         dead_manager_addr = (manager_info.tcp_host, manager_info.tcp_port)
         orphaned_count = 0
+        unaffected_count = 0
         current_time = time.monotonic()
 
         # Find all workflows whose job leader was the dead manager
@@ -707,12 +868,28 @@ class WorkerServer(HealthAwareServer):
                     if workflow_id not in self._orphaned_workflows:
                         self._orphaned_workflows[workflow_id] = current_time
                         orphaned_count += 1
+            else:
+                # This workflow's job leader is a different manager - not affected
+                if workflow_id in self._active_workflows:
+                    unaffected_count += 1
 
         if orphaned_count > 0:
             await self._udp_logger.log(
                 ServerWarning(
-                    message=f"Marked {orphaned_count} workflow(s) as orphaned after manager {manager_id} failure. "
-                            f"Grace period: {self._orphan_grace_period}s",
+                    message=f"Marked {orphaned_count} workflow(s) as orphaned after manager {manager_id[:8]}... failure. "
+                            f"Grace period: {self._orphan_grace_period}s. "
+                            f"({unaffected_count} workflow(s) with other job leaders unaffected)",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+        elif unaffected_count > 0:
+            # Section 8.8: Log when dead manager wasn't a job leader for any of our workflows
+            await self._udp_logger.log(
+                ServerDebug(
+                    message=f"Manager {manager_id[:8]}... failed but was not job leader for any active workflows. "
+                            f"{unaffected_count} workflow(s) with other job leaders unaffected.",
                     node_host=self._host,
                     node_port=self._tcp_port,
                     node_id=self._node_id.short,
@@ -1839,6 +2016,10 @@ class WorkerServer(HealthAwareServer):
             # Store the dispatching manager as the job leader for this workflow
             # Progress updates will be sent to this manager (or its successor on failover)
             self._workflow_job_leader[dispatch.workflow_id] = addr
+
+            # Section 8.3: Check for pending transfers that arrived before this dispatch
+            # If a leadership transfer arrived before the workflow, apply it now
+            await self._check_pending_transfer_for_job(dispatch.job_id, dispatch.workflow_id)
 
             # Create cancellation event
             cancel_event = asyncio.Event()
@@ -2977,7 +3158,7 @@ class WorkerServer(HealthAwareServer):
             return b''
     
     # =========================================================================
-    # TCP Handlers - Job Leadership Transfer (AD-31)
+    # TCP Handlers - Job Leadership Transfer (AD-31, Section 8)
     # =========================================================================
 
     @tcp.receive()
@@ -2988,68 +3169,186 @@ class WorkerServer(HealthAwareServer):
         clock_time: int,
     ) -> bytes:
         """
-        Handle job leadership transfer notification from manager (AD-31).
+        Handle job leadership transfer notification from manager (AD-31, Section 8).
 
         When a manager takes over job leadership from a failed manager,
         it notifies workers with active workflows so they update their
         _workflow_job_leader mapping to route progress to the new manager.
 
+        Section 8 robustness:
+        - 8.1: Uses per-job lock to prevent race conditions
+        - 8.2: Validates fence token and manager legitimacy
+        - 8.3: Stores pending transfers for late-arriving workflows
+        - 8.4: Returns detailed ack with workflow states
+        - 8.6: Updates transfer metrics
+        - 8.7: Detailed logging
+
         Orphan handling (Section 2.7):
         - Clears workflows from _orphaned_workflows when transfer arrives
         - This prevents cancellation if transfer arrives before grace period expires
         """
+        self._transfer_metrics_received += 1
+        transfer_start_time = time.monotonic()
+
         try:
             transfer = JobLeaderWorkerTransfer.load(data)
+            job_id = transfer.job_id
 
-            workflows_updated = 0
-            workflows_rescued_from_orphan = 0
-
-            # Update routing for each workflow mentioned in the transfer
-            for workflow_id in transfer.workflow_ids:
-                # Check if we have this workflow active
-                if workflow_id in self._active_workflows:
-                    current_leader = self._workflow_job_leader.get(workflow_id)
-                    new_leader = transfer.new_manager_addr
-
-                    if current_leader != new_leader:
-                        self._workflow_job_leader[workflow_id] = new_leader
-                        workflows_updated += 1
-
-                    # Clear from orphaned workflows if present (Section 2.7)
-                    # Transfer arrived before grace period expired - workflow is rescued
-                    if workflow_id in self._orphaned_workflows:
-                        del self._orphaned_workflows[workflow_id]
-                        workflows_rescued_from_orphan += 1
-
-            if workflows_updated > 0:
-                rescue_message = ""
-                if workflows_rescued_from_orphan > 0:
-                    rescue_message = f" ({workflows_rescued_from_orphan} rescued from orphan state)"
-
-                await self._udp_logger.log(
-                    ServerInfo(
-                        message=f"Job {transfer.job_id[:8]}... leadership transfer: "
-                                f"updated {workflows_updated} workflow(s) to route to {transfer.new_manager_addr}{rescue_message}",
-                        node_host=self._host,
-                        node_port=self._tcp_port,
-                        node_id=self._node_id.short,
-                    )
+            # 8.7: Detailed logging - start of transfer processing
+            await self._udp_logger.log(
+                ServerDebug(
+                    message=f"Processing job leadership transfer: job={job_id[:8]}..., "
+                            f"new_manager={transfer.new_manager_id[:8]}..., "
+                            f"old_manager={transfer.old_manager_id[:8] if transfer.old_manager_id else 'unknown'}..., "
+                            f"fence_token={transfer.fence_token}, "
+                            f"workflows={len(transfer.workflow_ids)}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
                 )
+            )
 
-            return JobLeaderWorkerTransferAck(
-                job_id=transfer.job_id,
-                worker_id=self._node_id.full,
-                workflows_updated=workflows_updated,
-                accepted=True,
-            ).dump()
+            # 8.1: Acquire per-job lock to prevent race conditions
+            job_lock = self._get_job_transfer_lock(job_id)
+            async with job_lock:
+
+                # 8.2: Validate fence token (reject stale transfers)
+                fence_valid, fence_reason = self._validate_transfer_fence_token(
+                    job_id, transfer.fence_token
+                )
+                if not fence_valid:
+                    self._transfer_metrics_rejected_stale_token += 1
+                    await self._udp_logger.log(
+                        ServerWarning(
+                            message=f"Rejected job leadership transfer for job {job_id[:8]}...: {fence_reason}",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
+                    return JobLeaderWorkerTransferAck(
+                        job_id=job_id,
+                        worker_id=self._node_id.full,
+                        workflows_updated=0,
+                        accepted=False,
+                        rejection_reason=fence_reason,
+                        fence_token_received=transfer.fence_token,
+                    ).dump()
+
+                # 8.2: Validate new manager is known
+                manager_valid, manager_reason = self._validate_transfer_manager(
+                    transfer.new_manager_id
+                )
+                if not manager_valid:
+                    self._transfer_metrics_rejected_unknown_manager += 1
+                    await self._udp_logger.log(
+                        ServerWarning(
+                            message=f"Rejected job leadership transfer for job {job_id[:8]}...: {manager_reason}",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
+                    return JobLeaderWorkerTransferAck(
+                        job_id=job_id,
+                        worker_id=self._node_id.full,
+                        workflows_updated=0,
+                        accepted=False,
+                        rejection_reason=manager_reason,
+                        fence_token_received=transfer.fence_token,
+                    ).dump()
+
+                # Update fence token now that we've validated
+                self._job_fence_tokens[job_id] = transfer.fence_token
+
+                workflows_updated = 0
+                workflows_rescued_from_orphan = 0
+                workflows_not_found: list[str] = []
+                workflow_states: dict[str, str] = {}
+
+                # Update routing for each workflow mentioned in the transfer
+                for workflow_id in transfer.workflow_ids:
+                    # Check if we have this workflow active
+                    if workflow_id in self._active_workflows:
+                        current_leader = self._workflow_job_leader.get(workflow_id)
+                        new_leader = transfer.new_manager_addr
+
+                        if current_leader != new_leader:
+                            self._workflow_job_leader[workflow_id] = new_leader
+                            workflows_updated += 1
+
+                        # Clear from orphaned workflows if present (Section 2.7)
+                        # Transfer arrived before grace period expired - workflow is rescued
+                        if workflow_id in self._orphaned_workflows:
+                            del self._orphaned_workflows[workflow_id]
+                            workflows_rescued_from_orphan += 1
+
+                        # 8.4: Collect workflow state for ack
+                        workflow_progress = self._active_workflows[workflow_id]
+                        workflow_states[workflow_id] = workflow_progress.status
+                    else:
+                        # Workflow not found - might arrive later
+                        workflows_not_found.append(workflow_id)
+
+                # 8.3: Store as pending transfer if some workflows weren't found
+                # This handles the edge case where transfer arrives before workflow dispatch
+                if workflows_not_found:
+                    self._pending_transfers[job_id] = PendingTransfer(
+                        job_id=job_id,
+                        workflow_ids=workflows_not_found,
+                        new_manager_id=transfer.new_manager_id,
+                        new_manager_addr=transfer.new_manager_addr,
+                        fence_token=transfer.fence_token,
+                        old_manager_id=transfer.old_manager_id,
+                        received_at=time.monotonic(),
+                    )
+
+                # 8.6: Update metrics
+                self._transfer_metrics_accepted += 1
+
+                # 8.7: Detailed logging
+                transfer_duration_ms = (time.monotonic() - transfer_start_time) * 1000
+                if workflows_updated > 0 or workflows_not_found:
+                    rescue_message = ""
+                    if workflows_rescued_from_orphan > 0:
+                        rescue_message = f" ({workflows_rescued_from_orphan} rescued from orphan state)"
+
+                    pending_message = ""
+                    if workflows_not_found:
+                        pending_message = f" ({len(workflows_not_found)} stored as pending)"
+
+                    await self._udp_logger.log(
+                        ServerInfo(
+                            message=f"Job {job_id[:8]}... leadership transfer: "
+                                    f"updated {workflows_updated} workflow(s) to route to {transfer.new_manager_addr}"
+                                    f"{rescue_message}{pending_message} "
+                                    f"[latency={transfer_duration_ms:.1f}ms]",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
+
+                # 8.4: Return detailed ack with workflow states
+                return JobLeaderWorkerTransferAck(
+                    job_id=job_id,
+                    worker_id=self._node_id.full,
+                    workflows_updated=workflows_updated,
+                    accepted=True,
+                    rejection_reason="",
+                    fence_token_received=transfer.fence_token,
+                    workflow_states=workflow_states,
+                ).dump()
 
         except Exception as error:
+            self._transfer_metrics_rejected_other += 1
             await self.handle_exception(error, "job_leader_worker_transfer")
             return JobLeaderWorkerTransferAck(
                 job_id="unknown",
                 worker_id=self._node_id.full,
                 workflows_updated=0,
                 accepted=False,
+                rejection_reason=str(error),
             ).dump()
 
     # =========================================================================
