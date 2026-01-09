@@ -3327,7 +3327,6 @@ class ManagerServer(HealthAwareServer):
 
         # Cancel dead node reap loop
         if self._dead_node_reap_task and not self._dead_node_reap_task.done():
-            print('BB')
             self._dead_node_reap_task.cancel()
             try:
                 await self._dead_node_reap_task

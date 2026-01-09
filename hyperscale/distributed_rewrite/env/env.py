@@ -127,6 +127,11 @@ class Env(BaseModel):
     CANCELLED_WORKFLOW_TTL: StrictFloat = 3600.0  # Seconds to retain cancelled workflow info (1 hour)
     CANCELLED_WORKFLOW_CLEANUP_INTERVAL: StrictFloat = 60.0  # Seconds between cleanup checks
 
+    # Client Leadership Transfer Settings (Section 9)
+    CLIENT_ORPHAN_GRACE_PERIOD: StrictFloat = 15.0  # Seconds to wait for leadership transfer cascade
+    CLIENT_ORPHAN_CHECK_INTERVAL: StrictFloat = 2.0  # Seconds between orphan grace period checks
+    CLIENT_RESPONSE_FRESHNESS_TIMEOUT: StrictFloat = 10.0  # Seconds to consider response stale after leadership change
+
     # Manager Dead Node Cleanup Settings
     MANAGER_DEAD_WORKER_REAP_INTERVAL: StrictFloat = 900.0  # Seconds before reaping dead workers (15 minutes)
     MANAGER_DEAD_PEER_REAP_INTERVAL: StrictFloat = 900.0  # Seconds before reaping dead manager peers (15 minutes)
@@ -435,6 +440,10 @@ class Env(BaseModel):
             # Cancelled workflow cleanup settings (Section 6)
             "CANCELLED_WORKFLOW_TTL": float,
             "CANCELLED_WORKFLOW_CLEANUP_INTERVAL": float,
+            # Client leadership transfer settings (Section 9)
+            "CLIENT_ORPHAN_GRACE_PERIOD": float,
+            "CLIENT_ORPHAN_CHECK_INTERVAL": float,
+            "CLIENT_RESPONSE_FRESHNESS_TIMEOUT": float,
             # Manager dead node cleanup settings
             "MANAGER_DEAD_WORKER_REAP_INTERVAL": float,
             "MANAGER_DEAD_PEER_REAP_INTERVAL": float,

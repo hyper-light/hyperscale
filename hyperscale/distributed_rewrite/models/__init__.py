@@ -91,6 +91,15 @@ from .distributed import (
     JobLeaderWorkerTransferAck as JobLeaderWorkerTransferAck,
     # Section 8: Worker robust response to job leadership takeover
     PendingTransfer as PendingTransfer,
+    # Section 9: Client leadership tracking models
+    GateLeaderInfo as GateLeaderInfo,
+    ManagerLeaderInfo as ManagerLeaderInfo,
+    OrphanedJobInfo as OrphanedJobInfo,
+    LeadershipRetryPolicy as LeadershipRetryPolicy,
+    GateJobLeaderTransfer as GateJobLeaderTransfer,
+    GateJobLeaderTransferAck as GateJobLeaderTransferAck,
+    ManagerJobLeaderTransfer as ManagerJobLeaderTransfer,
+    ManagerJobLeaderTransferAck as ManagerJobLeaderTransferAck,
     # Client push notifications
     JobStatusPush as JobStatusPush,
     DCStats as DCStats,

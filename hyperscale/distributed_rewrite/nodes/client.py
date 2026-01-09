@@ -63,6 +63,15 @@ from hyperscale.distributed_rewrite.models import (
     JobCancelRequest,
     JobCancelResponse,
     JobCancellationComplete,
+    # Section 9: Client leadership tracking
+    GateLeaderInfo,
+    ManagerLeaderInfo,
+    OrphanedJobInfo,
+    LeadershipRetryPolicy,
+    GateJobLeaderTransfer,
+    GateJobLeaderTransferAck,
+    ManagerJobLeaderTransfer,
+    ManagerJobLeaderTransferAck,
     # Client result models
     ClientReporterResult,
     ClientWorkflowDCResult,
