@@ -3052,65 +3052,9 @@ class ManagerServer(HealthAwareServer):
         
         # Not leader - request state sync from leader
         leader_addr = self.get_current_leader()
+        leader_tcp_addr: tuple[str, int] | None = None
 
-        if leader_addr:
-            # Find TCP address for leader (UDP -> TCP mapping)
-            leader_tcp_addr = self._manager_udp_to_tcp.get(leader_addr)
-
-            if not leader_tcp_addr:
-                # Log the mismatch for debugging
-                self._task_runner.run(
-                    self._udp_logger.log,
-                    ServerWarning(
-                        message=f"Leader UDP addr {leader_addr} not in UDP->TCP map. Map keys: {list(self._manager_udp_to_tcp.keys())}",
-                        node_host=self._host,
-                        node_port=self._tcp_port,
-                        node_id=self._node_id.short,
-                    )
-                )
-
-            if leader_tcp_addr:
-                self._task_runner.run(
-                    self._udp_logger.log,
-                    ServerInfo(
-                        message=f"Requesting state sync from leader at {leader_tcp_addr}",
-                        node_host=self._host,
-                        node_port=self._tcp_port,
-                        node_id=self._node_id.short,
-                    )
-                )
-                
-                # Request state sync from leader
-                request = StateSyncRequest(
-                    requester_id=self._node_id.full,
-                    requester_role=NodeRole.MANAGER.value,
-                    since_version=0,  # Request full state
-                )
-                
-                state = await self._request_manager_peer_state(leader_tcp_addr, request)
-                
-                if state:
-                    self._process_manager_state_response(state)
-                    self._task_runner.run(
-                        self._udp_logger.log,
-                        ServerInfo(
-                            message=f"State sync from leader complete, transitioning to ACTIVE",
-                            node_host=self._host,
-                            node_port=self._tcp_port,
-                            node_id=self._node_id.short,
-                        )
-                    )
-                else:
-                    # Expected during startup races - leader may not be ready yet
-                    await self._udp_logger.log(
-                        ServerWarning(
-                            message="State sync from leader incomplete, transitioning to ACTIVE anyway (fresh cluster or leader still starting)",
-                            node_host=self._host,
-                            node_port=self._tcp_port,
-                            node_id=self._node_id.short,
-                        )
-                    )
-        else:
+        if leader_addr is None:
             # No leader available - we might be the first manager
             self._task_runner.run(
                 self._udp_logger.log,
@@ -3121,6 +3065,66 @@ class ManagerServer(HealthAwareServer):
                     node_id=self._node_id.short,
                 )
             )
+            # Transition to ACTIVE even without leader sync
+            self._manager_state = ManagerState.ACTIVE
+            return
+
+        # Find TCP address for leader (UDP -> TCP mapping)
+        leader_tcp_addr = self._manager_udp_to_tcp.get(leader_addr)
+
+        if not leader_tcp_addr:
+            # Log the mismatch for debugging
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerWarning(
+                    message=f"Leader UDP addr {leader_addr} not in UDP->TCP map. Map keys: {list(self._manager_udp_to_tcp.keys())}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+
+        if leader_tcp_addr:
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerInfo(
+                    message=f"Requesting state sync from leader at {leader_tcp_addr}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            
+            # Request state sync from leader
+            request = StateSyncRequest(
+                requester_id=self._node_id.full,
+                requester_role=NodeRole.MANAGER.value,
+                since_version=0,  # Request full state
+            )
+            
+            state = await self._request_manager_peer_state(leader_tcp_addr, request)
+            
+            if state:
+                self._process_manager_state_response(state)
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerInfo(
+                        message=f"State sync from leader complete, transitioning to ACTIVE",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+            else:
+                # Expected during startup races - leader may not be ready yet
+                await self._udp_logger.log(
+                    ServerWarning(
+                        message="State sync from leader incomplete, transitioning to ACTIVE anyway (fresh cluster or leader still starting)",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
         
         # Transition to ACTIVE
         self._manager_state = ManagerState.ACTIVE

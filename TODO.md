@@ -296,6 +296,8 @@ The WorkflowRunner doesn't have explicit cancellation handling. Cancellation wor
 
 ## 3. Worker-Side Job Leader Failure Handling
 
+**Status**: ✅ Complete
+
 **Problem**: When workers learn their job leader has failed, they need to:
 1. Wait for potential `JobLeaderWorkerTransfer` (new leader taking over)
 2. If transfer arrives → update `_workflow_job_leader` mapping, continue
@@ -303,27 +305,27 @@ The WorkflowRunner doesn't have explicit cancellation handling. Cancellation wor
 
 ### Tasks
 
-- [ ] **3.1** Add orphaned workflow tracking to worker
+- [x] **3.1** Add orphaned workflow tracking to worker
   ```python
   _orphaned_workflows: dict[str, float]  # workflow_id -> orphan_timestamp
   ```
 
-- [ ] **3.2** Modify `_on_node_dead` to mark workflows as orphaned
+- [x] **3.2** Modify `_on_node_dead` to mark workflows as orphaned
   - Find all workflows for the dead manager
   - Add to `_orphaned_workflows` with current timestamp
   - Do NOT immediately cancel
 
-- [ ] **3.3** Modify `job_leader_worker_transfer` handler
+- [x] **3.3** Modify `job_leader_worker_transfer` handler
   - Clear workflow from `_orphaned_workflows` if present
   - Update `_workflow_job_leader` mapping
   - Log successful transfer
 
-- [ ] **3.4** Add orphan grace period checker
+- [x] **3.4** Add orphan grace period checker
   - Periodic task or integrate with existing cleanup task
   - For each orphaned workflow, check if grace period expired
   - If expired → trigger cancellation via event system (from item 2)
 
-- [ ] **3.5** Configuration
+- [x] **3.5** Configuration
   - `WORKER_ORPHAN_GRACE_PERIOD` env var (default: 5.0 seconds)
   - Tune based on expected election + takeover time
 
