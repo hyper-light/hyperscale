@@ -77,6 +77,7 @@ from hyperscale.distributed_rewrite.models import (
     # AD-20: Cancellation Propagation
     WorkflowCancelRequest,
     WorkflowCancelResponse,
+    WorkflowCancellationComplete,
     # AD-31: Job leadership transfer notifications
     JobLeaderWorkerTransfer,
     JobLeaderWorkerTransferAck,
@@ -988,6 +989,7 @@ class WorkerServer(HealthAwareServer):
 
         # Cancel all active workflows via TaskRunner
         for workflow_id in list(self._workflow_tokens.keys()):
+            # On shutdown we don't need the result - just cancel
             await self._cancel_workflow(workflow_id, "server_shutdown")
 
         # Graceful shutdown (broadcasts leave via SWIM)
@@ -1326,22 +1328,35 @@ class WorkerServer(HealthAwareServer):
 
 
         for wf_id in workflows:
-            if await self._cancel_workflow(wf_id, reason):
+            success, _ = await self._cancel_workflow(wf_id, reason)
+            if success:
                 stopped.append(wf_id)
 
         return stopped
     
-    async def _cancel_workflow(self, workflow_id: str, reason: str) -> bool:
-        """Cancel a running workflow."""
+    async def _cancel_workflow(self, workflow_id: str, reason: str) -> tuple[bool, list[str]]:
+        """
+        Cancel a running workflow and collect any errors.
+
+        Returns:
+            Tuple of (success, errors) where success is True if cancellation
+            completed and errors is a list of any errors encountered.
+        """
+        errors: list[str] = []
+
         token = self._workflow_tokens.get(workflow_id)
         if not token:
-            return False
+            return (False, [f"Workflow {workflow_id} not found (no token)"])
 
         cancel_event = self._workflow_cancel_events.get(workflow_id)
         if cancel_event:
             cancel_event.set()
 
         await self._task_runner.cancel(token)
+
+        # Get workflow info before cleanup
+        progress = self._active_workflows.get(workflow_id)
+        job_id = progress.job_id if progress else ""
 
         if workflow_id in self._active_workflows:
             self._active_workflows[workflow_id].status = WorkflowStatus.CANCELLED.value
@@ -1351,13 +1366,98 @@ class WorkerServer(HealthAwareServer):
         if workflow_name:
             run_id = hash(workflow_id) % (2**31)
             try:
-                await self._remote_manger.cancel_workflow(run_id, workflow_name)
-            except Exception:
-                # Best effort - don't fail the cancellation if remote manager fails
-                pass
+                success, remote_errors = await self._remote_manger.await_workflow_cancellation(
+                    run_id, workflow_name, timeout=5.0
+                )
+                if not success:
+                    errors.append(f"RemoteGraphManager cancellation timed out for {workflow_name}")
+                if remote_errors:
+                    errors.extend(remote_errors)
+            except Exception as err:
+                errors.append(f"RemoteGraphManager error: {str(err)}")
 
         self._increment_version()
-        return True
+
+        # Push cancellation completion to manager (fire-and-forget via task runner)
+        if job_id:
+            self._task_runner.run(
+                self._push_cancellation_complete,
+                job_id,
+                workflow_id,
+                len(errors) == 0,
+                errors,
+            )
+
+        return (True, errors)
+
+    async def _push_cancellation_complete(
+        self,
+        job_id: str,
+        workflow_id: str,
+        success: bool,
+        errors: list[str],
+    ) -> None:
+        """
+        Push workflow cancellation completion to the job leader manager.
+
+        This is fire-and-forget - we don't block the cancellation flow.
+        Uses the same job leader discovery pattern as progress updates.
+        """
+        completion = WorkflowCancellationComplete(
+            job_id=job_id,
+            workflow_id=workflow_id,
+            success=success,
+            errors=errors,
+            cancelled_at=time.time(),
+            node_id=self._node_id.short,
+        )
+
+        job_leader_addr = self._workflow_job_leader.get(workflow_id)
+
+        # Try job leader first
+        if job_leader_addr:
+            try:
+                await self.send_tcp(
+                    job_leader_addr,
+                    "workflow_cancellation_complete",
+                    completion.dump(),
+                    timeout=5.0,
+                )
+                return
+            except Exception:
+                # Job leader failed - try other managers
+                pass
+
+        # Job leader unknown or failed - try any healthy manager
+        for manager_id in list(self._healthy_manager_ids):
+            manager_info = self._known_managers.get(manager_id)
+            if not manager_info:
+                continue
+
+            manager_addr = (manager_info.tcp_host, manager_info.tcp_port)
+            if manager_addr == job_leader_addr:
+                continue  # Already tried
+
+            try:
+                await self.send_tcp(
+                    manager_addr,
+                    "workflow_cancellation_complete",
+                    completion.dump(),
+                    timeout=5.0,
+                )
+                return
+            except Exception:
+                continue
+
+        # All managers failed - log and give up (best effort)
+        await self._udp_logger.log(
+            ServerWarning(
+                message=f"Failed to push cancellation complete for workflow {workflow_id[:16]}... - no reachable managers",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
     
     # =========================================================================
     # TCP Handlers - Registration
@@ -2818,7 +2918,8 @@ class WorkerServer(HealthAwareServer):
             cancelled_count = 0
             for workflow_id, progress in list(self._active_workflows.items()):
                 if progress.job_id == cancel_request.job_id:
-                    if await self._cancel_workflow(workflow_id, cancel_request.reason):
+                    success, _ = await self._cancel_workflow(workflow_id, cancel_request.reason)
+                    if success:
                         cancelled_count += 1
 
             ack = CancelAck(
@@ -2900,7 +3001,7 @@ class WorkerServer(HealthAwareServer):
 
             # Cancel the workflow
             was_running = progress.status == WorkflowStatus.RUNNING.value
-            cancelled = await self._cancel_workflow(request.workflow_id, "manager_cancel_request")
+            cancelled, cancel_errors = await self._cancel_workflow(request.workflow_id, "manager_cancel_request")
 
             if cancelled:
                 await self._udp_logger.log(

@@ -611,7 +611,6 @@ class HierarchicalFailureDetector:
 
         This is called synchronously by the timing wheel.
         """
-        print(f"[DEBUG HierarchicalDetector] EXPIRATION: node={node}, incarnation={state.incarnation}")
         # Mark as globally dead
         self._globally_dead.add(node)
         self._global_deaths += 1

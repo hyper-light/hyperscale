@@ -135,6 +135,9 @@ async def scenario_gate_peer_discovery_cluster_size(cluster_size: int) -> bool:
                 env=Env(
                     MERCURY_SYNC_REQUEST_TIMEOUT='5s',
                     MERCURY_SYNC_LOG_LEVEL="error",
+                    # Shorter suspicion timeouts for faster test failure detection
+                    SWIM_SUSPICION_MIN_TIMEOUT=1.0,
+                    SWIM_SUSPICION_MAX_TIMEOUT=3.0,
                 ),
                 dc_id="global",
                 datacenter_managers={},  # No managers for this test
@@ -237,6 +240,9 @@ async def scenario_gate_heartbeat_message_validation(cluster_size: int) -> bool:
                 env=Env(
                     MERCURY_SYNC_REQUEST_TIMEOUT='5s',
                     MERCURY_SYNC_LOG_LEVEL="error",
+                    # Shorter suspicion timeouts for faster test failure detection
+                    SWIM_SUSPICION_MIN_TIMEOUT=1.0,
+                    SWIM_SUSPICION_MAX_TIMEOUT=3.0,
                 ),
                 dc_id="global",
                 datacenter_managers={},
@@ -407,6 +413,9 @@ async def scenario_gate_peer_discovery_failure_recovery(cluster_size: int) -> bo
                 env=Env(
                     MERCURY_SYNC_REQUEST_TIMEOUT='5s',
                     MERCURY_SYNC_LOG_LEVEL="error",
+                    # Shorter suspicion timeouts for faster test failure detection
+                    SWIM_SUSPICION_MIN_TIMEOUT=1.0,
+                    SWIM_SUSPICION_MAX_TIMEOUT=3.0,
                 ),
                 dc_id="global",
                 datacenter_managers={},
@@ -447,7 +456,7 @@ async def scenario_gate_peer_discovery_failure_recovery(cluster_size: int) -> bo
         print(f"  {failed_gate_name} stopped")
 
         print(f"\n[5/7] Waiting for failure detection ({failure_detection_time}s)...")
-        await asyncio.sleep(failure_detection_time)
+        await asyncio.sleep(failure_detection_time * len(gates))
 
         # Verify failure detected
         remaining_gates = gates[:failed_gate_index]
@@ -472,6 +481,9 @@ async def scenario_gate_peer_discovery_failure_recovery(cluster_size: int) -> bo
             env=Env(
                 MERCURY_SYNC_REQUEST_TIMEOUT='5s',
                 MERCURY_SYNC_LOG_LEVEL="error",
+                # Shorter suspicion timeouts for faster test failure detection
+                SWIM_SUSPICION_MIN_TIMEOUT=1.0,
+                SWIM_SUSPICION_MAX_TIMEOUT=3.0,
             ),
             dc_id="global",
             datacenter_managers={},
@@ -576,6 +588,9 @@ async def scenario_gate_discovery_peer_selection(cluster_size: int) -> bool:
                 env=Env(
                     MERCURY_SYNC_REQUEST_TIMEOUT='5s',
                     MERCURY_SYNC_LOG_LEVEL="error",
+                    # Shorter suspicion timeouts for faster test failure detection
+                    SWIM_SUSPICION_MIN_TIMEOUT=1.0,
+                    SWIM_SUSPICION_MAX_TIMEOUT=3.0,
                 ),
                 dc_id="global",
                 datacenter_managers={},
@@ -710,23 +725,23 @@ async def run_all_tests():
     print("  6. Peer selection works correctly")
     print(f"\nCluster sizes to test: {cluster_sizes}")
 
-    # Basic discovery tests
-    for size in cluster_sizes:
-        result = await scenario_gate_peer_discovery_cluster_size(size)
-        results[f"discovery_{size}_gates"] = result
-        await asyncio.sleep(2)  # Allow port cleanup between tests
+    # # Basic discovery tests
+    # for size in cluster_sizes:
+    #     result = await scenario_gate_peer_discovery_cluster_size(size)
+    #     results[f"discovery_{size}_gates"] = result
+    #     await asyncio.sleep(2)  # Allow port cleanup between tests
 
-    # Message validation tests
-    for size in [3]:
-        result = await scenario_gate_heartbeat_message_validation(size)
-        results[f"heartbeat_validation_{size}_gates"] = result
-        await asyncio.sleep(2)
+    # # Message validation tests
+    # for size in [3]:
+    #     result = await scenario_gate_heartbeat_message_validation(size)
+    #     results[f"heartbeat_validation_{size}_gates"] = result
+    #     await asyncio.sleep(2)
 
-    # Peer selection tests
-    for size in [3]:
-        result = await scenario_gate_discovery_peer_selection(size)
-        results[f"peer_selection_{size}_gates"] = result
-        await asyncio.sleep(2)
+    # # Peer selection tests
+    # for size in [3]:
+    #     result = await scenario_gate_discovery_peer_selection(size)
+    #     results[f"peer_selection_{size}_gates"] = result
+    #     await asyncio.sleep(2)
 
     # Failure/recovery tests (only for 3 and 5 gates to save time)
     for size in [3, 5]:

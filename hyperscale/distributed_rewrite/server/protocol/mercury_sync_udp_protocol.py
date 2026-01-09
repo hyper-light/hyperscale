@@ -47,7 +47,6 @@ class MercurySyncUDPProtocol(asyncio.DatagramProtocol, Generic[T]):
         self.scheme = "mudps" if is_ssl(transport) else "mudp"
 
     def datagram_received(self, data: bytes, addr: Tuple[str, int]) -> None:
-        print(f'[DEBUG] Received packets from {addr} of lenth {len(data)}')
         self.conn.read_udp(
             data,
             self.transport,

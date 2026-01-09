@@ -221,8 +221,6 @@ class GateServer(HealthAwareServer):
         self._gate_udp_peers = gate_udp_peers or []  # UDP for SWIM cluster
 
         # DEBUG: Track initialization
-        print(f"[DEBUG GATE INIT tcp={tcp_port}] _gate_peers (TCP): {self._gate_peers}")
-        print(f"[DEBUG GATE INIT tcp={tcp_port}] _gate_udp_peers (UDP): {self._gate_udp_peers}")
 
         # Track gate peer addresses for failure detection (same pattern as managers)
         # Maps UDP addr -> TCP addr for peer gates
@@ -230,13 +228,11 @@ class GateServer(HealthAwareServer):
         for i, tcp_addr in enumerate(self._gate_peers):
             if i < len(self._gate_udp_peers):
                 self._gate_udp_to_tcp[self._gate_udp_peers[i]] = tcp_addr
-                print(f"[DEBUG GATE INIT tcp={tcp_port}] Mapping UDP {self._gate_udp_peers[i]} -> TCP {tcp_addr}")
 
         # Track active gate peers (removed when SWIM marks as dead)
         # AD-29: Start empty - peers become active ONLY after we receive their heartbeat
         # This prevents false failure detection during cluster formation
         self._active_gate_peers: set[tuple[str, int]] = set()
-        print(f"[DEBUG GATE INIT tcp={tcp_port}] _active_gate_peers initialized empty (AD-29: peers start unconfirmed)")
 
         # Per-peer locks protecting _active_gate_peers modifications to prevent race conditions
         # between concurrent failure/recovery handlers for the SAME peer (asyncio task interleaving)
@@ -512,17 +508,11 @@ class GateServer(HealthAwareServer):
         Handles gate peer failures (for split-brain awareness).
         Datacenter manager failures are handled via DC availability checks.
         """
-        # DEBUG: Track callback invocation
-        print(f"[DEBUG GATE {self._tcp_port}] _on_node_dead called for {node_addr}")
-        print(f"[DEBUG GATE {self._tcp_port}] _gate_udp_to_tcp keys: {list(self._gate_udp_to_tcp.keys())}")
 
         # Check if this is a gate peer
         gate_tcp_addr = self._gate_udp_to_tcp.get(node_addr)
         if gate_tcp_addr:
-            print(f"[DEBUG GATE {self._tcp_port}] Found TCP addr {gate_tcp_addr}, dispatching failure handler")
             self._task_runner.run(self._handle_gate_peer_failure, node_addr, gate_tcp_addr)
-        else:
-            print(f"[DEBUG GATE {self._tcp_port}] No TCP addr found for {node_addr} - NOT a known gate peer")
 
     def _on_node_join(self, node_addr: tuple[str, int]) -> None:
         """
@@ -530,17 +520,11 @@ class GateServer(HealthAwareServer):
 
         Handles gate peer recovery.
         """
-        # DEBUG: Track callback invocation
-        print(f"[DEBUG GATE {self._tcp_port}] _on_node_join called for {node_addr}")
-        print(f"[DEBUG GATE {self._tcp_port}] _gate_udp_to_tcp keys: {list(self._gate_udp_to_tcp.keys())}")
 
         # Check if this is a gate peer
         gate_tcp_addr = self._gate_udp_to_tcp.get(node_addr)
         if gate_tcp_addr:
-            print(f"[DEBUG GATE {self._tcp_port}] Found TCP addr {gate_tcp_addr}, dispatching recovery handler")
             self._task_runner.run(self._handle_gate_peer_recovery, node_addr, gate_tcp_addr)
-        else:
-            print(f"[DEBUG GATE {self._tcp_port}] No TCP addr found for {node_addr} - NOT a known gate peer")
     
     def _get_peer_state_lock(self, peer_addr: tuple[str, int]) -> asyncio.Lock:
         """
@@ -571,9 +555,6 @@ class GateServer(HealthAwareServer):
         - Uses per-peer lock to coordinate with recovery handler for same peer
         - Increments epoch to invalidate any in-flight recovery operations
         """
-        # DEBUG: Track failure handler invocation
-        print(f"[DEBUG GATE {self._tcp_port}] _handle_gate_peer_failure called for UDP:{udp_addr} TCP:{tcp_addr}")
-        print(f"[DEBUG GATE {self._tcp_port}] _active_gate_peers BEFORE: {self._active_gate_peers}")
 
         peer_lock = self._get_peer_state_lock(tcp_addr)
         async with peer_lock:
@@ -582,7 +563,6 @@ class GateServer(HealthAwareServer):
 
             # Remove from active peers
             self._active_gate_peers.discard(tcp_addr)
-            print(f"[DEBUG GATE {self._tcp_port}] _active_gate_peers AFTER discard: {self._active_gate_peers}")
 
             # Remove from peer discovery service (AD-28)
             peer_host, peer_port = tcp_addr
@@ -641,9 +621,6 @@ class GateServer(HealthAwareServer):
         - Uses epoch checking to detect if failure handler ran during our jitter
         - Uses per-peer lock to coordinate state changes for same peer
         """
-        # DEBUG: Track recovery handler invocation
-        print(f"[DEBUG GATE {self._tcp_port}] _handle_gate_peer_recovery called for UDP:{udp_addr} TCP:{tcp_addr}")
-        print(f"[DEBUG GATE {self._tcp_port}] _active_gate_peers BEFORE recovery: {self._active_gate_peers}")
 
         peer_lock = self._get_peer_state_lock(tcp_addr)
 
@@ -682,8 +659,6 @@ class GateServer(HealthAwareServer):
 
                 # Epoch unchanged - safe to add peer back
                 self._active_gate_peers.add(tcp_addr)
-                print(f"[DEBUG GATE {self._tcp_port}] _active_gate_peers AFTER add: {self._active_gate_peers}")
-
                 # Add to peer discovery with synthetic peer_id based on address
                 # The real NodeId will be updated when we receive the peer's heartbeat
                 peer_host, peer_port = tcp_addr
@@ -817,12 +792,9 @@ class GateServer(HealthAwareServer):
         4. Job leadership propagation (Serf-style piggybacking)
         5. Per-DC manager tracking for job queries
         """
-        # DEBUG: Track heartbeat reception
-        print(f"[DEBUG GATE {self._tcp_port}] _handle_gate_peer_heartbeat from UDP:{source_addr} node_id:{heartbeat.node_id[:20]}...")
 
         # Check if update is stale using versioned clock
         if self._versioned_clock.is_entity_stale(heartbeat.node_id, heartbeat.version):
-            print(f"[DEBUG GATE {self._tcp_port}] Heartbeat from {source_addr} is STALE, ignoring")
             return
 
         # Store peer info keyed by UDP address (source_addr is the SWIM UDP address)
@@ -834,10 +806,6 @@ class GateServer(HealthAwareServer):
         peer_tcp_port = heartbeat.tcp_port if heartbeat.tcp_port else source_addr[1]
         peer_tcp_addr = (peer_tcp_host, peer_tcp_port)
 
-        print(f"[DEBUG GATE {self._tcp_port}] Heartbeat TCP addr from fields: {peer_tcp_addr}")
-        print(f"[DEBUG GATE {self._tcp_port}] Current _gate_udp_to_tcp: {self._gate_udp_to_tcp}")
-        print(f"[DEBUG GATE {self._tcp_port}] Current _active_gate_peers BEFORE: {self._active_gate_peers}")
-
         # AD-29: Confirm this peer in the SWIM layer since we received their heartbeat
         # This allows the suspicion subprotocol to function properly
         self.confirm_peer(source_addr)
@@ -848,22 +816,15 @@ class GateServer(HealthAwareServer):
         # cannot find the TCP address for dynamically discovered gates
         udp_addr = source_addr  # SWIM source address is always UDP
         if udp_addr not in self._gate_udp_to_tcp:
-            print(f"[DEBUG GATE {self._tcp_port}] NEW mapping: UDP {udp_addr} -> TCP {peer_tcp_addr}")
             self._gate_udp_to_tcp[udp_addr] = peer_tcp_addr
             # Also add to active peers since this is a new discovery via heartbeat
             self._active_gate_peers.add(peer_tcp_addr)
-            print(f"[DEBUG GATE {self._tcp_port}] Added {peer_tcp_addr} to _active_gate_peers")
         elif self._gate_udp_to_tcp[udp_addr] != peer_tcp_addr:
             # TCP address changed (rare but possible) - update mapping
             old_tcp_addr = self._gate_udp_to_tcp[udp_addr]
-            print(f"[DEBUG GATE {self._tcp_port}] TCP CHANGED: {old_tcp_addr} -> {peer_tcp_addr}")
             self._active_gate_peers.discard(old_tcp_addr)
             self._gate_udp_to_tcp[udp_addr] = peer_tcp_addr
             self._active_gate_peers.add(peer_tcp_addr)
-        else:
-            print(f"[DEBUG GATE {self._tcp_port}] Mapping already exists: UDP {udp_addr} -> TCP {peer_tcp_addr}")
-
-        print(f"[DEBUG GATE {self._tcp_port}] _active_gate_peers AFTER heartbeat: {self._active_gate_peers}")
 
         # Update peer discovery service (AD-28)
         self._peer_discovery.add_peer(

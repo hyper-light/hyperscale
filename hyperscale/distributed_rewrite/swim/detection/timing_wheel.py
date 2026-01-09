@@ -190,6 +190,7 @@ class TimingWheel:
 
         Returns True if added successfully, False if already exists.
         """
+
         async with self._lock:
             # Check if already tracked
             if node in self._node_locations:
@@ -415,6 +416,7 @@ class TimingWheel:
     def start(self) -> None:
         """Start the timing wheel advancement loop."""
         if self._running:
+            print("[DEBUG TimingWheel] start() called but already running")
             return
 
         self._running = True
@@ -535,7 +537,7 @@ class TimingWheel:
             bucket = self._coarse_wheel[bucket_idx]
 
         # Direct access to bucket entries
-        for entry in bucket._entries.values():
+        for entry in bucket.entries.values():
             if entry.node == node and entry.epoch == epoch:
                 return entry.state
 

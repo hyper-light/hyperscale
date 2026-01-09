@@ -1006,24 +1006,20 @@ class MercurySyncBaseServer(Generic[T]):
             return
 
         try:
-            print(f"[DEBUG] read_udp: received {len(data)} bytes from {sender_addr}")
             # Rate limiting (if sender address available)
             if sender_addr is not None:
                 if not self._rate_limiter.check(sender_addr):
                     self._udp_drop_counter.increment_rate_limited()
-                    print(f'[DEBUG] Rate limited {sender_addr}')
                     return
 
             # Message size validation (before decompression)
             if len(data) > MAX_MESSAGE_SIZE:
-                print(f'[DEBUG] Exceeded max size {sender_addr}')
                 self._udp_drop_counter.increment_message_too_large()
                 return
 
             try:
                 decrypted_data = self._encryptor.decrypt(data)
             except Exception:
-                print(f'[DEBUG] Failed decryption {sender_addr}')
                 self._udp_drop_counter.increment_decryption_failed()
                 return
 
@@ -1036,7 +1032,6 @@ class MercurySyncBaseServer(Generic[T]):
             try:
                 validate_message_size(len(decrypted_data), len(decrypted))
             except MessageSizeError:
-                print(f'[DEBUG] Exceeded message size limit {sender_addr}')
                 self._udp_drop_counter.increment_decompression_too_large()
                 return
 
@@ -1049,10 +1044,6 @@ class MercurySyncBaseServer(Generic[T]):
             data_len = int.from_bytes(rest[64:68], 'big')
             # Extract payload (remaining bytes)
             payload = rest[68:68 + data_len]
-
-            print(f'[DEBUG] Received message size {len(decrypted)} bytes with payload of {len(payload)} bytes')
-
-            print(f'[DEBUG] Received request_type={request_type} handler_name={handler_name} from addr={sender_addr} with payload={len(payload)} payload bytes')
 
             match request_type:
 
@@ -1087,9 +1078,6 @@ class MercurySyncBaseServer(Generic[T]):
 
 
         except Exception as err:
-            print(f'[DEBUG] Encountered unknown error {sender_addr} - {str(err)}')
-            import traceback
-            print(traceback.format_exc())
             self._udp_drop_counter.increment_malformed_message()
 
     async def process_tcp_client_response(
@@ -1302,13 +1290,9 @@ class MercurySyncBaseServer(Generic[T]):
         
         next_time = await self._udp_clock.update(clock_time)
 
-        print(f'[DEBUG] Server request received handler_name={handler_name.decode()} addr={addr.decode()} payload_bytes={len(payload)} payload bytes')
-        print(f'[DEBUG] Server request payload={payload}')
-
         try:
             parsed_addr = parse_address(addr)
         except AddressValidationError as e:
-            print(f'[DEBUG] failed due to malformed request {addr}')
             await self._log_security_warning(
                 f"UDP server request malformed address: {e}",
                 protocol="udp",
@@ -1327,7 +1311,6 @@ class MercurySyncBaseServer(Generic[T]):
                                 payload.sender_incarnation,
                             )
                         except ReplayError:
-                            print(f'[DEBUG] triggered replay error handler_name={handler_name.decode()} addr={addr.decode()}')
                             self._udp_drop_counter.increment_replay_detected()
                             return
 
@@ -1341,9 +1324,6 @@ class MercurySyncBaseServer(Generic[T]):
             if isinstance(response, Message):
                 response = response.dump()
 
-            print(f'[DEBUG] Server response prepared at {len(response)} bytes')
-            print(f'[DEBUG] Server response prepared at {response}')
-
             # UDP response with clock before length-prefixed data
             # Format: type<address<handler<clock(64 bytes)data_len(4 bytes)data(N bytes)
             response_len = len(response).to_bytes(4, 'big')
@@ -1356,9 +1336,6 @@ class MercurySyncBaseServer(Generic[T]):
             transport.sendto(response_payload, parsed_addr)
 
         except Exception as e:
-            import traceback
-            print(traceback.format_exc())
-            print(f'[DEBUG] failed to process due to {str(e)} - {list(addr)}')
             # Log security event - don't leak internal details
             await self._log_security_warning(
                 f"UDP server request failed: {type(e).__name__}",
@@ -1385,9 +1362,6 @@ class MercurySyncBaseServer(Generic[T]):
         _: asyncio.DatagramTransport,
     ):
         try:
-            print(f'[DEBUG] Client response received handler_name={handler_name.decode()} addr={addr.decode()} payload_bytes={len(payload)} payload bytes')
-            print(f'[DEBUG] Client response payload={payload}')
-
             await self._udp_clock.ack(clock_time)
 
             if response_model := self.udp_client_response_models.get(handler_name):

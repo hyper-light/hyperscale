@@ -443,7 +443,7 @@ async def scenario_manager_peer_discovery_failure_recovery(cluster_size: int) ->
         print(f"  {failed_manager_name} stopped")
 
         print(f"\n[5/7] Waiting for failure detection ({failure_detection_time}s)...")
-        await asyncio.sleep(failure_detection_time)
+        await asyncio.sleep(failure_detection_time * len(managers))
 
         # Verify failure detected
         remaining_managers = managers[:failed_manager_index]

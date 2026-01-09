@@ -101,6 +101,7 @@ from hyperscale.distributed_rewrite.models import (
     HealthcheckExtensionResponse,
     WorkflowCancellationQuery,
     WorkflowCancellationResponse,
+    WorkflowCancellationComplete,
     WorkerDiscoveryBroadcast,
     ContextForward,
     ContextLayerSync,
@@ -362,6 +363,16 @@ class ManagerServer(HealthAwareServer):
         # job_id -> origin gate TCP address
         # Set when job is submitted, used to route results directly to job leader gate
         self._job_origin_gates: dict[str, tuple[str, int]] = {}
+
+        # Cancellation completion tracking (AD-20 push notifications)
+        # job_id -> set of workflow_ids expected to report cancellation completion
+        self._cancellation_pending_workflows: dict[str, set[str]] = defaultdict(set)
+        # job_id -> list of errors from cancelled workflows
+        self._cancellation_errors: dict[str, list[str]] = defaultdict(list)
+        # job_id -> asyncio.Event (set when all workflows report cancellation complete)
+        self._cancellation_completion_events: dict[str, asyncio.Event] = {}
+        # job_id -> timestamp when cancellation was initiated
+        self._cancellation_initiated_at: dict[str, float] = {}
 
         # Job submissions for eager dispatch (need access to submission params)
         self._job_submissions: dict[str, JobSubmission] = {}  # job_id -> submission
