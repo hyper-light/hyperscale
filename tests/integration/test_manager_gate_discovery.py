@@ -39,9 +39,9 @@ from hyperscale.distributed_rewrite.env.env import Env
 from hyperscale.distributed_rewrite.models import ManagerHeartbeat, ManagerRegistrationResponse
 from hyperscale.logging.config.logging_config import LoggingConfig
 
-# Initialize logging directory
+# Disable logging during pytest to avoid pipe transport errors
 _logging_config = LoggingConfig()
-_logging_config.update(log_directory=os.getcwd())
+_logging_config.disable()
 
 
 # ==========================================================================
