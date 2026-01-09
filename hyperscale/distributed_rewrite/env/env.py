@@ -314,6 +314,22 @@ class Env(BaseModel):
     DISCOVERY_PROBE_INTERVAL: StrictFloat = 30.0  # Seconds between peer health probes
     DISCOVERY_FAILURE_DECAY_INTERVAL: StrictFloat = 60.0  # Seconds between failure count decay
 
+    # ==========================================================================
+    # Bounded Pending Response Queues Settings (AD-32)
+    # ==========================================================================
+    # Priority-aware bounded execution with load shedding
+    # CRITICAL (SWIM) never shed, LOW shed first under load
+    PENDING_RESPONSE_MAX_CONCURRENT: StrictInt = 1000  # Global limit across all priorities
+    PENDING_RESPONSE_HIGH_LIMIT: StrictInt = 500  # HIGH priority limit
+    PENDING_RESPONSE_NORMAL_LIMIT: StrictInt = 300  # NORMAL priority limit
+    PENDING_RESPONSE_LOW_LIMIT: StrictInt = 200  # LOW priority limit (shed first)
+    PENDING_RESPONSE_WARN_THRESHOLD: StrictFloat = 0.8  # Log warning at this % of global limit
+
+    # Client-side per-destination queue settings (AD-32)
+    OUTGOING_QUEUE_SIZE: StrictInt = 500  # Per-destination queue size
+    OUTGOING_OVERFLOW_SIZE: StrictInt = 100  # Overflow ring buffer size
+    OUTGOING_MAX_DESTINATIONS: StrictInt = 1000  # Max tracked destinations (LRU evicted)
+
     @classmethod
     def types_map(cls) -> Dict[str, Callable[[str], PrimaryType]]:
         return {
@@ -494,6 +510,16 @@ class Env(BaseModel):
             "CROSS_DC_ENABLE_LHM_CORRELATION": bool,
             "CROSS_DC_LHM_STRESSED_THRESHOLD": int,
             "CROSS_DC_LHM_CORRELATION_FRACTION": float,
+            # Bounded pending response queues settings (AD-32)
+            "PENDING_RESPONSE_MAX_CONCURRENT": int,
+            "PENDING_RESPONSE_HIGH_LIMIT": int,
+            "PENDING_RESPONSE_NORMAL_LIMIT": int,
+            "PENDING_RESPONSE_LOW_LIMIT": int,
+            "PENDING_RESPONSE_WARN_THRESHOLD": float,
+            # Client-side queue settings (AD-32)
+            "OUTGOING_QUEUE_SIZE": int,
+            "OUTGOING_OVERFLOW_SIZE": int,
+            "OUTGOING_MAX_DESTINATIONS": int,
         }
     
     def get_swim_init_context(self) -> dict:
@@ -837,3 +863,41 @@ class Env(BaseModel):
             # Dynamic registration mode
             allow_dynamic_registration=allow_dynamic_registration,
         )
+
+    def get_pending_response_config(self) -> dict:
+        """
+        Get bounded pending response configuration (AD-32).
+
+        Returns configuration for the priority-aware bounded execution system:
+        - Per-priority limits (CRITICAL unlimited, HIGH/NORMAL/LOW bounded)
+        - Global limit across all priorities
+        - Load shedding: LOW shed first, then NORMAL, then HIGH
+        - CRITICAL (SWIM probes/acks) NEVER shed
+
+        This prevents memory exhaustion under high load while:
+        - Ensuring SWIM protocol accuracy (CRITICAL never delayed)
+        - Providing graceful degradation (shed stats before job commands)
+        - Enabling immediate execution (no queue latency for most messages)
+        """
+        return {
+            'global_limit': self.PENDING_RESPONSE_MAX_CONCURRENT,
+            'high_limit': self.PENDING_RESPONSE_HIGH_LIMIT,
+            'normal_limit': self.PENDING_RESPONSE_NORMAL_LIMIT,
+            'low_limit': self.PENDING_RESPONSE_LOW_LIMIT,
+            'warn_threshold': self.PENDING_RESPONSE_WARN_THRESHOLD,
+        }
+
+    def get_outgoing_queue_config(self) -> dict:
+        """
+        Get client-side outgoing queue configuration (AD-32).
+
+        Returns configuration for per-destination RobustMessageQueue:
+        - Per-destination queue isolation (slow DC doesn't block fast DC)
+        - Graduated backpressure (HEALTHY → THROTTLED → BATCHING → OVERFLOW)
+        - LRU eviction when max destinations reached
+        """
+        return {
+            'queue_size': self.OUTGOING_QUEUE_SIZE,
+            'overflow_size': self.OUTGOING_OVERFLOW_SIZE,
+            'max_destinations': self.OUTGOING_MAX_DESTINATIONS,
+        }

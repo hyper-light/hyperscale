@@ -47,6 +47,9 @@ from hyperscale.distributed_rewrite.server.protocol import (
     AddressValidationError,
     frame_message,
     DropCounter,
+    InFlightTracker,
+    MessagePriority,
+    PriorityLimits,
 )
 from hyperscale.distributed_rewrite.server.protocol.security import MessageSizeError
 from hyperscale.distributed_rewrite.reliability import ServerRateLimiter
@@ -173,6 +176,19 @@ class MercurySyncBaseServer(Generic[T]):
         self._udp_drop_counter = DropCounter()
         self._drop_stats_task: asyncio.Task | None = None
         self._drop_stats_interval = 60.0  # Log drop stats every 60 seconds
+
+        # AD-32: Priority-aware bounded execution trackers
+        pending_config = env.get_pending_response_config()
+        priority_limits = PriorityLimits(
+            critical=0,  # CRITICAL (SWIM) unlimited
+            high=pending_config['high_limit'],
+            normal=pending_config['normal_limit'],
+            low=pending_config['low_limit'],
+            global_limit=pending_config['global_limit'],
+        )
+        self._tcp_in_flight_tracker = InFlightTracker(limits=priority_limits)
+        self._udp_in_flight_tracker = InFlightTracker(limits=priority_limits)
+        self._pending_response_warn_threshold = pending_config['warn_threshold']
         
         self._tcp_semaphore: asyncio.Semaphore | None= None
         self._udp_semaphore: asyncio.Semaphore | None= None
@@ -965,19 +981,113 @@ class MercurySyncBaseServer(Generic[T]):
                 node=(host, port)
             )
 
+    def _spawn_tcp_response(
+        self,
+        coro: Coroutine,
+        priority: MessagePriority = MessagePriority.NORMAL,
+    ) -> bool:
+        """
+        Spawn a TCP response task with priority-aware bounded execution (AD-32).
+
+        Returns True if task spawned, False if shed due to load.
+        Called from sync protocol callbacks.
+
+        Args:
+            coro: The coroutine to execute.
+            priority: Message priority for load shedding decisions.
+
+        Returns:
+            True if task was spawned, False if request was shed.
+        """
+        if not self._tcp_in_flight_tracker.try_acquire(priority):
+            # Load shedding - increment drop counter
+            self._tcp_drop_counter.increment_load_shed()
+            return False
+
+        task = asyncio.ensure_future(coro)
+        task.add_done_callback(
+            lambda t: self._on_tcp_task_done(t, priority)
+        )
+        self._pending_tcp_server_responses.append(task)
+        return True
+
+    def _on_tcp_task_done(
+        self,
+        task: asyncio.Task,
+        priority: MessagePriority,
+    ) -> None:
+        """Done callback for TCP response tasks - release slot and cleanup."""
+        # Retrieve exception to prevent memory leak
+        try:
+            task.exception()
+        except (asyncio.CancelledError, asyncio.InvalidStateError):
+            pass
+        except Exception:
+            pass  # Logged elsewhere
+
+        # Release the priority slot
+        self._tcp_in_flight_tracker.release(priority)
+
+    def _spawn_udp_response(
+        self,
+        coro: Coroutine,
+        priority: MessagePriority = MessagePriority.NORMAL,
+    ) -> bool:
+        """
+        Spawn a UDP response task with priority-aware bounded execution (AD-32).
+
+        Returns True if task spawned, False if shed due to load.
+        Called from sync protocol callbacks.
+
+        Args:
+            coro: The coroutine to execute.
+            priority: Message priority for load shedding decisions.
+
+        Returns:
+            True if task was spawned, False if request was shed.
+        """
+        if not self._udp_in_flight_tracker.try_acquire(priority):
+            # Load shedding - increment drop counter
+            self._udp_drop_counter.increment_load_shed()
+            return False
+
+        task = asyncio.ensure_future(coro)
+        task.add_done_callback(
+            lambda t: self._on_udp_task_done(t, priority)
+        )
+        self._pending_udp_server_responses.append(task)
+        return True
+
+    def _on_udp_task_done(
+        self,
+        task: asyncio.Task,
+        priority: MessagePriority,
+    ) -> None:
+        """Done callback for UDP response tasks - release slot and cleanup."""
+        # Retrieve exception to prevent memory leak
+        try:
+            task.exception()
+        except (asyncio.CancelledError, asyncio.InvalidStateError):
+            pass
+        except Exception:
+            pass  # Logged elsewhere
+
+        # Release the priority slot
+        self._udp_in_flight_tracker.release(priority)
+
     def read_client_tcp(
         self,
         data: bytes,
         transport: asyncio.Transport,
     ):
-        # print(f"DEBUG read_client_tcp: received {len(data)} bytes")
-        self._pending_tcp_server_responses.append(
-            asyncio.ensure_future(
-                self.process_tcp_client_response(
-                    data,
-                    transport,
-                ),
+        # AD-32: Use priority-aware spawn instead of direct append
+        # TCP client responses are typically status updates (NORMAL priority)
+        self._spawn_tcp_response(
+            self.process_tcp_client_response(
+                data,
+                transport,
             ),
+            priority=MessagePriority.NORMAL,
         )
 
     def read_server_tcp(
@@ -985,14 +1095,14 @@ class MercurySyncBaseServer(Generic[T]):
         data: bytes,
         transport: asyncio.Transport,
     ):
-       
-        self._pending_tcp_server_responses.append(
-            asyncio.ensure_future(
-                self.process_tcp_server_request(
-                    data,
-                    transport,
-                ),
+        # AD-32: Use priority-aware spawn instead of direct append
+        # TCP server requests are typically job commands (HIGH priority)
+        self._spawn_tcp_response(
+            self.process_tcp_server_request(
+                data,
+                transport,
             ),
+            priority=MessagePriority.HIGH,
         )
 
     def read_udp(
@@ -1048,32 +1158,32 @@ class MercurySyncBaseServer(Generic[T]):
             match request_type:
 
                 case b'c':
-
-                    self._pending_udp_server_responses.append(
-                        asyncio.ensure_future(
-                            self.process_udp_server_request(
-                                handler_name,
-                                addr,
-                                payload,
-                                clock_time,
-                                transport,
-                            ),
+                    # AD-32: Use priority-aware spawn instead of direct append
+                    # UDP client requests: priority determined by handler (subclass can override)
+                    # Default to NORMAL; SWIM handlers override to CRITICAL in subclasses
+                    self._spawn_udp_response(
+                        self.process_udp_server_request(
+                            handler_name,
+                            addr,
+                            payload,
+                            clock_time,
+                            transport,
                         ),
+                        priority=MessagePriority.NORMAL,
                     )
 
                 case b's':
-                    # Server response - pass the full 'rest' to process_udp_client_response
-                    # which expects clock(64) + data_len(4) + data(N), NOT pre-extracted payload
-                    self._pending_udp_server_responses.append(
-                        asyncio.ensure_future(
-                            self.process_udp_client_response(
-                                handler_name,
-                                addr,
-                                payload,
-                                clock_time,
-                                transport,
-                            )
-                        )
+                    # AD-32: Use priority-aware spawn for server responses
+                    # These are typically status updates (NORMAL priority)
+                    self._spawn_udp_response(
+                        self.process_udp_client_response(
+                            handler_name,
+                            addr,
+                            payload,
+                            clock_time,
+                            transport,
+                        ),
+                        priority=MessagePriority.NORMAL,
                     )
 
 
@@ -1459,6 +1569,7 @@ class MercurySyncBaseServer(Generic[T]):
                             decompression_too_large_count=tcp_snapshot.decompression_too_large,
                             decryption_failed_count=tcp_snapshot.decryption_failed,
                             malformed_message_count=tcp_snapshot.malformed_message,
+                            load_shed_count=tcp_snapshot.load_shed,
                             total_dropped=tcp_snapshot.total,
                             interval_seconds=tcp_snapshot.interval_seconds,
                         )
@@ -1482,6 +1593,7 @@ class MercurySyncBaseServer(Generic[T]):
                             decompression_too_large_count=udp_snapshot.decompression_too_large,
                             decryption_failed_count=udp_snapshot.decryption_failed,
                             malformed_message_count=udp_snapshot.malformed_message,
+                            load_shed_count=udp_snapshot.load_shed,
                             total_dropped=udp_snapshot.total,
                             interval_seconds=udp_snapshot.interval_seconds,
                         )

@@ -27,6 +27,7 @@ class DropCounter:
     decryption_failed: int = 0
     malformed_message: int = 0
     replay_detected: int = 0
+    load_shed: int = 0  # AD-32: Messages dropped due to backpressure
     _last_reset: float = field(default_factory=time.monotonic)
 
     def increment_rate_limited(self) -> None:
@@ -47,6 +48,10 @@ class DropCounter:
     def increment_replay_detected(self) -> None:
         self.replay_detected += 1
 
+    def increment_load_shed(self) -> None:
+        """AD-32: Increment when message dropped due to priority-based load shedding."""
+        self.load_shed += 1
+
     @property
     def total(self) -> int:
         return (
@@ -56,6 +61,7 @@ class DropCounter:
             + self.decryption_failed
             + self.malformed_message
             + self.replay_detected
+            + self.load_shed
         )
 
     @property
@@ -76,6 +82,7 @@ class DropCounter:
             decryption_failed=self.decryption_failed,
             malformed_message=self.malformed_message,
             replay_detected=self.replay_detected,
+            load_shed=self.load_shed,
             interval_seconds=self.interval_seconds,
         )
 
@@ -85,6 +92,7 @@ class DropCounter:
         self.decryption_failed = 0
         self.malformed_message = 0
         self.replay_detected = 0
+        self.load_shed = 0
         self._last_reset = time.monotonic()
 
         return snapshot
@@ -100,6 +108,7 @@ class DropCounterSnapshot:
     decryption_failed: int
     malformed_message: int
     replay_detected: int
+    load_shed: int  # AD-32: Messages dropped due to backpressure
     interval_seconds: float
 
     @property
@@ -111,6 +120,7 @@ class DropCounterSnapshot:
             + self.decryption_failed
             + self.malformed_message
             + self.replay_detected
+            + self.load_shed
         )
 
     @property

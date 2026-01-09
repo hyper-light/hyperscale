@@ -3650,6 +3650,787 @@ Manager1 (job leader in DC) dies
 
 ---
 
+### AD-32: Hybrid Bounded Execution with Priority Load Shedding
+
+**Decision**: Implement a hybrid approach for bounded pending responses optimized for a globally distributed performance testing framework:
+
+1. **Server-side (incoming requests)**: Priority-aware bounded immediate execution with load shedding
+2. **Client-side (outgoing requests)**: RobustMessageQueue per destination with graduated backpressure
+
+This prevents memory exhaustion while ensuring latency-critical messages (SWIM heartbeats) are never delayed by queue overhead, and slow destinations don't block fast ones.
+
+**Rationale - Why Hybrid?**
+
+In a globally distributed performance testing framework:
+- **Extreme latency** between datacenters (50-300ms RTT)
+- **Frequent stats updates** from workers (100+ updates/sec per worker)
+- **Busy workers** with high CPU/memory, making interval-based cleanup unreliable
+- **SWIM protocol** requires sub-millisecond response for accurate failure detection
+
+| Approach | Server-Side Problem | Client-Side Problem |
+|----------|--------------------|--------------------|
+| Queue-only | Consumer loop adds latency even at 0% load - deadly for SWIM | Works well |
+| Counter-only | Works well | Head-of-line blocking on slow destinations |
+| **Hybrid** | Immediate execution, priority discrimination | Per-destination isolation |
+
+---
+
+## Part 1: Server-Side Priority-Aware Bounded Immediate Execution
+
+**Problem Statement - Unbounded Hot Path Queues**:
+
+```
+Original Flow (Vulnerable):
+
+Incoming TCP/UDP Message (sync callback)
+        │
+        ▼
+self._pending_responses.append(        ◄── UNBOUNDED DEQUE
+    asyncio.ensure_future(
+        self.process_*_request(...)
+    )
+)
+
+Problem Scenarios:
+
+1. MANAGER under load:
+   - 1000 workers push stats at 100 updates/second each
+   - 100,000 tasks created per second
+   - Cleanup runs every 100ms → 10,000 tasks accumulate
+   - Memory grows linearly with load
+
+2. GATE under retry storm:
+   - 10 datacenters × 50 retries × 100 concurrent jobs
+   - 50,000 pending tasks during network partition recovery
+   - No bound → potential OOM
+
+3. WORKER under CPU pressure:
+   - High CPU utilization delays event loop
+   - Cleanup interval becomes unreliable
+   - Tasks accumulate faster than they're cleaned
+```
+
+**Solution: Priority-Aware InFlightTracker**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│           SERVER-SIDE: PRIORITY-AWARE BOUNDED IMMEDIATE EXECUTION                │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                  │
+│  Incoming Message (sync callback from protocol)                                  │
+│          │                                                                       │
+│          ▼                                                                       │
+│  ┌───────────────────────────────────────────────────────────────────────────┐  │
+│  │                     MESSAGE PRIORITY CLASSIFICATION                        │  │
+│  │                                                                            │  │
+│  │   CRITICAL (0) │ SWIM probe/ack, leadership, failure detection            │  │
+│  │   HIGH (1)     │ Job dispatch, workflow commands, state sync              │  │
+│  │   NORMAL (2)   │ Status updates, heartbeats (non-SWIM)                    │  │
+│  │   LOW (3)      │ Metrics, stats, telemetry, logs                          │  │
+│  └───────────────────────────────────────────────────────────────────────────┘  │
+│          │                                                                       │
+│          ▼                                                                       │
+│  ┌───────────────────────────────────────────────────────────────────────────┐  │
+│  │                     IN-FLIGHT TRACKER CHECK                                │  │
+│  │                                                                            │  │
+│  │   tracker.try_acquire(priority) → bool                                     │  │
+│  │                                                                            │  │
+│  │   Priority Limits (per-priority bounded):                                  │  │
+│  │   ┌──────────────────────────────────────────────────────────────────┐    │  │
+│  │   │ Priority   │ Limit │ Current │ Available │ Status              │    │  │
+│  │   ├──────────────────────────────────────────────────────────────────┤    │  │
+│  │   │ CRITICAL   │   ∞   │    5    │     ∞     │ Always allowed      │    │  │
+│  │   │ HIGH       │  500  │   480   │    20     │ ✓ Allowed           │    │  │
+│  │   │ NORMAL     │  300  │   300   │     0     │ ✗ At limit          │    │  │
+│  │   │ LOW        │  200  │   200   │     0     │ ✗ At limit, shed    │    │  │
+│  │   └──────────────────────────────────────────────────────────────────┘    │  │
+│  │                                                                            │  │
+│  │   Global Limit: 1000 (sum of all priorities)                              │  │
+│  └───────────────────────────────────────────────────────────────────────────┘  │
+│          │                           │                                          │
+│       ACQUIRED                    REJECTED                                      │
+│          │                           │                                          │
+│          ▼                           ▼                                          │
+│  ┌───────────────────┐    ┌───────────────────────────────────────────────────┐│
+│  │ Immediate Execute │    │              LOAD SHEDDING                         ││
+│  │                   │    │                                                    ││
+│  │ 1. Create task    │    │   Priority-based discrimination:                   ││
+│  │ 2. Add callback   │    │                                                    ││
+│  │ 3. Execute NOW    │    │   • LOW: Silent drop, increment counter           ││
+│  │                   │    │   • NORMAL: Drop if HIGH/CRITICAL pressure        ││
+│  │ No queue latency! │    │   • HIGH: Only drop if CRITICAL overwhelmed       ││
+│  │                   │    │   • CRITICAL: NEVER drop, always execute          ││
+│  └───────────────────┘    │                                                    ││
+│          │                │   Response varies by protocol:                     ││
+│          │                │   • UDP: Silent drop (no guarantee anyway)        ││
+│          │                │   • TCP: Error response with Retry-After          ││
+│          │                └───────────────────────────────────────────────────────┘│
+│          │                                                                       │
+│          ▼                                                                       │
+│  ┌───────────────────────────────────────────────────────────────────────────┐  │
+│  │                        TASK DONE CALLBACK                                  │  │
+│  │                                                                            │  │
+│  │  1. tracker.release(priority)  # Decrement priority-specific counter      │  │
+│  │  2. Retrieve exception (prevent memory leak)                              │  │
+│  │  3. Remove from tracking deque                                            │  │
+│  └───────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                  │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**State Diagram - Priority Load Shedding**:
+
+```
+                              ┌─────────────────────────────────────────────┐
+                              │              SYSTEM STATE                    │
+                              └─────────────────────────────────────────────┘
+                                                │
+        ┌───────────────────────────────────────┼───────────────────────────────────────┐
+        │                                       │                                       │
+        ▼                                       ▼                                       ▼
+┌───────────────────┐                ┌───────────────────┐                ┌───────────────────┐
+│     HEALTHY       │                │    PRESSURED      │                │    OVERLOADED     │
+│                   │                │                   │                │                   │
+│ All priorities    │                │ LOW at limit      │                │ NORMAL at limit   │
+│ have capacity     │                │ Others OK         │                │ Only HIGH+CRIT OK │
+│                   │                │                   │                │                   │
+│ Actions:          │                │ Actions:          │                │ Actions:          │
+│ • Accept all      │                │ • Shed LOW        │                │ • Shed LOW+NORMAL │
+│                   │                │ • Accept others   │                │ • Accept HIGH+CRIT│
+└───────────────────┘                └───────────────────┘                └───────────────────┘
+        │                                       │                                       │
+        │                                       │                                       │
+        ▼                                       ▼                                       ▼
+┌─────────────────────────────────────────────────────────────────────────────────────────────┐
+│                                      CRITICAL                                                │
+│                                                                                              │
+│  CRITICAL priority messages ALWAYS execute immediately, regardless of system state.         │
+│  This ensures SWIM probes/acks are never delayed, maintaining accurate failure detection.   │
+└─────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**InFlightTracker Implementation**:
+
+```python
+from enum import IntEnum
+from dataclasses import dataclass, field
+from typing import Dict
+import asyncio
+
+
+class MessagePriority(IntEnum):
+    """Priority levels for incoming messages."""
+    CRITICAL = 0  # SWIM probes/acks - NEVER shed
+    HIGH = 1      # Job dispatch, workflow commands
+    NORMAL = 2    # Status updates, non-SWIM heartbeats
+    LOW = 3       # Metrics, stats, telemetry
+
+
+@dataclass(slots=True)
+class PriorityLimits:
+    """Per-priority concurrency limits."""
+    critical: int = 0      # 0 = unlimited
+    high: int = 500
+    normal: int = 300
+    low: int = 200
+    global_limit: int = 1000
+
+
+@dataclass
+class InFlightTracker:
+    """
+    Tracks in-flight tasks by priority with bounded execution.
+
+    Thread-safety: All operations are sync-safe (GIL-protected integers).
+    Called from sync protocol callbacks.
+    """
+    limits: PriorityLimits = field(default_factory=PriorityLimits)
+
+    # Per-priority counters
+    _counts: Dict[MessagePriority, int] = field(default_factory=lambda: {
+        MessagePriority.CRITICAL: 0,
+        MessagePriority.HIGH: 0,
+        MessagePriority.NORMAL: 0,
+        MessagePriority.LOW: 0,
+    })
+
+    # Metrics
+    _acquired_total: Dict[MessagePriority, int] = field(default_factory=lambda: {
+        MessagePriority.CRITICAL: 0,
+        MessagePriority.HIGH: 0,
+        MessagePriority.NORMAL: 0,
+        MessagePriority.LOW: 0,
+    })
+    _shed_total: Dict[MessagePriority, int] = field(default_factory=lambda: {
+        MessagePriority.CRITICAL: 0,
+        MessagePriority.HIGH: 0,
+        MessagePriority.NORMAL: 0,
+        MessagePriority.LOW: 0,
+    })
+
+    def try_acquire(self, priority: MessagePriority) -> bool:
+        """
+        Try to acquire a slot for the given priority.
+
+        Returns True if acquired (execute immediately).
+        Returns False if rejected (apply load shedding).
+
+        CRITICAL priority ALWAYS succeeds.
+        """
+        # CRITICAL never shed
+        if priority == MessagePriority.CRITICAL:
+            self._counts[priority] += 1
+            self._acquired_total[priority] += 1
+            return True
+
+        # Check global limit
+        total = sum(self._counts.values())
+        if total >= self.limits.global_limit:
+            self._shed_total[priority] += 1
+            return False
+
+        # Check per-priority limit
+        limit = self._get_limit(priority)
+        if limit > 0 and self._counts[priority] >= limit:
+            self._shed_total[priority] += 1
+            return False
+
+        self._counts[priority] += 1
+        self._acquired_total[priority] += 1
+        return True
+
+    def release(self, priority: MessagePriority) -> None:
+        """Release a slot for the given priority."""
+        if self._counts[priority] > 0:
+            self._counts[priority] -= 1
+
+    def _get_limit(self, priority: MessagePriority) -> int:
+        """Get limit for priority. 0 means unlimited."""
+        if priority == MessagePriority.CRITICAL:
+            return self.limits.critical  # Usually 0 (unlimited)
+        elif priority == MessagePriority.HIGH:
+            return self.limits.high
+        elif priority == MessagePriority.NORMAL:
+            return self.limits.normal
+        else:  # LOW
+            return self.limits.low
+
+    @property
+    def total_in_flight(self) -> int:
+        """Total tasks currently in flight."""
+        return sum(self._counts.values())
+
+    def get_stats(self) -> dict:
+        """Get current stats for observability."""
+        return {
+            "in_flight": dict(self._counts),
+            "total_in_flight": self.total_in_flight,
+            "acquired_total": dict(self._acquired_total),
+            "shed_total": dict(self._shed_total),
+            "limits": {
+                "critical": self.limits.critical,
+                "high": self.limits.high,
+                "normal": self.limits.normal,
+                "low": self.limits.low,
+                "global": self.limits.global_limit,
+            }
+        }
+```
+
+**Integration with MercurySyncBaseServer**:
+
+```python
+class MercurySyncBaseServer:
+    def __init__(self, ...):
+        # ... existing init ...
+
+        # AD-32: Priority-aware bounded execution
+        self._tcp_tracker = InFlightTracker(
+            limits=PriorityLimits(
+                critical=0,  # Unlimited
+                high=env.PENDING_RESPONSE_HIGH_LIMIT,
+                normal=env.PENDING_RESPONSE_NORMAL_LIMIT,
+                low=env.PENDING_RESPONSE_LOW_LIMIT,
+                global_limit=env.PENDING_RESPONSE_MAX_CONCURRENT,
+            )
+        )
+        self._udp_tracker = InFlightTracker(limits=...)
+
+    def _spawn_tcp_response(
+        self,
+        coro: Coroutine,
+        priority: MessagePriority = MessagePriority.NORMAL
+    ) -> bool:
+        """
+        Spawn a TCP response task with priority-aware bounded execution.
+
+        Returns True if task spawned, False if shed.
+        Called from sync protocol callback.
+        """
+        if not self._tcp_tracker.try_acquire(priority):
+            # Load shedding - log and return
+            self._tcp_shed_count += 1
+            return False
+
+        task = asyncio.ensure_future(coro)
+        task.add_done_callback(
+            lambda t: self._on_tcp_task_done(t, priority)
+        )
+        self._pending_tcp_server_responses.append(task)
+        return True
+
+    def _on_tcp_task_done(
+        self,
+        task: asyncio.Task,
+        priority: MessagePriority
+    ) -> None:
+        """Done callback - release slot and cleanup."""
+        # Retrieve exception to prevent memory leak
+        try:
+            task.exception()
+        except (asyncio.CancelledError, asyncio.InvalidStateError):
+            pass
+        except Exception:
+            pass  # Logged elsewhere
+
+        # Release the priority slot
+        self._tcp_tracker.release(priority)
+```
+
+---
+
+## Part 2: Client-Side RobustMessageQueue for Slow Destinations
+
+**Problem Statement - Head-of-Line Blocking**:
+
+```
+Client sending to multiple destinations:
+
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                    PROBLEM: SINGLE QUEUE FOR ALL DESTINATIONS                    │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                  │
+│  Outgoing Messages:                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────────┐    │
+│  │  [DC-Asia:msg1] [DC-Asia:msg2] [DC-EU:msg1] [DC-US:msg1] [DC-Asia:msg3] │    │
+│  └─────────────────────────────────────────────────────────────────────────┘    │
+│                      ▲                                                          │
+│                      │                                                          │
+│              Asia DC has 300ms latency + packet loss                            │
+│              EU and US are fast (50ms)                                          │
+│                                                                                  │
+│  Result: All messages blocked behind slow Asia connection                       │
+│          Fast destinations starved                                              │
+│                                                                                  │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Solution: Per-Destination RobustMessageQueue**:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│              CLIENT-SIDE: PER-DESTINATION ROBUSTMESSAGEQUEUE                     │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                  │
+│  Outgoing Request Manager:                                                       │
+│                                                                                  │
+│  ┌─────────────────────────────────────────────────────────────────────────┐    │
+│  │                    PER-DESTINATION QUEUES                                │    │
+│  │                                                                          │    │
+│  │  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐       │    │
+│  │  │    DC-Asia       │  │     DC-EU        │  │     DC-US        │       │    │
+│  │  │  RobustQueue     │  │  RobustQueue     │  │  RobustQueue     │       │    │
+│  │  │                  │  │                  │  │                  │       │    │
+│  │  │ [msg1][msg2][m3] │  │ [msg1]           │  │ [msg1]           │       │    │
+│  │  │                  │  │                  │  │                  │       │    │
+│  │  │ State: THROTTLED │  │ State: HEALTHY   │  │ State: HEALTHY   │       │    │
+│  │  │ Consumer: slow   │  │ Consumer: fast   │  │ Consumer: fast   │       │    │
+│  │  └──────────────────┘  └──────────────────┘  └──────────────────┘       │    │
+│  │          │                     │                     │                   │    │
+│  │          ▼                     ▼                     ▼                   │    │
+│  │  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐       │    │
+│  │  │ Consumer Loop    │  │ Consumer Loop    │  │ Consumer Loop    │       │    │
+│  │  │ (per destination)│  │ (per destination)│  │ (per destination)│       │    │
+│  │  │                  │  │                  │  │                  │       │    │
+│  │  │ await send()     │  │ await send()     │  │ await send()     │       │    │
+│  │  │ (blocking on     │  │ (fast)           │  │ (fast)           │       │    │
+│  │  │  slow network)   │  │                  │  │                  │       │    │
+│  │  └──────────────────┘  └──────────────────┘  └──────────────────┘       │    │
+│  │                                                                          │    │
+│  └─────────────────────────────────────────────────────────────────────────┘    │
+│                                                                                  │
+│  Benefits:                                                                       │
+│  1. Slow DC doesn't block fast DCs                                              │
+│  2. Per-destination backpressure (THROTTLE → BATCH → OVERFLOW)                  │
+│  3. Overflow ring buffer preserves newest messages on burst                      │
+│  4. Metrics per destination for observability                                   │
+│                                                                                  │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**State Diagram - Per-Destination Queue States**:
+
+```
+                            ┌─────────────────────────────────────────┐
+                            │        ROBUSTMESSAGEQUEUE STATES        │
+                            └─────────────────────────────────────────┘
+                                            │
+        ┌───────────────────────────────────┼───────────────────────────────────────┐
+        │                                   │                                       │
+        ▼                                   ▼                                       ▼
+┌───────────────┐                  ┌───────────────┐                       ┌───────────────┐
+│   HEALTHY     │ fill < 70%       │  THROTTLED    │ 70% ≤ fill < 85%     │   BATCHING    │
+│               │ ─────────────────│               │ ─────────────────────│               │
+│ • No delay    │                  │ • 50ms delay  │                       │ • 200ms delay │
+│ • Full speed  │                  │ • Slow down   │                       │ • Batch only  │
+└───────────────┘                  └───────────────┘                       └───────────────┘
+        ▲                                   │                                       │
+        │                                   │                                       │
+        │  fill < 70%                       │ 85% ≤ fill < 95%                      │
+        └───────────────────────────────────┼───────────────────────────────────────┘
+                                            │
+                                            ▼
+                                   ┌───────────────┐
+                                   │   OVERFLOW    │ fill ≥ 95% or primary full
+                                   │               │
+                                   │ • 100ms delay │
+                                   │ • Using ring  │
+                                   │ • Drop oldest │
+                                   └───────────────┘
+                                            │
+                                            │ overflow also full
+                                            ▼
+                                   ┌───────────────┐
+                                   │   SATURATED   │
+                                   │               │
+                                   │ • 500ms delay │
+                                   │ • Reject new  │
+                                   │ • Critical    │
+                                   └───────────────┘
+```
+
+**OutgoingRequestManager Implementation**:
+
+```python
+from hyperscale.distributed_rewrite.reliability import (
+    RobustMessageQueue,
+    RobustQueueConfig,
+    QueueState,
+)
+from dataclasses import dataclass, field
+from typing import Dict, Tuple, Any, Callable, Awaitable
+import asyncio
+
+
+@dataclass(slots=True)
+class OutgoingRequest:
+    """Represents an outgoing request to a destination."""
+    destination: Tuple[str, int]
+    data: bytes
+    priority: MessagePriority = MessagePriority.NORMAL
+    created_at: float = field(default_factory=time.monotonic)
+
+
+class OutgoingRequestManager:
+    """
+    Manages outgoing requests with per-destination queuing.
+
+    Uses RobustMessageQueue per destination to:
+    1. Isolate slow destinations from fast ones
+    2. Provide graduated backpressure per destination
+    3. Preserve newest messages during overload
+
+    Usage:
+        manager = OutgoingRequestManager(send_func=self._send_to_destination)
+
+        # Enqueue a request
+        result = manager.enqueue(destination, data, priority)
+        if result.backpressure.level != BackpressureLevel.NONE:
+            # Sender should slow down for this destination
+            pass
+    """
+
+    def __init__(
+        self,
+        send_func: Callable[[Tuple[str, int], bytes], Awaitable[None]],
+        config: RobustQueueConfig | None = None,
+        max_destinations: int = 1000,
+    ):
+        self._send_func = send_func
+        self._config = config or RobustQueueConfig(
+            maxsize=500,
+            overflow_size=100,
+            throttle_threshold=0.70,
+            batch_threshold=0.85,
+            reject_threshold=0.95,
+        )
+        self._max_destinations = max_destinations
+
+        # Per-destination queues and consumers
+        self._queues: Dict[Tuple[str, int], RobustMessageQueue[OutgoingRequest]] = {}
+        self._consumers: Dict[Tuple[str, int], asyncio.Task] = {}
+        self._running = False
+
+        # LRU eviction for destinations
+        self._destination_access_order: list[Tuple[str, int]] = []
+
+    def enqueue(
+        self,
+        destination: Tuple[str, int],
+        data: bytes,
+        priority: MessagePriority = MessagePriority.NORMAL
+    ) -> QueuePutResult:
+        """
+        Enqueue a request to a destination.
+
+        Returns QueuePutResult with backpressure information.
+        Caller can use result.backpressure to decide whether to slow down.
+        """
+        queue = self._get_or_create_queue(destination)
+
+        request = OutgoingRequest(
+            destination=destination,
+            data=data,
+            priority=priority,
+        )
+
+        return queue.put_nowait(request)
+
+    def _get_or_create_queue(
+        self,
+        destination: Tuple[str, int]
+    ) -> RobustMessageQueue[OutgoingRequest]:
+        """Get or create queue for destination, with LRU eviction."""
+        if destination in self._queues:
+            # Update LRU order
+            if destination in self._destination_access_order:
+                self._destination_access_order.remove(destination)
+            self._destination_access_order.append(destination)
+            return self._queues[destination]
+
+        # Evict LRU if at capacity
+        while len(self._queues) >= self._max_destinations:
+            oldest = self._destination_access_order.pop(0)
+            self._evict_destination(oldest)
+
+        # Create new queue and consumer
+        queue = RobustMessageQueue[OutgoingRequest](self._config)
+        self._queues[destination] = queue
+        self._destination_access_order.append(destination)
+
+        # Start consumer for this destination
+        if self._running:
+            self._consumers[destination] = asyncio.create_task(
+                self._consume_destination(destination)
+            )
+
+        return queue
+
+    async def _consume_destination(self, destination: Tuple[str, int]) -> None:
+        """Consumer loop for a single destination."""
+        queue = self._queues.get(destination)
+        if not queue:
+            return
+
+        while self._running and destination in self._queues:
+            try:
+                request = await queue.get()
+                await self._send_func(request.destination, request.data)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                # Log and continue - don't let one failure stop the consumer
+                pass
+
+    async def start(self) -> None:
+        """Start all consumer loops."""
+        self._running = True
+        for destination in list(self._queues.keys()):
+            if destination not in self._consumers:
+                self._consumers[destination] = asyncio.create_task(
+                    self._consume_destination(destination)
+                )
+
+    async def stop(self) -> None:
+        """Stop all consumer loops gracefully."""
+        self._running = False
+        for task in self._consumers.values():
+            task.cancel()
+        await asyncio.gather(*self._consumers.values(), return_exceptions=True)
+        self._consumers.clear()
+
+    def _evict_destination(self, destination: Tuple[str, int]) -> None:
+        """Evict a destination (LRU cleanup)."""
+        if destination in self._consumers:
+            self._consumers[destination].cancel()
+            del self._consumers[destination]
+        if destination in self._queues:
+            del self._queues[destination]
+
+    def get_destination_stats(self, destination: Tuple[str, int]) -> dict | None:
+        """Get stats for a specific destination."""
+        queue = self._queues.get(destination)
+        if queue:
+            return queue.get_metrics()
+        return None
+
+    def get_all_stats(self) -> dict:
+        """Get stats for all destinations."""
+        return {
+            "destination_count": len(self._queues),
+            "destinations": {
+                f"{host}:{port}": queue.get_metrics()
+                for (host, port), queue in self._queues.items()
+            }
+        }
+```
+
+---
+
+## Part 3: Applicability Matrix
+
+| Component | Server-Side (Incoming) | Client-Side (Outgoing) | Notes |
+|-----------|------------------------|------------------------|-------|
+| **MercurySyncBaseServer** | ✅ InFlightTracker | ✅ OutgoingRequestManager | Both patterns apply |
+| **UDPProtocol (jobs)** | ✅ InFlightTracker | ✅ OutgoingRequestManager | Same pattern for job protocol |
+| **HealthAwareServer** | ✅ Inherits | ✅ Inherits | Extends MercurySyncBaseServer |
+| **RemoteGraphController** | ✅ Inherits | ✅ Inherits | Extends UDPProtocol |
+| **Gate** | ✅ Via inheritance | ✅ For DC communication | Cross-DC coordination |
+| **Manager** | ✅ Via inheritance | ✅ For worker communication | Stats from workers |
+| **Worker** | ✅ Via inheritance | ✅ For manager communication | Lower priority limits |
+| **WorkflowRunner** | ❌ | ❌ | Already has `_max_pending_workflows` |
+| **RemoteGraphManager** | ❌ | ❌ | Different pattern (workflow queuing) |
+
+---
+
+## Part 4: Configuration
+
+**Environment Variables (env.py)**:
+
+```python
+# AD-32: Priority-Aware Bounded Execution Settings
+PENDING_RESPONSE_MAX_CONCURRENT: StrictInt = 1000      # Global limit
+PENDING_RESPONSE_HIGH_LIMIT: StrictInt = 500           # HIGH priority limit
+PENDING_RESPONSE_NORMAL_LIMIT: StrictInt = 300         # NORMAL priority limit
+PENDING_RESPONSE_LOW_LIMIT: StrictInt = 200            # LOW priority limit (shed first)
+PENDING_RESPONSE_WARN_THRESHOLD: StrictFloat = 0.8     # Log warning at 80%
+
+# AD-32: Client-Side Queue Settings
+OUTGOING_QUEUE_SIZE: StrictInt = 500                   # Per-destination queue size
+OUTGOING_OVERFLOW_SIZE: StrictInt = 100                # Overflow ring buffer size
+OUTGOING_MAX_DESTINATIONS: StrictInt = 1000            # Max tracked destinations
+```
+
+**Per-Node Type Recommendations**:
+
+| Node Type | GLOBAL | HIGH | NORMAL | LOW | QUEUE_SIZE | Rationale |
+|-----------|--------|------|--------|-----|------------|-----------|
+| Gate | 2000 | 1000 | 600 | 400 | 1000 | Cross-DC coordination, high volume |
+| Manager | 5000 | 2500 | 1500 | 1000 | 500 | Highest load from worker stats |
+| Worker | 500 | 250 | 150 | 100 | 250 | Lower limit, focus on execution |
+
+---
+
+## Part 5: Observability
+
+**Logging Models**:
+
+```python
+@dataclass
+class PriorityLoadStats(ServerInfo):
+    """Tracks priority-aware load shedding stats."""
+    # Per-priority in-flight counts
+    critical_in_flight: int
+    high_in_flight: int
+    normal_in_flight: int
+    low_in_flight: int
+    total_in_flight: int
+
+    # Per-priority acquired totals
+    critical_acquired: int
+    high_acquired: int
+    normal_acquired: int
+    low_acquired: int
+
+    # Per-priority shed totals
+    critical_shed: int  # Should always be 0!
+    high_shed: int
+    normal_shed: int
+    low_shed: int
+
+    # Limits
+    global_limit: int
+    high_limit: int
+    normal_limit: int
+    low_limit: int
+
+
+@dataclass
+class DestinationQueueStats(ServerInfo):
+    """Tracks per-destination queue stats."""
+    destination_host: str
+    destination_port: int
+    primary_size: int
+    overflow_size: int
+    state: str  # HEALTHY, THROTTLED, BATCHING, OVERFLOW, SATURATED
+    total_enqueued: int
+    total_dropped: int
+    backpressure_level: str
+```
+
+**Alert Conditions**:
+
+```python
+# Critical: CRITICAL priority messages being shed (should never happen)
+if priority_stats.critical_shed > 0:
+    log.error("CRITICAL: SWIM messages being shed - cluster stability at risk!")
+
+# Warning: HIGH priority at limit
+if priority_stats.high_in_flight >= high_limit * 0.9:
+    log.warn(f"HIGH priority at {pct}% - job dispatch may be delayed")
+
+# Info: Destination in overflow
+if destination_stats.state in ("OVERFLOW", "SATURATED"):
+    log.warn(f"Destination {host}:{port} in {state} - slow connection")
+```
+
+---
+
+## Part 6: Testing Strategy
+
+**Server-Side (InFlightTracker)**:
+
+1. **Unit test**: CRITICAL always acquired regardless of load
+2. **Unit test**: LOW shed before NORMAL before HIGH
+3. **Unit test**: Per-priority limits enforced independently
+4. **Unit test**: Release correctly decrements counters
+5. **Integration test**: Manager under 10K updates/second sheds LOW, keeps CRITICAL
+6. **Chaos test**: SWIM probes never dropped even at 100% saturation
+
+**Client-Side (OutgoingRequestManager)**:
+
+1. **Unit test**: Per-destination queue isolation
+2. **Unit test**: LRU eviction when max destinations reached
+3. **Unit test**: Backpressure signals propagate correctly
+4. **Integration test**: Slow destination doesn't block fast destinations
+5. **Integration test**: Overflow preserves newest messages
+6. **Load test**: Memory bounded under sustained cross-DC traffic
+
+---
+
+## Part 7: Files Modified
+
+| File | Change |
+|------|--------|
+| `hyperscale/distributed_rewrite/server/server/mercury_sync_base_server.py` | Add InFlightTracker, _spawn_tcp_response, _spawn_udp_response |
+| `hyperscale/core/jobs/protocols/udp_protocol.py` | Add InFlightTracker for UDPProtocol._pending_responses |
+| `hyperscale/distributed_rewrite/env/env.py` | Add priority limit and queue configuration |
+| `hyperscale/distributed_rewrite/server/protocol/in_flight_tracker.py` | NEW: InFlightTracker, MessagePriority, PriorityLimits |
+| `hyperscale/distributed_rewrite/server/protocol/outgoing_request_manager.py` | NEW: OutgoingRequestManager using RobustMessageQueue |
+| `hyperscale/logging/hyperscale_logging_models.py` | Add PriorityLoadStats, DestinationQueueStats |
+
+---
+
 ## Architecture
 
 ### Node Types

@@ -186,6 +186,7 @@ class SilentDropStats(Entry, kw_only=True):
     decompression_too_large_count: int
     decryption_failed_count: int
     malformed_message_count: int
+    load_shed_count: int = 0  # AD-32: Messages dropped due to priority-based load shedding
     total_dropped: int
     interval_seconds: float
     level: LogLevel = LogLevel.WARN
