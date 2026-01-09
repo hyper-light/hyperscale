@@ -113,6 +113,8 @@ from hyperscale.distributed_rewrite.models import (
     JobLeaderGateTransferAck,
     JobLeaderManagerTransfer,
     JobLeaderManagerTransferAck,
+    JobLeaderWorkerTransfer,
+    JobLeaderWorkerTransferAck,
     ManagerToWorkerRegistration,
     ManagerToWorkerRegistrationAck,
     PingRequest,
@@ -1157,6 +1159,9 @@ class ManagerServer(HealthAwareServer):
             # AD-31: Notify origin gate of job leadership transfer
             await self._notify_gate_of_leadership_transfer(job_id, old_leader)
 
+            # AD-31: Notify workers with active workflows of job leadership transfer
+            await self._notify_workers_of_leadership_transfer(job_id, old_leader)
+
     async def _notify_gate_of_leadership_transfer(
         self,
         job_id: str,
@@ -1243,6 +1248,107 @@ class ManagerServer(HealthAwareServer):
                     node_id=self._node_id.short,
                 )
             )
+
+    async def _notify_workers_of_leadership_transfer(
+        self,
+        job_id: str,
+        old_manager_id: str | None,
+    ) -> None:
+        """
+        Notify workers with active workflows that job leadership has transferred.
+
+        Part of AD-31: When a manager takes over job leadership from a failed manager,
+        workers need to update their _workflow_job_leader mapping so progress
+        updates route to the new leader.
+
+        Args:
+            job_id: The job whose leadership transferred
+            old_manager_id: Node ID of the previous leader (if known)
+        """
+        # Get the job to find workers with active sub-workflows
+        job = self._job_manager.get_job_by_id(job_id)
+        if not job:
+            return
+
+        # Build mapping: worker_id -> list of workflow_ids
+        worker_workflows: dict[str, list[str]] = {}
+
+        for sub_wf_token_str, sub_wf in job.sub_workflows.items():
+            # Skip completed workflows (no need to update routing)
+            if sub_wf.result is not None:
+                continue
+
+            worker_id = sub_wf.worker_id
+            if worker_id:
+                if worker_id not in worker_workflows:
+                    worker_workflows[worker_id] = []
+                # Use the full sub-workflow token as the workflow_id
+                worker_workflows[worker_id].append(sub_wf_token_str)
+
+        if not worker_workflows:
+            return
+
+        fence_token = self._job_fencing_tokens.get(job_id, 0)
+        new_manager_addr = (self._host, self._tcp_port)
+
+        self._task_runner.run(
+            self._udp_logger.log,
+            ServerInfo(
+                message=f"Notifying {len(worker_workflows)} worker(s) of job {job_id[:8]}... leadership transfer",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+
+        # Send notification to each worker with active workflows
+        for worker_id, workflow_ids in worker_workflows.items():
+            worker_reg = self._workers.get(worker_id)
+            if not worker_reg:
+                continue
+
+            worker_addr = (worker_reg.node.host, worker_reg.node.port)
+
+            transfer_msg = JobLeaderWorkerTransfer(
+                job_id=job_id,
+                workflow_ids=workflow_ids,
+                new_manager_id=self._node_id.full,
+                new_manager_addr=new_manager_addr,
+                fence_token=fence_token,
+                old_manager_id=old_manager_id,
+            )
+
+            try:
+                response, _ = await self.send_tcp(
+                    worker_addr,
+                    action='job_leader_worker_transfer',
+                    data=transfer_msg.dump(),
+                    timeout=2.0,
+                )
+
+                if response and isinstance(response, bytes) and response != b'error':
+                    ack = JobLeaderWorkerTransferAck.load(response)
+                    if ack.accepted and ack.workflows_updated > 0:
+                        self._task_runner.run(
+                            self._udp_logger.log,
+                            ServerDebug(
+                                message=f"Worker {worker_id[:8]}... updated {ack.workflows_updated} workflow(s) for job {job_id[:8]}...",
+                                node_host=self._host,
+                                node_port=self._tcp_port,
+                                node_id=self._node_id.short,
+                            )
+                        )
+
+            except Exception as error:
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerWarning(
+                        message=f"Failed to notify worker {worker_id[:8]}... of job {job_id[:8]}... leadership transfer: {error}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
 
     async def _sync_state_from_workers(self) -> None:
         """

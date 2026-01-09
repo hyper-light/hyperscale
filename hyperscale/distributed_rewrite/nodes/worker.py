@@ -77,6 +77,9 @@ from hyperscale.distributed_rewrite.models import (
     # AD-20: Cancellation Propagation
     WorkflowCancelRequest,
     WorkflowCancelResponse,
+    # AD-31: Job leadership transfer notifications
+    JobLeaderWorkerTransfer,
+    JobLeaderWorkerTransferAck,
     restricted_loads,
 )
 from hyperscale.distributed_rewrite.env import Env
@@ -2735,9 +2738,71 @@ class WorkerServer(HealthAwareServer):
             return b''
     
     # =========================================================================
+    # TCP Handlers - Job Leadership Transfer (AD-31)
+    # =========================================================================
+
+    @tcp.receive()
+    async def job_leader_worker_transfer(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ) -> bytes:
+        """
+        Handle job leadership transfer notification from manager (AD-31).
+
+        When a manager takes over job leadership from a failed manager,
+        it notifies workers with active workflows so they update their
+        _workflow_job_leader mapping to route progress to the new manager.
+        """
+        try:
+            transfer = JobLeaderWorkerTransfer.load(data)
+
+            workflows_updated = 0
+
+            # Update routing for each workflow mentioned in the transfer
+            for workflow_id in transfer.workflow_ids:
+                # Check if we have this workflow active
+                if workflow_id in self._active_workflows:
+                    current_leader = self._workflow_job_leader.get(workflow_id)
+                    new_leader = transfer.new_manager_addr
+
+                    if current_leader != new_leader:
+                        self._workflow_job_leader[workflow_id] = new_leader
+                        workflows_updated += 1
+
+            if workflows_updated > 0:
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerInfo(
+                        message=f"Job {transfer.job_id[:8]}... leadership transfer: "
+                                f"updated {workflows_updated} workflow(s) to route to {transfer.new_manager_addr}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+
+            return JobLeaderWorkerTransferAck(
+                job_id=transfer.job_id,
+                worker_id=self._node_id.full,
+                workflows_updated=workflows_updated,
+                accepted=True,
+            ).dump()
+
+        except Exception as error:
+            await self.handle_exception(error, "job_leader_worker_transfer")
+            return JobLeaderWorkerTransferAck(
+                job_id="unknown",
+                worker_id=self._node_id.full,
+                workflows_updated=0,
+                accepted=False,
+            ).dump()
+
+    # =========================================================================
     # TCP Handlers - Cancellation
     # =========================================================================
-    
+
     @tcp.receive()
     async def cancel_job(
         self,

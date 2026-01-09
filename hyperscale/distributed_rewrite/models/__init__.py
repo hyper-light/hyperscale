@@ -80,6 +80,9 @@ from .distributed import (
     # Job leader manager transfer (AD-31: manager failure notification to gate)
     JobLeaderManagerTransfer as JobLeaderManagerTransfer,
     JobLeaderManagerTransferAck as JobLeaderManagerTransferAck,
+    # Job leader worker transfer (AD-31: manager failure notification to workers)
+    JobLeaderWorkerTransfer as JobLeaderWorkerTransfer,
+    JobLeaderWorkerTransferAck as JobLeaderWorkerTransferAck,
     # Client push notifications
     JobStatusPush as JobStatusPush,
     DCStats as DCStats,
