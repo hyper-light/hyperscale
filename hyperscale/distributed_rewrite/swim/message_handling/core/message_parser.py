@@ -4,20 +4,14 @@ Message parser for SWIM protocol.
 Extracts piggyback data, parses message format, and builds MessageContext.
 """
 
-import base64
-from dataclasses import dataclass
+from base64 import b64decode
+from typing import Callable
 
-from .base import MessageContext
-
-
-@dataclass(slots=True)
-class ParseResult:
-    """Result of parsing a raw UDP message."""
-    context: MessageContext
-
-    # Extracted piggyback data (to be processed separately)
-    health_piggyback: bytes | None = None
-    membership_piggyback: bytes | None = None
+from hyperscale.distributed_rewrite.swim.message_handling.models import (
+    MessageContext,
+    ParseResult,
+    ServerInterface,
+)
 
 
 class MessageParser:
@@ -34,21 +28,27 @@ class MessageParser:
     All piggyback uses consistent #|x pattern for unambiguous parsing.
     """
 
-    # Piggyback separators - all use consistent #|x pattern
-    STATE_SEPARATOR = b'#|s'       # State piggyback
-    MEMBERSHIP_SEPARATOR = b'#|m'  # Membership piggyback
-    HEALTH_SEPARATOR = b'#|h'      # Health piggyback
+    STATE_SEPARATOR = b"#|s"
+    MEMBERSHIP_SEPARATOR = b"#|m"
+    HEALTH_SEPARATOR = b"#|h"
+
+    CROSS_CLUSTER_PREFIXES = (b"xprobe", b"xack", b"xnack")
 
     def __init__(
         self,
-        process_embedded_state_callback,
+        server: ServerInterface,
+        process_embedded_state: Callable[[bytes, tuple[str, int]], None] | None = None,
     ) -> None:
         """
+        Initialize parser.
+
         Args:
-            process_embedded_state_callback: Function to call when embedded
-                state is extracted. Signature: (state_data: bytes, source: tuple) -> None
+            server: Server interface for state processing.
+            process_embedded_state: Callback for embedded state.
+                If None, uses server's default processing.
         """
-        self._process_embedded_state = process_embedded_state_callback
+        self._server = server
+        self._process_embedded_state = process_embedded_state
 
     def parse(
         self,
@@ -83,7 +83,7 @@ class MessageParser:
             data = data[:piggyback_idx]
 
         # Parse message structure: msg_type>target_addr
-        parsed = data.split(b'>', maxsplit=1)
+        parsed = data.split(b">", maxsplit=1)
         message = data
         target: tuple[str, int] | None = None
         target_addr_bytes: bytes | None = None
@@ -93,9 +93,9 @@ class MessageParser:
 
             # Handle cross-cluster messages specially
             # These have binary data after > that shouldn't be parsed as host:port
-            if msg_prefix in (b'xprobe', b'xack', b'xnack'):
+            if msg_prefix in self.CROSS_CLUSTER_PREFIXES:
                 message = msg_prefix
-                target_addr_bytes = parsed[1]  # Keep as raw bytes
+                target_addr_bytes = parsed[1]
                 target = source_addr  # Use source for response routing
             else:
                 message = parsed[0]
@@ -109,22 +109,14 @@ class MessageParser:
                     )
                     target_addr_bytes = addr_part
 
-                    # Process embedded state
-                    try:
-                        state_data = base64.b64decode(state_part)
-                        self._process_embedded_state(state_data, source_addr)
-                    except Exception:
-                        pass  # Invalid state, ignore
+                    # Process embedded state from sender
+                    self._decode_and_process_state(state_part, source_addr)
 
                 # Parse target address
-                try:
-                    host, port = target_addr_bytes.decode().split(':', maxsplit=1)
-                    target = (host, int(port))
-                except (ValueError, UnicodeDecodeError):
-                    target = None
+                target = self._parse_target_address(target_addr_bytes)
 
         # Extract message type (before first colon)
-        msg_type = message.split(b':', maxsplit=1)[0]
+        msg_type = message.split(b":", maxsplit=1)[0]
 
         context = MessageContext(
             source_addr=source_addr,
@@ -140,3 +132,41 @@ class MessageParser:
             health_piggyback=health_piggyback,
             membership_piggyback=membership_piggyback,
         )
+
+    def _decode_and_process_state(
+        self, state_part: bytes, source_addr: tuple[str, int]
+    ) -> None:
+        """
+        Decode and process embedded state.
+
+        Args:
+            state_part: Base64-encoded state data.
+            source_addr: Source address for context.
+        """
+        if self._process_embedded_state is None:
+            return
+
+        try:
+            state_data = b64decode(state_part)
+            self._process_embedded_state(state_data, source_addr)
+        except Exception:
+            pass  # Invalid state, ignore
+
+    def _parse_target_address(
+        self, target_addr_bytes: bytes
+    ) -> tuple[str, int] | None:
+        """
+        Parse target address from bytes.
+
+        Args:
+            target_addr_bytes: Address bytes (e.g., b'127.0.0.1:9000').
+
+        Returns:
+            Parsed address tuple or None if invalid.
+        """
+        try:
+            addr_str = target_addr_bytes.decode()
+            host, port_str = addr_str.split(":", maxsplit=1)
+            return (host, int(port_str))
+        except (ValueError, UnicodeDecodeError):
+            return None
