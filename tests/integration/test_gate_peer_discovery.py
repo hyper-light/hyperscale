@@ -725,23 +725,23 @@ async def run_all_tests():
     print("  6. Peer selection works correctly")
     print(f"\nCluster sizes to test: {cluster_sizes}")
 
-    # # Basic discovery tests
-    # for size in cluster_sizes:
-    #     result = await scenario_gate_peer_discovery_cluster_size(size)
-    #     results[f"discovery_{size}_gates"] = result
-    #     await asyncio.sleep(2)  # Allow port cleanup between tests
+    # Basic discovery tests
+    for size in cluster_sizes:
+        result = await scenario_gate_peer_discovery_cluster_size(size)
+        results[f"discovery_{size}_gates"] = result
+        await asyncio.sleep(2)  # Allow port cleanup between tests
 
-    # # Message validation tests
-    # for size in [3]:
-    #     result = await scenario_gate_heartbeat_message_validation(size)
-    #     results[f"heartbeat_validation_{size}_gates"] = result
-    #     await asyncio.sleep(2)
+    # Message validation tests
+    for size in [3]:
+        result = await scenario_gate_heartbeat_message_validation(size)
+        results[f"heartbeat_validation_{size}_gates"] = result
+        await asyncio.sleep(2)
 
-    # # Peer selection tests
-    # for size in [3]:
-    #     result = await scenario_gate_discovery_peer_selection(size)
-    #     results[f"peer_selection_{size}_gates"] = result
-    #     await asyncio.sleep(2)
+    # Peer selection tests
+    for size in [3]:
+        result = await scenario_gate_discovery_peer_selection(size)
+        results[f"peer_selection_{size}_gates"] = result
+        await asyncio.sleep(2)
 
     # Failure/recovery tests (only for 3 and 5 gates to save time)
     for size in [3, 5]:

@@ -318,3 +318,40 @@ class ServerInterface(Protocol):
     ) -> tuple[list[Any], list[Exception]]:
         """Gather coroutines with error collection."""
         ...
+
+    # === Cross-Cluster Operations ===
+
+    async def build_xprobe_response(
+        self,
+        source_addr: tuple[str, int],
+        probe_data: bytes,
+    ) -> bytes | None:
+        """
+        Build response to cross-cluster probe.
+
+        Subclasses (ManagerServer, GateServer) override for specific behavior.
+
+        Args:
+            source_addr: Address that sent the probe.
+            probe_data: Pickled CrossClusterProbe data.
+
+        Returns:
+            Pickled CrossClusterAck or None to send xnack.
+        """
+        ...
+
+    async def handle_xack_response(
+        self,
+        source_addr: tuple[str, int],
+        ack_data: bytes,
+    ) -> None:
+        """
+        Handle cross-cluster acknowledgment.
+
+        Subclasses (ManagerServer, GateServer) override for specific behavior.
+
+        Args:
+            source_addr: Address that sent the ack.
+            ack_data: Pickled CrossClusterAck data.
+        """
+        ...

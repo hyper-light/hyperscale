@@ -55,4 +55,4 @@ This document contains critical information about working with this codebase. Fo
     - Use f-strings for formatting
 
 - After any fix or implementation of a todo, we generate a fresh commit. Do NOT run the tests. A user will run them and confirm.
-
+- Always commit everything - i.e. `git add -A && git commit -m "<MESSAGE_HERE>"

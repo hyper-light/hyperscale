@@ -334,3 +334,31 @@ class ServerAdapter:
         return await self._server._gather_with_errors(
             coros, operation=operation, timeout=timeout
         )
+
+    # === Cross-Cluster Operations ===
+
+    async def build_xprobe_response(
+        self,
+        source_addr: tuple[str, int],
+        probe_data: bytes,
+    ) -> bytes | None:
+        """
+        Build response to cross-cluster probe.
+
+        Delegates to server's _build_xprobe_response which is overridden
+        in subclasses (ManagerServer, GateServer) for specific behavior.
+        """
+        return await self._server._build_xprobe_response(source_addr, probe_data)
+
+    async def handle_xack_response(
+        self,
+        source_addr: tuple[str, int],
+        ack_data: bytes,
+    ) -> None:
+        """
+        Handle cross-cluster acknowledgment.
+
+        Delegates to server's _handle_xack_response which is overridden
+        in subclasses (ManagerServer, GateServer) for specific behavior.
+        """
+        await self._server._handle_xack_response(source_addr, ack_data)

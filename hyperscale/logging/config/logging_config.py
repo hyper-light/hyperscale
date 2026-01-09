@@ -53,11 +53,19 @@ class LoggingConfig:
             )
 
     def enabled(self, logger_name: str, log_level: LogLevel) -> bool:
+        """Check if logging is enabled for a specific logger and level."""
+        # Check global disable first
+        if _global_logging_disabled.get():
+            return False
+
+        # Check per-logger disable
         disabled_loggers = self._disabled_loggers.get()
+        if logger_name in disabled_loggers:
+            return False
+
+        # Check log level
         current_log_level = self._log_level.get()
-        return logger_name not in disabled_loggers and (
-            self._level_map[log_level] >= self._level_map[current_log_level]
-        )
+        return self._level_map[log_level] >= self._level_map[current_log_level]
     
     def disable(self, logger_name: str | None = None):
         """Disable a specific logger by name, or disable all logging if no name provided."""

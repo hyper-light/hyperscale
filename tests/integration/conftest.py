@@ -22,7 +22,7 @@ def pytest_configure(config):
 @pytest.fixture(scope="session")
 def event_loop_policy():
     """Use the default event loop policy."""
-    return asyncio.DefaultEventLoopPolicy()
+    return asyncio.get_event_loop_policy()
 
 
 @pytest.fixture(scope="function")

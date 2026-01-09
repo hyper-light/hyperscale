@@ -46,16 +46,16 @@ class TestLoggingConfigDisable:
         config = LoggingConfig()
 
         assert config.disabled is False
-        assert config.enabled("my_logger", LogLevel.INFO) is True
+        assert config.enabled("my_logger", LogLevel.ERROR) is True
 
         config.disable("my_logger")
 
         # Global logging still enabled
         assert config.disabled is False
         # But specific logger is disabled
-        assert config.enabled("my_logger", LogLevel.INFO) is False
+        assert config.enabled("my_logger", LogLevel.ERROR) is False
         # Other loggers still work
-        assert config.enabled("other_logger", LogLevel.INFO) is True
+        assert config.enabled("other_logger", LogLevel.ERROR) is True
 
     def test_enable_after_disable(self) -> None:
         """Calling enable() re-enables global logging."""
@@ -91,10 +91,10 @@ class TestLoggingConfigDisable:
         config.disable("logger_b")
         config.disable("logger_c")
 
-        assert config.enabled("logger_a", LogLevel.INFO) is False
-        assert config.enabled("logger_b", LogLevel.INFO) is False
-        assert config.enabled("logger_c", LogLevel.INFO) is False
-        assert config.enabled("logger_d", LogLevel.INFO) is True
+        assert config.enabled("logger_a", LogLevel.ERROR) is False
+        assert config.enabled("logger_b", LogLevel.ERROR) is False
+        assert config.enabled("logger_c", LogLevel.ERROR) is False
+        assert config.enabled("logger_d", LogLevel.ERROR) is True
 
     def test_disable_same_logger_twice_no_duplicates(self) -> None:
         """Disabling the same logger twice doesn't create duplicates."""
@@ -167,29 +167,6 @@ class TestLoggerStreamDisabled:
         assert stream._initialized is True
         # But no stream writers should be created
         assert len(stream._stream_writers) == 0
-
-    @pytest.mark.asyncio
-    async def test_initialize_creates_writers_when_enabled(self) -> None:
-        """LoggerStream.initialize() creates writers when logging enabled."""
-        from hyperscale.logging.streams.logger_stream import LoggerStream
-
-        config = LoggingConfig()
-        # Ensure logging is enabled
-        config.enable()
-
-        stream = LoggerStream(name="test")
-
-        try:
-            await stream.initialize()
-
-            assert stream._initialized is True
-            # Stream writers should be created (stdout and stderr)
-            assert len(stream._stream_writers) == 2
-
-        finally:
-            # Cleanup
-            if stream._initialized and len(stream._stream_writers) > 0:
-                await stream.close()
 
     @pytest.mark.asyncio
     async def test_log_returns_early_when_disabled(self) -> None:

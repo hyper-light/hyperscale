@@ -28,8 +28,6 @@ import os
 import time
 from dataclasses import dataclass, field
 
-import pytest
-
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
@@ -39,7 +37,7 @@ from hyperscale.distributed_rewrite.env.env import Env
 from hyperscale.distributed_rewrite.models import ManagerHeartbeat, ManagerRegistrationResponse
 from hyperscale.logging.config.logging_config import LoggingConfig
 
-# Disable logging during pytest to avoid pipe transport errors
+# Disable logging to avoid pipe transport errors
 _logging_config = LoggingConfig()
 _logging_config.disable()
 
@@ -132,12 +130,10 @@ def get_dc_manager_udp_addrs(configs: list[dict]) -> list[tuple[str, int]]:
 # Test: Manager-Gate Discovery - Single DC
 # ==========================================================================
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("gate_count,manager_count", [(2, 2), (3, 3), (3, 5)])
-async def test_manager_gate_discovery_single_dc(
+async def scenario_manager_gate_discovery_single_dc(
     gate_count: int,
     manager_count: int,
-) -> None:
+) -> bool:
     """
     Test manager-gate discovery in a single datacenter.
 
@@ -255,8 +251,13 @@ async def test_manager_gate_discovery_single_dc(
         print(f"  Managers registered with gates: {'PASS' if managers_registered_ok else 'FAIL'}")
         print(f"{'=' * 70}")
 
-        assert gates_discovery_ok, "Gates did not discover all managers"
-        assert managers_registered_ok, "Managers did not register with gates"
+        return all_passed
+
+    except Exception as e:
+        import traceback
+        print(f"\nTest failed with exception: {e}")
+        traceback.print_exc()
+        return False
 
     finally:
         print("\nCleaning up...")
@@ -278,13 +279,11 @@ async def test_manager_gate_discovery_single_dc(
 # Test: Manager-Gate Discovery - Multi-DC
 # ==========================================================================
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("gate_count,managers_per_dc,dc_count", [(2, 2, 2), (3, 3, 2), (3, 2, 3)])
-async def test_manager_gate_discovery_multi_dc(
+async def scenario_manager_gate_discovery_multi_dc(
     gate_count: int,
     managers_per_dc: int,
     dc_count: int,
-) -> None:
+) -> bool:
     """
     Test manager-gate discovery across multiple datacenters.
 
@@ -410,7 +409,13 @@ async def test_manager_gate_discovery_multi_dc(
         print(f"  Per-DC discovery: {'PASS' if per_dc_discovery_ok else 'FAIL'}")
         print(f"{'=' * 70}")
 
-        assert per_dc_discovery_ok, "Per-DC discovery failed"
+        return per_dc_discovery_ok
+
+    except Exception as e:
+        import traceback
+        print(f"\nTest failed with exception: {e}")
+        traceback.print_exc()
+        return False
 
     finally:
         print("\nCleaning up...")
@@ -432,12 +437,10 @@ async def test_manager_gate_discovery_multi_dc(
 # Test: Manager-Gate Discovery - Failure and Recovery
 # ==========================================================================
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("gate_count,manager_count", [(2, 3), (3, 3)])
-async def test_manager_gate_discovery_failure_recovery(
+async def scenario_manager_gate_discovery_failure_recovery(
     gate_count: int,
     manager_count: int,
-) -> None:
+) -> bool:
     """
     Test manager-gate discovery handles failure and recovery.
 
@@ -588,9 +591,13 @@ async def test_manager_gate_discovery_failure_recovery(
         print(f"  Recovery detection: {'PASS' if recovery_detected else 'FAIL'}")
         print(f"{'=' * 70}")
 
-        assert initial_discovery_ok, "Initial discovery failed"
-        assert failure_detected, "Failure was not detected"
-        assert recovery_detected, "Recovery was not detected"
+        return all_passed
+
+    except Exception as e:
+        import traceback
+        print(f"\nTest failed with exception: {e}")
+        traceback.print_exc()
+        return False
 
     finally:
         print("\nCleaning up...")
@@ -611,9 +618,7 @@ async def test_manager_gate_discovery_failure_recovery(
 # Test: Manager-Gate Message Validation
 # ==========================================================================
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("gate_count,manager_count", [(2, 3)])
-async def test_manager_gate_message_validation(gate_count: int, manager_count: int) -> None:
+async def scenario_manager_gate_message_validation(gate_count: int, manager_count: int) -> bool:
     """
     Test that manager-gate messages contain correct fields.
 
@@ -760,7 +765,13 @@ async def test_manager_gate_message_validation(gate_count: int, manager_count: i
             print(f"  {key}: {'PASS' if valid else 'FAIL'}")
         print(f"{'=' * 70}")
 
-        assert all_valid, f"Validation failed: {[k for k, v in validation_results.items() if not v]}"
+        return all_valid
+
+    except Exception as e:
+        import traceback
+        print(f"\nTest failed with exception: {e}")
+        traceback.print_exc()
+        return False
 
     finally:
         print("\nCleaning up...")
@@ -781,8 +792,8 @@ async def test_manager_gate_message_validation(gate_count: int, manager_count: i
 # Main Test Runner (for manual execution)
 # ==========================================================================
 
-async def _run_all_tests():
-    """Run all manager-gate discovery tests manually (not for pytest)."""
+async def run_all_tests():
+    """Run all manager-gate discovery tests."""
     results = {}
 
     print("\n" + "=" * 70)
@@ -799,37 +810,29 @@ async def _run_all_tests():
     # Single DC tests
     print("\n--- Single DC Tests ---")
     for gates, managers in [(2, 2), (3, 3), (3, 5)]:
-        try:
-            await test_manager_gate_discovery_single_dc(gates, managers)
-            results[f"single_dc_{gates}g_{managers}m"] = True
-        except AssertionError:
-            results[f"single_dc_{gates}g_{managers}m"] = False
+        result = await scenario_manager_gate_discovery_single_dc(gates, managers)
+        results[f"single_dc_{gates}g_{managers}m"] = result
+        await asyncio.sleep(2)  # Allow port cleanup between tests
 
     # Multi-DC tests
     print("\n--- Multi-DC Tests ---")
     for gates, managers_per_dc, dcs in [(2, 2, 2), (3, 3, 2), (3, 2, 3)]:
-        try:
-            await test_manager_gate_discovery_multi_dc(gates, managers_per_dc, dcs)
-            results[f"multi_dc_{gates}g_{managers_per_dc}m_{dcs}dc"] = True
-        except AssertionError:
-            results[f"multi_dc_{gates}g_{managers_per_dc}m_{dcs}dc"] = False
+        result = await scenario_manager_gate_discovery_multi_dc(gates, managers_per_dc, dcs)
+        results[f"multi_dc_{gates}g_{managers_per_dc}m_{dcs}dc"] = result
+        await asyncio.sleep(2)
 
     # Message validation tests
     print("\n--- Message Validation Tests ---")
-    try:
-        await test_manager_gate_message_validation(2, 3)
-        results["message_validation_2g_3m"] = True
-    except AssertionError:
-        results["message_validation_2g_3m"] = False
+    result = await scenario_manager_gate_message_validation(2, 3)
+    results["message_validation_2g_3m"] = result
+    await asyncio.sleep(2)
 
     # Failure/recovery tests
     print("\n--- Failure/Recovery Tests ---")
     for gates, managers in [(2, 3), (3, 3)]:
-        try:
-            await test_manager_gate_discovery_failure_recovery(gates, managers)
-            results[f"failure_recovery_{gates}g_{managers}m"] = True
-        except AssertionError:
-            results[f"failure_recovery_{gates}g_{managers}m"] = False
+        result = await scenario_manager_gate_discovery_failure_recovery(gates, managers)
+        results[f"failure_recovery_{gates}g_{managers}m"] = result
+        await asyncio.sleep(2)
 
     # Final summary
     print("\n" + "=" * 70)
@@ -850,7 +853,7 @@ async def _run_all_tests():
 
 
 def main():
-    success = asyncio.run(_run_all_tests())
+    success = asyncio.run(run_all_tests())
     sys.exit(0 if success else 1)
 
 
