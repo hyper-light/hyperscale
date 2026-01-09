@@ -66,7 +66,7 @@ from .health.peer_health_awareness import PeerHealthAwareness, PeerHealthAwarene
 # Failure detection
 from .detection.incarnation_tracker import IncarnationTracker, MessageFreshness
 from .detection.suspicion_state import SuspicionState
-from .detection.suspicion_manager import SuspicionManager
+# SuspicionManager replaced by HierarchicalFailureDetector (AD-30)
 from .detection.indirect_probe_manager import IndirectProbeManager
 from .detection.probe_scheduler import ProbeScheduler
 from .detection.hierarchical_failure_detector import (
@@ -143,7 +143,6 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         # Initialize SWIM components
         self._local_health = LocalHealthMultiplier()
         self._incarnation_tracker = IncarnationTracker()
-        self._suspicion_manager = SuspicionManager()
         self._indirect_probe_manager = IndirectProbeManager()
 
         # Direct probe ACK tracking - key is target addr, value is Future set when ACK received
@@ -167,11 +166,15 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             self._peer_health_awareness.on_health_update
         )
 
-        # Hierarchical failure detector for multi-layer detection
+        # Hierarchical failure detector for multi-layer detection (AD-30)
         # - Global layer: Machine-level liveness (via timing wheel)
         # - Job layer: Per-job responsiveness (via adaptive polling)
-        # Subclasses can use this for job-specific failure tracking
-        self._hierarchical_detector: HierarchicalFailureDetector | None = None
+        # Uses polling instead of cancel/reschedule to avoid timer starvation
+        self._hierarchical_detector = HierarchicalFailureDetector(
+            on_global_death=self._on_suspicion_expired,
+            get_n_members=self._get_member_count,
+            get_lhm_multiplier=self._get_lhm_multiplier,
+        )
 
         # Initialize leader election with configurable parameters from Env
         from hyperscale.distributed_rewrite.swim.leadership.leader_state import LeaderState
@@ -255,14 +258,9 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         self._unconfirmed_peer_added_at: dict[tuple[str, int], float] = {}  # For stale detection
         self._peer_confirmation_callbacks: list[Callable[[tuple[str, int]], None]] = []
 
-        # Set up suspicion manager callbacks
-        self._suspicion_manager.set_callbacks(
-            on_expired=self._on_suspicion_expired,
-            get_n_members=self._get_member_count,
-            get_lhm_multiplier=self._get_lhm_multiplier,
-        )
-        # Set node port for debug logging
-        self._suspicion_manager._node_port = self._udp_port
+        # Hierarchical detector callbacks already set in __init__
+        # Debug: track port for logging
+        self._hierarchical_detector._node_port = self._udp_port
     
     @property
     def node_id(self) -> NodeId:
@@ -637,8 +635,8 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
     
     def _setup_task_runner_integration(self) -> None:
         """Integrate TaskRunner with SWIM components."""
-        # Pass task runner to suspicion manager for timer management
-        self._suspicion_manager.set_task_runner(self._task_runner)
+        # Hierarchical detector manages its own tasks via asyncio
+        pass
     
     def _setup_health_monitor(self) -> None:
         """Set up event loop health monitor with LHM integration."""
@@ -1080,9 +1078,9 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         async with ErrorContext(self._error_handler, "incarnation_cleanup"):
             stats['incarnation'] = await self._incarnation_tracker.cleanup()
         
-        # Cleanup suspicion manager (orphaned suspicions)
+        # Cleanup hierarchical detector (reconciliation)
         async with ErrorContext(self._error_handler, "suspicion_cleanup"):
-            stats['suspicion'] = await self._suspicion_manager.cleanup()
+            stats['suspicion'] = await self._hierarchical_detector.get_stats()
         
         # Cleanup indirect probe manager
         async with ErrorContext(self._error_handler, "indirect_probe_cleanup"):
@@ -1108,7 +1106,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         """Get cleanup statistics from all components."""
         return {
             'incarnation': self._incarnation_tracker.get_stats(),
-            'suspicion': self._suspicion_manager.get_stats(),
+            'suspicion': self._hierarchical_detector.get_stats_sync(),
             'indirect_probe': self._indirect_probe_manager.get_stats(),
             'gossip': self._gossip_buffer.get_stats(),
         }
@@ -1664,13 +1662,16 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         # Ensure error handler is set up first
         if self._error_handler is None:
             self._setup_error_handler()
-        
+
         # Integrate task runner with SWIM components
         self._setup_task_runner_integration()
-        
+
+        # Start hierarchical failure detector (AD-30)
+        await self._hierarchical_detector.start()
+
         # Start health monitor for proactive CPU detection
         await self.start_health_monitor()
-        
+
         # Start cleanup task
         await self.start_cleanup()
         
@@ -1995,7 +1996,14 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         except Exception as e:
             if self._error_handler:
                 await self.handle_exception(e, "shutdown_stop_cleanup")
-        
+
+        # Stop hierarchical failure detector (AD-30)
+        try:
+            await self._hierarchical_detector.stop()
+        except Exception as e:
+            if self._error_handler:
+                await self.handle_exception(e, "shutdown_stop_hierarchical_detector")
+
         # 5. Log final audit event
         self._audit_log.record(
             AuditEventType.NODE_LEFT,
@@ -2462,12 +2470,11 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         - Stale indirect probes interfering with new probes
         - Incarnation confusion from old state
         """
-        # Clear any active suspicion
-        if node in self._suspicion_manager.suspicions:
-            await self._suspicion_manager.refute_suspicion(
-                node,
-                self._incarnation_tracker.get_node_incarnation(node) + 1,
-            )
+        # Clear any active suspicion via hierarchical detector
+        await self._hierarchical_detector.refute_global(
+            node,
+            self._incarnation_tracker.get_node_incarnation(node) + 1,
+        )
         
         # Clear any pending indirect probes
         if self._indirect_probe_manager.get_pending_probe(node):
@@ -2577,7 +2584,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             incarnation,
             time.monotonic(),
         )
-        return await self._suspicion_manager.start_suspicion(node, incarnation, from_node)
+        return await self._hierarchical_detector.suspect_global(node, incarnation, from_node)
     
     async def confirm_suspicion(
         self,
@@ -2586,7 +2593,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         from_node: tuple[str, int],
     ) -> bool:
         """Add a confirmation to an existing suspicion."""
-        result = await self._suspicion_manager.confirm_suspicion(node, incarnation, from_node)
+        result = await self._hierarchical_detector.confirm_global(node, incarnation, from_node)
         if result:
             self._metrics.increment('suspicions_confirmed')
         return result
@@ -2597,7 +2604,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         incarnation: int,
     ) -> bool:
         """Refute a suspicion - the node proved it's alive."""
-        if await self._suspicion_manager.refute_suspicion(node, incarnation):
+        if await self._hierarchical_detector.refute_global(node, incarnation):
             self._metrics.increment('suspicions_refuted')
             self._audit_log.record(
                 AuditEventType.NODE_REFUTED,
@@ -2615,12 +2622,11 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
     
     def is_node_suspected(self, node: tuple[str, int]) -> bool:
         """Check if a node is currently under suspicion."""
-        return self._suspicion_manager.is_suspected(node)
-    
+        return self._hierarchical_detector.is_suspected_global(node)
+
     def get_suspicion_timeout(self, node: tuple[str, int]) -> float | None:
         """Get the remaining timeout for a suspicion, if any."""
-        state = self._suspicion_manager.get_suspicion(node)
-        return state.time_remaining() if state else None
+        return self._hierarchical_detector.get_time_remaining_global(node)
     
     def get_random_proxy_nodes(
         self,
@@ -3047,10 +3053,8 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         This hook adds piggybacked gossip data (membership + health) to
         outgoing messages for O(log n) dissemination.
         """
-        print(f"[DEBUG SWIM {self._udp_port}] SEND to {addr}, msg_first_bytes={message[:40] if message else b''}")
         # Add piggyback data (membership + health gossip) to outgoing messages
         message_with_piggyback = self._add_piggyback_safe(message)
-        print(f"[DEBUG SWIM {self._udp_port}] SEND: with_piggyback len={len(message_with_piggyback)}")
 
         return (
             addr,
@@ -3071,9 +3075,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         This hook intercepts responses from UDP sends (e.g., probe responses).
         We extract any embedded state for Serf-style passive discovery.
         """
-        print(f"[DEBUG SWIM {self._udp_port}] PROCESS (response handler) from {addr}, data_len={len(data) if data else 0}, first_bytes={data[:60] if data else b''}")
         if not data:
-            print(f"[DEBUG SWIM {self._udp_port}] PROCESS: empty data, returning")
             return data
 
         # Check if this is an ACK response - need to complete pending probe future
@@ -3119,7 +3121,6 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         data: Message,
         clock_time: int,
     ) -> Message:
-        print(f"[DEBUG SWIM {self._udp_port}] UDP RECEIVE from {addr}, data_len={len(data)}, first_bytes={data[:50] if data else b''}")
         try:
             # Validate message size first - prevent memory issues from oversized messages
             if len(data) > MAX_UDP_PAYLOAD:
@@ -3191,17 +3192,14 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                     # Extract embedded state from address portion (Serf-style)
                     # Format: host:port#|sbase64_state
                     if self._STATE_SEPARATOR in target_addr:
-                        print(f"[DEBUG SWIM {self._udp_port}] FOUND STATE_SEPARATOR in target_addr, parsing state from {addr}")
                         addr_part, state_part = target_addr.split(self._STATE_SEPARATOR, 1)
                         target_addr = addr_part
                         # Process embedded state from sender
                
                         try:
                             state_data = b64decode(state_part)
-                            print(f"[DEBUG SWIM {self._udp_port}] Decoded state, len={len(state_data)}, calling _process_embedded_state")
                             self._process_embedded_state(state_data, addr)
                         except Exception as e:
-                            print(f"[DEBUG SWIM {self._udp_port}] State decode/process FAILED: {e}")
                             pass  # Invalid state, ignore
                     
                     host, port = target_addr.decode().split(':', maxsplit=1)
@@ -3600,9 +3598,9 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                         if self.is_message_fresh(target, msg_incarnation, b'SUSPECT'):
                             await self.start_suspicion(target, msg_incarnation, addr)
 
-                            suspicion = self._suspicion_manager.get_suspicion(target)
-                            if suspicion and suspicion.should_regossip():
-                                suspicion.mark_regossiped()
+                            # Check if we should regossip this suspicion
+                            if self._hierarchical_detector.should_regossip_global(target):
+                                self._hierarchical_detector.mark_regossiped_global(target)
                                 await self.broadcast_suspicion(target, msg_incarnation)
 
                     # Embed state in ack for Serf-style heartbeat propagation

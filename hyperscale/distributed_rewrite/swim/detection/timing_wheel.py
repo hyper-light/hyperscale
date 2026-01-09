@@ -512,3 +512,31 @@ class TimingWheel:
                 adjusted_count += 1
 
             return adjusted_count
+
+    # =========================================================================
+    # Synchronous Accessors (for quick checks without async overhead)
+    # =========================================================================
+
+    def contains_sync(self, node: NodeAddress) -> bool:
+        """Synchronously check if node has an active suspicion."""
+        return node in self._node_locations
+
+    def get_state_sync(self, node: NodeAddress) -> SuspicionState | None:
+        """Synchronously get suspicion state for a node."""
+        location = self._node_locations.get(node)
+        if not location:
+            return None
+
+        wheel_type, bucket_idx, epoch = location
+
+        if wheel_type == "fine":
+            bucket = self._fine_wheel[bucket_idx]
+        else:
+            bucket = self._coarse_wheel[bucket_idx]
+
+        # Direct access to bucket entries
+        for entry in bucket._entries.values():
+            if entry.node == node and entry.epoch == epoch:
+                return entry.state
+
+        return None

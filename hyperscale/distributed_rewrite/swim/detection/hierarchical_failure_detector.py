@@ -609,3 +609,53 @@ class HierarchicalFailureDetector:
     ):
         """Get job suspicion state (for debugging)."""
         return self._job_manager.get_suspicion(job_id, node)
+
+    # =========================================================================
+    # Synchronous Helpers (for SWIM protocol integration)
+    # =========================================================================
+
+    def is_suspected_global(self, node: NodeAddress) -> bool:
+        """
+        Synchronously check if node is suspected at global level.
+
+        Note: This checks the timing wheel directly without async lock.
+        Use for quick checks in SWIM protocol handlers.
+        """
+        if node in self._globally_dead:
+            return True
+        return self._global_wheel.contains_sync(node)
+
+    def get_time_remaining_global(self, node: NodeAddress) -> float | None:
+        """
+        Get remaining timeout for global suspicion.
+
+        Returns None if node is not suspected.
+        """
+        state = self._global_wheel.get_state_sync(node)
+        if state:
+            return state.time_remaining()
+        return None
+
+    def should_regossip_global(self, node: NodeAddress) -> bool:
+        """
+        Check if global suspicion should be re-gossiped.
+
+        Returns False if node is not suspected.
+        """
+        state = self._global_wheel.get_state_sync(node)
+        if state:
+            return state.should_regossip()
+        return False
+
+    def mark_regossiped_global(self, node: NodeAddress) -> None:
+        """Mark global suspicion as having been re-gossiped."""
+        state = self._global_wheel.get_state_sync(node)
+        if state:
+            state.mark_regossiped()
+
+    def get_stats_sync(self) -> dict[str, int | float]:
+        """Synchronous version of get_stats."""
+        return self.get_stats()
+
+    # Debug attribute (set by HealthAwareServer)
+    _node_port: int = 0
