@@ -3268,6 +3268,8 @@ class GateServer(HealthAwareServer):
             is_leader=self.is_leader(),
             term=self._leadership_term,
             state=self._gate_state.value,
+            cluster_id=self.env.CLUSTER_ID,
+            environment_id=self.env.ENVIRONMENT_ID,
             active_jobs=self._job_manager.count_active_jobs(),
             manager_count=sum(len(addrs) for addrs in self._datacenter_managers.values()),
             protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
@@ -4116,6 +4118,48 @@ class GateServer(HealthAwareServer):
             # Store per-datacenter, per-manager using manager's self-reported address
             dc = heartbeat.datacenter
             manager_addr = (heartbeat.tcp_host, heartbeat.tcp_port)
+
+            # Cluster isolation validation (AD-28 Issue 2)
+            # MUST validate FIRST to prevent cross-cluster pollution
+            if heartbeat.cluster_id != self.env.CLUSTER_ID:
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerWarning(
+                        message=f"Manager {heartbeat.node_id} rejected: cluster_id mismatch (manager={heartbeat.cluster_id}, gate={self.env.CLUSTER_ID})",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+                response = ManagerRegistrationResponse(
+                    accepted=False,
+                    gate_id=self._node_id.full,
+                    healthy_gates=[],
+                    error=f"Cluster isolation violation: manager cluster_id '{heartbeat.cluster_id}' does not match gate cluster_id '{self.env.CLUSTER_ID}'",
+                    protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+                    protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+                )
+                return response.dump()
+
+            if heartbeat.environment_id != self.env.ENVIRONMENT_ID:
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerWarning(
+                        message=f"Manager {heartbeat.node_id} rejected: environment_id mismatch (manager={heartbeat.environment_id}, gate={self.env.ENVIRONMENT_ID})",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+                response = ManagerRegistrationResponse(
+                    accepted=False,
+                    gate_id=self._node_id.full,
+                    healthy_gates=[],
+                    error=f"Environment isolation violation: manager environment_id '{heartbeat.environment_id}' does not match gate environment_id '{self.env.ENVIRONMENT_ID}'",
+                    protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+                    protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+                )
+                return response.dump()
 
             # Role-based mTLS validation (AD-28 Issue 1)
             # TODO: Extract certificate from transport when handler signatures are updated

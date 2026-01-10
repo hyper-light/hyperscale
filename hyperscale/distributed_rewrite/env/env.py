@@ -313,6 +313,10 @@ class Env(BaseModel):
     # ==========================================================================
     # Discovery Service Settings (AD-28)
     # ==========================================================================
+    # Cluster and Environment Isolation (AD-28 Issue 2)
+    CLUSTER_ID: StrictStr = "hyperscale"  # Cluster identifier for isolation
+    ENVIRONMENT_ID: StrictStr = "default"  # Environment identifier for isolation
+
     # DNS-based peer discovery
     DISCOVERY_DNS_NAMES: StrictStr = ""  # Comma-separated DNS names for manager discovery
     DISCOVERY_DNS_CACHE_TTL: StrictFloat = 60.0  # DNS cache TTL in seconds
@@ -526,6 +530,9 @@ class Env(BaseModel):
             "STATUS_UPDATE_POLL_INTERVAL": float,
             "CLIENT_PROGRESS_RATE_LIMIT": float,
             "CLIENT_PROGRESS_BURST": int,
+            # Cluster and environment isolation (AD-28 Issue 2)
+            "CLUSTER_ID": str,
+            "ENVIRONMENT_ID": str,
             # Cross-DC correlation settings (Phase 7)
             "CROSS_DC_CORRELATION_WINDOW": float,
             "CROSS_DC_CORRELATION_LOW_THRESHOLD": int,

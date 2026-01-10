@@ -1392,6 +1392,8 @@ class WorkerServer(HealthAwareServer):
             available_cores=self._core_allocator.available_cores,
             memory_mb=self._get_memory_mb(),
             available_memory_mb=self._get_available_memory_mb(),
+            cluster_id=self._env.CLUSTER_ID,
+            environment_id=self._env.ENVIRONMENT_ID,
             protocol_version_major=self._node_capabilities.protocol_version.major,
             protocol_version_minor=self._node_capabilities.protocol_version.minor,
             capabilities=capabilities_str,

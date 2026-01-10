@@ -4020,6 +4020,8 @@ class ManagerServer(HealthAwareServer):
             healthy_worker_count=len(healthy_worker_ids),
             available_cores=self._worker_pool.get_total_available_cores(),
             total_cores=sum(worker.total_cores for worker in all_workers),
+            cluster_id=self._env.CLUSTER_ID,
+            environment_id=self._env.ENVIRONMENT_ID,
             state=self._manager_state.value,
             tcp_host=self._host,
             tcp_port=self._tcp_port,
@@ -4759,6 +4761,48 @@ class ManagerServer(HealthAwareServer):
         try:
             registration = WorkerRegistration.load(data)
 
+            # Cluster isolation validation (AD-28 Issue 2)
+            # MUST validate FIRST to prevent cross-cluster pollution
+            if registration.cluster_id != self._env.CLUSTER_ID:
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerWarning(
+                        message=f"Worker {registration.node.node_id} rejected: cluster_id mismatch (worker={registration.cluster_id}, manager={self._env.CLUSTER_ID})",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+                response = RegistrationResponse(
+                    accepted=False,
+                    manager_id=self._node_id.full,
+                    healthy_managers=[],
+                    error=f"Cluster isolation violation: worker cluster_id '{registration.cluster_id}' does not match manager cluster_id '{self._env.CLUSTER_ID}'",
+                    protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+                    protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+                )
+                return response.dump()
+
+            if registration.environment_id != self._env.ENVIRONMENT_ID:
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerWarning(
+                        message=f"Worker {registration.node.node_id} rejected: environment_id mismatch (worker={registration.environment_id}, manager={self._env.ENVIRONMENT_ID})",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+                response = RegistrationResponse(
+                    accepted=False,
+                    manager_id=self._node_id.full,
+                    healthy_managers=[],
+                    error=f"Environment isolation violation: worker environment_id '{registration.environment_id}' does not match manager environment_id '{self._env.ENVIRONMENT_ID}'",
+                    protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+                    protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+                )
+                return response.dump()
+
             # Role-based mTLS validation (AD-28 Issue 1)
             # TODO: Extract certificate from transport when handler signatures are updated
             # For now, validate role expectations without certificate
@@ -4918,6 +4962,50 @@ class ManagerServer(HealthAwareServer):
         """
         try:
             registration = GateRegistrationRequest.load(data)
+
+            # Cluster isolation validation (AD-28 Issue 2)
+            # MUST validate FIRST to prevent cross-cluster pollution
+            if registration.cluster_id != self._env.CLUSTER_ID:
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerWarning(
+                        message=f"Gate {registration.node_id} rejected: cluster_id mismatch (gate={registration.cluster_id}, manager={self._env.CLUSTER_ID})",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+                response = GateRegistrationResponse(
+                    accepted=False,
+                    manager_id=self._node_id.full,
+                    datacenter=self._node_id.datacenter,
+                    healthy_managers=[],
+                    error=f"Cluster isolation violation: gate cluster_id '{registration.cluster_id}' does not match manager cluster_id '{self._env.CLUSTER_ID}'",
+                    protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+                    protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+                )
+                return response.dump()
+
+            if registration.environment_id != self._env.ENVIRONMENT_ID:
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerWarning(
+                        message=f"Gate {registration.node_id} rejected: environment_id mismatch (gate={registration.environment_id}, manager={self._env.ENVIRONMENT_ID})",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+                response = GateRegistrationResponse(
+                    accepted=False,
+                    manager_id=self._node_id.full,
+                    datacenter=self._node_id.datacenter,
+                    healthy_managers=[],
+                    error=f"Environment isolation violation: gate environment_id '{registration.environment_id}' does not match manager environment_id '{self._env.ENVIRONMENT_ID}'",
+                    protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+                    protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+                )
+                return response.dump()
 
             # Protocol version validation (AD-25)
             gate_version = ProtocolVersion(

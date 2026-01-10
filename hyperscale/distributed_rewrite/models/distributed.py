@@ -406,6 +406,10 @@ class GateRegistrationRequest(Message):
     Protocol Version (AD-25):
     - protocol_version_major/minor: For version compatibility checks
     - capabilities: Comma-separated list of supported features
+
+    Cluster Isolation (AD-28 Issue 2):
+    - cluster_id: Cluster identifier for isolation validation
+    - environment_id: Environment identifier for isolation validation
     """
     node_id: str                            # Gate's unique identifier
     tcp_host: str                           # Gate's TCP host
@@ -415,6 +419,8 @@ class GateRegistrationRequest(Message):
     is_leader: bool                         # Whether this gate is the leader
     term: int                               # Current leadership term
     state: str                              # GateState value
+    cluster_id: str = "hyperscale"          # Cluster identifier for isolation
+    environment_id: str = "default"         # Environment identifier for isolation
     active_jobs: int = 0                    # Number of active jobs
     manager_count: int = 0                  # Number of known managers
     # Protocol version fields (AD-25)
@@ -508,12 +514,18 @@ class WorkerRegistration(Message):
     Protocol Version (AD-25):
     - protocol_version_major/minor: For version compatibility checks
     - capabilities: Comma-separated list of supported features
+
+    Cluster Isolation (AD-28 Issue 2):
+    - cluster_id: Cluster identifier for isolation validation
+    - environment_id: Environment identifier for isolation validation
     """
     node: NodeInfo               # Worker identity
     total_cores: int             # Total CPU cores available
     available_cores: int         # Currently free cores
     memory_mb: int               # Total memory in MB
     available_memory_mb: int     # Currently free memory
+    cluster_id: str              # Cluster identifier for isolation
+    environment_id: str          # Environment identifier for isolation
     # Protocol version fields (AD-25) - defaults for backwards compatibility
     protocol_version_major: int = 1
     protocol_version_minor: int = 0
@@ -594,6 +606,10 @@ class ManagerHeartbeat(Message):
     Protocol Version (AD-25):
     - protocol_version_major/minor: For version compatibility checks
     - capabilities: Comma-separated list of supported features
+
+    Cluster Isolation (AD-28 Issue 2):
+    - cluster_id: Cluster identifier for isolation validation
+    - environment_id: Environment identifier for isolation validation
     """
     node_id: str                 # Manager identifier
     datacenter: str              # Datacenter identifier
@@ -606,6 +622,8 @@ class ManagerHeartbeat(Message):
     healthy_worker_count: int    # Number of workers responding to SWIM probes
     available_cores: int         # Total available cores across healthy workers
     total_cores: int             # Total cores across all registered workers
+    cluster_id: str = "hyperscale"  # Cluster identifier for isolation
+    environment_id: str = "default"  # Environment identifier for isolation
     state: str = "active"        # ManagerState value (syncing/active/draining)
     tcp_host: str = ""           # Manager's TCP host (for proper storage key)
     tcp_port: int = 0            # Manager's TCP port (for proper storage key)
