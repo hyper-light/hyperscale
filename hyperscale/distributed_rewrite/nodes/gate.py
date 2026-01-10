@@ -134,7 +134,7 @@ from hyperscale.distributed_rewrite.jobs.gates import (
     JobForwardingTracker,
     ConsistentHashRing,
 )
-from hyperscale.distributed_rewrite.gates import (
+from hyperscale.distributed_rewrite.health import (
     CircuitBreakerManager,
     LatencyTracker,
 )
@@ -146,7 +146,7 @@ from hyperscale.distributed_rewrite.jobs import (
 from hyperscale.distributed_rewrite.datacenters import (
     DatacenterHealthManager,
     ManagerDispatcher,
-    LeaseManager,
+    LeaseManager as DatacenterLeaseManager,
     CrossDCCorrelationDetector,
     CorrelationSeverity,
 )
@@ -380,7 +380,42 @@ class GateServer(HealthAwareServer):
         # Tasks are tracked for cleanup when job is cleaned up
         self._job_reporter_tasks: dict[str, dict[str, asyncio.Task]] = {}
 
-        # Lease management for at-most-once
+        # Datacenter health manager - centralized DC health classification (AD-16)
+        # Replaces inline _classify_datacenter_health logic
+        self._dc_health_manager = DatacenterHealthManager(
+            heartbeat_timeout=30.0,
+            get_configured_managers=lambda dc_id: self._datacenter_managers.get(dc_id, []),
+        )
+        # Register known DCs with health manager
+        for datacenter_id in self._datacenter_managers.keys():
+            self._dc_health_manager.add_datacenter(datacenter_id)
+
+        # Manager dispatcher - centralized dispatch with retry/fallback
+        # Replaces inline _try_dispatch_to_dc logic
+        self._manager_dispatcher = ManagerDispatcher(
+            dispatch_timeout=5.0,
+            max_retries_per_dc=2,
+        )
+        # Register known DCs with dispatcher
+        for datacenter_id, manager_addrs in self._datacenter_managers.items():
+            self._manager_dispatcher.add_datacenter(datacenter_id, manager_addrs)
+
+        # Datacenter lease manager - at-most-once delivery for DC dispatch
+        # Different from _job_lease_manager which tracks per-job ownership
+        self._dc_lease_manager = DatacenterLeaseManager(
+            node_id="",  # Set in start() when node_id is available
+            lease_timeout=lease_timeout,
+        )
+
+        # Job forwarding tracker - cross-gate job message forwarding
+        # Tracks peer gates and handles forwarding job progress/results
+        self._job_forwarding_tracker = JobForwardingTracker(
+            local_gate_id="",  # Set in start() when node_id is available
+            forward_timeout=3.0,
+            max_forward_attempts=3,
+        )
+
+        # Lease management for at-most-once (legacy - to be migrated to _dc_lease_manager)
         self._leases: dict[str, DatacenterLease] = {}  # job_id:dc -> lease
         self._fence_token = 0
 
@@ -599,11 +634,15 @@ class GateServer(HealthAwareServer):
             # Remove from consistent hash ring for job ownership routing
             # Look up the real node_id from stored heartbeat info
             peer_heartbeat = self._gate_peer_info.get(udp_addr)
+            real_peer_id = peer_heartbeat.node_id if peer_heartbeat else peer_id
             if peer_heartbeat:
                 self._job_hash_ring.remove_node(peer_heartbeat.node_id)
             else:
                 # Fallback: try removing by synthetic ID (host:port)
                 self._job_hash_ring.remove_node(peer_id)
+
+            # Remove from job forwarding tracker
+            self._job_forwarding_tracker.unregister_peer(real_peer_id)
 
         # Check if this was the leader
         current_leader = self.get_current_leader()
@@ -789,6 +828,13 @@ class GateServer(HealthAwareServer):
         )
         # Progress is updated from throughput metrics if available
 
+        # Update DatacenterHealthManager for centralized DC health classification
+        self._dc_health_manager.update_manager(dc, manager_addr, heartbeat)
+
+        # Update ManagerDispatcher with leader info for optimized dispatch
+        if heartbeat.is_leader:
+            self._manager_dispatcher.set_leader(dc, manager_addr)
+
         # Record extension and LHM data for cross-DC correlation (Phase 7)
         # This helps distinguish load from failures - high extensions + high LHM
         # across DCs indicates load spike, not health issues
@@ -874,6 +920,13 @@ class GateServer(HealthAwareServer):
         # If node already exists, ConsistentHashRing.add_node will update it
         self._job_hash_ring.add_node(
             node_id=heartbeat.node_id,
+            tcp_host=peer_tcp_host,
+            tcp_port=peer_tcp_port,
+        )
+
+        # Register peer with job forwarding tracker for cross-gate message forwarding
+        self._job_forwarding_tracker.register_peer(
+            gate_id=heartbeat.node_id,
             tcp_host=peer_tcp_host,
             tcp_port=peer_tcp_port,
         )
@@ -1695,92 +1748,11 @@ class GateServer(HealthAwareServer):
     def _classify_datacenter_health(self, dc_id: str) -> DatacenterStatus:
         """
         Classify datacenter health based on TCP heartbeats from managers.
-        
-        Health States (evaluated in order):
-        1. UNHEALTHY: No managers registered OR no workers registered
-        2. DEGRADED: Majority of workers unhealthy OR majority of managers unhealthy
-        3. BUSY: NOT degraded AND available_cores == 0 (transient, will clear)
-        4. HEALTHY: NOT degraded AND available_cores > 0
-        
-        Key insight: BUSY ≠ UNHEALTHY
-        - BUSY = transient, will clear → accept job (queued)
-        - DEGRADED = structural problem, reduced capacity → may need intervention
-        - UNHEALTHY = severe problem → try fallback datacenter
-        
-        Note: Gates and managers are in different SWIM clusters, so we can't use
-        SWIM probes for cross-cluster health. We use TCP heartbeats instead.
-        Manager liveness is determined by recent TCP heartbeats per-manager.
-        
-        Uses the LEADER's heartbeat as the authoritative source for worker info.
-        Falls back to any fresh manager heartbeat if leader is stale.
-        
+
+        Delegates to DatacenterHealthManager for centralized health classification.
         See AD-16 in docs/architecture.md.
         """
-        # Get best manager heartbeat (prefers leader, falls back to any fresh)
-        status, alive_managers, total_managers = self._get_best_manager_heartbeat(dc_id)
-        
-        # === UNHEALTHY: No managers registered ===
-        if total_managers == 0:
-            return DatacenterStatus(
-                dc_id=dc_id,
-                health=DatacenterHealth.UNHEALTHY.value,
-                available_capacity=0,
-                queue_depth=0,
-                manager_count=0,
-                worker_count=0,
-                last_update=time.monotonic(),
-            )
-        
-        # === UNHEALTHY: No fresh heartbeats or no workers registered ===
-        if not status or status.worker_count == 0:
-            return DatacenterStatus(
-                dc_id=dc_id,
-                health=DatacenterHealth.UNHEALTHY.value,
-                available_capacity=0,
-                queue_depth=0,
-                manager_count=alive_managers,
-                worker_count=0,
-                last_update=time.monotonic(),
-            )
-        
-        # Extract worker health info from status
-        # ManagerHeartbeat includes healthy_worker_count (workers responding to SWIM)
-        total_workers = status.worker_count
-        healthy_workers = getattr(status, 'healthy_worker_count', total_workers)
-        available_cores = status.available_cores
-        
-        # === Check for DEGRADED state ===
-        is_degraded = False
-        
-        # Majority of managers unhealthy?
-        manager_quorum = total_managers // 2 + 1
-        if total_managers > 0 and alive_managers < manager_quorum:
-            is_degraded = True
-        
-        # Majority of workers unhealthy?
-        worker_quorum = total_workers // 2 + 1
-        if total_workers > 0 and healthy_workers < worker_quorum:
-            is_degraded = True
-        
-        # === Determine final health state ===
-        if is_degraded:
-            health = DatacenterHealth.DEGRADED
-        elif available_cores == 0:
-            # Not degraded, but no capacity = BUSY (transient)
-            health = DatacenterHealth.BUSY
-        else:
-            # Not degraded, has capacity = HEALTHY
-            health = DatacenterHealth.HEALTHY
-        
-        return DatacenterStatus(
-            dc_id=dc_id,
-            health=health.value,
-            available_capacity=available_cores,
-            queue_depth=getattr(status, 'queue_depth', 0),
-            manager_count=alive_managers,
-            worker_count=healthy_workers,  # Report healthy workers, not total
-            last_update=time.monotonic(),
-        )
+        return self._dc_health_manager.get_datacenter_health(dc_id)
     
     def _get_all_datacenter_health(self) -> dict[str, DatacenterStatus]:
         """
@@ -2245,6 +2217,45 @@ class GateServer(HealthAwareServer):
         primary, _, _ = self._select_datacenters_with_fallback(count, preferred)
         return primary
     
+    def _is_capacity_rejection(self, error: str | None) -> bool:
+        """Check if error indicates a capacity issue (transient, not unhealthy)."""
+        if not error:
+            return False
+        error_lower = error.lower()
+        return "no capacity" in error_lower or "busy" in error_lower
+
+    def _record_dispatch_success(
+        self,
+        manager_addr: tuple[str, int],
+        circuit: ErrorStats,
+    ) -> None:
+        """Record successful dispatch to a manager."""
+        circuit.record_success()
+        self._circuit_breaker_manager.record_success(manager_addr)
+
+    def _record_dispatch_failure(
+        self,
+        manager_addr: tuple[str, int],
+        circuit: ErrorStats,
+    ) -> None:
+        """Record failed dispatch to a manager."""
+        circuit.record_error()
+        self._circuit_breaker_manager.record_failure(manager_addr)
+
+    def _process_dispatch_ack(
+        self,
+        ack: JobAck,
+        manager_addr: tuple[str, int],
+        circuit: ErrorStats,
+    ) -> tuple[bool, str | None]:
+        """Process job acknowledgment and update circuit breakers."""
+        if ack.accepted or self._is_capacity_rejection(ack.error):
+            self._record_dispatch_success(manager_addr, circuit)
+            return (True, None)
+
+        self._record_dispatch_failure(manager_addr, circuit)
+        return (False, ack.error)
+
     async def _try_dispatch_to_manager(
         self,
         manager_addr: tuple[str, int],
@@ -2254,27 +2265,17 @@ class GateServer(HealthAwareServer):
     ) -> tuple[bool, str | None]:
         """
         Try to dispatch job to a single manager with retries.
-        
+
         Uses retries with exponential backoff:
         - Attempt 1: immediate
         - Attempt 2: 0.3s delay
         - Attempt 3: 0.6s delay
-        
-        Args:
-            manager_addr: (host, port) of the manager
-            submission: Job submission to dispatch
-            max_retries: Maximum retry attempts (default 2)
-            base_delay: Base delay for exponential backoff (default 0.3s)
-            
-        Returns:
-            (success: bool, error: str | None)
         """
-        # Check circuit breaker first
         if self._is_manager_circuit_open(manager_addr):
             return (False, "Circuit breaker is OPEN")
-        
+
         circuit = self._get_manager_circuit(manager_addr)
-        
+
         for attempt in range(max_retries + 1):
             try:
                 response, _ = await self.send_tcp(
@@ -2286,33 +2287,19 @@ class GateServer(HealthAwareServer):
 
                 if isinstance(response, bytes):
                     ack = JobAck.load(response)
-                    if ack.accepted:
-                        circuit.record_success()
-                        return (True, None)
-                    # Check if it's a capacity issue vs unhealthy
-                    if ack.error:
-                        error_lower = ack.error.lower()
-                        if "no capacity" in error_lower or "busy" in error_lower:
-                            # BUSY is still acceptable - job will be queued
-                            circuit.record_success()
-                            return (True, None)
-                    # Manager rejected - don't retry
-                    circuit.record_error()
-                    return (False, ack.error)
+                    return self._process_dispatch_ack(ack, manager_addr, circuit)
 
-            except Exception as e:
-                # Connection error - retry
+            except Exception as exception:
                 if attempt == max_retries:
-                    circuit.record_error()
-                    return (False, str(e))
-            
+                    self._record_dispatch_failure(manager_addr, circuit)
+                    return (False, str(exception))
+
             # Exponential backoff before retry
             if attempt < max_retries:
                 delay = base_delay * (2 ** attempt)
                 await asyncio.sleep(delay)
-        
-        # Should not reach here
-        circuit.record_error()
+
+        self._record_dispatch_failure(manager_addr, circuit)
         return (False, "Unknown error")
     
     async def _try_dispatch_to_dc(
@@ -2346,6 +2333,49 @@ class GateServer(HealthAwareServer):
         # All managers failed = DC is UNHEALTHY for this dispatch
         return (False, f"All managers in {dc} failed to accept job", None)
     
+    async def _try_fallback_dispatch(
+        self,
+        job_id: str,
+        failed_dc: str,
+        submission: JobSubmission,
+        fallback_queue: list[str],
+    ) -> tuple[str | None, tuple[str, int] | None]:
+        """
+        Try to dispatch to fallback DCs when primary fails.
+
+        Returns:
+            (fallback_dc that succeeded, accepting_manager) or (None, None) if all failed
+        """
+        while fallback_queue:
+            fallback_dc = fallback_queue.pop(0)
+            success, _, accepting_manager = await self._try_dispatch_to_dc(
+                job_id, fallback_dc, submission
+            )
+            if success:
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerInfo(
+                        message=f"Job {job_id}: Fallback from {failed_dc} to {fallback_dc}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+                return (fallback_dc, accepting_manager)
+        return (None, None)
+
+    def _record_dc_manager_for_job(
+        self,
+        job_id: str,
+        datacenter: str,
+        manager_addr: tuple[str, int] | None,
+    ) -> None:
+        """Record the accepting manager as job leader for a DC."""
+        if manager_addr:
+            if job_id not in self._job_dc_managers:
+                self._job_dc_managers[job_id] = {}
+            self._job_dc_managers[job_id][datacenter] = manager_addr
+
     async def _dispatch_job_with_fallback(
         self,
         submission: JobSubmission,
@@ -2360,62 +2390,32 @@ class GateServer(HealthAwareServer):
 
         Also records per-DC job leader (the manager that accepted the job)
         for routing queries to the authoritative manager.
-
-        Args:
-            submission: The job submission
-            primary_dcs: Primary target DCs
-            fallback_dcs: Fallback DCs to try if primary fails
-
-        Returns:
-            (successful_dcs, failed_dcs)
         """
-        successful = []
-        failed = []
+        successful: list[str] = []
+        failed: list[str] = []
         fallback_queue = list(fallback_dcs)
         job_id = submission.job_id
 
-        # Initialize job DC managers tracking if needed
-        if job_id not in self._job_dc_managers:
-            self._job_dc_managers[job_id] = {}
-
-        for dc in primary_dcs:
-            success, error, accepting_manager = await self._try_dispatch_to_dc(
-                job_id, dc, submission
+        for datacenter in primary_dcs:
+            success, _, accepting_manager = await self._try_dispatch_to_dc(
+                job_id, datacenter, submission
             )
 
             if success:
-                successful.append(dc)
-                # Record the accepting manager as job leader for this DC
-                if accepting_manager:
-                    self._job_dc_managers[job_id][dc] = accepting_manager
-            else:
-                # Try fallback
-                fallback_success = False
-                while fallback_queue:
-                    fallback_dc = fallback_queue.pop(0)
-                    fb_success, fb_error, fb_manager = await self._try_dispatch_to_dc(
-                        job_id, fallback_dc, submission
-                    )
-                    if fb_success:
-                        successful.append(fallback_dc)
-                        # Record the accepting manager as job leader for fallback DC
-                        if fb_manager:
-                            self._job_dc_managers[job_id][fallback_dc] = fb_manager
-                        fallback_success = True
-                        self._task_runner.run(
-                            self._udp_logger.log,
-                            ServerInfo(
-                                message=f"Job {job_id}: Fallback from {dc} to {fallback_dc}",
-                                node_host=self._host,
-                                node_port=self._tcp_port,
-                                node_id=self._node_id.short,
-                            )
-                        )
-                        break
+                successful.append(datacenter)
+                self._record_dc_manager_for_job(job_id, datacenter, accepting_manager)
+                continue
 
-                if not fallback_success:
-                    # No fallback worked
-                    failed.append(dc)
+            # Primary failed - try fallback
+            fallback_dc, fallback_manager = await self._try_fallback_dispatch(
+                job_id, datacenter, submission, fallback_queue
+            )
+
+            if fallback_dc:
+                successful.append(fallback_dc)
+                self._record_dc_manager_for_job(job_id, fallback_dc, fallback_manager)
+            else:
+                failed.append(datacenter)
 
         return (successful, failed)
     
@@ -2962,6 +2962,12 @@ class GateServer(HealthAwareServer):
         # Set node_id on job lease manager for ownership tracking
         self._job_lease_manager._node_id = self._node_id.full
 
+        # Set node_id on datacenter lease manager
+        self._dc_lease_manager.set_node_id(self._node_id.full)
+
+        # Set local gate ID on job forwarding tracker
+        self._job_forwarding_tracker.set_local_gate_id(self._node_id.full)
+
         # Add this gate to the consistent hash ring
         # Other gates will be added as they send heartbeats
         self._job_hash_ring.add_node(
@@ -3403,16 +3409,19 @@ class GateServer(HealthAwareServer):
         while self._running:
             try:
                 await asyncio.sleep(self._lease_timeout / 2)
-                
+
+                # Cleanup via DatacenterLeaseManager
+                self._dc_lease_manager.cleanup_expired()
+
+                # Also cleanup legacy dict for snapshot sync
                 now = time.monotonic()
-                expired = []
-                for key, lease in list(self._leases.items()):
-                    if lease.expires_at < now:
-                        expired.append(key)
-                
+                expired = [
+                    key for key, lease in self._leases.items()
+                    if lease.expires_at < now
+                ]
                 for key in expired:
                     self._leases.pop(key, None)
-                    
+
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -3520,24 +3529,16 @@ class GateServer(HealthAwareServer):
 
     def _create_lease(self, job_id: str, datacenter: str) -> DatacenterLease:
         """Create a new lease for a job in a datacenter."""
-        lease = DatacenterLease(
-            job_id=job_id,
-            datacenter=datacenter,
-            lease_holder=self._node_id.full,
-            fence_token=self._get_fence_token(),
-            expires_at=time.monotonic() + self._lease_timeout,
-            version=self._state_version,
-        )
+        # Use DatacenterLeaseManager for lease creation
+        lease = self._dc_lease_manager.acquire_lease(job_id, datacenter)
+        # Also store in legacy dict for snapshot sync compatibility
         self._leases[f"{job_id}:{datacenter}"] = lease
         return lease
-    
+
     def _get_lease(self, job_id: str, datacenter: str) -> DatacenterLease | None:
         """Get existing lease if valid."""
-        key = f"{job_id}:{datacenter}"
-        lease = self._leases.get(key)
-        if lease and lease.expires_at > time.monotonic():
-            return lease
-        return None
+        # Use DatacenterLeaseManager for lease lookup
+        return self._dc_lease_manager.get_lease(job_id, datacenter)
     
     async def _dispatch_job_to_datacenter(
         self,
@@ -5271,97 +5272,76 @@ class GateServer(HealthAwareServer):
 
         return False
 
-    async def _forward_job_result_to_peers(self, result: JobFinalResult) -> bool:
+    async def _try_forward_via_hash_ring(
+        self,
+        job_id: str,
+        endpoint: str,
+        data: bytes,
+        timeout: float,
+    ) -> bool:
         """
-        Forward a job final result to the job owner gate using consistent hashing.
+        Try forwarding via consistent hash ring candidates.
 
-        Uses the consistent hash ring to determine the owner and backup gates,
-        attempting them in order until one succeeds.
-
-        Returns True if forwarded to at least one peer.
+        Returns True if successfully forwarded.
         """
-        # Get owner and backup gates from hash ring
-        candidates = self._job_hash_ring.get_nodes(result.job_id, count=3)
+        candidates = self._job_hash_ring.get_nodes(job_id, count=3)
 
         for candidate in candidates:
             if candidate.node_id == self._node_id.full:
-                continue  # Don't forward to self
+                continue
 
             try:
                 gate_addr = (candidate.tcp_host, candidate.tcp_port)
-                await self.send_tcp(
-                    gate_addr,
-                    "job_final_result",
-                    result.dump(),
-                    timeout=3.0,
-                )
-                return True
-            except Exception:
-                continue  # Try next candidate
-
-        # Fallback: try known gates if hash ring is empty or all candidates failed
-        for gate_id, gate_info in list(self._known_gates.items()):
-            if gate_id == self._node_id.full:
-                continue
-            try:
-                gate_addr = (gate_info.tcp_host, gate_info.tcp_port)
-                await self.send_tcp(
-                    gate_addr,
-                    "job_final_result",
-                    result.dump(),
-                    timeout=3.0,
-                )
+                await self.send_tcp(gate_addr, endpoint, data, timeout=timeout)
                 return True
             except Exception:
                 continue
 
         return False
+
+    async def _forward_job_result_to_peers(self, result: JobFinalResult) -> bool:
+        """
+        Forward a job final result to the job owner gate.
+
+        Uses consistent hash ring first, then falls back to JobForwardingTracker.
+        """
+        data = result.dump()
+
+        # Try hash ring first
+        if await self._try_forward_via_hash_ring(
+            result.job_id, "job_final_result", data, timeout=3.0
+        ):
+            return True
+
+        # Fallback: use JobForwardingTracker
+        forwarding_result = await self._job_forwarding_tracker.forward_result(
+            job_id=result.job_id,
+            data=data,
+            send_tcp=self.send_tcp,
+        )
+        return forwarding_result.forwarded
 
     async def _forward_job_progress_to_peers(self, progress: JobProgress) -> bool:
         """
-        Forward job progress to the job owner gate using consistent hashing.
+        Forward job progress to the job owner gate.
 
-        Uses the consistent hash ring to determine the owner and backup gates,
-        attempting them in order until one succeeds.
-
-        Returns True if forwarded to at least one peer.
+        Uses consistent hash ring first, then falls back to JobForwardingTracker.
         """
-        # Get owner and backup gates from hash ring
-        candidates = self._job_hash_ring.get_nodes(progress.job_id, count=3)
+        data = progress.dump()
 
-        for candidate in candidates:
-            if candidate.node_id == self._node_id.full:
-                continue  # Don't forward to self
+        # Try hash ring first
+        if await self._try_forward_via_hash_ring(
+            progress.job_id, "job_progress", data, timeout=2.0
+        ):
+            return True
 
-            try:
-                gate_addr = (candidate.tcp_host, candidate.tcp_port)
-                await self.send_tcp(
-                    gate_addr,
-                    "job_progress",
-                    progress.dump(),
-                    timeout=2.0,
-                )
-                return True
-            except Exception:
-                continue  # Try next candidate
-
-        # Fallback: try known gates if hash ring is empty or all candidates failed
-        for gate_id, gate_info in list(self._known_gates.items()):
-            if gate_id == self._node_id.full:
-                continue
-            try:
-                gate_addr = (gate_info.tcp_host, gate_info.tcp_port)
-                await self.send_tcp(
-                    gate_addr,
-                    "job_progress",
-                    progress.dump(),
-                    timeout=2.0,
-                )
-                return True
-            except Exception:
-                continue
-
-        return False
+        # Fallback: use JobForwardingTracker
+        forwarding_result = await self._job_forwarding_tracker.forward_progress(
+            job_id=progress.job_id,
+            data=data,
+            send_tcp=self.send_tcp,
+        )
+        return forwarding_result.forwarded
     
     async def _send_global_job_result(self, job_id: str) -> None:
         """

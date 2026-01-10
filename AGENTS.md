@@ -53,6 +53,12 @@ This document contains critical information about working with this codebase. Fo
     - Constants in UPPER_SNAKE_CASE
     - Document with docstrings
     - Use f-strings for formatting
+    - Avoid cyclomatic complexity beyond three
+    - Use python 3.12+ Walrus operators and other modenr Python syntax
+    - Use list and dic comprehensions for filtering, flattening, or mapping
+    - Use .update() for merging dicts when possible to avoid unneccessary re-allocations
+    - sorted and map are fine when needed
+
 
 - After any fix or implementation of a todo, we generate a fresh commit. Do NOT run the tests. A user will run them and confirm.
 - Always commit everything - i.e. `git add -A && git commit -m "<MESSAGE_HERE>"

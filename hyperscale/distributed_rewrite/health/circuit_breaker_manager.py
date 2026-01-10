@@ -5,7 +5,7 @@ Manages per-manager circuit breakers to isolate failures and prevent
 cascading failures when a manager becomes unhealthy.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from hyperscale.distributed_rewrite.swim.core import (
     ErrorStats,

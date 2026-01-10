@@ -54,3 +54,12 @@ from hyperscale.distributed_rewrite.health.probes import (
     StartupProbe as StartupProbe,
     CompositeProbe as CompositeProbe,
 )
+
+from hyperscale.distributed_rewrite.health.circuit_breaker_manager import (
+    CircuitBreakerManager as CircuitBreakerManager,
+    CircuitBreakerConfig as CircuitBreakerConfig,
+)
+from hyperscale.distributed_rewrite.health.latency_tracker import (
+    LatencyTracker as LatencyTracker,
+    LatencyConfig as LatencyConfig,
+)
