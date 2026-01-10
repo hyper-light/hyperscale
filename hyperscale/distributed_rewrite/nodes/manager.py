@@ -2040,6 +2040,33 @@ class ManagerServer(HealthAwareServer):
         # Update stored deadline if granted
         if response.granted:
             self._worker_deadlines[heartbeat.node_id] = response.new_deadline
+
+            # AD-26 Issue 3: Integrate with SWIM timing wheels (SWIM as authority)
+            # Update SWIM's hierarchical detector timing wheels after extension is granted
+            hierarchical_detector = self.get_hierarchical_detector()
+            if hierarchical_detector and worker.registration:
+                worker_addr = (worker.registration.node.host, worker.registration.node.port)
+                # Submit to task runner since this is a sync method but needs to call async SWIM
+                async def update_swim_extension():
+                    granted, extension_seconds, denial_reason, is_warning = await hierarchical_detector.request_extension(
+                        node=worker_addr,
+                        reason=request.reason,
+                        current_progress=request.current_progress,
+                    )
+                    # Note: We already granted via WorkerHealthManager, SWIM extension should also succeed
+                    # If SWIM denies, log a warning as this indicates desync between the two systems
+                    if not granted:
+                        await self._udp_logger.log(
+                            ServerWarning(
+                                message=f"SWIM denied extension for {heartbeat.node_id} despite WorkerHealthManager grant: {denial_reason}",
+                                node_host=self._host,
+                                node_port=self._tcp_port,
+                                node_id=self._node_id.short,
+                            )
+                        )
+
+                self._task_runner.run(update_swim_extension)
+
             self._task_runner.run(
                 self._udp_logger.log,
                 ServerInfo(
@@ -5571,7 +5598,7 @@ class ManagerServer(HealthAwareServer):
         if self._known_gates or self._gate_addrs:
             self._task_runner.run(self._send_job_progress_to_gate, job)
         else:
-            self._check_job_completion(job_id)
+            self._task_runner.run(self._check_job_completion, job_id)
 
     def _create_progress_ack(self, job_id: str | None = None) -> WorkflowProgressAck:
         """Create a WorkflowProgressAck with current manager topology and job leader info.
@@ -7258,10 +7285,10 @@ class ManagerServer(HealthAwareServer):
                 # Client unreachable - continue with others
                 pass
     
-    def _check_job_completion(self, job_id: str) -> None:
+    async def _check_job_completion(self, job_id: str) -> None:
         """
         Check if a job has completed and push status if callback registered.
-        
+
         Called after workflow progress updates to detect job completion.
         """
         job = self._job_manager.get_job_by_id(job_id)
@@ -10706,6 +10733,28 @@ class ManagerServer(HealthAwareServer):
             # Update stored deadline if granted
             if response.granted:
                 self._worker_deadlines[request.worker_id] = response.new_deadline
+
+                # AD-26 Issue 3: Integrate with SWIM timing wheels (SWIM as authority)
+                # Update SWIM's hierarchical detector timing wheels after extension is granted
+                hierarchical_detector = self.get_hierarchical_detector()
+                if hierarchical_detector and worker.registration:
+                    worker_addr = (worker.registration.node.host, worker.registration.node.port)
+                    granted, extension_seconds, denial_reason, is_warning = await hierarchical_detector.request_extension(
+                        node=worker_addr,
+                        reason=request.reason,
+                        current_progress=request.current_progress,
+                    )
+                    # Note: We already granted via WorkerHealthManager, SWIM extension should also succeed
+                    # If SWIM denies, log a warning as this indicates desync between the two systems
+                    if not granted:
+                        await self._udp_logger.log(
+                            ServerWarning(
+                                message=f"SWIM denied extension for {request.worker_id} despite WorkerHealthManager grant: {denial_reason}",
+                                node_host=self._host,
+                                node_port=self._tcp_port,
+                                node_id=self._node_id.short,
+                            )
+                        )
 
                 # Notify timeout strategies of extension (AD-34 Part 10.4.7)
                 await self._notify_timeout_strategies_of_extension(
