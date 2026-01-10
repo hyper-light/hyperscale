@@ -5062,7 +5062,7 @@ class GateServer(HealthAwareServer):
             job.status = JobStatus.RUNNING.value
             job.completed_datacenters = 0
             job.failed_datacenters = len(failed_dcs)
-            
+
             if failed_dcs:
                 self._task_runner.run(
                     self._udp_logger.log,
@@ -5074,7 +5074,15 @@ class GateServer(HealthAwareServer):
                         node_id=self._node_id.short,
                     )
                 )
-        
+
+            # Start timeout tracking (AD-34 Task 11.5.11)
+            # Gate coordinates global timeout across all datacenters
+            await self._job_timeout_tracker.start_tracking_job(
+                job_id=submission.job_id,
+                timeout_seconds=submission.timeout_seconds,
+                target_datacenters=successful_dcs,
+            )
+
         self._increment_version()
     
     # =========================================================================
