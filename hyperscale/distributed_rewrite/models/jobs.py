@@ -235,6 +235,48 @@ class SubWorkflowInfo:
 
 
 @dataclass(slots=True)
+class TimeoutTrackingState:
+    """
+    Timeout tracking state persisted in JobInfo (AD-34).
+
+    Survives leader transfers via state sync - new leader inherits this state
+    and resumes timeout tracking with incremented fence token.
+
+    Extension Integration (AD-26):
+    - total_extensions_granted: Sum of ALL extensions granted to workers in this job
+    - max_worker_extension: Largest single extension granted
+    - active_workers_with_extensions: Workers currently with active extensions
+    - Extensions are additive: effective_timeout = timeout_seconds + total_extensions_granted
+    - Extension grant = progress signal (updates last_progress_at)
+    """
+    strategy_type: str  # "local_authority" | "gate_coordinated"
+    gate_addr: tuple[str, int] | None
+
+    # Timestamps (absolute, monotonic)
+    started_at: float  # When job started (never changes)
+    last_progress_at: float  # Last workflow progress or extension
+    last_report_at: float  # Last progress report to gate (multi-DC only)
+
+    # Timeout configuration
+    timeout_seconds: float
+    stuck_threshold: float = 120.0  # No progress threshold (2 minutes)
+
+    # Extension tracking (AD-26 integration)
+    total_extensions_granted: float = 0.0  # Total seconds granted to ALL workers
+    max_worker_extension: float = 0.0  # Largest extension granted to any worker
+    last_extension_at: float = 0.0  # When last extension was granted
+    active_workers_with_extensions: set[str] = field(default_factory=set)
+
+    # State flags (idempotency)
+    locally_timed_out: bool = False  # Manager reported/detected timeout
+    globally_timed_out: bool = False  # Gate declared global timeout
+    timeout_reason: str = ""
+
+    # Fencing (prevent stale decisions after leader transfer)
+    timeout_fence_token: int = 0  # Incremented on leader transfer
+
+
+@dataclass(slots=True)
 class JobInfo:
     """All state for a single job, protected by its own lock."""
     token: TrackingToken          # Job-level token (DC:manager:job)
@@ -264,6 +306,9 @@ class JobInfo:
 
     # Callbacks
     callback_addr: tuple[str, int] | None = None
+
+    # Timeout tracking (AD-34) - persisted across leader transfers
+    timeout_tracking: TimeoutTrackingState | None = None
 
     @property
     def job_id(self) -> str:
