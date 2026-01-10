@@ -3007,6 +3007,9 @@ class GateServer(HealthAwareServer):
                 self._task_runner.run(self._suspect_manager_for_dc, dc, manager_addr)
 
         # All managers failed = DC is UNHEALTHY for this dispatch
+        # AD-36: Notify router of DC failure for cooldown tracking
+        if self._job_router:
+            self._job_router.record_dispatch_failure(job_id, dc)
         return (False, f"All managers in {dc} failed to accept job", None)
     
     async def _try_fallback_dispatch(
