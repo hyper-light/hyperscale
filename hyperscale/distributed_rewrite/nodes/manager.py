@@ -152,6 +152,9 @@ from hyperscale.distributed_rewrite.reliability import (
     HybridOverloadDetector,
     LoadShedder,
     ServerRateLimiter,
+    RetryExecutor,
+    RetryConfig,
+    JitterStrategy,
 )
 from hyperscale.distributed_rewrite.health import (
     WorkerHealthManager,
@@ -1743,47 +1746,49 @@ class ManagerServer(HealthAwareServer):
     ) -> WorkerStateSnapshot | None:
         """
         Request state from a single worker with retries.
-        
-        Uses exponential backoff: delay = base_delay * (2 ** attempt)
+
+        Uses RetryExecutor with jittered exponential backoff (AD-21).
         """
-        last_error = None
-        
-        for attempt in range(max_retries):
-            try:
-                response, _ = await self.send_tcp(
-                    worker_addr,
-                    action='state_sync_request',
-                    data=request.dump(),
-                    timeout=5.0,
-                )
-                
-                if response and not isinstance(response, Exception):
-                    sync_response = StateSyncResponse.load(response)
-                    if sync_response.worker_state:
-                        return await self._process_worker_state_response(sync_response.worker_state)
-                
-                # No valid response, will retry
-                last_error = "Empty or invalid response"
-                
-            except Exception as e:
-                last_error = str(e)
-            
-            # Don't sleep after last attempt
-            if attempt < max_retries - 1:
-                delay = base_delay * (2 ** attempt)
-                await asyncio.sleep(delay)
-        
-        # All retries failed
-        self._task_runner.run(
-            self._udp_logger.log,
-            ServerError(
-                message=f"State sync failed for {worker_addr} after {max_retries} attempts: {last_error}",
-                node_host=self._host,
-                node_port=self._tcp_port,
-                node_id=self._node_id.short,
-            )
+        retry_config = self._create_retry_config(
+            max_attempts=max_retries,
+            base_delay=base_delay,
         )
-        return None
+        executor = RetryExecutor(retry_config)
+
+        async def sync_operation() -> WorkerStateSnapshot:
+            response, _ = await self.send_tcp(
+                worker_addr,
+                action='state_sync_request',
+                data=request.dump(),
+                timeout=5.0,
+            )
+
+            if response and not isinstance(response, Exception):
+                sync_response = StateSyncResponse.load(response)
+                if sync_response.worker_state:
+                    result = await self._process_worker_state_response(sync_response.worker_state)
+                    if result:
+                        return result
+
+            # No valid response - raise to trigger retry
+            raise ConnectionError("Empty or invalid response from worker")
+
+        try:
+            return await executor.execute(
+                sync_operation,
+                operation_name=f"request_worker_state_{worker_addr}",
+            )
+        except Exception as exception:
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerError(
+                    message=f"State sync failed for {worker_addr} after {max_retries} attempts: {exception}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            return None
     
     async def _process_worker_state_response(
         self,
@@ -1824,7 +1829,7 @@ class ManagerServer(HealthAwareServer):
         """
         Request state from a peer manager with retries.
 
-        Uses exponential backoff: delay = base_delay * (2 ** attempt)
+        Uses RetryExecutor with jittered exponential backoff (AD-21).
         Timeout and retries are configurable via Env.
 
         Handles the case where the peer is not ready (still in SYNCING state)
@@ -1834,52 +1839,74 @@ class ManagerServer(HealthAwareServer):
             max_retries = self.env.MANAGER_STATE_SYNC_RETRIES
 
         sync_timeout = self.env.MANAGER_STATE_SYNC_TIMEOUT
-        last_error = None
 
-        for attempt in range(max_retries):
-            try:
-                response, _ = await self.send_tcp(
-                    peer_addr,
-                    action='state_sync_request',
-                    data=request.dump(),
-                    timeout=sync_timeout,
-                )
+        class PeerNotReadyError(Exception):
+            """Raised when peer is alive but not ready for state sync."""
+            pass
 
-                if response and not isinstance(response, Exception):
-                    sync_response = StateSyncResponse.load(response)
-
-                    # Check if peer is ready to serve state
-                    if not sync_response.responder_ready:
-                        last_error = "Peer not ready (still syncing)"
-                        # Retry - peer is alive but not ready yet
-                    elif sync_response.manager_state:
-                        return await self._process_manager_state_response(sync_response.manager_state)
-                    else:
-                        # Peer is ready but no state (fresh cluster)
-                        last_error = "Peer ready but no state available"
-                        return None
-                else:
-                    # No valid response, will retry
-                    last_error = "Empty or invalid response"
-
-            except Exception as e:
-                last_error = str(e)
-
-            # Don't sleep after last attempt
-            if attempt < max_retries - 1:
-                delay = base_delay * (2 ** attempt)
-                await asyncio.sleep(delay)
-
-        # All retries failed - log at warning level (expected during startup races)
-        await self._udp_logger.log(
-            ServerWarning(
-                message=f"Manager peer state sync incomplete for {peer_addr} after {max_retries} attempts: {last_error}",
-                node_host=self._host,
-                node_port=self._tcp_port,
-                node_id=self._node_id.short,
-            )
+        retry_config = RetryConfig(
+            max_attempts=max_retries,
+            base_delay=base_delay,
+            max_delay=30.0,
+            jitter=JitterStrategy.FULL,
+            retryable_exceptions=(
+                ConnectionError,
+                TimeoutError,
+                OSError,
+                PeerNotReadyError,  # Include peer-not-ready as retryable
+            ),
         )
-        return None
+        executor = RetryExecutor(retry_config)
+
+        async def sync_operation() -> ManagerStateSnapshot | None:
+            response, _ = await self.send_tcp(
+                peer_addr,
+                action='state_sync_request',
+                data=request.dump(),
+                timeout=sync_timeout,
+            )
+
+            if response and not isinstance(response, Exception):
+                sync_response = StateSyncResponse.load(response)
+
+                # Check if peer is ready to serve state
+                if not sync_response.responder_ready:
+                    # Peer is alive but not ready yet - raise to trigger retry
+                    raise PeerNotReadyError("Peer not ready (still syncing)")
+                elif sync_response.manager_state:
+                    return await self._process_manager_state_response(sync_response.manager_state)
+                else:
+                    # Peer is ready but no state (fresh cluster) - success with None
+                    return None
+
+            # No valid response - raise to trigger retry
+            raise ConnectionError("Empty or invalid response")
+
+        try:
+            return await executor.execute(
+                sync_operation,
+                operation_name=f"request_manager_peer_state_{peer_addr}",
+            )
+        except PeerNotReadyError:
+            await self._udp_logger.log(
+                ServerWarning(
+                    message=f"Manager peer {peer_addr} not ready for state sync after {max_retries} attempts",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            return None
+        except Exception as exception:
+            await self._udp_logger.log(
+                ServerWarning(
+                    message=f"Manager peer state sync incomplete for {peer_addr} after {max_retries} attempts: {exception}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            return None
     
     async def _process_manager_state_response(
         self,
@@ -2821,6 +2848,8 @@ class ManagerServer(HealthAwareServer):
         """
         Register this manager with a peer manager.
 
+        Uses RetryExecutor with jittered exponential backoff (AD-21).
+
         Similar to worker registration - establishes bidirectional relationship
         and discovers the full cluster topology.
 
@@ -2838,94 +2867,93 @@ class ManagerServer(HealthAwareServer):
             is_leader=self.is_leader(),
         )
 
-        for attempt in range(max_retries + 1):
-            try:
-                result, _ = await self.send_manager_peer_register(
-                    peer_addr,
-                    registration.dump(),
-                    timeout=5.0,
-                )
+        retry_config = self._create_retry_config(
+            max_attempts=max_retries + 1,
+            base_delay=base_delay,
+        )
+        executor = RetryExecutor(retry_config)
 
-                if isinstance(result, Exception):
-                    raise result
+        async def register_operation() -> ManagerPeerRegistrationResponse:
+            result, _ = await self.send_manager_peer_register(
+                peer_addr,
+                registration.dump(),
+                timeout=5.0,
+            )
 
-                response = ManagerPeerRegistrationResponse.load(result)
+            if isinstance(result, Exception):
+                raise result
 
-                if response.accepted:
-                    # Add to known peers
-                    self._registered_with_managers.add(response.manager_id)
+            response = ManagerPeerRegistrationResponse.load(result)
 
-                    # Learn about other peers from response
-                    for peer_info in response.known_peers:
-                        if peer_info.node_id != self._node_id.full:
-                            self._known_manager_peers[peer_info.node_id] = peer_info
-                            # AD-29: Do NOT add to active sets here - defer until confirmed
+            if not response.accepted:
+                raise ConnectionError(f"Peer manager {peer_addr} rejected registration")
 
-                            # Update UDP -> TCP mapping
-                            udp_addr = (peer_info.udp_host, peer_info.udp_port)
-                            tcp_addr = (peer_info.tcp_host, peer_info.tcp_port)
-                            self._manager_udp_to_tcp[udp_addr] = tcp_addr
+            return response
 
-                            # AD-29: Track as unconfirmed peer - will be moved to active
-                            # sets when we receive successful SWIM communication
-                            self.add_unconfirmed_peer(udp_addr)
+        try:
+            response = await executor.execute(
+                register_operation,
+                operation_name=f"register_with_peer_manager_{peer_addr}",
+            )
 
-                            # Add to SWIM probing so we can confirm the peer
-                            self._probe_scheduler.add_member(udp_addr)
+            # Add to known peers
+            self._registered_with_managers.add(response.manager_id)
 
-                            # Also populate _manager_peer_info for _get_active_manager_peer_addrs()
-                            # Create initial heartbeat that will be updated by SWIM
-                            if udp_addr not in self._manager_peer_info:
-                                initial_heartbeat = ManagerHeartbeat(
-                                    node_id=peer_info.node_id,
-                                    datacenter=peer_info.datacenter,
-                                    is_leader=(peer_info.node_id == response.manager_id and response.is_leader),
-                                    term=response.term,
-                                    version=0,
-                                    active_jobs=0,
-                                    active_workflows=0,
-                                    worker_count=0,
-                                    healthy_worker_count=0,
-                                    available_cores=0,
-                                    total_cores=0,
-                                    state=ManagerState.ACTIVE.value,
-                                    tcp_host=peer_info.tcp_host,
-                                    tcp_port=peer_info.tcp_port,
-                                    udp_host=peer_info.udp_host,
-                                    udp_port=peer_info.udp_port,
-                                )
-                                self._manager_peer_info[udp_addr] = initial_heartbeat
+            # Learn about other peers from response
+            for peer_info in response.known_peers:
+                if peer_info.node_id != self._node_id.full:
+                    self._known_manager_peers[peer_info.node_id] = peer_info
+                    # AD-29: Do NOT add to active sets here - defer until confirmed
 
-                    if attempt > 0:
-                        self._task_runner.run(
-                            self._udp_logger.log,
-                            ServerInfo(
-                                message=f"Registered with peer manager {peer_addr} after {attempt + 1} attempts",
-                                node_host=self._host,
-                                node_port=self._tcp_port,
-                                node_id=self._node_id.short,
-                            )
+                    # Update UDP -> TCP mapping
+                    udp_addr = (peer_info.udp_host, peer_info.udp_port)
+                    tcp_addr = (peer_info.tcp_host, peer_info.tcp_port)
+                    self._manager_udp_to_tcp[udp_addr] = tcp_addr
+
+                    # AD-29: Track as unconfirmed peer - will be moved to active
+                    # sets when we receive successful SWIM communication
+                    self.add_unconfirmed_peer(udp_addr)
+
+                    # Add to SWIM probing so we can confirm the peer
+                    self._probe_scheduler.add_member(udp_addr)
+
+                    # Also populate _manager_peer_info for _get_active_manager_peer_addrs()
+                    # Create initial heartbeat that will be updated by SWIM
+                    if udp_addr not in self._manager_peer_info:
+                        initial_heartbeat = ManagerHeartbeat(
+                            node_id=peer_info.node_id,
+                            datacenter=peer_info.datacenter,
+                            is_leader=(peer_info.node_id == response.manager_id and response.is_leader),
+                            term=response.term,
+                            version=0,
+                            active_jobs=0,
+                            active_workflows=0,
+                            worker_count=0,
+                            healthy_worker_count=0,
+                            available_cores=0,
+                            total_cores=0,
+                            state=ManagerState.ACTIVE.value,
+                            tcp_host=peer_info.tcp_host,
+                            tcp_port=peer_info.tcp_port,
+                            udp_host=peer_info.udp_host,
+                            udp_port=peer_info.udp_port,
                         )
-                    return True
+                        self._manager_peer_info[udp_addr] = initial_heartbeat
 
-            except Exception as e:
-                error_detail = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
-                self._task_runner.run(
-                    self._udp_logger.log,
-                    ServerError(
-                        message=f"Peer registration attempt {attempt + 1}/{max_retries + 1} failed for {peer_addr}: {error_detail}",
-                        node_host=self._host,
-                        node_port=self._tcp_port,
-                        node_id=self._node_id.short,
-                    )
+            return True
+
+        except Exception as exception:
+            error_detail = f"{type(exception).__name__}: {exception}" if str(exception) else type(exception).__name__
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerError(
+                    message=f"Peer registration failed for {peer_addr} after {max_retries + 1} attempts: {error_detail}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
                 )
-
-            # Exponential backoff before retry
-            if attempt < max_retries:
-                delay = base_delay * (2 ** attempt)
-                await asyncio.sleep(delay)
-
-        return False
+            )
+            return False
 
     async def _register_with_seed_managers(self) -> None:
         """
@@ -3462,20 +3490,15 @@ class ManagerServer(HealthAwareServer):
     ) -> ManagerRegistrationResponse | None:
         """
         Try to register with a single gate.
-        
-        Uses retries with exponential backoff:
-        - Attempt 1: immediate
-        - Attempt 2: 0.5s delay
-        - Attempt 3: 1.0s delay
-        - Attempt 4: 2.0s delay
-        
+
+        Uses RetryExecutor with jittered exponential backoff (AD-21).
         Also respects the circuit breaker - if open, fails fast.
-        
+
         Args:
             gate_addr: (host, port) tuple of gate
             max_retries: Maximum retry attempts (default 3)
             base_delay: Base delay for exponential backoff (default 0.5s)
-            
+
         Returns:
             ManagerRegistrationResponse if successful, None otherwise
         """
@@ -3491,86 +3514,102 @@ class ManagerServer(HealthAwareServer):
                 )
             )
             return None
-        
+
         heartbeat = self._build_manager_heartbeat()
-        
-        for attempt in range(max_retries + 1):
-            try:
-                response, _ = await self.send_tcp(
-                    gate_addr,
-                    "manager_register",
-                    heartbeat.dump(),
-                    timeout=5.0,
+        retry_config = self._create_retry_config(
+            max_attempts=max_retries + 1,
+            base_delay=base_delay,
+        )
+        executor = RetryExecutor(retry_config)
+
+        # Store rejection result so we can return it even after exception handling
+        rejection_result: ManagerRegistrationResponse | None = None
+
+        class GateRejectedError(Exception):
+            """Raised when gate explicitly rejects registration (non-retryable)."""
+            pass
+
+        async def register_operation() -> ManagerRegistrationResponse:
+            nonlocal rejection_result
+
+            response, _ = await self.send_tcp(
+                gate_addr,
+                "manager_register",
+                heartbeat.dump(),
+                timeout=5.0,
+            )
+
+            if isinstance(response, Exception):
+                raise response
+
+            result = ManagerRegistrationResponse.load(response)
+            if result.accepted:
+                return result
+            else:
+                # Gate rejected registration - don't retry
+                rejection_result = result
+                raise GateRejectedError(getattr(result, 'error', 'Unknown error'))
+
+        try:
+            result = await executor.execute(
+                register_operation,
+                operation_name=f"register_with_gate_{gate_addr}",
+            )
+
+            self._gate_circuit.record_success()
+
+            # Store negotiated capabilities (AD-25)
+            gate_version = ProtocolVersion(
+                major=getattr(result, 'protocol_version_major', 1),
+                minor=getattr(result, 'protocol_version_minor', 0),
+            )
+            negotiated_caps_str = getattr(result, 'capabilities', '')
+            negotiated_features = set(negotiated_caps_str.split(',')) if negotiated_caps_str else set()
+
+            self._gate_negotiated_caps[result.gate_id] = NegotiatedCapabilities(
+                local_version=CURRENT_PROTOCOL_VERSION,
+                remote_version=gate_version,
+                common_features=negotiated_features,
+                compatible=True,
+            )
+
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerInfo(
+                    message=f"Registered with gate {gate_addr} (protocol {gate_version}, "
+                            f"{len(negotiated_features)} features)",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
                 )
-                
-                if isinstance(response, Exception):
-                    raise response
-                
-                result = ManagerRegistrationResponse.load(response)
-                if result.accepted:
-                    self._gate_circuit.record_success()
+            )
+            return result
 
-                    # Store negotiated capabilities (AD-25)
-                    gate_version = ProtocolVersion(
-                        major=getattr(result, 'protocol_version_major', 1),
-                        minor=getattr(result, 'protocol_version_minor', 0),
-                    )
-                    negotiated_caps_str = getattr(result, 'capabilities', '')
-                    negotiated_features = set(negotiated_caps_str.split(',')) if negotiated_caps_str else set()
-
-                    self._gate_negotiated_caps[result.gate_id] = NegotiatedCapabilities(
-                        local_version=CURRENT_PROTOCOL_VERSION,
-                        remote_version=gate_version,
-                        common_features=negotiated_features,
-                        compatible=True,
-                    )
-
-                    self._task_runner.run(
-                        self._udp_logger.log,
-                        ServerInfo(
-                            message=f"Registered with gate {gate_addr} (protocol {gate_version}, "
-                                    f"{len(negotiated_features)} features)"
-                                    + (f" after {attempt + 1} attempts" if attempt > 0 else ""),
-                            node_host=self._host,
-                            node_port=self._tcp_port,
-                            node_id=self._node_id.short,
-                        )
-                    )
-                    return result
-                else:
-                    # Gate rejected registration - log error and don't retry
-                    self._gate_circuit.record_error()
-                    error_msg = getattr(result, 'error', 'Unknown error')
-                    self._task_runner.run(
-                        self._udp_logger.log,
-                        ServerWarning(
-                            message=f"Gate {gate_addr} rejected registration: {error_msg}",
-                            node_host=self._host,
-                            node_port=self._tcp_port,
-                            node_id=self._node_id.short,
-                        )
-                    )
-                    return result
-                    
-            except Exception as e:
-                self._task_runner.run(
-                    self._udp_logger.log,
-                    ServerError(
-                        message=f"Gate registration attempt {attempt + 1}/{max_retries + 1} to {gate_addr} failed: {e}",
-                        node_host=self._host,
-                        node_port=self._tcp_port,
-                        node_id=self._node_id.short,
-                    )
+        except GateRejectedError as rejection:
+            self._gate_circuit.record_error()
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerWarning(
+                    message=f"Gate {gate_addr} rejected registration: {rejection}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
                 )
-            
-            # Exponential backoff before retry (except after last attempt)
-            if attempt < max_retries:
-                delay = base_delay * (2 ** attempt)
-                await asyncio.sleep(delay)
-        
-        # All retries exhausted
-        self._gate_circuit.record_error()
-        return None
+            )
+            return rejection_result
+
+        except Exception as exception:
+            self._gate_circuit.record_error()
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerError(
+                    message=f"Gate registration failed for {gate_addr} after {max_retries + 1} attempts: {exception}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            return None
     
     async def stop(
         self,
@@ -3778,7 +3817,34 @@ class ManagerServer(HealthAwareServer):
     def _is_gate_circuit_open(self) -> bool:
         """Check if gate circuit breaker is open (fail-fast mode)."""
         return self._gate_circuit.circuit_state == CircuitState.OPEN
-    
+
+    def _create_retry_config(
+        self,
+        max_attempts: int = 3,
+        base_delay: float = 0.5,
+        max_delay: float = 30.0,
+    ) -> RetryConfig:
+        """
+        Create a standardized retry config with full jitter (AD-21).
+
+        Full jitter provides maximum spread for retry delays, preventing
+        thundering herd when multiple clients retry simultaneously.
+
+        Args:
+            max_attempts: Maximum number of retry attempts (default 3)
+            base_delay: Base delay in seconds for exponential backoff (default 0.5s)
+            max_delay: Maximum delay cap in seconds (default 30s)
+
+        Returns:
+            RetryConfig with JitterStrategy.FULL
+        """
+        return RetryConfig(
+            max_attempts=max_attempts,
+            base_delay=base_delay,
+            max_delay=max_delay,
+            jitter=JitterStrategy.FULL,
+        )
+
     def get_gate_circuit_status(self) -> dict:
         """
         Get current gate circuit breaker status.
@@ -4259,15 +4325,14 @@ class ManagerServer(HealthAwareServer):
         """
         Send job progress to the job leader gate (direct routing).
 
+        Uses RetryExecutor with jittered exponential backoff (AD-21).
+
         Uses Direct DC-to-Job-Leader Routing:
         1. Try origin_gate_addr first (the gate that submitted the job)
         2. If origin gate unreachable, fall back to primary/seed gates
 
-        Uses limited retries with exponential backoff:
-        - Progress updates can be frequent, so we keep retries short
-        - Attempt 1: immediate
-        - Attempt 2: 0.2s delay
-        - Attempt 3: 0.4s delay
+        Uses limited retries with short delays since progress updates
+        are frequent.
 
         The gate responds with JobProgressAck containing updated
         gate topology which we use to maintain redundant channels.
@@ -4292,31 +4357,37 @@ class ManagerServer(HealthAwareServer):
             else:
                 return
 
-        for attempt in range(max_retries + 1):
-            try:
-                response, _ = await self.send_tcp(
-                    gate_addr,
-                    "job_progress",
-                    job.dump(),
-                    timeout=2.0,
-                )
+        retry_config = self._create_retry_config(
+            max_attempts=max_retries + 1,
+            base_delay=base_delay,
+        )
+        executor = RetryExecutor(retry_config)
 
-                # Process ack to update gate topology
-                if response and isinstance(response, bytes) and response != b'error':
-                    self._process_job_progress_ack(response)
-                    self._gate_circuit.record_success()
-                    return  # Success
+        async def send_progress_operation() -> None:
+            response, _ = await self.send_tcp(
+                gate_addr,
+                "job_progress",
+                job.dump(),
+                timeout=2.0,
+            )
 
-            except Exception:
-                pass
+            # Process ack to update gate topology
+            if response and isinstance(response, bytes) and response != b'error':
+                self._process_job_progress_ack(response)
+                self._gate_circuit.record_success()
+                return
 
-            # Exponential backoff before retry (except after last attempt)
-            if attempt < max_retries:
-                delay = base_delay * (2 ** attempt)
-                await asyncio.sleep(delay)
+            # No valid response - raise to trigger retry
+            raise ConnectionError("No valid response from gate")
 
-        # All retries exhausted
-        self._gate_circuit.record_error()
+        try:
+            await executor.execute(
+                send_progress_operation,
+                operation_name=f"send_job_progress_to_gate_{gate_addr}",
+            )
+        except Exception:
+            # All retries exhausted
+            self._gate_circuit.record_error()
     
     async def _send_job_progress_to_all_gates(self, job: JobProgress) -> None:
         """
@@ -4509,10 +4580,7 @@ class ManagerServer(HealthAwareServer):
         """
         Dispatch a workflow to a specific worker.
 
-        Uses retries with exponential backoff:
-        - Attempt 1: immediate
-        - Attempt 2: 0.3s delay
-        - Attempt 3: 0.6s delay
+        Uses RetryExecutor with jittered exponential backoff (AD-21).
 
         Checks and updates the per-worker circuit breaker.
 
@@ -4588,74 +4656,79 @@ class ManagerServer(HealthAwareServer):
             )
         )
 
+        retry_config = self._create_retry_config(
+            max_attempts=max_retries + 1,
+            base_delay=base_delay,
+        )
+        executor = RetryExecutor(retry_config)
+
+        # Store rejection ack so we can return it after exception handling
+        rejection_ack: WorkflowDispatchAck | None = None
+
+        class WorkerRejectedError(Exception):
+            """Raised when worker explicitly rejects dispatch (non-retryable)."""
+            pass
+
+        async def dispatch_operation() -> WorkflowDispatchAck:
+            nonlocal rejection_ack
+
+            response, _ = await self.send_tcp(
+                worker_addr,
+                "workflow_dispatch",
+                dispatch.dump(),
+                timeout=5.0,
+            )
+
+            if isinstance(response, bytes):
+                ack = WorkflowDispatchAck.load(response)
+                if ack.accepted:
+                    return ack
+                else:
+                    # Worker rejected - don't retry (not a transient error)
+                    rejection_ack = ack
+                    raise WorkerRejectedError("Worker rejected dispatch")
+
+            # No valid response - raise to trigger retry
+            raise ConnectionError("No valid response from worker")
+
         # Limit concurrent dispatches to this worker
         async with dispatch_semaphore:
-            for attempt in range(max_retries + 1):
-                try:
-                    self._task_runner.run(
-                        self._udp_logger.log,
-                        ServerInfo(
-                            message=f"TCP send attempt {attempt + 1} to {worker_addr}",
-                            node_host=self._host,
-                            node_port=self._tcp_port,
-                            node_id=self._node_id.short,
-                        )
-                    )
-                    response, _ = await self.send_tcp(
-                        worker_addr,
-                        "workflow_dispatch",
-                        dispatch.dump(),
-                        timeout=5.0,
-                    )
-
-                    if isinstance(response, bytes):
-                        ack = WorkflowDispatchAck.load(response)
-                        if ack.accepted:
-                            circuit.record_success()
-                            # Store dispatch bytes for retry on worker failure
-                            # Key: workflow_id, Value: (retry_count, dispatch_bytes, failed_workers)
-                            self._workflow_retries[workflow_id] = (0, dispatch.dump(), set())
-                            if attempt > 0:
-                                self._task_runner.run(
-                                    self._udp_logger.log,
-                                    ServerInfo(
-                                        message=f"Dispatched to worker {worker_node_id} after {attempt + 1} attempts",
-                                        node_host=self._host,
-                                        node_port=self._tcp_port,
-                                        node_id=self._node_id.short,
-                                    )
-                                )
-                            return ack
-                        else:
-                            # Worker rejected - don't retry (not a transient error)
-                            circuit.record_error()
-                            return ack
-
-                except Exception as e:
-                    self._task_runner.run(
-                        self._udp_logger.log,
-                        ServerError(
-                            message=f"Dispatch attempt {attempt + 1}/{max_retries + 1} to {worker_node_id} failed: {e}",
-                            node_host=self._host,
-                            node_port=self._tcp_port,
-                            node_id=self._node_id.short,
-                        )
-                    )
-
-                # Exponential backoff before retry (except after last attempt)
-                if attempt < max_retries:
-                    delay = base_delay * (2 ** attempt)
-                    await asyncio.sleep(delay)
-
-            # All retries exhausted - suspect worker for this job (AD-30)
-            circuit.record_error()
-            if worker_addr and dispatch.job_id:
-                self._task_runner.run(
-                    self._suspect_worker_for_job,
-                    dispatch.job_id,
-                    worker_addr,
+            try:
+                ack = await executor.execute(
+                    dispatch_operation,
+                    operation_name=f"dispatch_workflow_to_worker_{worker_node_id}",
                 )
-            return None
+
+                circuit.record_success()
+                # Store dispatch bytes for retry on worker failure
+                # Key: workflow_id, Value: (retry_count, dispatch_bytes, failed_workers)
+                self._workflow_retries[workflow_id] = (0, dispatch.dump(), set())
+                return ack
+
+            except WorkerRejectedError:
+                circuit.record_error()
+                return rejection_ack
+
+            except Exception as exception:
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerError(
+                        message=f"Dispatch to {worker_node_id} failed after {max_retries + 1} attempts: {exception}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+
+                # All retries exhausted - suspect worker for this job (AD-30)
+                circuit.record_error()
+                if worker_addr and dispatch.job_id:
+                    self._task_runner.run(
+                        self._suspect_worker_for_job,
+                        dispatch.job_id,
+                        worker_addr,
+                    )
+                return None
     
     async def _request_quorum_confirmation(
         self,
@@ -8556,6 +8629,8 @@ class ManagerServer(HealthAwareServer):
         """
         Cancel a single running dependent workflow with retry (AD-33 Issue 3 fix).
 
+        Uses RetryExecutor with jittered exponential backoff (AD-21).
+
         Args:
             job_id: Job ID
             dep_id: Dependent workflow ID to cancel
@@ -8576,72 +8651,67 @@ class ManagerServer(HealthAwareServer):
             ))
             return False
 
-        for attempt in range(max_retries):
-            try:
-                # Transition to CANCELLING on first attempt
-                if attempt == 0 and self._workflow_lifecycle_states:
-                    await self._workflow_lifecycle_states.transition(
-                        dep_id,
-                        WorkflowState.CANCELLING,
-                        reason="parent workflow failed"
-                    )
+        # Transition to CANCELLING before retry loop starts
+        if self._workflow_lifecycle_states:
+            await self._workflow_lifecycle_states.transition(
+                dep_id,
+                WorkflowState.CANCELLING,
+                reason="parent workflow failed"
+            )
 
-                # Send cancel request to worker
-                cancel_req = WorkflowCancelRequest(
-                    job_id=job_id,
-                    workflow_id=dep_id,
-                    requester_id="manager_failure_handler",
-                    timestamp=time.monotonic(),
+        retry_config = self._create_retry_config(
+            max_attempts=max_retries,
+            base_delay=retry_delay_base,
+        )
+        executor = RetryExecutor(retry_config)
+
+        async def cancel_operation() -> bool:
+            # Send cancel request to worker
+            cancel_req = WorkflowCancelRequest(
+                job_id=job_id,
+                workflow_id=dep_id,
+                requester_id="manager_failure_handler",
+                timestamp=time.monotonic(),
+            )
+            response, _ = await self.send_tcp(
+                worker_addr,
+                "cancel_workflow",
+                cancel_req.dump(),
+                timeout=5.0,
+            )
+
+            # Verify cancellation
+            if isinstance(response, bytes):
+                wf_response = WorkflowCancelResponse.load(response)
+                if wf_response.success:
+                    return True
+
+            # Worker returned non-success - raise to trigger retry
+            raise ConnectionError("Worker returned non-success for cancellation")
+
+        try:
+            result = await executor.execute(
+                cancel_operation,
+                operation_name=f"cancel_dependent_workflow_{dep_id}",
+            )
+
+            # Transition to CANCELLED on success
+            if result and self._workflow_lifecycle_states:
+                await self._workflow_lifecycle_states.transition(
+                    dep_id,
+                    WorkflowState.CANCELLED,
+                    reason="worker confirmed cancellation"
                 )
-                response, _ = await self.send_tcp(
-                    worker_addr,
-                    "cancel_workflow",
-                    cancel_req.dump(),
-                    timeout=5.0,
-                )
+            return result
 
-                # Verify cancellation
-                if isinstance(response, bytes):
-                    wf_response = WorkflowCancelResponse.load(response)
-                    if wf_response.success:
-                        # Transition to CANCELLED
-                        if self._workflow_lifecycle_states:
-                            await self._workflow_lifecycle_states.transition(
-                                dep_id,
-                                WorkflowState.CANCELLED,
-                                reason="worker confirmed cancellation"
-                            )
-                        return True
-
-                # If we got a response but not success, log and retry
-                await self._udp_logger.log(ServerWarning(
-                    message=f"Cancel attempt {attempt + 1}/{max_retries} for {dep_id} failed - worker returned non-success",
-                    node_host=self._host,
-                    node_port=self._tcp_port,
-                    node_id=self._node_id.short,
-                ))
-
-            except Exception as e:
-                await self._udp_logger.log(ServerWarning(
-                    message=f"Cancel attempt {attempt + 1}/{max_retries} for {dep_id} failed: {e}",
-                    node_host=self._host,
-                    node_port=self._tcp_port,
-                    node_id=self._node_id.short,
-                ))
-
-            # Exponential backoff before retry (except on last attempt)
-            if attempt < max_retries - 1:
-                delay = retry_delay_base * (2 ** attempt)
-                await asyncio.sleep(delay)
-
-        # All retries exhausted
-        await self._udp_logger.log(ServerError(
-            message=f"Failed to cancel dependent workflow {dep_id} after {max_retries} attempts",
-            node_host=self._host,
-            node_port=self._tcp_port,
-            node_id=self._node_id.short,
-        ))
-        return False
+        except Exception as exception:
+            await self._udp_logger.log(ServerError(
+                message=f"Failed to cancel dependent workflow {dep_id} after {max_retries} attempts: {exception}",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            ))
+            return False
 
     async def _cancel_dependent_workflows_for_failure(
         self,

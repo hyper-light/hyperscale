@@ -109,6 +109,12 @@ from hyperscale.distributed_rewrite.models import (
     JobLeaderManagerTransfer,
     JobLeaderManagerTransferAck,
     restricted_loads,
+    # AD-34: Multi-DC timeout coordination messages
+    JobProgressReport,
+    JobTimeoutReport,
+    JobGlobalTimeout,
+    JobLeaderTransfer,
+    JobFinalStatus,
 )
 from hyperscale.distributed_rewrite.swim.core import (
     QuorumError,
@@ -1619,7 +1625,7 @@ class GateServer(HealthAwareServer):
         """
         Sync state from active gate peers when becoming leader.
 
-        Uses exponential backoff for retries to handle transient failures.
+        Uses RetryExecutor with jittered exponential backoff (AD-21).
         Handles the case where peers are not ready (still in SYNCING state)
         by retrying until the peer becomes ACTIVE or retries are exhausted.
         """
@@ -1636,45 +1642,9 @@ class GateServer(HealthAwareServer):
         max_retries = 3
 
         for peer_addr in self._active_gate_peers:
-            for attempt in range(max_retries):
-                try:
-                    response, _ = await self.send_tcp(
-                        peer_addr,
-                        "gate_state_sync_request",
-                        request.dump(),
-                        timeout=5.0 * (attempt + 1),  # Exponential backoff
-                    )
-
-                    if isinstance(response, bytes) and response:
-                        sync_response = StateSyncResponse.load(response)
-
-                        # Check if peer is ready to serve state
-                        if not sync_response.responder_ready:
-                            # Peer is alive but not ready yet - retry
-                            if attempt < max_retries - 1:
-                                await asyncio.sleep(0.5 * (2 ** attempt))
-                                continue
-                            # Last attempt - log warning and move on
-                            await self._udp_logger.log(
-                                ServerWarning(
-                                    message=f"Gate peer {peer_addr} not ready for state sync after {max_retries} attempts",
-                                    node_host=self._host,
-                                    node_port=self._tcp_port,
-                                    node_id=self._node_id.short,
-                                )
-                            )
-                            break
-
-                        if sync_response.gate_state:
-                            self._apply_gate_state_snapshot(sync_response.gate_state)
-                            synced_count += 1
-                    break  # Success or no state available
-
-                except Exception as e:
-                    if attempt == max_retries - 1:
-                        await self.handle_exception(e, f"state_sync_from_{peer_addr}")
-                    else:
-                        await asyncio.sleep(0.5 * (2 ** attempt))  # Backoff
+            synced = await self._sync_state_from_single_peer(peer_addr, request, max_retries)
+            if synced:
+                synced_count += 1
 
         await self._udp_logger.log(
             ServerInfo(
@@ -1684,6 +1654,80 @@ class GateServer(HealthAwareServer):
                 node_id=self._node_id.short,
             )
         )
+
+    async def _sync_state_from_single_peer(
+        self,
+        peer_addr: tuple[str, int],
+        request: StateSyncRequest,
+        max_retries: int,
+    ) -> bool:
+        """
+        Sync state from a single gate peer with retry.
+
+        Uses RetryExecutor with jittered exponential backoff (AD-21).
+        Handles peer-not-ready by raising a retryable exception.
+
+        Returns True if state was successfully synced, False otherwise.
+        """
+        class PeerNotReadyError(Exception):
+            """Raised when peer is alive but not ready for state sync."""
+            pass
+
+        retry_config = RetryConfig(
+            max_attempts=max_retries,
+            base_delay=0.5,
+            max_delay=30.0,
+            jitter=JitterStrategy.FULL,
+            retryable_exceptions=(
+                ConnectionError,
+                TimeoutError,
+                OSError,
+                PeerNotReadyError,  # Include peer-not-ready as retryable
+            ),
+        )
+        executor = RetryExecutor(retry_config)
+
+        async def sync_operation() -> bool:
+            response, _ = await self.send_tcp(
+                peer_addr,
+                "gate_state_sync_request",
+                request.dump(),
+                timeout=5.0,
+            )
+
+            if isinstance(response, bytes) and response:
+                sync_response = StateSyncResponse.load(response)
+
+                # Check if peer is ready to serve state
+                if not sync_response.responder_ready:
+                    # Peer is alive but not ready yet - raise to trigger retry
+                    raise PeerNotReadyError(f"Peer {peer_addr} not ready for state sync")
+
+                if sync_response.gate_state:
+                    self._apply_gate_state_snapshot(sync_response.gate_state)
+                    return True
+
+            # Empty response means no state available - success (nothing to sync)
+            return False
+
+        try:
+            return await executor.execute(
+                sync_operation,
+                operation_name=f"sync_state_from_peer_{peer_addr}",
+            )
+        except PeerNotReadyError:
+            await self._udp_logger.log(
+                ServerWarning(
+                    message=f"Gate peer {peer_addr} not ready for state sync after {max_retries} attempts",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            return False
+        except Exception as exception:
+            await self.handle_exception(exception, f"state_sync_from_{peer_addr}")
+            return False
     
     def _apply_gate_state_snapshot(self, snapshot: GateStateSnapshot) -> None:
         """
@@ -1804,7 +1848,34 @@ class GateServer(HealthAwareServer):
     def get_all_manager_circuit_status(self) -> dict:
         """Get circuit breaker status for all managers."""
         return self._circuit_breaker_manager.get_all_circuit_status()
-    
+
+    def _create_retry_config(
+        self,
+        max_attempts: int = 3,
+        base_delay: float = 0.5,
+        max_delay: float = 30.0,
+    ) -> RetryConfig:
+        """
+        Create a standardized retry config with full jitter (AD-21).
+
+        Full jitter provides maximum spread for retry delays, preventing
+        thundering herd when multiple clients retry simultaneously.
+
+        Args:
+            max_attempts: Maximum number of retry attempts (default 3)
+            base_delay: Base delay in seconds for exponential backoff (default 0.5s)
+            max_delay: Maximum delay cap in seconds (default 30s)
+
+        Returns:
+            RetryConfig with JitterStrategy.FULL
+        """
+        return RetryConfig(
+            max_attempts=max_attempts,
+            base_delay=base_delay,
+            max_delay=max_delay,
+            jitter=JitterStrategy.FULL,
+        )
+
     def _count_active_datacenters(self) -> int:
         """
         Count datacenters with at least one fresh manager heartbeat.
@@ -2603,41 +2674,43 @@ class GateServer(HealthAwareServer):
         """
         Try to dispatch job to a single manager with retries.
 
-        Uses retries with exponential backoff:
-        - Attempt 1: immediate
-        - Attempt 2: 0.3s delay
-        - Attempt 3: 0.6s delay
+        Uses RetryExecutor with jittered exponential backoff (AD-21):
+        - max_attempts = max_retries + 1 (to match original semantics)
+        - Full jitter prevents thundering herd on retries
         """
         if self._is_manager_circuit_open(manager_addr):
             return (False, "Circuit breaker is OPEN")
 
         circuit = self._get_manager_circuit(manager_addr)
+        retry_config = self._create_retry_config(
+            max_attempts=max_retries + 1,
+            base_delay=base_delay,
+        )
+        executor = RetryExecutor(retry_config)
 
-        for attempt in range(max_retries + 1):
-            try:
-                response, _ = await self.send_tcp(
-                    manager_addr,
-                    "job_submission",
-                    submission.dump(),
-                    timeout=5.0,
-                )
+        async def dispatch_operation() -> tuple[bool, str | None]:
+            response, _ = await self.send_tcp(
+                manager_addr,
+                "job_submission",
+                submission.dump(),
+                timeout=5.0,
+            )
 
-                if isinstance(response, bytes):
-                    ack = JobAck.load(response)
-                    return self._process_dispatch_ack(ack, manager_addr, circuit)
+            if isinstance(response, bytes):
+                ack = JobAck.load(response)
+                return self._process_dispatch_ack(ack, manager_addr, circuit)
 
-            except Exception as exception:
-                if attempt == max_retries:
-                    self._record_dispatch_failure(manager_addr, circuit)
-                    return (False, str(exception))
+            # No valid response - raise to trigger retry
+            raise ConnectionError("No valid response from manager")
 
-            # Exponential backoff before retry
-            if attempt < max_retries:
-                delay = base_delay * (2 ** attempt)
-                await asyncio.sleep(delay)
-
-        self._record_dispatch_failure(manager_addr, circuit)
-        return (False, "Unknown error")
+        try:
+            return await executor.execute(
+                dispatch_operation,
+                operation_name=f"dispatch_to_manager_{manager_addr}",
+            )
+        except Exception as exception:
+            self._record_dispatch_failure(manager_addr, circuit)
+            return (False, str(exception))
     
     async def _try_dispatch_to_dc(
         self,
@@ -3237,52 +3310,57 @@ class GateServer(HealthAwareServer):
     ) -> bool:
         """
         Request and apply state snapshot from a peer gate.
-        
-        Uses exponential backoff for retries.
-        
+
+        Uses RetryExecutor with jittered exponential backoff (AD-21).
+
         Returns True if sync succeeded, False otherwise.
         """
-        max_retries = 3
-        base_delay = 0.5
-        
-        for attempt in range(max_retries):
-            try:
-                request = StateSyncRequest(
-                    requester_id=self._node_id.full,
-                    requester_role=NodeRole.GATE.value,
-                    since_version=self._state_version,
+        retry_config = self._create_retry_config(
+            max_attempts=3,
+            base_delay=0.5,
+        )
+        executor = RetryExecutor(retry_config)
+
+        async def sync_operation() -> bool:
+            request = StateSyncRequest(
+                requester_id=self._node_id.full,
+                requester_role=NodeRole.GATE.value,
+                since_version=self._state_version,
+            )
+
+            result, _ = await self.send_tcp(
+                peer_tcp_addr,
+                "state_sync",
+                request.dump(),
+                timeout=5.0,
+            )
+
+            if isinstance(result, bytes) and len(result) > 0:
+                response = StateSyncResponse.load(result)
+                if response.success and response.snapshot:
+                    snapshot = GateStateSnapshot.load(response.snapshot)
+                    await self._apply_gate_state_snapshot(snapshot)
+                    return True
+
+            # No valid response - raise to trigger retry
+            raise ConnectionError("No valid state sync response from peer")
+
+        try:
+            return await executor.execute(
+                sync_operation,
+                operation_name=f"sync_state_from_gate_peer_{peer_tcp_addr}",
+            )
+        except Exception as exception:
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerError(
+                    message=f"State sync failed after retries: {exception}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
                 )
-                
-                result, _ = await self.send_tcp(
-                    peer_tcp_addr,
-                    "state_sync",
-                    request.dump(),
-                    timeout=5.0,
-                )
-                
-                if isinstance(result, bytes) and len(result) > 0:
-                    response = StateSyncResponse.load(result)
-                    if response.success and response.snapshot:
-                        snapshot = GateStateSnapshot.load(response.snapshot)
-                        await self._apply_gate_state_snapshot(snapshot)
-                        return True
-                        
-            except Exception as e:
-                self._task_runner.run(
-                    self._udp_logger.log,
-                    ServerError(
-                        message=f"State sync attempt {attempt + 1} failed: {e}",
-                        node_host=self._host,
-                        node_port=self._tcp_port,
-                        node_id=self._node_id.short,
-                    )
-                )
-            
-            # Exponential backoff
-            delay = base_delay * (2 ** attempt)
-            await asyncio.sleep(delay)
-        
-        return False
+            )
+            return False
     
     async def _apply_gate_state_snapshot(
         self,
@@ -3438,7 +3516,7 @@ class GateServer(HealthAwareServer):
         """
         Try to register with a single manager.
 
-        Uses retries with exponential backoff.
+        Uses RetryExecutor with jittered exponential backoff (AD-21).
 
         Args:
             manager_addr: (host, port) tuple of manager
@@ -3466,27 +3544,33 @@ class GateServer(HealthAwareServer):
             capabilities=",".join(sorted(self._node_capabilities.capabilities)),
         )
 
-        for attempt in range(max_retries + 1):
-            try:
-                response, _ = await self.send_tcp(
-                    manager_addr,
-                    "gate_register",
-                    request.dump(),
-                    timeout=5.0,
-                )
+        retry_config = self._create_retry_config(
+            max_attempts=max_retries + 1,
+            base_delay=base_delay,
+        )
+        executor = RetryExecutor(retry_config)
 
-                if isinstance(response, bytes) and len(response) > 0:
-                    return GateRegistrationResponse.load(response)
+        async def register_operation() -> GateRegistrationResponse:
+            response, _ = await self.send_tcp(
+                manager_addr,
+                "gate_register",
+                request.dump(),
+                timeout=5.0,
+            )
 
-            except Exception:
-                pass
+            if isinstance(response, bytes) and len(response) > 0:
+                return GateRegistrationResponse.load(response)
 
-            # Exponential backoff between retries
-            if attempt < max_retries:
-                delay = base_delay * (2 ** attempt)
-                await asyncio.sleep(delay)
+            # No valid response - raise to trigger retry
+            raise ConnectionError("No valid registration response from manager")
 
-        return None
+        try:
+            return await executor.execute(
+                register_operation,
+                operation_name=f"register_with_manager_{manager_addr}",
+            )
+        except Exception:
+            return None
 
     async def start(self) -> None:
         """
