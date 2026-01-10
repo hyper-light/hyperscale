@@ -2553,7 +2553,13 @@ class WorkerServer(HealthAwareServer):
 
         Runs continuously while the worker is active, flushing all buffered
         progress updates at a controlled interval. Respects backpressure signals
-        from managers to adjust update frequency (AD-23).
+        from managers to adjust update frequency (AD-23/AD-37).
+
+        AD-37 Backpressure behavior:
+        - NONE: Flush all updates immediately
+        - THROTTLE: Flush with added delay (handled by _get_effective_flush_interval)
+        - BATCH: Aggregate by job_id, send fewer combined updates
+        - REJECT: Drop non-critical updates entirely
         """
         while self._running:
             try:
@@ -2561,10 +2567,10 @@ class WorkerServer(HealthAwareServer):
                 effective_interval = self._get_effective_flush_interval()
                 await asyncio.sleep(effective_interval)
 
-                # Skip if under heavy backpressure (BATCH or REJECT level)
                 max_backpressure = self._get_max_backpressure_level()
+
+                # AD-37: REJECT level - drop all non-critical updates
                 if max_backpressure >= BackpressureLevel.REJECT:
-                    # Drop non-critical updates under heavy backpressure
                     async with self._progress_buffer_lock:
                         self._progress_buffer.clear()
                     continue
@@ -2575,6 +2581,10 @@ class WorkerServer(HealthAwareServer):
                         continue
                     updates_to_send = dict(self._progress_buffer)
                     self._progress_buffer.clear()
+
+                # AD-37: BATCH level - aggregate by job_id, send fewer updates
+                if max_backpressure >= BackpressureLevel.BATCH:
+                    updates_to_send = self._aggregate_progress_by_job(updates_to_send)
 
                 # Send buffered updates to job leaders
                 # Uses _send_progress_to_job_leader which routes to the correct
@@ -2587,6 +2597,76 @@ class WorkerServer(HealthAwareServer):
                 break
             except Exception:
                 pass
+
+    def _aggregate_progress_by_job(
+        self,
+        updates: dict[str, "WorkflowProgress"],
+    ) -> dict[str, "WorkflowProgress"]:
+        """
+        Aggregate progress updates by job_id for BATCH mode (AD-37).
+
+        Under BATCH backpressure, we reduce update count by keeping only
+        the most representative update per job. This reduces network traffic
+        while still providing visibility into job progress.
+
+        Strategy:
+        - Group updates by job_id
+        - For each job, keep the update with highest completed_count (most progress)
+        - Aggregate total counts across all workflows in the job
+
+        Args:
+            updates: Dictionary of workflow_id -> WorkflowProgress
+
+        Returns:
+            Reduced dictionary with one representative update per job
+        """
+        if not updates:
+            return updates
+
+        # Group by job_id
+        by_job: dict[str, list["WorkflowProgress"]] = {}
+        for workflow_id, progress in updates.items():
+            job_id = progress.job_id
+            if job_id not in by_job:
+                by_job[job_id] = []
+            by_job[job_id].append(progress)
+
+        # For each job, create an aggregated update
+        aggregated: dict[str, "WorkflowProgress"] = {}
+        for job_id, job_updates in by_job.items():
+            if len(job_updates) == 1:
+                # Single update - no aggregation needed
+                aggregated[job_updates[0].workflow_id] = job_updates[0]
+            else:
+                # Multiple workflows for same job - aggregate
+                # Keep the update with most progress as representative
+                best_update = max(job_updates, key=lambda p: p.completed_count)
+
+                # Sum counts across all workflows for this job
+                total_completed = sum(p.completed_count for p in job_updates)
+                total_failed = sum(p.failed_count for p in job_updates)
+                total_rate = sum(p.rate_per_second for p in job_updates)
+                max_elapsed = max(p.elapsed_seconds for p in job_updates)
+
+                # Create aggregated progress using the representative update
+                # We modify the counts to reflect aggregate across workflows
+                aggregated_progress = WorkflowProgress(
+                    job_id=job_id,
+                    workflow_id=best_update.workflow_id,
+                    workflow_name=best_update.workflow_name,
+                    status=best_update.status,
+                    completed_count=total_completed,
+                    failed_count=total_failed,
+                    rate_per_second=total_rate,
+                    elapsed_seconds=max_elapsed,
+                    step_stats=best_update.step_stats,
+                    timestamp=best_update.timestamp,
+                    collected_at=best_update.collected_at,
+                    assigned_cores=best_update.assigned_cores,
+                )
+                aggregated[best_update.workflow_id] = aggregated_progress
+
+        return aggregated
 
     def _get_effective_flush_interval(self) -> float:
         """

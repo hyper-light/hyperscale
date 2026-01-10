@@ -968,12 +968,13 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         Separates the message content from any embedded state, processes
         the state if present, and returns the clean message.
 
-        Wire format: msg_type>host:port#|sbase64_state#|mtype:inc:host:port#|hentry1;entry2
+        Wire format: msg_type>host:port#|sbase64_state#|mtype:inc:host:port#|hentry1;entry2#|v{json}
 
         All piggyback uses consistent #|x pattern - parsing is unambiguous:
-        1. Strip health gossip (#|h...) - added last, strip first
-        2. Strip membership piggyback (#|m...) - added second, strip second
-        3. Extract state (#|s...) - part of base message
+        1. Strip Vivaldi coordinates (#|v...) - AD-35 Task 12.2.3, added last, strip first
+        2. Strip health gossip (#|h...) - added second to last, strip second
+        3. Strip membership piggyback (#|m...) - added third to last, strip third
+        4. Extract state (#|s...) - part of base message
 
         Args:
             message: Raw message that may contain embedded state and piggyback.
@@ -985,27 +986,37 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         # Track boundaries to avoid repeated slicing until the end
         # msg_end marks where the core message ends (before any piggyback)
         msg_end = len(message)
+        vivaldi_piggyback: bytes | None = None
         health_piggyback: bytes | None = None
         membership_piggyback: bytes | None = None
 
-        # Step 1: Find health gossip piggyback (#|h...)
-        # Health is always appended last, so strip first
-        health_idx = message.find(self._HEALTH_SEPARATOR)
+        # Step 1: Find Vivaldi coordinate piggyback (#|v...) - AD-35 Task 12.2.3
+        # Vivaldi is always appended last, so strip first
+        vivaldi_idx = message.find(b"#|v")
+        if vivaldi_idx > 0:
+            vivaldi_piggyback = message[vivaldi_idx + 3:]  # Skip '#|v' separator
+            msg_end = vivaldi_idx
+
+        # Step 2: Find health gossip piggyback (#|h...)
+        # Health is added second to last, strip second
+        health_idx = message.find(self._HEALTH_SEPARATOR, 0, msg_end)
         if health_idx > 0:
             health_piggyback = message[health_idx:]
             msg_end = health_idx
 
-        # Step 2: Find membership piggyback (#|m...) in the remaining portion
+        # Step 3: Find membership piggyback (#|m...) in the remaining portion
         membership_idx = message.find(self._MEMBERSHIP_SEPARATOR, 0, msg_end)
         if membership_idx > 0:
             membership_piggyback = message[membership_idx:msg_end]
             msg_end = membership_idx
 
-        # Step 3: Find message structure in core message only
+        # Step 4: Find message structure in core message only
         # Format: msg_type>host:port#|sbase64_state
         addr_sep_idx = message.find(b">", 0, msg_end)
         if addr_sep_idx < 0:
             # No address separator - process piggyback and return
+            if vivaldi_piggyback:
+                self._process_vivaldi_piggyback(vivaldi_piggyback, source_addr)
             if health_piggyback:
                 self._health_gossip_buffer.decode_and_process_piggyback(
                     health_piggyback
@@ -1018,6 +1029,8 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         state_sep_idx = message.find(self._STATE_SEPARATOR, addr_sep_idx, msg_end)
 
         # Process piggyback data (can happen in parallel with state processing)
+        if vivaldi_piggyback:
+            self._process_vivaldi_piggyback(vivaldi_piggyback, source_addr)
         if health_piggyback:
             self._health_gossip_buffer.decode_and_process_piggyback(health_piggyback)
         if membership_piggyback:
@@ -1042,15 +1055,63 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         # Return message up to state separator (excludes state and all piggyback)
         return message[:state_sep_idx]
 
+    def _process_vivaldi_piggyback(
+        self,
+        vivaldi_data: bytes,
+        source_addr: tuple[str, int],
+    ) -> None:
+        """
+        Process Vivaldi coordinate piggyback from peer (AD-35 Task 12.2.4).
+
+        Extracts peer's Vivaldi coordinate, calculates RTT if this is an ACK
+        response to our probe, and updates the CoordinateTracker.
+
+        Args:
+            vivaldi_data: JSON-encoded coordinate dictionary
+            source_addr: Sender's address tuple
+        """
+        try:
+            import json
+            from hyperscale.distributed_rewrite.models.coordinates import NetworkCoordinate
+
+            coord_dict = json.loads(vivaldi_data)
+            peer_coord = NetworkCoordinate.from_dict(coord_dict)
+
+            # Check if this is a response to our probe (we have start time)
+            probe_start = self._pending_probe_start.get(source_addr)
+            if probe_start is not None:
+                # Calculate RTT in milliseconds
+                rtt_seconds = time.monotonic() - probe_start
+                rtt_ms = rtt_seconds * 1000.0
+
+                # Update coordinate tracker with RTT measurement (AD-35 Task 12.2.6)
+                peer_id = f"{source_addr[0]}:{source_addr[1]}"
+                self._coordinate_tracker.update_peer_coordinate(
+                    peer_id=peer_id,
+                    peer_coordinate=peer_coord,
+                    rtt_ms=rtt_ms,
+                )
+            else:
+                # No RTT measurement available - just store coordinate
+                peer_id = f"{source_addr[0]}:{source_addr[1]}"
+                # Store coordinate without updating (no RTT measurement)
+                self._coordinate_tracker._peers[peer_id] = peer_coord
+                self._coordinate_tracker._peer_last_seen[peer_id] = time.monotonic()
+
+        except Exception:
+            # Invalid JSON or coordinate data - ignore silently
+            # Don't let coordinate processing errors break message handling
+            pass
+
     # === Message Size Helpers ===
 
     def _add_piggyback_safe(self, base_message: bytes) -> bytes:
         """
         Add piggybacked gossip updates to a message, respecting MTU limits.
 
-        This adds both membership gossip and health gossip (Phase 6.1) to
-        outgoing messages for O(log n) dissemination of both membership
-        and health state.
+        This adds membership gossip, health gossip (Phase 6.1), and Vivaldi
+        coordinates (AD-35 Task 12.2.5) to outgoing messages for O(log n)
+        dissemination of both membership, health state, and network coordinates.
 
         Args:
             base_message: The core message to send.
@@ -1085,7 +1146,22 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             max_size=remaining,
         )
 
-        return message_with_membership + health_gossip
+        message_with_health = message_with_membership + health_gossip
+
+        # AD-35 Task 12.2.5: Add Vivaldi coordinates (format: #|v{json})
+        # Only add if there's room - coordinates are ~80-150 bytes
+        remaining_after_health = MAX_UDP_PAYLOAD - len(message_with_health)
+        if remaining_after_health >= 150:
+            import json
+            coord = self._coordinate_tracker.get_coordinate()
+            coord_dict = coord.to_dict()
+            coord_json = json.dumps(coord_dict, separators=(',', ':')).encode()
+            vivaldi_piggyback = b"#|v" + coord_json
+
+            if len(message_with_health) + len(vivaldi_piggyback) <= MAX_UDP_PAYLOAD:
+                return message_with_health + vivaldi_piggyback
+
+        return message_with_health
 
     def _check_message_size(self, message: bytes) -> bool:
         """
