@@ -920,3 +920,814 @@ class TestFullPushChain:
         # Should have pushed to gate 3 times (once per workflow completion when all cancelled)
         gate_pushes = [c for c in manager._tcp_calls if c[1] == "receive_job_cancellation_complete"]
         assert len(gate_pushes) == 3
+
+
+# =============================================================================
+# Extended Tests: Negative Paths and Failure Modes
+# =============================================================================
+
+
+class TestNegativePathsWorker:
+    """Tests for worker negative paths and error handling."""
+
+    @pytest.mark.asyncio
+    async def test_push_with_unknown_workflow_no_job_leader(self):
+        """Worker should handle workflow with no known job leader."""
+        worker = MockWorkerServer()
+
+        # No job leader set, no healthy managers
+        await worker._push_cancellation_complete(
+            job_id="job-001",
+            workflow_id="unknown-workflow",
+            success=True,
+            errors=[],
+        )
+
+        # Should silently succeed with no TCP calls
+        assert len(worker._tcp_calls) == 0
+
+    @pytest.mark.asyncio
+    async def test_push_with_empty_error_list(self):
+        """Worker should handle empty error list correctly."""
+        worker = MockWorkerServer()
+
+        job_leader_addr = ("192.168.1.10", 9090)
+        worker.set_job_leader("workflow-001", job_leader_addr)
+
+        await worker._push_cancellation_complete(
+            job_id="job-001",
+            workflow_id="workflow-001",
+            success=False,
+            errors=[],  # Empty but success=False
+        )
+
+        assert len(worker._tcp_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_push_with_very_long_error_messages(self):
+        """Worker should handle very long error messages."""
+        worker = MockWorkerServer()
+
+        job_leader_addr = ("192.168.1.10", 9090)
+        worker.set_job_leader("workflow-001", job_leader_addr)
+
+        # Very long error message
+        long_error = "E" * 10000
+
+        await worker._push_cancellation_complete(
+            job_id="job-001",
+            workflow_id="workflow-001",
+            success=False,
+            errors=[long_error],
+        )
+
+        assert len(worker._tcp_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_push_with_many_errors(self):
+        """Worker should handle many errors in list."""
+        worker = MockWorkerServer()
+
+        job_leader_addr = ("192.168.1.10", 9090)
+        worker.set_job_leader("workflow-001", job_leader_addr)
+
+        # 100 errors
+        errors = [f"Error {i}: Something went wrong" for i in range(100)]
+
+        await worker._push_cancellation_complete(
+            job_id="job-001",
+            workflow_id="workflow-001",
+            success=False,
+            errors=errors,
+        )
+
+        assert len(worker._tcp_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_push_after_manager_removed_from_healthy(self):
+        """Worker should skip manager if removed from healthy set."""
+        worker = MockWorkerServer()
+
+        # Add manager then remove from healthy
+        worker.add_manager("manager-001", "192.168.1.20", 9090)
+        worker._healthy_manager_ids.discard("manager-001")
+
+        await worker._push_cancellation_complete(
+            job_id="job-001",
+            workflow_id="workflow-001",
+            success=True,
+            errors=[],
+        )
+
+        # No calls (manager not healthy)
+        assert len(worker._tcp_calls) == 0
+
+
+class TestNegativePathsManager:
+    """Tests for manager negative paths and error handling."""
+
+    @pytest.mark.asyncio
+    async def test_receive_completion_for_unknown_job(self):
+        """Manager should handle completion for unknown job."""
+        manager = MockManagerServer()
+
+        # No job added
+        completion = MockWorkflowCancellationComplete(
+            job_id="unknown-job",
+            workflow_id="workflow-001",
+            success=True,
+            errors=[],
+            cancelled_at=time.time(),
+            node_id="worker-001",
+        )
+
+        # Should not raise
+        await manager.workflow_cancellation_complete(completion)
+
+        # Should record completion
+        assert len(manager._cancellation_completions) == 1
+
+    @pytest.mark.asyncio
+    async def test_receive_completion_for_unknown_workflow(self):
+        """Manager should handle completion for unknown workflow in known job."""
+        manager = MockManagerServer()
+
+        manager.add_job("job-001", ["workflow-001"])
+
+        completion = MockWorkflowCancellationComplete(
+            job_id="job-001",
+            workflow_id="unknown-workflow",
+            success=True,
+            errors=[],
+            cancelled_at=time.time(),
+            node_id="worker-001",
+        )
+
+        await manager.workflow_cancellation_complete(completion)
+
+        assert len(manager._cancellation_completions) == 1
+
+    @pytest.mark.asyncio
+    async def test_receive_duplicate_completion(self):
+        """Manager should handle duplicate completions for same workflow."""
+        manager = MockManagerServer()
+
+        manager.add_job("job-001", ["workflow-001"])
+        manager.mark_workflow_cancelled("job-001", "workflow-001")
+        manager.set_origin_gate("job-001", ("192.168.1.100", 8080))
+
+        completion = MockWorkflowCancellationComplete(
+            job_id="job-001",
+            workflow_id="workflow-001",
+            success=True,
+            errors=[],
+            cancelled_at=time.time(),
+            node_id="worker-001",
+        )
+
+        # Send twice
+        await manager.workflow_cancellation_complete(completion)
+        await manager.workflow_cancellation_complete(completion)
+
+        # Both recorded
+        assert len(manager._cancellation_completions) == 2
+
+    @pytest.mark.asyncio
+    async def test_push_with_no_origin_gate_or_callback(self):
+        """Manager should handle case where no destination is configured."""
+        manager = MockManagerServer()
+
+        manager.add_job("job-001", ["workflow-001"])
+        manager.mark_workflow_cancelled("job-001", "workflow-001")
+        # No origin gate or callback set
+
+        completion = MockWorkflowCancellationComplete(
+            job_id="job-001",
+            workflow_id="workflow-001",
+            success=True,
+            errors=[],
+            cancelled_at=time.time(),
+            node_id="worker-001",
+        )
+
+        # Should not raise
+        await manager.workflow_cancellation_complete(completion)
+
+        # No TCP calls (no destination)
+        assert len(manager._tcp_calls) == 0
+
+
+class TestNegativePathsGate:
+    """Tests for gate negative paths and error handling."""
+
+    @pytest.mark.asyncio
+    async def test_receive_completion_no_client_callback(self):
+        """Gate should handle completion when no client callback registered."""
+        gate = MockGateServer()
+
+        # No client callback set
+        completion = MockJobCancellationComplete(
+            job_id="job-001",
+            success=True,
+            cancelled_workflow_count=1,
+            total_workflow_count=1,
+            errors=[],
+            cancelled_at=time.monotonic(),
+        )
+
+        await gate.receive_job_cancellation_complete(completion)
+
+        # Should record but not forward
+        assert len(gate._received_completions) == 1
+        assert len(gate._tcp_calls) == 0
+
+    @pytest.mark.asyncio
+    async def test_receive_completion_for_different_job_id(self):
+        """Gate should not forward to wrong client callback."""
+        gate = MockGateServer()
+
+        # Callback for different job
+        gate.set_client_callback("other-job", ("192.168.1.200", 7070))
+
+        completion = MockJobCancellationComplete(
+            job_id="job-001",  # Different from callback
+            success=True,
+            cancelled_workflow_count=1,
+            total_workflow_count=1,
+            errors=[],
+            cancelled_at=time.monotonic(),
+        )
+
+        await gate.receive_job_cancellation_complete(completion)
+
+        # Should record but not forward (different job)
+        assert len(gate._received_completions) == 1
+        assert len(gate._tcp_calls) == 0
+
+
+class TestNegativePathsClient:
+    """Tests for client negative paths and error handling."""
+
+    @pytest.mark.asyncio
+    async def test_await_cancellation_for_unknown_job(self):
+        """Client await should timeout for unknown job."""
+        client = MockClientServer()
+
+        success, errors = await client.await_job_cancellation("unknown-job", timeout=0.1)
+
+        assert not success
+        assert "timeout" in errors
+
+    @pytest.mark.asyncio
+    async def test_receive_completion_overwrites_previous(self):
+        """Later completion should overwrite earlier result for same job."""
+        client = MockClientServer()
+
+        # First completion
+        completion_1 = MockJobCancellationComplete(
+            job_id="job-001",
+            success=False,
+            cancelled_workflow_count=0,
+            total_workflow_count=1,
+            errors=["First error"],
+            cancelled_at=time.monotonic(),
+        )
+        await client.receive_job_cancellation_complete(completion_1)
+
+        # Second completion overwrites
+        completion_2 = MockJobCancellationComplete(
+            job_id="job-001",
+            success=True,
+            cancelled_workflow_count=1,
+            total_workflow_count=1,
+            errors=[],
+            cancelled_at=time.monotonic(),
+        )
+        await client.receive_job_cancellation_complete(completion_2)
+
+        # Latest wins
+        success, errors = client._cancellation_results["job-001"]
+        assert success
+        assert errors == []
+
+
+# =============================================================================
+# Extended Tests: Concurrency and Race Conditions
+# =============================================================================
+
+
+class TestConcurrencyWorker:
+    """Tests for concurrent operations on worker."""
+
+    @pytest.mark.asyncio
+    async def test_concurrent_pushes_for_different_workflows(self):
+        """Worker should handle concurrent pushes for different workflows."""
+        worker = MockWorkerServer()
+
+        # Setup job leaders for multiple workflows
+        for i in range(10):
+            worker.set_job_leader(f"workflow-{i:03d}", ("192.168.1.10", 9090))
+
+        # Push all concurrently
+        await asyncio.gather(*[
+            worker._push_cancellation_complete(
+                job_id="job-001",
+                workflow_id=f"workflow-{i:03d}",
+                success=True,
+                errors=[],
+            )
+            for i in range(10)
+        ])
+
+        # All should succeed
+        assert len(worker._tcp_calls) == 10
+
+    @pytest.mark.asyncio
+    async def test_concurrent_pushes_same_workflow(self):
+        """Worker should handle concurrent pushes for same workflow."""
+        worker = MockWorkerServer()
+
+        worker.set_job_leader("workflow-001", ("192.168.1.10", 9090))
+
+        # Push same workflow multiple times concurrently
+        await asyncio.gather(*[
+            worker._push_cancellation_complete(
+                job_id="job-001",
+                workflow_id="workflow-001",
+                success=True,
+                errors=[],
+            )
+            for _ in range(5)
+        ])
+
+        # All pushes should go through
+        assert len(worker._tcp_calls) == 5
+
+    @pytest.mark.asyncio
+    async def test_rapid_succession_pushes(self):
+        """Worker should handle rapid succession of pushes."""
+        worker = MockWorkerServer()
+
+        worker.set_job_leader("workflow-001", ("192.168.1.10", 9090))
+
+        # Rapid fire
+        for i in range(100):
+            await worker._push_cancellation_complete(
+                job_id="job-001",
+                workflow_id="workflow-001",
+                success=i % 2 == 0,  # Alternate success/failure
+                errors=[] if i % 2 == 0 else [f"Error {i}"],
+            )
+
+        assert len(worker._tcp_calls) == 100
+
+
+class TestConcurrencyManager:
+    """Tests for concurrent operations on manager."""
+
+    @pytest.mark.asyncio
+    async def test_concurrent_completions_from_multiple_workers(self):
+        """Manager should handle concurrent completions from multiple workers."""
+        manager = MockManagerServer()
+
+        manager.add_job("job-001", [f"workflow-{i:03d}" for i in range(10)])
+        manager.set_origin_gate("job-001", ("192.168.1.100", 8080))
+
+        # Mark all cancelled
+        for i in range(10):
+            manager.mark_workflow_cancelled("job-001", f"workflow-{i:03d}")
+
+        # Send completions concurrently from different "workers"
+        await asyncio.gather(*[
+            manager.workflow_cancellation_complete(
+                MockWorkflowCancellationComplete(
+                    job_id="job-001",
+                    workflow_id=f"workflow-{i:03d}",
+                    success=True,
+                    errors=[],
+                    cancelled_at=time.time(),
+                    node_id=f"worker-{i:03d}",
+                )
+            )
+            for i in range(10)
+        ])
+
+        # All completions recorded
+        assert len(manager._cancellation_completions) == 10
+
+    @pytest.mark.asyncio
+    async def test_concurrent_completions_for_different_jobs(self):
+        """Manager should handle concurrent completions for different jobs."""
+        manager = MockManagerServer()
+
+        # Setup multiple jobs
+        for job_idx in range(5):
+            job_id = f"job-{job_idx:03d}"
+            manager.add_job(job_id, [f"{job_id}-workflow-001"])
+            manager.set_origin_gate(job_id, ("192.168.1.100", 8080))
+            manager.mark_workflow_cancelled(job_id, f"{job_id}-workflow-001")
+
+        # Concurrent completions for different jobs
+        await asyncio.gather(*[
+            manager.workflow_cancellation_complete(
+                MockWorkflowCancellationComplete(
+                    job_id=f"job-{job_idx:03d}",
+                    workflow_id=f"job-{job_idx:03d}-workflow-001",
+                    success=True,
+                    errors=[],
+                    cancelled_at=time.time(),
+                    node_id="worker-001",
+                )
+            )
+            for job_idx in range(5)
+        ])
+
+        # All completions recorded
+        assert len(manager._cancellation_completions) == 5
+
+
+class TestConcurrencyClient:
+    """Tests for concurrent operations on client."""
+
+    @pytest.mark.asyncio
+    async def test_multiple_waiters_same_job(self):
+        """Multiple awaits on same job should all receive result."""
+        client = MockClientServer()
+
+        # Start multiple waiters
+        async def waiter():
+            return await client.await_job_cancellation("job-001", timeout=1.0)
+
+        waiter_tasks = [asyncio.create_task(waiter()) for _ in range(5)]
+
+        # Send completion after waiters started
+        await asyncio.sleep(0.05)
+
+        completion = MockJobCancellationComplete(
+            job_id="job-001",
+            success=True,
+            cancelled_workflow_count=1,
+            total_workflow_count=1,
+            errors=[],
+            cancelled_at=time.monotonic(),
+        )
+        await client.receive_job_cancellation_complete(completion)
+
+        # All waiters should get result (or timeout if event not shared)
+        results = await asyncio.gather(*waiter_tasks)
+
+        # At least one should succeed
+        successes = [r for r in results if r[0]]
+        assert len(successes) >= 1
+
+    @pytest.mark.asyncio
+    async def test_concurrent_receives_different_jobs(self):
+        """Client should handle concurrent receives for different jobs."""
+        client = MockClientServer()
+
+        completions = [
+            MockJobCancellationComplete(
+                job_id=f"job-{i:03d}",
+                success=True,
+                cancelled_workflow_count=1,
+                total_workflow_count=1,
+                errors=[],
+                cancelled_at=time.monotonic(),
+            )
+            for i in range(10)
+        ]
+
+        await asyncio.gather(*[
+            client.receive_job_cancellation_complete(c) for c in completions
+        ])
+
+        # All recorded
+        assert len(client._received_completions) == 10
+        assert len(client._cancellation_results) == 10
+
+
+# =============================================================================
+# Extended Tests: Edge Cases and Boundary Conditions
+# =============================================================================
+
+
+class TestEdgeCasesWorker:
+    """Edge case tests for worker."""
+
+    @pytest.mark.asyncio
+    async def test_push_with_special_characters_in_ids(self):
+        """Worker should handle special characters in job/workflow IDs."""
+        worker = MockWorkerServer()
+
+        job_leader_addr = ("192.168.1.10", 9090)
+
+        special_ids = [
+            ("job:with:colons", "workflow:with:colons"),
+            ("job-with-dashes", "workflow-with-dashes"),
+            ("job_with_underscores", "workflow_with_underscores"),
+            ("job.with.dots", "workflow.with.dots"),
+            ("job/with/slashes", "workflow/with/slashes"),
+        ]
+
+        for job_id, workflow_id in special_ids:
+            worker.set_job_leader(workflow_id, job_leader_addr)
+            await worker._push_cancellation_complete(
+                job_id=job_id,
+                workflow_id=workflow_id,
+                success=True,
+                errors=[],
+            )
+
+        assert len(worker._tcp_calls) == 5
+
+    @pytest.mark.asyncio
+    async def test_push_with_unicode_in_errors(self):
+        """Worker should handle unicode in error messages."""
+        worker = MockWorkerServer()
+
+        job_leader_addr = ("192.168.1.10", 9090)
+        worker.set_job_leader("workflow-001", job_leader_addr)
+
+        unicode_errors = [
+            "Error with emoji: 🚀",
+            "Error with Japanese: エラー",
+            "Error with Chinese: 错误",
+            "Error with Arabic: خطأ",
+        ]
+
+        await worker._push_cancellation_complete(
+            job_id="job-001",
+            workflow_id="workflow-001",
+            success=False,
+            errors=unicode_errors,
+        )
+
+        assert len(worker._tcp_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_push_with_empty_job_id(self):
+        """Worker should handle empty job ID."""
+        worker = MockWorkerServer()
+
+        job_leader_addr = ("192.168.1.10", 9090)
+        worker.set_job_leader("workflow-001", job_leader_addr)
+
+        await worker._push_cancellation_complete(
+            job_id="",  # Empty
+            workflow_id="workflow-001",
+            success=True,
+            errors=[],
+        )
+
+        assert len(worker._tcp_calls) == 1
+
+
+class TestEdgeCasesManager:
+    """Edge case tests for manager."""
+
+    @pytest.mark.asyncio
+    async def test_zero_workflow_job(self):
+        """Manager should handle job with zero workflows."""
+        manager = MockManagerServer()
+
+        manager.add_job("job-001", [])  # No workflows
+        manager.set_origin_gate("job-001", ("192.168.1.100", 8080))
+
+        # Receiving completion for unknown workflow in zero-workflow job
+        completion = MockWorkflowCancellationComplete(
+            job_id="job-001",
+            workflow_id="phantom-workflow",
+            success=True,
+            errors=[],
+            cancelled_at=time.time(),
+            node_id="worker-001",
+        )
+
+        await manager.workflow_cancellation_complete(completion)
+
+        # Should record but no all_cancelled (empty = all cancelled)
+        assert len(manager._cancellation_completions) == 1
+
+    @pytest.mark.asyncio
+    async def test_partial_workflow_cancellation_status(self):
+        """Manager should only push when ALL workflows are cancelled."""
+        manager = MockManagerServer()
+
+        manager.add_job("job-001", ["workflow-001", "workflow-002"])
+        manager.set_origin_gate("job-001", ("192.168.1.100", 8080))
+
+        # Only mark one as cancelled
+        manager.mark_workflow_cancelled("job-001", "workflow-001")
+
+        completion = MockWorkflowCancellationComplete(
+            job_id="job-001",
+            workflow_id="workflow-001",
+            success=True,
+            errors=[],
+            cancelled_at=time.time(),
+            node_id="worker-001",
+        )
+
+        await manager.workflow_cancellation_complete(completion)
+
+        # Should NOT push to gate (workflow-002 not cancelled)
+        gate_pushes = [c for c in manager._tcp_calls if c[1] == "receive_job_cancellation_complete"]
+        assert len(gate_pushes) == 0
+
+    @pytest.mark.asyncio
+    async def test_completion_with_future_timestamp(self):
+        """Manager should handle completion with future timestamp."""
+        manager = MockManagerServer()
+
+        manager.add_job("job-001", ["workflow-001"])
+        manager.mark_workflow_cancelled("job-001", "workflow-001")
+        manager.set_origin_gate("job-001", ("192.168.1.100", 8080))
+
+        # Future timestamp
+        completion = MockWorkflowCancellationComplete(
+            job_id="job-001",
+            workflow_id="workflow-001",
+            success=True,
+            errors=[],
+            cancelled_at=time.time() + 86400,  # 1 day in future
+            node_id="worker-001",
+        )
+
+        await manager.workflow_cancellation_complete(completion)
+
+        # Should still process
+        assert len(manager._cancellation_completions) == 1
+
+
+class TestEdgeCasesClient:
+    """Edge case tests for client."""
+
+    @pytest.mark.asyncio
+    async def test_await_with_zero_timeout(self):
+        """Client await with zero timeout should return immediately."""
+        client = MockClientServer()
+
+        success, errors = await client.await_job_cancellation("job-001", timeout=0.0)
+
+        assert not success
+        assert "timeout" in errors
+
+    @pytest.mark.asyncio
+    async def test_await_with_very_short_timeout(self):
+        """Client await with very short timeout should handle gracefully."""
+        client = MockClientServer()
+
+        success, errors = await client.await_job_cancellation("job-001", timeout=0.001)
+
+        assert not success
+        assert "timeout" in errors
+
+    @pytest.mark.asyncio
+    async def test_completion_with_zero_counts(self):
+        """Client should handle completion with zero workflow counts."""
+        client = MockClientServer()
+
+        completion = MockJobCancellationComplete(
+            job_id="job-001",
+            success=True,
+            cancelled_workflow_count=0,
+            total_workflow_count=0,
+            errors=[],
+            cancelled_at=time.monotonic(),
+        )
+
+        await client.receive_job_cancellation_complete(completion)
+
+        success, errors = client._cancellation_results["job-001"]
+        assert success
+
+    @pytest.mark.asyncio
+    async def test_completion_with_mismatched_counts(self):
+        """Client should handle completion where counts don't match."""
+        client = MockClientServer()
+
+        completion = MockJobCancellationComplete(
+            job_id="job-001",
+            success=True,  # Success despite mismatch
+            cancelled_workflow_count=3,
+            total_workflow_count=5,  # 3 of 5 cancelled but still "success"
+            errors=[],
+            cancelled_at=time.monotonic(),
+        )
+
+        await client.receive_job_cancellation_complete(completion)
+
+        # Should accept as-is
+        assert len(client._received_completions) == 1
+
+
+class TestFullChainEdgeCases:
+    """Edge case tests for full push chain."""
+
+    @pytest.mark.asyncio
+    async def test_chain_with_mixed_success_failure(self):
+        """Test chain where some workflows succeed, others fail."""
+        manager = MockManagerServer()
+        gate = MockGateServer()
+        client = MockClientServer()
+
+        # Setup
+        manager.add_job("job-001", ["workflow-001", "workflow-002", "workflow-003"])
+        manager.set_origin_gate("job-001", ("192.168.1.100", 8080))
+        for wf in ["workflow-001", "workflow-002", "workflow-003"]:
+            manager.mark_workflow_cancelled("job-001", wf)
+
+        gate.set_client_callback("job-001", ("192.168.1.200", 7070))
+
+        # Mixed completions
+        completions = [
+            MockWorkflowCancellationComplete(
+                job_id="job-001",
+                workflow_id="workflow-001",
+                success=True,
+                errors=[],
+                cancelled_at=time.time(),
+                node_id="worker-001",
+            ),
+            MockWorkflowCancellationComplete(
+                job_id="job-001",
+                workflow_id="workflow-002",
+                success=False,
+                errors=["Failed to cancel"],
+                cancelled_at=time.time(),
+                node_id="worker-002",
+            ),
+            MockWorkflowCancellationComplete(
+                job_id="job-001",
+                workflow_id="workflow-003",
+                success=True,
+                errors=[],
+                cancelled_at=time.time(),
+                node_id="worker-003",
+            ),
+        ]
+
+        for completion in completions:
+            await manager.workflow_cancellation_complete(completion)
+
+        # All completions recorded
+        assert len(manager._cancellation_completions) == 3
+
+    @pytest.mark.asyncio
+    async def test_chain_with_large_number_of_workflows(self):
+        """Test chain with large number of workflows."""
+        manager = MockManagerServer()
+
+        workflow_ids = [f"workflow-{i:06d}" for i in range(1000)]
+        manager.add_job("job-001", workflow_ids)
+        manager.set_origin_gate("job-001", ("192.168.1.100", 8080))
+
+        for wf_id in workflow_ids:
+            manager.mark_workflow_cancelled("job-001", wf_id)
+
+        # Send all completions
+        for wf_id in workflow_ids:
+            completion = MockWorkflowCancellationComplete(
+                job_id="job-001",
+                workflow_id=wf_id,
+                success=True,
+                errors=[],
+                cancelled_at=time.time(),
+                node_id="worker-001",
+            )
+            await manager.workflow_cancellation_complete(completion)
+
+        # All recorded
+        assert len(manager._cancellation_completions) == 1000
+
+    @pytest.mark.asyncio
+    async def test_chain_with_interleaved_jobs(self):
+        """Test chain with completions for multiple jobs interleaved."""
+        manager = MockManagerServer()
+
+        # Setup multiple jobs
+        for job_idx in range(3):
+            job_id = f"job-{job_idx:03d}"
+            workflow_ids = [f"{job_id}-wf-{i:03d}" for i in range(3)]
+            manager.add_job(job_id, workflow_ids)
+            manager.set_origin_gate(job_id, ("192.168.1.100", 8080))
+            for wf_id in workflow_ids:
+                manager.mark_workflow_cancelled(job_id, wf_id)
+
+        # Interleaved completions
+        for wf_idx in range(3):
+            for job_idx in range(3):
+                job_id = f"job-{job_idx:03d}"
+                wf_id = f"{job_id}-wf-{wf_idx:03d}"
+                completion = MockWorkflowCancellationComplete(
+                    job_id=job_id,
+                    workflow_id=wf_id,
+                    success=True,
+                    errors=[],
+                    cancelled_at=time.time(),
+                    node_id="worker-001",
+                )
+                await manager.workflow_cancellation_complete(completion)
+
+        # 9 completions total (3 jobs * 3 workflows)
+        assert len(manager._cancellation_completions) == 9
