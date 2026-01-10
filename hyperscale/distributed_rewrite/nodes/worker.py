@@ -1450,61 +1450,43 @@ class WorkerServer(HealthAwareServer):
             capabilities=capabilities_str,
         )
 
-        for attempt in range(max_retries + 1):
-            try:
-                # Use decorated send method - handle() will capture manager's address
-                result = await self.send_worker_register(
-                    manager_addr,
-                    registration.dump(),
-                    timeout=5.0,
-                )
-
-                if not isinstance(result, Exception):
-                    circuit.record_success()
-                    if attempt > 0:
-                        self._task_runner.run(
-                            self._udp_logger.log,
-                            ServerInfo(
-                                message=f"Registered with manager {manager_addr} after {attempt + 1} attempts",
-                                node_host=self._host,
-                                node_port=self._tcp_port,
-                                node_id=self._node_id.short,
-                            )
-                        )
-                    return True
-
-            except Exception as e:
-                self._task_runner.run(
-                    self._udp_logger.log,
-                    ServerError(
-                        message=f"Registration attempt {attempt + 1}/{max_retries + 1} failed for {manager_addr}: {e}",
-                        node_host=self._host,
-                        node_port=self._tcp_port,
-                        node_id=self._node_id.short,
-                    )
-                )
-
-            # Exponential backoff with jitter before retry (except after last attempt)
-            # Jitter prevents thundering herd when multiple workers retry simultaneously
-            if attempt < max_retries:
-                import random
-                delay = base_delay * (2 ** attempt)
-                # Add full jitter (0 to delay) per AWS best practices
-                jitter = random.uniform(0, delay)
-                await asyncio.sleep(delay + jitter)
-
-        # All retries exhausted - record error on this manager's circuit breaker
-        circuit.record_error()
-        self._task_runner.run(
-            self._udp_logger.log,
-            ServerError(
-                message=f"Failed to register with manager {manager_addr} after {max_retries + 1} attempts",
-                node_host=self._host,
-                node_port=self._tcp_port,
-                node_id=self._node_id.short,
-            )
+        # AD-21: Use unified RetryExecutor with full jitter
+        retry_config = RetryConfig(
+            max_attempts=max_retries + 1,
+            base_delay=base_delay,
+            max_delay=base_delay * (2 ** max_retries),
+            jitter=JitterStrategy.FULL,
         )
-        return False
+        executor = RetryExecutor(retry_config)
+
+        async def attempt_registration() -> bool:
+            result = await self.send_worker_register(
+                manager_addr,
+                registration.dump(),
+                timeout=5.0,
+            )
+            if isinstance(result, Exception):
+                raise result
+            return True
+
+        try:
+            await executor.execute(attempt_registration, "worker_registration")
+            circuit.record_success()
+            return True
+
+        except Exception as error:
+            # All retries exhausted - record error on this manager's circuit breaker
+            circuit.record_error()
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerError(
+                    message=f"Failed to register with manager {manager_addr} after {max_retries + 1} attempts: {error}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            return False
     
     def _get_worker_state(self) -> WorkerState:
         """Determine current worker state."""
@@ -3017,31 +2999,35 @@ class WorkerServer(HealthAwareServer):
 
         circuit = self._get_manager_circuit_by_addr(manager_addr) if not primary_id else self._get_manager_circuit(primary_id)
 
-        for attempt in range(max_retries + 1):
-            try:
-                response, _ = await self.send_tcp(
-                    manager_addr,
-                    "workflow_progress",
-                    progress.dump(),
-                    timeout=1.0,
-                )
+        # AD-21: Use unified RetryExecutor with full jitter
+        retry_config = RetryConfig(
+            max_attempts=max_retries + 1,
+            base_delay=base_delay,
+            max_delay=base_delay * (2 ** max_retries),
+            jitter=JitterStrategy.FULL,
+        )
+        executor = RetryExecutor(retry_config)
 
-                # Process ack to update manager topology
-                if response and isinstance(response, bytes) and response != b'error':
-                    self._process_workflow_progress_ack(response)
-                    circuit.record_success()
-                    return  # Success
+        async def attempt_send_progress() -> None:
+            response, _ = await self.send_tcp(
+                manager_addr,
+                "workflow_progress",
+                progress.dump(),
+                timeout=1.0,
+            )
+            # Process ack to update manager topology
+            if response and isinstance(response, bytes) and response != b'error':
+                self._process_workflow_progress_ack(response)
+            else:
+                raise ConnectionError("Invalid or error response from manager")
 
-            except Exception:
-                pass
+        try:
+            await executor.execute(attempt_send_progress, "progress_update")
+            circuit.record_success()
 
-            # Exponential backoff before retry (except after last attempt)
-            if attempt < max_retries:
-                delay = base_delay * (2 ** attempt)
-                await asyncio.sleep(delay)
-
-        # All retries exhausted
-        circuit.record_error()
+        except Exception:
+            # All retries exhausted
+            circuit.record_error()
 
     async def _send_progress_to_job_leader(
         self,
@@ -3269,44 +3255,50 @@ class WorkerServer(HealthAwareServer):
             manager_addr = (manager_info.tcp_host, manager_info.tcp_port)
             circuit = self._get_manager_circuit(manager_id)
 
-            for attempt in range(max_retries + 1):
-                try:
-                    response, _ = await self.send_tcp(
-                        manager_addr,
-                        "workflow_final_result",
-                        final_result.dump(),
-                        timeout=5.0,  # Longer timeout for final results
+            # AD-21: Use unified RetryExecutor with full jitter
+            retry_config = RetryConfig(
+                max_attempts=max_retries + 1,
+                base_delay=base_delay,
+                max_delay=base_delay * (2 ** max_retries),
+                jitter=JitterStrategy.FULL,
+            )
+            executor = RetryExecutor(retry_config)
+
+            async def attempt_send_final() -> bytes:
+                response, _ = await self.send_tcp(
+                    manager_addr,
+                    "workflow_final_result",
+                    final_result.dump(),
+                    timeout=5.0,  # Longer timeout for final results
+                )
+                if response and isinstance(response, bytes) and response != b'error':
+                    return response
+                raise ConnectionError("Invalid or error response from manager")
+
+            try:
+                await executor.execute(attempt_send_final, "final_result")
+                circuit.record_success()
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerDebug(
+                        message=f"Sent final result for {final_result.workflow_id} status={final_result.status}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
                     )
+                )
+                return  # Success
 
-                    if response and isinstance(response, bytes) and response != b'error':
-                        circuit.record_success()
-                        self._task_runner.run(
-                            self._udp_logger.log,
-                            ServerDebug(
-                                message=f"Sent final result for {final_result.workflow_id} status={final_result.status}",
-                                node_host=self._host,
-                                node_port=self._tcp_port,
-                                node_id=self._node_id.short,
-                            )
-                        )
-                        return  # Success
-
-                except Exception as e:
-                    await self._udp_logger.log(
-                        ServerError(
-                            message=f"Failed to send final result for {final_result.workflow_id} attempt {attempt+1}: {e}",
-                            node_host=self._host,
-                            node_port=self._tcp_port,
-                            node_id=self._node_id.short,
-                        )
+            except Exception as send_exception:
+                circuit.record_error()
+                await self._udp_logger.log(
+                    ServerError(
+                        message=f"Failed to send final result for {final_result.workflow_id} to manager {manager_id}: {send_exception}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
                     )
-                # Exponential backoff before retry (except after last attempt)
-                if attempt < max_retries:
-                    delay = base_delay * (2 ** attempt)
-                    await asyncio.sleep(delay)
-
-            # All retries exhausted for this manager
-            circuit.record_error()
+                )
 
         # All managers failed
         await self._udp_logger.log(
