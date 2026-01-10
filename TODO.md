@@ -6,7 +6,7 @@ This document tracks the remaining implementation work for AD-34, AD-35, AD-36, 
 
 **Implementation Status** (as of 2026-01-10):
 - **AD-34**: ✅ **100% COMPLETE** - All critical gaps fixed, fully functional for multi-DC deployments
-- **AD-35**: 25% complete - Coordinate algorithm works, SWIM integration and role-aware logic missing
+- **AD-35**: 🟢 **~80% COMPLETE** - Vivaldi coordinates, SWIM integration, UNCONFIRMED lifecycle, RoleAwareConfirmationManager all implemented. Remaining: integration glue and adaptive timeout calculation
 - **AD-36**: 5% complete - Only basic health bucket selection implemented, entire routing subsystem missing
 - **AD-37**: ✅ **100% COMPLETE** - Message classification, backpressure levels, BATCH aggregation implemented
 
@@ -205,21 +205,23 @@ Per CLAUDE.md: "DO NOT RUN THE INTEGRATION TESTS YOURSELF. Ask me to."
 - [ ] **12.4.3** Gossip role in SWIM messages
 - [ ] **12.4.4** Make role accessible in HealthAwareServer for failure detection
 
-### 12.5 Role-Aware Confirmation Manager ❌ NOT IMPLEMENTED
+### 12.5 Role-Aware Confirmation Manager ✅ COMPLETE (except integration)
 
-**File**: `hyperscale/distributed_rewrite/swim/roles/confirmation_manager.py` (NEW)
+**Files**:
+- `hyperscale/distributed_rewrite/swim/roles/confirmation_strategy.py`
+- `hyperscale/distributed_rewrite/swim/roles/confirmation_manager.py`
 
-🔴 **CRITICAL**: Core component completely missing
+✅ **IMPLEMENTED**: Core components exist, integration with HealthAwareServer pending
 
-- [ ] **12.5.1** Create `RoleBasedConfirmationStrategy` dataclass
-- [ ] **12.5.2** Define strategy constants:
+- [x] **12.5.1** Create `RoleBasedConfirmationStrategy` dataclass - Complete
+- [x] **12.5.2** Define strategy constants: - Complete
   - GATE_STRATEGY: 120s timeout, 5 proactive attempts, Vivaldi-aware
   - MANAGER_STRATEGY: 90s timeout, 3 proactive attempts, Vivaldi-aware
   - WORKER_STRATEGY: 180s timeout, passive-only, no Vivaldi
-- [ ] **12.5.3** Implement `RoleAwareConfirmationManager` class
-- [ ] **12.5.4** Implement proactive confirmation for Gates/Managers
-- [ ] **12.5.5** Implement passive-only strategy for Workers
-- [ ] **12.5.6** Integrate with HealthAwareServer
+- [x] **12.5.3** Implement `RoleAwareConfirmationManager` class - Complete (lines 47-406 in confirmation_manager.py)
+- [x] **12.5.4** Implement proactive confirmation for Gates/Managers - Complete (see _attempt_proactive_confirmation)
+- [x] **12.5.5** Implement passive-only strategy for Workers - Complete (WORKER_STRATEGY.enable_proactive_confirmation=False)
+- [ ] **12.5.6** Integrate with HealthAwareServer - NOT DONE (no references in health_aware_server.py)
 
 ### 12.6 Adaptive Timeouts ❌ NOT IMPLEMENTED (10%)
 
@@ -323,16 +325,17 @@ All remaining AD-36 items deferred. Core routing subsystem must be built first.
 
 **Result:** ✅ AD-34 is now fully functional for multi-DC deployments
 
-### Phase 2: Complete AD-35 SWIM Integration 🟡 IN PROGRESS
+### Phase 2: Complete AD-35 SWIM Integration 🟢 MOSTLY COMPLETE
 **Effort:** 3-5 days
 
 1. [x] Add `vivaldi_coord` field to SWIM ping/ack messages (Section 12.2) - Commit b8187b27
 2. [x] Implement coordinate updates on every ping/ack exchange - Commit b8187b27
 3. [x] Add UNCONFIRMED state to IncarnationTracker (Section 12.3) - Commit 97c17ce1
-4. [ ] Implement basic RoleAwareConfirmationManager (Section 12.5) - ALREADY EXISTS
-5. [ ] Add adaptive timeout calculation using Vivaldi RTT (Section 12.6)
+4. [x] Implement basic RoleAwareConfirmationManager (Section 12.5) - EXISTS (not integrated yet)
+5. [ ] Add adaptive timeout calculation using Vivaldi RTT (Section 12.6) - Only Task 12.6.3 remains
+6. [ ] Integrate RoleAwareConfirmationManager with HealthAwareServer (Task 12.5.6)
 
-**Result:** AD-35 provides geographic latency awareness and role-specific confirmation
+**Result:** AD-35 core functionality complete, integration work remains
 
 ### Phase 3: Implement AD-36 Routing Foundation 🟢 LOWER PRIORITY
 **Effort:** 5-7 days
