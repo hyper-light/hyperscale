@@ -6,6 +6,8 @@
 - Ensure all dataclasses use `slots=True` and live in a `models/` submodule.
 - Preserve behavior and interfaces; refactor in small, safe moves.
 - Prefer list/dict comprehensions, walrus operators, and early returns.
+- Reduce the number of lines of code significantly
+- Optimize for readability *and* performance.
 
 ## Constraints
 - One class per file (including nested helper classes).
@@ -14,6 +16,7 @@
 - Avoid new architectural behavior changes while splitting files.
 - Maximum cyclic complexity of 5 for classes and 4 for functions.
 - Examine AD-10 through AD-36 in architecture.md. DO NOT BREAK COMPLIANCE with any of these.
+- 
 
 ## Target Module Layout (Shared Pattern)
 ```
