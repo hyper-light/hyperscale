@@ -916,3 +916,546 @@ class TestTransferNotificationTracking:
         assert len(worker._transfer_notifications) == 2
         assert worker._transfer_notifications[0].job_id == "job-001"
         assert worker._transfer_notifications[1].job_id == "job-002"
+
+
+# =============================================================================
+# Extended Tests: Negative Paths and Failure Modes
+# =============================================================================
+
+
+class TestNegativePaths:
+    """Tests for error handling and negative scenarios."""
+
+    @pytest.mark.asyncio
+    async def test_manager_failure_for_unknown_manager(self):
+        """Handling failure for a manager not in known managers."""
+        worker = MockWorkerServer()
+
+        # No managers configured
+        assert len(worker._known_managers) == 0
+
+        # Try to handle failure for unknown manager
+        await worker._handle_manager_failure("unknown-manager")
+
+        # Should not raise, no workflows orphaned
+        assert len(worker._orphaned_workflows) == 0
+
+    @pytest.mark.asyncio
+    async def test_duplicate_manager_failure_events(self):
+        """Handling duplicate failure events for the same manager."""
+        worker = MockWorkerServer()
+
+        manager_addr = ("192.168.1.10", 9090)
+        worker.add_manager("manager-001", "192.168.1.10", 9090)
+        worker.add_workflow("workflow-001", manager_addr)
+
+        # First failure
+        await worker._handle_manager_failure("manager-001")
+        first_orphan_time = worker._orphaned_workflows["workflow-001"]
+
+        # Small delay
+        await asyncio.sleep(0.01)
+
+        # Duplicate failure event
+        await worker._handle_manager_failure("manager-001")
+
+        # Orphan timestamp should NOT be updated (already orphaned)
+        assert worker._orphaned_workflows["workflow-001"] == first_orphan_time
+
+    @pytest.mark.asyncio
+    async def test_transfer_after_workflow_already_cancelled(self):
+        """Transfer arriving after workflow was already cancelled."""
+        env = MockWorkerEnv(
+            WORKER_ORPHAN_GRACE_PERIOD=0.1,
+            WORKER_ORPHAN_CHECK_INTERVAL=0.02,
+        )
+        worker = MockWorkerServer(env)
+
+        manager_addr = ("192.168.1.10", 9090)
+        worker.add_manager("manager-001", "192.168.1.10", 9090)
+        worker.add_workflow("workflow-001", manager_addr)
+
+        await worker._handle_manager_failure("manager-001")
+
+        worker.start_orphan_check_loop()
+        await asyncio.sleep(0.2)  # Wait for cancellation
+        await worker.stop_orphan_check_loop()
+
+        # Workflow should be cancelled
+        assert len(worker._cancelled_workflows) == 1
+        assert "workflow-001" not in worker._active_workflows
+
+        # Late transfer arrives
+        transfer = MockJobLeaderWorkerTransfer(
+            job_id="job-001",
+            workflow_ids=["workflow-001"],
+            new_manager_addr=("192.168.1.20", 9090),
+            old_manager_id="manager-001",
+            fencing_token=2,
+        )
+
+        ack = await worker.job_leader_worker_transfer(transfer)
+
+        # Should accept but with 0 updates (workflow gone)
+        assert ack.accepted
+        assert ack.workflows_updated == 0
+
+    @pytest.mark.asyncio
+    async def test_empty_workflow_list_in_transfer(self):
+        """Transfer with empty workflow list."""
+        worker = MockWorkerServer()
+
+        transfer = MockJobLeaderWorkerTransfer(
+            job_id="job-001",
+            workflow_ids=[],  # Empty list
+            new_manager_addr=("192.168.1.20", 9090),
+            old_manager_id="manager-001",
+            fencing_token=2,
+        )
+
+        ack = await worker.job_leader_worker_transfer(transfer)
+
+        assert ack.accepted
+        assert ack.workflows_updated == 0
+
+    @pytest.mark.asyncio
+    async def test_workflow_with_no_job_leader_mapping(self):
+        """Workflow exists but has no job leader mapping."""
+        worker = MockWorkerServer()
+
+        # Add workflow without job leader
+        worker._active_workflows.add("workflow-001")
+        # Don't set job leader mapping
+
+        manager_addr = ("192.168.1.10", 9090)
+        worker.add_manager("manager-001", "192.168.1.10", 9090)
+
+        # This should not raise
+        await worker._handle_manager_failure("manager-001")
+
+        # Workflow should NOT be orphaned (has no job leader)
+        assert "workflow-001" not in worker._orphaned_workflows
+
+
+class TestConcurrencyAndRaceConditions:
+    """Tests for concurrent operations and race conditions."""
+
+    @pytest.mark.asyncio
+    async def test_concurrent_manager_failure_and_transfer(self):
+        """Concurrent manager failure and transfer notifications."""
+        worker = MockWorkerServer()
+
+        manager_addr = ("192.168.1.10", 9090)
+        worker.add_manager("manager-001", "192.168.1.10", 9090)
+        worker.add_workflow("workflow-001", manager_addr)
+
+        transfer = MockJobLeaderWorkerTransfer(
+            job_id="job-001",
+            workflow_ids=["workflow-001"],
+            new_manager_addr=("192.168.1.20", 9090),
+            old_manager_id="manager-001",
+            fencing_token=2,
+        )
+
+        # Run both concurrently
+        await asyncio.gather(
+            worker._handle_manager_failure("manager-001"),
+            worker.job_leader_worker_transfer(transfer),
+        )
+
+        # Workflow should be rescued (transfer should win)
+        # The order is non-deterministic, but the workflow should end up not orphaned
+        # because transfer clears orphan status
+        assert "workflow-001" not in worker._orphaned_workflows or \
+               worker._workflow_job_leader.get("workflow-001") == ("192.168.1.20", 9090)
+
+    @pytest.mark.asyncio
+    async def test_rapid_successive_transfers(self):
+        """Rapid succession of transfers for the same job."""
+        worker = MockWorkerServer()
+
+        manager_addr = ("192.168.1.10", 9090)
+        worker.add_manager("manager-001", "192.168.1.10", 9090)
+        worker.add_workflow("workflow-001", manager_addr)
+
+        # Multiple rapid transfers
+        transfers = [
+            MockJobLeaderWorkerTransfer(
+                job_id="job-001",
+                workflow_ids=["workflow-001"],
+                new_manager_addr=(f"192.168.1.{20 + i}", 9090),
+                old_manager_id="manager-001",
+                fencing_token=i + 1,
+            )
+            for i in range(5)
+        ]
+
+        # Apply all transfers
+        for transfer in transfers:
+            await worker.job_leader_worker_transfer(transfer)
+
+        # Final job leader should be the last one
+        assert worker._workflow_job_leader["workflow-001"] == ("192.168.1.24", 9090)
+        assert len(worker._transfer_notifications) == 5
+
+    @pytest.mark.asyncio
+    async def test_concurrent_transfers_for_same_workflow(self):
+        """Concurrent transfers for the same workflow."""
+        worker = MockWorkerServer()
+
+        manager_addr = ("192.168.1.10", 9090)
+        worker.add_manager("manager-001", "192.168.1.10", 9090)
+        worker.add_workflow("workflow-001", manager_addr)
+
+        transfer_1 = MockJobLeaderWorkerTransfer(
+            job_id="job-001",
+            workflow_ids=["workflow-001"],
+            new_manager_addr=("192.168.1.20", 9090),
+            old_manager_id="manager-001",
+            fencing_token=2,
+        )
+        transfer_2 = MockJobLeaderWorkerTransfer(
+            job_id="job-001",
+            workflow_ids=["workflow-001"],
+            new_manager_addr=("192.168.1.30", 9090),
+            old_manager_id="manager-001",
+            fencing_token=3,
+        )
+
+        # Run concurrently
+        results = await asyncio.gather(
+            worker.job_leader_worker_transfer(transfer_1),
+            worker.job_leader_worker_transfer(transfer_2),
+        )
+
+        # Both should succeed
+        assert all(r.accepted for r in results)
+        # One of the addresses should be final
+        assert worker._workflow_job_leader["workflow-001"] in [
+            ("192.168.1.20", 9090),
+            ("192.168.1.30", 9090),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_orphan_check_during_transfer_processing(self):
+        """Orphan check running while transfer is being processed."""
+        env = MockWorkerEnv(
+            WORKER_ORPHAN_GRACE_PERIOD=0.1,
+            WORKER_ORPHAN_CHECK_INTERVAL=0.02,
+        )
+        worker = MockWorkerServer(env)
+
+        manager_addr = ("192.168.1.10", 9090)
+        worker.add_manager("manager-001", "192.168.1.10", 9090)
+        worker.add_workflow("workflow-001", manager_addr)
+
+        await worker._handle_manager_failure("manager-001")
+
+        # Start orphan check loop
+        worker.start_orphan_check_loop()
+
+        # Wait almost until grace period
+        await asyncio.sleep(0.08)
+
+        # Transfer arrives just before expiration
+        transfer = MockJobLeaderWorkerTransfer(
+            job_id="job-001",
+            workflow_ids=["workflow-001"],
+            new_manager_addr=("192.168.1.20", 9090),
+            old_manager_id="manager-001",
+            fencing_token=2,
+        )
+        await worker.job_leader_worker_transfer(transfer)
+
+        # Wait past original grace period
+        await asyncio.sleep(0.1)
+
+        await worker.stop_orphan_check_loop()
+
+        # Workflow should NOT be cancelled
+        assert len(worker._cancelled_workflows) == 0
+
+    @pytest.mark.asyncio
+    async def test_multiple_manager_failures_in_quick_succession(self):
+        """Multiple different managers failing quickly."""
+        worker = MockWorkerServer()
+
+        # Setup multiple managers with workflows
+        for i in range(5):
+            manager_id = f"manager-{i:03d}"
+            addr = (f"192.168.1.{10 + i}", 9090)
+            worker.add_manager(manager_id, f"192.168.1.{10 + i}", 9090)
+            worker.add_workflow(f"workflow-{i:03d}", addr)
+
+        # All managers fail concurrently
+        await asyncio.gather(*[
+            worker._handle_manager_failure(f"manager-{i:03d}")
+            for i in range(5)
+        ])
+
+        # All workflows should be orphaned
+        assert len(worker._orphaned_workflows) == 5
+
+
+class TestEdgeCasesAndBoundaryConditions:
+    """Tests for edge cases and boundary conditions."""
+
+    @pytest.mark.asyncio
+    async def test_zero_grace_period(self):
+        """Grace period of zero should still work (immediate cancellation)."""
+        env = MockWorkerEnv(
+            WORKER_ORPHAN_GRACE_PERIOD=0.0,  # Zero grace period
+            WORKER_ORPHAN_CHECK_INTERVAL=0.01,
+        )
+        worker = MockWorkerServer(env)
+
+        manager_addr = ("192.168.1.10", 9090)
+        worker.add_manager("manager-001", "192.168.1.10", 9090)
+        worker.add_workflow("workflow-001", manager_addr)
+
+        await worker._handle_manager_failure("manager-001")
+
+        worker.start_orphan_check_loop()
+        await asyncio.sleep(0.05)
+        await worker.stop_orphan_check_loop()
+
+        # Should be cancelled almost immediately
+        assert len(worker._cancelled_workflows) == 1
+
+    @pytest.mark.asyncio
+    async def test_very_long_grace_period(self):
+        """Very long grace period should not cause issues."""
+        env = MockWorkerEnv(
+            WORKER_ORPHAN_GRACE_PERIOD=3600.0,  # 1 hour
+            WORKER_ORPHAN_CHECK_INTERVAL=0.05,
+        )
+        worker = MockWorkerServer(env)
+
+        manager_addr = ("192.168.1.10", 9090)
+        worker.add_manager("manager-001", "192.168.1.10", 9090)
+        worker.add_workflow("workflow-001", manager_addr)
+
+        await worker._handle_manager_failure("manager-001")
+
+        worker.start_orphan_check_loop()
+        await asyncio.sleep(0.1)
+        await worker.stop_orphan_check_loop()
+
+        # Should NOT be cancelled (grace period not expired)
+        assert len(worker._cancelled_workflows) == 0
+        assert "workflow-001" in worker._orphaned_workflows
+
+    @pytest.mark.asyncio
+    async def test_transfer_with_same_new_and_old_manager(self):
+        """Transfer where new manager is the same as current (no-op)."""
+        worker = MockWorkerServer()
+
+        manager_addr = ("192.168.1.10", 9090)
+        worker.add_manager("manager-001", "192.168.1.10", 9090)
+        worker.add_workflow("workflow-001", manager_addr)
+
+        # Transfer to same address
+        transfer = MockJobLeaderWorkerTransfer(
+            job_id="job-001",
+            workflow_ids=["workflow-001"],
+            new_manager_addr=manager_addr,  # Same as current
+            old_manager_id="manager-001",
+            fencing_token=2,
+        )
+
+        ack = await worker.job_leader_worker_transfer(transfer)
+
+        # Should succeed but no change in routing
+        assert ack.accepted
+        assert ack.workflows_updated == 0  # No change
+        assert worker._workflow_job_leader["workflow-001"] == manager_addr
+
+    @pytest.mark.asyncio
+    async def test_large_number_of_workflows(self):
+        """Handling large number of workflows from single manager."""
+        worker = MockWorkerServer()
+
+        manager_addr = ("192.168.1.10", 9090)
+        worker.add_manager("manager-001", "192.168.1.10", 9090)
+
+        # Add 1000 workflows
+        workflow_ids = [f"workflow-{i:06d}" for i in range(1000)]
+        for wf_id in workflow_ids:
+            worker.add_workflow(wf_id, manager_addr)
+
+        # Manager fails
+        await worker._handle_manager_failure("manager-001")
+
+        # All should be orphaned
+        assert len(worker._orphaned_workflows) == 1000
+
+        # Single transfer rescues all
+        transfer = MockJobLeaderWorkerTransfer(
+            job_id="job-001",
+            workflow_ids=workflow_ids,
+            new_manager_addr=("192.168.1.20", 9090),
+            old_manager_id="manager-001",
+            fencing_token=2,
+        )
+
+        ack = await worker.job_leader_worker_transfer(transfer)
+
+        assert ack.accepted
+        assert ack.workflows_updated == 1000
+        assert len(worker._orphaned_workflows) == 0
+
+    @pytest.mark.asyncio
+    async def test_workflow_id_with_special_characters(self):
+        """Workflow IDs with special characters handled correctly."""
+        worker = MockWorkerServer()
+
+        manager_addr = ("192.168.1.10", 9090)
+        worker.add_manager("manager-001", "192.168.1.10", 9090)
+
+        # Workflow IDs with various characters
+        special_ids = [
+            "workflow:with:colons",
+            "workflow-with-dashes",
+            "workflow_with_underscores",
+            "workflow.with.dots",
+            "workflow/with/slashes",
+        ]
+
+        for wf_id in special_ids:
+            worker.add_workflow(wf_id, manager_addr)
+
+        await worker._handle_manager_failure("manager-001")
+
+        # All should be orphaned
+        for wf_id in special_ids:
+            assert wf_id in worker._orphaned_workflows
+
+    @pytest.mark.asyncio
+    async def test_manager_with_different_port(self):
+        """Same host but different port should be tracked separately."""
+        worker = MockWorkerServer()
+
+        addr_1 = ("192.168.1.10", 9090)
+        addr_2 = ("192.168.1.10", 9091)  # Same host, different port
+
+        worker.add_manager("manager-001", "192.168.1.10", 9090)
+        worker.add_manager("manager-002", "192.168.1.10", 9091)
+
+        worker.add_workflow("workflow-001", addr_1)
+        worker.add_workflow("workflow-002", addr_2)
+
+        # Only manager-001 fails
+        await worker._handle_manager_failure("manager-001")
+
+        # Only workflow-001 should be orphaned
+        assert "workflow-001" in worker._orphaned_workflows
+        assert "workflow-002" not in worker._orphaned_workflows
+
+
+class TestOrphanLoopStopStart:
+    """Tests for stopping and restarting the orphan check loop."""
+
+    @pytest.mark.asyncio
+    async def test_stop_loop_before_start(self):
+        """Stopping loop before it's started should not raise."""
+        worker = MockWorkerServer()
+
+        # Should not raise
+        await worker.stop_orphan_check_loop()
+
+    @pytest.mark.asyncio
+    async def test_double_start_loop(self):
+        """Starting loop twice should not create duplicate tasks."""
+        worker = MockWorkerServer()
+
+        worker.start_orphan_check_loop()
+        first_task = worker._orphan_check_task
+
+        worker.start_orphan_check_loop()
+        second_task = worker._orphan_check_task
+
+        # Should be the same task (not started twice)
+        assert first_task is second_task
+
+        await worker.stop_orphan_check_loop()
+
+    @pytest.mark.asyncio
+    async def test_restart_loop_after_stop(self):
+        """Restarting loop after stop should work."""
+        env = MockWorkerEnv(
+            WORKER_ORPHAN_GRACE_PERIOD=0.1,
+            WORKER_ORPHAN_CHECK_INTERVAL=0.02,
+        )
+        worker = MockWorkerServer(env)
+
+        manager_addr = ("192.168.1.10", 9090)
+        worker.add_manager("manager-001", "192.168.1.10", 9090)
+        worker.add_workflow("workflow-001", manager_addr)
+
+        # Start and stop
+        worker.start_orphan_check_loop()
+        await asyncio.sleep(0.05)
+        await worker.stop_orphan_check_loop()
+
+        # Re-enable running
+        worker._running = True
+
+        # Mark orphaned
+        await worker._handle_manager_failure("manager-001")
+
+        # Restart
+        worker.start_orphan_check_loop()
+        await asyncio.sleep(0.2)
+        await worker.stop_orphan_check_loop()
+
+        # Workflow should be cancelled
+        assert len(worker._cancelled_workflows) == 1
+
+
+class TestTransferValidation:
+    """Tests for transfer message validation."""
+
+    @pytest.mark.asyncio
+    async def test_transfer_with_none_old_manager_id(self):
+        """Transfer with None old_manager_id (unknown previous leader)."""
+        worker = MockWorkerServer()
+
+        manager_addr = ("192.168.1.10", 9090)
+        worker.add_manager("manager-001", "192.168.1.10", 9090)
+        worker.add_workflow("workflow-001", manager_addr)
+
+        transfer = MockJobLeaderWorkerTransfer(
+            job_id="job-001",
+            workflow_ids=["workflow-001"],
+            new_manager_addr=("192.168.1.20", 9090),
+            old_manager_id=None,  # Unknown previous leader
+            fencing_token=2,
+        )
+
+        ack = await worker.job_leader_worker_transfer(transfer)
+
+        assert ack.accepted
+        assert ack.workflows_updated == 1
+
+    @pytest.mark.asyncio
+    async def test_transfer_with_duplicate_workflow_ids(self):
+        """Transfer with duplicate workflow IDs in the list."""
+        worker = MockWorkerServer()
+
+        manager_addr = ("192.168.1.10", 9090)
+        worker.add_manager("manager-001", "192.168.1.10", 9090)
+        worker.add_workflow("workflow-001", manager_addr)
+
+        transfer = MockJobLeaderWorkerTransfer(
+            job_id="job-001",
+            workflow_ids=["workflow-001", "workflow-001", "workflow-001"],  # Duplicates
+            new_manager_addr=("192.168.1.20", 9090),
+            old_manager_id="manager-001",
+            fencing_token=2,
+        )
+
+        ack = await worker.job_leader_worker_transfer(transfer)
+
+        assert ack.accepted
+        # Should only count as 1 update (same workflow updated multiple times)
+        assert ack.workflows_updated == 1
