@@ -19963,3 +19963,82 @@ Gate               DC-A Manager          DC-B Manager
 
 AD-36 uses AD-35's conservative RTT UCB and AD-17's health ordering to route jobs safely and efficiently.
 The combination is robust against noisy coordinates, high load, and WAN variability, while avoiding routing churn.
+
+---
+
+### AD-37: Explicit Backpressure Policy (Gate → Manager → Worker)
+
+**Decision**: Make backpressure explicit for high-volume stats/progress updates, while preserving AD-22/AD-32
+bounded execution and priority load shedding as the global safety net for all traffic.
+
+**Rationale**:
+- Workers are CPU/memory bound and emit frequent stats; explicit backpressure prevents stats from starving control.
+- Control-plane messages (SWIM, cancellation, leadership transfer) are CRITICAL and never shed by AD-32.
+- Global load shedding still protects the system under overload without slowing critical paths.
+
+**Compatibility**:
+- AD-37 extends AD-23 (stats/progress backpressure) and does not override AD-20 cancellation guarantees.
+- AD-37 does not change AD-17/AD-36 routing decisions; it only shapes update traffic.
+
+**Message Classes**:
+| Class | Examples | Policy |
+|------|----------|--------|
+| CONTROL | SWIM probes/acks, cancellation, leadership transfer | Never backpressured (CRITICAL) |
+| DISPATCH | Job submission, workflow dispatch, state sync | Shed under overload, bounded by priority |
+| DATA | Workflow progress, stats updates | Explicit backpressure + batching |
+| TELEMETRY | Debug stats, detailed metrics | Shed first under overload |
+
+**Backpressure Levels (StatsBuffer)**:
+- `NONE` (<70% hot tier fill): accept all
+- `THROTTLE` (70–85%): increase worker flush interval
+- `BATCH` (85–95%): accept batched updates only
+- `REJECT` (>95%): drop non-critical updates
+
+**Flow Diagram**:
+```
+Worker Progress  ──► Manager WorkflowProgress handler
+        │                 │
+        │                 ├─ StatsBuffer.record(rate)
+        │                 ├─ BackpressureLevel derived
+        │                 └─ WorkflowProgressAck(backpressure_*)
+        │                              │
+        └────────── ack ◄──────────────┘
+                 │
+                 ├─ _handle_backpressure_signal()
+                 ├─ _get_max_backpressure_level()
+                 └─ _progress_flush_loop() throttles/batches/drops
+```
+
+**State Diagram (Worker Flush)**:
+```
+[NO_BACKPRESSURE]
+   | (level >= THROTTLE)
+   v
+[THROTTLED] --(level >= BATCH)--> [BATCH_ONLY]
+   ^  (level < THROTTLE)            | (level >= REJECT)
+   |                                v
+   +---------------------------- [REJECT]
+```
+
+**Timing Diagram (Progress Flush)**:
+```
+T0: Worker collects progress
+T0+Δ: Manager acks with backpressure_level
+T0+Δ+ε: Worker updates per-manager signal
+T0+interval: Flush loop checks max signal
+  - NONE: flush immediately
+  - THROTTLE: add delay
+  - BATCH: aggregate buffer, flush less often
+  - REJECT: drop non-critical updates
+```
+
+**Implementation**:
+- Manager emits `BackpressureSignal` in `WorkflowProgressAck` based on `StatsBuffer` fill ratio.
+- Worker consumes ack and throttles progress flush loop using max backpressure across managers.
+- Gate uses load shedding for job submission and respects manager backpressure for forwarded updates.
+
+**References**:
+- `hyperscale/distributed_rewrite/reliability/backpressure.py:7`
+- `hyperscale/distributed_rewrite/nodes/manager.py:6066`
+- `hyperscale/distributed_rewrite/nodes/worker.py:3320`
+- `hyperscale/distributed_rewrite/server/protocol/in_flight_tracker.py:1`

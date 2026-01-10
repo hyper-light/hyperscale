@@ -12,6 +12,8 @@
 - Dataclasses must be defined in `models/` submodules and declared with `slots=True`.
 - Keep async patterns, TaskRunner usage, and logging patterns intact.
 - Avoid new architectural behavior changes while splitting files.
+- Maximum cyclic complexity of 5 for classes and 4 for functions.
+- Examine AD-10 through AD-36 in architecture.md. DO NOT BREAK COMPLIANCE with any of these.
 
 ## Target Module Layout (Shared Pattern)
 ```

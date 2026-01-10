@@ -10535,7 +10535,61 @@ class ManagerServer(HealthAwareServer):
     ):
         """Handle raw provision confirm."""
         return data
-    
+
+    @tcp.receive()
+    async def job_global_timeout(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+        transport: asyncio.Transport,
+    ):
+        """
+        Handle global timeout decision from gate (AD-34 Part 4).
+
+        Gate has declared job timed out - cancel it locally.
+        Validates fence token to reject stale timeout decisions.
+        """
+        try:
+            timeout_msg = JobGlobalTimeout.load(data)
+
+            strategy = self._job_timeout_strategies.get(timeout_msg.job_id)
+            if not strategy:
+                await self._udp_logger.log(
+                    ServerDebug(
+                        message=f"No timeout strategy for job {timeout_msg.job_id}, ignoring global timeout",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+                return b''
+
+            # Delegate to strategy (handles fence token validation)
+            accepted = await strategy.handle_global_timeout(
+                timeout_msg.job_id,
+                timeout_msg.reason,
+                timeout_msg.fence_token
+            )
+
+            if accepted:
+                # Clean up tracking
+                self._job_timeout_strategies.pop(timeout_msg.job_id, None)
+                await self._udp_logger.log(
+                    ServerInfo(
+                        message=f"Job {timeout_msg.job_id} globally timed out by gate: {timeout_msg.reason}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+
+            return b''
+
+        except Exception as e:
+            await self.handle_exception(e, "receive_job_global_timeout")
+            return b''
+
     @tcp.receive()
     async def provision_request(
         self,
