@@ -178,20 +178,20 @@ Per CLAUDE.md: "DO NOT RUN THE INTEGRATION TESTS YOURSELF. Ask me to."
 
 **Current State**: ✅ Coordinates now piggybacked on ALL SWIM messages (#|v{json} format). RTT measured from probe start time on ACK receipt. CoordinateTracker updated with peer coordinates and RTT on every ping/ack exchange.
 
-### 12.3 UNCONFIRMED Lifecycle State ❌ NOT IMPLEMENTED
+### 12.3 UNCONFIRMED Lifecycle State ✅ COMPLETE
 
 **File**: `hyperscale/distributed_rewrite/swim/detection/incarnation_tracker.py`
 
-🔴 **CRITICAL**: No formal UNCONFIRMED state exists
+✅ **COMPLETE**: Formal UNCONFIRMED state machine implemented - Commit 97c17ce1
 
-- [ ] **12.3.1** Add `UNCONFIRMED = b"UNCONFIRMED"` to lifecycle enum
-- [ ] **12.3.2** Implement UNCONFIRMED → ALIVE transition on first successful bidirectional communication
-- [ ] **12.3.3** Implement UNCONFIRMED → Removed transition on role-aware timeout
-- [ ] **12.3.4** Prevent UNCONFIRMED → SUSPECT transitions (AD-29 compliance)
-- [ ] **12.3.5** Add `get_nodes_by_state(state)` method
-- [ ] **12.3.6** Add `remove_node(node)` method for unconfirmed cleanup
+- [x] **12.3.1** Add `UNCONFIRMED = b"UNCONFIRMED"` to lifecycle enum - Commit 97c17ce1
+- [x] **12.3.2** Implement UNCONFIRMED → OK transition on first bidirectional communication - Commit 97c17ce1
+- [x] **12.3.3** Implement UNCONFIRMED → Removed transition on role-aware timeout - Commit 97c17ce1
+- [x] **12.3.4** Prevent UNCONFIRMED → SUSPECT transitions (AD-29 compliance) - Commit 97c17ce1
+- [x] **12.3.5** Add `get_nodes_by_state(state)` method - Commit 97c17ce1
+- [x] **12.3.6** Add `remove_node(node)` method for unconfirmed cleanup - Commit 97c17ce1
 
-**Current State**: Ad-hoc tracking via `_unconfirmed_peer_added_at` dict in health_aware_server.py (lines 1205-1218). No formal state machine.
+**Current State**: ✅ Complete formal state machine. Peers start as UNCONFIRMED, transition to OK on confirmation, can be removed but never SUSPECTED.
 
 ### 12.4 Role Classification ⚠️ EXISTS BUT NOT INTEGRATED (30%)
 
@@ -328,8 +328,8 @@ All remaining AD-36 items deferred. Core routing subsystem must be built first.
 
 1. [x] Add `vivaldi_coord` field to SWIM ping/ack messages (Section 12.2) - Commit b8187b27
 2. [x] Implement coordinate updates on every ping/ack exchange - Commit b8187b27
-3. [ ] Add UNCONFIRMED state to IncarnationTracker (Section 12.3)
-4. [ ] Implement basic RoleAwareConfirmationManager (Section 12.5)
+3. [x] Add UNCONFIRMED state to IncarnationTracker (Section 12.3) - Commit 97c17ce1
+4. [ ] Implement basic RoleAwareConfirmationManager (Section 12.5) - ALREADY EXISTS
 5. [ ] Add adaptive timeout calculation using Vivaldi RTT (Section 12.6)
 
 **Result:** AD-35 provides geographic latency awareness and role-specific confirmation
