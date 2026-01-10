@@ -144,6 +144,7 @@ from hyperscale.distributed_rewrite.models import (
     JobTimeoutReport,
     JobGlobalTimeout,
     JobFinalStatus,
+    TrackingToken,
     restricted_loads,
 )
 from hyperscale.distributed_rewrite.env import Env
@@ -8418,6 +8419,8 @@ class ManagerServer(HealthAwareServer):
 
         # Step 3-7: For each failed workflow, cancel dependents and prepare for retry
         all_workflows_to_retry: list[tuple[str, str]] = []  # (job_id, workflow_token)
+        # AD-33 Fix 3: Track workflows where cancellation is still pending
+        workflows_pending_cancellation: list[tuple[str, str, str, list[str]]] = []  # (job_id, workflow_token, subworkflow_token, dependent_ids)
 
         for job_id, workflow_token, subworkflow_token in failed_workflows:
             # Find all workflows that depend on this one (use workflow_token for lookups)
@@ -8431,27 +8434,51 @@ class ManagerServer(HealthAwareServer):
                     reason=f"cancelling {len(dependent_workflow_ids)} dependents"
                 )
 
-            # Cancel dependent workflows
+            # AD-33 Fix 3: Cancel dependent workflows and CHECK the result
+            cancellation_succeeded = True
             if dependent_workflow_ids:
-                await self._cancel_dependent_workflows_for_failure(
+                cancellation_succeeded = await self._cancel_dependent_workflows_for_failure(
                     job_id,
                     dependent_workflow_ids
                 )
 
-            # Transition: FAILED_CANCELING_DEPENDENTS → FAILED_READY_FOR_RETRY (use subworkflow_token)
-            if self._workflow_lifecycle_states:
-                await self._workflow_lifecycle_states.transition(
-                    subworkflow_token,
-                    WorkflowState.FAILED_READY_FOR_RETRY,
-                    reason="dependents cancelled, ready for retry"
-                )
+            # AD-33 Fix 3: Only transition to FAILED_READY_FOR_RETRY if all cancellations succeeded
+            if cancellation_succeeded:
+                # Transition: FAILED_CANCELING_DEPENDENTS → FAILED_READY_FOR_RETRY (use subworkflow_token)
+                if self._workflow_lifecycle_states:
+                    await self._workflow_lifecycle_states.transition(
+                        subworkflow_token,
+                        WorkflowState.FAILED_READY_FOR_RETRY,
+                        reason="dependents cancelled, ready for retry"
+                    )
 
-            # Collect for retry (use workflow_token for requeue operations)
-            all_workflows_to_retry.append((job_id, workflow_token))
-            all_workflows_to_retry.extend((job_id, dep_id) for dep_id in dependent_workflow_ids)
+                # Collect for retry (use workflow_token for requeue operations)
+                all_workflows_to_retry.append((job_id, workflow_token))
+                all_workflows_to_retry.extend((job_id, dep_id) for dep_id in dependent_workflow_ids)
+            else:
+                # AD-33 Fix 3: Cancellation failed - workflow stays in FAILED_CANCELING_DEPENDENTS
+                # Track for background retry of cancellation
+                workflows_pending_cancellation.append((
+                    job_id, workflow_token, subworkflow_token, dependent_workflow_ids
+                ))
+                await self._udp_logger.log(ServerWarning(
+                    message=f"Workflow {workflow_token} blocked in FAILED_CANCELING_DEPENDENTS - "
+                            f"some dependent cancellations failed. Will retry cancellation.",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                ))
 
-        # Step 8-9: Re-queue in dependency order
-        await self._requeue_workflows_in_dependency_order(all_workflows_to_retry)
+        # Step 8-9: Re-queue successfully cancelled workflows in dependency order
+        if all_workflows_to_retry:
+            await self._requeue_workflows_in_dependency_order(all_workflows_to_retry)
+
+        # AD-33 Fix 3: Schedule background retry for workflows with failed cancellations
+        if workflows_pending_cancellation:
+            self._task_runner.run(
+                self._retry_pending_cancellations,
+                workflows_pending_cancellation,
+            )
 
     async def _cancel_single_running_dependent(
         self,
@@ -8647,6 +8674,77 @@ class ManagerServer(HealthAwareServer):
             ))
 
         return all_succeeded
+
+    async def _retry_pending_cancellations(
+        self,
+        pending_workflows: list[tuple[str, str, str, list[str]]],
+        max_retry_attempts: int = 5,
+        base_delay: float = 2.0,
+    ) -> None:
+        """
+        Retry cancellations for workflows stuck in FAILED_CANCELING_DEPENDENTS (AD-33 Fix 3).
+
+        This background task retries dependent cancellations with exponential backoff.
+        Once all dependents are cancelled, the workflow transitions to FAILED_READY_FOR_RETRY
+        and is re-queued for retry.
+
+        Args:
+            pending_workflows: List of (job_id, workflow_token, subworkflow_token, dependent_ids)
+            max_retry_attempts: Maximum number of retry attempts per workflow
+            base_delay: Base delay for exponential backoff
+        """
+        for attempt in range(max_retry_attempts):
+            if not pending_workflows:
+                return
+
+            # Exponential backoff
+            delay = base_delay * (2 ** attempt)
+            await asyncio.sleep(delay)
+
+            still_pending: list[tuple[str, str, str, list[str]]] = []
+
+            for job_id, workflow_token, subworkflow_token, dependent_ids in pending_workflows:
+                # Retry cancellation of remaining dependents
+                cancellation_succeeded = await self._cancel_dependent_workflows_for_failure(
+                    job_id,
+                    dependent_ids
+                )
+
+                if cancellation_succeeded:
+                    # Transition: FAILED_CANCELING_DEPENDENTS → FAILED_READY_FOR_RETRY
+                    if self._workflow_lifecycle_states:
+                        await self._workflow_lifecycle_states.transition(
+                            subworkflow_token,
+                            WorkflowState.FAILED_READY_FOR_RETRY,
+                            reason=f"dependents cancelled after retry attempt {attempt + 1}"
+                        )
+
+                    # Re-queue the workflow and its dependents
+                    workflows_to_retry = [(job_id, workflow_token)]
+                    workflows_to_retry.extend((job_id, dep_id) for dep_id in dependent_ids)
+                    await self._requeue_workflows_in_dependency_order(workflows_to_retry)
+
+                    await self._udp_logger.log(ServerInfo(
+                        message=f"Workflow {workflow_token} cancellation retry succeeded on attempt {attempt + 1}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    ))
+                else:
+                    # Still pending - will retry on next attempt
+                    still_pending.append((job_id, workflow_token, subworkflow_token, dependent_ids))
+
+            pending_workflows = still_pending
+
+        # All retries exhausted for remaining workflows
+        for job_id, workflow_token, subworkflow_token, dependent_ids in pending_workflows:
+            await self._udp_logger.log(ServerError(
+                message=f"Workflow {workflow_token} cancellation retry exhausted after {max_retry_attempts} attempts. "
+                        f"Workflow stuck in FAILED_CANCELING_DEPENDENTS state. Manual intervention required.",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            ))
 
     async def _requeue_workflows_in_dependency_order(
         self,
@@ -11031,7 +11129,7 @@ class ManagerServer(HealthAwareServer):
             await self.handle_exception(e, "receive_workflow_cancellation_peer_notification")
             return b"ERROR"
 
-    async def _find_dependent_workflows(self, job_id: str, workflow_id: str) -> list[str]:
+    async def _find_dependent_workflows(self, job_id: str, workflow_token: str) -> list[str]:
         """
         Find all workflows that depend on the given workflow.
 
@@ -11041,25 +11139,52 @@ class ManagerServer(HealthAwareServer):
         Uses the WorkflowDispatcher's dependency graph, which maintains
         the authoritative dependency information from job submission.
 
+        AD-33 Fix 1: Token format handling
+        - Input: 4-part workflow_token (DC:mgr:job:wf_id)
+        - Dependency graph uses client workflow_ids (e.g., "wf-0001")
+        - Output: 4-part workflow tokens for consistency with job.workflows
+
         Args:
             job_id: Job ID
-            workflow_id: Workflow ID to find dependents of
+            workflow_token: 4-part workflow token (DC:manager:job_id:workflow_id)
 
         Returns:
-            List of workflow IDs that depend (directly or transitively) on the given workflow
+            List of 4-part workflow tokens that depend (directly or transitively) on the given workflow
         """
-        dependents: list[str] = []
+        dependent_tokens: list[str] = []
 
         if not self._workflow_dispatcher:
-            return dependents
+            return dependent_tokens
 
-        # Get dependency graph from dispatcher
+        # AD-33 Fix 1: Extract client workflow_id from 4-part token
+        # The dependency graph uses client IDs like "wf-0001", not full tokens
+        try:
+            parsed_token = TrackingToken.parse(workflow_token)
+            client_workflow_id = parsed_token.workflow_id
+            if not client_workflow_id:
+                await self._udp_logger.log(ServerWarning(
+                    message=f"Cannot extract workflow_id from token {workflow_token}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                ))
+                return dependent_tokens
+        except ValueError as error:
+            await self._udp_logger.log(ServerWarning(
+                message=f"Failed to parse workflow token {workflow_token}: {error}",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            ))
+            return dependent_tokens
+
+        # Get dependency graph from dispatcher (uses client workflow_ids)
         deps = await self._workflow_dispatcher.get_job_dependency_graph(job_id)
 
         if not deps:
-            return dependents
+            return dependent_tokens
 
-        # Build reverse dependency map (workflow -> workflows that depend on it)
+        # Build reverse dependency map (client_workflow_id -> list of dependent client_workflow_ids)
         reverse_deps: dict[str, list[str]] = {}
         for wf_id, dep_set in deps.items():
             for dep in dep_set:
@@ -11067,8 +11192,9 @@ class ManagerServer(HealthAwareServer):
                     reverse_deps[dep] = []
                 reverse_deps[dep].append(wf_id)
 
-        # BFS to find all dependents (direct and transitive)
-        queue = [workflow_id]
+        # BFS to find all dependents (direct and transitive) using client IDs
+        dependent_client_ids: list[str] = []
+        queue = [client_workflow_id]
         visited: set[str] = set()
 
         while queue:
@@ -11079,10 +11205,16 @@ class ManagerServer(HealthAwareServer):
 
             for dependent in reverse_deps.get(current, []):
                 if dependent not in visited:
-                    dependents.append(dependent)
+                    dependent_client_ids.append(dependent)
                     queue.append(dependent)
 
-        return dependents
+        # AD-33 Fix 1: Convert client IDs back to 4-part workflow tokens
+        # Use the same datacenter and manager_id from the original token
+        for client_id in dependent_client_ids:
+            dependent_token = self._job_manager.create_workflow_token(job_id, client_id)
+            dependent_tokens.append(str(dependent_token))
+
+        return dependent_tokens
 
     async def _notify_peers_of_workflow_cancellation(
         self,

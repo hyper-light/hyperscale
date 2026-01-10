@@ -1,50 +1,16 @@
 # AD-29 / AD-30 Compliance Fixes
 
-## AD-29 (Protocol-Level Peer Confirmation) — NOT fully compliant
+## AD-29 (Protocol-Level Peer Confirmation) — compliant
 
-### 1) Use unconfirmed tracking when adding peers
-**Problem**: Nodes add peers to active sets and SWIM probing without calling `add_unconfirmed_peer()`, bypassing the unconfirmed/confirmed state machine.
+Peer confirmation and unconfirmed tracking are wired end-to-end:
+- Unconfirmed peers tracked via `add_unconfirmed_peer()` and only activated via confirmation callbacks.
+- Confirmation is triggered by SWIM message handlers, and suspicion is gated on confirmation.
+- Stale unconfirmed peers are logged during cleanup.
 
-**Exact changes**:
-- **Manager**: In `manager_peer_register()` after `udp_addr` is built, call `self.add_unconfirmed_peer(udp_addr)` and **defer** adding to `_active_manager_peers` / `_active_manager_peer_ids` until confirmation.
-  - File: `hyperscale/distributed_rewrite/nodes/manager.py`
-  - Method: `manager_peer_register()`
-- **Gate**: When discovering managers/gates from registration or discovery, call `add_unconfirmed_peer(udp_addr)` before adding to active peer sets.
-  - File: `hyperscale/distributed_rewrite/nodes/gate.py`
-  - Methods: registration/discovery paths where `_probe_scheduler.add_member()` is called
-- **Worker**: When adding manager UDP addresses to SWIM probing, call `add_unconfirmed_peer(manager_udp_addr)`.
-  - File: `hyperscale/distributed_rewrite/nodes/worker.py`
-  - Method: manager discovery/registration path where `_probe_scheduler.add_member()` is called
-
-**Acceptance**:
-- Unconfirmed peers are not in active peer sets until `confirm_peer()` is invoked by a successful SWIM message.
-
----
-
-### 2) Wire peer confirmation callback to activate peers
-**Problem**: `HealthAwareServer.register_on_peer_confirmed()` exists but no node uses it to move peers into active sets.
-
-**Exact changes**:
-- Register a callback in Gate/Manager/Worker that:
-  - Adds the confirmed peer to the corresponding active peer sets.
-  - Removes it from any pending/unconfirmed tracking used in the node.
-
-**Acceptance**:
-- Active peer sets contain only confirmed peers.
-- Confirmation occurs on first successful message (ACK/heartbeat/etc.).
-
----
-
-### 3) Add stale unconfirmed logging/metrics
-**Problem**: `_unconfirmed_peer_added_at` is tracked but never used for visibility.
-
-**Exact changes**:
-- In `HealthAwareServer._run_cleanup()`, add:
-  - A warning log + metric when an unconfirmed peer exceeds a threshold (e.g., 60s).
-  - Optional: remove from `_unconfirmed_peers` after a larger TTL if policy allows; logging is the minimum requirement per AD-29 mitigation guidance.
-
-**Acceptance**:
-- Long-lived unconfirmed peers are visible in logs/metrics.
+References:
+- `hyperscale/distributed_rewrite/swim/health_aware_server.py:273`
+- `hyperscale/distributed_rewrite/swim/health_aware_server.py:2709`
+- `hyperscale/distributed_rewrite/nodes/manager.py:715`
 
 ---
 
@@ -68,29 +34,19 @@ No fixes required. Priority-aware in-flight tracking, load shedding, and bounded
 
 ## AD-33 (Workflow State Machine + Federated Health Monitoring) — NOT fully compliant
 
-### 1) Fix rescheduling token mismatch in worker-failure path
-**Problem**: `_handle_worker_failure()` builds `workflow_id` from sub-workflow tokens and later looks up `job.workflows[workflow_id]`, but `job.workflows` is keyed by the **parent workflow token** (no worker suffix). This prevents re-queueing and breaks AD-33 reschedule semantics.
+### 1) Rescheduling token handling (worker-failure path) — compliant
+`_handle_worker_failure()` separates parent workflow tokens for job lookups and subworkflow tokens for lifecycle transitions.
 
-**Exact changes**:
-- In `hyperscale/distributed_rewrite/nodes/manager.py`, ensure `failed_workflows` uses the **parent workflow token** for lookups and the **subworkflow token** only for lifecycle transitions.
-- Update `_requeue_workflows_in_dependency_order()` to accept parent workflow tokens and map them back to subworkflow tokens when applying lifecycle transitions.
-
-**Acceptance**:
-- Failed workflows are correctly found in `job.workflows` and re-queued.
-- State transitions occur on the correct token type.
+References:
+- `hyperscale/distributed_rewrite/nodes/manager.py:8374`
 
 ---
 
-### 2) Provide dependency information to the rescheduler
-**Problem**: `_find_dependent_workflows()` relies on `sub_wf.dependencies`, but `SubWorkflowInfo` has no `dependencies` field; dependencies currently live in `WorkflowDispatcher.PendingWorkflow`.
+### 2) Dependency discovery for rescheduling — compliant
+`_find_dependent_workflows()` reads the dependency graph from `WorkflowDispatcher` and traverses dependents (direct + transitive).
 
-**Exact changes**:
-- Persist dependencies into `SubWorkflowInfo` when constructing sub-workflows, **or**
-- In `_find_dependent_workflows()`, consult `WorkflowDispatcher`’s dependency graph instead of `SubWorkflowInfo`.
-
-**Acceptance**:
-- Dependent workflows are correctly discovered (direct + transitive).
-- AD-33 cancellation-before-retry ordering works.
+References:
+- `hyperscale/distributed_rewrite/nodes/manager.py:11034`
 
 ---
 
@@ -106,15 +62,18 @@ No fixes required. Priority-aware in-flight tracking, load shedding, and bounded
 
 ---
 
-### 4) FederatedHealthMonitor integration (AD-33 cross-DC)
-**Problem**: AD-33 specifies `FederatedHealthMonitor` for cross-DC health checks; ensure gate routes through it instead of only local aggregates.
+### 4) FederatedHealthMonitor integration (AD-33 cross-DC) — NOT fully compliant
+**Observed**: Gate initializes `FederatedHealthMonitor` and handles `xprobe/xack`, but DC health classification is still delegated to `DatacenterHealthManager` (manager TCP heartbeats only) in `_classify_datacenter_health()`.
 
 **Exact changes**:
-- Verify `Gate` uses `FederatedHealthMonitor` to classify DCs for routing decisions.
-- If not wired, integrate `FederatedHealthMonitor` outputs into `_datacenter_status` and `_select_datacenters_with_fallback()`.
+- Incorporate `FederatedHealthMonitor` health signals into DC classification and routing (e.g., feed into `_dc_health_manager` or layer its result in `_classify_datacenter_health()` / `_select_datacenters_with_fallback()`).
 
 **Acceptance**:
-- Cross-DC health classification uses `xprobe/xack` signals, not just local SWIM state.
+- Cross-DC health classification reflects `xprobe/xack` results, not only manager heartbeats.
+
+References:
+- `hyperscale/distributed_rewrite/nodes/gate.py:533`
+- `hyperscale/distributed_rewrite/nodes/gate.py:1929`
 
 ---
 

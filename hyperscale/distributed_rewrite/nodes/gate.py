@@ -43,6 +43,7 @@ from hyperscale.distributed_rewrite.swim.health import (
     FederatedHealthMonitor,
     CrossClusterAck,
     DCLeaderAnnouncement,
+    DCReachability,
 )
 from hyperscale.distributed_rewrite.models import (
     NodeInfo,
@@ -1928,12 +1929,97 @@ class GateServer(HealthAwareServer):
     
     def _classify_datacenter_health(self, dc_id: str) -> DatacenterStatus:
         """
-        Classify datacenter health based on TCP heartbeats from managers.
+        Classify datacenter health based on TCP heartbeats and UDP probes.
 
-        Delegates to DatacenterHealthManager for centralized health classification.
-        See AD-16 in docs/architecture.md.
+        AD-33 Fix 4: Integrates FederatedHealthMonitor's UDP probe results
+        with DatacenterHealthManager's TCP heartbeat data.
+
+        Health classification combines two signals:
+        1. TCP heartbeats from managers (DatacenterHealthManager)
+        2. UDP probes to DC leader (FederatedHealthMonitor)
+
+        If FederatedHealthMonitor shows DC as UNREACHABLE, the DC is UNHEALTHY
+        regardless of TCP heartbeat status. If SUSPECTED, DC is DEGRADED.
+
+        See AD-16, AD-33 in docs/architecture.md.
         """
-        return self._dc_health_manager.get_datacenter_health(dc_id)
+        # Get TCP heartbeat-based health from DatacenterHealthManager
+        tcp_status = self._dc_health_manager.get_datacenter_health(dc_id)
+
+        # AD-33 Fix 4: Integrate FederatedHealthMonitor's UDP probe results
+        federated_health = self._dc_health_monitor.get_dc_health(dc_id)
+
+        if federated_health is None:
+            # No FederatedHealthMonitor data yet - use TCP-only status
+            return tcp_status
+
+        # Check UDP probe reachability
+        if federated_health.reachability == DCReachability.UNREACHABLE:
+            # DC is UNREACHABLE via UDP probes - override to UNHEALTHY
+            # This catches cases where TCP heartbeats are stale but UDP shows DC is down
+            return DatacenterStatus(
+                dc_id=dc_id,
+                health=DatacenterHealth.UNHEALTHY.value,
+                available_capacity=0,
+                queue_depth=tcp_status.queue_depth,
+                manager_count=tcp_status.manager_count,
+                worker_count=0,
+                last_update=tcp_status.last_update,
+            )
+
+        if federated_health.reachability == DCReachability.SUSPECTED:
+            # DC is SUSPECTED via UDP probes - at minimum DEGRADED
+            # If TCP already shows worse (UNHEALTHY), keep that
+            if tcp_status.health == DatacenterHealth.UNHEALTHY.value:
+                return tcp_status
+
+            return DatacenterStatus(
+                dc_id=dc_id,
+                health=DatacenterHealth.DEGRADED.value,
+                available_capacity=tcp_status.available_capacity,
+                queue_depth=tcp_status.queue_depth,
+                manager_count=tcp_status.manager_count,
+                worker_count=tcp_status.worker_count,
+                last_update=tcp_status.last_update,
+            )
+
+        # FederatedHealthMonitor shows REACHABLE - use TCP-based status
+        # but also consider FederatedHealthMonitor's self-reported health from last ack
+        if federated_health.last_ack:
+            reported_health = federated_health.last_ack.dc_health
+            # If DC self-reports worse health than TCP status shows, use worse
+            if reported_health == "UNHEALTHY" and tcp_status.health != DatacenterHealth.UNHEALTHY.value:
+                return DatacenterStatus(
+                    dc_id=dc_id,
+                    health=DatacenterHealth.UNHEALTHY.value,
+                    available_capacity=0,
+                    queue_depth=tcp_status.queue_depth,
+                    manager_count=federated_health.last_ack.healthy_managers,
+                    worker_count=federated_health.last_ack.healthy_workers,
+                    last_update=tcp_status.last_update,
+                )
+            if reported_health == "DEGRADED" and tcp_status.health == DatacenterHealth.HEALTHY.value:
+                return DatacenterStatus(
+                    dc_id=dc_id,
+                    health=DatacenterHealth.DEGRADED.value,
+                    available_capacity=federated_health.last_ack.available_cores,
+                    queue_depth=tcp_status.queue_depth,
+                    manager_count=federated_health.last_ack.healthy_managers,
+                    worker_count=federated_health.last_ack.healthy_workers,
+                    last_update=tcp_status.last_update,
+                )
+            if reported_health == "BUSY" and tcp_status.health == DatacenterHealth.HEALTHY.value:
+                return DatacenterStatus(
+                    dc_id=dc_id,
+                    health=DatacenterHealth.BUSY.value,
+                    available_capacity=federated_health.last_ack.available_cores,
+                    queue_depth=tcp_status.queue_depth,
+                    manager_count=federated_health.last_ack.healthy_managers,
+                    worker_count=federated_health.last_ack.healthy_workers,
+                    last_update=tcp_status.last_update,
+                )
+
+        return tcp_status
     
     def _get_all_datacenter_health(self) -> dict[str, DatacenterStatus]:
         """
