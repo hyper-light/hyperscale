@@ -2,12 +2,16 @@ import math
 import time
 from typing import Iterable
 
-from hyperscale.distributed_rewrite.models.coordinates import NetworkCoordinate
+from hyperscale.distributed_rewrite.models.coordinates import (
+    NetworkCoordinate,
+    VivaldiConfig,
+)
 
 
 class NetworkCoordinateEngine:
     def __init__(
         self,
+        config: VivaldiConfig | None = None,
         dimensions: int = 8,
         ce: float = 0.25,
         error_decay: float = 0.25,
@@ -17,16 +21,27 @@ class NetworkCoordinateEngine:
         min_error: float = 0.05,
         max_error: float = 10.0,
     ) -> None:
-        self._dimensions = dimensions
-        self._ce = ce
-        self._error_decay = error_decay
-        self._gravity = gravity
-        self._height_adjustment = height_adjustment
-        self._adjustment_smoothing = adjustment_smoothing
-        self._min_error = min_error
-        self._max_error = max_error
+        # Use config if provided, otherwise use individual parameters
+        self._config = config or VivaldiConfig(
+            dimensions=dimensions,
+            ce=ce,
+            error_decay=error_decay,
+            gravity=gravity,
+            height_adjustment=height_adjustment,
+            adjustment_smoothing=adjustment_smoothing,
+            min_error=min_error,
+            max_error=max_error,
+        )
+        self._dimensions = self._config.dimensions
+        self._ce = self._config.ce
+        self._error_decay = self._config.error_decay
+        self._gravity = self._config.gravity
+        self._height_adjustment = self._config.height_adjustment
+        self._adjustment_smoothing = self._config.adjustment_smoothing
+        self._min_error = self._config.min_error
+        self._max_error = self._config.max_error
         self._coordinate = NetworkCoordinate(
-            vec=[0.0 for _ in range(dimensions)],
+            vec=[0.0 for _ in range(self._dimensions)],
             height=0.0,
             adjustment=0.0,
             error=1.0,
@@ -120,3 +135,120 @@ class NetworkCoordinateEngine:
     @staticmethod
     def _clamp(value: float, min_value: float, max_value: float) -> float:
         return max(min_value, min(max_value, value))
+
+    def estimate_rtt_ucb_ms(
+        self,
+        local: NetworkCoordinate | None,
+        remote: NetworkCoordinate | None,
+    ) -> float:
+        """
+        Estimate RTT with upper confidence bound (AD-35 Task 12.1.4).
+
+        Uses Vivaldi distance plus a safety margin based on coordinate error.
+        Falls back to conservative defaults when coordinates are unavailable.
+
+        Formula: rtt_ucb = clamp(rtt_hat + K_SIGMA * sigma, RTT_MIN, RTT_MAX)
+
+        Args:
+            local: Local node coordinate (or None for default)
+            remote: Remote node coordinate (or None for default)
+
+        Returns:
+            RTT upper confidence bound in milliseconds
+        """
+        if local is None or remote is None:
+            rtt_hat_ms = self._config.rtt_default_ms
+            sigma_ms = self._config.sigma_default_ms
+        else:
+            # Estimate RTT from coordinate distance (in seconds, convert to ms)
+            rtt_hat_ms = self.estimate_rtt_ms(local, remote)
+            # Sigma is combined error of both coordinates (in seconds → ms)
+            combined_error = (local.error + remote.error) * 1000.0
+            sigma_ms = self._clamp(
+                combined_error,
+                self._config.sigma_min_ms,
+                self._config.sigma_max_ms,
+            )
+
+        # Apply UCB formula: rtt_hat + K_SIGMA * sigma
+        rtt_ucb = rtt_hat_ms + self._config.k_sigma * sigma_ms
+
+        return self._clamp(
+            rtt_ucb,
+            self._config.rtt_min_ms,
+            self._config.rtt_max_ms,
+        )
+
+    def coordinate_quality(
+        self,
+        coord: NetworkCoordinate | None = None,
+    ) -> float:
+        """
+        Compute coordinate quality score (AD-35 Task 12.1.5).
+
+        Quality is a value in [0.0, 1.0] based on:
+        - Sample count: More samples = higher quality
+        - Error: Lower error = higher quality
+        - Staleness: Fresher coordinates = higher quality
+
+        Formula: quality = sample_quality * error_quality * staleness_quality
+
+        Args:
+            coord: Coordinate to assess (defaults to local coordinate)
+
+        Returns:
+            Quality score in [0.0, 1.0]
+        """
+        if coord is None:
+            coord = self._coordinate
+
+        # Sample quality: ramps up to 1.0 as sample_count approaches min_samples
+        sample_quality = min(
+            1.0,
+            coord.sample_count / self._config.min_samples_for_routing,
+        )
+
+        # Error quality: error in seconds, config threshold in ms
+        error_ms = coord.error * 1000.0
+        error_quality = min(
+            1.0,
+            self._config.error_good_ms / max(error_ms, 1.0),
+        )
+
+        # Staleness quality: degrades after coord_ttl_seconds
+        staleness_seconds = time.monotonic() - coord.updated_at
+        if staleness_seconds <= self._config.coord_ttl_seconds:
+            staleness_quality = 1.0
+        else:
+            staleness_quality = self._config.coord_ttl_seconds / staleness_seconds
+
+        # Combined quality (all factors multiplicative)
+        quality = sample_quality * error_quality * staleness_quality
+
+        return self._clamp(quality, 0.0, 1.0)
+
+    def is_converged(self, coord: NetworkCoordinate | None = None) -> bool:
+        """
+        Check if coordinate has converged (AD-35 Task 12.1.6).
+
+        A coordinate is converged when:
+        - Error is below the convergence threshold
+        - Sample count is at or above minimum
+
+        Args:
+            coord: Coordinate to check (defaults to local coordinate)
+
+        Returns:
+            True if coordinate is converged
+        """
+        if coord is None:
+            coord = self._coordinate
+
+        error_converged = coord.error <= self._config.convergence_error_threshold
+        samples_sufficient = coord.sample_count >= self._config.convergence_min_samples
+
+        return error_converged and samples_sufficient
+
+    def get_config(self) -> VivaldiConfig:
+        """Get the Vivaldi configuration."""
+        return self._config
