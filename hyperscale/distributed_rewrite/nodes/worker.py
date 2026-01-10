@@ -41,7 +41,6 @@ except ImportError:
     _PSUTIL_AVAILABLE = False
 
 from hyperscale.core.engines.client.time_parser import TimeParser
-from hyperscale.core.graph import Workflow
 from hyperscale.core.jobs.graphs.remote_graph_manager import RemoteGraphManager
 from hyperscale.ui import InterfaceUpdatesController
 from hyperscale.core.monitoring import CPUMonitor, MemoryMonitor
@@ -96,7 +95,6 @@ from hyperscale.distributed_rewrite.protocol.version import (
     NodeCapabilities,
     ProtocolVersion,
     NegotiatedCapabilities,
-    get_features_for_version,
 )
 from hyperscale.distributed_rewrite.discovery import DiscoveryService
 from hyperscale.logging.config.logging_config import LoggingConfig
@@ -277,7 +275,12 @@ class WorkerServer(HealthAwareServer):
         # Protocol version negotiation result (AD-25)
         # Set during registration response handling
         self._negotiated_capabilities: NegotiatedCapabilities | None = None
-        
+
+        # Node capabilities for protocol negotiation (AD-25)
+        # Used when registering with managers and responding to manager registrations
+        # node_version is set properly in start() when node_id is available
+        self._node_capabilities = NodeCapabilities.current(node_version="")
+
         # Queue depth tracking
         self._pending_workflows: list[WorkflowDispatch] = []
         
@@ -498,6 +501,11 @@ class WorkerServer(HealthAwareServer):
         # Start the underlying server (TCP/UDP listeners, task runner, etc.)
         # Uses SWIM settings from Env configuration
         await self.start_server(init_context=self.env.get_swim_init_context())
+
+        # Now that node_id is available, update node capabilities with proper version
+        self._node_capabilities = NodeCapabilities.current(
+            node_version=f"worker-{self._node_id.short}"
+        )
 
         # Mark as started for stop() guard
         self._started = True
@@ -1377,9 +1385,8 @@ class WorkerServer(HealthAwareServer):
             )
             return False
 
-        # Build capabilities string from current protocol version (AD-25)
-        current_features = get_features_for_version(CURRENT_PROTOCOL_VERSION)
-        capabilities_str = ",".join(sorted(current_features))
+        # Build capabilities string from node capabilities (AD-25)
+        capabilities_str = ",".join(sorted(self._node_capabilities.capabilities))
 
         registration = WorkerRegistration(
             node=self.node_info,
@@ -1387,8 +1394,8 @@ class WorkerServer(HealthAwareServer):
             available_cores=self._core_allocator.available_cores,
             memory_mb=self._get_memory_mb(),
             available_memory_mb=self._get_available_memory_mb(),
-            protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
-            protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+            protocol_version_major=self._node_capabilities.protocol_version.major,
+            protocol_version_minor=self._node_capabilities.protocol_version.minor,
             capabilities=capabilities_str,
         )
 
