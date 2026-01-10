@@ -7998,7 +7998,7 @@ class ManagerServer(HealthAwareServer):
 
         for job_id, workflow_token, subworkflow_token in failed_workflows:
             # Find all workflows that depend on this one (use workflow_token for lookups)
-            dependent_workflow_ids = self._find_dependent_workflows(job_id, workflow_token)
+            dependent_workflow_ids = await self._find_dependent_workflows(job_id, workflow_token)
 
             # Transition: FAILED → FAILED_CANCELING_DEPENDENTS (use subworkflow_token)
             if self._workflow_lifecycle_states:
@@ -8150,8 +8150,8 @@ class ManagerServer(HealthAwareServer):
             if not job:
                 continue
 
-            # Get dependency graph for this job
-            workflow_deps = self._build_dependency_graph(job)
+            # Get dependency graph for this job from WorkflowDispatcher
+            workflow_deps = await self._build_dependency_graph(job_id)
 
             # Topological sort to get correct order
             ordered_workflows = self._topological_sort(workflow_ids, workflow_deps)
@@ -8237,12 +8237,29 @@ class ManagerServer(HealthAwareServer):
                 node_id=self._node_id.short,
             ))
 
-    def _build_dependency_graph(self, job) -> dict[str, list[str]]:
-        """Build workflow ID → dependencies map (AD-33)."""
-        deps = {}
-        for sub_wf in job.sub_workflows.values():
-            workflow_id = str(sub_wf.token)
-            deps[workflow_id] = getattr(sub_wf, 'dependencies', [])
+    async def _build_dependency_graph(self, job_id: str) -> dict[str, list[str]]:
+        """
+        Build workflow ID → dependencies map (AD-33).
+
+        Retrieves the actual dependency graph from WorkflowDispatcher,
+        which maintains the authoritative dependency information from
+        job submission.
+
+        Args:
+            job_id: Job ID to get dependencies for
+
+        Returns:
+            Dict mapping workflow_id to list of dependency workflow_ids
+        """
+        if not self._workflow_dispatcher:
+            return {}
+
+        # Get dependency graph from dispatcher (returns dict[str, set[str]])
+        deps_sets = await self._workflow_dispatcher.get_job_dependency_graph(job_id)
+
+        # Convert sets to lists for compatibility with topological sort
+        deps = {wf_id: list(dep_set) for wf_id, dep_set in deps_sets.items()}
+
         return deps
 
     def _topological_sort(
@@ -9882,31 +9899,43 @@ class ManagerServer(HealthAwareServer):
             await self.handle_exception(e, "receive_workflow_cancellation_peer_notification")
             return b"ERROR"
 
-    def _find_dependent_workflows(self, job_id: str, workflow_id: str) -> list[str]:
+    async def _find_dependent_workflows(self, job_id: str, workflow_id: str) -> list[str]:
         """
         Find all workflows that depend on the given workflow.
 
         Recursively traverses the dependency graph to find ALL dependents
         (direct and transitive).
+
+        Uses the WorkflowDispatcher's dependency graph, which maintains
+        the authoritative dependency information from job submission.
+
+        Args:
+            job_id: Job ID
+            workflow_id: Workflow ID to find dependents of
+
+        Returns:
+            List of workflow IDs that depend (directly or transitively) on the given workflow
         """
         dependents: list[str] = []
-        job = self._job_manager.get_job_by_id(job_id)
-        if not job:
+
+        if not self._workflow_dispatcher:
+            return dependents
+
+        # Get dependency graph from dispatcher
+        deps = await self._workflow_dispatcher.get_job_dependency_graph(job_id)
+
+        if not deps:
             return dependents
 
         # Build reverse dependency map (workflow -> workflows that depend on it)
         reverse_deps: dict[str, list[str]] = {}
-        for sub_wf in job.sub_workflows.values():
-            wf_id = str(sub_wf.token)
-            # Dependencies would be stored in the workflow's metadata
-            # For now, we check if this workflow has dependencies
-            if hasattr(sub_wf, 'dependencies') and sub_wf.dependencies:
-                for dep in sub_wf.dependencies:
-                    if dep not in reverse_deps:
-                        reverse_deps[dep] = []
-                    reverse_deps[dep].append(wf_id)
+        for wf_id, dep_set in deps.items():
+            for dep in dep_set:
+                if dep not in reverse_deps:
+                    reverse_deps[dep] = []
+                reverse_deps[dep].append(wf_id)
 
-        # BFS to find all dependents
+        # BFS to find all dependents (direct and transitive)
         queue = [workflow_id]
         visited: set[str] = set()
 

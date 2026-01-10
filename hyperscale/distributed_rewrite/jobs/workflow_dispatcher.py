@@ -1001,6 +1001,32 @@ class WorkflowDispatcher:
 
         return cancelled_workflow_ids
 
+    async def get_job_dependency_graph(self, job_id: str) -> dict[str, set[str]]:
+        """
+        Get the dependency graph for all workflows in a job.
+
+        Returns a dict mapping workflow_id -> set of dependency workflow_ids.
+        This is needed by the Manager's failure handler to find dependents
+        when rescheduling workflows after worker failure (AD-33).
+
+        Args:
+            job_id: The job ID
+
+        Returns:
+            Dict mapping workflow_id to its set of dependencies.
+            Empty dict if job not found or no workflows.
+        """
+        dependency_graph: dict[str, set[str]] = {}
+
+        async with self._pending_lock:
+            # Extract dependencies from all pending workflows for this job
+            for key, pending in self._pending.items():
+                if pending.job_id == job_id:
+                    # Copy the set to avoid external mutation
+                    dependency_graph[pending.workflow_id] = pending.dependencies.copy()
+
+        return dependency_graph
+
     async def add_pending_workflow(
         self,
         job_id: str,
