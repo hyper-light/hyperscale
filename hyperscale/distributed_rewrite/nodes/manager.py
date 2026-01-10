@@ -2018,11 +2018,13 @@ class ManagerServer(HealthAwareServer):
             time.monotonic() + 30.0,  # Default 30s deadline
         )
 
-        # Create extension request from heartbeat data
+        # Create extension request from heartbeat data (AD-26 Issue 1 fix)
         request = HealthcheckExtensionRequest(
             worker_id=heartbeat.node_id,
             reason=heartbeat.extension_reason or "heartbeat_piggyback",
             current_progress=heartbeat.extension_current_progress,
+            estimated_completion=heartbeat.extension_estimated_completion,
+            active_workflow_count=heartbeat.extension_active_workflow_count,
         )
 
         # Handle extension request

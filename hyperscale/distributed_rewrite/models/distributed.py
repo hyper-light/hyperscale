@@ -555,6 +555,8 @@ class WorkerHeartbeat(Message):
     extension_requested: bool = False
     extension_reason: str = ""
     extension_current_progress: float = 0.0  # 0.0-1.0 progress indicator
+    extension_estimated_completion: float = 0.0  # Estimated seconds until completion
+    extension_active_workflow_count: int = 0  # Number of workflows currently executing
 
 
 @dataclass(slots=True)
