@@ -14,7 +14,7 @@ for the HealthGossipBuffer, enabling O(log n) health state dissemination
 alongside membership gossip.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol, Callable, Any
 import time
 
@@ -23,6 +23,7 @@ from hyperscale.distributed_rewrite.models import (
     ManagerHeartbeat,
     GateHeartbeat,
 )
+from hyperscale.distributed_rewrite.models.coordinates import NetworkCoordinate
 from hyperscale.distributed_rewrite.health.tracker import HealthPiggyback
 from typing import cast
 
@@ -74,6 +75,8 @@ class StateEmbedder(Protocol):
         """
         ...
 
+    def record_probe_rtt(self, source_addr: tuple[str, int], rtt_ms: float) -> None: ...
+
 
 class NullStateEmbedder:
     """
@@ -96,6 +99,9 @@ class NullStateEmbedder:
 
     def get_health_piggyback(self) -> HealthPiggyback | None:
         """No health piggyback available."""
+        return None
+
+    def record_probe_rtt(self, source_addr: tuple[str, int], rtt_ms: float) -> None:
         return None
 
 
@@ -127,6 +133,7 @@ class WorkerStateEmbedder:
         get_health_expected_throughput: Callable returning expected throughput.
         get_health_overload_state: Callable returning overload state.
     """
+
     get_node_id: Callable[[], str]
     get_worker_state: Callable[[], str]
     get_available_cores: Callable[[], int]
@@ -138,6 +145,11 @@ class WorkerStateEmbedder:
     on_manager_heartbeat: Callable[[Any, tuple[str, int]], None] | None = None
     get_tcp_host: Callable[[], str] | None = None
     get_tcp_port: Callable[[], int] | None = None
+    get_coordinate: Callable[[], NetworkCoordinate | None] | None = None
+    on_peer_coordinate: Callable[[str, NetworkCoordinate, float], None] | None = None
+    _probe_rtt_cache: dict[tuple[str, int], float] = field(
+        default_factory=dict, init=False, repr=False
+    )
     # Health piggyback fields (AD-19)
     get_health_accepting_work: Callable[[], bool] | None = None
     get_health_throughput: Callable[[], float] | None = None
@@ -162,14 +174,28 @@ class WorkerStateEmbedder:
             tcp_host=self.get_tcp_host() if self.get_tcp_host else "",
             tcp_port=self.get_tcp_port() if self.get_tcp_port else 0,
             # Health piggyback fields
-            health_accepting_work=self.get_health_accepting_work() if self.get_health_accepting_work else True,
-            health_throughput=self.get_health_throughput() if self.get_health_throughput else 0.0,
-            health_expected_throughput=self.get_health_expected_throughput() if self.get_health_expected_throughput else 0.0,
-            health_overload_state=self.get_health_overload_state() if self.get_health_overload_state else "healthy",
+            health_accepting_work=self.get_health_accepting_work()
+            if self.get_health_accepting_work
+            else True,
+            health_throughput=self.get_health_throughput()
+            if self.get_health_throughput
+            else 0.0,
+            health_expected_throughput=self.get_health_expected_throughput()
+            if self.get_health_expected_throughput
+            else 0.0,
+            health_overload_state=self.get_health_overload_state()
+            if self.get_health_overload_state
+            else "healthy",
             # Extension request fields (AD-26)
-            extension_requested=self.get_extension_requested() if self.get_extension_requested else False,
-            extension_reason=self.get_extension_reason() if self.get_extension_reason else "",
-            extension_current_progress=self.get_extension_current_progress() if self.get_extension_current_progress else 0.0,
+            extension_requested=self.get_extension_requested()
+            if self.get_extension_requested
+            else False,
+            extension_reason=self.get_extension_reason()
+            if self.get_extension_reason
+            else "",
+            extension_current_progress=self.get_extension_current_progress()
+            if self.get_extension_current_progress
+            else 0.0,
         )
         return heartbeat.dump()
 
@@ -200,11 +226,19 @@ class WorkerStateEmbedder:
             node_id=self.get_node_id(),
             node_type="worker",
             is_alive=True,
-            accepting_work=self.get_health_accepting_work() if self.get_health_accepting_work else True,
+            accepting_work=self.get_health_accepting_work()
+            if self.get_health_accepting_work
+            else True,
             capacity=self.get_available_cores(),
-            throughput=self.get_health_throughput() if self.get_health_throughput else 0.0,
-            expected_throughput=self.get_health_expected_throughput() if self.get_health_expected_throughput else 0.0,
-            overload_state=self.get_health_overload_state() if self.get_health_overload_state else "healthy",
+            throughput=self.get_health_throughput()
+            if self.get_health_throughput
+            else 0.0,
+            expected_throughput=self.get_health_expected_throughput()
+            if self.get_health_expected_throughput
+            else 0.0,
+            overload_state=self.get_health_overload_state()
+            if self.get_health_overload_state
+            else "healthy",
             timestamp=time.monotonic(),
         )
 
@@ -243,6 +277,7 @@ class ManagerStateEmbedder:
         get_health_expected_throughput: Callable returning expected throughput.
         get_health_overload_state: Callable returning overload state.
     """
+
     get_node_id: Callable[[], str]
     get_datacenter: Callable[[], str]
     is_leader: Callable[[], bool]
@@ -296,21 +331,39 @@ class ManagerStateEmbedder:
             udp_host=self.get_udp_host() if self.get_udp_host else "",
             udp_port=self.get_udp_port() if self.get_udp_port else 0,
             # Health piggyback fields
-            health_accepting_jobs=self.get_health_accepting_jobs() if self.get_health_accepting_jobs else True,
-            health_has_quorum=self.get_health_has_quorum() if self.get_health_has_quorum else True,
-            health_throughput=self.get_health_throughput() if self.get_health_throughput else 0.0,
-            health_expected_throughput=self.get_health_expected_throughput() if self.get_health_expected_throughput else 0.0,
-            health_overload_state=self.get_health_overload_state() if self.get_health_overload_state else "healthy",
+            health_accepting_jobs=self.get_health_accepting_jobs()
+            if self.get_health_accepting_jobs
+            else True,
+            health_has_quorum=self.get_health_has_quorum()
+            if self.get_health_has_quorum
+            else True,
+            health_throughput=self.get_health_throughput()
+            if self.get_health_throughput
+            else 0.0,
+            health_expected_throughput=self.get_health_expected_throughput()
+            if self.get_health_expected_throughput
+            else 0.0,
+            health_overload_state=self.get_health_overload_state()
+            if self.get_health_overload_state
+            else "healthy",
             # Gate leader tracking for propagation among managers
-            current_gate_leader_id=self.get_current_gate_leader_id() if self.get_current_gate_leader_id else None,
-            current_gate_leader_host=self.get_current_gate_leader_host() if self.get_current_gate_leader_host else None,
-            current_gate_leader_port=self.get_current_gate_leader_port() if self.get_current_gate_leader_port else None,
+            current_gate_leader_id=self.get_current_gate_leader_id()
+            if self.get_current_gate_leader_id
+            else None,
+            current_gate_leader_host=self.get_current_gate_leader_host()
+            if self.get_current_gate_leader_host
+            else None,
+            current_gate_leader_port=self.get_current_gate_leader_port()
+            if self.get_current_gate_leader_port
+            else None,
             known_gates=self.get_known_gates() if self.get_known_gates else {},
             # Job leadership for worker notification
-            job_leaderships=self.get_job_leaderships() if self.get_job_leaderships else {},
+            job_leaderships=self.get_job_leaderships()
+            if self.get_job_leaderships
+            else {},
         )
         return heartbeat.dump()
-    
+
     def process_state(
         self,
         state_data: bytes,
@@ -346,11 +399,19 @@ class ManagerStateEmbedder:
             node_id=self.get_node_id(),
             node_type="manager",
             is_alive=True,
-            accepting_work=self.get_health_accepting_jobs() if self.get_health_accepting_jobs else True,
+            accepting_work=self.get_health_accepting_jobs()
+            if self.get_health_accepting_jobs
+            else True,
             capacity=self.get_available_cores(),
-            throughput=self.get_health_throughput() if self.get_health_throughput else 0.0,
-            expected_throughput=self.get_health_expected_throughput() if self.get_health_expected_throughput else 0.0,
-            overload_state=self.get_health_overload_state() if self.get_health_overload_state else "healthy",
+            throughput=self.get_health_throughput()
+            if self.get_health_throughput
+            else 0.0,
+            expected_throughput=self.get_health_expected_throughput()
+            if self.get_health_expected_throughput
+            else 0.0,
+            overload_state=self.get_health_overload_state()
+            if self.get_health_overload_state
+            else "healthy",
             timestamp=time.monotonic(),
         )
 
@@ -388,6 +449,7 @@ class GateStateEmbedder:
         get_health_expected_throughput: Callable returning expected throughput.
         get_health_overload_state: Callable returning overload state.
     """
+
     # Required fields (no defaults) - must come first
     get_node_id: Callable[[], str]
     get_datacenter: Callable[[], str]
@@ -404,11 +466,15 @@ class GateStateEmbedder:
     get_tcp_port: Callable[[], int] | None = None
     on_gate_heartbeat: Callable[[Any, tuple[str, int]], None] | None = None
     # Piggybacking callbacks for discovery
-    get_known_managers: Callable[[], dict[str, tuple[str, int, str, int, str]]] | None = None
+    get_known_managers: (
+        Callable[[], dict[str, tuple[str, int, str, int, str]]] | None
+    ) = None
     get_known_gates: Callable[[], dict[str, tuple[str, int, str, int]]] | None = None
     # Job leadership piggybacking (like managers - Serf-style consistency)
     get_job_leaderships: Callable[[], dict[str, tuple[int, int]]] | None = None
-    get_job_dc_managers: Callable[[], dict[str, dict[str, tuple[str, int]]]] | None = None
+    get_job_dc_managers: Callable[[], dict[str, dict[str, tuple[str, int]]]] | None = (
+        None
+    )
     # Health piggyback fields (AD-19)
     get_health_has_dc_connectivity: Callable[[], bool] | None = None
     get_health_connected_dc_count: Callable[[], int] | None = None
@@ -454,14 +520,24 @@ class GateStateEmbedder:
             job_leaderships=job_leaderships,
             job_dc_managers=job_dc_managers,
             # Health piggyback fields
-            health_has_dc_connectivity=self.get_health_has_dc_connectivity() if self.get_health_has_dc_connectivity else True,
-            health_connected_dc_count=self.get_health_connected_dc_count() if self.get_health_connected_dc_count else 0,
-            health_throughput=self.get_health_throughput() if self.get_health_throughput else 0.0,
-            health_expected_throughput=self.get_health_expected_throughput() if self.get_health_expected_throughput else 0.0,
-            health_overload_state=self.get_health_overload_state() if self.get_health_overload_state else "healthy",
+            health_has_dc_connectivity=self.get_health_has_dc_connectivity()
+            if self.get_health_has_dc_connectivity
+            else True,
+            health_connected_dc_count=self.get_health_connected_dc_count()
+            if self.get_health_connected_dc_count
+            else 0,
+            health_throughput=self.get_health_throughput()
+            if self.get_health_throughput
+            else 0.0,
+            health_expected_throughput=self.get_health_expected_throughput()
+            if self.get_health_expected_throughput
+            else 0.0,
+            health_overload_state=self.get_health_overload_state()
+            if self.get_health_overload_state
+            else "healthy",
         )
         return heartbeat.dump()
-    
+
     def process_state(
         self,
         state_data: bytes,
@@ -471,7 +547,9 @@ class GateStateEmbedder:
 
         # Unpickle once and dispatch based on actual type
         try:
-            obj = cast(ManagerHeartbeat | GateHeartbeat, ManagerHeartbeat.load(state_data))  # Base unpickle
+            obj = cast(
+                ManagerHeartbeat | GateHeartbeat, ManagerHeartbeat.load(state_data)
+            )  # Base unpickle
         except Exception as e:
             return  # Invalid data
 
@@ -491,16 +569,28 @@ class GateStateEmbedder:
         messages, not just ACKs.
         """
         # Gates use connected DC count as capacity metric
-        connected_dcs = self.get_health_connected_dc_count() if self.get_health_connected_dc_count else 0
+        connected_dcs = (
+            self.get_health_connected_dc_count()
+            if self.get_health_connected_dc_count
+            else 0
+        )
 
         return HealthPiggyback(
             node_id=self.get_node_id(),
             node_type="gate",
             is_alive=True,
-            accepting_work=self.get_health_has_dc_connectivity() if self.get_health_has_dc_connectivity else True,
+            accepting_work=self.get_health_has_dc_connectivity()
+            if self.get_health_has_dc_connectivity
+            else True,
             capacity=connected_dcs,
-            throughput=self.get_health_throughput() if self.get_health_throughput else 0.0,
-            expected_throughput=self.get_health_expected_throughput() if self.get_health_expected_throughput else 0.0,
-            overload_state=self.get_health_overload_state() if self.get_health_overload_state else "healthy",
+            throughput=self.get_health_throughput()
+            if self.get_health_throughput
+            else 0.0,
+            expected_throughput=self.get_health_expected_throughput()
+            if self.get_health_expected_throughput
+            else 0.0,
+            overload_state=self.get_health_overload_state()
+            if self.get_health_overload_state
+            else "healthy",
             timestamp=time.monotonic(),
         )

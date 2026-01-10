@@ -3891,25 +3891,25 @@ class GateServer(HealthAwareServer):
         """
         try:
             broadcast = ManagerDiscoveryBroadcast.load(data)
-            
+
             dc = broadcast.datacenter
             manager_addr = tuple(broadcast.manager_tcp_addr)
-            
+
+            # Ensure datacenter tracking structures exist
+            dc_managers = self._datacenter_managers.setdefault(dc, [])
+            dc_manager_status = self._datacenter_manager_status.setdefault(dc, {})
+
             # Add manager if not already tracked
-            if dc not in self._datacenter_managers:
-                self._datacenter_managers[dc] = []
-            
-            if manager_addr not in self._datacenter_managers[dc]:
-                self._datacenter_managers[dc].append(manager_addr)
-                
+            if manager_addr not in dc_managers:
+                dc_managers.append(manager_addr)
+
                 # Also add UDP address if provided
                 if broadcast.manager_udp_addr:
-                    if dc not in self._datacenter_manager_udp:
-                        self._datacenter_manager_udp[dc] = []
+                    dc_udp = self._datacenter_manager_udp.setdefault(dc, [])
                     udp_addr = tuple(broadcast.manager_udp_addr)
-                    if udp_addr not in self._datacenter_manager_udp[dc]:
-                        self._datacenter_manager_udp[dc].append(udp_addr)
-                
+                    if udp_addr not in dc_udp:
+                        dc_udp.append(udp_addr)
+
                 self._task_runner.run(
                     self._udp_logger.log,
                     ServerInfo(
@@ -3919,11 +3919,6 @@ class GateServer(HealthAwareServer):
                         node_id=self._node_id.short,
                     )
                 )
-            
-            # Store per-datacenter, per-manager status
-            # Create a synthetic ManagerHeartbeat for the discovered manager
-            if dc not in self._datacenter_manager_status:
-                self._datacenter_manager_status[dc] = {}
             
             synthetic_heartbeat = ManagerHeartbeat(
                 node_id=f"discovered-via-{broadcast.source_gate_id}",
@@ -3939,7 +3934,7 @@ class GateServer(HealthAwareServer):
                 total_cores=broadcast.total_cores,
                 state="active",
             )
-            self._datacenter_manager_status[dc][manager_addr] = synthetic_heartbeat
+            dc_manager_status[manager_addr] = synthetic_heartbeat
             self._manager_last_status[manager_addr] = time.monotonic()
             
             return b'ok'
@@ -4519,6 +4514,41 @@ class GateServer(HealthAwareServer):
     # TCP Handlers - Cancellation (AD-20)
     # =========================================================================
 
+    def _build_cancel_response(
+        self,
+        use_ad20: bool,
+        job_id: str,
+        success: bool,
+        error: str | None = None,
+        cancelled_count: int = 0,
+        already_cancelled: bool = False,
+        already_completed: bool = False,
+    ) -> bytes:
+        """Build cancel response in appropriate format (AD-20 or legacy)."""
+        if use_ad20:
+            return JobCancelResponse(
+                job_id=job_id,
+                success=success,
+                error=error,
+                cancelled_workflow_count=cancelled_count,
+                already_cancelled=already_cancelled,
+                already_completed=already_completed,
+            ).dump()
+        return CancelAck(
+            job_id=job_id,
+            cancelled=success,
+            error=error,
+            workflows_cancelled=cancelled_count,
+        ).dump()
+
+    def _is_ad20_cancel_request(self, data: bytes) -> bool:
+        """Check if cancel request data is AD-20 format."""
+        try:
+            JobCancelRequest.load(data)
+            return True
+        except Exception:
+            return False
+
     @tcp.receive()
     async def receive_cancel_job(
         self,
@@ -4549,7 +4579,7 @@ class GateServer(HealthAwareServer):
                 fence_token = cancel_request.fence_token
                 requester_id = cancel_request.requester_id
                 reason = cancel_request.reason
-                use_ad20_response = True
+                use_ad20 = True
             except Exception:
                 # Fall back to legacy CancelJob format
                 cancel = CancelJob.load(data)
@@ -4557,71 +4587,26 @@ class GateServer(HealthAwareServer):
                 fence_token = cancel.fence_token
                 requester_id = f"{addr[0]}:{addr[1]}"
                 reason = cancel.reason
-                use_ad20_response = False
+                use_ad20 = False
 
             job = self._job_manager.get_job(job_id)
             if not job:
-                if use_ad20_response:
-                    return JobCancelResponse(
-                        job_id=job_id,
-                        success=False,
-                        error="Job not found",
-                    ).dump()
-                else:
-                    return CancelAck(
-                        job_id=job_id,
-                        cancelled=False,
-                        error="Job not found",
-                    ).dump()
+                return self._build_cancel_response(use_ad20, job_id, success=False, error="Job not found")
 
             # Check fence token if provided (prevents cancelling restarted jobs)
-            if fence_token > 0 and hasattr(job, 'fence_token'):
-                if job.fence_token != fence_token:
-                    error_msg = f"Fence token mismatch: expected {job.fence_token}, got {fence_token}"
-                    if use_ad20_response:
-                        return JobCancelResponse(
-                            job_id=job_id,
-                            success=False,
-                            error=error_msg,
-                        ).dump()
-                    else:
-                        return CancelAck(
-                            job_id=job_id,
-                            cancelled=False,
-                            error=error_msg,
-                        ).dump()
+            if fence_token > 0 and hasattr(job, 'fence_token') and job.fence_token != fence_token:
+                error_msg = f"Fence token mismatch: expected {job.fence_token}, got {fence_token}"
+                return self._build_cancel_response(use_ad20, job_id, success=False, error=error_msg)
 
             # Check if already cancelled (idempotency)
             if job.status == JobStatus.CANCELLED.value:
-                if use_ad20_response:
-                    return JobCancelResponse(
-                        job_id=job_id,
-                        success=True,
-                        already_cancelled=True,
-                        cancelled_workflow_count=0,
-                    ).dump()
-                else:
-                    return CancelAck(
-                        job_id=job_id,
-                        cancelled=True,
-                        workflows_cancelled=0,
-                    ).dump()
+                return self._build_cancel_response(use_ad20, job_id, success=True, already_cancelled=True)
 
             # Check if already completed (cannot cancel)
             if job.status == JobStatus.COMPLETED.value:
-                if use_ad20_response:
-                    return JobCancelResponse(
-                        job_id=job_id,
-                        success=False,
-                        already_completed=True,
-                        error="Job already completed",
-                    ).dump()
-                else:
-                    return CancelAck(
-                        job_id=job_id,
-                        cancelled=False,
-                        error="Job already completed",
-                    ).dump()
+                return self._build_cancel_response(
+                    use_ad20, job_id, success=False, already_completed=True, error="Job already completed"
+                )
 
             # Create retry executor with exponential backoff for DC communication
             retry_config = RetryConfig(
@@ -4649,7 +4634,7 @@ class GateServer(HealthAwareServer):
 
                     async def send_cancel_to_manager():
                         # Build the cancel request for the manager
-                        if use_ad20_response:
+                        if use_ad20:
                             cancel_data = JobCancelRequest(
                                 job_id=job_id,
                                 requester_id=requester_id,
@@ -4698,37 +4683,16 @@ class GateServer(HealthAwareServer):
             self._increment_version()
 
             # Build response
-            if use_ad20_response:
-                return JobCancelResponse(
-                    job_id=job_id,
-                    success=True,
-                    cancelled_workflow_count=cancelled_workflows,
-                    error="; ".join(errors) if errors else None,
-                ).dump()
-            else:
-                return CancelAck(
-                    job_id=job_id,
-                    cancelled=True,
-                    workflows_cancelled=cancelled_workflows,
-                ).dump()
+            error_str = "; ".join(errors) if errors else None
+            return self._build_cancel_response(
+                use_ad20, job_id, success=True, cancelled_count=cancelled_workflows, error=error_str
+            )
 
         except Exception as e:
             await self.handle_exception(e, "receive_cancel_job")
-            # Return error in appropriate format
-            try:
-                # Try to parse to determine format
-                JobCancelRequest.load(data)
-                return JobCancelResponse(
-                    job_id="unknown",
-                    success=False,
-                    error=str(e),
-                ).dump()
-            except Exception:
-                return CancelAck(
-                    job_id="unknown",
-                    cancelled=False,
-                    error=str(e),
-                ).dump()
+            # Return error in appropriate format - detect format from request
+            is_ad20 = self._is_ad20_cancel_request(data)
+            return self._build_cancel_response(is_ad20, "unknown", success=False, error=str(e))
 
     @tcp.receive()
     async def receive_job_cancellation_complete(
