@@ -277,7 +277,69 @@ class HyperscaleClient(MercurySyncBaseServer):
         addr = self._gates[self._current_gate_idx]
         self._current_gate_idx = (self._current_gate_idx + 1) % len(self._gates)
         return addr
-    
+
+    def _get_all_targets(self) -> list[tuple[str, int]]:
+        """Get all available gate and manager targets."""
+        return list(self._gates) + list(self._managers)
+
+    def _get_targets_for_job(self, job_id: str) -> list[tuple[str, int]]:
+        """
+        Get targets prioritizing the one that accepted the job.
+
+        Returns list with job target first if known, then all other gates/managers.
+        """
+        all_targets = self._get_all_targets()
+        if job_id not in self._job_targets:
+            return all_targets
+
+        job_target = self._job_targets[job_id]
+        # Put job target first, then others
+        return [job_target] + [t for t in all_targets if t != job_target]
+
+    def _initialize_job_tracking(
+        self,
+        job_id: str,
+        on_status_update: Callable[[JobStatusPush], None] | None = None,
+        on_progress_update: Callable | None = None,
+        on_workflow_result: Callable[[WorkflowResultPush], None] | None = None,
+        on_reporter_result: Callable[[ReporterResultPush], None] | None = None,
+    ) -> None:
+        """Initialize tracking structures for a new job."""
+        self._jobs[job_id] = JobResult(
+            job_id=job_id,
+            status=JobStatus.SUBMITTED.value,
+        )
+        self._job_events[job_id] = asyncio.Event()
+
+        # Register callbacks if provided
+        if on_status_update:
+            self._job_callbacks[job_id] = on_status_update
+        if on_progress_update:
+            self._progress_callbacks[job_id] = on_progress_update
+        if on_workflow_result:
+            self._workflow_callbacks[job_id] = on_workflow_result
+        if on_reporter_result:
+            self._reporter_callbacks[job_id] = on_reporter_result
+
+    def _mark_job_failed(self, job_id: str, error: str | None) -> None:
+        """Mark a job as failed and signal completion."""
+        job = self._jobs.get(job_id)
+        if job:
+            job.status = JobStatus.FAILED.value
+            job.error = error
+        event = self._job_events.get(job_id)
+        if event:
+            event.set()
+
+    def _update_job_status(self, job_id: str, status: str) -> None:
+        """Update job status and signal completion event."""
+        job = self._jobs.get(job_id)
+        if job:
+            job.status = status
+        event = self._job_events.get(job_id)
+        if event:
+            event.set()
+
     # Transient error messages that should trigger retry with backoff
     _TRANSIENT_ERRORS = frozenset([
         "syncing",
@@ -395,23 +457,15 @@ class HyperscaleClient(MercurySyncBaseServer):
         )
 
         # Initialize job tracking
-        self._jobs[job_id] = JobResult(
-            job_id=job_id,
-            status=JobStatus.SUBMITTED.value,
+        self._initialize_job_tracking(
+            job_id,
+            on_status_update=on_status_update,
+            on_progress_update=on_progress_update,
+            on_workflow_result=on_workflow_result,
+            on_reporter_result=on_reporter_result,
         )
-        self._job_events[job_id] = asyncio.Event()
-        if on_status_update:
-            self._job_callbacks[job_id] = on_status_update
-        if on_progress_update:
-            self._progress_callbacks[job_id] = on_progress_update
-        if on_workflow_result:
-            self._workflow_callbacks[job_id] = on_workflow_result
-        if on_reporter_result:
-            self._reporter_callbacks[job_id] = on_reporter_result
 
         # Store reporting configs for local file-based reporting
-        # Combine extracted local configs from workflows with any explicitly passed configs
-        # Filter explicitly passed configs to only include local file types
         explicit_local_configs = [
             config for config in (reporting_configs or [])
             if getattr(config, 'reporter_type', None) in self._local_reporter_types
@@ -419,12 +473,7 @@ class HyperscaleClient(MercurySyncBaseServer):
         self._job_reporting_configs[job_id] = extracted_local_configs + explicit_local_configs
 
         # Get all available targets for fallback
-        all_targets = []
-        if self._gates:
-            all_targets.extend(self._gates)
-        if self._managers:
-            all_targets.extend(self._managers)
-
+        all_targets = self._get_all_targets()
         if not all_targets:
             raise RuntimeError("No managers or gates configured")
 
@@ -484,21 +533,16 @@ class HyperscaleClient(MercurySyncBaseServer):
                     break  # Exit redirect loop, continue to retry
 
                 # Permanent rejection - fail immediately
-                self._jobs[job_id].status = JobStatus.FAILED.value
-                self._jobs[job_id].error = ack.error
-                self._job_events[job_id].set()
+                self._mark_job_failed(job_id, ack.error)
                 raise RuntimeError(f"Job rejected: {ack.error}")
 
-            # If we have retries remaining and the error was transient, wait and retry
+            # Exponential backoff before retry
             if retry < max_retries and last_error:
-                # Exponential backoff: 0.5s, 1s, 2s, 4s, 8s
                 delay = retry_base_delay * (2 ** retry)
                 await asyncio.sleep(delay)
 
         # All retries exhausted
-        self._jobs[job_id].status = JobStatus.FAILED.value
-        self._jobs[job_id].error = last_error
-        self._job_events[job_id].set()
+        self._mark_job_failed(job_id, last_error)
         raise RuntimeError(f"Job submission failed after {max_retries} retries: {last_error}")
     
     async def wait_for_job(
@@ -581,22 +625,7 @@ class HyperscaleClient(MercurySyncBaseServer):
         )
 
         # Determine targets - prefer the manager/gate that accepted the job
-        all_targets: list[tuple[str, int]] = []
-
-        if job_id in self._job_targets:
-            # Job was submitted through this client, try its target first
-            all_targets.append(self._job_targets[job_id])
-
-        # Add all gates and managers as fallback
-        if self._gates:
-            for gate in self._gates:
-                if gate not in all_targets:
-                    all_targets.append(gate)
-        if self._managers:
-            for manager in self._managers:
-                if manager not in all_targets:
-                    all_targets.append(manager)
-
+        all_targets = self._get_targets_for_job(job_id)
         if not all_targets:
             raise RuntimeError("No managers or gates configured")
 
@@ -628,27 +657,15 @@ class HyperscaleClient(MercurySyncBaseServer):
                 response = JobCancelResponse.load(response_data)
 
                 if response.success:
-                    # Update local job state
-                    job = self._jobs.get(job_id)
-                    if job:
-                        job.status = JobStatus.CANCELLED.value
-                        event = self._job_events.get(job_id)
-                        if event:
-                            event.set()
+                    self._update_job_status(job_id, JobStatus.CANCELLED.value)
                     return response
 
                 # Check for already completed/cancelled (not an error)
-                if response.already_cancelled or response.already_completed:
-                    # Still update local state if we have it
-                    job = self._jobs.get(job_id)
-                    if job:
-                        if response.already_cancelled:
-                            job.status = JobStatus.CANCELLED.value
-                        elif response.already_completed:
-                            job.status = JobStatus.COMPLETED.value
-                        event = self._job_events.get(job_id)
-                        if event:
-                            event.set()
+                if response.already_cancelled:
+                    self._update_job_status(job_id, JobStatus.CANCELLED.value)
+                    return response
+                if response.already_completed:
+                    self._update_job_status(job_id, JobStatus.COMPLETED.value)
                     return response
 
                 # Check for transient error
@@ -708,12 +725,7 @@ class HyperscaleClient(MercurySyncBaseServer):
             KeyError: If job not found on any configured gate/manager
         """
         # Build list of all potential targets
-        all_targets = []
-        if self._gates:
-            all_targets.extend(self._gates)
-        if self._managers:
-            all_targets.extend(self._managers)
-
+        all_targets = self._get_all_targets()
         if not all_targets:
             raise RuntimeError("No managers or gates configured")
 

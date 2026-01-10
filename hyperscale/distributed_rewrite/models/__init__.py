@@ -12,6 +12,10 @@ from .restricted_unpickler import (
     SecurityError as SecurityError,
 )
 
+from .coordinates import (
+    NetworkCoordinate as NetworkCoordinate,
+)
+
 # Distributed system types
 from .distributed import (
     # Enums
