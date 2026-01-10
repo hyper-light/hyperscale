@@ -12,6 +12,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable
 
+import aiodns
+
 from hyperscale.distributed_rewrite.discovery.dns.negative_cache import NegativeCache
 from hyperscale.distributed_rewrite.discovery.dns.security import (
     DNSSecurityValidator,
@@ -29,6 +31,23 @@ class DNSError(Exception):
 
 
 @dataclass(slots=True)
+class SRVRecord:
+    """Represents a DNS SRV record."""
+
+    priority: int
+    """Priority of the target host (lower values are preferred)."""
+
+    weight: int
+    """Weight for hosts with the same priority (for load balancing)."""
+
+    port: int
+    """Port number of the service."""
+
+    target: str
+    """Target hostname."""
+
+
+@dataclass(slots=True)
 class DNSResult:
     """Result of a DNS lookup."""
 
@@ -40,6 +59,9 @@ class DNSResult:
 
     port: int | None = None
     """Port from SRV record (if applicable)."""
+
+    srv_records: list[SRVRecord] = field(default_factory=list)
+    """SRV records if this was an SRV query."""
 
     ttl_seconds: float = 60.0
     """Time-to-live for this result."""
@@ -59,17 +81,25 @@ class AsyncDNSResolver:
     Async DNS resolver with positive and negative caching.
 
     Features:
-    - Async resolution using getaddrinfo
+    - Async resolution using getaddrinfo for A/AAAA records
+    - Real DNS SRV record resolution using aiodns
     - Positive caching with configurable TTL
     - Negative caching with exponential backoff
     - Concurrent resolution limits
-    - Support for SRV record patterns (hostname:port)
+    - Support for SRV record patterns (_service._proto.domain)
 
     Usage:
         resolver = AsyncDNSResolver()
+
+        # A/AAAA record resolution
         result = await resolver.resolve("manager.hyperscale.local")
         for addr in result.addresses:
             print(f"Found: {addr}")
+
+        # SRV record resolution
+        result = await resolver.resolve("_hyperscale-manager._tcp.cluster.local")
+        for srv in result.srv_records:
+            print(f"Found: {srv.target}:{srv.port} (priority={srv.priority})")
     """
 
     default_ttl_seconds: float = 60.0
@@ -118,9 +148,94 @@ class AsyncDNSResolver:
     If False, violations are logged but IPs are still returned.
     """
 
+    _aiodns_resolver: aiodns.DNSResolver | None = field(default=None, repr=False)
+    """Internal aiodns resolver for SRV queries."""
+
     def __post_init__(self) -> None:
-        """Initialize the semaphore."""
+        """Initialize the semaphore and aiodns resolver."""
         self._resolution_semaphore = asyncio.Semaphore(self.max_concurrent_resolutions)
+        self._aiodns_resolver = aiodns.DNSResolver()
+
+    @staticmethod
+    def _is_srv_pattern(hostname: str) -> bool:
+        """
+        Check if a hostname follows the SRV record pattern.
+
+        SRV patterns start with '_' and contain either '._tcp.' or '._udp.'
+        Examples:
+            - _hyperscale-manager._tcp.cluster.local
+            - _http._tcp.example.com
+            - _service._udp.domain.local
+
+        Args:
+            hostname: The hostname to check
+
+        Returns:
+            True if hostname matches SRV pattern
+        """
+        return hostname.startswith("_") and ("._tcp." in hostname or "._udp." in hostname)
+
+    async def resolve_srv(self, service_name: str) -> list[SRVRecord]:
+        """
+        Resolve a DNS SRV record.
+
+        SRV records provide service discovery by returning a list of
+        (priority, weight, port, target) tuples. This allows clients
+        to discover multiple instances of a service and choose based
+        on priority and weight.
+
+        Args:
+            service_name: The SRV record name to query
+                         Format: _service._proto.domain
+                         Example: _hyperscale-manager._tcp.cluster.local
+
+        Returns:
+            List of SRVRecord objects, sorted by priority (ascending) then weight (descending)
+
+        Raises:
+            DNSError: If SRV query fails or returns no records
+        """
+        if self._aiodns_resolver is None:
+            self._aiodns_resolver = aiodns.DNSResolver()
+
+        try:
+            # Query SRV records using aiodns
+            srv_results = await asyncio.wait_for(
+                self._aiodns_resolver.query(service_name, "SRV"),
+                timeout=self.resolution_timeout_seconds,
+            )
+
+            if not srv_results:
+                raise DNSError(service_name, "No SRV records returned")
+
+            # Convert to our SRVRecord dataclass
+            records: list[SRVRecord] = []
+            for srv in srv_results:
+                # aiodns returns objects with priority, weight, port, host attributes
+                record = SRVRecord(
+                    priority=srv.priority,
+                    weight=srv.weight,
+                    port=srv.port,
+                    target=srv.host.rstrip("."),  # Remove trailing dot from FQDN
+                )
+                records.append(record)
+
+            # Sort by priority (ascending), then weight (descending)
+            # Lower priority values are preferred
+            # Higher weight values are preferred for same priority
+            records.sort(key=lambda r: (r.priority, -r.weight))
+
+            return records
+
+        except asyncio.TimeoutError:
+            raise DNSError(
+                service_name,
+                f"SRV resolution timeout ({self.resolution_timeout_seconds}s)",
+            )
+        except aiodns.error.DNSError as exc:
+            raise DNSError(service_name, f"SRV query failed: {exc}")
+        except Exception as exc:
+            raise DNSError(service_name, f"Unexpected error during SRV query: {exc}")
 
     async def resolve(
         self,
@@ -131,13 +246,18 @@ class AsyncDNSResolver:
         """
         Resolve a hostname to IP addresses.
 
+        Supports both standard A/AAAA records and SRV records.
+        SRV patterns are detected automatically (starting with '_' and containing '._tcp.' or '._udp.').
+
         Args:
-            hostname: The hostname to resolve
-            port: Optional port (for SRV-style lookups)
+            hostname: The hostname or SRV pattern to resolve
+                     A/AAAA: "manager.hyperscale.local"
+                     SRV: "_hyperscale-manager._tcp.cluster.local"
+            port: Optional port (ignored for SRV lookups which provide their own ports)
             force_refresh: If True, bypass cache and force fresh lookup
 
         Returns:
-            DNSResult with resolved addresses
+            DNSResult with resolved addresses and optional SRV records
 
         Raises:
             DNSError: If resolution fails and hostname is not in positive cache
@@ -166,7 +286,11 @@ class AsyncDNSResolver:
         self._pending_resolutions[cache_key] = future
 
         try:
-            result = await self._do_resolve(hostname, port)
+            # Detect SRV pattern and route accordingly
+            if self._is_srv_pattern(hostname):
+                result = await self._do_resolve_srv(hostname)
+            else:
+                result = await self._do_resolve(hostname, port)
 
             # Cache successful result
             self._positive_cache[cache_key] = result
@@ -271,6 +395,80 @@ class AsyncDNSResolver:
                 )
             except socket.gaierror as exc:
                 raise DNSError(hostname, f"getaddrinfo failed: {exc}")
+
+    async def _do_resolve_srv(self, service_name: str) -> DNSResult:
+        """
+        Perform SRV record resolution and resolve target hostnames to IPs.
+
+        This method:
+        1. Queries SRV records for the service name
+        2. Resolves each SRV target hostname to IP addresses
+        3. Returns a DNSResult with all addresses and SRV records
+
+        Args:
+            service_name: The SRV service name to resolve
+
+        Returns:
+            DNSResult with addresses from all SRV targets and the SRV records
+        """
+        if self._resolution_semaphore is None:
+            self._resolution_semaphore = asyncio.Semaphore(
+                self.max_concurrent_resolutions
+            )
+
+        async with self._resolution_semaphore:
+            # First, get the SRV records
+            srv_records = await self.resolve_srv(service_name)
+
+            if not srv_records:
+                raise DNSError(service_name, "No SRV records found")
+
+            # Now resolve each target to IP addresses
+            all_addresses: list[str] = []
+            seen_addresses: set[str] = set()
+
+            for srv_record in srv_records:
+                try:
+                    # Resolve the target hostname to IPs
+                    # Note: We resolve recursively but avoid adding to cache under service_name
+                    target_result = await self._do_resolve(srv_record.target, srv_record.port)
+
+                    # Collect unique addresses
+                    for addr in target_result.addresses:
+                        if addr not in seen_addresses:
+                            seen_addresses.add(addr)
+                            all_addresses.append(addr)
+
+                except DNSError:
+                    # If one target fails, continue with others
+                    # This provides resilience if some targets are down
+                    continue
+
+            if not all_addresses:
+                raise DNSError(
+                    service_name,
+                    "All SRV target hostnames failed to resolve to IP addresses"
+                )
+
+            # Apply security validation if configured
+            if self.security_validator and self.security_validator.is_enabled:
+                validated_addresses = self._validate_addresses(service_name, all_addresses)
+                if not validated_addresses and self.reject_on_security_violation:
+                    raise DNSError(
+                        service_name,
+                        f"All resolved IPs failed security validation: {all_addresses}"
+                    )
+                all_addresses = validated_addresses if validated_addresses else all_addresses
+
+            # Return result with both addresses and SRV records
+            # The port from the first (highest priority) SRV record is used
+            return DNSResult(
+                hostname=service_name,
+                addresses=all_addresses,
+                port=srv_records[0].port if srv_records else None,
+                srv_records=srv_records,
+                ttl_seconds=self.default_ttl_seconds,
+            )
 
     async def resolve_many(
         self,

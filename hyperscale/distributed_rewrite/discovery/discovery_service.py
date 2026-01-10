@@ -43,6 +43,8 @@ from typing import Callable
 from hyperscale.distributed_rewrite.discovery.dns.resolver import (
     AsyncDNSResolver,
     DNSError,
+    DNSResult,
+    SRVRecord,
 )
 from hyperscale.distributed_rewrite.discovery.dns.security import (
     DNSSecurityValidator,
@@ -219,6 +221,10 @@ class DiscoveryService:
         Resolves configured DNS names and adds discovered addresses as peers.
         Uses caching unless force_refresh is True.
 
+        Supports both A/AAAA records (hostname -> IPs) and SRV records
+        (_service._proto.domain -> priority, weight, port, target).
+        For SRV records, each target's individual port is used.
+
         Args:
             force_refresh: If True, bypass cache and force fresh DNS lookup
 
@@ -242,25 +248,19 @@ class DiscoveryService:
                     # Note: We don't have cache info from resolver, record as uncached query
                     self._metrics.record_dns_query(cached=False)
 
-                    for addr in result.addresses:
-                        port = result.port or self.config.default_port
-                        peer_id = f"dns-{addr}-{port}"
-
-                        if peer_id not in self._peers:
-                            peer = PeerInfo(
-                                peer_id=peer_id,
-                                host=addr,
-                                port=port,
-                                role="manager",  # Discovered peers are typically managers
-                                cluster_id=self.config.cluster_id,
-                                environment_id=self.config.environment_id,
+                    # Handle SRV records specially - each target may have a different port
+                    if result.srv_records:
+                        discovered.extend(
+                            self._add_peers_from_srv_records(result)
+                        )
+                    else:
+                        # Standard A/AAAA record handling
+                        discovered.extend(
+                            self._add_peers_from_addresses(
+                                result.addresses,
+                                result.port or self.config.default_port,
                             )
-                            self._peers[peer_id] = peer
-                            self._selector.add_peer(peer_id, weight=1.0)
-                            discovered.append(peer)
-
-                            if self._on_peer_added is not None:
-                                self._on_peer_added(peer)
+                        )
 
                 except DNSError:
                     self._metrics.record_dns_failure()
@@ -272,6 +272,114 @@ class DiscoveryService:
             self._discovery_in_progress = False
 
         return discovered
+
+    def _add_peers_from_addresses(
+        self,
+        addresses: list[str],
+        port: int,
+    ) -> list[PeerInfo]:
+        """
+        Add peers from resolved IP addresses (A/AAAA records).
+
+        Args:
+            addresses: List of resolved IP addresses
+            port: Port to use for all addresses
+
+        Returns:
+            List of newly added peers
+        """
+        added: list[PeerInfo] = []
+
+        for addr in addresses:
+            peer_id = f"dns-{addr}-{port}"
+
+            if peer_id not in self._peers:
+                peer = PeerInfo(
+                    peer_id=peer_id,
+                    host=addr,
+                    port=port,
+                    role="manager",  # Discovered peers are typically managers
+                    cluster_id=self.config.cluster_id,
+                    environment_id=self.config.environment_id,
+                )
+                self._peers[peer_id] = peer
+                self._selector.add_peer(peer_id, weight=1.0)
+                added.append(peer)
+
+                if self._on_peer_added is not None:
+                    self._on_peer_added(peer)
+
+        return added
+
+    def _add_peers_from_srv_records(
+        self,
+        result: DNSResult,
+    ) -> list[PeerInfo]:
+        """
+        Add peers from SRV record resolution.
+
+        Each SRV record specifies a target hostname and port. The target
+        hostnames have already been resolved to IP addresses by the resolver.
+        This method maps IPs back to their SRV record ports.
+
+        For SRV records, we create peers with:
+        - Priority-based ordering (lower priority = preferred)
+        - Per-target port from the SRV record
+        - Weight information stored for potential load balancing
+
+        Args:
+            result: DNS result containing srv_records and resolved addresses
+
+        Returns:
+            List of newly added peers
+        """
+        added: list[PeerInfo] = []
+
+        # Build a mapping of target hostname to SRV record for port lookup
+        # Note: The resolver resolves each SRV target and collects all IPs
+        # We need to use the port from the corresponding SRV record
+        target_to_srv: dict[str, SRVRecord] = {}
+        for srv_record in result.srv_records:
+            target_to_srv[srv_record.target] = srv_record
+
+        # If we have SRV records, use each record's port and target
+        # The addresses in result are the resolved IPs of all targets
+        # Since _do_resolve_srv resolves each target separately, we iterate
+        # through srv_records to get the proper port for each target
+        for srv_record in result.srv_records:
+            # The port comes from the SRV record
+            port = srv_record.port
+            target = srv_record.target
+
+            # Create peer using the target hostname (it will be resolved on connect)
+            # or we can use the already-resolved IPs if available
+            # For now, use the target hostname to preserve the SRV semantics
+            peer_id = f"srv-{target}-{port}"
+
+            if peer_id not in self._peers:
+                # Calculate weight factor from SRV priority and weight
+                # Lower priority is better, higher weight is better
+                # Normalize to 0.1 - 1.0 range for selector weight
+                priority_factor = 1.0 / (1.0 + srv_record.priority)
+                weight_factor = (srv_record.weight + 1) / 100.0  # Normalize weight
+                selector_weight = max(0.1, min(1.0, priority_factor * weight_factor))
+
+                peer = PeerInfo(
+                    peer_id=peer_id,
+                    host=target,
+                    port=port,
+                    role="manager",  # Discovered peers are typically managers
+                    cluster_id=self.config.cluster_id,
+                    environment_id=self.config.environment_id,
+                )
+                self._peers[peer_id] = peer
+                self._selector.add_peer(peer_id, weight=selector_weight)
+                added.append(peer)
+
+                if self._on_peer_added is not None:
+                    self._on_peer_added(peer)
+
+        return added
 
     def add_peer(
         self,

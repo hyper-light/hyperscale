@@ -32,9 +32,32 @@ class DiscoveryConfig:
 
     # ===== DNS Configuration =====
     dns_names: list[str] = field(default_factory=list)
-    """DNS names to resolve for peer discovery (SRV or A records).
+    """DNS names to resolve for peer discovery (SRV or A/AAAA records).
 
-    Example: ['managers.hyperscale.svc.cluster.local']
+    Supports two resolution modes:
+
+    1. **A/AAAA Records** (standard hostnames):
+       - Format: 'hostname.domain.tld'
+       - Example: 'managers.hyperscale.svc.cluster.local'
+       - Returns IP addresses; uses default_port for connections
+
+    2. **SRV Records** (service discovery):
+       - Format: '_service._proto.domain' (must start with '_' and contain '._tcp.' or '._udp.')
+       - Example: '_hyperscale-manager._tcp.cluster.local'
+       - Returns (priority, weight, port, target) tuples
+       - Targets are resolved to IPs with ports from SRV records
+       - Results sorted by priority (ascending) then weight (descending)
+
+    SRV records are the standard DNS mechanism for service discovery, used by
+    Kubernetes, Consul, and other orchestration systems. They allow:
+    - Multiple service instances with different ports
+    - Priority-based failover (lower priority = preferred)
+    - Weight-based load balancing (higher weight = more traffic)
+
+    Example SRV record:
+        _hyperscale-manager._tcp.cluster.local. 30 IN SRV 0 10 8080 manager1.cluster.local.
+        _hyperscale-manager._tcp.cluster.local. 30 IN SRV 0 10 8080 manager2.cluster.local.
+        _hyperscale-manager._tcp.cluster.local. 30 IN SRV 1 5  8080 manager3.cluster.local.  # backup
     """
 
     static_seeds: list[str] = field(default_factory=list)

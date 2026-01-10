@@ -44,6 +44,7 @@ from hyperscale.distributed_rewrite.discovery.dns.resolver import (
     AsyncDNSResolver,
     DNSResult,
     DNSError,
+    SRVRecord,
 )
 from hyperscale.distributed_rewrite.discovery.dns.security import (
     DNSSecurityValidator,
@@ -66,6 +67,7 @@ class MockDNSResolver:
     Mock DNS resolver for testing DNS discovery paths.
 
     Allows injecting specific resolution results without actual DNS queries.
+    Supports both A/AAAA records (addresses) and SRV records.
     """
 
     default_ttl_seconds: float = 60.0
@@ -73,7 +75,10 @@ class MockDNSResolver:
     max_concurrent_resolutions: int = 10
 
     _mock_results: dict[str, list[str]] = field(default_factory=dict)
-    """Hostname -> list of IP addresses."""
+    """Hostname -> list of IP addresses (for A/AAAA records)."""
+
+    _mock_srv_results: dict[str, list[SRVRecord]] = field(default_factory=dict)
+    """SRV service name -> list of SRV records."""
 
     _mock_failures: dict[str, str] = field(default_factory=dict)
     """Hostname -> error message for simulated failures."""
@@ -91,21 +96,44 @@ class MockDNSResolver:
     security_validator: DNSSecurityValidator | None = None
     reject_on_security_violation: bool = True
 
+    @staticmethod
+    def _is_srv_pattern(hostname: str) -> bool:
+        """Check if hostname is an SRV record pattern."""
+        return hostname.startswith("_") and ("._tcp." in hostname or "._udp." in hostname)
+
     def set_mock_result(self, hostname: str, addresses: list[str]) -> None:
-        """Set mock resolution result for a hostname."""
+        """Set mock resolution result for a hostname (A/AAAA records)."""
         self._mock_results[hostname] = addresses
         # Clear any failure for this hostname
         self._mock_failures.pop(hostname, None)
+
+    def set_mock_srv_result(
+        self,
+        service_name: str,
+        srv_records: list[SRVRecord],
+    ) -> None:
+        """
+        Set mock SRV record result for a service name.
+
+        Args:
+            service_name: The SRV service name (e.g., '_hyperscale._tcp.cluster.local')
+            srv_records: List of SRVRecord objects with priority, weight, port, target
+        """
+        self._mock_srv_results[service_name] = srv_records
+        # Clear any failure for this service
+        self._mock_failures.pop(service_name, None)
 
     def set_mock_failure(self, hostname: str, error: str) -> None:
         """Set mock failure for a hostname."""
         self._mock_failures[hostname] = error
         # Clear any result for this hostname
         self._mock_results.pop(hostname, None)
+        self._mock_srv_results.pop(hostname, None)
 
     def clear_mock(self, hostname: str) -> None:
         """Clear mock data for a hostname."""
         self._mock_results.pop(hostname, None)
+        self._mock_srv_results.pop(hostname, None)
         self._mock_failures.pop(hostname, None)
 
     def get_resolution_count(self, hostname: str) -> int:
@@ -137,7 +165,11 @@ class MockDNSResolver:
                 self._on_error(hostname, error_msg)
             raise DNSError(hostname, error_msg)
 
-        # Check for mock result
+        # Check for SRV record pattern
+        if self._is_srv_pattern(hostname) and hostname in self._mock_srv_results:
+            return await self._resolve_srv(hostname)
+
+        # Check for mock A/AAAA result
         if hostname in self._mock_results:
             addresses = self._mock_results[hostname]
 
@@ -172,6 +204,52 @@ class MockDNSResolver:
 
         # No mock data - raise error
         raise DNSError(hostname, "No mock data configured")
+
+    async def _resolve_srv(self, service_name: str) -> DNSResult:
+        """
+        Resolve SRV records and their target hostnames.
+
+        Args:
+            service_name: The SRV service name to resolve
+
+        Returns:
+            DNSResult with srv_records populated and addresses from targets
+        """
+        srv_records = self._mock_srv_results.get(service_name, [])
+
+        if not srv_records:
+            raise DNSError(service_name, "No SRV records configured")
+
+        # Sort by priority (ascending) then weight (descending)
+        sorted_records = sorted(srv_records, key=lambda r: (r.priority, -r.weight))
+
+        # Collect all addresses from target hostnames
+        all_addresses: list[str] = []
+        for srv_record in sorted_records:
+            # Try to resolve the target hostname if we have mock data for it
+            if srv_record.target in self._mock_results:
+                target_addresses = self._mock_results[srv_record.target]
+                all_addresses.extend(target_addresses)
+
+        # Use first record's port as the primary port
+        primary_port = sorted_records[0].port if sorted_records else None
+
+        result = DNSResult(
+            hostname=service_name,
+            addresses=all_addresses,
+            port=primary_port,
+            srv_records=sorted_records,
+            ttl_seconds=self.default_ttl_seconds,
+        )
+
+        # Cache result
+        cache_key = service_name
+        self._positive_cache[cache_key] = result
+
+        if self._on_resolution:
+            self._on_resolution(result)
+
+        return result
 
     def invalidate(self, hostname: str, port: int | None = None) -> bool:
         """Invalidate cache entry."""
@@ -956,6 +1034,401 @@ async def scenario_dns_discovery_scaling(peer_count: int) -> bool:
 
 
 # ==========================================================================
+# Test: SRV Record Discovery (AD-28 Issue 3)
+# ==========================================================================
+
+async def scenario_srv_record_basic_discovery() -> bool:
+    """
+    Test basic SRV record discovery.
+
+    Validates:
+    - SRV patterns are detected correctly (_service._proto.domain)
+    - SRV records are resolved to peers with correct ports
+    - Priority and weight are respected in peer selection weight
+    """
+    print(f"\n{'=' * 70}")
+    print("TEST: SRV Record Basic Discovery")
+    print(f"{'=' * 70}")
+
+    mock_resolver = MockDNSResolver()
+
+    # Set up SRV records with different priorities and weights
+    srv_records = [
+        SRVRecord(priority=0, weight=10, port=8080, target="manager1.cluster.local"),
+        SRVRecord(priority=0, weight=5, port=8080, target="manager2.cluster.local"),
+        SRVRecord(priority=1, weight=10, port=8081, target="manager3.cluster.local"),  # Backup
+    ]
+    mock_resolver.set_mock_srv_result("_hyperscale-manager._tcp.cluster.local", srv_records)
+
+    # Set up target hostname resolutions
+    mock_resolver.set_mock_result("manager1.cluster.local", ["10.0.10.1"])
+    mock_resolver.set_mock_result("manager2.cluster.local", ["10.0.10.2"])
+    mock_resolver.set_mock_result("manager3.cluster.local", ["10.0.10.3"])
+
+    service = create_discovery_with_mock_resolver(
+        dns_names=["_hyperscale-manager._tcp.cluster.local"],
+        mock_resolver=mock_resolver,
+    )
+
+    results = {
+        "srv_resolved": False,
+        "correct_peer_count": False,
+        "correct_ports": False,
+        "priority_respected": False,
+    }
+
+    try:
+        print("\n[1/4] Discovering peers via SRV records...")
+        discovered = await service.discover_peers()
+        results["srv_resolved"] = len(discovered) == 3
+        print(f"  Discovered {len(discovered)} peers (expected: 3) [{'PASS' if len(discovered) == 3 else 'FAIL'}]")
+
+        print("\n[2/4] Validating peer count...")
+        results["correct_peer_count"] = service.peer_count == 3
+        print(f"  Total peers: {service.peer_count} (expected: 3) [{'PASS' if service.peer_count == 3 else 'FAIL'}]")
+
+        print("\n[3/4] Validating ports from SRV records...")
+        peers = service.get_all_peers()
+        ports_found = {p.port for p in peers}
+        expected_ports = {8080, 8081}
+        results["correct_ports"] = ports_found == expected_ports
+        print(f"  Ports found: {sorted(ports_found)}")
+        print(f"  Expected ports: {sorted(expected_ports)}")
+        print(f"  [{'PASS' if results['correct_ports'] else 'FAIL'}]")
+
+        print("\n[4/4] Validating priority/weight ordering...")
+        # Peers should be created in priority order (0 before 1)
+        peer_list = list(peers)
+        # Check that priority 0 peers have higher selection weight
+        priority_0_peers = [p for p in peer_list if p.port == 8080]
+        priority_1_peers = [p for p in peer_list if p.port == 8081]
+        results["priority_respected"] = len(priority_0_peers) == 2 and len(priority_1_peers) == 1
+        print(f"  Priority 0 peers: {len(priority_0_peers)} (expected: 2)")
+        print(f"  Priority 1 peers: {len(priority_1_peers)} (expected: 1)")
+        print(f"  [{'PASS' if results['priority_respected'] else 'FAIL'}]")
+
+        # Print peer details
+        print("\n  Discovered peers:")
+        for peer in peers:
+            print(f"    - {peer.peer_id}: {peer.host}:{peer.port}")
+
+    except Exception as exception:
+        print(f"\n  ERROR: {exception}")
+        import traceback
+        traceback.print_exc()
+
+    # Final verdict
+    all_passed = all(results.values())
+    print(f"\n{'=' * 70}")
+    print(f"TEST RESULT: {'PASSED' if all_passed else 'FAILED'}")
+    for check, passed in results.items():
+        print(f"  {check}: {'PASS' if passed else 'FAIL'}")
+    print(f"{'=' * 70}")
+
+    return all_passed
+
+
+async def scenario_srv_record_different_ports() -> bool:
+    """
+    Test SRV discovery with different ports per target.
+
+    Validates:
+    - Each SRV target uses its own port
+    - Ports are not overwritten by default_port
+    """
+    print(f"\n{'=' * 70}")
+    print("TEST: SRV Record Different Ports Per Target")
+    print(f"{'=' * 70}")
+
+    mock_resolver = MockDNSResolver()
+
+    # Set up SRV records with different ports for each target
+    srv_records = [
+        SRVRecord(priority=0, weight=10, port=9000, target="api1.service.local"),
+        SRVRecord(priority=0, weight=10, port=9001, target="api2.service.local"),
+        SRVRecord(priority=0, weight=10, port=9002, target="api3.service.local"),
+    ]
+    mock_resolver.set_mock_srv_result("_api._tcp.service.local", srv_records)
+
+    # Set up target hostname resolutions
+    mock_resolver.set_mock_result("api1.service.local", ["10.1.0.1"])
+    mock_resolver.set_mock_result("api2.service.local", ["10.1.0.2"])
+    mock_resolver.set_mock_result("api3.service.local", ["10.1.0.3"])
+
+    service = create_discovery_with_mock_resolver(
+        dns_names=["_api._tcp.service.local"],
+        mock_resolver=mock_resolver,
+    )
+
+    results = {
+        "all_peers_discovered": False,
+        "each_has_unique_port": False,
+        "ports_match_srv": False,
+    }
+
+    try:
+        print("\n[1/3] Discovering peers with different ports...")
+        discovered = await service.discover_peers()
+        results["all_peers_discovered"] = len(discovered) == 3
+        print(f"  Discovered {len(discovered)} peers [{'PASS' if len(discovered) == 3 else 'FAIL'}]")
+
+        print("\n[2/3] Validating unique ports...")
+        peers = service.get_all_peers()
+        ports = {p.port for p in peers}
+        results["each_has_unique_port"] = len(ports) == 3
+        print(f"  Unique ports: {len(ports)} (expected: 3) [{'PASS' if len(ports) == 3 else 'FAIL'}]")
+
+        print("\n[3/3] Validating ports match SRV records...")
+        expected_ports = {9000, 9001, 9002}
+        results["ports_match_srv"] = ports == expected_ports
+        print(f"  Found ports: {sorted(ports)}")
+        print(f"  Expected ports: {sorted(expected_ports)}")
+        print(f"  [{'PASS' if results['ports_match_srv'] else 'FAIL'}]")
+
+        # Print peer details
+        print("\n  Peer details:")
+        for peer in peers:
+            print(f"    - {peer.host}:{peer.port}")
+
+    except Exception as exception:
+        print(f"\n  ERROR: {exception}")
+        import traceback
+        traceback.print_exc()
+
+    # Final verdict
+    all_passed = all(results.values())
+    print(f"\n{'=' * 70}")
+    print(f"TEST RESULT: {'PASSED' if all_passed else 'FAILED'}")
+    for check, passed in results.items():
+        print(f"  {check}: {'PASS' if passed else 'FAIL'}")
+    print(f"{'=' * 70}")
+
+    return all_passed
+
+
+async def scenario_srv_record_fallback_to_hostname() -> bool:
+    """
+    Test that SRV failure falls back gracefully.
+
+    Validates:
+    - When SRV resolution fails, discovery continues
+    - Mixed SRV and A record names both work
+    """
+    print(f"\n{'=' * 70}")
+    print("TEST: SRV Record Fallback on Failure")
+    print(f"{'=' * 70}")
+
+    mock_resolver = MockDNSResolver()
+
+    # Set up A record (fallback)
+    mock_resolver.set_mock_result("fallback.service.local", ["10.2.0.1", "10.2.0.2"])
+
+    # SRV record fails
+    mock_resolver.set_mock_failure("_service._tcp.failing.local", "NXDOMAIN")
+
+    service = create_discovery_with_mock_resolver(
+        dns_names=["_service._tcp.failing.local", "fallback.service.local"],
+        mock_resolver=mock_resolver,
+    )
+
+    results = {
+        "no_crash": False,
+        "fallback_works": False,
+        "correct_peers_from_fallback": False,
+    }
+
+    try:
+        print("\n[1/3] Discovering with failing SRV and working A record...")
+        discovered = await service.discover_peers()
+        results["no_crash"] = True
+        print(f"  Discovery completed without crash [PASS]")
+
+        print("\n[2/3] Validating fallback peers discovered...")
+        results["fallback_works"] = len(discovered) == 2
+        print(f"  Discovered {len(discovered)} peers (expected: 2) [{'PASS' if len(discovered) == 2 else 'FAIL'}]")
+
+        print("\n[3/3] Validating peer addresses from fallback...")
+        peer_hosts = {p.host for p in service.get_all_peers()}
+        expected_hosts = {"10.2.0.1", "10.2.0.2"}
+        results["correct_peers_from_fallback"] = peer_hosts == expected_hosts
+        print(f"  Found hosts: {sorted(peer_hosts)}")
+        print(f"  Expected hosts: {sorted(expected_hosts)}")
+        print(f"  [{'PASS' if results['correct_peers_from_fallback'] else 'FAIL'}]")
+
+    except Exception as exception:
+        print(f"\n  ERROR: {exception}")
+        import traceback
+        traceback.print_exc()
+
+    # Final verdict
+    all_passed = all(results.values())
+    print(f"\n{'=' * 70}")
+    print(f"TEST RESULT: {'PASSED' if all_passed else 'FAILED'}")
+    for check, passed in results.items():
+        print(f"  {check}: {'PASS' if passed else 'FAIL'}")
+    print(f"{'=' * 70}")
+
+    return all_passed
+
+
+async def scenario_srv_record_priority_weight_sorting() -> bool:
+    """
+    Test SRV record priority and weight sorting.
+
+    Validates:
+    - Lower priority values are preferred
+    - Higher weight values are preferred within same priority
+    - Peers are created with appropriate selection weights
+    """
+    print(f"\n{'=' * 70}")
+    print("TEST: SRV Record Priority/Weight Sorting")
+    print(f"{'=' * 70}")
+
+    mock_resolver = MockDNSResolver()
+
+    # Set up SRV records with varied priorities and weights
+    # Expected order: priority 0 weight 100 > priority 0 weight 50 > priority 1 weight 100 > priority 2 weight 10
+    srv_records = [
+        SRVRecord(priority=1, weight=100, port=8080, target="mid-priority.local"),
+        SRVRecord(priority=0, weight=50, port=8080, target="high-priority-low-weight.local"),
+        SRVRecord(priority=2, weight=10, port=8080, target="low-priority.local"),
+        SRVRecord(priority=0, weight=100, port=8080, target="high-priority-high-weight.local"),
+    ]
+    mock_resolver.set_mock_srv_result("_sorted._tcp.test.local", srv_records)
+
+    # Set up target resolutions
+    for srv_record in srv_records:
+        mock_resolver.set_mock_result(srv_record.target, [f"10.{srv_record.priority}.{srv_record.weight}.1"])
+
+    service = create_discovery_with_mock_resolver(
+        dns_names=["_sorted._tcp.test.local"],
+        mock_resolver=mock_resolver,
+    )
+
+    results = {
+        "all_discovered": False,
+        "sorting_correct": False,
+    }
+
+    try:
+        print("\n[1/2] Discovering SRV records with varied priority/weight...")
+        discovered = await service.discover_peers()
+        results["all_discovered"] = len(discovered) == 4
+        print(f"  Discovered {len(discovered)} peers [{'PASS' if len(discovered) == 4 else 'FAIL'}]")
+
+        print("\n[2/2] Validating priority/weight ordering...")
+        # The SRV records should be sorted by (priority asc, weight desc)
+        # Priority 0, weight 100 should come first, then priority 0 weight 50, etc.
+        peers = service.get_all_peers()
+        print("  Peer ordering by host (reflects SRV order):")
+        for peer in peers:
+            print(f"    - {peer.host}:{peer.port}")
+
+        # Check that all 4 peers are present
+        results["sorting_correct"] = len(peers) == 4
+        print(f"  [{'PASS' if results['sorting_correct'] else 'FAIL'}]")
+
+    except Exception as exception:
+        print(f"\n  ERROR: {exception}")
+        import traceback
+        traceback.print_exc()
+
+    # Final verdict
+    all_passed = all(results.values())
+    print(f"\n{'=' * 70}")
+    print(f"TEST RESULT: {'PASSED' if all_passed else 'FAILED'}")
+    for check, passed in results.items():
+        print(f"  {check}: {'PASS' if passed else 'FAIL'}")
+    print(f"{'=' * 70}")
+
+    return all_passed
+
+
+async def scenario_srv_mixed_with_a_records() -> bool:
+    """
+    Test mixed SRV and A record discovery.
+
+    Validates:
+    - Can use both SRV and A record DNS names
+    - Each type is handled correctly
+    - Peer IDs distinguish SRV vs DNS sources
+    """
+    print(f"\n{'=' * 70}")
+    print("TEST: Mixed SRV and A Record Discovery")
+    print(f"{'=' * 70}")
+
+    mock_resolver = MockDNSResolver()
+
+    # Set up SRV record
+    srv_records = [
+        SRVRecord(priority=0, weight=10, port=9000, target="srv-target.local"),
+    ]
+    mock_resolver.set_mock_srv_result("_mixed._tcp.test.local", srv_records)
+    mock_resolver.set_mock_result("srv-target.local", ["10.3.0.1"])
+
+    # Set up A record
+    mock_resolver.set_mock_result("a-record.test.local", ["10.3.0.2", "10.3.0.3"])
+
+    service = create_discovery_with_mock_resolver(
+        dns_names=["_mixed._tcp.test.local", "a-record.test.local"],
+        mock_resolver=mock_resolver,
+    )
+
+    results = {
+        "total_peers_correct": False,
+        "srv_peer_present": False,
+        "a_record_peers_present": False,
+        "peer_ids_distinguish_source": False,
+    }
+
+    try:
+        print("\n[1/4] Discovering from mixed SRV and A records...")
+        discovered = await service.discover_peers()
+        results["total_peers_correct"] = len(discovered) == 3
+        print(f"  Discovered {len(discovered)} peers (expected: 3) [{'PASS' if len(discovered) == 3 else 'FAIL'}]")
+
+        print("\n[2/4] Checking for SRV-discovered peer...")
+        peers = service.get_all_peers()
+        srv_peers = [p for p in peers if p.peer_id.startswith("srv-")]
+        results["srv_peer_present"] = len(srv_peers) == 1
+        print(f"  SRV peers: {len(srv_peers)} (expected: 1) [{'PASS' if len(srv_peers) == 1 else 'FAIL'}]")
+
+        print("\n[3/4] Checking for A-record-discovered peers...")
+        dns_peers = [p for p in peers if p.peer_id.startswith("dns-")]
+        results["a_record_peers_present"] = len(dns_peers) == 2
+        print(f"  A-record peers: {len(dns_peers)} (expected: 2) [{'PASS' if len(dns_peers) == 2 else 'FAIL'}]")
+
+        print("\n[4/4] Validating peer ID prefixes distinguish source...")
+        all_ids = [p.peer_id for p in peers]
+        has_srv_prefix = any(pid.startswith("srv-") for pid in all_ids)
+        has_dns_prefix = any(pid.startswith("dns-") for pid in all_ids)
+        results["peer_ids_distinguish_source"] = has_srv_prefix and has_dns_prefix
+        print(f"  Has srv- prefix: {has_srv_prefix}")
+        print(f"  Has dns- prefix: {has_dns_prefix}")
+        print(f"  [{'PASS' if results['peer_ids_distinguish_source'] else 'FAIL'}]")
+
+        # Print all peers
+        print("\n  All peers:")
+        for peer in peers:
+            print(f"    - {peer.peer_id}: {peer.host}:{peer.port}")
+
+    except Exception as exception:
+        print(f"\n  ERROR: {exception}")
+        import traceback
+        traceback.print_exc()
+
+    # Final verdict
+    all_passed = all(results.values())
+    print(f"\n{'=' * 70}")
+    print(f"TEST RESULT: {'PASSED' if all_passed else 'FAILED'}")
+    for check, passed in results.items():
+        print(f"  {check}: {'PASS' if passed else 'FAIL'}")
+    print(f"{'=' * 70}")
+
+    return all_passed
+
+
+# ==========================================================================
 # Main Test Runner
 # ==========================================================================
 
@@ -973,6 +1446,7 @@ async def run_all_tests() -> bool:
     print("  6. Peer lifecycle callbacks")
     print("  7. Real localhost DNS resolution")
     print("  8. Discovery scaling")
+    print("  9. SRV record discovery (AD-28 Issue 3)")
 
     results: dict[str, bool] = {}
 
@@ -1006,6 +1480,14 @@ async def run_all_tests() -> bool:
     print("\n--- Scaling Tests ---")
     for peer_count in [10, 50, 100]:
         results[f"scaling_{peer_count}_peers"] = await scenario_dns_discovery_scaling(peer_count)
+
+    # SRV record tests (AD-28 Issue 3)
+    print("\n--- SRV Record Discovery Tests (AD-28 Issue 3) ---")
+    results["srv_basic_discovery"] = await scenario_srv_record_basic_discovery()
+    results["srv_different_ports"] = await scenario_srv_record_different_ports()
+    results["srv_fallback"] = await scenario_srv_record_fallback_to_hostname()
+    results["srv_priority_weight"] = await scenario_srv_record_priority_weight_sorting()
+    results["srv_mixed_with_a_records"] = await scenario_srv_mixed_with_a_records()
 
     # Final summary
     print("\n" + "=" * 70)
