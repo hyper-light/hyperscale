@@ -162,20 +162,20 @@ Per CLAUDE.md: "DO NOT RUN THE INTEGRATION TESTS YOURSELF. Ask me to."
 - [ ] **12.1.7** Create `VivaldiConfig` dataclass - Currently uses hardcoded values
 - [ ] **12.1.8** Add coordinate cleanup/TTL - No stale coordinate removal
 
-### 12.2 SWIM Message Integration ❌ NOT IMPLEMENTED
+### 12.2 SWIM Message Integration ✅ COMPLETE
 
-**File**: `hyperscale/distributed_rewrite/models/message.py` or swim protocol files
+**File**: `hyperscale/distributed_rewrite/swim/health_aware_server.py`
 
-🔴 **CRITICAL**: Coordinates must piggyback on SWIM ping/ack messages per AD-35 spec
+✅ **COMPLETE**: Coordinates piggyback on all SWIM messages using #|v{json} format
 
-- [ ] **12.2.1** Add `vivaldi_coord` field to ping messages
-- [ ] **12.2.2** Add `vivaldi_coord` field to ack messages
-- [ ] **12.2.3** Add `rtt_ms` field to ack messages for measured RTT
-- [ ] **12.2.4** Update ping handler to include local coordinate
-- [ ] **12.2.5** Update ack handler to include local coordinate + measured RTT
-- [ ] **12.2.6** Call `CoordinateTracker.update_coordinate_from_peer()` on every ack
+- [x] **12.2.1** Add `vivaldi_coord` field to ping messages - Commit b8187b27
+- [x] **12.2.2** Add `vivaldi_coord` field to ack messages - Commit b8187b27
+- [x] **12.2.3** Add `rtt_ms` field to ack messages for measured RTT - Commit b8187b27
+- [x] **12.2.4** Update ping handler to include local coordinate - Commit b8187b27
+- [x] **12.2.5** Update ack handler to include local coordinate + measured RTT - Commit b8187b27
+- [x] **12.2.6** Call `CoordinateTracker.update_coordinate_from_peer()` on every ack - Commit b8187b27
 
-**Current State**: Coordinates embedded in heartbeat payloads (StateEmbedder), NOT in ping/ack protocol messages. This provides passive learning but not per-probe RTT measurement required by AD-35.
+**Current State**: ✅ Coordinates now piggybacked on ALL SWIM messages (#|v{json} format). RTT measured from probe start time on ACK receipt. CoordinateTracker updated with peer coordinates and RTT on every ping/ack exchange.
 
 ### 12.3 UNCONFIRMED Lifecycle State ❌ NOT IMPLEMENTED
 
@@ -322,11 +322,11 @@ All remaining AD-36 items deferred. Core routing subsystem must be built first.
 
 **Result:** ✅ AD-34 is now fully functional for multi-DC deployments
 
-### Phase 2: Complete AD-35 SWIM Integration 🟡 MEDIUM PRIORITY
+### Phase 2: Complete AD-35 SWIM Integration 🟡 IN PROGRESS
 **Effort:** 3-5 days
 
-1. [ ] Add `vivaldi_coord` field to SWIM ping/ack messages (Section 12.2)
-2. [ ] Implement coordinate updates on every ping/ack exchange
+1. [x] Add `vivaldi_coord` field to SWIM ping/ack messages (Section 12.2) - Commit b8187b27
+2. [x] Implement coordinate updates on every ping/ack exchange - Commit b8187b27
 3. [ ] Add UNCONFIRMED state to IncarnationTracker (Section 12.3)
 4. [ ] Implement basic RoleAwareConfirmationManager (Section 12.5)
 5. [ ] Add adaptive timeout calculation using Vivaldi RTT (Section 12.6)
