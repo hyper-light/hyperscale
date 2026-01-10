@@ -3847,6 +3847,13 @@ class GateServer(HealthAwareServer):
         # Start AD-34 multi-DC job timeout tracker
         await self._job_timeout_tracker.start()
 
+        # AD-36: Initialize Vivaldi-based job router with CoordinateTracker
+        # Uses multi-factor scoring for optimal datacenter selection
+        self._job_router = GateJobRouter(
+            coordinate_tracker=self._coordinate_tracker,
+            get_datacenter_candidates=self._build_datacenter_candidates,
+        )
+
         # Register with all managers (symmetric to managers registering with all gates)
         # This ensures managers know about all gates for proper routing and health tracking
         if self._datacenter_managers:
