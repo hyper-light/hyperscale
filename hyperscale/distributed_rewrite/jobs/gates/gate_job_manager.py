@@ -134,9 +134,17 @@ class GateJobManager:
         """Get all job IDs."""
         return list(self._jobs.keys())
 
+    def get_all_jobs(self) -> dict[str, GlobalJobStatus]:
+        """Get a copy of all jobs for snapshotting."""
+        return dict(self._jobs)
+
     def job_count(self) -> int:
         """Get the number of tracked jobs."""
         return len(self._jobs)
+
+    def items(self):
+        """Iterate over job_id, job pairs."""
+        return self._jobs.items()
 
     # =========================================================================
     # Target DC Management

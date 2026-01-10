@@ -299,21 +299,14 @@ class GateServer(HealthAwareServer):
         # Versioned state clock for rejecting stale updates
         # Tracks per-datacenter versions using Lamport timestamps
         self._versioned_clock = VersionedStateClock()
-        
-        # Global job state
-        self._jobs: dict[str, GlobalJobStatus] = {}  # job_id -> status
-        
-        # Per-DC final results for job completion aggregation
-        # job_id -> {datacenter -> JobFinalResult}
-        self._job_dc_results: dict[str, dict[str, JobFinalResult]] = {}
+
+        # Centralized job state management with per-job locking
+        # Handles: job status, DC results, target DCs, callbacks, fence tokens
+        self._job_manager = GateJobManager()
 
         # Per-workflow results from all DCs for cross-DC aggregation
         # job_id -> workflow_id -> datacenter -> WorkflowResultPush
         self._workflow_dc_results: dict[str, dict[str, dict[str, WorkflowResultPush]]] = {}
-
-        # Track which DCs were assigned for each job (to know when complete)
-        # job_id -> set of datacenter IDs
-        self._job_target_dcs: dict[str, set[str]] = {}
 
         # Track expected workflow IDs per job (client-generated, globally unique)
         # job_id -> set of workflow IDs
@@ -335,10 +328,6 @@ class GateServer(HealthAwareServer):
         # Used for routing queries to the authoritative manager for each job
         # job_id -> {dc_id -> (manager_host, manager_tcp_port)}
         self._job_dc_managers: dict[str, dict[str, tuple[str, int]]] = {}
-
-        # Client push notification callbacks
-        # job_id -> callback address for push notifications
-        self._job_callbacks: dict[str, tuple[str, int]] = {}
 
         # Cancellation completion tracking (AD-20 push notifications from managers)
         # job_id -> asyncio.Event (set when cancellation complete notification received)
@@ -373,10 +362,6 @@ class GateServer(HealthAwareServer):
         # Lease management for at-most-once
         self._leases: dict[str, DatacenterLease] = {}  # job_id:dc -> lease
         self._fence_token = 0
-
-        # Per-job fence token tracking for rejecting stale updates
-        # job_id -> highest fence_token seen for this job
-        self._job_fence_tokens: dict[str, int] = {}
 
         # Section 7: Gate job leadership takeover handling
         # Track managers confirmed dead that were job leaders
@@ -427,7 +412,7 @@ class GateServer(HealthAwareServer):
             get_term=lambda: self._leader_election.state.current_term,
             get_state_version=lambda: self._state_version,
             get_gate_state=lambda: self._gate_state.value,
-            get_active_jobs=lambda: len(self._jobs),
+            get_active_jobs=lambda: self._job_manager.job_count(),
             get_active_datacenters=lambda: self._count_active_datacenters(),
             get_manager_count=lambda: sum(
                 len(managers) for managers in self._datacenter_managers.values()
@@ -1058,7 +1043,7 @@ class GateServer(HealthAwareServer):
         # Filter to only active (non-terminal) jobs
         orphaned_jobs: list[str] = []
         for job_id in candidate_jobs:
-            job = self._jobs.get(job_id)
+            job = self._job_manager.get_job(job_id)
             if job and job.status not in (
                 JobStatus.COMPLETED.value,
                 JobStatus.FAILED.value,
@@ -1085,7 +1070,7 @@ class GateServer(HealthAwareServer):
             old_gate_id = self._job_leadership_tracker.get_leader(job_id)
 
             # Use tracker's takeover method (handles fencing token increment)
-            target_dc_count = len(self._job_target_dcs.get(job_id, set()))
+            target_dc_count = len(self._job_manager.get_target_dcs(job_id))
             self._job_leadership_tracker.takeover_leadership(job_id, metadata=target_dc_count)
 
             # Broadcast new leadership to peer gates
@@ -1259,7 +1244,7 @@ class GateServer(HealthAwareServer):
             is_leader=self.is_leader(),
             term=self._leader_election.state.current_term,
             version=self._state_version,
-            jobs=dict(self._jobs),
+            jobs=self._job_manager.get_all_jobs(),
             datacenter_status={
                 dc: self._classify_datacenter_health(dc)
                 for dc in self._datacenter_managers.keys()
@@ -1404,9 +1389,9 @@ class GateServer(HealthAwareServer):
         """
         # Merge jobs - keep newer versions
         for job_id, job in snapshot.jobs.items():
-            existing = self._jobs.get(job_id)
+            existing = self._job_manager.get_job(job_id)
             if not existing or getattr(job, 'timestamp', 0) > getattr(existing, 'timestamp', 0):
-                self._jobs[job_id] = job
+                self._job_manager.set_job(job_id, job)
 
         # Merge leases - keep ones with higher fence tokens
         for lease_key, lease in snapshot.leases.items():
@@ -1608,7 +1593,7 @@ class GateServer(HealthAwareServer):
         # Convert to expected format, using stored metadata or computing from _job_target_dcs
         result: dict[str, tuple[int, int]] = {}
         for job_id, (fencing_token, metadata) in claims.items():
-            target_dc_count = metadata if metadata is not None else len(self._job_target_dcs.get(job_id, set()))
+            target_dc_count = metadata if metadata is not None else len(self._job_manager.get_target_dcs(job_id))
             result[job_id] = (fencing_token, target_dc_count)
         return result
 
@@ -2450,11 +2435,11 @@ class GateServer(HealthAwareServer):
         If client provided a callback_addr at submission time, pushes
         JobStatusPush to that address via TCP.
         """
-        job = self._jobs.get(job_id)
+        job = self._job_manager.get_job(job_id)
         if not job:
             return
-        
-        callback = self._job_callbacks.get(job_id)
+
+        callback = self._job_manager.get_callback(job_id)
         
         self._task_runner.run(
             self._udp_logger.log,
@@ -2520,22 +2505,22 @@ class GateServer(HealthAwareServer):
                 for push in final_pushes:
                     await self._push_windowed_stats_to_client(push)
 
-                self._job_callbacks.pop(job_id, None)
+                self._job_manager.remove_callback(job_id)
                 self._progress_callbacks.pop(job_id, None)
-    
+
     async def _batch_stats_update(self) -> None:
         """
         Process a batch of Tier 2 (Periodic) updates.
-        
+
         Aggregates pending progress updates and pushes to clients
         that have registered callbacks. This is more efficient than
         sending each update individually.
         """
         # Collect running jobs with callbacks
         jobs_with_callbacks = []
-        for job_id, job in list(self._jobs.items()):
+        for job_id, job in list(self._job_manager.items()):
             if job.status == JobStatus.RUNNING.value:
-                callback = self._job_callbacks.get(job_id)
+                callback = self._job_manager.get_callback(job_id)
                 if callback:
                     jobs_with_callbacks.append((job_id, job, callback))
         
@@ -2862,8 +2847,8 @@ class GateServer(HealthAwareServer):
         """
         # Merge jobs we don't have
         for job_id, job_status in snapshot.jobs.items():
-            if job_id not in self._jobs:
-                self._jobs[job_id] = job_status
+            if not self._job_manager.has_job(job_id):
+                self._job_manager.set_job(job_id, job_status)
         
         # Merge manager discovery - add any managers we don't know about
         new_managers_count = 0
@@ -3362,7 +3347,7 @@ class GateServer(HealthAwareServer):
         )
         
         # Count active jobs
-        active_jobs = len(self._jobs)
+        active_jobs = self._job_manager.job_count()
         
         # Determine gate cluster health
         gate_health = "HEALTHY"
@@ -3428,23 +3413,20 @@ class GateServer(HealthAwareServer):
                 now = time.monotonic()
                 jobs_to_remove = []
 
-                for job_id, job in list(self._jobs.items()):
+                for job_id, job in list(self._job_manager.items()):
                     if job.status in terminal_states:
                         # Check age - use elapsed_seconds as relative timestamp
                         # or timestamp if available
                         age = now - getattr(job, 'timestamp', now)
                         if age > self._job_max_age:
                             jobs_to_remove.append(job_id)
-                
+
                 for job_id in jobs_to_remove:
-                    self._jobs.pop(job_id, None)
-                    # Also clean up related tracking dicts
-                    self._job_fence_tokens.pop(job_id, None)
-                    self._job_dc_results.pop(job_id, None)
+                    # GateJobManager.delete_job cleans up: jobs, dc_results, target_dcs, callbacks, fence_tokens
+                    self._job_manager.delete_job(job_id)
+                    # Also clean up related tracking dicts not managed by GateJobManager
                     self._workflow_dc_results.pop(job_id, None)
-                    self._job_target_dcs.pop(job_id, None)
                     self._job_workflow_ids.pop(job_id, None)
-                    self._job_callbacks.pop(job_id, None)
                     self._progress_callbacks.pop(job_id, None)
                     # Clean up per-job leadership tracking
                     self._job_leadership_tracker.release_leadership(job_id)
@@ -3576,7 +3558,7 @@ class GateServer(HealthAwareServer):
     
     async def _gather_job_status(self, job_id: str) -> GlobalJobStatus:
         """Gather and aggregate job status from all DCs."""
-        job = self._jobs.get(job_id)
+        job = self._job_manager.get_job(job_id)
         if not job:
             return GlobalJobStatus(
                 job_id=job_id,
@@ -4046,10 +4028,10 @@ class GateServer(HealthAwareServer):
                 datacenters=[],
                 timestamp=time.monotonic(),
             )
-            self._jobs[submission.job_id] = job
+            self._job_manager.set_job(submission.job_id, job)
 
             # Track which DCs this job targets (for completion detection)
-            self._job_target_dcs[submission.job_id] = set(target_dcs)
+            self._job_manager.set_target_dcs(submission.job_id, set(target_dcs))
 
             # Extract and track workflow IDs from submission (client-generated)
             # Format: list[tuple[str, list[str], Workflow]] - (workflow_id, dependencies, workflow)
@@ -4063,7 +4045,7 @@ class GateServer(HealthAwareServer):
 
             # Store callback for push notifications (if provided)
             if submission.callback_addr:
-                self._job_callbacks[submission.job_id] = submission.callback_addr
+                self._job_manager.set_callback(submission.job_id, submission.callback_addr)
                 # Also register for progress updates (same address, different message type)
                 self._progress_callbacks[submission.job_id] = submission.callback_addr
 
@@ -4097,7 +4079,7 @@ class GateServer(HealthAwareServer):
             ack = JobAck(
                 job_id=submission.job_id,
                 accepted=True,
-                queued_position=len(self._jobs),
+                queued_position=self._job_manager.job_count(),
                 protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
                 protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
                 capabilities=negotiated_caps_str,
@@ -4151,7 +4133,7 @@ class GateServer(HealthAwareServer):
         - Sets origin_gate_addr so managers send results directly to this gate
         - This gate is the job leader for this job
         """
-        job = self._jobs.get(submission.job_id)
+        job = self._job_manager.get_job(submission.job_id)
         if not job:
             return
 
@@ -4160,6 +4142,7 @@ class GateServer(HealthAwareServer):
         submission.origin_gate_addr = (self._host, self._tcp_port)
 
         job.status = JobStatus.DISPATCHING.value
+        self._job_manager.set_job(submission.job_id, job)
         self._increment_version()
         
         # Get primary and fallback DCs based on health classification
@@ -4364,7 +4347,7 @@ class GateServer(HealthAwareServer):
             progress = JobProgress.load(data)
 
             # Check if we own this job - if not, forward to peers
-            if progress.job_id not in self._jobs:
+            if not self._job_manager.has_job(progress.job_id):
                 # We don't own this job - forward to peer gates
                 forwarded = await self._forward_job_progress_to_peers(progress)
                 if forwarded:
@@ -4378,7 +4361,7 @@ class GateServer(HealthAwareServer):
                 # No peers to forward to - continue processing locally
 
             # Validate fence token - reject stale updates
-            current_fence = self._job_fence_tokens.get(progress.job_id, 0)
+            current_fence = self._job_manager.get_fence_token(progress.job_id)
             if progress.fence_token < current_fence:
                 # Stale update from old owner - reject silently
                 self._task_runner.run(
@@ -4401,9 +4384,9 @@ class GateServer(HealthAwareServer):
 
             # Update fence token if higher
             if progress.fence_token > current_fence:
-                self._job_fence_tokens[progress.job_id] = progress.fence_token
+                self._job_manager.set_fence_token(progress.job_id, progress.fence_token)
 
-            job = self._jobs.get(progress.job_id)
+            job = self._job_manager.get_job(progress.job_id)
             if job:
                 old_status = job.status
 
@@ -4507,7 +4490,7 @@ class GateServer(HealthAwareServer):
                 reason = cancel.reason
                 use_ad20_response = False
 
-            job = self._jobs.get(job_id)
+            job = self._job_manager.get_job(job_id)
             if not job:
                 if use_ad20_response:
                     return JobCancelResponse(
@@ -4718,7 +4701,7 @@ class GateServer(HealthAwareServer):
                 event.set()
 
             # Push notification to client callback if registered
-            callback = self._job_callbacks.get(job_id)
+            callback = self._job_manager.get_callback(job_id)
             if callback:
                 self._task_runner.run(
                     self._push_cancellation_complete_to_client,
@@ -4797,7 +4780,7 @@ class GateServer(HealthAwareServer):
             )
 
             # Find all datacenters with this job
-            job_info = self._jobs.get(request.job_id)
+            job_info = self._job_manager.get_job(request.job_id)
             if not job_info:
                 return SingleWorkflowCancelResponse(
                     job_id=request.job_id,
@@ -5011,7 +4994,7 @@ class GateServer(HealthAwareServer):
             result = JobFinalResult.load(data)
 
             # Check if we own this job - if not, forward to peers
-            if result.job_id not in self._jobs:
+            if not self._job_manager.has_job(result.job_id):
                 # We don't own this job - forward to peer gates
                 forwarded = await self._forward_job_result_to_peers(result)
                 if forwarded:
@@ -5029,7 +5012,7 @@ class GateServer(HealthAwareServer):
                 # This can happen during startup or single-gate deployments
 
             # Validate fence token - reject stale results
-            current_fence = self._job_fence_tokens.get(result.job_id, 0)
+            current_fence = self._job_manager.get_fence_token(result.job_id)
             if result.fence_token < current_fence:
                 # Stale result from old owner - reject silently
                 self._task_runner.run(
@@ -5046,7 +5029,7 @@ class GateServer(HealthAwareServer):
 
             # Update fence token if higher
             if result.fence_token > current_fence:
-                self._job_fence_tokens[result.job_id] = result.fence_token
+                self._job_manager.set_fence_token(result.job_id, result.fence_token)
 
             self._task_runner.run(
                 self._udp_logger.log,
@@ -5059,13 +5042,11 @@ class GateServer(HealthAwareServer):
             )
 
             # Store per-DC result
-            if result.job_id not in self._job_dc_results:
-                self._job_dc_results[result.job_id] = {}
-            self._job_dc_results[result.job_id][result.datacenter] = result
+            self._job_manager.set_dc_result(result.job_id, result.datacenter, result)
 
             # Check if we have results from all target DCs
-            target_dcs = self._job_target_dcs.get(result.job_id, set())
-            received_dcs = set(self._job_dc_results.get(result.job_id, {}).keys())
+            target_dcs = self._job_manager.get_target_dcs(result.job_id)
+            received_dcs = set(self._job_manager.get_all_dc_results(result.job_id).keys())
 
             if target_dcs and received_dcs >= target_dcs:
                 # All DCs reported - aggregate and send to client
@@ -5095,7 +5076,7 @@ class GateServer(HealthAwareServer):
             push = WorkflowResultPush.load(data)
 
             # Check if we own this job
-            if push.job_id not in self._jobs:
+            if not self._job_manager.has_job(push.job_id):
                 # Forward to peer gates
                 await self._forward_workflow_result_to_peers(push)
                 return b'ok'
@@ -5118,7 +5099,7 @@ class GateServer(HealthAwareServer):
             self._workflow_dc_results[push.job_id][push.workflow_id][push.datacenter] = push
 
             # Check if we have results from all target DCs for this workflow
-            target_dcs = self._job_target_dcs.get(push.job_id, set())
+            target_dcs = self._job_manager.get_target_dcs(push.job_id)
             received_dcs = set(self._workflow_dc_results[push.job_id][push.workflow_id].keys())
 
             if target_dcs and received_dcs >= target_dcs:
@@ -5234,7 +5215,7 @@ class GateServer(HealthAwareServer):
         )
 
         # Send to client
-        callback = self._job_callbacks.get(job_id)
+        callback = self._job_manager.get_callback(job_id)
         if callback:
             try:
                 await self.send_tcp(
@@ -5331,7 +5312,7 @@ class GateServer(HealthAwareServer):
         Uses Results.merge_results() to properly aggregate WorkflowStats
         from all datacenters, including timing percentiles (p50, p95, p99).
         """
-        dc_results = self._job_dc_results.get(job_id, {})
+        dc_results = self._job_manager.get_all_dc_results(job_id)
         if not dc_results:
             return
         
@@ -5478,7 +5459,7 @@ class GateServer(HealthAwareServer):
         )
         
         # Send to client
-        callback = self._job_callbacks.get(job_id)
+        callback = self._job_manager.get_callback(job_id)
         if callback:
             try:
                 await self.send_tcp(
@@ -5508,8 +5489,10 @@ class GateServer(HealthAwareServer):
                 )
         
         # Update job status
-        if job_id in self._jobs:
-            self._jobs[job_id].status = overall_status
+        job = self._job_manager.get_job(job_id)
+        if job:
+            job.status = overall_status
+            self._job_manager.set_job(job_id, job)
 
         # Start background reporter submission after DC aggregation
         # Pass the merged workflow stats for reporting
@@ -5521,7 +5504,8 @@ class GateServer(HealthAwareServer):
             )
 
         # Clean up DC results (but not job submission - needed for reporter tasks)
-        self._job_dc_results.pop(job_id, None)
+        # Note: We clear dc_results from job_manager via explicit clearing, but keep the job itself
+        # The job will be cleaned up later by the cleanup loop
         self._workflow_dc_results.pop(job_id, None)
 
     # =========================================================================
@@ -5815,7 +5799,7 @@ class GateServer(HealthAwareServer):
                 ))
 
             # Get active job IDs
-            active_job_ids = list(self._jobs.keys())
+            active_job_ids = self._job_manager.get_all_job_ids()
 
             # Get peer gate addresses
             peer_gates = list(self._active_gate_peers)
@@ -5873,7 +5857,7 @@ class GateServer(HealthAwareServer):
             job_id = request.job_id
 
             # Check if we own this job
-            job = self._jobs.get(job_id)
+            job = self._job_manager.get_job(job_id)
             if not job:
                 # Job not found on this gate
                 response = RegisterCallbackResponse(
@@ -5884,7 +5868,7 @@ class GateServer(HealthAwareServer):
                 return response.dump()
 
             # Register the callback address for both status and progress updates
-            self._job_callbacks[job_id] = request.callback_addr
+            self._job_manager.set_callback(job_id, request.callback_addr)
             self._progress_callbacks[job_id] = request.callback_addr
 
             # Calculate elapsed time
@@ -6701,7 +6685,7 @@ class GateServer(HealthAwareServer):
         )
 
         # Notify client if callback registered
-        callback = self._job_callbacks.get(job_id)
+        callback = self._job_manager.get_callback(job_id)
         if callback:
             try:
                 # Create a failure notification
@@ -6728,13 +6712,14 @@ class GateServer(HealthAwareServer):
                 )
 
         # Update job status to failed
-        job_info = self._jobs.get(job_id)
+        job_info = self._job_manager.get_job(job_id)
         if job_info:
             job_info.status = JobStatus.FAILED.value
             job_info.error = "Job leader manager failed, no replacement within grace period"
+            self._job_manager.set_job(job_id, job_info)
 
         # Clean up callbacks
-        self._job_callbacks.pop(job_id, None)
+        self._job_manager.remove_callback(job_id)
         self._progress_callbacks.pop(job_id, None)
 
     def start_orphan_check_loop(self) -> None:
