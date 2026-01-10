@@ -44,6 +44,8 @@ from .distributed import (
     GateInfo as GateInfo,
     GateHeartbeat as GateHeartbeat,
     ManagerRegistrationResponse as ManagerRegistrationResponse,
+    GateRegistrationRequest as GateRegistrationRequest,
+    GateRegistrationResponse as GateRegistrationResponse,
     ManagerDiscoveryBroadcast as ManagerDiscoveryBroadcast,
     WorkerDiscoveryBroadcast as WorkerDiscoveryBroadcast,
     JobProgressAck as JobProgressAck,

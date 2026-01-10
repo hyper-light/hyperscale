@@ -395,14 +395,66 @@ class ManagerRegistrationResponse(Message):
 
 
 @dataclass(slots=True, kw_only=True)
+class GateRegistrationRequest(Message):
+    """
+    Registration request from gate to manager.
+
+    Gates register with all managers at startup (symmetric to managers
+    registering with all gates). This ensures managers know about all
+    gates for proper routing and health tracking.
+
+    Protocol Version (AD-25):
+    - protocol_version_major/minor: For version compatibility checks
+    - capabilities: Comma-separated list of supported features
+    """
+    node_id: str                            # Gate's unique identifier
+    tcp_host: str                           # Gate's TCP host
+    tcp_port: int                           # Gate's TCP port
+    udp_host: str                           # Gate's UDP host
+    udp_port: int                           # Gate's UDP port
+    is_leader: bool                         # Whether this gate is the leader
+    term: int                               # Current leadership term
+    state: str                              # GateState value
+    active_jobs: int = 0                    # Number of active jobs
+    manager_count: int = 0                  # Number of known managers
+    # Protocol version fields (AD-25)
+    protocol_version_major: int = 1
+    protocol_version_minor: int = 0
+    capabilities: str = ""                  # Comma-separated feature list
+
+
+@dataclass(slots=True, kw_only=True)
+class GateRegistrationResponse(Message):
+    """
+    Registration acknowledgment from manager to gate.
+
+    Contains list of all known managers so gate can establish
+    redundant communication channels across datacenters.
+
+    Protocol Version (AD-25):
+    - protocol_version_major/minor: For version compatibility checks
+    - capabilities: Comma-separated negotiated features
+    """
+    accepted: bool                          # Whether registration was accepted
+    manager_id: str                         # Responding manager's node_id
+    datacenter: str                         # Manager's datacenter
+    healthy_managers: list[ManagerInfo]     # All known healthy managers
+    error: str | None = None                # Error message if not accepted
+    # Protocol version fields (AD-25)
+    protocol_version_major: int = 1
+    protocol_version_minor: int = 0
+    capabilities: str = ""                  # Comma-separated negotiated features
+
+
+@dataclass(slots=True, kw_only=True)
 class ManagerDiscoveryBroadcast(Message):
     """
     Broadcast from one gate to another about a newly discovered manager.
-    
+
     Used for cross-gate synchronization of manager discovery.
     When a manager registers with one gate, that gate broadcasts
     to all peer gates so they can also track the manager.
-    
+
     Includes manager status so peer gates can also update _datacenter_status.
     """
     datacenter: str                         # Manager's datacenter

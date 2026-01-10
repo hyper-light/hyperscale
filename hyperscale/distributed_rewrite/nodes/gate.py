@@ -21,6 +21,7 @@ Protocols:
 """
 
 import asyncio
+import random
 import secrets
 import statistics
 import time
@@ -49,6 +50,8 @@ from hyperscale.distributed_rewrite.models import (
     GateState,
     GateHeartbeat,
     ManagerRegistrationResponse,
+    GateRegistrationRequest,
+    GateRegistrationResponse,
     ManagerDiscoveryBroadcast,
     JobProgressAck,
     ManagerHeartbeat,
@@ -2860,7 +2863,77 @@ class GateServer(HealthAwareServer):
             "circuit_error_rate": self._quorum_circuit.error_rate,
             "gate_state": self._gate_state.value,
         }
-    
+
+    async def _wait_for_cluster_stabilization(self) -> None:
+        """
+        Wait for the SWIM cluster to stabilize before starting leader election.
+
+        This ensures all configured gate peers are visible in the cluster
+        before any node attempts to become leader. This prevents the race
+        condition where a gate becomes leader with only 1 vote (itself)
+        because it started election before other peers joined.
+
+        The method waits until:
+        - All expected peers are in the nodes dict, OR
+        - The stabilization timeout is reached
+
+        With sequential starts, this allows later-starting gates to join
+        before election begins. With concurrent starts, this ensures all
+        gates see each other.
+        """
+        expected_peers = len(self._gate_udp_peers)
+        if expected_peers == 0:
+            # Single gate, no cluster to stabilize
+            return
+
+        timeout = self.env.CLUSTER_STABILIZATION_TIMEOUT
+        poll_interval = self.env.CLUSTER_STABILIZATION_POLL_INTERVAL
+        start_time = time.monotonic()
+
+        self._task_runner.run(
+            self._udp_logger.log,
+            ServerInfo(
+                message=f"Waiting for cluster stabilization (expecting {expected_peers} peers, timeout={timeout}s)",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+
+        while True:
+            # Check how many peers we can see
+            nodes = self._context.read('nodes')
+            self_addr = (self._host, self._udp_port)
+            visible_peers = len([n for n in nodes.keys() if n != self_addr])
+
+            if visible_peers >= expected_peers:
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerInfo(
+                        message=f"Cluster stabilized: {visible_peers}/{expected_peers} peers visible",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+                return
+
+            # Check timeout
+            elapsed = time.monotonic() - start_time
+            if elapsed >= timeout:
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerWarning(
+                        message=f"Cluster stabilization timeout: only {visible_peers}/{expected_peers} peers visible after {timeout}s",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+                return
+
+            await asyncio.sleep(poll_interval)
+
     async def _complete_startup_sync(self) -> None:
         """
         Complete the startup state sync and transition to ACTIVE.
@@ -3073,7 +3146,142 @@ class GateServer(HealthAwareServer):
                 node_id=self._node_id.short,
             )
         )
-    
+
+    async def _register_with_managers(self) -> None:
+        """
+        Register this gate with ALL managers.
+
+        Like managers register with all gates, gates register with all managers.
+        This ensures managers know about all gates for proper routing and
+        health tracking.
+
+        Discovers additional managers from responses and registers with those too.
+        """
+        registered_managers: set[tuple[str, int]] = set()
+        failed_managers: set[tuple[str, int]] = set()
+
+        # Phase 1: Register with all known managers across datacenters
+        for datacenter, manager_addrs in list(self._datacenter_managers.items()):
+            for manager_addr in manager_addrs:
+                if manager_addr in registered_managers or manager_addr in failed_managers:
+                    continue
+
+                response = await self._try_register_with_manager(manager_addr)
+                if response and response.accepted:
+                    registered_managers.add(manager_addr)
+
+                    # Discover additional managers from response
+                    for manager_info in response.healthy_managers:
+                        discovered_addr = (manager_info.tcp_host, manager_info.tcp_port)
+                        discovered_dc = manager_info.datacenter
+
+                        # Add to our tracking if new
+                        if discovered_dc not in self._datacenter_managers:
+                            self._datacenter_managers[discovered_dc] = []
+                        if discovered_addr not in self._datacenter_managers[discovered_dc]:
+                            self._datacenter_managers[discovered_dc].append(discovered_addr)
+
+                        # Track UDP address
+                        discovered_udp = (manager_info.udp_host, manager_info.udp_port)
+                        if discovered_dc not in self._datacenter_manager_udp:
+                            self._datacenter_manager_udp[discovered_dc] = []
+                        if discovered_udp not in self._datacenter_manager_udp[discovered_dc]:
+                            self._datacenter_manager_udp[discovered_dc].append(discovered_udp)
+                else:
+                    failed_managers.add(manager_addr)
+
+        # Phase 2: Register with newly discovered managers
+        for datacenter, manager_addrs in list(self._datacenter_managers.items()):
+            for manager_addr in manager_addrs:
+                if manager_addr in registered_managers or manager_addr in failed_managers:
+                    continue
+
+                response = await self._try_register_with_manager(manager_addr)
+                if response and response.accepted:
+                    registered_managers.add(manager_addr)
+                else:
+                    failed_managers.add(manager_addr)
+
+        # Log results
+        if registered_managers:
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerInfo(
+                    message=f"Registered with {len(registered_managers)} managers, "
+                            f"failed: {len(failed_managers)}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+        else:
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerWarning(
+                    message="Failed to register with any manager - gate will rely on manager registration",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+
+    async def _try_register_with_manager(
+        self,
+        manager_addr: tuple[str, int],
+        max_retries: int = 3,
+        base_delay: float = 0.5,
+    ) -> GateRegistrationResponse | None:
+        """
+        Try to register with a single manager.
+
+        Uses retries with exponential backoff.
+
+        Args:
+            manager_addr: (host, port) tuple of manager
+            max_retries: Maximum retry attempts (default 3)
+            base_delay: Base delay for exponential backoff (default 0.5s)
+
+        Returns:
+            GateRegistrationResponse if successful, None otherwise
+        """
+        request = GateRegistrationRequest(
+            node_id=self._node_id.full,
+            tcp_host=self._host,
+            tcp_port=self._tcp_port,
+            udp_host=self._host,
+            udp_port=self._udp_port,
+            is_leader=self.is_leader(),
+            term=self._leadership_term,
+            state=self._gate_state.value,
+            active_jobs=self._job_manager.count_active_jobs(),
+            manager_count=sum(len(addrs) for addrs in self._datacenter_managers.values()),
+            protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+            protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+            capabilities=",".join(sorted(self._node_capabilities.capabilities)),
+        )
+
+        for attempt in range(max_retries + 1):
+            try:
+                response, _ = await self.send_tcp(
+                    manager_addr,
+                    "gate_register",
+                    request.dump(),
+                    timeout=5.0,
+                )
+
+                if isinstance(response, bytes) and len(response) > 0:
+                    return GateRegistrationResponse.load(response)
+
+            except Exception:
+                pass
+
+            # Exponential backoff between retries
+            if attempt < max_retries:
+                delay = base_delay * (2 ** attempt)
+                await asyncio.sleep(delay)
+
+        return None
+
     async def start(self) -> None:
         """
         Start the gate server.
@@ -3125,20 +3333,44 @@ class GateServer(HealthAwareServer):
         # Join SWIM cluster with other gates (UDP healthchecks)
         for peer_udp in self._gate_udp_peers:
             await self.join_cluster(peer_udp)
-        
+
         # NOTE: Managers are NOT added to gate's SWIM probe scheduler.
         # Managers are in their own SWIM cluster (per-datacenter).
         # Gate-to-manager health is monitored via FederatedHealthMonitor (xprobe/xack).
-        
+
         # Start SWIM probe cycle (UDP healthchecks for gates only)
         self._task_runner.run(self.start_probe_cycle)
-        
+
+        # Wait for cluster to stabilize before starting leader election
+        # This ensures all gate peers are visible before voting begins,
+        # preventing the "1-vote leader" race condition.
+        await self._wait_for_cluster_stabilization()
+
+        # Add random jitter before starting leader election to prevent
+        # simultaneous elections when gates start concurrently.
+        # This is a standard Raft technique - each node waits a random
+        # amount of time before starting its first election.
+        jitter_max = self.env.LEADER_ELECTION_JITTER_MAX
+        if jitter_max > 0 and len(self._gate_udp_peers) > 0:
+            jitter = random.uniform(0, jitter_max)
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerInfo(
+                    message=f"Waiting {jitter:.2f}s jitter before starting leader election",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            await asyncio.sleep(jitter)
+
         # Start leader election (uses SWIM membership info)
         await self.start_leader_election()
-        
-        # Wait a short time for leader election to stabilize
-        await asyncio.sleep(0.5)
-        
+
+        # Wait for leader election to stabilize before state sync
+        startup_sync_delay = self.env.MANAGER_STARTUP_SYNC_DELAY
+        await asyncio.sleep(startup_sync_delay)
+
         # Sync state and transition to ACTIVE
         await self._complete_startup_sync()
         
@@ -3176,6 +3408,11 @@ class GateServer(HealthAwareServer):
 
         # Start discovery maintenance loop (AD-28)
         self._discovery_maintenance_task = asyncio.create_task(self._discovery_maintenance_loop())
+
+        # Register with all managers (symmetric to managers registering with all gates)
+        # This ensures managers know about all gates for proper routing and health tracking
+        if self._datacenter_managers:
+            await self._register_with_managers()
 
         self._task_runner.run(
             self._udp_logger.log,

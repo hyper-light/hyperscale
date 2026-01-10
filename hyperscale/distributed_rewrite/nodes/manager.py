@@ -66,6 +66,8 @@ from hyperscale.distributed_rewrite.models import (
     GateInfo,
     GateHeartbeat,
     ManagerRegistrationResponse,
+    GateRegistrationRequest,
+    GateRegistrationResponse,
     JobProgressAck,
     WorkerRegistration,
     WorkerHeartbeat,
@@ -3155,22 +3157,34 @@ class ManagerServer(HealthAwareServer):
     
     async def _register_with_gates(self) -> None:
         """
-        Register this manager with gates.
-        
-        Try each seed gate until one responds with a ManagerRegistrationResponse
-        containing the list of all healthy gates.
+        Register this manager with ALL gates.
+
+        Like workers register with all managers, managers register with all gates.
+        This ensures all gates know about this manager for proper routing and
+        health tracking.
+
+        First gate to respond populates the known gates list. Then we register
+        with all discovered gates as well.
         """
+        registered_gates: set[tuple[str, int]] = set()
+        failed_gates: set[tuple[str, int]] = set()
+
+        # Phase 1: Register with seed gates, discovering additional gates
         for gate_addr in self._seed_gates:
             response = await self._try_register_with_gate(gate_addr)
             if response and response.accepted:
-                self._current_gate = gate_addr
-                self._primary_gate_id = response.gate_id
-                
+                registered_gates.add(gate_addr)
+
+                # First successful registration sets primary gate
+                if self._primary_gate_id is None:
+                    self._current_gate = gate_addr
+                    self._primary_gate_id = response.gate_id
+
                 # Populate known gates from response
                 for gate_info in response.healthy_gates:
                     self._known_gates[gate_info.node_id] = gate_info
                     self._healthy_gate_ids.add(gate_info.node_id)
-                    
+
                     # Track gate's UDP address for federated health monitoring
                     # NOTE: We do NOT add gates to our SWIM probe scheduler.
                     # Gates are in a separate SWIM cluster - we use xprobe/xack
@@ -3178,32 +3192,44 @@ class ManagerServer(HealthAwareServer):
                     gate_udp_addr = (gate_info.udp_host, gate_info.udp_port)
                     if gate_udp_addr not in self._gate_udp_addrs:
                         self._gate_udp_addrs.append(gate_udp_addr)
-                    
-                    # Add to federated health monitor (will be started in start())
-                    # The monitor isn't set up yet at registration time, so we
-                    # just store the addresses - start() will add them
-                
-                self._task_runner.run(
-                    self._udp_logger.log,
-                    ServerInfo(
-                        message=f"Registered with gate {response.gate_id}, discovered {len(response.healthy_gates)} gates",
-                        node_host=self._host,
-                        node_port=self._tcp_port,
-                        node_id=self._node_id.short,
-                    )
+            else:
+                failed_gates.add(gate_addr)
+
+        # Phase 2: Register with discovered gates we haven't registered with yet
+        for gate_id, gate_info in list(self._known_gates.items()):
+            gate_tcp_addr = (gate_info.tcp_host, gate_info.tcp_port)
+            if gate_tcp_addr in registered_gates or gate_tcp_addr in failed_gates:
+                continue
+
+            response = await self._try_register_with_gate(gate_tcp_addr)
+            if response and response.accepted:
+                registered_gates.add(gate_tcp_addr)
+            else:
+                failed_gates.add(gate_tcp_addr)
+
+        # Log results
+        if registered_gates:
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerInfo(
+                    message=f"Registered with {len(registered_gates)} gates, "
+                            f"primary: {self._primary_gate_id}, "
+                            f"failed: {len(failed_gates)}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
                 )
-                return
-        
-        # Failed to register with any gate
-        self._task_runner.run(
-            self._udp_logger.log,
-            ServerError(
-                message="Failed to register with any gate - manager will operate without gate coordination",
-                node_host=self._host,
-                node_port=self._tcp_port,
-                node_id=self._node_id.short,
             )
-        )
+        else:
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerError(
+                    message="Failed to register with any gate - manager will operate without gate coordination",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
     
     async def _try_register_with_gate(
         self,
@@ -4751,6 +4777,137 @@ class ManagerServer(HealthAwareServer):
             response = RegistrationResponse(
                 accepted=False,
                 manager_id=self._node_id.full,
+                healthy_managers=[],
+                error=str(e),
+                protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+                protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+            )
+            return response.dump()
+
+    @tcp.receive()
+    async def gate_register(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ):
+        """
+        Handle gate registration via TCP.
+
+        Gates register with all managers at startup (symmetric to managers
+        registering with all gates). This ensures managers know about all
+        gates for proper routing and health tracking.
+
+        Protocol Negotiation (AD-25):
+        - Extracts gate's protocol version and capabilities
+        - Performs capability negotiation
+        - Returns negotiated capabilities in response
+        - Rejects registration if protocol versions are incompatible
+        """
+        try:
+            registration = GateRegistrationRequest.load(data)
+
+            # Protocol version validation (AD-25)
+            gate_version = ProtocolVersion(
+                registration.protocol_version_major,
+                registration.protocol_version_minor,
+            )
+            gate_capabilities_set = (
+                set(registration.capabilities.split(","))
+                if registration.capabilities
+                else set()
+            )
+            gate_caps = NodeCapabilities(
+                protocol_version=gate_version,
+                capabilities=gate_capabilities_set,
+            )
+            local_caps = NodeCapabilities.current()
+            negotiated = negotiate_capabilities(local_caps, gate_caps)
+
+            if not negotiated.compatible:
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerWarning(
+                        message=(
+                            f"Gate {registration.node_id} rejected: incompatible protocol version "
+                            f"{gate_version} (local: {CURRENT_PROTOCOL_VERSION})"
+                        ),
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+                response = GateRegistrationResponse(
+                    accepted=False,
+                    manager_id=self._node_id.full,
+                    datacenter=self._node_id.datacenter,
+                    healthy_managers=[],
+                    error=f"Incompatible protocol version: {gate_version} (requires major version {CURRENT_PROTOCOL_VERSION.major})",
+                    protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+                    protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+                )
+                return response.dump()
+
+            # Store gate info
+            gate_info = GateInfo(
+                node_id=registration.node_id,
+                tcp_host=registration.tcp_host,
+                tcp_port=registration.tcp_port,
+                udp_host=registration.udp_host,
+                udp_port=registration.udp_port,
+            )
+            gate_tcp_addr = (registration.tcp_host, registration.tcp_port)
+            gate_udp_addr = (registration.udp_host, registration.udp_port)
+
+            # Add to known gates
+            self._known_gates[registration.node_id] = gate_info
+            self._healthy_gate_ids.add(registration.node_id)
+
+            # Track gate UDP address for federated health monitoring
+            if gate_udp_addr not in self._gate_udp_addrs:
+                self._gate_udp_addrs.append(gate_udp_addr)
+
+            # Add to federated health monitor if running
+            if self._gate_health_monitor._is_running:
+                self._gate_health_monitor.add_datacenter(
+                    datacenter="gate-cluster",
+                    leader_udp_addr=gate_udp_addr,
+                    leader_node_id=registration.node_id,
+                )
+
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerInfo(
+                    message=(
+                        f"Gate registered: {registration.node_id} at {gate_tcp_addr} "
+                        f"(leader={registration.is_leader}, protocol: {gate_version})"
+                    ),
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+
+            # Return response with list of all healthy managers and negotiated capabilities
+            negotiated_capabilities_str = ",".join(sorted(negotiated.common_features))
+            response = GateRegistrationResponse(
+                accepted=True,
+                manager_id=self._node_id.full,
+                datacenter=self._node_id.datacenter,
+                healthy_managers=self._get_healthy_managers(),
+                protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+                protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+                capabilities=negotiated_capabilities_str,
+            )
+
+            return response.dump()
+
+        except Exception as e:
+            await self.handle_exception(e, "gate_register")
+            response = GateRegistrationResponse(
+                accepted=False,
+                manager_id=self._node_id.full,
+                datacenter=self._node_id.datacenter,
                 healthy_managers=[],
                 error=str(e),
                 protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
