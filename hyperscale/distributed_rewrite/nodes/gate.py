@@ -180,6 +180,12 @@ from hyperscale.distributed_rewrite.discovery.security.role_validator import (
     CertificateClaims,
     NodeRole as SecurityNodeRole,
 )
+from hyperscale.distributed_rewrite.routing import (
+    GateJobRouter,
+    GateJobRouterConfig,
+    RoutingDecision as VivaldiRoutingDecision,
+    DatacenterCandidate,
+)
 from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerWarning, ServerError, ServerDebug
 
 
@@ -479,6 +485,11 @@ class GateServer(HealthAwareServer):
             check_interval=getattr(env, 'GATE_TIMEOUT_CHECK_INTERVAL', 15.0),
             stuck_threshold=getattr(env, 'GATE_ALL_DC_STUCK_THRESHOLD', 180.0),
         )
+
+        # AD-36: Vivaldi-based job router for optimal datacenter selection
+        # Uses multi-factor scoring (RTT UCB × load × quality) with hysteresis
+        # Initialized in start() after CoordinateTracker is available
+        self._job_router: GateJobRouter | None = None
 
         # State versioning (local gate state version)
         self._state_version = 0
