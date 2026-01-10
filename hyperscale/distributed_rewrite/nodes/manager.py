@@ -8030,19 +8030,132 @@ class ManagerServer(HealthAwareServer):
         # Step 8-9: Re-queue in dependency order
         await self._requeue_workflows_in_dependency_order(all_workflows_to_retry)
 
+    async def _cancel_single_running_dependent(
+        self,
+        job_id: str,
+        dep_id: str,
+        sub_wf,
+        max_retries: int = 3,
+        retry_delay_base: float = 1.0
+    ) -> bool:
+        """
+        Cancel a single running dependent workflow with retry (AD-33 Issue 3 fix).
+
+        Args:
+            job_id: Job ID
+            dep_id: Dependent workflow ID to cancel
+            sub_wf: SubWorkflowInfo for the dependent
+            max_retries: Maximum cancellation attempts
+            retry_delay_base: Base delay for exponential backoff
+
+        Returns:
+            True if cancellation succeeded, False otherwise
+        """
+        worker_addr = self._get_worker_tcp_addr(sub_wf.worker_id)
+        if not worker_addr:
+            await self._udp_logger.log(ServerWarning(
+                message=f"Cannot cancel {dep_id} - worker {sub_wf.worker_id} address not found",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            ))
+            return False
+
+        for attempt in range(max_retries):
+            try:
+                # Transition to CANCELLING on first attempt
+                if attempt == 0 and self._workflow_lifecycle_states:
+                    await self._workflow_lifecycle_states.transition(
+                        dep_id,
+                        WorkflowState.CANCELLING,
+                        reason="parent workflow failed"
+                    )
+
+                # Send cancel request to worker
+                cancel_req = WorkflowCancelRequest(
+                    job_id=job_id,
+                    workflow_id=dep_id,
+                    requester_id="manager_failure_handler",
+                    timestamp=time.monotonic(),
+                )
+                response, _ = await self.send_tcp(
+                    worker_addr,
+                    "cancel_workflow",
+                    cancel_req.dump(),
+                    timeout=5.0,
+                )
+
+                # Verify cancellation
+                if isinstance(response, bytes):
+                    wf_response = WorkflowCancelResponse.load(response)
+                    if wf_response.success:
+                        # Transition to CANCELLED
+                        if self._workflow_lifecycle_states:
+                            await self._workflow_lifecycle_states.transition(
+                                dep_id,
+                                WorkflowState.CANCELLED,
+                                reason="worker confirmed cancellation"
+                            )
+                        return True
+
+                # If we got a response but not success, log and retry
+                await self._udp_logger.log(ServerWarning(
+                    message=f"Cancel attempt {attempt + 1}/{max_retries} for {dep_id} failed - worker returned non-success",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                ))
+
+            except Exception as e:
+                await self._udp_logger.log(ServerWarning(
+                    message=f"Cancel attempt {attempt + 1}/{max_retries} for {dep_id} failed: {e}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                ))
+
+            # Exponential backoff before retry (except on last attempt)
+            if attempt < max_retries - 1:
+                delay = retry_delay_base * (2 ** attempt)
+                await asyncio.sleep(delay)
+
+        # All retries exhausted
+        await self._udp_logger.log(ServerError(
+            message=f"Failed to cancel dependent workflow {dep_id} after {max_retries} attempts",
+            node_host=self._host,
+            node_port=self._tcp_port,
+            node_id=self._node_id.short,
+        ))
+        return False
+
     async def _cancel_dependent_workflows_for_failure(
         self,
         job_id: str,
         dependent_workflow_ids: list[str]
-    ) -> None:
+    ) -> bool:
         """
         Cancel dependent workflows after parent failed (AD-33).
 
+        Enhanced with retry logic and blocking verification (Issue 3 fix).
+
         1. Remove pending dependents from WorkflowDispatcher
-        2. Cancel running dependents on workers
+        2. Cancel running dependents on workers with retry
         3. Transition dependents to CANCELLED
+        4. Block until all cancellations confirmed or timeout
+
+        Args:
+            job_id: Job ID
+            dependent_workflow_ids: List of dependent workflow IDs to cancel
+
+        Returns:
+            True if all cancellations succeeded, False if any failed
         """
-        # Remove from pending queue
+        if not dependent_workflow_ids:
+            return True
+
+        all_succeeded = True
+
+        # Step 1: Remove from pending queue
         if self._workflow_dispatcher:
             removed_pending = await self._workflow_dispatcher.cancel_pending_workflows_by_ids(
                 job_id,
@@ -8058,10 +8171,12 @@ class ManagerServer(HealthAwareServer):
                         reason="parent workflow failed"
                     )
 
-        # Cancel running dependents on workers
+        # Step 2: Cancel running dependents on workers with retry
         job = self._job_manager.get_job_by_id(job_id)
         if not job:
-            return
+            return False
+
+        cancellation_tasks = []
 
         for dep_id in dependent_workflow_ids:
             # Skip if already cancelled (was pending)
@@ -8078,50 +8193,37 @@ class ManagerServer(HealthAwareServer):
             if not sub_wf:
                 continue
 
-            # If running on a worker, cancel it
+            # If running on a worker, cancel it with retry
             if sub_wf.worker_id and self._workflow_lifecycle_states and self._workflow_lifecycle_states.is_in_state(dep_id, WorkflowState.RUNNING):
-                worker_addr = self._get_worker_tcp_addr(sub_wf.worker_id)
-                if worker_addr:
-                    try:
-                        # Transition to CANCELLING
-                        await self._workflow_lifecycle_states.transition(
-                            dep_id,
-                            WorkflowState.CANCELLING,
-                            reason="parent workflow failed"
-                        )
+                task = self._cancel_single_running_dependent(job_id, dep_id, sub_wf)
+                cancellation_tasks.append((dep_id, task))
 
-                        # Send cancel request to worker
-                        cancel_req = WorkflowCancelRequest(
-                            job_id=job_id,
-                            workflow_id=dep_id,
-                            requester_id="manager_failure_handler",
-                            timestamp=time.monotonic(),
-                        )
-                        response, _ = await self.send_tcp(
-                            worker_addr,
-                            "cancel_workflow",
-                            cancel_req.dump(),
-                            timeout=5.0,
-                        )
+        # Step 3: Wait for all cancellations to complete
+        if cancellation_tasks:
+            results = await asyncio.gather(*[task for _, task in cancellation_tasks], return_exceptions=True)
 
-                        # Verify cancellation
-                        if isinstance(response, bytes):
-                            wf_response = WorkflowCancelResponse.load(response)
-                            if wf_response.success:
-                                # Transition to CANCELLED
-                                await self._workflow_lifecycle_states.transition(
-                                    dep_id,
-                                    WorkflowState.CANCELLED,
-                                    reason="worker confirmed cancellation"
-                                )
+            for (dep_id, _), result in zip(cancellation_tasks, results):
+                if isinstance(result, Exception):
+                    await self._udp_logger.log(ServerError(
+                        message=f"Cancellation task for {dep_id} raised exception: {result}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    ))
+                    all_succeeded = False
+                elif not result:
+                    # Cancellation failed after retries
+                    all_succeeded = False
 
-                    except Exception as e:
-                        await self._udp_logger.log(ServerError(
-                            message=f"Failed to cancel dependent workflow {dep_id}: {e}",
-                            node_host=self._host,
-                            node_port=self._tcp_port,
-                            node_id=self._node_id.short,
-                        ))
+        if not all_succeeded:
+            await self._udp_logger.log(ServerWarning(
+                message=f"Some dependent cancellations failed for job {job_id}, but continuing with retry",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            ))
+
+        return all_succeeded
 
     async def _requeue_workflows_in_dependency_order(
         self,
