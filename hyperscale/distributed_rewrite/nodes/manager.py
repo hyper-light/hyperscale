@@ -23,6 +23,7 @@ Protocols:
 """
 
 import asyncio
+import random
 import secrets
 import time
 import inspect
@@ -163,7 +164,6 @@ from hyperscale.reporting.common import ReporterTypes
 from hyperscale.distributed_rewrite.jobs import (
     JobManager,
     WorkflowStateMachine,
-    JobInfo,
     WorkerPool,
     WorkerHealth,
     WorkflowDispatcher,
@@ -171,7 +171,6 @@ from hyperscale.distributed_rewrite.jobs import (
     WindowedStatsPush,
 )
 from hyperscale.distributed_rewrite.models import PendingWorkflow
-from hyperscale.distributed_rewrite.models.jobs import JobInfo
 from hyperscale.reporting.common.results_types import WorkflowStats
 
 
@@ -807,7 +806,6 @@ class ManagerServer(HealthAwareServer):
         async with self._recovery_semaphore:
             # Apply jitter before recovery actions to prevent thundering herd
             # when multiple managers detect recovery simultaneously
-            import random
             jitter_min = self.env.RECOVERY_JITTER_MIN
             jitter_max = self.env.RECOVERY_JITTER_MAX
             if jitter_max > 0:
@@ -1065,7 +1063,6 @@ class ManagerServer(HealthAwareServer):
         async with self._recovery_semaphore:
             # Apply jitter before recovery actions to prevent thundering herd
             # when multiple nodes detect recovery simultaneously
-            import random
             jitter_min = self.env.RECOVERY_JITTER_MIN
             jitter_max = self.env.RECOVERY_JITTER_MAX
             if jitter_max > 0:
@@ -1166,7 +1163,6 @@ class ManagerServer(HealthAwareServer):
 
         # Apply per-job jitter to spread takeover load and prevent thundering herd
         # when multiple jobs need takeover simultaneously
-        import random
         jitter_min = self.env.RECOVERY_JITTER_MIN
         jitter_max = self.env.RECOVERY_JITTER_MAX
 
@@ -1258,7 +1254,6 @@ class ManagerServer(HealthAwareServer):
         )
 
         # Apply per-job jitter to spread takeover load
-        import random
         jitter_min = self.env.RECOVERY_JITTER_MIN
         jitter_max = self.env.RECOVERY_JITTER_MAX
 
@@ -1969,8 +1964,6 @@ class ManagerServer(HealthAwareServer):
         Workers can request extensions via their regular heartbeat to reduce
         latency and avoid extra round-trips during load spikes.
         """
-        from hyperscale.distributed_rewrite.models import HealthcheckExtensionRequest
-
         # Check if worker is registered
         worker = self._worker_pool.get_worker(heartbeat.node_id)
         if not worker:
@@ -2530,9 +2523,9 @@ class ManagerServer(HealthAwareServer):
         for tcp_addr in self._active_manager_peers:
             # Find UDP addr for this peer
             udp_addr: tuple[str, int] | None = None
-            for udp, tcp in list(self._manager_udp_to_tcp.items()):
-                if tcp == tcp_addr:
-                    udp_addr = udp
+            for udp_address, tcp_address in list(self._manager_udp_to_tcp.items()):
+                if tcp_address == tcp_addr:
+                    udp_addr = udp_address
                     break
             
             if udp_addr is None:
@@ -2866,7 +2859,6 @@ class ManagerServer(HealthAwareServer):
         # amount of time before starting its first election.
         jitter_max = self.env.LEADER_ELECTION_JITTER_MAX
         if jitter_max > 0 and len(self._manager_udp_peers) > 0:
-            import random
             jitter = random.uniform(0, jitter_max)
             self._task_runner.run(
                 self._udp_logger.log,
@@ -3688,8 +3680,6 @@ class ManagerServer(HealthAwareServer):
         Returns aggregate datacenter health for the gate to track.
         Only responds if we are the DC leader.
         """
-        from hyperscale.distributed_rewrite.swim.health import CrossClusterAck
-        
         # Only DC leader responds to xprobes
         if not self.is_leader():
             return None
