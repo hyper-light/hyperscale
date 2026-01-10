@@ -15243,3 +15243,1012 @@ class Gate:
 | `datacenters/cross_dc_correlation.py` | Integration with correlation detection |
 
 ---
+
+---
+
+# AD-33: Workflow State Machine for Complete Lifecycle Management
+
+## Overview
+
+A comprehensive state machine that governs the **entire workflow lifecycle**, from initial queuing through completion, failure, cancellation, and retry. This replaces ad-hoc status checks with a formal state machine that enforces valid transitions, prevents race conditions, and provides clear semantics for all workflow operations.
+
+**Problem**: Current workflow status management is fragmented:
+- Status stored in multiple places (`WorkflowProgress.status`, `sub_workflows`, pending queues)
+- No validation of state transitions (can accidentally dispatch a failed workflow)
+- Race conditions during worker failure (can retry before dependents cancelled)
+- Unclear semantics (is workflow "failed and waiting" or "failed and ready to retry"?)
+- Difficult debugging (no state history, hard to trace what happened)
+
+**Solution**: Single state machine that:
+- ✅ Enforces valid state transitions
+- ✅ Prevents all race conditions
+- ✅ Provides clear semantics for every operation
+- ✅ Tracks state history for debugging
+- ✅ Guarantees idempotency
+- ✅ Works with WorkflowDispatcher's dependency-aware dispatch
+
+---
+
+## Part 1: Complete State Diagram
+
+```
+                    ┌──────────────────────────────────────┐
+                    │                                      │
+                    ▼                                      │
+              ┌─────────┐                                  │
+         ┌───►│ PENDING │◄──────────────────┐             │
+         │    └─────────┘                    │             │
+         │         │                         │             │
+         │         │ dispatch               │             │
+         │         ▼                         │             │
+         │    ┌──────────┐                  │             │
+         │    │DISPATCHED│                  │             │
+         │    └──────────┘                  │             │
+         │         │                         │             │
+         │         │ worker ack              │             │
+         │         ▼                         │             │
+         │    ┌─────────┐                   │             │
+         │    │ RUNNING │                   │             │
+         │    └─────────┘                   │             │
+         │         │                         │             │
+         │         ├──success────────────────┼────────────►│ COMPLETED
+         │         │                         │             │  (terminal)
+         │         ├──timeout/error──────────┼────────────►│ FAILED
+         │         │                         │             │  (terminal if max retries)
+         │         └──cancel request─────────┼────────────►│ CANCELLED
+         │                                    │             │  (terminal)
+         │                                    │
+         │                                    │
+   retry │    ┌────────────────┐             │
+   after │    │     FAILED     │             │
+   deps  │    └────────────────┘             │
+  cancel │           │                        │
+         │           │ find dependents        │
+         │           ▼                        │
+         │    ┌────────────────┐             │
+         │    │FAILED_CANCELING│─────────────┤ (cancel dependents)
+         │    │   _DEPENDENTS  │             │
+         │    └────────────────┘             │
+         │           │                        │
+         │           │ dependents cancelled   │
+         │           ▼                        │
+         │    ┌────────────────┐             │
+         └────┤ FAILED_READY   │             │
+              │  _FOR_RETRY    │             │
+              └────────────────┘             │
+                                              │
+              ┌──────────────┐               │
+              │  CANCELLING  │───────────────┤ (cancel request)
+              └──────────────┘               │
+                     │                        │
+                     └────────────────────────┘ CANCELLED
+```
+
+---
+
+## Part 2: State Definitions
+
+### Normal Execution Path
+
+| State | Description | Valid Transitions | Duration |
+|-------|-------------|-------------------|----------|
+| **PENDING** | In WorkflowDispatcher queue, waiting for worker with capacity | DISPATCHED, CANCELLING, FAILED | Seconds to minutes (depends on queue depth) |
+| **DISPATCHED** | Dispatch message sent to worker, awaiting acknowledgment | RUNNING, CANCELLING, FAILED | Milliseconds (network RTT) |
+| **RUNNING** | Worker executing workflow | COMPLETED, FAILED, CANCELLING | Seconds to minutes (workflow duration) |
+| **COMPLETED** | Workflow finished successfully | *(none - terminal)* | Forever (until job cleanup) |
+
+### Failure & Retry Path
+
+| State | Description | Valid Transitions | Duration |
+|-------|-------------|-------------------|----------|
+| **FAILED** | Worker died, timeout, or execution error | FAILED_CANCELING_DEPENDENTS, CANCELLED | Milliseconds (transition is fast) |
+| **FAILED_CANCELING_DEPENDENTS** | Cancelling workflows that depend on this failed workflow | FAILED_READY_FOR_RETRY | Seconds (depends on # of dependents) |
+| **FAILED_READY_FOR_RETRY** | All dependents cancelled, safe to retry | PENDING | Milliseconds (re-queued immediately) |
+
+**Rationale for Three-State Failure Path**:
+1. **FAILED**: Immediate transition when failure detected. Prevents dispatch while we cancel dependents.
+2. **FAILED_CANCELING_DEPENDENTS**: Explicit state while cancelling dependents. Prevents retry before dependents cleared.
+3. **FAILED_READY_FOR_RETRY**: Explicit "ready" state. State machine enforces we can only reach PENDING from here.
+
+### Cancellation Path
+
+| State | Description | Valid Transitions | Duration |
+|-------|-------------|-------------------|----------|
+| **CANCELLING** | Cancel request sent, awaiting worker confirmation | CANCELLED | Milliseconds to seconds (worker response time) |
+| **CANCELLED** | Cancellation confirmed | *(none - terminal)* | Forever (until job cleanup) |
+
+### Additional States
+
+| State | Description | Valid Transitions | Duration |
+|-------|-------------|-------------------|----------|
+| **AGGREGATED** | Results aggregated (multi-core workflows only) | *(none - terminal)* | Forever (until job cleanup) |
+
+---
+
+## Part 3: Valid State Transitions
+
+```python
+class WorkflowState(Enum):
+    """
+    Complete workflow lifecycle states (AD-33).
+    
+    State machine ensures workflows can only transition through valid paths,
+    preventing race conditions and maintaining system invariants.
+    """
+    # Normal execution path
+    PENDING = "pending"
+    DISPATCHED = "dispatched"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    
+    # Failure & retry path
+    FAILED = "failed"
+    FAILED_CANCELING_DEPENDENTS = "failed_canceling_deps"
+    FAILED_READY_FOR_RETRY = "failed_ready"
+    
+    # Cancellation path
+    CANCELLING = "cancelling"
+    CANCELLED = "cancelled"
+    
+    # Additional states
+    AGGREGATED = "aggregated"
+
+
+VALID_TRANSITIONS: dict[WorkflowState, set[WorkflowState]] = {
+    WorkflowState.PENDING: {
+        WorkflowState.DISPATCHED,     # Normal: selected worker, sending dispatch
+        WorkflowState.CANCELLING,     # Cancel requested before dispatch
+        WorkflowState.FAILED,         # Worker died during dispatch selection
+    },
+    
+    WorkflowState.DISPATCHED: {
+        WorkflowState.RUNNING,        # Worker acked, started execution
+        WorkflowState.CANCELLING,     # Cancel requested after dispatch
+        WorkflowState.FAILED,         # Worker died before ack
+    },
+    
+    WorkflowState.RUNNING: {
+        WorkflowState.COMPLETED,      # Execution succeeded
+        WorkflowState.FAILED,         # Worker died, timeout, or execution error
+        WorkflowState.CANCELLING,     # Cancel requested during execution
+        WorkflowState.AGGREGATED,     # Multi-core workflow aggregation
+    },
+    
+    WorkflowState.FAILED: {
+        WorkflowState.FAILED_CANCELING_DEPENDENTS,  # Start cancelling dependents
+        WorkflowState.CANCELLED,      # Job-level cancel supersedes retry
+    },
+    
+    WorkflowState.FAILED_CANCELING_DEPENDENTS: {
+        WorkflowState.FAILED_READY_FOR_RETRY,  # All dependents cancelled
+    },
+    
+    WorkflowState.FAILED_READY_FOR_RETRY: {
+        WorkflowState.PENDING,        # Re-queued for retry
+    },
+    
+    WorkflowState.CANCELLING: {
+        WorkflowState.CANCELLED,      # Cancellation confirmed
+    },
+    
+    # Terminal states - no outbound transitions
+    WorkflowState.COMPLETED: set(),
+    WorkflowState.CANCELLED: set(),
+    WorkflowState.AGGREGATED: set(),
+}
+```
+
+**Transition Validation**:
+- Every state transition is validated before execution
+- Invalid transitions are logged and rejected
+- Prevents impossible states (e.g., COMPLETED → PENDING)
+
+---
+
+## Part 4: State Machine Implementation
+
+```python
+@dataclass
+class StateTransition:
+    """Record of a state transition for observability."""
+    from_state: WorkflowState
+    to_state: WorkflowState
+    timestamp: float
+    reason: str  # Why transition occurred
+
+
+class WorkflowStateMachine:
+    """
+    Manages workflow state transitions with validation (AD-33).
+    
+    Ensures workflows can only transition through valid paths,
+    preventing race conditions and maintaining system invariants.
+    """
+    
+    def __init__(self):
+        # Current state per workflow
+        self._states: dict[str, WorkflowState] = {}
+        
+        # State transition history (for debugging)
+        self._state_history: dict[str, list[StateTransition]] = {}
+        
+        # Lock for atomic state transitions
+        self._lock = asyncio.Lock()
+    
+    async def transition(
+        self,
+        workflow_id: str,
+        to_state: WorkflowState,
+        reason: str = ""
+    ) -> bool:
+        """
+        Attempt to transition workflow to new state.
+        
+        Args:
+            workflow_id: Workflow to transition
+            to_state: Target state
+            reason: Human-readable reason for transition
+        
+        Returns:
+            True if transition succeeded, False if invalid
+        """
+        async with self._lock:
+            current_state = self._states.get(workflow_id, WorkflowState.PENDING)
+            
+            # Validate transition
+            valid_next_states = VALID_TRANSITIONS.get(current_state, set())
+            if to_state not in valid_next_states:
+                await self._log_invalid_transition(
+                    workflow_id, current_state, to_state, reason
+                )
+                return False
+            
+            # Record transition
+            self._states[workflow_id] = to_state
+            
+            # Record in history
+            if workflow_id not in self._state_history:
+                self._state_history[workflow_id] = []
+            
+            self._state_history[workflow_id].append(StateTransition(
+                from_state=current_state,
+                to_state=to_state,
+                timestamp=time.monotonic(),
+                reason=reason
+            ))
+            
+            await self._log_transition(workflow_id, current_state, to_state, reason)
+            return True
+    
+    def get_state(self, workflow_id: str) -> WorkflowState:
+        """Get current state of workflow."""
+        return self._states.get(workflow_id, WorkflowState.PENDING)
+    
+    def is_in_state(self, workflow_id: str, *states: WorkflowState) -> bool:
+        """Check if workflow is in any of the given states."""
+        return self.get_state(workflow_id) in states
+    
+    def get_history(self, workflow_id: str) -> list[StateTransition]:
+        """Get complete state history for debugging."""
+        return self._state_history.get(workflow_id, [])
+    
+    def cleanup_workflow(self, workflow_id: str) -> None:
+        """Remove workflow from tracking (job cleanup)."""
+        self._states.pop(workflow_id, None)
+        self._state_history.pop(workflow_id, None)
+```
+
+---
+
+## Part 5: Worker Failure Handling with State Machine
+
+### Problem Statement
+
+When a worker fails:
+1. ❌ Current: Immediately retries failed workflows
+2. ❌ Doesn't cancel dependent workflows
+3. ❌ Can violate dependency order
+4. ❌ Race condition: dependent workflows might start before parent retries
+
+### Solution: State-Driven Failure Recovery
+
+```python
+async def _handle_worker_failure(self, worker_node_id: str) -> None:
+    """
+    Handle worker becoming unavailable (AD-33 state machine).
+    
+    Flow:
+    1. Identify workflows in RUNNING/DISPATCHED states on failed worker
+    2. Transition to FAILED
+    3. For each failed workflow, find ALL dependents
+    4. Cancel dependents (removes from pending queue, cancels on workers)
+    5. Transition FAILED → FAILED_CANCELING_DEPENDENTS
+    6. Wait for dependent cancellation confirmation
+    7. Transition FAILED_CANCELING_DEPENDENTS → FAILED_READY_FOR_RETRY
+    8. Re-queue failed workflow + dependents in dependency order
+    9. Transition FAILED_READY_FOR_RETRY → PENDING
+    """
+    # Step 1: Find all workflows on this worker
+    failed_workflow_ids: list[tuple[str, str]] = []  # (job_id, workflow_id)
+    
+    for job in self._job_manager.iter_jobs():
+        for sub_wf in job.sub_workflows.values():
+            workflow_id = str(sub_wf.token)
+            
+            # Check if on failed worker and in active state
+            if sub_wf.worker_id == worker_node_id:
+                current_state = self._workflow_states.get_state(workflow_id)
+                if current_state in {WorkflowState.DISPATCHED, WorkflowState.RUNNING}:
+                    failed_workflow_ids.append((job.job_id, workflow_id))
+    
+    if not failed_workflow_ids:
+        return
+    
+    await self._udp_logger.log(ServerInfo(
+        message=f"Worker {worker_node_id} failed, handling {len(failed_workflow_ids)} workflows",
+        node_host=self._host,
+        node_port=self._tcp_port,
+        node_id=self._node_id.short,
+    ))
+    
+    # Step 2: Transition all failed workflows: (DISPATCHED|RUNNING) → FAILED
+    for job_id, workflow_id in failed_workflow_ids:
+        success = await self._workflow_states.transition(
+            workflow_id,
+            WorkflowState.FAILED,
+            reason=f"worker {worker_node_id} died"
+        )
+        if not success:
+            await self._udp_logger.log(ServerWarning(
+                message=f"Failed to transition {workflow_id} to FAILED state",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            ))
+    
+    # Step 3-7: For each failed workflow, cancel dependents and prepare for retry
+    all_workflows_to_retry: list[tuple[str, str]] = []  # (job_id, workflow_id)
+    
+    for job_id, workflow_id in failed_workflow_ids:
+        # Find all workflows that depend on this one
+        dependent_workflow_ids = self._find_dependent_workflows(job_id, workflow_id)
+        
+        # Transition: FAILED → FAILED_CANCELING_DEPENDENTS
+        await self._workflow_states.transition(
+            workflow_id,
+            WorkflowState.FAILED_CANCELING_DEPENDENTS,
+            reason=f"cancelling {len(dependent_workflow_ids)} dependents"
+        )
+        
+        # Cancel dependent workflows
+        if dependent_workflow_ids:
+            await self._cancel_dependent_workflows_for_failure(
+                job_id,
+                dependent_workflow_ids
+            )
+        
+        # Transition: FAILED_CANCELING_DEPENDENTS → FAILED_READY_FOR_RETRY
+        await self._workflow_states.transition(
+            workflow_id,
+            WorkflowState.FAILED_READY_FOR_RETRY,
+            reason="dependents cancelled, ready for retry"
+        )
+        
+        # Collect for retry
+        all_workflows_to_retry.append((job_id, workflow_id))
+        all_workflows_to_retry.extend((job_id, dep_id) for dep_id in dependent_workflow_ids)
+    
+    # Step 8-9: Re-queue in dependency order
+    await self._requeue_workflows_in_dependency_order(all_workflows_to_retry)
+
+
+async def _cancel_dependent_workflows_for_failure(
+    self,
+    job_id: str,
+    dependent_workflow_ids: list[str]
+) -> None:
+    """
+    Cancel dependent workflows after parent failed.
+    
+    1. Remove pending dependents from WorkflowDispatcher
+    2. Cancel running dependents on workers
+    3. Transition dependents to CANCELLED
+    """
+    # Remove from pending queue
+    if self._workflow_dispatcher:
+        removed_pending = await self._workflow_dispatcher.cancel_pending_workflows_by_ids(
+            job_id,
+            dependent_workflow_ids
+        )
+        
+        # Transition removed pending workflows to CANCELLED
+        for wf_id in removed_pending:
+            await self._workflow_states.transition(
+                wf_id,
+                WorkflowState.CANCELLED,
+                reason="parent workflow failed"
+            )
+    
+    # Cancel running dependents on workers
+    job = self._job_manager.get_job_by_id(job_id)
+    if not job:
+        return
+    
+    for dep_id in dependent_workflow_ids:
+        # Skip if already cancelled (was pending)
+        if self._workflow_states.is_in_state(dep_id, WorkflowState.CANCELLED):
+            continue
+        
+        # Find the sub-workflow
+        sub_wf = None
+        for sw in job.sub_workflows.values():
+            if str(sw.token) == dep_id:
+                sub_wf = sw
+                break
+        
+        if not sub_wf:
+            continue
+        
+        # If running on a worker, cancel it
+        if sub_wf.worker_id and self._workflow_states.is_in_state(dep_id, WorkflowState.RUNNING):
+            worker_addr = self._get_worker_tcp_addr(sub_wf.worker_id)
+            if worker_addr:
+                try:
+                    # Transition to CANCELLING
+                    await self._workflow_states.transition(
+                        dep_id,
+                        WorkflowState.CANCELLING,
+                        reason="parent workflow failed"
+                    )
+                    
+                    # Send cancel request to worker
+                    cancel_req = WorkflowCancelRequest(
+                        job_id=job_id,
+                        workflow_id=dep_id,
+                        requester_id="manager_failure_handler",
+                        timestamp=time.monotonic(),
+                    )
+                    response, _ = await self.send_tcp(
+                        worker_addr,
+                        "cancel_workflow",
+                        cancel_req.dump(),
+                        timeout=5.0,
+                    )
+                    
+                    # Verify cancellation
+                    if isinstance(response, bytes):
+                        wf_response = WorkflowCancelResponse.load(response)
+                        if wf_response.success:
+                            # Transition to CANCELLED
+                            await self._workflow_states.transition(
+                                dep_id,
+                                WorkflowState.CANCELLED,
+                                reason="worker confirmed cancellation"
+                            )
+                
+                except Exception as e:
+                    await self._udp_logger.log(ServerError(
+                        message=f"Failed to cancel dependent workflow {dep_id}: {e}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    ))
+
+
+async def _requeue_workflows_in_dependency_order(
+    self,
+    workflows_to_retry: list[tuple[str, str]]
+) -> None:
+    """
+    Re-queue failed workflows in dependency order.
+    
+    Workflows are added back to WorkflowDispatcher's pending queue,
+    preserving dependency metadata. WorkflowDispatcher's existing
+    dispatch loop handles dependency-aware dispatch.
+    
+    Args:
+        workflows_to_retry: List of (job_id, workflow_id) tuples
+    """
+    # Group by job
+    workflows_by_job: dict[str, list[str]] = {}
+    for job_id, workflow_id in workflows_to_retry:
+        if job_id not in workflows_by_job:
+            workflows_by_job[job_id] = []
+        workflows_by_job[job_id].append(workflow_id)
+    
+    # Process each job
+    for job_id, workflow_ids in workflows_by_job.items():
+        job = self._job_manager.get_job_by_id(job_id)
+        if not job:
+            continue
+        
+        # Get dependency graph for this job
+        workflow_deps = self._build_dependency_graph(job)
+        
+        # Topological sort to get correct order
+        ordered_workflows = self._topological_sort(workflow_ids, workflow_deps)
+        
+        # Add back to WorkflowDispatcher in dependency order
+        for workflow_id in ordered_workflows:
+            # Find original dispatch data
+            sub_wf = None
+            for sw in job.sub_workflows.values():
+                if str(sw.token) == workflow_id:
+                    sub_wf = sw
+                    break
+            
+            if not sub_wf:
+                continue
+            
+            # Get original dispatch bytes from retry tracking
+            retry_info = self._workflow_retries.get(workflow_id)
+            if not retry_info or not retry_info[1]:
+                continue
+            
+            dispatch_bytes = retry_info[1]
+            
+            # Add to WorkflowDispatcher
+            if self._workflow_dispatcher:
+                await self._workflow_dispatcher.add_pending_workflow(
+                    job_id=job_id,
+                    workflow_id=workflow_id,
+                    dispatch_bytes=dispatch_bytes,
+                    dependencies=getattr(sub_wf, 'dependencies', []),
+                )
+            
+            # Transition: FAILED_READY_FOR_RETRY → PENDING
+            await self._workflow_states.transition(
+                workflow_id,
+                WorkflowState.PENDING,
+                reason="re-queued after failure"
+            )
+        
+        await self._udp_logger.log(ServerInfo(
+            message=f"Re-queued {len(ordered_workflows)} workflows for job {job_id} in dependency order",
+            node_host=self._host,
+            node_port=self._tcp_port,
+            node_id=self._node_id.short,
+        ))
+
+
+def _build_dependency_graph(self, job) -> dict[str, list[str]]:
+    """Build workflow ID → dependencies map."""
+    deps = {}
+    for sub_wf in job.sub_workflows.values():
+        workflow_id = str(sub_wf.token)
+        deps[workflow_id] = getattr(sub_wf, 'dependencies', [])
+    return deps
+
+
+def _topological_sort(
+    self,
+    workflow_ids: list[str],
+    deps: dict[str, list[str]]
+) -> list[str]:
+    """
+    Topological sort of workflows to preserve dependency order.
+    
+    Returns workflows in order such that dependencies come before dependents.
+    """
+    # Build adjacency list (reverse: who depends on me)
+    dependents = {wf_id: [] for wf_id in workflow_ids}
+    in_degree = {wf_id: 0 for wf_id in workflow_ids}
+    
+    for wf_id in workflow_ids:
+        for dep in deps.get(wf_id, []):
+            if dep in workflow_ids:  # Only consider workflows in our set
+                dependents[dep].append(wf_id)
+                in_degree[wf_id] += 1
+    
+    # Kahn's algorithm
+    queue = [wf_id for wf_id in workflow_ids if in_degree[wf_id] == 0]
+    result = []
+    
+    while queue:
+        wf_id = queue.pop(0)
+        result.append(wf_id)
+        
+        for dependent in dependents[wf_id]:
+            in_degree[dependent] -= 1
+            if in_degree[dependent] == 0:
+                queue.append(dependent)
+    
+    # If result doesn't contain all workflows, there's a cycle
+    # (shouldn't happen with valid dependency graphs)
+    if len(result) != len(workflow_ids):
+        # Fall back to original order
+        return workflow_ids
+    
+    return result
+```
+
+---
+
+## Part 6: Integration with Other Operations
+
+### Dispatch
+
+```python
+async def _dispatch_workflow_to_worker(
+    self,
+    workflow_id: str,
+    worker_id: str,
+    dispatch: WorkflowDispatch
+) -> bool:
+    """Dispatch workflow with state machine transitions."""
+    
+    # Validate we're in PENDING state
+    if not self._workflow_states.is_in_state(workflow_id, WorkflowState.PENDING):
+        await self._udp_logger.log(ServerError(
+            message=f"Cannot dispatch {workflow_id} - not in PENDING state",
+            ...
+        ))
+        return False
+    
+    # Transition: PENDING → DISPATCHED
+    await self._workflow_states.transition(
+        workflow_id,
+        WorkflowState.DISPATCHED,
+        reason=f"dispatching to worker {worker_id}"
+    )
+    
+    try:
+        # Send dispatch
+        response, _ = await self.send_tcp(worker_addr, "workflow_dispatch", ...)
+        
+        if response and isinstance(response, bytes):
+            ack = WorkflowDispatchAck.load(response)
+            if ack.accepted:
+                # Transition: DISPATCHED → RUNNING
+                await self._workflow_states.transition(
+                    workflow_id,
+                    WorkflowState.RUNNING,
+                    reason="worker acknowledged"
+                )
+                return True
+        
+        # Worker rejected or no response
+        await self._workflow_states.transition(
+            workflow_id,
+            WorkflowState.FAILED,
+            reason="worker rejected dispatch"
+        )
+        return False
+    
+    except Exception as e:
+        # Dispatch failed
+        await self._workflow_states.transition(
+            workflow_id,
+            WorkflowState.FAILED,
+            reason=f"dispatch exception: {e}"
+        )
+        return False
+```
+
+### Completion
+
+```python
+async def receive_workflow_result(
+    self,
+    addr: tuple[str, int],
+    data: bytes,
+    clock_time: int
+):
+    """Handle workflow completion with state transition."""
+    result = WorkflowFinalResult.load(data)
+    
+    # Validate state
+    if not self._workflow_states.is_in_state(
+        result.workflow_id,
+        WorkflowState.RUNNING
+    ):
+        # Workflow not in RUNNING state - may have been cancelled
+        return
+    
+    # Transition: RUNNING → COMPLETED
+    await self._workflow_states.transition(
+        result.workflow_id,
+        WorkflowState.COMPLETED,
+        reason="worker reported success"
+    )
+    
+    # ... rest of completion logic ...
+```
+
+### Cancellation
+
+```python
+async def receive_cancel_job(
+    self,
+    addr: tuple[str, int],
+    data: bytes,
+    clock_time: int
+):
+    """Cancel job with state transitions."""
+    # ... parse request, validate job ...
+    
+    for sub_wf in job.sub_workflows.values():
+        workflow_id = str(sub_wf.token)
+        current_state = self._workflow_states.get_state(workflow_id)
+        
+        if current_state == WorkflowState.PENDING:
+            # Remove from queue directly
+            if self._workflow_dispatcher:
+                await self._workflow_dispatcher.cancel_pending_workflows_by_ids(
+                    job_id, [workflow_id]
+                )
+            
+            # Transition: PENDING → CANCELLED
+            await self._workflow_states.transition(
+                workflow_id,
+                WorkflowState.CANCELLED,
+                reason="job cancelled while pending"
+            )
+        
+        elif current_state in {WorkflowState.DISPATCHED, WorkflowState.RUNNING}:
+            # Transition: (DISPATCHED|RUNNING) → CANCELLING
+            await self._workflow_states.transition(
+                workflow_id,
+                WorkflowState.CANCELLING,
+                reason="job cancel request"
+            )
+            
+            # Send cancel to worker
+            # ... send WorkflowCancelRequest ...
+            
+            # When worker confirms:
+            # Transition: CANCELLING → CANCELLED
+            await self._workflow_states.transition(
+                workflow_id,
+                WorkflowState.CANCELLED,
+                reason="worker confirmed cancellation"
+            )
+```
+
+---
+
+## Part 7: Benefits
+
+### 1. Race Condition Prevention
+
+**Before**:
+```python
+# Race: workflow might be dispatched during this check
+if workflow.status == "pending":
+    remove_from_queue()
+    # ❌ Another thread might dispatch it here!
+    mark_as_cancelled()
+```
+
+**After**:
+```python
+# State machine prevents invalid transitions
+if self._workflow_states.is_in_state(wf_id, WorkflowState.PENDING):
+    await self._workflow_states.transition(wf_id, WorkflowState.CANCELLING, ...)
+    # ✅ No one can transition to DISPATCHED now - invalid transition!
+    remove_from_queue()
+```
+
+### 2. Clear Failure Semantics
+
+**Before**:
+```python
+# Unclear: is it safe to retry?
+if workflow.status == "failed":
+    retry_workflow()  # ❌ What about dependents?
+```
+
+**After**:
+```python
+# Can only retry from FAILED_READY_FOR_RETRY state
+if self._workflow_states.is_in_state(wf_id, WorkflowState.FAILED_READY_FOR_RETRY):
+    # ✅ Guaranteed that dependents are cancelled
+    retry_workflow()
+```
+
+### 3. Debugging with State History
+
+```python
+# Get complete state history
+history = self._workflow_states.get_history(workflow_id)
+
+# Output:
+# 0.0s:   PENDING → DISPATCHED (dispatching to worker-1)
+# 0.1s:   DISPATCHED → RUNNING (worker acknowledged)
+# 5.0s:   RUNNING → FAILED (worker worker-1 died)
+# 5.0s:   FAILED → FAILED_CANCELING_DEPENDENTS (cancelling 3 dependents)
+# 6.2s:   FAILED_CANCELING_DEPENDENTS → FAILED_READY_FOR_RETRY (dependents cancelled)
+# 6.2s:   FAILED_READY_FOR_RETRY → PENDING (re-queued after failure)
+# 6.5s:   PENDING → DISPATCHED (dispatching to worker-2)
+# 6.6s:   DISPATCHED → RUNNING (worker acknowledged)
+# 10.0s:  RUNNING → COMPLETED (worker reported success)
+```
+
+### 4. Idempotency
+
+```python
+# If worker failure handler runs twice
+async def _handle_worker_failure(worker_id):
+    for wf_id in workflows_on_worker:
+        current = self._workflow_states.get_state(wf_id)
+        
+        # Check if already handled
+        if current in {
+            WorkflowState.FAILED,
+            WorkflowState.FAILED_CANCELING_DEPENDENTS,
+            WorkflowState.FAILED_READY_FOR_RETRY,
+            WorkflowState.PENDING  # Already re-queued
+        }:
+            # ✅ Already processing or done - skip
+            continue
+        
+        # Only process if in valid starting state
+        if current in {WorkflowState.DISPATCHED, WorkflowState.RUNNING}:
+            # Handle failure...
+```
+
+---
+
+## Part 8: State Persistence
+
+### In-Memory State
+
+```python
+class Manager:
+    def __init__(self, ...):
+        # State machine instance
+        self._workflow_states = WorkflowStateMachine()
+        
+        # Other tracking...
+```
+
+### State Synchronization with WorkflowProgress
+
+```python
+# WorkflowProgress.status remains for external API compatibility
+# But internally, state machine is authoritative
+
+def _sync_workflow_status(self, workflow_id: str):
+    """Sync state machine state to WorkflowProgress.status."""
+    state = self._workflow_states.get_state(workflow_id)
+    
+    # Map state machine state to WorkflowStatus
+    status_map = {
+        WorkflowState.PENDING: WorkflowStatus.PENDING,
+        WorkflowState.DISPATCHED: WorkflowStatus.PENDING,  # Not yet running
+        WorkflowState.RUNNING: WorkflowStatus.RUNNING,
+        WorkflowState.COMPLETED: WorkflowStatus.COMPLETED,
+        WorkflowState.FAILED: WorkflowStatus.FAILED,
+        WorkflowState.FAILED_CANCELING_DEPENDENTS: WorkflowStatus.FAILED,
+        WorkflowState.FAILED_READY_FOR_RETRY: WorkflowStatus.PENDING,  # Ready to retry
+        WorkflowState.CANCELLING: WorkflowStatus.CANCELLED,  # Cancelling counts as cancelled
+        WorkflowState.CANCELLED: WorkflowStatus.CANCELLED,
+        WorkflowState.AGGREGATED: WorkflowStatus.AGGREGATED,
+    }
+    
+    # Update WorkflowProgress.status
+    # ... sync logic ...
+```
+
+---
+
+## Part 9: Configuration
+
+**No new environment variables** - state machine is always enabled.
+
+**Logging Configuration**:
+```python
+WORKFLOW_STATE_TRANSITION_LOG_LEVEL: str = "DEBUG"  # TRACE, DEBUG, INFO, WARNING
+```
+
+---
+
+## Part 10: Observability
+
+### Logging Models
+
+```python
+@dataclass
+class WorkflowStateTransition(ServerDebug):
+    """Logged on every state transition."""
+    workflow_id: str
+    job_id: str
+    from_state: str
+    to_state: str
+    reason: str
+    transition_duration_ms: float  # Time in previous state
+
+
+@dataclass
+class InvalidStateTransition(ServerWarning):
+    """Logged when invalid transition attempted."""
+    workflow_id: str
+    current_state: str
+    attempted_state: str
+    reason: str
+
+
+@dataclass
+class WorkflowStateStats(ServerInfo):
+    """Periodic stats about workflow states."""
+    pending_count: int
+    dispatched_count: int
+    running_count: int
+    completed_count: int
+    failed_count: int
+    failed_canceling_deps_count: int
+    failed_ready_for_retry_count: int
+    cancelling_count: int
+    cancelled_count: int
+```
+
+### Metrics
+
+Track per-state counts:
+```python
+workflow_state_count{state="pending"} 150
+workflow_state_count{state="dispatched"} 20
+workflow_state_count{state="running"} 300
+workflow_state_count{state="failed"} 5
+workflow_state_count{state="failed_canceling_deps"} 2
+workflow_state_count{state="failed_ready_for_retry"} 0
+```
+
+Track transition counts:
+```python
+workflow_state_transitions_total{from="running",to="completed"} 1500
+workflow_state_transitions_total{from="running",to="failed"} 10
+workflow_state_transitions_total{from="failed",to="failed_canceling_deps"} 10
+workflow_state_transitions_total{from="failed_ready_for_retry",to="pending"} 8
+```
+
+---
+
+## Part 11: Files
+
+| File | Purpose |
+|------|---------|
+| `distributed_rewrite/workflow/state_machine.py` | WorkflowStateMachine, WorkflowState enum, transition validation |
+| `nodes/manager.py` | Integration with Manager, _handle_worker_failure rewrite |
+| `jobs/workflow_dispatcher.py` | State-aware dispatch (only dispatch PENDING workflows) |
+| `models/distributed.py` | StateTransition model |
+
+---
+
+## Part 12: Migration Strategy
+
+**Phase 1**: Add state machine alongside existing status tracking
+- State machine tracks state
+- Existing `WorkflowProgress.status` still used
+- Sync state machine → status after each transition
+
+**Phase 2**: Migrate operations one at a time
+- Start with dispatch (add state transitions)
+- Then completion
+- Then cancellation
+- Then failure handling
+
+**Phase 3**: Make state machine authoritative
+- Remove direct status assignments
+- Always go through state machine
+- Keep `WorkflowProgress.status` for API compatibility
+
+**Phase 4**: Cleanup
+- Remove redundant status tracking
+- State machine is single source of truth
+
+---
+
+## Summary
+
+AD-33 introduces a **complete workflow lifecycle state machine** that:
+
+✅ **Enforces valid transitions** - prevents impossible states  
+✅ **Prevents race conditions** - atomic state changes with locking  
+✅ **Clear failure semantics** - explicit states for each failure stage  
+✅ **Dependency-aware retry** - workflows only retry after dependents cancelled  
+✅ **Complete observability** - state history for every workflow  
+✅ **Idempotent operations** - safe to call failure handler multiple times  
+✅ **Works with WorkflowDispatcher** - reuses existing dependency-aware dispatch  
+
+This is the **most robust and correct** approach to workflow lifecycle management.
