@@ -4220,6 +4220,10 @@ class ManagerServer(HealthAwareServer):
         # Build capabilities string for protocol negotiation (AD-25)
         capabilities_str = ','.join(sorted(get_features_for_version(CURRENT_PROTOCOL_VERSION)))
 
+        # AD-37: Get current backpressure level from stats buffer
+        backpressure_level = self._stats_buffer.get_backpressure_level()
+        backpressure_signal = BackpressureSignal.from_level(backpressure_level)
+
         return ManagerHeartbeat(
             node_id=self._node_id.full,
             datacenter=self._node_id.datacenter,
@@ -4244,6 +4248,9 @@ class ManagerServer(HealthAwareServer):
             # Extension and LHM tracking for cross-DC correlation (Phase 7)
             workers_with_extensions=self._worker_health_manager.workers_with_active_extensions,
             lhm_score=self._local_health.score,
+            # AD-37: Backpressure fields for gate throttling
+            backpressure_level=backpressure_signal.level.value,
+            backpressure_delay_ms=backpressure_signal.suggested_delay_ms,
             # Protocol version fields (AD-25)
             protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
             protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,

@@ -155,13 +155,13 @@ Per CLAUDE.md: "DO NOT RUN THE INTEGRATION TESTS YOURSELF. Ask me to."
   - RTT estimation complete
   - Distance calculation complete
 - [x] **12.1.3** `CoordinateTracker` class exists and tracks local + peer coordinates
+- [x] **12.1.4** `estimate_rtt_ucb_ms()` - Implemented in coordinate_tracker.py (lines 65-88)
+- [x] **12.1.5** `coordinate_quality()` function - Implemented in coordinate_tracker.py (lines 94-107)
+- [x] **12.1.6** `is_converged()` method - Implemented in coordinate_tracker.py (lines 109-116)
+- [x] **12.1.7** `VivaldiConfig` dataclass - Exists in models/coordinates.py (lines 6-41)
+- [x] **12.1.8** Coordinate cleanup/TTL - Implemented via `cleanup_stale_peers()` (lines 122-143)
 
-**Missing:**
-- [ ] **12.1.4** Implement `estimate_rtt_ucb_ms()` - Upper confidence bound RTT (AD-35 requirement)
-- [ ] **12.1.5** Implement `coordinate_quality()` function - Quality scoring based on sample_count, error, staleness
-- [ ] **12.1.6** Implement `is_converged()` method - Convergence detection
-- [ ] **12.1.7** Create `VivaldiConfig` dataclass - Currently uses hardcoded values
-- [ ] **12.1.8** Add coordinate cleanup/TTL - No stale coordinate removal
+**Current State**: ✅ Section 12.1 is complete. All Vivaldi coordinate algorithm components implemented.
 
 ### 12.2 SWIM Message Integration ✅ COMPLETE
 
@@ -428,6 +428,37 @@ All remaining AD-36 items deferred. Core routing subsystem must be built first.
 - [x] **14.6.2** `PriorityLimits` configuration with per-priority caps
 - [x] **14.6.3** `try_acquire()` with CRITICAL always succeeding
 - [x] **14.6.4** Server integration in `mercury_sync_base_server.py`
+
+### 14.7 Unified LoadShedder Classification ✅ COMPLETE
+
+**File**: `hyperscale/distributed_rewrite/reliability/load_shedding.py`
+
+- [x] **14.7.1** `MESSAGE_CLASS_TO_REQUEST_PRIORITY` mapping from MessageClass to RequestPriority
+- [x] **14.7.2** `classify_handler_to_priority()` function using AD-37 MessageClass classification
+- [x] **14.7.3** `LoadShedder.should_shed_handler()` method using unified classification
+- [x] **14.7.4** Exported from `hyperscale.distributed_rewrite.reliability`
+
+### 14.8 Gate Manager Backpressure Tracking ✅ COMPLETE
+
+**File**: `hyperscale/distributed_rewrite/nodes/gate.py`
+
+- [x] **14.8.1** `_manager_backpressure` tracking dict for per-manager backpressure levels
+- [x] **14.8.2** `_dc_backpressure` aggregated per-datacenter backpressure
+- [x] **14.8.3** `_handle_manager_backpressure_signal()` method to process manager signals
+- [x] **14.8.4** `_get_dc_backpressure_level()` and `_get_max_backpressure_level()` accessors
+- [x] **14.8.5** `_should_throttle_forwarded_update()` for throttling decisions
+- [x] **14.8.6** Backpressure extraction from `ManagerHeartbeat` in status handlers
+
+### 14.9 Manager Backpressure in Heartbeats ✅ COMPLETE
+
+**File**: `hyperscale/distributed_rewrite/models/distributed.py`
+
+- [x] **14.9.1** `backpressure_level` field added to `ManagerHeartbeat`
+- [x] **14.9.2** `backpressure_delay_ms` field added to `ManagerHeartbeat`
+
+**File**: `hyperscale/distributed_rewrite/nodes/manager.py`
+
+- [x] **14.9.3** `_build_manager_heartbeat()` includes backpressure signal from stats buffer
 
 ---
 

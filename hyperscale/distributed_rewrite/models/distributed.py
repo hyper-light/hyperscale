@@ -659,6 +659,10 @@ class ManagerHeartbeat(Message):
     # Used by gates to distinguish load from failures
     workers_with_extensions: int = 0  # Workers currently with active extensions
     lhm_score: int = 0  # Local Health Multiplier score (0-8, higher = more stressed)
+    # AD-37: Backpressure fields for gate throttling
+    # Gates use these to throttle forwarded updates when managers are under load
+    backpressure_level: int = 0  # BackpressureLevel enum value (0=NONE, 1=THROTTLE, 2=BATCH, 3=REJECT)
+    backpressure_delay_ms: int = 0  # Suggested delay before next update (milliseconds)
     # Protocol version fields (AD-25) - defaults for backwards compatibility
     protocol_version_major: int = 1
     protocol_version_minor: int = 0

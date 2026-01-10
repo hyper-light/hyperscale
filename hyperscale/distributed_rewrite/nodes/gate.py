@@ -2473,6 +2473,116 @@ class GateServer(HealthAwareServer):
         }
 
     # =========================================================================
+    # AD-37: Manager Backpressure Handling
+    # =========================================================================
+
+    def _handle_manager_backpressure_signal(
+        self,
+        manager_addr: tuple[str, int],
+        dc_id: str,
+        signal: BackpressureSignal,
+    ) -> None:
+        """
+        Handle backpressure signal from a manager.
+
+        Updates tracking state to throttle forwarded updates when managers
+        are under load. This prevents the gate from overwhelming managers
+        with forwarded progress/stats updates.
+
+        Args:
+            manager_addr: Address of the manager that sent the signal
+            dc_id: Datacenter ID of the manager
+            signal: BackpressureSignal from the manager
+        """
+        self._manager_backpressure[manager_addr] = signal.level
+        self._backpressure_delay_ms = max(
+            self._backpressure_delay_ms,
+            signal.suggested_delay_ms,
+        )
+
+        # Update per-DC backpressure (max across all managers in DC)
+        self._update_dc_backpressure(dc_id)
+
+    def _update_dc_backpressure(self, dc_id: str) -> None:
+        """
+        Update the aggregated backpressure level for a datacenter.
+
+        Uses the maximum backpressure level across all managers in the DC.
+
+        Args:
+            dc_id: Datacenter ID to update
+        """
+        manager_addrs = self._datacenter_managers.get(dc_id, [])
+        if not manager_addrs:
+            return
+
+        max_level = BackpressureLevel.NONE
+        for manager_addr in manager_addrs:
+            level = self._manager_backpressure.get(manager_addr, BackpressureLevel.NONE)
+            if level > max_level:
+                max_level = level
+
+        self._dc_backpressure[dc_id] = max_level
+
+    def _get_dc_backpressure_level(self, dc_id: str) -> BackpressureLevel:
+        """
+        Get the current backpressure level for a datacenter.
+
+        Args:
+            dc_id: Datacenter ID
+
+        Returns:
+            BackpressureLevel for the datacenter (NONE if no signal received)
+        """
+        return self._dc_backpressure.get(dc_id, BackpressureLevel.NONE)
+
+    def _get_max_backpressure_level(self) -> BackpressureLevel:
+        """
+        Get the maximum backpressure level across all managers.
+
+        Returns:
+            Maximum BackpressureLevel from any manager
+        """
+        if not self._manager_backpressure:
+            return BackpressureLevel.NONE
+        return max(self._manager_backpressure.values())
+
+    def _should_throttle_forwarded_update(self, dc_id: str) -> bool:
+        """
+        Check if forwarded updates to a DC should be throttled.
+
+        Uses AD-37 backpressure levels:
+        - NONE: Forward normally
+        - THROTTLE: Add delay (handled by caller)
+        - BATCH: Only forward batched updates
+        - REJECT: Drop non-critical updates
+
+        Args:
+            dc_id: Target datacenter ID
+
+        Returns:
+            True if update should be throttled/dropped, False to forward normally
+        """
+        level = self._get_dc_backpressure_level(dc_id)
+        # REJECT level means drop non-critical forwarded updates
+        return level >= BackpressureLevel.REJECT
+
+    def _get_backpressure_metrics(self) -> dict:
+        """Get backpressure tracking metrics for monitoring."""
+        return {
+            "max_backpressure_level": self._get_max_backpressure_level().name,
+            "backpressure_delay_ms": self._backpressure_delay_ms,
+            "per_dc_backpressure": {
+                dc_id: level.name
+                for dc_id, level in self._dc_backpressure.items()
+            },
+            "per_manager_backpressure": {
+                f"{addr[0]}:{addr[1]}": level.name
+                for addr, level in self._manager_backpressure.items()
+            },
+        }
+
+    # =========================================================================
     # Rate Limiting (AD-24)
     # =========================================================================
 
@@ -4392,6 +4502,18 @@ class GateServer(HealthAwareServer):
             # Use version as generation proxy - detects restarts via node_id change
             self._record_manager_heartbeat(dc, manager_addr, status.node_id, status.version)
 
+            # AD-37: Extract and track backpressure signal from manager
+            if status.backpressure_level > 0 or status.backpressure_delay_ms > 0:
+                backpressure_signal = BackpressureSignal(
+                    level=BackpressureLevel(status.backpressure_level),
+                    suggested_delay_ms=status.backpressure_delay_ms,
+                )
+                self._handle_manager_backpressure_signal(manager_addr, dc, backpressure_signal)
+            elif manager_addr in self._manager_backpressure:
+                # Manager no longer under backpressure - clear tracking
+                self._manager_backpressure[manager_addr] = BackpressureLevel.NONE
+                self._update_dc_backpressure(dc)
+
             return b'ok'
 
         except Exception as e:
@@ -4598,6 +4720,14 @@ class GateServer(HealthAwareServer):
             # Update DC registration state (AD-27)
             # Use version as generation proxy - detects restarts via node_id change
             self._record_manager_heartbeat(dc, manager_addr, heartbeat.node_id, heartbeat.version)
+
+            # AD-37: Extract and track backpressure signal from manager
+            if heartbeat.backpressure_level > 0 or heartbeat.backpressure_delay_ms > 0:
+                backpressure_signal = BackpressureSignal(
+                    level=BackpressureLevel(heartbeat.backpressure_level),
+                    suggested_delay_ms=heartbeat.backpressure_delay_ms,
+                )
+                self._handle_manager_backpressure_signal(manager_addr, dc, backpressure_signal)
 
             self._task_runner.run(
                 self._udp_logger.log,
