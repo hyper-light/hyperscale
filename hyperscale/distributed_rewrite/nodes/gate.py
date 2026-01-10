@@ -113,6 +113,9 @@ from hyperscale.distributed_rewrite.swim.core import (
     ErrorStats,
     CircuitState,
 )
+from hyperscale.distributed_rewrite.swim.detection import (
+    HierarchicalConfig,
+)
 from hyperscale.distributed_rewrite.health import (
     ManagerHealthState,
     ManagerHealthConfig,
@@ -495,10 +498,27 @@ class GateServer(HealthAwareServer):
         # (Same pattern as ManagerServer for split-brain prevention)
         self.register_on_node_dead(self._on_node_dead)
         self.register_on_node_join(self._on_node_join)
-        
+
         # Register leadership callbacks for state sync
         self.register_on_become_leader(self._on_gate_become_leader)
         self.register_on_lose_leadership(self._on_gate_lose_leadership)
+
+        # Initialize hierarchical failure detector for DC-layer detection (AD-30)
+        # Treats each datacenter as a "job" for per-DC manager health tracking
+        # This enables detecting "manager is slow for DC-A but fine for DC-B"
+        self.init_hierarchical_detector(
+            config=HierarchicalConfig(
+                # Very long timeout for WAN (cross-DC) latency
+                global_min_timeout=30.0,
+                global_max_timeout=120.0,
+                # Per-DC timeout (DC treated as "job")
+                job_min_timeout=5.0,
+                job_max_timeout=30.0,
+            ),
+            on_global_death=self._on_manager_globally_dead,
+            on_job_death=self._on_manager_dead_for_dc,
+            get_job_n_members=self._get_dc_manager_count,
+        )
         
         # Federated Health Monitor for cross-DC probing (Gate -> DC Leader)
         # Uses configurable settings tuned for high-latency global links
@@ -768,7 +788,115 @@ class GateServer(HealthAwareServer):
                 node_id=self._node_id.short,
             )
         )
-    
+
+    # =========================================================================
+    # Hierarchical Failure Detection Callbacks (AD-30)
+    # =========================================================================
+
+    def _on_manager_globally_dead(
+        self,
+        manager_addr: tuple[str, int],
+        incarnation: int,
+    ) -> None:
+        """
+        Manager machine is dead (global layer) - affects ALL DCs this manager serves.
+
+        Called by HierarchicalFailureDetector when a manager is declared dead
+        at the global (machine) level.
+        """
+        self._task_runner.run(
+            self._udp_logger.log,
+            ServerInfo(
+                message=f"Manager {manager_addr} globally dead (incarnation={incarnation})",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+        # The manager will be removed from all DC tracking via circuit breaker
+        # and health classification logic
+
+    def _on_manager_dead_for_dc(
+        self,
+        dc_id: str,
+        manager_addr: tuple[str, int],
+        incarnation: int,
+    ) -> None:
+        """
+        Manager is unresponsive for a specific datacenter (DC layer).
+
+        Called by HierarchicalFailureDetector when a manager is declared dead
+        for a specific DC but may still be alive globally. This enables routing
+        around slow managers for specific DCs.
+        """
+        self._task_runner.run(
+            self._udp_logger.log,
+            ServerInfo(
+                message=f"Manager {manager_addr} dead for DC {dc_id} (incarnation={incarnation})",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+        # Update circuit breaker for this specific DC-manager combination
+        self._circuit_breaker_manager.record_failure(manager_addr)
+
+    def _get_dc_manager_count(self, dc_id: str) -> int:
+        """
+        Get number of managers registered for a datacenter.
+
+        Used by HierarchicalFailureDetector for Lifeguard timeout calculation.
+        """
+        return len(self._datacenter_managers.get(dc_id, []))
+
+    async def _suspect_manager_for_dc(
+        self,
+        dc_id: str,
+        manager_addr: tuple[str, int],
+    ) -> None:
+        """
+        Start DC-specific suspicion for a manager.
+
+        Called when job dispatch or heartbeat times out for a specific DC.
+        The manager may still be alive globally but is unresponsive for this DC.
+        """
+        # Get manager incarnation from health state if available
+        incarnation = 0
+        health_state = self._datacenter_manager_status.get(dc_id, {}).get(manager_addr)
+        if health_state:
+            incarnation = getattr(health_state, 'incarnation', 0)
+
+        await self.suspect_node_for_job(
+            job_id=dc_id,  # DC ID used as "job ID"
+            node=manager_addr,
+            incarnation=incarnation,
+            from_node=(self._host, self._udp_port),
+        )
+
+    async def _confirm_manager_for_dc(
+        self,
+        dc_id: str,
+        manager_addr: tuple[str, int],
+    ) -> None:
+        """
+        Confirm manager is alive for a DC (clear suspicion).
+
+        Called when we receive a response from the manager for this DC.
+        """
+        incarnation = 0
+        health_state = self._datacenter_manager_status.get(dc_id, {}).get(manager_addr)
+        if health_state:
+            incarnation = getattr(health_state, 'incarnation', 0)
+
+        detector = self.get_hierarchical_detector()
+        if detector:
+            await detector.confirm_job(
+                job_id=dc_id,
+                node=manager_addr,
+                incarnation=incarnation,
+                from_node=(self._host, self._udp_port),
+            )
+
     def _handle_embedded_manager_heartbeat(
         self,
         heartbeat: ManagerHeartbeat,
@@ -827,6 +955,10 @@ class GateServer(HealthAwareServer):
             worker_count=heartbeat.healthy_worker_count,
         )
         # Progress is updated from throughput metrics if available
+
+        # Confirm manager is responsive for this DC (AD-30 job-layer detection)
+        # Receiving heartbeat proves the manager is alive for this DC
+        self._task_runner.run(self._confirm_manager_for_dc, dc, manager_addr)
 
         # Update DatacenterHealthManager for centralized DC health classification
         self._dc_health_manager.update_manager(dc, manager_addr, heartbeat)
@@ -2326,9 +2458,13 @@ class GateServer(HealthAwareServer):
                 manager_addr, submission
             )
             if success:
+                # Confirm manager is responsive for this DC (AD-30)
+                self._task_runner.run(self._confirm_manager_for_dc, dc, manager_addr)
                 # Return the accepting manager address for job leader tracking
                 return (True, None, manager_addr)
-            # Continue to next manager
+            else:
+                # Suspect manager for this DC (AD-30)
+                self._task_runner.run(self._suspect_manager_for_dc, dc, manager_addr)
 
         # All managers failed = DC is UNHEALTHY for this dispatch
         return (False, f"All managers in {dc} failed to accept job", None)

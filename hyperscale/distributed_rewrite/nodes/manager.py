@@ -51,6 +51,9 @@ from hyperscale.distributed_rewrite.swim.core import (
     QuorumTimeoutError,
     QuorumCircuitOpenError,
 )
+from hyperscale.distributed_rewrite.swim.detection import (
+    HierarchicalConfig,
+)
 from hyperscale.distributed_rewrite.models import (
     NodeInfo,
     NodeRole,
@@ -635,10 +638,26 @@ class ManagerServer(HealthAwareServer):
         # Register leadership callbacks (composition pattern - no override)
         self.register_on_become_leader(self._on_manager_become_leader)
         self.register_on_lose_leadership(self._on_manager_lose_leadership)
-        
+
         # Register node death and join callbacks for failure/recovery handling
         self.register_on_node_dead(self._on_node_dead)
         self.register_on_node_join(self._on_node_join)
+
+        # Initialize hierarchical failure detector for job-layer detection (AD-30)
+        # This enables per-job suspicion tracking separate from global SWIM liveness
+        self.init_hierarchical_detector(
+            config=HierarchicalConfig(
+                # Longer global timeout for machine-level liveness
+                global_min_timeout=10.0,
+                global_max_timeout=60.0,
+                # Shorter job timeout for responsiveness detection
+                job_min_timeout=2.0,
+                job_max_timeout=15.0,
+            ),
+            on_global_death=self._on_worker_globally_dead,
+            on_job_death=self._on_worker_dead_for_job,
+            get_job_n_members=self._get_job_worker_count,
+        )
     
     def _on_manager_become_leader(self) -> None:
         """
@@ -4373,8 +4392,14 @@ class ManagerServer(HealthAwareServer):
                     delay = base_delay * (2 ** attempt)
                     await asyncio.sleep(delay)
 
-            # All retries exhausted
+            # All retries exhausted - suspect worker for this job (AD-30)
             circuit.record_error()
+            if worker_addr and dispatch.job_id:
+                self._task_runner.run(
+                    self._suspect_worker_for_job,
+                    dispatch.job_id,
+                    worker_addr,
+                )
             return None
     
     async def _request_quorum_confirmation(
@@ -5024,6 +5049,10 @@ class ManagerServer(HealthAwareServer):
         """
         try:
             progress = WorkflowProgress.load(data)
+
+            # Confirm worker is alive for this job (AD-30 job-layer detection)
+            # Receiving progress proves the worker is responsive for this job
+            self._task_runner.run(self._confirm_worker_for_job, progress.job_id, addr)
 
             # Resolve worker_id from address for windowed stats tracking
             worker_id = self._worker_addr_to_id.get(addr, f"{addr[0]}:{addr[1]}")
@@ -6972,7 +7001,11 @@ class ManagerServer(HealthAwareServer):
                 for wf_info in job.workflows.values()
             )
             job.status = JobStatus.FAILED.value if any_failed else JobStatus.COMPLETED.value
-            
+
+            # Clear job-layer suspicions for this job (AD-30)
+            # Job is complete, no need to track per-job suspicions anymore
+            self._task_runner.run(self.clear_job_suspicions, job_id)
+
             # Push final status to client
             if self._job_callbacks.get(job_id):
                 self._task_runner.run(
@@ -7517,7 +7550,180 @@ class ManagerServer(HealthAwareServer):
             return None
 
         return secrets.choice(eligible)
-    
+
+    # =========================================================================
+    # Hierarchical Failure Detection Callbacks (AD-30)
+    # =========================================================================
+
+    def _on_worker_globally_dead(
+        self,
+        worker_addr: tuple[str, int],
+        incarnation: int,
+    ) -> None:
+        """
+        Worker machine is dead (global layer) - affects ALL jobs on that worker.
+
+        This is called by the HierarchicalFailureDetector when a worker is
+        declared dead at the global (machine) level. All jobs assigned to
+        this worker are affected.
+        """
+        worker_id = self._worker_addr_to_id.get(worker_addr)
+        if worker_id:
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerInfo(
+                    message=f"Worker {worker_id} globally dead (incarnation={incarnation})",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            # Trigger full worker failure handling (removes from all jobs)
+            self._task_runner.run(self._handle_worker_failure, worker_id)
+
+    def _on_worker_dead_for_job(
+        self,
+        job_id: str,
+        worker_addr: tuple[str, int],
+        incarnation: int,
+    ) -> None:
+        """
+        Worker is unresponsive for a specific job (job layer).
+
+        This is called by the HierarchicalFailureDetector when a worker is
+        declared dead for a specific job but may still be alive globally.
+        Only workflows for this job should be rerouted.
+        """
+        worker_id = self._worker_addr_to_id.get(worker_addr)
+        if not worker_id:
+            return
+
+        self._task_runner.run(
+            self._udp_logger.log,
+            ServerInfo(
+                message=f"Worker {worker_id} dead for job {job_id} (incarnation={incarnation})",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+
+        # Retry only workflows for this specific job that were assigned to this worker
+        self._task_runner.run(self._retry_job_workflows_from_worker, job_id, worker_id)
+
+    async def _retry_job_workflows_from_worker(
+        self,
+        job_id: str,
+        worker_id: str,
+    ) -> None:
+        """
+        Retry workflows for a specific job that were assigned to a failed worker.
+
+        Unlike _handle_worker_failure which handles ALL jobs, this only handles
+        workflows for the specified job.
+        """
+        job = self._job_manager.get_job_by_id(job_id)
+        if not job:
+            return
+
+        workflows_to_retry = [
+            str(sub_wf.token)
+            for sub_wf in job.sub_workflows.values()
+            if sub_wf.worker_id == worker_id and sub_wf.result is None
+        ]
+
+        if not workflows_to_retry:
+            return
+
+        await self._udp_logger.log(
+            ServerInfo(
+                message=f"Retrying {len(workflows_to_retry)} workflows for job {job_id} from worker {worker_id}",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+
+        for workflow_id in workflows_to_retry:
+            retry_entry = self._workflow_retries.get(workflow_id)
+            if not retry_entry:
+                continue
+
+            count, data, failed = retry_entry
+            failed.add(worker_id)
+            self._workflow_retries[workflow_id] = (count, data, failed)
+
+            await self._retry_workflow(workflow_id, worker_id)
+
+    def _get_job_worker_count(self, job_id: str) -> int:
+        """
+        Get number of workers assigned to a job.
+
+        Used by HierarchicalFailureDetector for Lifeguard timeout calculation.
+        """
+        job = self._job_manager.get_job_by_id(job_id)
+        if not job:
+            return 0
+
+        # Count unique workers with active workflows for this job
+        worker_ids = {
+            sub_wf.worker_id
+            for sub_wf in job.sub_workflows.values()
+            if sub_wf.worker_id and sub_wf.result is None
+        }
+        return len(worker_ids)
+
+    async def _suspect_worker_for_job(
+        self,
+        job_id: str,
+        worker_addr: tuple[str, int],
+    ) -> None:
+        """
+        Start job-specific suspicion for a worker.
+
+        Called when workflow dispatch or response times out for a specific job.
+        The worker may still be alive globally but is unresponsive for this job.
+        """
+        worker_id = self._worker_addr_to_id.get(worker_addr)
+        if not worker_id:
+            return
+
+        worker_info = self._worker_pool.get_worker(worker_id)
+        incarnation = worker_info.incarnation if worker_info else 0
+
+        await self.suspect_node_for_job(
+            job_id=job_id,
+            node=worker_addr,
+            incarnation=incarnation,
+            from_node=(self._host, self._udp_port),
+        )
+
+    async def _confirm_worker_for_job(
+        self,
+        job_id: str,
+        worker_addr: tuple[str, int],
+    ) -> None:
+        """
+        Confirm worker is alive for a job (clear suspicion).
+
+        Called when we receive a response from the worker for this job.
+        """
+        worker_id = self._worker_addr_to_id.get(worker_addr)
+        if not worker_id:
+            return
+
+        worker_info = self._worker_pool.get_worker(worker_id)
+        incarnation = worker_info.incarnation if worker_info else 0
+
+        detector = self.get_hierarchical_detector()
+        if detector:
+            await detector.confirm_job(
+                job_id=job_id,
+                node=worker_addr,
+                incarnation=incarnation,
+                from_node=(self._host, self._udp_port),
+            )
+
     async def _handle_worker_failure(self, worker_node_id: str) -> None:
         """
         Handle a worker becoming unavailable (detected via SWIM).
