@@ -961,6 +961,46 @@ class WorkflowDispatcher:
 
         return cancelled_workflow_ids
 
+    async def cancel_pending_workflows_by_ids(
+        self,
+        job_id: str,
+        workflow_ids: list[str]
+    ) -> list[str]:
+        """
+        Cancel specific pending workflows by their IDs (for single workflow cancellation).
+
+        Used when cancelling a workflow and its dependents - only removes
+        workflows from the pending queue if they are in the provided list.
+
+        Args:
+            job_id: The job ID
+            workflow_ids: List of specific workflow IDs to cancel
+
+        Returns:
+            List of workflow IDs that were actually cancelled from the pending queue
+        """
+        cancelled_workflow_ids: list[str] = []
+
+        async with self._pending_lock:
+            # Find pending workflows matching the provided IDs
+            for workflow_id in workflow_ids:
+                key = f"{job_id}:{workflow_id}"
+                pending = self._pending.pop(key, None)
+
+                if pending:
+                    cancelled_workflow_ids.append(workflow_id)
+
+                    # Set ready event to unblock any waiters
+                    pending.ready_event.set()
+
+            if cancelled_workflow_ids:
+                await self._log_info(
+                    f"Cancelled {len(cancelled_workflow_ids)} specific pending workflows",
+                    job_id=job_id
+                )
+
+        return cancelled_workflow_ids
+
     # =========================================================================
     # Logging Helpers
     # =========================================================================

@@ -9394,21 +9394,30 @@ class ManagerServer(HealthAwareServer):
                         datacenter=self._datacenter,
                     ).dump()
 
-                # Collect all workflows to cancel (target + dependents if requested)
-                workflows_to_cancel = [request.workflow_id]
+                # Identify all workflows to cancel (target + dependents if requested)
+                # Critical: Cancel dependents FIRST, then target, to maintain dependency integrity
+                workflows_to_cancel_ordered: list[str] = []
                 cancelled_dependents: list[str] = []
 
                 if request.cancel_dependents:
+                    # Find dependent workflows
                     dependents = self._find_dependent_workflows(request.job_id, request.workflow_id)
-                    workflows_to_cancel.extend(dependents)
                     cancelled_dependents = dependents
+                    # Cancel dependents FIRST, then target
+                    workflows_to_cancel_ordered = dependents + [request.workflow_id]
+                else:
+                    # Just cancel the target workflow
+                    workflows_to_cancel_ordered = [request.workflow_id]
 
-                # Cancel workflows
+                # Track results
                 errors: list[str] = []
+                pending_cancelled_ids: list[str] = []
+                running_cancelled_ids: list[str] = []
                 status = WorkflowCancellationStatus.CANCELLED.value
 
-                for wf_id in workflows_to_cancel:
-                    # Add to cancelled bucket
+                # Cancel workflows in order (dependents first, then target)
+                for wf_id in workflows_to_cancel_ordered:
+                    # Add to cancelled bucket to prevent resurrection
                     self._cancelled_workflows[wf_id] = CancelledWorkflowInfo(
                         job_id=request.job_id,
                         workflow_id=wf_id,
@@ -9429,11 +9438,24 @@ class ManagerServer(HealthAwareServer):
 
                     # Check if pending (in queue) or running (on worker)
                     if sub_wf_to_cancel.progress is None or sub_wf_to_cancel.progress.status == WorkflowStatus.PENDING.value:
-                        # Pending - just mark as cancelled
+                        # Pending - remove from WorkflowDispatcher queue
+                        if self._workflow_dispatcher:
+                            # Remove from dispatch queue to prevent execution
+                            removed = await self._workflow_dispatcher.cancel_pending_workflows_by_ids(
+                                request.job_id,
+                                [wf_id]
+                            )
+                            if wf_id in removed:
+                                pending_cancelled_ids.append(wf_id)
+
+                        # Mark as cancelled in sub_workflows
                         if sub_wf_to_cancel.progress:
                             sub_wf_to_cancel.progress.status = WorkflowStatus.CANCELLED.value
+
+                        # Set status for target workflow
                         if wf_id == request.workflow_id:
                             status = WorkflowCancellationStatus.PENDING_CANCELLED.value
+
                     elif sub_wf_to_cancel.progress.status == WorkflowStatus.RUNNING.value:
                         # Running on worker - dispatch cancellation
                         worker_id = sub_wf_to_cancel.worker_id
@@ -9447,12 +9469,27 @@ class ManagerServer(HealthAwareServer):
                                         requester_id=request.requester_id,
                                         timestamp=request.timestamp,
                                     )
-                                    await self.send_tcp(
+                                    response, _ = await self.send_tcp(
                                         worker_addr,
                                         "cancel_workflow",
                                         cancel_req.dump(),
                                         timeout=5.0,
                                     )
+
+                                    # Verify cancellation succeeded
+                                    if isinstance(response, bytes):
+                                        try:
+                                            wf_response = WorkflowCancelResponse.load(response)
+                                            if wf_response.success:
+                                                running_cancelled_ids.append(wf_id)
+                                            else:
+                                                error_msg = wf_response.error or "Worker reported cancellation failure"
+                                                errors.append(f"Failed to cancel {wf_id[:8]}...: {error_msg}")
+                                        except Exception as e:
+                                            errors.append(f"Failed to parse response for {wf_id[:8]}...: {e}")
+                                    else:
+                                        errors.append(f"No response when cancelling {wf_id[:8]}...")
+
                                 except Exception as e:
                                     errors.append(f"Failed to cancel {wf_id[:8]}... on worker: {e}")
 
@@ -9462,7 +9499,7 @@ class ManagerServer(HealthAwareServer):
                     request.job_id,
                     request.workflow_id,
                     request.request_id,
-                    workflows_to_cancel,
+                    workflows_to_cancel_ordered,
                 )
 
                 return SingleWorkflowCancelResponse(
