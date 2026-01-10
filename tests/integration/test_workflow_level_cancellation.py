@@ -825,3 +825,766 @@ class TestConcurrentCancellation:
 
         # Now dispatch check should block
         assert manager.is_workflow_cancelled("workflow-001")
+
+
+# =============================================================================
+# Extended Tests: Negative Paths and Failure Modes
+# =============================================================================
+
+
+class TestNegativePathsManager:
+    """Tests for manager negative paths and error handling."""
+
+    @pytest.mark.asyncio
+    async def test_cancel_nonexistent_job(self):
+        """Manager should return NOT_FOUND for nonexistent job."""
+        manager = MockManagerServer()
+
+        # No job added
+        request = MockSingleWorkflowCancelRequest(
+            job_id="nonexistent-job",
+            workflow_id="workflow-001",
+            request_id=str(uuid.uuid4()),
+            requester_id="client-001",
+            timestamp=time.monotonic(),
+        )
+
+        response = await manager.receive_cancel_single_workflow(request)
+
+        assert response.status == MockWorkflowCancellationStatus.NOT_FOUND
+        assert "Job not found" in response.errors
+
+    @pytest.mark.asyncio
+    async def test_cancel_with_empty_workflow_id(self):
+        """Manager should handle empty workflow ID."""
+        manager = MockManagerServer()
+
+        workflows = {
+            "wf1": MockSubWorkflow(
+                token="workflow-001",
+                progress=MockWorkflowProgress(status="RUNNING"),
+            )
+        }
+        manager.add_job("job-001", workflows)
+
+        request = MockSingleWorkflowCancelRequest(
+            job_id="job-001",
+            workflow_id="",  # Empty
+            request_id=str(uuid.uuid4()),
+            requester_id="client-001",
+            timestamp=time.monotonic(),
+        )
+
+        response = await manager.receive_cancel_single_workflow(request)
+
+        assert response.status == MockWorkflowCancellationStatus.NOT_FOUND
+
+    @pytest.mark.asyncio
+    async def test_cancel_with_empty_job_id(self):
+        """Manager should handle empty job ID."""
+        manager = MockManagerServer()
+
+        request = MockSingleWorkflowCancelRequest(
+            job_id="",  # Empty
+            workflow_id="workflow-001",
+            request_id=str(uuid.uuid4()),
+            requester_id="client-001",
+            timestamp=time.monotonic(),
+        )
+
+        response = await manager.receive_cancel_single_workflow(request)
+
+        assert response.status == MockWorkflowCancellationStatus.NOT_FOUND
+
+    @pytest.mark.asyncio
+    async def test_cancel_workflow_with_null_progress(self):
+        """Manager should handle workflow with null progress."""
+        manager = MockManagerServer()
+
+        workflows = {
+            "wf1": MockSubWorkflow(
+                token="workflow-001",
+                progress=None,  # No progress yet
+            )
+        }
+        manager.add_job("job-001", workflows)
+
+        request = MockSingleWorkflowCancelRequest(
+            job_id="job-001",
+            workflow_id="workflow-001",
+            request_id=str(uuid.uuid4()),
+            requester_id="client-001",
+            timestamp=time.monotonic(),
+        )
+
+        response = await manager.receive_cancel_single_workflow(request)
+
+        # Should be PENDING_CANCELLED since no progress means pending
+        assert response.status == MockWorkflowCancellationStatus.PENDING_CANCELLED
+
+    @pytest.mark.asyncio
+    async def test_cancel_aggregated_workflow(self):
+        """Manager should not cancel an aggregated workflow."""
+        manager = MockManagerServer()
+
+        workflows = {
+            "wf1": MockSubWorkflow(
+                token="workflow-001",
+                progress=MockWorkflowProgress(status="AGGREGATED"),
+            )
+        }
+        manager.add_job("job-001", workflows)
+
+        request = MockSingleWorkflowCancelRequest(
+            job_id="job-001",
+            workflow_id="workflow-001",
+            request_id=str(uuid.uuid4()),
+            requester_id="client-001",
+            timestamp=time.monotonic(),
+        )
+
+        response = await manager.receive_cancel_single_workflow(request)
+
+        assert response.status == MockWorkflowCancellationStatus.ALREADY_COMPLETED
+
+
+class TestNegativePathsGate:
+    """Tests for gate negative paths and error handling."""
+
+    @pytest.mark.asyncio
+    async def test_gate_forward_to_unavailable_datacenter(self):
+        """Gate should handle unavailable datacenters gracefully."""
+        gate = MockGateServer()
+
+        gate.add_job("job-001")
+        # Add datacenter with None addr
+        gate._datacenter_managers["dc1"] = None
+
+        request = MockSingleWorkflowCancelRequest(
+            job_id="job-001",
+            workflow_id="workflow-001",
+            request_id=str(uuid.uuid4()),
+            requester_id="client-001",
+            timestamp=time.monotonic(),
+        )
+
+        response = await gate.receive_cancel_single_workflow(request)
+
+        # Should return NOT_FOUND since no valid DCs
+        assert response.status == MockWorkflowCancellationStatus.NOT_FOUND
+
+    @pytest.mark.asyncio
+    async def test_gate_with_empty_job_id(self):
+        """Gate should handle empty job ID."""
+        gate = MockGateServer()
+
+        request = MockSingleWorkflowCancelRequest(
+            job_id="",  # Empty
+            workflow_id="workflow-001",
+            request_id=str(uuid.uuid4()),
+            requester_id="client-001",
+            timestamp=time.monotonic(),
+        )
+
+        response = await gate.receive_cancel_single_workflow(request)
+
+        assert response.status == MockWorkflowCancellationStatus.NOT_FOUND
+
+
+class TestDependencyEdgeCases:
+    """Tests for edge cases in dependency handling."""
+
+    @pytest.mark.asyncio
+    async def test_circular_dependencies(self):
+        """Manager should handle circular dependencies without infinite loop."""
+        manager = MockManagerServer()
+
+        # Circular: A -> B -> C -> A
+        workflows = {
+            "wfA": MockSubWorkflow(
+                token="workflow-A",
+                progress=MockWorkflowProgress(status="RUNNING"),
+                dependencies=["workflow-C"],  # Creates cycle
+            ),
+            "wfB": MockSubWorkflow(
+                token="workflow-B",
+                progress=MockWorkflowProgress(status="PENDING"),
+                dependencies=["workflow-A"],
+            ),
+            "wfC": MockSubWorkflow(
+                token="workflow-C",
+                progress=MockWorkflowProgress(status="PENDING"),
+                dependencies=["workflow-B"],
+            ),
+        }
+        manager.add_job("job-001", workflows)
+
+        request = MockSingleWorkflowCancelRequest(
+            job_id="job-001",
+            workflow_id="workflow-A",
+            request_id=str(uuid.uuid4()),
+            requester_id="client-001",
+            timestamp=time.monotonic(),
+            cancel_dependents=True,
+        )
+
+        # Should not hang
+        response = await asyncio.wait_for(
+            manager.receive_cancel_single_workflow(request),
+            timeout=1.0,
+        )
+
+        assert response.status in [
+            MockWorkflowCancellationStatus.CANCELLED,
+            MockWorkflowCancellationStatus.PENDING_CANCELLED,
+        ]
+
+    @pytest.mark.asyncio
+    async def test_diamond_dependency_pattern(self):
+        """Manager should handle diamond dependency pattern correctly."""
+        manager = MockManagerServer()
+
+        #     A
+        #    / \
+        #   B   C
+        #    \ /
+        #     D
+        workflows = {
+            "wfA": MockSubWorkflow(
+                token="workflow-A",
+                progress=MockWorkflowProgress(status="RUNNING"),
+                dependencies=[],
+            ),
+            "wfB": MockSubWorkflow(
+                token="workflow-B",
+                progress=MockWorkflowProgress(status="PENDING"),
+                dependencies=["workflow-A"],
+            ),
+            "wfC": MockSubWorkflow(
+                token="workflow-C",
+                progress=MockWorkflowProgress(status="PENDING"),
+                dependencies=["workflow-A"],
+            ),
+            "wfD": MockSubWorkflow(
+                token="workflow-D",
+                progress=MockWorkflowProgress(status="PENDING"),
+                dependencies=["workflow-B", "workflow-C"],
+            ),
+        }
+        manager.add_job("job-001", workflows)
+
+        request = MockSingleWorkflowCancelRequest(
+            job_id="job-001",
+            workflow_id="workflow-A",
+            request_id=str(uuid.uuid4()),
+            requester_id="client-001",
+            timestamp=time.monotonic(),
+            cancel_dependents=True,
+        )
+
+        response = await manager.receive_cancel_single_workflow(request)
+
+        # All 4 should be cancelled
+        assert "workflow-A" in manager._cancelled_workflows
+        assert "workflow-B" in manager._cancelled_workflows
+        assert "workflow-C" in manager._cancelled_workflows
+        assert "workflow-D" in manager._cancelled_workflows
+
+    @pytest.mark.asyncio
+    async def test_workflow_with_no_dependencies(self):
+        """Manager should handle workflow with no dependencies."""
+        manager = MockManagerServer()
+
+        workflows = {
+            "wf1": MockSubWorkflow(
+                token="workflow-001",
+                progress=MockWorkflowProgress(status="RUNNING"),
+                dependencies=[],  # Explicit empty
+            )
+        }
+        manager.add_job("job-001", workflows)
+
+        request = MockSingleWorkflowCancelRequest(
+            job_id="job-001",
+            workflow_id="workflow-001",
+            request_id=str(uuid.uuid4()),
+            requester_id="client-001",
+            timestamp=time.monotonic(),
+            cancel_dependents=True,
+        )
+
+        response = await manager.receive_cancel_single_workflow(request)
+
+        assert response.status == MockWorkflowCancellationStatus.CANCELLED
+        assert len(response.cancelled_dependents) == 0
+
+    @pytest.mark.asyncio
+    async def test_deep_dependency_chain(self):
+        """Manager should handle deep dependency chains."""
+        manager = MockManagerServer()
+
+        # Chain of 20 workflows
+        workflows = {}
+        for i in range(20):
+            wf_id = f"workflow-{i:03d}"
+            deps = [f"workflow-{i-1:03d}"] if i > 0 else []
+            workflows[f"wf{i}"] = MockSubWorkflow(
+                token=wf_id,
+                progress=MockWorkflowProgress(status="PENDING" if i > 0 else "RUNNING"),
+                dependencies=deps,
+            )
+        manager.add_job("job-001", workflows)
+
+        request = MockSingleWorkflowCancelRequest(
+            job_id="job-001",
+            workflow_id="workflow-000",  # First in chain
+            request_id=str(uuid.uuid4()),
+            requester_id="client-001",
+            timestamp=time.monotonic(),
+            cancel_dependents=True,
+        )
+
+        response = await manager.receive_cancel_single_workflow(request)
+
+        # All 20 should be cancelled
+        assert len(manager._cancelled_workflows) == 20
+
+
+# =============================================================================
+# Extended Tests: Concurrency and Race Conditions
+# =============================================================================
+
+
+class TestConcurrencyRaceConditions:
+    """Tests for concurrent operations and race conditions."""
+
+    @pytest.mark.asyncio
+    async def test_concurrent_cancel_different_workflows(self):
+        """Concurrent cancellation of different workflows."""
+        manager = MockManagerServer()
+
+        workflows = {}
+        for i in range(10):
+            workflows[f"wf{i}"] = MockSubWorkflow(
+                token=f"workflow-{i:03d}",
+                progress=MockWorkflowProgress(status="RUNNING"),
+            )
+        manager.add_job("job-001", workflows)
+
+        requests = [
+            MockSingleWorkflowCancelRequest(
+                job_id="job-001",
+                workflow_id=f"workflow-{i:03d}",
+                request_id=str(uuid.uuid4()),
+                requester_id="client-001",
+                timestamp=time.monotonic(),
+            )
+            for i in range(10)
+        ]
+
+        responses = await asyncio.gather(*[
+            manager.receive_cancel_single_workflow(req)
+            for req in requests
+        ])
+
+        # All should be cancelled
+        cancelled_count = sum(
+            1 for r in responses
+            if r.status == MockWorkflowCancellationStatus.CANCELLED
+        )
+        assert cancelled_count == 10
+
+    @pytest.mark.asyncio
+    async def test_rapid_successive_cancellations_same_workflow(self):
+        """Rapid successive cancellations of the same workflow."""
+        manager = MockManagerServer()
+
+        workflows = {
+            "wf1": MockSubWorkflow(
+                token="workflow-001",
+                progress=MockWorkflowProgress(status="RUNNING"),
+            )
+        }
+        manager.add_job("job-001", workflows)
+
+        # Rapid fire
+        for i in range(50):
+            request = MockSingleWorkflowCancelRequest(
+                job_id="job-001",
+                workflow_id="workflow-001",
+                request_id=str(uuid.uuid4()),
+                requester_id=f"client-{i}",
+                timestamp=time.monotonic(),
+            )
+            response = await manager.receive_cancel_single_workflow(request)
+
+            # First should be CANCELLED, rest ALREADY_CANCELLED
+            if i == 0:
+                assert response.status == MockWorkflowCancellationStatus.CANCELLED
+            else:
+                assert response.status == MockWorkflowCancellationStatus.ALREADY_CANCELLED
+
+    @pytest.mark.asyncio
+    async def test_concurrent_cancel_with_dependencies(self):
+        """Concurrent cancellation of parent and child workflows."""
+        manager = MockManagerServer()
+
+        workflows = {
+            "wfA": MockSubWorkflow(
+                token="workflow-A",
+                progress=MockWorkflowProgress(status="RUNNING"),
+                dependencies=[],
+            ),
+            "wfB": MockSubWorkflow(
+                token="workflow-B",
+                progress=MockWorkflowProgress(status="PENDING"),
+                dependencies=["workflow-A"],
+            ),
+        }
+        manager.add_job("job-001", workflows)
+
+        request_parent = MockSingleWorkflowCancelRequest(
+            job_id="job-001",
+            workflow_id="workflow-A",
+            request_id=str(uuid.uuid4()),
+            requester_id="client-001",
+            timestamp=time.monotonic(),
+            cancel_dependents=True,
+        )
+        request_child = MockSingleWorkflowCancelRequest(
+            job_id="job-001",
+            workflow_id="workflow-B",
+            request_id=str(uuid.uuid4()),
+            requester_id="client-002",
+            timestamp=time.monotonic(),
+        )
+
+        # Cancel both concurrently
+        responses = await asyncio.gather(
+            manager.receive_cancel_single_workflow(request_parent),
+            manager.receive_cancel_single_workflow(request_child),
+        )
+
+        # Both workflows should be cancelled
+        assert "workflow-A" in manager._cancelled_workflows
+        assert "workflow-B" in manager._cancelled_workflows
+
+    @pytest.mark.asyncio
+    async def test_gate_concurrent_forwards(self):
+        """Gate should handle concurrent forwards to datacenters."""
+        gate = MockGateServer()
+
+        gate.add_job("job-001")
+        gate.add_datacenter("dc1", ("192.168.1.10", 9090))
+        gate.add_datacenter("dc2", ("192.168.1.20", 9090))
+
+        requests = [
+            MockSingleWorkflowCancelRequest(
+                job_id="job-001",
+                workflow_id=f"workflow-{i:03d}",
+                request_id=str(uuid.uuid4()),
+                requester_id=f"client-{i}",
+                timestamp=time.monotonic(),
+            )
+            for i in range(10)
+        ]
+
+        responses = await asyncio.gather(*[
+            gate.receive_cancel_single_workflow(req)
+            for req in requests
+        ])
+
+        # 10 requests * 2 datacenters = 20 TCP calls
+        assert len(gate._tcp_calls) == 20
+
+
+# =============================================================================
+# Extended Tests: Edge Cases and Boundary Conditions
+# =============================================================================
+
+
+class TestEdgeCasesAndBoundaryConditions:
+    """Tests for edge cases and boundary conditions."""
+
+    @pytest.mark.asyncio
+    async def test_workflow_id_with_special_characters(self):
+        """Manager should handle workflow IDs with special characters."""
+        manager = MockManagerServer()
+
+        special_ids = [
+            "workflow:with:colons",
+            "workflow-with-dashes",
+            "workflow_with_underscores",
+            "workflow.with.dots",
+        ]
+
+        for wf_id in special_ids:
+            workflows = {
+                "wf1": MockSubWorkflow(
+                    token=wf_id,
+                    progress=MockWorkflowProgress(status="RUNNING"),
+                )
+            }
+            manager.add_job(f"job-{wf_id}", workflows)
+
+            request = MockSingleWorkflowCancelRequest(
+                job_id=f"job-{wf_id}",
+                workflow_id=wf_id,
+                request_id=str(uuid.uuid4()),
+                requester_id="client-001",
+                timestamp=time.monotonic(),
+            )
+
+            response = await manager.receive_cancel_single_workflow(request)
+            assert response.status == MockWorkflowCancellationStatus.CANCELLED
+
+    @pytest.mark.asyncio
+    async def test_very_long_workflow_id(self):
+        """Manager should handle very long workflow IDs."""
+        manager = MockManagerServer()
+
+        long_id = "w" * 1000
+
+        workflows = {
+            "wf1": MockSubWorkflow(
+                token=long_id,
+                progress=MockWorkflowProgress(status="RUNNING"),
+            )
+        }
+        manager.add_job("job-001", workflows)
+
+        request = MockSingleWorkflowCancelRequest(
+            job_id="job-001",
+            workflow_id=long_id,
+            request_id=str(uuid.uuid4()),
+            requester_id="client-001",
+            timestamp=time.monotonic(),
+        )
+
+        response = await manager.receive_cancel_single_workflow(request)
+        assert response.status == MockWorkflowCancellationStatus.CANCELLED
+
+    @pytest.mark.asyncio
+    async def test_job_with_zero_workflows(self):
+        """Manager should handle job with zero workflows."""
+        manager = MockManagerServer()
+
+        manager.add_job("job-001", {})  # Empty job
+
+        request = MockSingleWorkflowCancelRequest(
+            job_id="job-001",
+            workflow_id="workflow-001",
+            request_id=str(uuid.uuid4()),
+            requester_id="client-001",
+            timestamp=time.monotonic(),
+        )
+
+        response = await manager.receive_cancel_single_workflow(request)
+        assert response.status == MockWorkflowCancellationStatus.NOT_FOUND
+
+    @pytest.mark.asyncio
+    async def test_job_with_large_number_of_workflows(self):
+        """Manager should handle job with many workflows."""
+        manager = MockManagerServer()
+
+        workflows = {}
+        for i in range(1000):
+            workflows[f"wf{i}"] = MockSubWorkflow(
+                token=f"workflow-{i:06d}",
+                progress=MockWorkflowProgress(status="RUNNING"),
+            )
+        manager.add_job("job-001", workflows)
+
+        request = MockSingleWorkflowCancelRequest(
+            job_id="job-001",
+            workflow_id="workflow-000500",  # Middle workflow
+            request_id=str(uuid.uuid4()),
+            requester_id="client-001",
+            timestamp=time.monotonic(),
+        )
+
+        response = await manager.receive_cancel_single_workflow(request)
+        assert response.status == MockWorkflowCancellationStatus.CANCELLED
+
+    @pytest.mark.asyncio
+    async def test_stale_timestamp_request(self):
+        """Manager should handle requests with stale timestamps."""
+        manager = MockManagerServer()
+
+        workflows = {
+            "wf1": MockSubWorkflow(
+                token="workflow-001",
+                progress=MockWorkflowProgress(status="RUNNING"),
+            )
+        }
+        manager.add_job("job-001", workflows)
+
+        request = MockSingleWorkflowCancelRequest(
+            job_id="job-001",
+            workflow_id="workflow-001",
+            request_id=str(uuid.uuid4()),
+            requester_id="client-001",
+            timestamp=time.monotonic() - 86400,  # 1 day ago
+        )
+
+        response = await manager.receive_cancel_single_workflow(request)
+        # Should still process stale requests
+        assert response.status == MockWorkflowCancellationStatus.CANCELLED
+
+    @pytest.mark.asyncio
+    async def test_future_timestamp_request(self):
+        """Manager should handle requests with future timestamps."""
+        manager = MockManagerServer()
+
+        workflows = {
+            "wf1": MockSubWorkflow(
+                token="workflow-001",
+                progress=MockWorkflowProgress(status="RUNNING"),
+            )
+        }
+        manager.add_job("job-001", workflows)
+
+        request = MockSingleWorkflowCancelRequest(
+            job_id="job-001",
+            workflow_id="workflow-001",
+            request_id=str(uuid.uuid4()),
+            requester_id="client-001",
+            timestamp=time.monotonic() + 86400,  # 1 day in future
+        )
+
+        response = await manager.receive_cancel_single_workflow(request)
+        assert response.status == MockWorkflowCancellationStatus.CANCELLED
+
+
+class TestPreDispatchCheckEdgeCases:
+    """Tests for pre-dispatch cancellation check edge cases."""
+
+    @pytest.mark.asyncio
+    async def test_check_cancelled_vs_not_cancelled(self):
+        """Pre-dispatch check should distinguish cancelled from not cancelled."""
+        manager = MockManagerServer()
+
+        # Cancel one workflow
+        manager._cancelled_workflows["workflow-001"] = MockCancelledWorkflowInfo(
+            job_id="job-001",
+            workflow_id="workflow-001",
+            cancelled_at=time.monotonic(),
+            request_id="request-001",
+        )
+
+        # Check cancelled
+        assert manager.is_workflow_cancelled("workflow-001")
+        # Check not cancelled
+        assert not manager.is_workflow_cancelled("workflow-002")
+        # Check empty string
+        assert not manager.is_workflow_cancelled("")
+        # Check None-like string
+        assert not manager.is_workflow_cancelled("None")
+
+    @pytest.mark.asyncio
+    async def test_cancelled_info_has_correct_metadata(self):
+        """Cancelled workflow info should contain correct metadata."""
+        manager = MockManagerServer()
+
+        workflows = {
+            "wf1": MockSubWorkflow(
+                token="workflow-001",
+                progress=MockWorkflowProgress(status="RUNNING"),
+                dependencies=[],
+            ),
+            "wf2": MockSubWorkflow(
+                token="workflow-002",
+                progress=MockWorkflowProgress(status="PENDING"),
+                dependencies=["workflow-001"],
+            ),
+        }
+        manager.add_job("job-001", workflows)
+
+        request_id = str(uuid.uuid4())
+        request = MockSingleWorkflowCancelRequest(
+            job_id="job-001",
+            workflow_id="workflow-001",
+            request_id=request_id,
+            requester_id="client-001",
+            timestamp=time.monotonic(),
+            cancel_dependents=True,
+        )
+
+        await manager.receive_cancel_single_workflow(request)
+
+        # Check metadata
+        cancelled_info = manager._cancelled_workflows["workflow-001"]
+        assert cancelled_info.job_id == "job-001"
+        assert cancelled_info.workflow_id == "workflow-001"
+        assert cancelled_info.request_id == request_id
+        assert cancelled_info.cancelled_at > 0
+        assert "workflow-002" in cancelled_info.dependents
+
+
+class TestGateForwardingEdgeCases:
+    """Tests for gate forwarding edge cases."""
+
+    @pytest.mark.asyncio
+    async def test_gate_with_many_datacenters(self):
+        """Gate should forward to many datacenters."""
+        gate = MockGateServer()
+
+        gate.add_job("job-001")
+        for i in range(10):
+            gate.add_datacenter(f"dc{i}", (f"192.168.{i}.10", 9090))
+
+        request = MockSingleWorkflowCancelRequest(
+            job_id="job-001",
+            workflow_id="workflow-001",
+            request_id=str(uuid.uuid4()),
+            requester_id="client-001",
+            timestamp=time.monotonic(),
+        )
+
+        response = await gate.receive_cancel_single_workflow(request)
+
+        # Should forward to all 10 DCs
+        assert len(gate._tcp_calls) == 10
+
+    @pytest.mark.asyncio
+    async def test_gate_with_single_datacenter(self):
+        """Gate should forward to single datacenter."""
+        gate = MockGateServer()
+
+        gate.add_job("job-001")
+        gate.add_datacenter("dc1", ("192.168.1.10", 9090))
+
+        request = MockSingleWorkflowCancelRequest(
+            job_id="job-001",
+            workflow_id="workflow-001",
+            request_id=str(uuid.uuid4()),
+            requester_id="client-001",
+            timestamp=time.monotonic(),
+        )
+
+        response = await gate.receive_cancel_single_workflow(request)
+
+        # Should forward to 1 DC
+        assert len(gate._tcp_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_gate_aggregates_dependent_results(self):
+        """Gate should aggregate cancelled_dependents from all DCs."""
+        gate = MockGateServer()
+
+        gate.add_job("job-001")
+        gate.add_datacenter("dc1", ("192.168.1.10", 9090))
+        gate.add_datacenter("dc2", ("192.168.1.20", 9090))
+
+        request = MockSingleWorkflowCancelRequest(
+            job_id="job-001",
+            workflow_id="workflow-001",
+            request_id=str(uuid.uuid4()),
+            requester_id="client-001",
+            timestamp=time.monotonic(),
+        )
+
+        response = await gate.receive_cancel_single_workflow(request)
+
+        # Response should be aggregated
+        assert response.status == MockWorkflowCancellationStatus.CANCELLED
