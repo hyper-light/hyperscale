@@ -28,7 +28,6 @@ import asyncio
 import os
 import time
 from multiprocessing import active_children
-from typing import Any
 
 import cloudpickle
 
@@ -3323,6 +3322,7 @@ class WorkerServer(HealthAwareServer):
         This enables:
         1. Continuous manager list refresh - every ack includes healthy managers
         2. Job leader discovery - ack includes current job leader for failover
+        3. AD-23: Backpressure signal handling - adjust update behavior based on manager load
 
         Args:
             data: Serialized WorkflowProgressAck bytes
@@ -3363,6 +3363,16 @@ class WorkerServer(HealthAwareServer):
                             node_id=self._node_id.short,
                         )
                     )
+
+            # AD-23: Extract and apply backpressure signal from manager
+            # The ack includes backpressure fields indicating manager load level
+            if ack.backpressure_level > 0:
+                backpressure_signal = BackpressureSignal(
+                    level=BackpressureLevel(ack.backpressure_level),
+                    suggested_delay_ms=ack.backpressure_delay_ms,
+                    batch_only=ack.backpressure_batch_only,
+                )
+                self._handle_backpressure_signal(ack.manager_id, backpressure_signal)
 
         except Exception:
             # Backwards compatibility: ignore parse errors for old b'ok' responses

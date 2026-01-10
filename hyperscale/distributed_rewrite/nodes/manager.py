@@ -27,7 +27,6 @@ import random
 import secrets
 import time
 import inspect
-from typing import Any
 
 import cloudpickle
 from collections import defaultdict
@@ -37,7 +36,7 @@ from hyperscale.core.graph.workflow import Workflow
 from hyperscale.core.state.context import Context
 from hyperscale.core.jobs.workers.stage_priority import StagePriority
 from hyperscale.core.hooks import HookType
-from hyperscale.distributed_rewrite.server import tcp, udp
+from hyperscale.distributed_rewrite.server import tcp
 from hyperscale.distributed_rewrite.server.protocol.utils import get_peer_certificate_der
 from hyperscale.distributed_rewrite.server.events import VersionedStateClock
 from hyperscale.distributed_rewrite.swim import HealthAwareServer, ManagerStateEmbedder
