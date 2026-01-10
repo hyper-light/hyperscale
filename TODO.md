@@ -2,12 +2,13 @@
 
 ## Overview
 
-This document tracks the remaining implementation work for AD-34, AD-35, and AD-36 architectural decisions.
+This document tracks the remaining implementation work for AD-34, AD-35, AD-36, and AD-37 architectural decisions.
 
 **Implementation Status** (as of 2026-01-10):
 - **AD-34**: ✅ **100% COMPLETE** - All critical gaps fixed, fully functional for multi-DC deployments
 - **AD-35**: 25% complete - Coordinate algorithm works, SWIM integration and role-aware logic missing
 - **AD-36**: 5% complete - Only basic health bucket selection implemented, entire routing subsystem missing
+- **AD-37**: ✅ **100% COMPLETE** - Message classification, backpressure levels, BATCH aggregation implemented
 
 ---
 
@@ -358,6 +359,75 @@ All remaining AD-36 items deferred. Core routing subsystem must be built first.
 
 ---
 
+---
+
+## 14. AD-37: Explicit Backpressure Policy (Gate → Manager → Worker)
+
+**Status**: ✅ **COMPLETE** (100%)
+
+**Overview**: Explicit backpressure for high-volume stats/progress updates, extending AD-23 (stats backpressure) and preserving AD-22/AD-32 bounded execution as the global safety net.
+
+### 14.1 Message Classification ✅ COMPLETE
+
+**File**: `hyperscale/distributed_rewrite/reliability/message_class.py`
+
+- [x] **14.1.1** `MessageClass` enum: CONTROL, DISPATCH, DATA, TELEMETRY
+- [x] **14.1.2** `MESSAGE_CLASS_TO_PRIORITY` mapping to `MessagePriority`
+- [x] **14.1.3** Handler classification sets: `CONTROL_HANDLERS`, `DISPATCH_HANDLERS`, `DATA_HANDLERS`, `TELEMETRY_HANDLERS`
+- [x] **14.1.4** `classify_handler()` function for automatic classification
+- [x] **14.1.5** `get_priority_for_handler()` convenience function
+- [x] **14.1.6** Exported from `hyperscale.distributed_rewrite.reliability`
+
+### 14.2 Backpressure Levels ✅ COMPLETE (AD-23)
+
+**File**: `hyperscale/distributed_rewrite/reliability/backpressure.py`
+
+- [x] **14.2.1** `BackpressureLevel` enum: NONE, THROTTLE, BATCH, REJECT
+- [x] **14.2.2** `StatsBuffer` with tiered retention and fill-ratio based levels
+- [x] **14.2.3** `BackpressureSignal` dataclass for embedding in responses
+- [x] **14.2.4** Threshold configuration: 70% THROTTLE, 85% BATCH, 95% REJECT
+
+### 14.3 Manager Backpressure Emission ✅ COMPLETE
+
+**File**: `hyperscale/distributed_rewrite/nodes/manager.py`
+
+- [x] **14.3.1** `_create_progress_ack()` includes backpressure signal (lines 6058-6086)
+- [x] **14.3.2** `WorkflowProgressAck` contains backpressure fields
+- [x] **14.3.3** Signal derived from `_stats_buffer.get_backpressure_level()`
+
+### 14.4 Worker Backpressure Consumption ✅ COMPLETE
+
+**File**: `hyperscale/distributed_rewrite/nodes/worker.py`
+
+- [x] **14.4.1** `_handle_backpressure_signal()` tracks per-manager signals (lines 2680-2698)
+- [x] **14.4.2** `_get_max_backpressure_level()` computes max across managers (lines 2673-2677)
+- [x] **14.4.3** `_get_effective_flush_interval()` adds delay on THROTTLE (lines 2671-2672)
+- [x] **14.4.4** `_progress_flush_loop()` respects all levels (lines 2550-2599)
+  - NONE: Flush immediately
+  - THROTTLE: Add delay
+  - BATCH: Aggregate by job_id via `_aggregate_progress_by_job()` (lines 2601-2669)
+  - REJECT: Drop non-critical updates
+- [x] **14.4.5** `_process_workflow_progress_ack()` extracts signal from ack (lines 3362-3370)
+
+### 14.5 Gate Load Shedding ✅ COMPLETE (AD-22/AD-32)
+
+**File**: `hyperscale/distributed_rewrite/nodes/gate.py`
+
+- [x] **14.5.1** Job submission load shedding check (line 4757)
+- [x] **14.5.2** `InFlightTracker` with `MessagePriority` for bounded execution
+- [x] **14.5.3** CRITICAL priority (CONTROL class) never shed
+
+### 14.6 InFlightTracker Priority System ✅ COMPLETE (AD-32)
+
+**File**: `hyperscale/distributed_rewrite/server/protocol/in_flight_tracker.py`
+
+- [x] **14.6.1** `MessagePriority` enum: CRITICAL, HIGH, NORMAL, LOW
+- [x] **14.6.2** `PriorityLimits` configuration with per-priority caps
+- [x] **14.6.3** `try_acquire()` with CRITICAL always succeeding
+- [x] **14.6.4** Server integration in `mercury_sync_base_server.py`
+
+---
+
 ## Dependencies
 
 ### AD-34 Dependencies
@@ -374,3 +444,8 @@ All remaining AD-36 items deferred. Core routing subsystem must be built first.
 - ❌ AD-35 (Vivaldi Coordinates) - Foundation exists but not usable for routing yet
 - ✅ AD-17 (Datacenter Health Classification) - Fully working
 - ✅ AD-33 (Federated Health Monitoring) - DC health signals available
+
+### AD-37 Dependencies
+- ✅ AD-22 (Load Shedding) - Gate uses load shedding for job submission
+- ✅ AD-23 (Stats Backpressure) - StatsBuffer and BackpressureLevel integrated
+- ✅ AD-32 (Bounded Execution) - InFlightTracker with MessagePriority

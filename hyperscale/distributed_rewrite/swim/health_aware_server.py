@@ -403,10 +403,13 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
 
     def add_unconfirmed_peer(self, peer: tuple[str, int]) -> None:
         """
-        Add a peer from configuration as unconfirmed.
+        Add a peer from configuration as unconfirmed (AD-29 compliant).
 
         Unconfirmed peers are probed but failure detection does NOT apply
         until we successfully communicate with them at least once.
+
+        This updates both the local tracking sets AND the incarnation tracker
+        to maintain a formal UNCONFIRMED state in the state machine.
 
         Args:
             peer: The UDP address of the peer to track.
@@ -417,19 +420,27 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         if peer in self._confirmed_peers:
             return  # Already confirmed, no action needed
 
+        # Check incarnation tracker - don't demote confirmed nodes
+        if self._incarnation_tracker.is_node_confirmed(peer):
+            return
+
         if peer not in self._unconfirmed_peers:
             self._unconfirmed_peers.add(peer)
             self._unconfirmed_peer_added_at[peer] = time.monotonic()
+            # AD-29: Add to incarnation tracker with formal UNCONFIRMED state
+            self._incarnation_tracker.add_unconfirmed_node(peer)
 
-    def confirm_peer(self, peer: tuple[str, int]) -> bool:
+    def confirm_peer(self, peer: tuple[str, int], incarnation: int = 0) -> bool:
         """
-        Mark a peer as confirmed after successful communication.
+        Mark a peer as confirmed after successful communication (AD-29 compliant).
 
-        This transitions the peer from unconfirmed to confirmed state,
+        This transitions the peer from UNCONFIRMED to OK state in both the
+        local tracking and the formal incarnation tracker state machine,
         enabling failure detection for this peer.
 
         Args:
             peer: The UDP address of the peer to confirm.
+            incarnation: The peer's incarnation number from the confirming message.
 
         Returns:
             True if peer was newly confirmed, False if already confirmed.
@@ -441,10 +452,13 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             return False  # Already confirmed
 
         # Transition from unconfirmed to confirmed
-        was_unconfirmed = peer in self._unconfirmed_peers
         self._unconfirmed_peers.discard(peer)
         self._unconfirmed_peer_added_at.pop(peer, None)
         self._confirmed_peers.add(peer)
+
+        # AD-29: Update incarnation tracker with formal state transition
+        # This transitions UNCONFIRMED → OK in the state machine
+        self._incarnation_tracker.confirm_node(peer, incarnation)
 
         # Invoke confirmation callbacks
         for callback in self._peer_confirmation_callbacks:
@@ -458,12 +472,26 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         return True
 
     def is_peer_confirmed(self, peer: tuple[str, int]) -> bool:
-        """Check if a peer has been confirmed."""
-        return peer in self._confirmed_peers
+        """
+        Check if a peer has been confirmed (AD-29 compliant).
+
+        Checks both local tracking set and formal incarnation tracker state.
+        """
+        # Check local set first (fast path)
+        if peer in self._confirmed_peers:
+            return True
+        # Fall back to incarnation tracker for formal state
+        return self._incarnation_tracker.is_node_confirmed(peer)
 
     def is_peer_unconfirmed(self, peer: tuple[str, int]) -> bool:
-        """Check if a peer is known but unconfirmed."""
-        return peer in self._unconfirmed_peers
+        """
+        Check if a peer is known but unconfirmed (AD-29 compliant).
+
+        Checks both local tracking set and formal incarnation tracker state.
+        """
+        if peer in self._unconfirmed_peers:
+            return True
+        return self._incarnation_tracker.is_node_unconfirmed(peer)
 
     def get_confirmed_peers(self) -> set[tuple[str, int]]:
         """Get the set of confirmed peers."""
@@ -473,15 +501,30 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         """Get the set of unconfirmed peers."""
         return self._unconfirmed_peers.copy()
 
+    def can_suspect_peer(self, peer: tuple[str, int]) -> bool:
+        """
+        Check if a peer can be suspected (AD-29 Task 12.3.4).
+
+        Per AD-29: Only confirmed peers can transition to SUSPECT.
+        UNCONFIRMED peers cannot be suspected.
+
+        Returns:
+            True if peer can be suspected
+        """
+        return self._incarnation_tracker.can_suspect_node(peer)
+
     def remove_peer_tracking(self, peer: tuple[str, int]) -> None:
         """
-        Remove a peer from all confirmation tracking.
+        Remove a peer from all confirmation tracking (AD-29 Task 12.3.6).
 
         Use when a peer is intentionally removed from the cluster.
+        Also removes from incarnation tracker state machine.
         """
         self._confirmed_peers.discard(peer)
         self._unconfirmed_peers.discard(peer)
         self._unconfirmed_peer_added_at.pop(peer, None)
+        # AD-29: Also remove from formal state machine
+        self._incarnation_tracker.remove_node(peer)
 
     # =========================================================================
     # Hierarchical Failure Detection
@@ -2785,9 +2828,13 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         Per AD-29: Only confirmed peers can be suspected. If we've never
         successfully communicated with a peer, we can't meaningfully suspect
         them - they might just not be up yet during cluster formation.
+
+        AD-29 Task 12.3.4: UNCONFIRMED → SUSPECT transitions are explicitly
+        prevented by the formal state machine.
         """
         # AD-29: Guard against suspecting unconfirmed peers
-        if not self.is_peer_confirmed(node):
+        # Use formal state machine check which prevents UNCONFIRMED → SUSPECT
+        if not self._incarnation_tracker.can_suspect_node(node):
             self._metrics.increment("suspicions_skipped_unconfirmed")
             return None
 

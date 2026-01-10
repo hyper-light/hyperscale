@@ -39,6 +39,7 @@ MSG_STEPDOWN = b'STEPDOWN:'
 # Status Bytes (used in node state tracking)
 # =============================================================================
 
+STATUS_UNCONFIRMED = b'UNCONFIRMED'  # AD-35 Task 12.3.1: Unconfirmed peer state
 STATUS_OK = b'OK'
 STATUS_JOIN = b'JOIN'
 STATUS_SUSPECT = b'SUSPECT'

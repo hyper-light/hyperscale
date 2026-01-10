@@ -106,6 +106,7 @@ from .constants import (
     MSG_HEARTBEAT,
     MSG_STEPDOWN,
     # Status bytes
+    STATUS_UNCONFIRMED,
     STATUS_OK,
     STATUS_JOIN,
     STATUS_SUSPECT,
@@ -208,6 +209,7 @@ __all__ = [
     'MSG_ELECTED',
     'MSG_HEARTBEAT',
     'MSG_STEPDOWN',
+    'STATUS_UNCONFIRMED',
     'STATUS_OK',
     'STATUS_JOIN',
     'STATUS_SUSPECT',
