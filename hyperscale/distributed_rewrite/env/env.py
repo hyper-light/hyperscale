@@ -67,6 +67,10 @@ class Env(BaseModel):
     LEADER_LEASE_DURATION: StrictFloat = 5.0  # Leader lease duration in seconds
     LEADER_MAX_LHM: StrictInt = 4  # Max LHM score for leader eligibility (higher = more tolerant)
 
+    # Job Lease Settings (Gate per-job ownership)
+    JOB_LEASE_DURATION: StrictFloat = 30.0  # Duration of job ownership lease in seconds
+    JOB_LEASE_CLEANUP_INTERVAL: StrictFloat = 10.0  # How often to clean up expired job leases
+
     # Cluster Formation Settings
     CLUSTER_STABILIZATION_TIMEOUT: StrictFloat = 10.0  # Max seconds to wait for cluster to form
     CLUSTER_STABILIZATION_POLL_INTERVAL: StrictFloat = 0.5  # How often to check cluster membership

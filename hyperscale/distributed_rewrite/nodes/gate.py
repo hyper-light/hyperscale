@@ -30,7 +30,7 @@ from typing import Any
 import cloudpickle
 
 from hyperscale.distributed_rewrite.server import tcp, udp
-from hyperscale.distributed_rewrite.leases import JobLease
+from hyperscale.distributed_rewrite.leases import JobLease, LeaseManager as JobLeaseManager
 from hyperscale.reporting.results import Results
 from hyperscale.reporting.reporter import Reporter
 from hyperscale.reporting.common import ReporterTypes
@@ -329,6 +329,15 @@ class GateServer(HealthAwareServer):
         self._job_leadership_tracker: JobLeadershipTracker[int] = JobLeadershipTracker(
             node_id="",  # Set properly in start() when node_id is available
             node_addr=("", 0),  # Set properly in start()
+        )
+
+        # Per-job lease management for at-most-once delivery semantics
+        # Provides time-bounded ownership with fencing tokens to prevent stale writes
+        # node_id is set properly in start() when available
+        self._job_lease_manager = JobLeaseManager(
+            node_id="",  # Set in start()
+            default_duration=env.JOB_LEASE_DURATION,
+            cleanup_interval=env.JOB_LEASE_CLEANUP_INTERVAL,
         )
 
         # Per-job per-DC manager leader tracking
@@ -2972,6 +2981,9 @@ class GateServer(HealthAwareServer):
         # Now that node_id is available, initialize the job leadership tracker
         self._job_leadership_tracker.node_id = self._node_id.full
         self._job_leadership_tracker.node_addr = (self._host, self._tcp_port)
+
+        # Set node_id on job lease manager for ownership tracking
+        self._job_lease_manager._node_id = self._node_id.full
 
         # Add this gate to the consistent hash ring
         # Other gates will be added as they send heartbeats
