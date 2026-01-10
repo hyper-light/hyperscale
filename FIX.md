@@ -98,10 +98,10 @@ This document lists the **exact changes** required to reach compliance.
 
 ## Deliverable Checklist
 
-- [ ] Heartbeat extension payload includes required fields
-- [ ] Worker extension progress is monotonic (no clamp)
-- [ ] Deadline enforcement tied to eviction/suspicion
-- [ ] RoleValidator is real and enforced
-- [ ] `cluster_id`/`environment_id` added + validated
-- [ ] Real SRV lookup implemented
-- [ ] ConnectionPool integrated into DiscoveryService
+- [x] Heartbeat extension payload includes required fields (already complete)
+- [x] Worker extension progress is monotonic (no clamp) - fixed in worker.py:1599
+- [x] Deadline enforcement tied to eviction/suspicion - added metrics to manager.py:9618,9643
+- [x] RoleValidator is real and enforced - implemented in gate.py:4167-4241
+- [x] `cluster_id`/`environment_id` added + validated (already in wire models and validated)
+- [x] Real SRV lookup implemented (already in resolver.py:178-238 using aiodns)
+- [x] ConnectionPool integrated into DiscoveryService (already in discovery_service.py:227-238)

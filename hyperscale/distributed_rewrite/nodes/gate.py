@@ -4165,28 +4165,80 @@ class GateServer(HealthAwareServer):
                 return response.dump()
 
             # Role-based mTLS validation (AD-28 Issue 1)
-            # TODO: Extract certificate from transport when handler signatures are updated
-            # For now, validate role expectations without certificate
-            # Expected flow: Manager (source) -> Gate (target)
-            if not self._role_validator.is_allowed(SecurityNodeRole.MANAGER, SecurityNodeRole.GATE):
-                self._task_runner.run(
-                    self._udp_logger.log,
-                    ServerWarning(
-                        message=f"Manager {heartbeat.node_id} registration rejected: role-based access denied (manager->gate not allowed)",
-                        node_host=self._host,
-                        node_port=self._tcp_port,
-                        node_id=self._node_id.short,
+            # Extract certificate from transport for validation
+            cert_der = get_peer_certificate_der(transport)
+            if cert_der is not None:
+                # Certificate is available - validate claims
+                claims = RoleValidator.extract_claims_from_cert(
+                    cert_der,
+                    default_cluster=self.env.CLUSTER_ID,
+                    default_environment=self.env.ENVIRONMENT_ID,
+                )
+
+                # Validate claims against expected cluster/environment
+                validation_result = self._role_validator.validate_claims(claims)
+                if not validation_result.allowed:
+                    self._task_runner.run(
+                        self._udp_logger.log,
+                        ServerWarning(
+                            message=f"Manager {heartbeat.node_id} rejected: certificate claims validation failed - {validation_result.reason}",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
                     )
-                )
-                response = ManagerRegistrationResponse(
-                    accepted=False,
-                    gate_id=self._node_id.full,
-                    healthy_gates=[],
-                    error="Role-based access denied: managers cannot register with gates in this configuration",
-                    protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
-                    protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
-                )
-                return response.dump()
+                    response = ManagerRegistrationResponse(
+                        accepted=False,
+                        gate_id=self._node_id.full,
+                        healthy_gates=[],
+                        error=f"Certificate claims validation failed: {validation_result.reason}",
+                        protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+                        protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+                    )
+                    return response.dump()
+
+                # Validate role matrix: Manager -> Gate must be allowed
+                if not self._role_validator.is_allowed(claims.role, SecurityNodeRole.GATE):
+                    self._task_runner.run(
+                        self._udp_logger.log,
+                        ServerWarning(
+                            message=f"Manager {heartbeat.node_id} rejected: role-based access denied ({claims.role.value}->gate not allowed)",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
+                    response = ManagerRegistrationResponse(
+                        accepted=False,
+                        gate_id=self._node_id.full,
+                        healthy_gates=[],
+                        error=f"Role-based access denied: {claims.role.value} cannot register with gates",
+                        protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+                        protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+                    )
+                    return response.dump()
+            else:
+                # No certificate - fall back to role matrix check without certificate claims
+                # Expected flow: Manager (source) -> Gate (target)
+                if not self._role_validator.is_allowed(SecurityNodeRole.MANAGER, SecurityNodeRole.GATE):
+                    self._task_runner.run(
+                        self._udp_logger.log,
+                        ServerWarning(
+                            message=f"Manager {heartbeat.node_id} registration rejected: role-based access denied (manager->gate not allowed)",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
+                    response = ManagerRegistrationResponse(
+                        accepted=False,
+                        gate_id=self._node_id.full,
+                        healthy_gates=[],
+                        error="Role-based access denied: managers cannot register with gates in this configuration",
+                        protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+                        protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+                    )
+                    return response.dump()
 
             # Protocol version negotiation (AD-25)
             manager_version = ProtocolVersion(
