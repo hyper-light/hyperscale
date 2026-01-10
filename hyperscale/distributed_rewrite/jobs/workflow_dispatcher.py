@@ -1001,6 +1001,79 @@ class WorkflowDispatcher:
 
         return cancelled_workflow_ids
 
+    async def add_pending_workflow(
+        self,
+        job_id: str,
+        workflow_id: str,
+        workflow_name: str,
+        workflow: Workflow,
+        vus: int,
+        priority: StagePriority,
+        is_test: bool,
+        dependencies: set[str],
+        timeout_seconds: float
+    ) -> None:
+        """
+        Add a workflow back to the pending queue (AD-33 retry mechanism).
+
+        Used during failure recovery to re-queue failed workflows in dependency order.
+        The workflow will be dispatched when its dependencies are satisfied and cores
+        are available.
+
+        Args:
+            job_id: The job ID
+            workflow_id: The workflow ID
+            workflow_name: Human-readable workflow name
+            workflow: The workflow instance to dispatch
+            vus: Virtual users for this workflow
+            priority: Dispatch priority
+            is_test: Whether this is a test workflow
+            dependencies: Set of workflow IDs this workflow depends on
+            timeout_seconds: Timeout for this workflow
+        """
+        now = time.monotonic()
+        key = f"{job_id}:{workflow_id}"
+
+        async with self._pending_lock:
+            # Check if already pending (idempotent)
+            if key in self._pending:
+                await self._log_debug(
+                    f"Workflow {workflow_id} already pending, skipping add",
+                    job_id=job_id,
+                    workflow_id=workflow_id
+                )
+                return
+
+            # Create new pending workflow entry
+            pending = PendingWorkflow(
+                job_id=job_id,
+                workflow_id=workflow_id,
+                workflow_name=workflow_name,
+                workflow=workflow,
+                vus=vus,
+                priority=priority,
+                is_test=is_test,
+                dependencies=dependencies,
+                registered_at=now,
+                timeout_seconds=timeout_seconds,
+                next_retry_delay=self.INITIAL_RETRY_DELAY,
+                max_dispatch_attempts=self._max_dispatch_attempts,
+            )
+
+            self._pending[key] = pending
+
+            # Check if ready for immediate dispatch
+            pending.check_and_signal_ready()
+
+            await self._log_info(
+                f"Added workflow {workflow_id} back to pending queue for retry",
+                job_id=job_id,
+                workflow_id=workflow_id
+            )
+
+        # Signal dispatch trigger to wake up dispatch loop
+        self.signal_dispatch()
+
     # =========================================================================
     # Logging Helpers
     # =========================================================================

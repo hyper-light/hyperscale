@@ -8129,14 +8129,15 @@ class ManagerServer(HealthAwareServer):
 
             # Add back to WorkflowDispatcher in dependency order
             for workflow_id in ordered_workflows:
-                # Find original dispatch data
-                sub_wf = None
-                for sw in job.sub_workflows.values():
-                    if str(sw.token) == workflow_id:
-                        sub_wf = sw
-                        break
-
-                if not sub_wf:
+                # Find workflow info
+                workflow_info = job.workflows.get(workflow_id)
+                if not workflow_info:
+                    await self._udp_logger.log(ServerError(
+                        message=f"Cannot retry workflow {workflow_id} - not found in job",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    ))
                     continue
 
                 # Get original dispatch bytes from retry tracking
@@ -8152,12 +8153,45 @@ class ManagerServer(HealthAwareServer):
 
                 dispatch_bytes = retry_info[1]
 
+                # Deserialize dispatch to extract workflow details
+                try:
+                    dispatch = WorkflowDispatch.load(dispatch_bytes)
+                    workflow = dispatch.load_workflow()
+                except Exception as e:
+                    await self._udp_logger.log(ServerError(
+                        message=f"Failed to deserialize workflow {workflow_id} for retry: {e}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    ))
+                    continue
+
+                # Get workflow dependencies from the dependency graph
+                workflow_dependencies = workflow_deps.get(workflow_id, [])
+                dependencies_set = set(workflow_dependencies)
+
+                # Extract workflow metadata
+                workflow_name = workflow_info.name
+                vus = dispatch.vus
+                timeout_seconds = dispatch.timeout_seconds
+
+                # Get priority and is_test from workflow
+                priority = self._get_workflow_priority(workflow)
+                is_test = self._is_test_workflow(workflow)
+
                 # Add to WorkflowDispatcher
                 if self._workflow_dispatcher:
-                    # Note: WorkflowDispatcher.add_pending_workflow doesn't exist yet
-                    # We'll need to add workflows back to the pending queue
-                    # For now, use the existing dispatch mechanism
-                    pass  # TODO: Implement proper re-queuing
+                    await self._workflow_dispatcher.add_pending_workflow(
+                        job_id=job_id,
+                        workflow_id=workflow_id,
+                        workflow_name=workflow_name,
+                        workflow=workflow,
+                        vus=vus,
+                        priority=priority,
+                        is_test=is_test,
+                        dependencies=dependencies_set,
+                        timeout_seconds=timeout_seconds
+                    )
 
                 # Transition: FAILED_READY_FOR_RETRY → PENDING
                 if self._workflow_lifecycle_states:
@@ -8224,6 +8258,17 @@ class ManagerServer(HealthAwareServer):
             return workflow_ids
 
         return result
+
+    def _get_workflow_priority(self, workflow: Workflow) -> StagePriority:
+        """
+        Determine dispatch priority for a workflow (AD-33).
+
+        Used during re-queuing to preserve original workflow priority.
+        """
+        priority = getattr(workflow, 'priority', None)
+        if isinstance(priority, StagePriority):
+            return priority
+        return StagePriority.AUTO
 
     # =========================================================================
     # Background Cleanup
