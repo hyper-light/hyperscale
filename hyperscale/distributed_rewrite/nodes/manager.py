@@ -97,8 +97,7 @@ from hyperscale.distributed_rewrite.models import (
     ProvisionRequest,
     ProvisionConfirm,
     ProvisionCommit,
-    CancelJob,
-    CancelAck,
+    CancelJob,  # Legacy format - accepted at boundary, normalized to AD-20 internally
     JobCancelRequest,
     JobCancelResponse,
     WorkflowCancelRequest,
@@ -8946,7 +8945,6 @@ class ManagerServer(HealthAwareServer):
 
     def _build_cancel_response(
         self,
-        use_ad20: bool,
         job_id: str,
         success: bool,
         error: str | None = None,
@@ -8954,30 +8952,15 @@ class ManagerServer(HealthAwareServer):
         already_cancelled: bool = False,
         already_completed: bool = False,
     ) -> bytes:
-        """Build cancel response in appropriate format (AD-20 or legacy)."""
-        if use_ad20:
-            return JobCancelResponse(
-                job_id=job_id,
-                success=success,
-                error=error,
-                cancelled_workflow_count=cancelled_count,
-                already_cancelled=already_cancelled,
-                already_completed=already_completed,
-            ).dump()
-        return CancelAck(
+        """Build cancel response in AD-20 format."""
+        return JobCancelResponse(
             job_id=job_id,
-            cancelled=success,
+            success=success,
             error=error,
-            workflows_cancelled=cancelled_count,
+            cancelled_workflow_count=cancelled_count,
+            already_cancelled=already_cancelled,
+            already_completed=already_completed,
         ).dump()
-
-    def _is_ad20_cancel_request(self, data: bytes) -> bool:
-        """Check if cancel request data is AD-20 format."""
-        try:
-            JobCancelRequest.load(data)
-            return True
-        except Exception:
-            return False
 
     @tcp.receive()
     async def receive_cancel_job(
@@ -8989,8 +8972,9 @@ class ManagerServer(HealthAwareServer):
         """
         Handle job cancellation (from gate or client) (AD-20).
 
-        Supports both legacy CancelJob and new JobCancelRequest formats.
-        Forwards cancellation to workers running the job's workflows.
+        Accepts both legacy CancelJob and new JobCancelRequest formats at the
+        boundary, but normalizes to AD-20 internally. Always sends per-workflow
+        WorkflowCancelRequest messages to workers.
         """
         try:
             # Rate limit check (AD-24)
@@ -9002,45 +8986,42 @@ class ManagerServer(HealthAwareServer):
                     retry_after_seconds=retry_after,
                 ).dump()
 
-            # Try to parse as JobCancelRequest first (AD-20), fall back to CancelJob
+            # Parse request - accept both formats at boundary, normalize to AD-20 internally
             try:
                 cancel_request = JobCancelRequest.load(data)
                 job_id = cancel_request.job_id
                 fence_token = cancel_request.fence_token
                 requester_id = cancel_request.requester_id
-                reason = cancel_request.reason
                 timestamp = cancel_request.timestamp
-                use_ad20 = True
             except Exception:
-                # Fall back to legacy CancelJob format
+                # Normalize legacy CancelJob format to AD-20 fields
                 cancel = CancelJob.load(data)
                 job_id = cancel.job_id
                 fence_token = cancel.fence_token
                 requester_id = f"{addr[0]}:{addr[1]}"
-                reason = cancel.reason
                 timestamp = time.monotonic()
-                use_ad20 = False
 
             job = self._job_manager.get_job_by_id(job_id)
             if not job:
-                return self._build_cancel_response(use_ad20, job_id, success=False, error="Job not found")
+                return self._build_cancel_response(job_id, success=False, error="Job not found")
 
             # Check fence token if provided (prevents cancelling restarted jobs)
             if fence_token > 0 and hasattr(job, 'fence_token') and job.fence_token != fence_token:
                 error_msg = f"Fence token mismatch: expected {job.fence_token}, got {fence_token}"
-                return self._build_cancel_response(use_ad20, job_id, success=False, error=error_msg)
+                return self._build_cancel_response(job_id, success=False, error=error_msg)
 
             # Check if already cancelled (idempotency)
             if job.status == JobStatus.CANCELLED.value:
-                return self._build_cancel_response(use_ad20, job_id, success=True, already_cancelled=True)
+                return self._build_cancel_response(job_id, success=True, already_cancelled=True)
 
             # Check if already completed (cannot cancel)
             if job.status == JobStatus.COMPLETED.value:
                 return self._build_cancel_response(
-                    use_ad20, job_id, success=False, already_completed=True, error="Job already completed"
+                    job_id, success=False, already_completed=True, error="Job already completed"
                 )
 
             # Cancel all workflows on workers via sub_workflows from JobManager
+            # Always use AD-20 WorkflowCancelRequest for worker communication
             cancelled_count = 0
             workers_notified: set[str] = set()
             errors: list[str] = []
@@ -9057,20 +9038,13 @@ class ManagerServer(HealthAwareServer):
                     worker = self._worker_pool.get_worker(worker_id)
                     if worker and worker.registration:
                         try:
-                            # Send AD-20 WorkflowCancelRequest to worker
-                            if use_ad20:
-                                cancel_data = WorkflowCancelRequest(
-                                    job_id=job_id,
-                                    workflow_id=sub_wf.workflow_id,
-                                    requester_id=requester_id,
-                                    timestamp=timestamp,
-                                ).dump()
-                            else:
-                                cancel_data = CancelJob(
-                                    job_id=job_id,
-                                    reason=reason,
-                                    fence_token=fence_token,
-                                ).dump()
+                            # Always send AD-20 WorkflowCancelRequest to worker
+                            cancel_data = WorkflowCancelRequest(
+                                job_id=job_id,
+                                workflow_id=sub_wf.workflow_id,
+                                requester_id=requester_id,
+                                timestamp=timestamp,
+                            ).dump()
 
                             response, _ = await self.send_tcp(
                                 (worker.registration.node.host, worker.registration.node.port),
@@ -9080,13 +9054,12 @@ class ManagerServer(HealthAwareServer):
                             )
 
                             if isinstance(response, bytes):
-                                # Count workflows cancelled from the worker response
                                 try:
                                     wf_response = WorkflowCancelResponse.load(response)
                                     if wf_response.success:
                                         cancelled_count += 1
                                 except Exception:
-                                    # Legacy format or different response
+                                    # Unexpected response format - count as success if no exception
                                     cancelled_count += 1
 
                             workers_notified.add(worker_id)
@@ -9097,17 +9070,15 @@ class ManagerServer(HealthAwareServer):
             job.status = JobStatus.CANCELLED.value
             self._increment_version()
 
-            # Build response
+            # Build response (always AD-20 format)
             error_str = "; ".join(errors) if errors else None
             return self._build_cancel_response(
-                use_ad20, job_id, success=True, cancelled_count=cancelled_count, error=error_str
+                job_id, success=True, cancelled_count=cancelled_count, error=error_str
             )
 
         except Exception as e:
             await self.handle_exception(e, "receive_cancel_job")
-            # Return error in appropriate format - detect format from request
-            is_ad20 = self._is_ad20_cancel_request(data)
-            return self._build_cancel_response(is_ad20, "unknown", success=False, error=str(e))
+            return self._build_cancel_response("unknown", success=False, error=str(e))
 
     @tcp.receive()
     async def workflow_cancellation_query(

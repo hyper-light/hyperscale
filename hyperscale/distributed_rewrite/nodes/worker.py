@@ -69,8 +69,6 @@ from hyperscale.distributed_rewrite.models import (
     StepStats,
     StateSyncRequest,
     StateSyncResponse,
-    CancelJob,
-    CancelAck,
     WorkflowCancellationQuery,
     WorkflowCancellationResponse,
     # AD-20: Cancellation Propagation
@@ -89,6 +87,7 @@ from hyperscale.distributed_rewrite.jobs import CoreAllocator
 from hyperscale.distributed_rewrite.reliability import (
     BackpressureLevel,
     BackpressureSignal,
+    HybridOverloadDetector,
 )
 from hyperscale.distributed_rewrite.protocol.version import (
     CURRENT_PROTOCOL_VERSION,
@@ -272,6 +271,14 @@ class WorkerServer(HealthAwareServer):
         self._extension_reason: str = ""
         self._extension_current_progress: float = 0.0  # 0.0-1.0 progress indicator
 
+        # Overload detection (AD-18)
+        # Workers use HybridOverloadDetector to track CPU/memory/latency
+        # and report overload state via health gossip. Fast resource polling
+        # ensures immediate escalation when resources are exhausted.
+        self._overload_detector = HybridOverloadDetector()
+        self._overload_poll_interval: float = getattr(env, 'WORKER_OVERLOAD_POLL_INTERVAL', 0.25)  # 250ms default
+        self._overload_poll_task: asyncio.Task | None = None
+
         # Protocol version negotiation result (AD-25)
         # Set during registration response handling
         self._negotiated_capabilities: NegotiatedCapabilities | None = None
@@ -303,7 +310,7 @@ class WorkerServer(HealthAwareServer):
             get_health_accepting_work=lambda: self._get_worker_state() in (WorkerState.HEALTHY, WorkerState.DEGRADED),
             get_health_throughput=lambda: 0.0,  # Actual throughput tracking deferred
             get_health_expected_throughput=lambda: 0.0,  # Expected throughput calculation deferred
-            get_health_overload_state=lambda: "healthy",  # Workers don't have overload detector yet
+            get_health_overload_state=self._get_overload_state_str,
             # Extension request fields (AD-26)
             get_extension_requested=lambda: self._extension_requested,
             get_extension_reason=lambda: self._extension_reason,
@@ -623,6 +630,10 @@ class WorkerServer(HealthAwareServer):
 
         # Start discovery maintenance loop (AD-28)
         self._discovery_maintenance_task = asyncio.create_task(self._discovery_maintenance_loop())
+
+        # Start overload detection polling loop (AD-18)
+        # Fast polling ensures immediate escalation when CPU/memory thresholds are crossed
+        self._overload_poll_task = asyncio.create_task(self._overload_poll_loop())
 
         manager_count = len(self._known_managers)
         await self._udp_logger.log(
@@ -1249,6 +1260,14 @@ class WorkerServer(HealthAwareServer):
             except asyncio.CancelledError:
                 pass
 
+        # Cancel overload poll loop (AD-18)
+        if self._overload_poll_task and not self._overload_poll_task.done():
+            self._overload_poll_task.cancel()
+            try:
+                await self._overload_poll_task
+            except asyncio.CancelledError:
+                pass
+
         # Cancel all active workflows via TaskRunner
         for workflow_id in list(self._workflow_tokens.keys()):
             # On shutdown we don't need the result - just cancel
@@ -1469,7 +1488,29 @@ class WorkerServer(HealthAwareServer):
         if not _PSUTIL_AVAILABLE:
             return 0.0
         return psutil.virtual_memory().percent
-    
+
+    def _get_overload_state_str(self) -> str:
+        """
+        Get current overload state as string for health gossip.
+
+        The HybridOverloadDetector combines CPU, memory, and latency signals
+        to determine overload state. Escalation to worse states is immediate
+        (no hysteresis), ensuring fast detection when resources are exhausted.
+        """
+        cpu = self._get_cpu_percent()
+        memory = self._get_memory_percent()
+        state = self._overload_detector.get_state(cpu, memory)
+        return state.value
+
+    def _record_workflow_latency(self, latency_ms: float) -> None:
+        """
+        Record workflow execution latency for overload detection.
+
+        Called when a workflow completes. This is a secondary signal
+        complementing the primary resource-based detection (CPU/memory).
+        """
+        self._overload_detector.record_latency(latency_ms)
+
     def _get_state_snapshot(self) -> WorkerStateSnapshot:
         """Get a complete state snapshot."""
         return WorkerStateSnapshot(
@@ -2312,6 +2353,12 @@ class WorkerServer(HealthAwareServer):
         if start_time is not None:
             progress.elapsed_seconds = time.monotonic() - start_time
 
+            # Record workflow latency for overload detection (AD-18)
+            # This is a secondary signal complementing resource-based detection
+            if new_status == WorkflowStatus.COMPLETED:
+                latency_ms = progress.elapsed_seconds * 1000.0
+                self._record_workflow_latency(latency_ms)
+
         # Always send lifecycle transitions immediately (not buffered)
         # This ensures short-running workflows still get all state updates
         if self._healthy_manager_ids:
@@ -2611,6 +2658,37 @@ class WorkerServer(HealthAwareServer):
             except asyncio.CancelledError:
                 break
             except Exception:
+                pass
+
+    async def _overload_poll_loop(self) -> None:
+        """
+        Fast polling loop for overload detection (AD-18).
+
+        Samples CPU and memory at a fast interval (default 250ms) to ensure
+        immediate detection when resources are exhausted. The HybridOverloadDetector
+        escalates to worse states immediately (no hysteresis), so we detect
+        overload within one poll interval.
+
+        This is critical for workers under extreme load (load testing) where
+        waiting for workflow completion would delay overload detection.
+        """
+        while self._running:
+            try:
+                await asyncio.sleep(self._overload_poll_interval)
+
+                # Sample current resource usage
+                cpu_percent = self._get_cpu_percent()
+                memory_percent = self._get_memory_percent()
+
+                # Update detector state - escalation is immediate if thresholds crossed
+                # The state is cached internally and retrieved via _get_overload_state_str()
+                # which is called by the state embedder for health gossip
+                self._overload_detector.get_state(cpu_percent, memory_percent)
+
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                # Don't crash the loop on transient errors (e.g., psutil failures)
                 pass
 
     def _select_best_manager(self, key: str) -> tuple[str, int] | None:
@@ -3370,42 +3448,8 @@ class WorkerServer(HealthAwareServer):
             ).dump()
 
     # =========================================================================
-    # TCP Handlers - Cancellation
+    # TCP Handlers - Cancellation (AD-20)
     # =========================================================================
-
-    @tcp.receive()
-    async def cancel_job(
-        self,
-        addr: tuple[str, int],
-        data: bytes,
-        clock_time: int,
-    ) -> bytes:
-        """Handle job cancellation request from manager."""
-        try:
-            cancel_request = CancelJob.load(data)
-
-            # Find and cancel all workflows for this job
-            cancelled_count = 0
-            for workflow_id, progress in list(self._active_workflows.items()):
-                if progress.job_id == cancel_request.job_id:
-                    success, _ = await self._cancel_workflow(workflow_id, cancel_request.reason)
-                    if success:
-                        cancelled_count += 1
-
-            ack = CancelAck(
-                job_id=cancel_request.job_id,
-                cancelled=True,
-                workflows_cancelled=cancelled_count,
-            )
-            return ack.dump()
-
-        except Exception as e:
-            ack = CancelAck(
-                job_id="unknown",
-                cancelled=False,
-                error=str(e),
-            )
-            return ack.dump()
 
     def _build_already_completed_response(
         self,
