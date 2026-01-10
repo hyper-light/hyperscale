@@ -138,6 +138,10 @@ from hyperscale.distributed_rewrite.models import (
     RegisterCallback,
     RegisterCallbackResponse,
     RateLimitResponse,
+    JobProgressReport,
+    JobTimeoutReport,
+    JobGlobalTimeout,
+    JobFinalStatus,
     restricted_loads,
 )
 from hyperscale.distributed_rewrite.env import Env
@@ -173,6 +177,11 @@ from hyperscale.distributed_rewrite.jobs import (
     WorkflowDispatcher,
     WindowedStatsCollector,
     WindowedStatsPush,
+)
+from hyperscale.distributed_rewrite.jobs.timeout_strategy import (
+    TimeoutStrategy,
+    LocalAuthorityTimeout,
+    GateCoordinatedTimeout,
 )
 from hyperscale.distributed_rewrite.workflow import (
     WorkflowStateMachine as WorkflowLifecycleStateMachine,  # AD-33: Full lifecycle tracking
@@ -455,6 +464,11 @@ class ManagerServer(HealthAwareServer):
 
         # Lock for dispatch synchronization (used by WorkflowDispatcher)
         self._eager_dispatch_lock: asyncio.Lock | None = None
+
+        # Job timeout strategies (AD-34)
+        # Maps job_id -> TimeoutStrategy (LocalAuthorityTimeout or GateCoordinatedTimeout)
+        # Strategies are created on job submission and cleaned up on job completion
+        self._job_timeout_strategies: dict[str, "TimeoutStrategy"] = {}
         self._workflow_results_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 
         # Store aggregated workflow results for reporter submission
