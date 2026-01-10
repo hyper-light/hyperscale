@@ -1,7 +1,7 @@
 # Refactor Plan: Gate/Manager/Worker Servers
 
 ## Goals
-- Enforce one-class-per-file across gate/manager/worker server code.
+- Enforce one-class-per-file across gate/manager/worker/client code.
 - Group related logic into cohesive submodules with explicit boundaries.
 - Ensure all dataclasses use `slots=True` and live in a `models/` submodule.
 - Preserve behavior and interfaces; refactor in small, safe moves.
@@ -204,6 +204,59 @@ class WorkerExecutor:
 
 ### Worker models to relocate
 - `ManagerPeerState`, `WorkflowRuntimeState`, `CancelState` in `nodes/worker/models/` with `slots=True`.
+
+## Client Refactor (nodes/client)
+### What moves where
+- **HyperscaleClient** → `nodes/client/client.py`.
+  - Composition root for client lifecycle and handler wiring.
+- **Configuration** → `nodes/client/config.py`.
+  - Defaults for ports, retry policies, backpressure handling, reporter settings.
+- **Runtime State** → `nodes/client/state.py`.
+  - Job tracking, events, callbacks, and negotiated capabilities maps.
+- **Target Selection** → `nodes/client/targets.py`.
+  - Manager/gate selection and failover; leadership-aware routing.
+- **Submission** → `nodes/client/submission.py`.
+  - Job submission, serialization, gate/manager selection, ack handling.
+- **Tracking** → `nodes/client/tracking.py`.
+  - Job status tracking, completion waits, cancellation completion tracking.
+- **Reporting** → `nodes/client/reporting.py`.
+  - Reporter configs and local reporter handling (CSV/JSON/XML).
+- **Protocol** → `nodes/client/protocol.py`.
+  - Version negotiation, capabilities handling, rate limit handling.
+- **Leadership** → `nodes/client/leadership.py`.
+  - Gate/manager leader tracking and retry policy.
+- **Handlers** → `nodes/client/handlers/`.
+  - TCP handlers for push updates and leadership notifications.
+
+### Client handler modules
+- `handlers/tcp_job_status_push.py` → `JobStatusPush` / `JobBatchPush`
+- `handlers/tcp_reporter_result.py` → `ReporterResultPush`
+- `handlers/tcp_workflow_result.py` → `WorkflowResultPush`
+- `handlers/tcp_cancellation_complete.py` → `JobCancellationComplete`
+- `handlers/tcp_leadership_transfer.py` → `GateJobLeaderTransfer` / `ManagerJobLeaderTransfer`
+
+### Client models (dataclasses, slots=True)
+- `models/job_tracking_state.py` (job status, completion event refs)
+- `models/cancellation_state.py` (cancel events + errors)
+- `models/leader_tracking.py` (GateLeaderInfo/ManagerLeaderInfo snapshots)
+- `models/request_routing.py` (per-job routing lock, selected target)
+
+### Example: move job submission (Client)
+**Current**: `submit_job()` in `nodes/client.py`.
+
+**New**: `nodes/client/submission.py`
+```python
+class ClientJobSubmission:
+    def __init__(self, state: ClientState, targets: ClientTargetSelector, protocol: ClientProtocol):
+        self._state = state
+        self._targets = targets
+        self._protocol = protocol
+
+    async def submit_job(self, submission: JobSubmission) -> JobAck:
+        target = self._targets.select_submission_target()
+        response, _ = await self._state.send_tcp(target, "submit_job", submission.dump())
+        return JobAck.load(response)
+```
 
 ## Handler Modules (Examples)
 ### Gate TCP handler example

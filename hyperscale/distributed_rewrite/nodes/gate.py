@@ -4415,6 +4415,9 @@ class GateServer(HealthAwareServer):
                     self._cleanup_reporter_tasks(job_id)
                     # AD-14: Clean up CRDT stats for completed job
                     await self._cleanup_job_crdt_stats(job_id)
+                    # AD-36: Clean up job routing state (hysteresis, cooldown tracking)
+                    if self._job_router:
+                        self._job_router.cleanup_job_state(job_id)
                     # Clean up any leases for this job
                     lease_keys_to_remove = [
                         key for key in self._leases
