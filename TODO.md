@@ -374,44 +374,17 @@ Per CLAUDE.md: "DO NOT RUN THE INTEGRATION TESTS YOURSELF. Ask me to."
 - [x] **13.5.3** Conservative RTT defaults (RTT_DEFAULT_MS) - Uses defaults from VivaldiConfig
 - [x] **13.5.4** Graceful degradation - Handled in GateJobRouter.route_job()
 
-### 13.6 Gate Integration ⚠️ READY FOR INTEGRATION (5% Remaining)
+### 13.6 Gate Integration ✅ COMPLETE
 
 **File**: `hyperscale/distributed_rewrite/nodes/gate.py`
 
-**Required Integration Steps:**
-- [ ] **13.6.1** Add `_job_router: GateJobRouter` field to GateServer.__init__
-- [ ] **13.6.2** Initialize GateJobRouter with self._coordinate_tracker and datacenter candidate callback
-- [ ] **13.6.3** Replace `_select_datacenters_with_fallback()` logic with `_job_router.route_job()` call
-- [ ] **13.6.4** Wire dispatch failures to `_job_router.record_dispatch_failure()`
-- [ ] **13.6.5** Wire job completion to `_job_router.cleanup_job_state()`
-- [ ] **13.6.6** Create `_build_datacenter_candidates()` helper to convert gate state → DatacenterCandidate objects
-
-**Infrastructure Status**: ✅ ALL COMPLETE
-- ✅ GateJobRouter fully implemented and exported from routing module
-- ✅ All supporting components (scoring, hysteresis, bootstrap, fallback) complete
-- ✅ AD-35 Vivaldi coordinates available via self._coordinate_tracker
-- ✅ DatacenterCandidate model defined with all required fields
-- ✅ Module exports updated in `routing/__init__.py`
-
-**Integration Example**:
-```python
-# In GateServer.__init__()
-from hyperscale.distributed_rewrite.routing import GateJobRouter, DatacenterCandidate
-
-self._job_router = GateJobRouter(
-    coordinate_tracker=self._coordinate_tracker,
-    get_datacenter_candidates=self._build_datacenter_candidates,
-)
-
-# In _select_datacenters_with_fallback()
-decision = self._job_router.route_job(
-    job_id=job_id,
-    preferred_datacenters=set(preferred) if preferred else None,
-)
-return (decision.primary_datacenters, decision.fallback_datacenters, decision.primary_bucket)
-```
-
-**Current:** Gate.py (7952 lines) uses legacy capacity-based selection instead of GateJobRouter
+**Implemented:**
+- [x] **13.6.1** Add `_job_router: GateJobRouter` field to GateServer.__init__
+- [x] **13.6.2** Initialize GateJobRouter with self._coordinate_tracker and datacenter candidate callback (lines 3850-3855)
+- [x] **13.6.3** Replace `_select_datacenters_with_fallback()` logic with `_job_router.route_job()` call (lines 2741-2799)
+- [x] **13.6.4** Wire dispatch failures to `_job_router.record_dispatch_failure()` (lines 3009-3013)
+- [x] **13.6.5** Wire job completion to `_job_router.cleanup_job_state()` (lines 4418-4420)
+- [x] **13.6.6** Create `_build_datacenter_candidates()` helper to convert gate state → DatacenterCandidate objects (lines 2215-2290)
 
 ---
 
