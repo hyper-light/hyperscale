@@ -47,13 +47,11 @@ from hyperscale.distributed_rewrite.models import (
     PingRequest,
     ManagerPingResponse,
     GatePingResponse,
-    DatacenterInfo,
     DatacenterListRequest,
     DatacenterListResponse,
     WorkflowQueryRequest,
     WorkflowStatusInfo,
     WorkflowQueryResponse,
-    DatacenterWorkflowStatus,
     GateWorkflowQueryResponse,
     RegisterCallback,
     RegisterCallbackResponse,
@@ -94,8 +92,6 @@ from hyperscale.distributed_rewrite.protocol.version import (
 from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerError
 from hyperscale.reporting.reporter import Reporter
 from hyperscale.reporting.json import JSONConfig
-from hyperscale.reporting.csv import CSVConfig
-from hyperscale.reporting.xml import XMLConfig
 from hyperscale.reporting.common import ReporterTypes
 
 
@@ -345,9 +341,28 @@ class HyperscaleClient(MercurySyncBaseServer):
         # Input: list[tuple[list[str], Workflow]] - (dependencies, workflow)
         # Output: list[tuple[str, list[str], Workflow]] - (workflow_id, dependencies, workflow)
         workflows_with_ids: list[tuple[str, list[str], object]] = []
+
+        # Extract reporter configs from workflow instances for local file handling
+        # CSV, XML, and JSON reporters must output locally at the client
+        extracted_local_configs: list = []
+
         for dependencies, workflow_instance in workflows:
             workflow_id = f"wf-{secrets.token_hex(8)}"
             workflows_with_ids.append((workflow_id, dependencies, workflow_instance))
+
+            # Extract reporter config from workflow if present
+            workflow_reporting = getattr(workflow_instance, 'reporting', None)
+            if workflow_reporting is not None:
+                # Handle single config or list of configs
+                configs_to_check = (
+                    workflow_reporting if isinstance(workflow_reporting, list)
+                    else [workflow_reporting]
+                )
+                for config in configs_to_check:
+                    # Check if this is a local file reporter type
+                    reporter_type = getattr(config, 'reporter_type', None)
+                    if reporter_type in self._local_reporter_types:
+                        extracted_local_configs.append(config)
 
         # Serialize workflows with IDs
         workflows_bytes = cloudpickle.dumps(workflows_with_ids)
@@ -395,7 +410,13 @@ class HyperscaleClient(MercurySyncBaseServer):
             self._reporter_callbacks[job_id] = on_reporter_result
 
         # Store reporting configs for local file-based reporting
-        self._job_reporting_configs[job_id] = reporting_configs or []
+        # Combine extracted local configs from workflows with any explicitly passed configs
+        # Filter explicitly passed configs to only include local file types
+        explicit_local_configs = [
+            config for config in (reporting_configs or [])
+            if getattr(config, 'reporter_type', None) in self._local_reporter_types
+        ]
+        self._job_reporting_configs[job_id] = extracted_local_configs + explicit_local_configs
 
         # Get all available targets for fallback
         all_targets = []
