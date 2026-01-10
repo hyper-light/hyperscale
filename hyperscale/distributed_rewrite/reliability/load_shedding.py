@@ -1,29 +1,32 @@
 """
-Load Shedding with Priority Queues (AD-22).
+Load Shedding with Priority Queues (AD-22, AD-37).
 
 Provides graceful degradation under load by shedding low-priority
 requests based on current overload state.
 
-Priority Levels:
-- CRITICAL (0): Health checks, cancellation, final results, SWIM
-- HIGH (1): Job submissions, workflow dispatch, state sync
-- NORMAL (2): Progress updates, stats queries, reconnection
-- LOW (3): Detailed stats, debug requests
+Uses unified MessageClass classification from AD-37:
+- CONTROL (CRITICAL): SWIM probes/acks, cancellation, leadership - never shed
+- DISPATCH (HIGH): Job submissions, workflow dispatch, state sync
+- DATA (NORMAL): Progress updates, stats queries
+- TELEMETRY (LOW): Debug stats, detailed metrics - shed first
 
 Shedding Behavior by State:
 - healthy: Accept all requests
-- busy: Shed LOW priority
-- stressed: Shed NORMAL and LOW
-- overloaded: Shed all except CRITICAL
+- busy: Shed TELEMETRY (LOW) only
+- stressed: Shed DATA (NORMAL) and TELEMETRY (LOW)
+- overloaded: Shed all except CONTROL (CRITICAL)
 """
 
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import Callable
 
 from hyperscale.distributed_rewrite.reliability.overload import (
     HybridOverloadDetector,
     OverloadState,
+)
+from hyperscale.distributed_rewrite.reliability.message_class import (
+    MessageClass,
+    classify_handler,
 )
 
 
@@ -31,12 +34,22 @@ class RequestPriority(IntEnum):
     """Priority levels for request classification.
 
     Lower values indicate higher priority.
+    Maps directly to AD-37 MessageClass via MESSAGE_CLASS_TO_PRIORITY.
     """
 
-    CRITICAL = 0  # Health checks, cancellation, final results, SWIM
-    HIGH = 1  # Job submissions, workflow dispatch, state sync
-    NORMAL = 2  # Progress updates, stats queries, reconnection
-    LOW = 3  # Detailed stats, debug requests
+    CRITICAL = 0  # CONTROL: SWIM probes/acks, cancellation, leadership - never shed
+    HIGH = 1  # DISPATCH: Job submissions, workflow dispatch, state sync
+    NORMAL = 2  # DATA: Progress updates, stats queries
+    LOW = 3  # TELEMETRY: Debug stats, detailed metrics
+
+
+# Mapping from MessageClass to RequestPriority (AD-37 compliance)
+MESSAGE_CLASS_TO_REQUEST_PRIORITY: dict[MessageClass, RequestPriority] = {
+    MessageClass.CONTROL: RequestPriority.CRITICAL,
+    MessageClass.DISPATCH: RequestPriority.HIGH,
+    MessageClass.DATA: RequestPriority.NORMAL,
+    MessageClass.TELEMETRY: RequestPriority.LOW,
+}
 
 
 @dataclass(slots=True)
@@ -48,16 +61,17 @@ class LoadShedderConfig:
     shed_thresholds: dict[OverloadState, RequestPriority | None] = field(
         default_factory=lambda: {
             OverloadState.HEALTHY: None,  # Accept all
-            OverloadState.BUSY: RequestPriority.LOW,  # Shed LOW only
-            OverloadState.STRESSED: RequestPriority.NORMAL,  # Shed NORMAL and LOW
-            OverloadState.OVERLOADED: RequestPriority.HIGH,  # Shed all except CRITICAL
+            OverloadState.BUSY: RequestPriority.LOW,  # Shed TELEMETRY only
+            OverloadState.STRESSED: RequestPriority.NORMAL,  # Shed DATA and TELEMETRY
+            OverloadState.OVERLOADED: RequestPriority.HIGH,  # Shed all except CONTROL
         }
     )
 
 
-# Default message type to priority classification
+# Legacy message type to priority mapping for backwards compatibility
+# New code should use classify_handler_to_priority() which uses AD-37 MessageClass
 DEFAULT_MESSAGE_PRIORITIES: dict[str, RequestPriority] = {
-    # CRITICAL priority
+    # CRITICAL/CONTROL priority - never shed
     "Ping": RequestPriority.CRITICAL,
     "Ack": RequestPriority.CRITICAL,
     "Nack": RequestPriority.CRITICAL,
@@ -73,7 +87,7 @@ DEFAULT_MESSAGE_PRIORITIES: dict[str, RequestPriority] = {
     "JobFinalResult": RequestPriority.CRITICAL,
     "Heartbeat": RequestPriority.CRITICAL,
     "HealthCheck": RequestPriority.CRITICAL,
-    # HIGH priority
+    # HIGH/DISPATCH priority
     "SubmitJob": RequestPriority.HIGH,
     "SubmitJobResponse": RequestPriority.HIGH,
     "JobAssignment": RequestPriority.HIGH,
@@ -86,7 +100,7 @@ DEFAULT_MESSAGE_PRIORITIES: dict[str, RequestPriority] = {
     "AntiEntropyResponse": RequestPriority.HIGH,
     "JobLeaderGateTransfer": RequestPriority.HIGH,
     "JobLeaderGateTransferAck": RequestPriority.HIGH,
-    # NORMAL priority
+    # NORMAL/DATA priority
     "JobProgress": RequestPriority.NORMAL,
     "JobStatusRequest": RequestPriority.NORMAL,
     "JobStatusResponse": RequestPriority.NORMAL,
@@ -95,7 +109,7 @@ DEFAULT_MESSAGE_PRIORITIES: dict[str, RequestPriority] = {
     "RegisterCallbackResponse": RequestPriority.NORMAL,
     "StatsUpdate": RequestPriority.NORMAL,
     "StatsQuery": RequestPriority.NORMAL,
-    # LOW priority
+    # LOW/TELEMETRY priority - shed first
     "DetailedStatsRequest": RequestPriority.LOW,
     "DetailedStatsResponse": RequestPriority.LOW,
     "DebugRequest": RequestPriority.LOW,
@@ -103,6 +117,23 @@ DEFAULT_MESSAGE_PRIORITIES: dict[str, RequestPriority] = {
     "DiagnosticsRequest": RequestPriority.LOW,
     "DiagnosticsResponse": RequestPriority.LOW,
 }
+
+
+def classify_handler_to_priority(handler_name: str) -> RequestPriority:
+    """
+    Classify a handler using AD-37 MessageClass and return RequestPriority.
+
+    This is the preferred classification method that uses the unified
+    AD-37 message classification system.
+
+    Args:
+        handler_name: Name of the handler (e.g., "receive_workflow_progress")
+
+    Returns:
+        RequestPriority based on AD-37 MessageClass
+    """
+    message_class = classify_handler(handler_name)
+    return MESSAGE_CLASS_TO_REQUEST_PRIORITY[message_class]
 
 
 class LoadShedder:
@@ -173,6 +204,9 @@ class LoadShedder:
         """
         Determine if a request should be shed based on current load.
 
+        Uses legacy message type mapping. For AD-37 compliant classification,
+        use should_shed_handler() instead.
+
         Args:
             message_type: The type of message/request
             cpu_percent: Current CPU utilization (0-100), optional
@@ -184,6 +218,31 @@ class LoadShedder:
         self._total_requests += 1
 
         priority = self.classify_request(message_type)
+        return self.should_shed_priority(priority, cpu_percent, memory_percent)
+
+    def should_shed_handler(
+        self,
+        handler_name: str,
+        cpu_percent: float | None = None,
+        memory_percent: float | None = None,
+    ) -> bool:
+        """
+        Determine if a request should be shed using AD-37 MessageClass classification.
+
+        This is the preferred method for AD-37 compliant load shedding.
+        Uses classify_handler() to determine MessageClass and maps to RequestPriority.
+
+        Args:
+            handler_name: Name of the handler (e.g., "receive_workflow_progress")
+            cpu_percent: Current CPU utilization (0-100), optional
+            memory_percent: Current memory utilization (0-100), optional
+
+        Returns:
+            True if request should be shed, False if it should be processed
+        """
+        self._total_requests += 1
+
+        priority = classify_handler_to_priority(handler_name)
         return self.should_shed_priority(priority, cpu_percent, memory_percent)
 
     def should_shed_priority(

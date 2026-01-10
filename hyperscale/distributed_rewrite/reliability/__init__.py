@@ -24,6 +24,8 @@ from hyperscale.distributed_rewrite.reliability.load_shedding import (
     LoadShedder as LoadShedder,
     LoadShedderConfig as LoadShedderConfig,
     RequestPriority as RequestPriority,
+    MESSAGE_CLASS_TO_REQUEST_PRIORITY as MESSAGE_CLASS_TO_REQUEST_PRIORITY,
+    classify_handler_to_priority as classify_handler_to_priority,
 )
 from hyperscale.distributed_rewrite.reliability.backpressure import (
     BackpressureLevel as BackpressureLevel,

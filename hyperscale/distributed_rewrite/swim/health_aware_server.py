@@ -2330,10 +2330,18 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         self, base_timeout: float, target_node_id: str | None = None
     ) -> float:
         """
-        Get timeout adjusted by Local Health Multiplier, degradation level, and peer health.
+        Get timeout adjusted by Local Health Multiplier, degradation level, peer health,
+        and Vivaldi-based latency (AD-35 Task 12.6.3).
 
         Phase 6.2: When probing a peer that we know is overloaded (via health gossip),
         we extend the timeout to avoid false failure detection.
+
+        AD-35: When Vivaldi coordinates are available, adjust timeout based on estimated RTT
+        to account for geographic distance.
+
+        Formula: timeout = base × lhm × degradation × latency_mult × confidence_adj
+        - latency_mult = min(10.0, max(1.0, estimated_rtt / reference_rtt))
+        - confidence_adj = 1.0 + (coordinate_error / 10.0)
 
         Args:
             base_timeout: Base probe timeout in seconds
@@ -2345,6 +2353,29 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         lhm_multiplier = self._local_health.get_multiplier()
         degradation_multiplier = self._degradation.get_timeout_multiplier()
         base_adjusted = base_timeout * lhm_multiplier * degradation_multiplier
+
+        # AD-35 Task 12.6.3: Apply Vivaldi-based latency multiplier
+        if target_node_id:
+            peer_coord = self._coordinate_tracker.get_peer_coordinate(target_node_id)
+            if peer_coord is not None:
+                # Estimate RTT with upper confidence bound for conservative timeout
+                estimated_rtt_ms = self._coordinate_tracker.estimate_rtt_ucb_ms(
+                    peer_coordinate=peer_coord
+                )
+                reference_rtt_ms = 10.0  # Same-datacenter baseline (10ms)
+
+                # Latency multiplier: 1.0x for same-DC, up to 10.0x for cross-continent
+                latency_multiplier = min(
+                    10.0,
+                    max(1.0, estimated_rtt_ms / reference_rtt_ms)
+                )
+
+                # Confidence adjustment based on coordinate quality
+                # Lower quality (higher error) → higher adjustment (more conservative)
+                quality = self._coordinate_tracker.coordinate_quality(peer_coord)
+                confidence_adjustment = 1.0 + (1.0 - quality) * 0.5
+
+                base_adjusted *= latency_multiplier * confidence_adjustment
 
         # Apply peer health-aware timeout adjustment (Phase 6.2)
         if target_node_id:

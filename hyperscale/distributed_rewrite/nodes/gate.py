@@ -140,6 +140,8 @@ from hyperscale.distributed_rewrite.reliability import (
     RetryExecutor,
     RetryConfig,
     JitterStrategy,
+    BackpressureLevel,
+    BackpressureSignal,
 )
 from hyperscale.distributed_rewrite.jobs.gates import (
     GateJobManager,
@@ -304,6 +306,15 @@ class GateServer(HealthAwareServer):
         # Tracks latency and sheds low-priority requests under load
         self._overload_detector = HybridOverloadDetector()
         self._load_shedder = LoadShedder(self._overload_detector)
+
+        # AD-37: Manager backpressure tracking for forwarded updates
+        # Tracks backpressure signals from managers to throttle forwarded progress updates
+        # Maps manager_addr -> BackpressureLevel
+        self._manager_backpressure: dict[tuple[str, int], BackpressureLevel] = {}
+        # Current max backpressure delay from any manager (milliseconds)
+        self._backpressure_delay_ms: int = 0
+        # Per-datacenter backpressure aggregation (max level across managers in DC)
+        self._dc_backpressure: dict[str, BackpressureLevel] = {}
 
         # Throughput tracking for AD-19 Three-Signal Health Model
         # Tracks job forwards per interval for health signal calculation
