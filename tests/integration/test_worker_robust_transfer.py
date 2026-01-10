@@ -759,3 +759,636 @@ class TestLogging:
 
         assert any("Rejected" in msg for msg in worker.log_messages)
         assert any("Unknown manager" in msg for msg in worker.log_messages)
+
+
+# =============================================================================
+# Extended Tests: Negative Paths and Failure Modes
+# =============================================================================
+
+
+class TestNegativePaths:
+    """Tests for error handling and negative scenarios."""
+
+    @pytest.mark.asyncio
+    async def test_transfer_with_empty_workflow_list(self):
+        """Transfer with empty workflow list should be accepted."""
+        worker = MockWorkerServer()
+        worker.known_managers["manager-new"] = ManagerInfo(
+            node_id="manager-new",
+            tcp_host="127.0.0.1",
+            tcp_port=8001,
+            udp_host="127.0.0.1",
+            udp_port=8002,
+        )
+
+        transfer = JobLeaderWorkerTransfer(
+            job_id="job-1",
+            workflow_ids=[],  # Empty list
+            new_manager_id="manager-new",
+            new_manager_addr=("127.0.0.1", 8001),
+            fence_token=1,
+        )
+
+        ack = await worker.job_leader_worker_transfer(transfer)
+
+        assert ack.accepted is True
+        assert ack.workflows_updated == 0
+
+    @pytest.mark.asyncio
+    async def test_transfer_with_equal_fence_token_rejected(self):
+        """Transfer with equal fence token (not greater) should be rejected."""
+        worker = MockWorkerServer()
+        worker.known_managers["manager-new"] = ManagerInfo(
+            node_id="manager-new",
+            tcp_host="127.0.0.1",
+            tcp_port=8001,
+            udp_host="127.0.0.1",
+            udp_port=8002,
+        )
+
+        # Set current fence token
+        worker.job_fence_tokens["job-1"] = 5
+
+        # Try transfer with EQUAL fence token
+        transfer = JobLeaderWorkerTransfer(
+            job_id="job-1",
+            workflow_ids=["wf-1"],
+            new_manager_id="manager-new",
+            new_manager_addr=("127.0.0.1", 8001),
+            fence_token=5,  # Equal to current 5
+        )
+
+        ack = await worker.job_leader_worker_transfer(transfer)
+
+        assert ack.accepted is False
+        assert "Stale fence token" in ack.rejection_reason
+
+    @pytest.mark.asyncio
+    async def test_transfer_with_negative_fence_token(self):
+        """Transfer with negative fence token should work if first."""
+        worker = MockWorkerServer()
+        worker.known_managers["manager-new"] = ManagerInfo(
+            node_id="manager-new",
+            tcp_host="127.0.0.1",
+            tcp_port=8001,
+            udp_host="127.0.0.1",
+            udp_port=8002,
+        )
+
+        transfer = JobLeaderWorkerTransfer(
+            job_id="job-1",
+            workflow_ids=["wf-1"],
+            new_manager_id="manager-new",
+            new_manager_addr=("127.0.0.1", 8001),
+            fence_token=-1,  # Negative but > default -1
+        )
+
+        # Default is -1, so -1 should be rejected (not > -1)
+        ack = await worker.job_leader_worker_transfer(transfer)
+
+        assert ack.accepted is False
+
+    @pytest.mark.asyncio
+    async def test_transfer_with_zero_fence_token(self):
+        """Transfer with zero fence token should work for new job."""
+        worker = MockWorkerServer()
+        worker.known_managers["manager-new"] = ManagerInfo(
+            node_id="manager-new",
+            tcp_host="127.0.0.1",
+            tcp_port=8001,
+            udp_host="127.0.0.1",
+            udp_port=8002,
+        )
+
+        transfer = JobLeaderWorkerTransfer(
+            job_id="job-1",
+            workflow_ids=["wf-1"],
+            new_manager_id="manager-new",
+            new_manager_addr=("127.0.0.1", 8001),
+            fence_token=0,  # 0 > -1 (default)
+        )
+
+        ack = await worker.job_leader_worker_transfer(transfer)
+
+        assert ack.accepted is True
+        assert worker.job_fence_tokens["job-1"] == 0
+
+    @pytest.mark.asyncio
+    async def test_duplicate_workflow_ids_in_transfer(self):
+        """Transfer with duplicate workflow IDs should handle gracefully."""
+        worker = MockWorkerServer()
+        worker.known_managers["manager-new"] = ManagerInfo(
+            node_id="manager-new",
+            tcp_host="127.0.0.1",
+            tcp_port=8001,
+            udp_host="127.0.0.1",
+            udp_port=8002,
+        )
+
+        worker.active_workflows["wf-1"] = WorkflowProgress(
+            job_id="job-1",
+            workflow_id="wf-1",
+            workflow_name="test",
+            status=WorkflowStatus.RUNNING.value,
+            completed_count=0,
+            failed_count=0,
+            rate_per_second=0.0,
+            elapsed_seconds=0.0,
+            timestamp=time.monotonic(),
+        )
+        worker.workflow_job_leader["wf-1"] = ("127.0.0.1", 8000)
+
+        transfer = JobLeaderWorkerTransfer(
+            job_id="job-1",
+            workflow_ids=["wf-1", "wf-1", "wf-1"],  # Duplicates
+            new_manager_id="manager-new",
+            new_manager_addr=("127.0.0.1", 8001),
+            fence_token=1,
+        )
+
+        ack = await worker.job_leader_worker_transfer(transfer)
+
+        assert ack.accepted is True
+        # Counted 3 times but same workflow
+        assert ack.workflows_updated == 3
+
+
+class TestConcurrencyRaceConditions:
+    """Tests for concurrent operations and race conditions."""
+
+    @pytest.mark.asyncio
+    async def test_concurrent_transfers_different_jobs(self):
+        """Concurrent transfers for different jobs should all succeed."""
+        worker = MockWorkerServer()
+        worker.known_managers["manager-new"] = ManagerInfo(
+            node_id="manager-new",
+            tcp_host="127.0.0.1",
+            tcp_port=8001,
+            udp_host="127.0.0.1",
+            udp_port=8002,
+        )
+
+        transfers = [
+            JobLeaderWorkerTransfer(
+                job_id=f"job-{i}",
+                workflow_ids=[f"wf-{i}"],
+                new_manager_id="manager-new",
+                new_manager_addr=("127.0.0.1", 8001),
+                fence_token=1,
+            )
+            for i in range(10)
+        ]
+
+        results = await asyncio.gather(*[
+            worker.job_leader_worker_transfer(t) for t in transfers
+        ])
+
+        # All should be accepted
+        assert all(r.accepted for r in results)
+        assert worker.transfer_metrics_accepted == 10
+
+    @pytest.mark.asyncio
+    async def test_rapid_successive_transfers_same_job(self):
+        """Rapid successive transfers for same job with increasing tokens."""
+        worker = MockWorkerServer()
+        worker.known_managers["manager-new"] = ManagerInfo(
+            node_id="manager-new",
+            tcp_host="127.0.0.1",
+            tcp_port=8001,
+            udp_host="127.0.0.1",
+            udp_port=8002,
+        )
+
+        # Sequential transfers with increasing tokens
+        for i in range(20):
+            transfer = JobLeaderWorkerTransfer(
+                job_id="job-1",
+                workflow_ids=["wf-1"],
+                new_manager_id="manager-new",
+                new_manager_addr=("127.0.0.1", 8001),
+                fence_token=i,
+            )
+            ack = await worker.job_leader_worker_transfer(transfer)
+            assert ack.accepted is True
+
+        assert worker.job_fence_tokens["job-1"] == 19
+
+    @pytest.mark.asyncio
+    async def test_interleaved_accepted_and_rejected_transfers(self):
+        """Interleaved accepted and rejected transfers should be tracked correctly."""
+        worker = MockWorkerServer()
+        worker.known_managers["manager-known"] = ManagerInfo(
+            node_id="manager-known",
+            tcp_host="127.0.0.1",
+            tcp_port=8001,
+            udp_host="127.0.0.1",
+            udp_port=8002,
+        )
+
+        # Set initial fence token
+        worker.job_fence_tokens["job-1"] = 10
+
+        results = []
+        for i in range(5):
+            # Alternating valid (higher token) and invalid (lower token)
+            if i % 2 == 0:
+                token = 11 + i  # Valid: higher
+                manager = "manager-known"
+            else:
+                token = 5 + i  # Invalid: lower
+                manager = "manager-known"
+
+            transfer = JobLeaderWorkerTransfer(
+                job_id="job-1",
+                workflow_ids=["wf-1"],
+                new_manager_id=manager,
+                new_manager_addr=("127.0.0.1", 8001),
+                fence_token=token,
+            )
+            results.append(await worker.job_leader_worker_transfer(transfer))
+
+        accepted = [r for r in results if r.accepted]
+        rejected = [r for r in results if not r.accepted]
+
+        assert len(accepted) == 3  # i=0,2,4 (tokens 11, 13, 15)
+        assert len(rejected) == 2  # i=1,3 (tokens 6, 8)
+
+
+class TestEdgeCasesAndBoundaryConditions:
+    """Tests for edge cases and boundary conditions."""
+
+    @pytest.mark.asyncio
+    async def test_very_large_fence_token(self):
+        """Worker should handle very large fence tokens."""
+        worker = MockWorkerServer()
+        worker.known_managers["manager-new"] = ManagerInfo(
+            node_id="manager-new",
+            tcp_host="127.0.0.1",
+            tcp_port=8001,
+            udp_host="127.0.0.1",
+            udp_port=8002,
+        )
+
+        transfer = JobLeaderWorkerTransfer(
+            job_id="job-1",
+            workflow_ids=["wf-1"],
+            new_manager_id="manager-new",
+            new_manager_addr=("127.0.0.1", 8001),
+            fence_token=2**63 - 1,  # Max int64
+        )
+
+        ack = await worker.job_leader_worker_transfer(transfer)
+
+        assert ack.accepted is True
+        assert worker.job_fence_tokens["job-1"] == 2**63 - 1
+
+    @pytest.mark.asyncio
+    async def test_workflow_id_with_special_characters(self):
+        """Worker should handle workflow IDs with special characters."""
+        worker = MockWorkerServer()
+        worker.known_managers["manager-new"] = ManagerInfo(
+            node_id="manager-new",
+            tcp_host="127.0.0.1",
+            tcp_port=8001,
+            udp_host="127.0.0.1",
+            udp_port=8002,
+        )
+
+        special_ids = [
+            "wf:with:colons",
+            "wf-with-dashes",
+            "wf_with_underscores",
+            "wf.with.dots",
+        ]
+
+        for wf_id in special_ids:
+            worker.active_workflows[wf_id] = WorkflowProgress(
+                job_id="job-1",
+                workflow_id=wf_id,
+                workflow_name="test",
+                status=WorkflowStatus.RUNNING.value,
+                completed_count=0,
+                failed_count=0,
+                rate_per_second=0.0,
+                elapsed_seconds=0.0,
+                timestamp=time.monotonic(),
+            )
+            worker.workflow_job_leader[wf_id] = ("127.0.0.1", 8000)
+
+        transfer = JobLeaderWorkerTransfer(
+            job_id="job-1",
+            workflow_ids=special_ids,
+            new_manager_id="manager-new",
+            new_manager_addr=("127.0.0.1", 8001),
+            fence_token=1,
+        )
+
+        ack = await worker.job_leader_worker_transfer(transfer)
+
+        assert ack.accepted is True
+        assert ack.workflows_updated == 4
+
+    @pytest.mark.asyncio
+    async def test_very_long_workflow_id(self):
+        """Worker should handle very long workflow IDs."""
+        worker = MockWorkerServer()
+        worker.known_managers["manager-new"] = ManagerInfo(
+            node_id="manager-new",
+            tcp_host="127.0.0.1",
+            tcp_port=8001,
+            udp_host="127.0.0.1",
+            udp_port=8002,
+        )
+
+        long_id = "w" * 1000
+
+        worker.active_workflows[long_id] = WorkflowProgress(
+            job_id="job-1",
+            workflow_id=long_id,
+            workflow_name="test",
+            status=WorkflowStatus.RUNNING.value,
+            completed_count=0,
+            failed_count=0,
+            rate_per_second=0.0,
+            elapsed_seconds=0.0,
+            timestamp=time.monotonic(),
+        )
+        worker.workflow_job_leader[long_id] = ("127.0.0.1", 8000)
+
+        transfer = JobLeaderWorkerTransfer(
+            job_id="job-1",
+            workflow_ids=[long_id],
+            new_manager_id="manager-new",
+            new_manager_addr=("127.0.0.1", 8001),
+            fence_token=1,
+        )
+
+        ack = await worker.job_leader_worker_transfer(transfer)
+
+        assert ack.accepted is True
+        assert ack.workflows_updated == 1
+
+    @pytest.mark.asyncio
+    async def test_large_number_of_workflows_in_transfer(self):
+        """Worker should handle transfer with many workflows."""
+        worker = MockWorkerServer()
+        worker.known_managers["manager-new"] = ManagerInfo(
+            node_id="manager-new",
+            tcp_host="127.0.0.1",
+            tcp_port=8001,
+            udp_host="127.0.0.1",
+            udp_port=8002,
+        )
+
+        # Add 1000 workflows
+        workflow_ids = [f"wf-{i:06d}" for i in range(1000)]
+        for wf_id in workflow_ids:
+            worker.active_workflows[wf_id] = WorkflowProgress(
+                job_id="job-1",
+                workflow_id=wf_id,
+                workflow_name="test",
+                status=WorkflowStatus.RUNNING.value,
+                completed_count=0,
+                failed_count=0,
+                rate_per_second=0.0,
+                elapsed_seconds=0.0,
+                timestamp=time.monotonic(),
+            )
+            worker.workflow_job_leader[wf_id] = ("127.0.0.1", 8000)
+
+        transfer = JobLeaderWorkerTransfer(
+            job_id="job-1",
+            workflow_ids=workflow_ids,
+            new_manager_id="manager-new",
+            new_manager_addr=("127.0.0.1", 8001),
+            fence_token=1,
+        )
+
+        ack = await worker.job_leader_worker_transfer(transfer)
+
+        assert ack.accepted is True
+        assert ack.workflows_updated == 1000
+
+
+class TestPendingTransferEdgeCases:
+    """Tests for pending transfer edge cases."""
+
+    @pytest.mark.asyncio
+    async def test_pending_transfer_overwrites_previous(self):
+        """Later pending transfer should overwrite earlier one for same job."""
+        worker = MockWorkerServer()
+        worker.known_managers["manager-1"] = ManagerInfo(
+            node_id="manager-1",
+            tcp_host="127.0.0.1",
+            tcp_port=8001,
+            udp_host="127.0.0.1",
+            udp_port=8002,
+        )
+        worker.known_managers["manager-2"] = ManagerInfo(
+            node_id="manager-2",
+            tcp_host="127.0.0.1",
+            tcp_port=8003,
+            udp_host="127.0.0.1",
+            udp_port=8004,
+        )
+
+        # First transfer creates pending
+        transfer1 = JobLeaderWorkerTransfer(
+            job_id="job-1",
+            workflow_ids=["wf-1"],
+            new_manager_id="manager-1",
+            new_manager_addr=("127.0.0.1", 8001),
+            fence_token=1,
+        )
+        await worker.job_leader_worker_transfer(transfer1)
+
+        assert worker.pending_transfers["job-1"].new_manager_id == "manager-1"
+
+        # Second transfer overwrites
+        transfer2 = JobLeaderWorkerTransfer(
+            job_id="job-1",
+            workflow_ids=["wf-2"],
+            new_manager_id="manager-2",
+            new_manager_addr=("127.0.0.1", 8003),
+            fence_token=2,
+        )
+        await worker.job_leader_worker_transfer(transfer2)
+
+        assert worker.pending_transfers["job-1"].new_manager_id == "manager-2"
+        assert worker.pending_transfers["job-1"].workflow_ids == ["wf-2"]
+
+    @pytest.mark.asyncio
+    async def test_pending_transfer_not_created_if_all_workflows_found(self):
+        """No pending transfer if all workflows are found."""
+        worker = MockWorkerServer()
+        worker.known_managers["manager-new"] = ManagerInfo(
+            node_id="manager-new",
+            tcp_host="127.0.0.1",
+            tcp_port=8001,
+            udp_host="127.0.0.1",
+            udp_port=8002,
+        )
+
+        # Add all workflows
+        for wf_id in ["wf-1", "wf-2"]:
+            worker.active_workflows[wf_id] = WorkflowProgress(
+                job_id="job-1",
+                workflow_id=wf_id,
+                workflow_name="test",
+                status=WorkflowStatus.RUNNING.value,
+                completed_count=0,
+                failed_count=0,
+                rate_per_second=0.0,
+                elapsed_seconds=0.0,
+                timestamp=time.monotonic(),
+            )
+            worker.workflow_job_leader[wf_id] = ("127.0.0.1", 8000)
+
+        transfer = JobLeaderWorkerTransfer(
+            job_id="job-1",
+            workflow_ids=["wf-1", "wf-2"],
+            new_manager_id="manager-new",
+            new_manager_addr=("127.0.0.1", 8001),
+            fence_token=1,
+        )
+
+        await worker.job_leader_worker_transfer(transfer)
+
+        # No pending transfer created
+        assert "job-1" not in worker.pending_transfers
+
+
+class TestMultipleWorkflowStates:
+    """Tests for handling workflows in various states."""
+
+    @pytest.mark.asyncio
+    async def test_transfer_updates_workflows_in_various_states(self):
+        """Transfer should update workflows regardless of their state."""
+        worker = MockWorkerServer()
+        worker.known_managers["manager-new"] = ManagerInfo(
+            node_id="manager-new",
+            tcp_host="127.0.0.1",
+            tcp_port=8001,
+            udp_host="127.0.0.1",
+            udp_port=8002,
+        )
+
+        states = [
+            WorkflowStatus.PENDING.value,
+            WorkflowStatus.RUNNING.value,
+            WorkflowStatus.COMPLETING.value,
+            WorkflowStatus.COMPLETED.value,
+        ]
+
+        for i, status in enumerate(states):
+            wf_id = f"wf-{i}"
+            worker.active_workflows[wf_id] = WorkflowProgress(
+                job_id="job-1",
+                workflow_id=wf_id,
+                workflow_name=f"test-{i}",
+                status=status,
+                completed_count=0,
+                failed_count=0,
+                rate_per_second=0.0,
+                elapsed_seconds=0.0,
+                timestamp=time.monotonic(),
+            )
+            worker.workflow_job_leader[wf_id] = ("127.0.0.1", 8000)
+
+        transfer = JobLeaderWorkerTransfer(
+            job_id="job-1",
+            workflow_ids=[f"wf-{i}" for i in range(4)],
+            new_manager_id="manager-new",
+            new_manager_addr=("127.0.0.1", 8001),
+            fence_token=1,
+        )
+
+        ack = await worker.job_leader_worker_transfer(transfer)
+
+        assert ack.accepted is True
+        assert ack.workflows_updated == 4
+        assert len(ack.workflow_states) == 4
+        assert ack.workflow_states["wf-0"] == WorkflowStatus.PENDING.value
+        assert ack.workflow_states["wf-1"] == WorkflowStatus.RUNNING.value
+
+    @pytest.mark.asyncio
+    async def test_mixed_orphaned_and_non_orphaned_workflows(self):
+        """Transfer should clear orphan status for orphaned workflows only."""
+        worker = MockWorkerServer()
+        worker.known_managers["manager-new"] = ManagerInfo(
+            node_id="manager-new",
+            tcp_host="127.0.0.1",
+            tcp_port=8001,
+            udp_host="127.0.0.1",
+            udp_port=8002,
+        )
+
+        # Add workflows
+        for wf_id in ["wf-1", "wf-2", "wf-3"]:
+            worker.active_workflows[wf_id] = WorkflowProgress(
+                job_id="job-1",
+                workflow_id=wf_id,
+                workflow_name="test",
+                status=WorkflowStatus.RUNNING.value,
+                completed_count=0,
+                failed_count=0,
+                rate_per_second=0.0,
+                elapsed_seconds=0.0,
+                timestamp=time.monotonic(),
+            )
+            worker.workflow_job_leader[wf_id] = ("127.0.0.1", 8000)
+
+        # Only wf-1 and wf-2 are orphaned
+        worker.orphaned_workflows["wf-1"] = time.monotonic()
+        worker.orphaned_workflows["wf-2"] = time.monotonic()
+
+        transfer = JobLeaderWorkerTransfer(
+            job_id="job-1",
+            workflow_ids=["wf-1", "wf-2", "wf-3"],
+            new_manager_id="manager-new",
+            new_manager_addr=("127.0.0.1", 8001),
+            fence_token=1,
+        )
+
+        await worker.job_leader_worker_transfer(transfer)
+
+        # All orphan statuses should be cleared
+        assert "wf-1" not in worker.orphaned_workflows
+        assert "wf-2" not in worker.orphaned_workflows
+        assert "wf-3" not in worker.orphaned_workflows  # Was never orphaned
+
+
+class TestLockBehavior:
+    """Tests for per-job lock behavior."""
+
+    @pytest.mark.asyncio
+    async def test_lock_created_on_first_access(self):
+        """Lock should be created on first access for a job."""
+        worker = MockWorkerServer()
+
+        assert "job-1" not in worker.job_leader_transfer_locks
+
+        lock = worker._get_job_transfer_lock("job-1")
+
+        assert "job-1" in worker.job_leader_transfer_locks
+        assert lock is worker.job_leader_transfer_locks["job-1"]
+
+    @pytest.mark.asyncio
+    async def test_same_lock_returned_on_subsequent_access(self):
+        """Same lock should be returned on subsequent accesses."""
+        worker = MockWorkerServer()
+
+        lock1 = worker._get_job_transfer_lock("job-1")
+        lock2 = worker._get_job_transfer_lock("job-1")
+
+        assert lock1 is lock2
+
+    @pytest.mark.asyncio
+    async def test_different_locks_for_different_jobs(self):
+        """Different jobs should have different locks."""
+        worker = MockWorkerServer()
+
+        lock1 = worker._get_job_transfer_lock("job-1")
+        lock2 = worker._get_job_transfer_lock("job-2")
+
+        assert lock1 is not lock2
