@@ -4300,11 +4300,9 @@ class ManagerServer(HealthAwareServer):
 
         # Get or create per-worker dispatch semaphore to limit concurrent dispatches
         # This prevents overloading a single worker with too many simultaneous requests
-        if worker_node_id not in self._dispatch_semaphores:
-            self._dispatch_semaphores[worker_node_id] = asyncio.Semaphore(
-                self._dispatch_max_concurrent
-            )
-        dispatch_semaphore = self._dispatch_semaphores[worker_node_id]
+        dispatch_semaphore = self._dispatch_semaphores.setdefault(
+            worker_node_id, asyncio.Semaphore(self._dispatch_max_concurrent)
+        )
 
         self._task_runner.run(
             self._udp_logger.log,
@@ -8581,6 +8579,41 @@ class ManagerServer(HealthAwareServer):
     # TCP Handlers - Cancellation (AD-20)
     # =========================================================================
 
+    def _build_cancel_response(
+        self,
+        use_ad20: bool,
+        job_id: str,
+        success: bool,
+        error: str | None = None,
+        cancelled_count: int = 0,
+        already_cancelled: bool = False,
+        already_completed: bool = False,
+    ) -> bytes:
+        """Build cancel response in appropriate format (AD-20 or legacy)."""
+        if use_ad20:
+            return JobCancelResponse(
+                job_id=job_id,
+                success=success,
+                error=error,
+                cancelled_workflow_count=cancelled_count,
+                already_cancelled=already_cancelled,
+                already_completed=already_completed,
+            ).dump()
+        return CancelAck(
+            job_id=job_id,
+            cancelled=success,
+            error=error,
+            workflows_cancelled=cancelled_count,
+        ).dump()
+
+    def _is_ad20_cancel_request(self, data: bytes) -> bool:
+        """Check if cancel request data is AD-20 format."""
+        try:
+            JobCancelRequest.load(data)
+            return True
+        except Exception:
+            return False
+
     @tcp.receive()
     async def receive_cancel_job(
         self,
@@ -8612,7 +8645,7 @@ class ManagerServer(HealthAwareServer):
                 requester_id = cancel_request.requester_id
                 reason = cancel_request.reason
                 timestamp = cancel_request.timestamp
-                use_ad20_response = True
+                use_ad20 = True
             except Exception:
                 # Fall back to legacy CancelJob format
                 cancel = CancelJob.load(data)
@@ -8621,71 +8654,26 @@ class ManagerServer(HealthAwareServer):
                 requester_id = f"{addr[0]}:{addr[1]}"
                 reason = cancel.reason
                 timestamp = time.monotonic()
-                use_ad20_response = False
+                use_ad20 = False
 
             job = self._job_manager.get_job_by_id(job_id)
             if not job:
-                if use_ad20_response:
-                    return JobCancelResponse(
-                        job_id=job_id,
-                        success=False,
-                        error="Job not found",
-                    ).dump()
-                else:
-                    return CancelAck(
-                        job_id=job_id,
-                        cancelled=False,
-                        error="Job not found",
-                    ).dump()
+                return self._build_cancel_response(use_ad20, job_id, success=False, error="Job not found")
 
             # Check fence token if provided (prevents cancelling restarted jobs)
-            if fence_token > 0 and hasattr(job, 'fence_token'):
-                if job.fence_token != fence_token:
-                    error_msg = f"Fence token mismatch: expected {job.fence_token}, got {fence_token}"
-                    if use_ad20_response:
-                        return JobCancelResponse(
-                            job_id=job_id,
-                            success=False,
-                            error=error_msg,
-                        ).dump()
-                    else:
-                        return CancelAck(
-                            job_id=job_id,
-                            cancelled=False,
-                            error=error_msg,
-                        ).dump()
+            if fence_token > 0 and hasattr(job, 'fence_token') and job.fence_token != fence_token:
+                error_msg = f"Fence token mismatch: expected {job.fence_token}, got {fence_token}"
+                return self._build_cancel_response(use_ad20, job_id, success=False, error=error_msg)
 
             # Check if already cancelled (idempotency)
             if job.status == JobStatus.CANCELLED.value:
-                if use_ad20_response:
-                    return JobCancelResponse(
-                        job_id=job_id,
-                        success=True,
-                        already_cancelled=True,
-                        cancelled_workflow_count=0,
-                    ).dump()
-                else:
-                    return CancelAck(
-                        job_id=job_id,
-                        cancelled=True,
-                        workflows_cancelled=0,
-                    ).dump()
+                return self._build_cancel_response(use_ad20, job_id, success=True, already_cancelled=True)
 
             # Check if already completed (cannot cancel)
             if job.status == JobStatus.COMPLETED.value:
-                if use_ad20_response:
-                    return JobCancelResponse(
-                        job_id=job_id,
-                        success=False,
-                        already_completed=True,
-                        error="Job already completed",
-                    ).dump()
-                else:
-                    return CancelAck(
-                        job_id=job_id,
-                        cancelled=False,
-                        error="Job already completed",
-                    ).dump()
+                return self._build_cancel_response(
+                    use_ad20, job_id, success=False, already_completed=True, error="Job already completed"
+                )
 
             # Cancel all workflows on workers via sub_workflows from JobManager
             cancelled_count = 0
@@ -8705,7 +8693,7 @@ class ManagerServer(HealthAwareServer):
                     if worker and worker.registration:
                         try:
                             # Send AD-20 WorkflowCancelRequest to worker
-                            if use_ad20_response:
+                            if use_ad20:
                                 cancel_data = WorkflowCancelRequest(
                                     job_id=job_id,
                                     workflow_id=sub_wf.workflow_id,
@@ -8745,36 +8733,16 @@ class ManagerServer(HealthAwareServer):
             self._increment_version()
 
             # Build response
-            if use_ad20_response:
-                return JobCancelResponse(
-                    job_id=job_id,
-                    success=True,
-                    cancelled_workflow_count=cancelled_count,
-                    error="; ".join(errors) if errors else None,
-                ).dump()
-            else:
-                return CancelAck(
-                    job_id=job_id,
-                    cancelled=True,
-                    workflows_cancelled=cancelled_count,
-                ).dump()
+            error_str = "; ".join(errors) if errors else None
+            return self._build_cancel_response(
+                use_ad20, job_id, success=True, cancelled_count=cancelled_count, error=error_str
+            )
 
         except Exception as e:
             await self.handle_exception(e, "receive_cancel_job")
-            # Return error in appropriate format
-            try:
-                JobCancelRequest.load(data)
-                return JobCancelResponse(
-                    job_id="unknown",
-                    success=False,
-                    error=str(e),
-                ).dump()
-            except Exception:
-                return CancelAck(
-                    job_id="unknown",
-                    cancelled=False,
-                    error=str(e),
-                ).dump()
+            # Return error in appropriate format - detect format from request
+            is_ad20 = self._is_ad20_cancel_request(data)
+            return self._build_cancel_response(is_ad20, "unknown", success=False, error=str(e))
 
     @tcp.receive()
     async def workflow_cancellation_query(

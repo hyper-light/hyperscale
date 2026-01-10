@@ -173,6 +173,7 @@ class WorkerStateEmbedder:
             active_workflows=self.get_active_workflows(),
             tcp_host=self.get_tcp_host() if self.get_tcp_host else "",
             tcp_port=self.get_tcp_port() if self.get_tcp_port else 0,
+            coordinate=self.get_coordinate() if self.get_coordinate else None,
             # Health piggyback fields
             health_accepting_work=self.get_health_accepting_work()
             if self.get_health_accepting_work
@@ -208,11 +209,13 @@ class WorkerStateEmbedder:
         if self.on_manager_heartbeat:
             try:
                 obj = ManagerHeartbeat.load(state_data)  # Base unpickle
-                # Only process if actually a ManagerHeartbeat
                 if isinstance(obj, ManagerHeartbeat):
                     self.on_manager_heartbeat(obj, source_addr)
+                    if self.on_peer_coordinate and obj.coordinate:
+                        rtt_ms = self._probe_rtt_cache.pop(source_addr, None)
+                        if rtt_ms is not None:
+                            self.on_peer_coordinate(obj.node_id, obj.coordinate, rtt_ms)
             except Exception:
-                # Invalid data - ignore
                 pass
 
     def get_health_piggyback(self) -> HealthPiggyback | None:
@@ -241,6 +244,9 @@ class WorkerStateEmbedder:
             else "healthy",
             timestamp=time.monotonic(),
         )
+
+    def record_probe_rtt(self, source_addr: tuple[str, int], rtt_ms: float) -> None:
+        self._probe_rtt_cache[source_addr] = rtt_ms
 
 
 @dataclass(slots=True)
@@ -297,6 +303,11 @@ class ManagerStateEmbedder:
     get_tcp_port: Callable[[], int] | None = None
     get_udp_host: Callable[[], str] | None = None
     get_udp_port: Callable[[], int] | None = None
+    get_coordinate: Callable[[], NetworkCoordinate | None] | None = None
+    on_peer_coordinate: Callable[[str, NetworkCoordinate, float], None] | None = None
+    _probe_rtt_cache: dict[tuple[str, int], float] = field(
+        default_factory=dict, init=False, repr=False
+    )
     # Health piggyback fields (AD-19)
     get_health_accepting_jobs: Callable[[], bool] | None = None
     get_health_has_quorum: Callable[[], bool] | None = None
@@ -330,6 +341,7 @@ class ManagerStateEmbedder:
             tcp_port=self.get_tcp_port() if self.get_tcp_port else 0,
             udp_host=self.get_udp_host() if self.get_udp_host else "",
             udp_port=self.get_udp_port() if self.get_udp_port else 0,
+            coordinate=self.get_coordinate() if self.get_coordinate else None,
             # Health piggyback fields
             health_accepting_jobs=self.get_health_accepting_jobs()
             if self.get_health_accepting_jobs
@@ -380,13 +392,24 @@ class ManagerStateEmbedder:
 
         # Dispatch based on actual type
         if isinstance(obj, WorkerHeartbeat):
-            self.on_worker_heartbeat(obj, source_addr)
+            self.on_manager_heartbeat(obj, source_addr)
+            if self.on_peer_coordinate and obj.coordinate:
+                rtt_ms = self._probe_rtt_cache.pop(source_addr, None)
+                if rtt_ms is not None:
+                    self.on_peer_coordinate(obj.node_id, obj.coordinate, rtt_ms)
         elif isinstance(obj, ManagerHeartbeat) and self.on_manager_heartbeat:
-            # Don't process our own heartbeat
             if obj.node_id != self.get_node_id():
                 self.on_manager_heartbeat(obj, source_addr)
+                if self.on_peer_coordinate and obj.coordinate:
+                    rtt_ms = self._probe_rtt_cache.pop(source_addr, None)
+                    if rtt_ms is not None:
+                        self.on_peer_coordinate(obj.node_id, obj.coordinate, rtt_ms)
         elif isinstance(obj, GateHeartbeat) and self.on_gate_heartbeat:
             self.on_gate_heartbeat(obj, source_addr)
+            if self.on_peer_coordinate and obj.coordinate:
+                rtt_ms = self._probe_rtt_cache.pop(source_addr, None)
+                if rtt_ms is not None:
+                    self.on_peer_coordinate(obj.node_id, obj.coordinate, rtt_ms)
 
     def get_health_piggyback(self) -> HealthPiggyback | None:
         """
@@ -414,6 +437,9 @@ class ManagerStateEmbedder:
             else "healthy",
             timestamp=time.monotonic(),
         )
+
+    def record_probe_rtt(self, source_addr: tuple[str, int], rtt_ms: float) -> None:
+        self._probe_rtt_cache[source_addr] = rtt_ms
 
 
 @dataclass(slots=True)
