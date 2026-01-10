@@ -103,7 +103,12 @@ class MockWorkerServer:
         job_lock = self._get_job_transfer_lock(job_id)
         async with job_lock:
             # 8.2: Validate fence token
-            fence_valid, fence_reason = self._validate_transfer_fence_token(job_id, transfer.fence_token)
+            # Support both sync and async validation (for testing with delays)
+            fence_result = self._validate_transfer_fence_token(job_id, transfer.fence_token)
+            if asyncio.iscoroutine(fence_result):
+                fence_valid, fence_reason = await fence_result
+            else:
+                fence_valid, fence_reason = fence_result
             if not fence_valid:
                 self.transfer_metrics_rejected_stale_token += 1
                 self.log_messages.append(f"Rejected: {fence_reason}")
@@ -449,7 +454,7 @@ class TestTransferAcknowledgment:
             job_id="job-1",
             workflow_id="wf-2",
             workflow_name="test2",
-            status=WorkflowStatus.COMPLETING.value,
+            status=WorkflowStatus.ASSIGNED.value,
             completed_count=100,
             failed_count=0,
             rate_per_second=0.0,
@@ -474,7 +479,7 @@ class TestTransferAcknowledgment:
         assert ack.fence_token_received == 1
         assert ack.workflow_states == {
             "wf-1": WorkflowStatus.RUNNING.value,
-            "wf-2": WorkflowStatus.COMPLETING.value,
+            "wf-2": WorkflowStatus.ASSIGNED.value,
         }
 
     @pytest.mark.asyncio
@@ -1304,7 +1309,7 @@ class TestMultipleWorkflowStates:
         states = [
             WorkflowStatus.PENDING.value,
             WorkflowStatus.RUNNING.value,
-            WorkflowStatus.COMPLETING.value,
+            WorkflowStatus.ASSIGNED.value,
             WorkflowStatus.COMPLETED.value,
         ]
 
