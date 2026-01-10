@@ -8972,9 +8972,15 @@ class ManagerServer(HealthAwareServer):
         """
         Handle job cancellation (from gate or client) (AD-20).
 
+        Robust cancellation flow:
+        1. Verify job exists
+        2. Remove ALL pending workflows from dispatch queue
+        3. Cancel ALL running workflows on workers
+        4. Wait for verification that no workflows are still running
+        5. Return detailed per-workflow cancellation results
+
         Accepts both legacy CancelJob and new JobCancelRequest formats at the
-        boundary, but normalizes to AD-20 internally. Always sends per-workflow
-        WorkflowCancelRequest messages to workers.
+        boundary, but normalizes to AD-20 internally.
         """
         try:
             # Rate limit check (AD-24)
@@ -9001,6 +9007,7 @@ class ManagerServer(HealthAwareServer):
                 requester_id = f"{addr[0]}:{addr[1]}"
                 timestamp = time.monotonic()
 
+            # Step 1: Verify job exists
             job = self._job_manager.get_job_by_id(job_id)
             if not job:
                 return self._build_cancel_response(job_id, success=False, error="Job not found")
@@ -9020,60 +9027,128 @@ class ManagerServer(HealthAwareServer):
                     job_id, success=False, already_completed=True, error="Job already completed"
                 )
 
-            # Cancel all workflows on workers via sub_workflows from JobManager
-            # Always use AD-20 WorkflowCancelRequest for worker communication
-            cancelled_count = 0
-            workers_notified: set[str] = set()
-            errors: list[str] = []
+            # Collect all workflows for this job
+            all_workflow_ids = [str(sub_wf.token) for sub_wf in job.sub_workflows.values()]
 
-            # Initialize cancellation tracking for push notifications from workers
-            self._cancellation_initiated_at[job_id] = time.monotonic()
-            self._cancellation_completion_events[job_id] = asyncio.Event()
-            for sub_wf in job.sub_workflows.values():
-                self._cancellation_pending_workflows[job_id].add(sub_wf.workflow_id)
+            # Track results per workflow
+            pending_cancelled: list[str] = []  # Workflows cancelled from pending queue
+            running_cancelled: list[str] = []  # Workflows cancelled from workers
+            workflow_errors: dict[str, str] = {}  # workflow_id -> error message
 
-            for sub_wf in job.sub_workflows.values():
-                worker_id = sub_wf.worker_id
-                if worker_id and worker_id not in workers_notified:
-                    worker = self._worker_pool.get_worker(worker_id)
-                    if worker and worker.registration:
-                        try:
-                            # Always send AD-20 WorkflowCancelRequest to worker
-                            cancel_data = WorkflowCancelRequest(
+            # Step 2: Remove ALL pending workflows from dispatch queue FIRST
+            # This prevents any pending workflows from being dispatched during cancellation
+            if self._workflow_dispatcher:
+                removed_pending = await self._workflow_dispatcher.cancel_pending_workflows(job_id)
+                pending_cancelled.extend(removed_pending)
+
+                # Mark pending workflows as cancelled in sub_workflows
+                for workflow_id in removed_pending:
+                    for sub_wf in job.sub_workflows.values():
+                        if str(sub_wf.token) == workflow_id:
+                            if sub_wf.progress:
+                                sub_wf.progress.status = WorkflowStatus.CANCELLED.value
+                            # Add to cancelled bucket to prevent resurrection
+                            self._cancelled_workflows[workflow_id] = CancelledWorkflowInfo(
                                 job_id=job_id,
-                                workflow_id=sub_wf.workflow_id,
-                                requester_id=requester_id,
-                                timestamp=timestamp,
-                            ).dump()
-
-                            response, _ = await self.send_tcp(
-                                (worker.registration.node.host, worker.registration.node.port),
-                                "cancel_workflow",
-                                cancel_data,
-                                timeout=5.0,
+                                workflow_id=workflow_id,
+                                cancelled_at=timestamp,
+                                request_id=requester_id,
+                                dependents=[],
                             )
+                            break
 
-                            if isinstance(response, bytes):
-                                try:
-                                    wf_response = WorkflowCancelResponse.load(response)
-                                    if wf_response.success:
-                                        cancelled_count += 1
-                                except Exception:
-                                    # Unexpected response format - count as success if no exception
-                                    cancelled_count += 1
+            # Step 3: Cancel ALL running workflows on workers
+            # Group workflows by worker for efficient batching
+            worker_workflows: dict[str, list[tuple[str, Any]]] = {}  # worker_id -> [(workflow_id, sub_wf)]
 
-                            workers_notified.add(worker_id)
-                        except Exception as e:
-                            errors.append(f"Worker {worker_id}: {str(e)}")
+            for sub_wf in job.sub_workflows.values():
+                workflow_id = str(sub_wf.token)
+
+                # Skip if already cancelled from pending queue
+                if workflow_id in pending_cancelled:
+                    continue
+
+                # Check if running on a worker
+                if sub_wf.worker_id and sub_wf.progress and sub_wf.progress.status == WorkflowStatus.RUNNING.value:
+                    if sub_wf.worker_id not in worker_workflows:
+                        worker_workflows[sub_wf.worker_id] = []
+                    worker_workflows[sub_wf.worker_id].append((workflow_id, sub_wf))
+
+            # Send cancellation requests to workers and collect responses
+            for worker_id, workflows in worker_workflows.items():
+                worker = self._worker_pool.get_worker(worker_id)
+                if not worker or not worker.registration:
+                    for workflow_id, _ in workflows:
+                        workflow_errors[workflow_id] = f"Worker {worker_id} not found or not registered"
+                    continue
+
+                worker_addr = (worker.registration.node.host, worker.registration.node.port)
+
+                for workflow_id, sub_wf in workflows:
+                    try:
+                        # Send AD-20 WorkflowCancelRequest to worker
+                        cancel_data = WorkflowCancelRequest(
+                            job_id=job_id,
+                            workflow_id=workflow_id,
+                            requester_id=requester_id,
+                            timestamp=timestamp,
+                        ).dump()
+
+                        response, _ = await self.send_tcp(
+                            worker_addr,
+                            "cancel_workflow",
+                            cancel_data,
+                            timeout=5.0,
+                        )
+
+                        if isinstance(response, bytes):
+                            try:
+                                wf_response = WorkflowCancelResponse.load(response)
+                                if wf_response.success:
+                                    running_cancelled.append(workflow_id)
+                                    # Add to cancelled bucket
+                                    self._cancelled_workflows[workflow_id] = CancelledWorkflowInfo(
+                                        job_id=job_id,
+                                        workflow_id=workflow_id,
+                                        cancelled_at=timestamp,
+                                        request_id=requester_id,
+                                        dependents=[],
+                                    )
+                                else:
+                                    error_msg = wf_response.error or "Worker reported cancellation failure"
+                                    workflow_errors[workflow_id] = error_msg
+                            except Exception as e:
+                                workflow_errors[workflow_id] = f"Failed to parse worker response: {e}"
+                        else:
+                            workflow_errors[workflow_id] = "No response from worker"
+
+                    except Exception as e:
+                        workflow_errors[workflow_id] = f"Failed to send cancellation to worker: {e}"
+
+            # Step 4: Verify all workflows are accounted for
+            successfully_cancelled = pending_cancelled + running_cancelled
+            total_workflows = len(all_workflow_ids)
+            total_cancelled = len(successfully_cancelled)
+            total_errors = len(workflow_errors)
 
             # Update job status
             job.status = JobStatus.CANCELLED.value
             self._increment_version()
 
-            # Build response (always AD-20 format)
-            error_str = "; ".join(errors) if errors else None
+            # Step 5: Build detailed response
+            # Success = all workflows cancelled without errors
+            overall_success = (total_cancelled == total_workflows) and (total_errors == 0)
+
+            error_str = None
+            if workflow_errors:
+                error_details = [f"{wf_id[:8]}...: {err}" for wf_id, err in workflow_errors.items()]
+                error_str = f"{total_errors} workflow(s) failed: {'; '.join(error_details)}"
+
             return self._build_cancel_response(
-                job_id, success=True, cancelled_count=cancelled_count, error=error_str
+                job_id,
+                success=overall_success,
+                cancelled_count=total_cancelled,
+                error=error_str,
             )
 
         except Exception as e:

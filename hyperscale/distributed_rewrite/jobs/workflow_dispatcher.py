@@ -918,6 +918,49 @@ class WorkflowDispatcher:
                     # Set the ready event to unblock any waiters, then clear
                     pending.ready_event.set()
 
+    async def cancel_pending_workflows(self, job_id: str) -> list[str]:
+        """
+        Cancel all pending workflows for a job (AD-20 job cancellation).
+
+        Removes workflows from the pending queue before they can be dispatched.
+        This is critical for robust job cancellation - pending workflows must
+        be removed BEFORE cancelling running workflows to prevent race conditions
+        where a pending workflow gets dispatched during cancellation.
+
+        Args:
+            job_id: The job ID whose pending workflows should be cancelled
+
+        Returns:
+            List of workflow IDs that were cancelled from the pending queue
+        """
+        cancelled_workflow_ids: list[str] = []
+
+        async with self._pending_lock:
+            # Find all pending workflows for this job
+            keys_to_remove = [
+                key for key in self._pending
+                if key.startswith(f"{job_id}:")
+            ]
+
+            # Remove each pending workflow
+            for key in keys_to_remove:
+                pending = self._pending.pop(key, None)
+                if pending:
+                    # Extract workflow_id from key (format: "job_id:workflow_id")
+                    workflow_id = key.split(":", 1)[1]
+                    cancelled_workflow_ids.append(workflow_id)
+
+                    # Set ready event to unblock any waiters
+                    pending.ready_event.set()
+
+            if cancelled_workflow_ids:
+                await self._log_info(
+                    f"Cancelled {len(cancelled_workflow_ids)} pending workflows for job cancellation",
+                    job_id=job_id
+                )
+
+        return cancelled_workflow_ids
+
     # =========================================================================
     # Logging Helpers
     # =========================================================================
