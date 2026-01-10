@@ -15,8 +15,8 @@
 - Keep async patterns, TaskRunner usage, and logging patterns intact.
 - Avoid new architectural behavior changes while splitting files.
 - Maximum cyclic complexity of 5 for classes and 4 for functions.
-- Examine AD-10 through AD-36 in architecture.md. DO NOT BREAK COMPLIANCE with any of these.
-- 
+- Examine AD-10 through AD-37 in architecture.md. DO NOT BREAK COMPLIANCE with any of these.
+- Once you have generated a file or refactored any function/method/tangible unit of code, generate a commit.
 
 ## Target Module Layout (Shared Pattern)
 ```
