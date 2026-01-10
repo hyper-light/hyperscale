@@ -2742,34 +2742,76 @@ class GateServer(HealthAwareServer):
         self,
         count: int,
         preferred: list[str] | None = None,
+        job_id: str | None = None,
     ) -> tuple[list[str], list[str], str]:
         """
-        Select datacenters with fallback list for resilient routing.
+        Select datacenters with fallback list using AD-36 Vivaldi-based routing.
 
-        Routing Rules (evaluated in order):
-        - UNHEALTHY: Fallback to non-UNHEALTHY DC, else fail job with error
-        - DEGRADED: Fallback to non-DEGRADED DC, else queue with warning
-        - BUSY: Fallback to HEALTHY DC, else queue
-        - HEALTHY: Enqueue (preferred)
+        REFACTOR.md compliance: Uses GateJobRouter for multi-factor scoring
+        (RTT UCB × load × quality) with hysteresis and AD-17 health bucket preservation.
+
+        Routing Rules (AD-17 compliant):
+        - UNHEALTHY: Excluded by CandidateFilter
+        - HEALTHY > BUSY > DEGRADED: Bucket priority enforced by BucketSelector
+        - Within bucket: Scored by RTT UCB, load factor, and coordinate quality
+        - Hysteresis: Hold-down timers and improvement thresholds prevent churn
 
         Args:
-            count: Number of primary DCs to select
-            preferred: Optional list of preferred DCs
+            count: Number of primary DCs to select (passed to router config)
+            preferred: Optional list of preferred DCs (10% score bonus)
+            job_id: Optional job ID for routing state tracking
 
         Returns:
             (primary_dcs, fallback_dcs, worst_health)
-            worst_health indicates the worst state we had to accept:
-            - "healthy": All selected DCs are healthy
-            - "busy": Had to accept BUSY DCs (no HEALTHY available)
-            - "degraded": Had to accept DEGRADED DCs (no HEALTHY/BUSY available)
-            - "unhealthy": All registered DCs are unhealthy (job should fail)
-            - "initializing": No DCs have completed registration yet (retry later)
+            worst_health indicates the primary bucket selected:
+            - "healthy": Primary bucket was HEALTHY
+            - "busy": Primary bucket was BUSY
+            - "degraded": Primary bucket was DEGRADED
+            - "unhealthy": All DCs excluded (should fail)
+            - "initializing": No DCs registered yet (retry later)
+        """
+        # Check if router is initialized (happens in start())
+        if self._job_router is None:
+            # Fallback to legacy selection during initialization
+            return self._legacy_select_datacenters_with_fallback(count, preferred)
+
+        # Use GateJobRouter for AD-36 compliant selection
+        decision = self._job_router.route_job(
+            job_id=job_id or f"temp-{time.monotonic()}",
+            preferred_datacenters=set(preferred) if preferred else None,
+        )
+
+        # Extract primary and fallback from routing decision
+        primary_dcs = decision.primary_datacenters[:count] if decision.primary_datacenters else []
+        fallback_dcs = decision.fallback_datacenters + decision.primary_datacenters[count:]
+
+        # Map primary_bucket to worst_health for compatibility
+        if not decision.primary_bucket:
+            # No eligible candidates - check why
+            configured_dc_count = len(self._datacenter_managers)
+            dc_health = self._get_all_datacenter_health()
+            if len(dc_health) == 0 and configured_dc_count > 0:
+                return ([], [], "initializing")
+            return ([], [], "unhealthy")
+
+        worst_health = decision.primary_bucket.lower()  # HEALTHY -> "healthy"
+
+        return (primary_dcs, fallback_dcs, worst_health)
+
+    def _legacy_select_datacenters_with_fallback(
+        self,
+        count: int,
+        preferred: list[str] | None = None,
+    ) -> tuple[list[str], list[str], str]:
+        """
+        Legacy datacenter selection (used during initialization before router is ready).
+
+        Preserved for compatibility during startup phase.
         """
         # Classify all registered DCs (AD-27: only DCs with READY/PARTIAL status)
         dc_health = self._get_all_datacenter_health()
 
         # Check if we have any configured DCs that are still initializing
-        # This distinguishes "no healthy DCs" from "DCs still starting up"
         configured_dc_count = len(self._datacenter_managers)
         registered_dc_count = len(dc_health)
 
@@ -2819,10 +2861,7 @@ class GateServer(HealthAwareServer):
         if len(all_usable) == 0:
             # No usable DCs - determine why
             if registered_dc_count == 0 and configured_dc_count > 0:
-                # DCs are configured but none have completed registration
-                # This is a startup scenario - client should retry
                 return ([], [], "initializing")
-            # All registered DCs are UNHEALTHY - job should fail
             return ([], [], "unhealthy")
 
         # Primary = first `count` DCs
@@ -5047,10 +5086,11 @@ class GateServer(HealthAwareServer):
                     required_quorum=self._quorum_size(),
                 )
             
-            # Select datacenters with fallback support
+            # Select datacenters with fallback support (AD-36: uses GateJobRouter)
             primary_dcs, fallback_dcs, worst_health = self._select_datacenters_with_fallback(
                 submission.datacenter_count,
                 submission.datacenters if submission.datacenters else None,
+                job_id=submission.job_id,
             )
 
             # If DCs are still initializing (no manager heartbeats yet), return retryable error
@@ -5207,12 +5247,13 @@ class GateServer(HealthAwareServer):
         self._job_manager.set_job(submission.job_id, job)
         self._increment_version()
         
-        # Get primary and fallback DCs based on health classification
+        # Get primary and fallback DCs based on health classification (AD-36: uses GateJobRouter)
         # Note: "initializing" case is normally handled in job_submission before this method is called.
         # However, if DC state changes between job acceptance and dispatch, we handle it here too.
         primary_dcs, fallback_dcs, worst_health = self._select_datacenters_with_fallback(
             len(target_dcs),
             target_dcs if target_dcs else None,
+            job_id=submission.job_id,
         )
 
         # If DCs regressed to initializing (rare race condition), mark job pending
