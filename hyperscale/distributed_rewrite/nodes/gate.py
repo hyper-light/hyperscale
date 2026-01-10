@@ -107,6 +107,8 @@ from hyperscale.distributed_rewrite.models import (
     JobLeaderManagerTransfer,
     JobLeaderManagerTransferAck,
     restricted_loads,
+    # AD-14: CRDT-based cross-DC statistics aggregation
+    JobStatsCRDT,
     # AD-34: Multi-DC timeout coordination messages
     JobProgressReport,
     JobTimeoutReport,
@@ -402,6 +404,12 @@ class GateServer(HealthAwareServer):
         # Maps job_id -> dict[reporter_type -> asyncio.Task]
         # Tasks are tracked for cleanup when job is cleaned up
         self._job_reporter_tasks: dict[str, dict[str, asyncio.Task]] = {}
+
+        # AD-14: CRDT-based cross-DC statistics aggregation
+        # Tracks per-job stats using CRDTs for eventual consistency across DCs.
+        # GCounters for completed/failed (monotonic), LWW for rate/status.
+        self._job_stats_crdt: dict[str, JobStatsCRDT] = {}
+        self._job_stats_crdt_lock = asyncio.Lock()
 
         # Datacenter health manager - centralized DC health classification (AD-16)
         # Replaces inline _classify_datacenter_health logic
@@ -4147,6 +4155,8 @@ class GateServer(HealthAwareServer):
                         await self._push_windowed_stats_to_client(push)
                     # Clean up reporter tasks and submissions
                     self._cleanup_reporter_tasks(job_id)
+                    # AD-14: Clean up CRDT stats for completed job
+                    await self._cleanup_job_crdt_stats(job_id)
                     # Clean up any leases for this job
                     lease_keys_to_remove = [
                         key for key in self._leases
@@ -5221,6 +5231,16 @@ class GateServer(HealthAwareServer):
                 job.total_failed = sum(p.total_failed for p in job.datacenters)
                 job.overall_rate = sum(p.overall_rate for p in job.datacenters)
                 job.timestamp = time.monotonic()
+
+                # AD-14: Record DC stats using CRDT for cross-DC aggregation
+                await self._record_dc_job_stats(
+                    job_id=progress.job_id,
+                    datacenter_id=progress.datacenter,
+                    completed=progress.total_completed,
+                    failed=progress.total_failed,
+                    rate=progress.overall_rate,
+                    status=progress.status,
+                )
 
                 # Check if all DCs are done to update job status
                 completed_dcs = sum(
@@ -6441,6 +6461,96 @@ class GateServer(HealthAwareServer):
         # Note: We clear dc_results from job_manager via explicit clearing, but keep the job itself
         # The job will be cleaned up later by the cleanup loop
         self._workflow_dc_results.pop(job_id, None)
+
+    # =========================================================================
+    # AD-14: CRDT-Based Cross-DC Statistics Aggregation
+    # =========================================================================
+
+    async def _record_dc_job_stats(
+        self,
+        job_id: str,
+        datacenter_id: str,
+        completed: int,
+        failed: int,
+        rate: float,
+        status: str,
+    ) -> None:
+        """
+        Record job statistics from a datacenter using CRDT (AD-14).
+
+        Uses GCounter for completed/failed (monotonically increasing)
+        and LWW for rate/status (latest value wins).
+
+        Args:
+            job_id: The job identifier
+            datacenter_id: The datacenter reporting stats
+            completed: Completed action count (cumulative total for this DC)
+            failed: Failed action count (cumulative total for this DC)
+            rate: Current rate per second
+            status: Current job status in this DC
+        """
+        async with self._job_stats_crdt_lock:
+            if job_id not in self._job_stats_crdt:
+                self._job_stats_crdt[job_id] = JobStatsCRDT(job_id=job_id)
+
+            stats = self._job_stats_crdt[job_id]
+            timestamp = int(time.monotonic() * 1000)  # milliseconds for LWW
+
+            # GCounter: Record cumulative counts from this DC
+            # Note: GCounter.increment expects delta, but we track cumulative
+            # So we compute delta from last recorded value
+            current_completed = stats.completed.get_node_value(datacenter_id)
+            current_failed = stats.failed.get_node_value(datacenter_id)
+
+            completed_delta = max(0, completed - current_completed)
+            failed_delta = max(0, failed - current_failed)
+
+            if completed_delta > 0:
+                stats.record_completed(datacenter_id, completed_delta)
+            if failed_delta > 0:
+                stats.record_failed(datacenter_id, failed_delta)
+
+            # LWW for current rate and status
+            stats.record_rate(datacenter_id, rate, timestamp)
+            stats.record_status(datacenter_id, status, timestamp)
+
+    def _get_job_crdt_stats(self, job_id: str) -> JobStatsCRDT | None:
+        """
+        Get CRDT stats for a job (AD-14).
+
+        Returns the JobStatsCRDT containing aggregated stats from all DCs,
+        or None if no stats have been recorded for this job.
+        """
+        return self._job_stats_crdt.get(job_id)
+
+    async def _cleanup_job_crdt_stats(self, job_id: str) -> None:
+        """
+        Clean up CRDT stats for completed/cancelled jobs (AD-14).
+
+        Should be called when a job reaches terminal state to prevent
+        memory leaks from accumulating CRDT state.
+        """
+        async with self._job_stats_crdt_lock:
+            self._job_stats_crdt.pop(job_id, None)
+
+    async def _merge_peer_job_stats(self, peer_stats: dict[str, dict]) -> None:
+        """
+        Merge CRDT job stats from a peer gate (AD-14).
+
+        Used during gate-to-gate state sync to ensure eventual consistency
+        of job statistics across the gate cluster. The merge operation is
+        idempotent - safe to call multiple times with the same data.
+
+        Args:
+            peer_stats: Dictionary mapping job_id -> serialized JobStatsCRDT dict
+        """
+        async with self._job_stats_crdt_lock:
+            for job_id, stats_dict in peer_stats.items():
+                peer_crdt = JobStatsCRDT.from_dict(stats_dict)
+                if job_id in self._job_stats_crdt:
+                    self._job_stats_crdt[job_id].merge_in_place(peer_crdt)
+                else:
+                    self._job_stats_crdt[job_id] = peer_crdt
 
     # =========================================================================
     # Background Reporter Submission
