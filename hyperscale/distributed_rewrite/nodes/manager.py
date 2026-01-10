@@ -5942,6 +5942,12 @@ class ManagerServer(HealthAwareServer):
                 )
 
                 if success:
+                    # Report progress to timeout strategy (AD-34 Task 11.4.12)
+                    await self._report_workflow_progress_to_timeout_strategy(
+                        job_id=job.job_id,
+                        workflow_id=progress.workflow_id,
+                        state=target_state.value,
+                    )
                     # Also update the old status field for backward compatibility
                     wf_info.status = new_status
                     return
@@ -8575,7 +8581,14 @@ class ManagerServer(HealthAwareServer):
                     WorkflowState.FAILED,
                     reason=f"worker {worker_node_id} died"
                 )
-                if not success:
+                if success:
+                    # Report progress to timeout strategy (AD-34 Task 11.4.12)
+                    await self._report_workflow_progress_to_timeout_strategy(
+                        job_id=job_id,
+                        workflow_id=subworkflow_token,
+                        state=WorkflowState.FAILED.value,
+                    )
+                else:
                     await self._udp_logger.log(ServerWarning(
                         message=f"Failed to transition {subworkflow_token} to FAILED state",
                         node_host=self._host,
@@ -8594,11 +8607,18 @@ class ManagerServer(HealthAwareServer):
 
             # Transition: FAILED → FAILED_CANCELING_DEPENDENTS (use subworkflow_token)
             if self._workflow_lifecycle_states:
-                await self._workflow_lifecycle_states.transition(
+                success = await self._workflow_lifecycle_states.transition(
                     subworkflow_token,
                     WorkflowState.FAILED_CANCELING_DEPENDENTS,
                     reason=f"cancelling {len(dependent_workflow_ids)} dependents"
                 )
+                if success:
+                    # Report progress to timeout strategy (AD-34 Task 11.4.12)
+                    await self._report_workflow_progress_to_timeout_strategy(
+                        job_id=job_id,
+                        workflow_id=subworkflow_token,
+                        state=WorkflowState.FAILED_CANCELING_DEPENDENTS.value,
+                    )
 
             # AD-33 Fix 3: Cancel dependent workflows and CHECK the result
             cancellation_succeeded = True
@@ -8612,11 +8632,18 @@ class ManagerServer(HealthAwareServer):
             if cancellation_succeeded:
                 # Transition: FAILED_CANCELING_DEPENDENTS → FAILED_READY_FOR_RETRY (use subworkflow_token)
                 if self._workflow_lifecycle_states:
-                    await self._workflow_lifecycle_states.transition(
+                    success = await self._workflow_lifecycle_states.transition(
                         subworkflow_token,
                         WorkflowState.FAILED_READY_FOR_RETRY,
                         reason="dependents cancelled, ready for retry"
                     )
+                    if success:
+                        # Report progress to timeout strategy (AD-34 Task 11.4.12)
+                        await self._report_workflow_progress_to_timeout_strategy(
+                            job_id=job_id,
+                            workflow_id=subworkflow_token,
+                            state=WorkflowState.FAILED_READY_FOR_RETRY.value,
+                        )
 
                 # Collect for retry (use workflow_token for requeue operations)
                 all_workflows_to_retry.append((job_id, workflow_token))
@@ -8681,11 +8708,18 @@ class ManagerServer(HealthAwareServer):
 
         # Transition to CANCELLING before retry loop starts
         if self._workflow_lifecycle_states:
-            await self._workflow_lifecycle_states.transition(
+            success = await self._workflow_lifecycle_states.transition(
                 dep_id,
                 WorkflowState.CANCELLING,
                 reason="parent workflow failed"
             )
+            if success:
+                # Report progress to timeout strategy (AD-34 Task 11.4.12)
+                await self._report_workflow_progress_to_timeout_strategy(
+                    job_id=job_id,
+                    workflow_id=dep_id,
+                    state=WorkflowState.CANCELLING.value,
+                )
 
         retry_config = self._create_retry_config(
             max_attempts=max_retries,
@@ -8725,11 +8759,18 @@ class ManagerServer(HealthAwareServer):
 
             # Transition to CANCELLED on success
             if result and self._workflow_lifecycle_states:
-                await self._workflow_lifecycle_states.transition(
+                success = await self._workflow_lifecycle_states.transition(
                     dep_id,
                     WorkflowState.CANCELLED,
                     reason="worker confirmed cancellation"
                 )
+                if success:
+                    # Report progress to timeout strategy (AD-34 Task 11.4.12)
+                    await self._report_workflow_progress_to_timeout_strategy(
+                        job_id=job_id,
+                        workflow_id=dep_id,
+                        state=WorkflowState.CANCELLED.value,
+                    )
             return result
 
         except Exception as exception:
@@ -8876,11 +8917,18 @@ class ManagerServer(HealthAwareServer):
                 if cancellation_succeeded:
                     # Transition: FAILED_CANCELING_DEPENDENTS → FAILED_READY_FOR_RETRY
                     if self._workflow_lifecycle_states:
-                        await self._workflow_lifecycle_states.transition(
+                        success = await self._workflow_lifecycle_states.transition(
                             subworkflow_token,
                             WorkflowState.FAILED_READY_FOR_RETRY,
                             reason=f"dependents cancelled after retry attempt {attempt + 1}"
                         )
+                        if success:
+                            # Report progress to timeout strategy (AD-34 Task 11.4.12)
+                            await self._report_workflow_progress_to_timeout_strategy(
+                                job_id=job_id,
+                                workflow_id=subworkflow_token,
+                                state=WorkflowState.FAILED_READY_FOR_RETRY.value,
+                            )
 
                     # Re-queue the workflow and its dependents
                     workflows_to_retry = [(job_id, workflow_token)]
@@ -9010,11 +9058,18 @@ class ManagerServer(HealthAwareServer):
 
                 # Transition: FAILED_READY_FOR_RETRY → PENDING
                 if self._workflow_lifecycle_states:
-                    await self._workflow_lifecycle_states.transition(
+                    success = await self._workflow_lifecycle_states.transition(
                         workflow_id,
                         WorkflowState.PENDING,
                         reason="re-queued after failure"
                     )
+                    if success:
+                        # Report progress to timeout strategy (AD-34 Task 11.4.12)
+                        await self._report_workflow_progress_to_timeout_strategy(
+                            job_id=job_id,
+                            workflow_id=workflow_id,
+                            state=WorkflowState.PENDING.value,
+                        )
 
             await self._udp_logger.log(ServerInfo(
                 message=f"Re-queued {len(ordered_workflows)} workflows for job {job_id} in dependency order",
@@ -9515,6 +9570,41 @@ class ManagerServer(HealthAwareServer):
                 await self._udp_logger.log(
                     ServerDebug(
                         message=f"Error cleaning up extensions for worker {worker_id} in job {job_id}: {error}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+
+    async def _report_workflow_progress_to_timeout_strategy(
+        self,
+        job_id: str,
+        workflow_id: str,
+        state: str,
+    ) -> None:
+        """
+        Report workflow state transition to timeout strategy (AD-34 Task 11.4.12).
+
+        Workflow progress indicates the job is making forward progress and
+        prevents stuck detection. This is called after each successful workflow
+        lifecycle state transition.
+
+        Args:
+            job_id: Job ID
+            workflow_id: Workflow ID that transitioned
+            state: New workflow state (for progress_type)
+        """
+        strategy = self._job_timeout_strategies.get(job_id)
+        if strategy:
+            try:
+                await strategy.report_progress(
+                    job_id=job_id,
+                    progress_type=f"workflow_{state}",
+                )
+            except Exception as error:
+                await self._udp_logger.log(
+                    ServerDebug(
+                        message=f"Error reporting workflow progress for job {job_id}: {error}",
                         node_host=self._host,
                         node_port=self._tcp_port,
                         node_id=self._node_id.short,
