@@ -16252,3 +16252,2574 @@ AD-33 introduces a **complete workflow lifecycle state machine** that:
 ✅ **Works with WorkflowDispatcher** - reuses existing dependency-aware dispatch  
 
 This is the **most robust and correct** approach to workflow lifecycle management.
+
+---
+
+# AD-34: Adaptive Job Timeout with Multi-DC Coordination
+
+## Overview
+
+Jobs need timeout protection to prevent resource leaks when workers are alive but workflows are stuck. The challenge: **the same job may execute in multiple datacenters simultaneously**, requiring coordinated timeout detection and cancellation.
+
+AD-34 provides an **adaptive timeout architecture** that:
+- Auto-detects deployment topology (single-DC vs multi-DC)
+- Uses **local authority** for single-DC (manager decides)
+- Uses **gate coordination** for multi-DC (gate decides globally)
+- Handles leader failures, network partitions, and race conditions
+- Detects both "overall timeout" and "workflows stuck but worker alive"
+
+---
+
+## Problem Statement
+
+### Timeout Scenarios
+
+1. **Overall Job Timeout**: Job exceeds `timeout_seconds` from submission
+2. **Stuck Workflows**: Worker alive but workflows making no progress
+3. **Multi-DC Consistency**: In multi-DC, if DC-A times out, DC-B/C should be cancelled
+4. **Worker vs Workflow Failure**: Worker heartbeat OK, but workflow stuck
+
+### Challenges
+
+1. **Multi-DC Coordination**: How does DC-A timeout trigger cancellation in DC-B/C?
+2. **Topology Flexibility**: System must work in both single-DC and multi-DC
+3. **Fault Tolerance**: Leader failures, gate failures, network partitions
+4. **Race Conditions**: Job completes while timeout is being declared
+5. **State Recovery**: New leader must resume timeout tracking
+
+---
+
+## Part 1: Architecture Overview
+
+### Deployment Topologies
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     Single-DC Deployment                        │
+└─────────────────────────────────────────────────────────────────┘
+
+Client → Manager Leader → Workers
+              ↓
+         (Local Authority)
+         Directly marks job
+         as timed out
+
+
+┌─────────────────────────────────────────────────────────────────┐
+│                     Multi-DC Deployment                         │
+└─────────────────────────────────────────────────────────────────┘
+
+                    Client
+                      ↓
+                    Gate (Global Authority)
+                      ↓
+        ┌─────────────┼─────────────┐
+        ↓             ↓             ↓
+      DC-A          DC-B          DC-C
+    Manager       Manager       Manager
+    (Reports)     (Reports)     (Reports)
+        ↓             ↓             ↓
+    Workers       Workers       Workers
+
+Gate receives timeout reports from each DC
+Gate declares global timeout
+Gate cancels job in ALL DCs
+```
+
+### Auto-Detection Pattern
+
+**Strategy selected per-job based on JobSubmission:**
+
+```python
+if job_submission.gate_addr is not None:
+    # Multi-DC: Gate submitted job
+    strategy = GateCoordinatedTimeout(manager)
+else:
+    # Single-DC: Client submitted directly
+    strategy = LocalAuthorityTimeout(manager)
+```
+
+No configuration needed! System adapts automatically.
+
+---
+
+## Part 2: Core Components
+
+### Timeout Tracking State (Persistent)
+
+```python
+@dataclass
+class TimeoutTrackingState:
+    """
+    Timeout tracking state persisted in JobInfo.
+
+    Survives leader transfers via state sync - new leader
+    inherits this state and resumes timeout tracking.
+    """
+    strategy_type: str  # "local_authority" | "gate_coordinated"
+    gate_addr: tuple[str, int] | None  # Where to report (multi-DC only)
+
+    # Timestamps (absolute, monotonic)
+    started_at: float  # When job started (never changes)
+    last_progress_at: float  # Last workflow progress
+    last_report_at: float  # Last progress report to gate (multi-DC only)
+
+    # Timeout configuration
+    timeout_seconds: float
+    stuck_threshold: float = 120.0  # No progress threshold (2 minutes)
+
+    # State flags (idempotency)
+    locally_timed_out: bool = False  # Manager reported timeout to gate
+    globally_timed_out: bool = False  # Gate declared global timeout
+    timeout_reason: str = ""
+
+    # Fencing (prevent stale decisions)
+    timeout_fence_token: int = 0  # Incremented on leader transfer
+```
+
+**Key Design Points:**
+
+1. **Stored in JobInfo**: Survives leader failures (transferred via state sync)
+2. **Absolute Timestamps**: `started_at` never changes, enables timeout calculation after leader transfer
+3. **Idempotency Flags**: `locally_timed_out` prevents duplicate timeout reports
+4. **Fence Tokens**: Prevent stale timeout decisions after leader transfer
+
+### Timeout Strategy Interface
+
+```python
+class TimeoutStrategy(ABC):
+    """Base timeout strategy with state recovery."""
+
+    @abstractmethod
+    async def start_tracking(
+        self,
+        job_id: str,
+        timeout_seconds: float,
+        gate_addr: tuple[str, int] | None = None
+    ) -> None:
+        """Start tracking on job submission."""
+        pass
+
+    @abstractmethod
+    async def resume_tracking(self, job_id: str) -> None:
+        """
+        Resume tracking after leader transfer.
+
+        CRITICAL: New leader calls this to continue timeout tracking.
+        Reconstructs strategy state from JobInfo.timeout_tracking.
+        """
+        pass
+
+    @abstractmethod
+    async def report_progress(self, job_id: str, progress_type: str) -> None:
+        """Record workflow progress event."""
+        pass
+
+    @abstractmethod
+    async def check_timeout(self, job_id: str) -> tuple[bool, str]:
+        """
+        Check if job timed out.
+
+        Returns (is_timed_out, reason).
+        Idempotent - safe to call multiple times.
+        """
+        pass
+
+    @abstractmethod
+    async def handle_global_timeout(
+        self,
+        job_id: str,
+        reason: str,
+        fence_token: int
+    ) -> bool:
+        """
+        Handle global timeout decision from gate.
+
+        Returns True if accepted, False if rejected (stale).
+        """
+        pass
+```
+
+---
+
+## Part 3: Strategy 1 - Local Authority (Single-DC)
+
+### Overview
+
+**When**: No gate involved (direct client → manager submission)
+**Authority**: Manager leader has full timeout authority
+**Behavior**: Manager directly marks job as timed out
+
+### Implementation
+
+```python
+class LocalAuthorityTimeout(TimeoutStrategy):
+    """
+    Manager has full authority (single-DC deployment).
+
+    Fault Tolerance:
+    - State in JobInfo.timeout_tracking (survives leader transfer)
+    - New leader calls resume_tracking() to continue
+    - Idempotent timeout marking (won't double-timeout)
+    """
+
+    def __init__(self, manager: 'ManagerServer'):
+        self._manager = manager
+
+    async def start_tracking(
+        self,
+        job_id: str,
+        timeout_seconds: float,
+        gate_addr: tuple[str, int] | None = None
+    ) -> None:
+        """Initialize timeout tracking state in JobInfo."""
+        job = self._manager._job_manager.get_job_by_id(job_id)
+        if not job:
+            return
+
+        async with job.lock:
+            now = time.monotonic()
+            job.timeout_tracking = TimeoutTrackingState(
+                strategy_type="local_authority",
+                gate_addr=None,
+                started_at=now,
+                last_progress_at=now,
+                last_report_at=now,
+                timeout_seconds=timeout_seconds,
+                timeout_fence_token=0
+            )
+
+    async def resume_tracking(self, job_id: str) -> None:
+        """
+        Resume after leader transfer.
+
+        State already in JobInfo - just increment fence token.
+        """
+        job = self._manager._job_manager.get_job_by_id(job_id)
+        if not job or not job.timeout_tracking:
+            await self._manager._udp_logger.log(ServerWarning(
+                message=f"Cannot resume timeout tracking for {job_id} - no state",
+                node_host=self._manager._host,
+                node_port=self._manager._tcp_port,
+                node_id=self._manager._node_id.short,
+            ))
+            return
+
+        # Increment fence token (prevents stale operations)
+        async with job.lock:
+            job.timeout_tracking.timeout_fence_token += 1
+
+    async def report_progress(self, job_id: str, progress_type: str) -> None:
+        """Update last_progress_at timestamp."""
+        job = self._manager._job_manager.get_job_by_id(job_id)
+        if not job or not job.timeout_tracking:
+            return
+
+        async with job.lock:
+            job.timeout_tracking.last_progress_at = time.monotonic()
+
+    async def check_timeout(self, job_id: str) -> tuple[bool, str]:
+        """
+        Check for timeout. Idempotent - safe to call repeatedly.
+
+        Only times out once (checked via locally_timed_out flag).
+        """
+        job = self._manager._job_manager.get_job_by_id(job_id)
+        if not job or not job.timeout_tracking:
+            return False, ""
+
+        # Idempotent: already timed out
+        if job.timeout_tracking.locally_timed_out:
+            return False, ""
+
+        # Check terminal state
+        if job.status in {JobStatus.COMPLETED.value, JobStatus.FAILED.value}:
+            return False, ""
+
+        now = time.monotonic()
+        tracking = job.timeout_tracking
+
+        # Check overall timeout
+        elapsed = now - tracking.started_at
+        if elapsed > tracking.timeout_seconds:
+            async with job.lock:
+                tracking.locally_timed_out = True
+                tracking.timeout_reason = (
+                    f"Job timeout exceeded ({elapsed:.1f}s > "
+                    f"{tracking.timeout_seconds:.1f}s)"
+                )
+
+            await self._manager._timeout_job(job_id, tracking.timeout_reason)
+            return True, tracking.timeout_reason
+
+        # Check for stuck (no progress)
+        time_since_progress = now - tracking.last_progress_at
+        if time_since_progress > tracking.stuck_threshold:
+            async with job.lock:
+                tracking.locally_timed_out = True
+                tracking.timeout_reason = (
+                    f"Job stuck (no progress for {time_since_progress:.1f}s)"
+                )
+
+            await self._manager._timeout_job(job_id, tracking.timeout_reason)
+            return True, tracking.timeout_reason
+
+        return False, ""
+
+    async def handle_global_timeout(
+        self,
+        job_id: str,
+        reason: str,
+        fence_token: int
+    ) -> bool:
+        """Not applicable for local authority."""
+        return False
+```
+
+### State Diagram - Local Authority
+
+```
+Job Submitted
+     ↓
+TimeoutTrackingState created
+  started_at = now
+  locally_timed_out = False
+     ↓
+╔═══════════════════════════════════╗
+║    Periodic Timeout Checks         ║
+║    (every 30s, leader only)        ║
+╚═══════════════════════════════════╝
+     ↓
+┌─────────────────────────────────┐
+│ Check 1: Overall Timeout        │
+│ elapsed > timeout_seconds?      │
+└─────────────────────────────────┘
+     ↓ YES                    ↓ NO
+  Mark timed out           Continue
+  Call _timeout_job()         ↓
+                        ┌─────────────────────────────────┐
+                        │ Check 2: Stuck Detection        │
+                        │ (now - last_progress_at) > 120s?│
+                        └─────────────────────────────────┘
+                             ↓ YES              ↓ NO
+                          Mark stuck         Keep tracking
+                          Call _timeout_job()   ↓
+                                            Resume loop
+
+Leader Failure → New Leader → resume_tracking() → Continue from same state
+```
+
+---
+
+## Part 4: Strategy 2 - Gate Coordinated (Multi-DC)
+
+### Overview
+
+**When**: Gate submitted job (`gate_addr` in JobSubmission)
+**Authority**: Gate has global timeout authority
+**Manager Role**: Detect local timeouts, report to gate
+**Gate Role**: Collect reports from all DCs, declare global timeout, broadcast cancellation
+
+### Implementation - Manager Side
+
+```python
+class GateCoordinatedTimeout(TimeoutStrategy):
+    """
+    Gate has authority (multi-DC deployment).
+
+    Manager:
+    - Detects DC-local timeouts/stuck state
+    - Reports to gate (not mark job failed locally)
+    - Sends periodic progress reports
+    - Waits for gate's global decision
+
+    Fault Tolerance:
+    - Progress reports are periodic (loss tolerated)
+    - Timeout reports are persistent until ACK'd
+    - Fallback to local timeout if gate unreachable for 5+ minutes
+    """
+
+    def __init__(self, manager: 'ManagerServer'):
+        self._manager = manager
+        self._pending_reports: dict[str, list[Message]] = {}
+        self._report_lock = asyncio.Lock()
+
+    async def start_tracking(
+        self,
+        job_id: str,
+        timeout_seconds: float,
+        gate_addr: tuple[str, int] | None = None
+    ) -> None:
+        """Initialize gate-coordinated tracking."""
+        if not gate_addr:
+            raise ValueError("Gate address required for gate-coordinated timeout")
+
+        job = self._manager._job_manager.get_job_by_id(job_id)
+        if not job:
+            return
+
+        async with job.lock:
+            now = time.monotonic()
+            job.timeout_tracking = TimeoutTrackingState(
+                strategy_type="gate_coordinated",
+                gate_addr=gate_addr,
+                started_at=now,
+                last_progress_at=now,
+                last_report_at=now,
+                timeout_seconds=timeout_seconds,
+                timeout_fence_token=0
+            )
+
+    async def resume_tracking(self, job_id: str) -> None:
+        """Resume after leader transfer - notify gate."""
+        job = self._manager._job_manager.get_job_by_id(job_id)
+        if not job or not job.timeout_tracking:
+            return
+
+        async with job.lock:
+            job.timeout_tracking.timeout_fence_token += 1
+            fence_token = job.timeout_tracking.timeout_fence_token
+
+        # Send leadership transfer notification to gate
+        await self._send_leader_transfer_report(job_id, fence_token)
+
+    async def report_progress(self, job_id: str, progress_type: str) -> None:
+        """Update progress timestamp."""
+        job = self._manager._job_manager.get_job_by_id(job_id)
+        if not job or not job.timeout_tracking:
+            return
+
+        async with job.lock:
+            job.timeout_tracking.last_progress_at = time.monotonic()
+
+    async def check_timeout(self, job_id: str) -> tuple[bool, str]:
+        """
+        Check DC-local timeout and report to gate.
+
+        Does NOT mark job failed locally - waits for gate decision.
+        Fallback: if can't reach gate for 5+ minutes, timeout locally.
+        """
+        job = self._manager._job_manager.get_job_by_id(job_id)
+        if not job or not job.timeout_tracking:
+            return False, ""
+
+        tracking = job.timeout_tracking
+
+        # Already reported, waiting for gate decision
+        if tracking.locally_timed_out:
+            # Fallback: gate unresponsive for 5+ minutes
+            if not tracking.globally_timed_out:
+                time_since_report = time.monotonic() - tracking.last_report_at
+                if time_since_report > 300.0:  # 5 minutes
+                    await self._manager._udp_logger.log(ServerWarning(
+                        message=f"Gate unresponsive for {time_since_report:.0f}s, "
+                                f"timing out job {job_id} locally",
+                        node_host=self._manager._host,
+                        node_port=self._manager._tcp_port,
+                        node_id=self._manager._node_id.short,
+                    ))
+                    await self._manager._timeout_job(
+                        job_id,
+                        "Gate unresponsive, local timeout fallback"
+                    )
+                    return True, "gate_unresponsive_fallback"
+
+            return False, ""
+
+        # Check terminal state
+        if job.status in {JobStatus.COMPLETED.value, JobStatus.FAILED.value}:
+            return False, ""
+
+        now = time.monotonic()
+
+        # Send periodic progress reports
+        if now - tracking.last_report_at > 10.0:
+            await self._send_progress_report(job_id)
+            async with job.lock:
+                tracking.last_report_at = now
+
+        # Check for DC-local timeout
+        elapsed = now - tracking.started_at
+        if elapsed > tracking.timeout_seconds:
+            reason = (
+                f"DC-local timeout ({elapsed:.1f}s > "
+                f"{tracking.timeout_seconds:.1f}s)"
+            )
+            await self._send_timeout_report(job_id, reason)
+
+            async with job.lock:
+                tracking.locally_timed_out = True
+                tracking.timeout_reason = reason
+                tracking.last_report_at = now
+
+            return True, reason
+
+        # Check for stuck
+        time_since_progress = now - tracking.last_progress_at
+        if time_since_progress > tracking.stuck_threshold:
+            reason = f"DC-local stuck (no progress for {time_since_progress:.1f}s)"
+            await self._send_timeout_report(job_id, reason)
+
+            async with job.lock:
+                tracking.locally_timed_out = True
+                tracking.timeout_reason = reason
+                tracking.last_report_at = now
+
+            return True, reason
+
+        return False, ""
+
+    async def handle_global_timeout(
+        self,
+        job_id: str,
+        reason: str,
+        fence_token: int
+    ) -> bool:
+        """
+        Handle global timeout from gate.
+
+        Validates fence token to reject stale decisions.
+        """
+        job = self._manager._job_manager.get_job_by_id(job_id)
+        if not job or not job.timeout_tracking:
+            return False
+
+        # Fence token validation (prevent stale decisions)
+        if fence_token < job.timeout_tracking.timeout_fence_token:
+            await self._manager._udp_logger.log(ServerWarning(
+                message=f"Rejected stale global timeout for {job_id} "
+                        f"(fence {fence_token} < {job.timeout_tracking.timeout_fence_token})",
+                node_host=self._manager._host,
+                node_port=self._manager._tcp_port,
+                node_id=self._manager._node_id.short,
+            ))
+            return False
+
+        # Check if already terminal
+        if job.status in {JobStatus.COMPLETED.value, JobStatus.FAILED.value}:
+            # Send correction to gate
+            await self._send_status_correction(job_id, job.status)
+            return False
+
+        # Accept gate's decision
+        async with job.lock:
+            job.timeout_tracking.globally_timed_out = True
+            job.timeout_tracking.timeout_reason = reason
+
+        await self._manager._timeout_job(job_id, f"Global timeout: {reason}")
+        return True
+
+    async def _send_progress_report(self, job_id: str) -> None:
+        """Send progress to gate (best-effort, loss tolerated)."""
+        job = self._manager._job_manager.get_job_by_id(job_id)
+        if not job or not job.timeout_tracking:
+            return
+
+        report = JobProgressReport(
+            job_id=job_id,
+            datacenter=self._manager._datacenter,
+            manager_id=self._manager._node_id.short,
+            workflows_total=job.workflows_total,
+            workflows_completed=job.workflows_completed,
+            workflows_failed=job.workflows_failed,
+            has_recent_progress=(
+                time.monotonic() - job.timeout_tracking.last_progress_at < 10.0
+            ),
+            timestamp=time.monotonic(),
+            fence_token=job.timeout_tracking.timeout_fence_token
+        )
+
+        try:
+            await self._manager.send_tcp(
+                job.timeout_tracking.gate_addr,
+                "job_progress_report",
+                report.dump()
+            )
+        except Exception as e:
+            # Progress report failure is non-critical
+            await self._manager._udp_logger.log(ServerDebug(
+                message=f"Failed to send progress report for {job_id}: {e}",
+                node_host=self._manager._host,
+                node_port=self._manager._tcp_port,
+                node_id=self._manager._node_id.short,
+            ))
+
+    async def _send_timeout_report(self, job_id: str, reason: str) -> None:
+        """Send timeout report to gate (persistent until ACK'd)."""
+        job = self._manager._job_manager.get_job_by_id(job_id)
+        if not job or not job.timeout_tracking:
+            return
+
+        report = JobTimeoutReport(
+            job_id=job_id,
+            datacenter=self._manager._datacenter,
+            manager_id=self._manager._node_id.short,
+            reason=reason,
+            elapsed_seconds=time.monotonic() - job.timeout_tracking.started_at,
+            fence_token=job.timeout_tracking.timeout_fence_token
+        )
+
+        # Store for retry
+        async with self._report_lock:
+            if job_id not in self._pending_reports:
+                self._pending_reports[job_id] = []
+            self._pending_reports[job_id].append(report)
+
+        try:
+            await self._manager.send_tcp(
+                job.timeout_tracking.gate_addr,
+                "job_timeout_report",
+                report.dump()
+            )
+            # Success - remove from pending
+            async with self._report_lock:
+                self._pending_reports.pop(job_id, None)
+        except Exception as e:
+            await self._manager._udp_logger.log(ServerWarning(
+                message=f"Failed to send timeout report for {job_id}: {e} (will retry)",
+                node_host=self._manager._host,
+                node_port=self._manager._tcp_port,
+                node_id=self._manager._node_id.short,
+            ))
+```
+
+### State Diagram - Gate Coordinated (Manager)
+
+```
+Job Submitted (with gate_addr)
+     ↓
+TimeoutTrackingState created
+  strategy = "gate_coordinated"
+  gate_addr = <gate>
+     ↓
+╔═══════════════════════════════════╗
+║  Periodic Checks (every 30s)      ║
+╚═══════════════════════════════════╝
+     ↓
+Send Progress Report (every 10s)
+     ↓ (best-effort)
+   Gate
+     ↓
+Check DC-Local Timeout
+     ↓ TIMEOUT DETECTED
+Send Timeout Report to Gate
+  locally_timed_out = True
+     ↓
+╔═══════════════════════════════════╗
+║    Wait for Gate Decision          ║
+║  (or 5min fallback timeout)       ║
+╚═══════════════════════════════════╝
+     ↓
+  ┌──────────────┬──────────────┐
+  ↓              ↓              ↓
+Gate            Gate         5min passed
+Says            Unresponsive  No response
+Timeout                       ↓
+  ↓                          Local
+Mark                         Fallback
+globally_timed_out           Timeout
+  ↓                            ↓
+_timeout_job()           _timeout_job()
+```
+
+---
+
+## Part 5: Gate Global Timeout Coordination
+
+### Gate Job Tracker
+
+```python
+@dataclass
+class GateJobTrackingInfo:
+    """Gate's view of a job across all DCs."""
+    job_id: str
+    submitted_at: float  # Global start time
+    timeout_seconds: float
+    target_datacenters: list[str]  # Which DCs running this job
+
+    # Per-DC state
+    dc_status: dict[str, str]  # dc_name -> "running" | "completed" | "timed_out"
+    dc_last_progress: dict[str, float]  # dc_name -> last progress timestamp
+    dc_manager_addrs: dict[str, tuple[str, int]]  # dc_name -> manager addr
+
+    # Global timeout decision
+    globally_timed_out: bool = False
+    timeout_reason: str = ""
+    timeout_fence_token: int = 0  # Gate's fence token for this decision
+
+
+class GateJobTracker:
+    """Track jobs across all DCs (Gate-side)."""
+
+    def __init__(self, gate: 'GateServer'):
+        self._gate = gate
+        self._tracked_jobs: dict[str, GateJobTrackingInfo] = {}
+        self._lock = asyncio.Lock()
+
+    async def start_tracking_job(
+        self,
+        job_id: str,
+        timeout_seconds: float,
+        target_dcs: list[str]
+    ) -> None:
+        """Start tracking when job is submitted."""
+        async with self._lock:
+            self._tracked_jobs[job_id] = GateJobTrackingInfo(
+                job_id=job_id,
+                submitted_at=time.monotonic(),
+                timeout_seconds=timeout_seconds,
+                target_datacenters=target_dcs,
+                dc_status={dc: "running" for dc in target_dcs},
+                dc_last_progress={dc: time.monotonic() for dc in target_dcs},
+                dc_manager_addrs={},
+                timeout_fence_token=0
+            )
+
+    async def record_progress(self, report: JobProgressReport) -> None:
+        """Record progress from a DC."""
+        async with self._lock:
+            info = self._tracked_jobs.get(report.job_id)
+            if not info:
+                return
+
+            info.dc_last_progress[report.datacenter] = report.timestamp
+            info.dc_manager_addrs[report.datacenter] = (
+                report.manager_host,
+                report.manager_port
+            )
+
+            if report.workflows_completed == report.workflows_total:
+                info.dc_status[report.datacenter] = "completed"
+
+    async def record_timeout(self, report: JobTimeoutReport) -> None:
+        """Record timeout from a DC."""
+        async with self._lock:
+            info = self._tracked_jobs.get(report.job_id)
+            if not info:
+                return
+
+            info.dc_status[report.datacenter] = "timed_out"
+            info.dc_manager_addrs[report.datacenter] = (
+                report.manager_host,
+                report.manager_port
+            )
+
+    async def check_global_timeouts(self) -> list[tuple[str, str]]:
+        """
+        Check for global timeouts.
+
+        Returns list of (job_id, reason) for timed-out jobs.
+        """
+        timed_out_jobs = []
+        now = time.monotonic()
+
+        async with self._lock:
+            for info in list(self._tracked_jobs.values()):
+                if info.globally_timed_out:
+                    continue
+
+                # Check 1: Global timeout exceeded
+                elapsed = now - info.submitted_at
+                if elapsed > info.timeout_seconds:
+                    info.globally_timed_out = True
+                    info.timeout_reason = (
+                        f"Global timeout exceeded ({elapsed:.1f}s > "
+                        f"{info.timeout_seconds:.1f}s)"
+                    )
+                    info.timeout_fence_token += 1
+                    timed_out_jobs.append((info.job_id, info.timeout_reason))
+                    continue
+
+                # Check 2: Any DC reported timeout
+                timed_out_dcs = [
+                    dc for dc, status in info.dc_status.items()
+                    if status == "timed_out"
+                ]
+
+                if timed_out_dcs:
+                    info.globally_timed_out = True
+                    info.timeout_reason = (
+                        f"DC timeout: {', '.join(timed_out_dcs)}"
+                    )
+                    info.timeout_fence_token += 1
+                    timed_out_jobs.append((info.job_id, info.timeout_reason))
+                    continue
+
+                # Check 3: All DCs stuck (no progress for 3+ minutes)
+                stuck_dcs = [
+                    dc for dc, last_progress in info.dc_last_progress.items()
+                    if now - last_progress > 180.0
+                ]
+
+                if stuck_dcs and len(stuck_dcs) == len(info.target_datacenters):
+                    info.globally_timed_out = True
+                    info.timeout_reason = f"All DCs stuck: {', '.join(stuck_dcs)}"
+                    info.timeout_fence_token += 1
+                    timed_out_jobs.append((info.job_id, info.timeout_reason))
+
+        return timed_out_jobs
+
+    def get_job(self, job_id: str) -> GateJobTrackingInfo | None:
+        """Get tracking info for a job."""
+        return self._tracked_jobs.get(job_id)
+```
+
+### Gate Global Timeout Loop
+
+```python
+# In GateServer
+async def _global_timeout_loop(self) -> None:
+    """Check for global timeouts and coordinate cancellation."""
+    while not self._shutdown:
+        await asyncio.sleep(15.0)  # Gate checks more frequently
+
+        timed_out_jobs = await self._job_tracker.check_global_timeouts()
+
+        for job_id, reason in timed_out_jobs:
+            await self._declare_and_broadcast_timeout(job_id, reason)
+
+async def _declare_and_broadcast_timeout(self, job_id: str, reason: str) -> None:
+    """Declare job globally timed out and cancel in ALL DCs."""
+    tracking_info = self._job_tracker.get_job(job_id)
+    if not tracking_info:
+        return
+
+    await self._logger.log(ServerInfo(
+        message=f"Job {job_id} globally timed out: {reason}",
+        node_host=self._host,
+        node_port=self._tcp_port,
+        node_id=self._node_id.short,
+    ))
+
+    # Send cancellation to ALL target DCs
+    timeout_msg = JobGlobalTimeout(
+        job_id=job_id,
+        reason=reason,
+        timed_out_at=time.monotonic(),
+        fence_token=tracking_info.timeout_fence_token
+    )
+
+    for dc_name in tracking_info.target_datacenters:
+        manager_addr = tracking_info.dc_manager_addrs.get(dc_name)
+        if manager_addr and tracking_info.dc_status.get(dc_name) not in {
+            "completed", "timed_out", "failed"
+        }:
+            try:
+                await self.send_tcp(
+                    manager_addr,
+                    "job_global_timeout",
+                    timeout_msg.dump()
+                )
+            except Exception as e:
+                await self._logger.log(ServerWarning(
+                    message=f"Failed to send global timeout to {dc_name}: {e}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                ))
+```
+
+### State Diagram - Gate Global Coordinator
+
+```
+Job Submitted to Multiple DCs
+     ↓
+GateJobTrackingInfo created
+  dc_status = {A: "running", B: "running", C: "running"}
+     ↓
+╔═══════════════════════════════════╗
+║   Receive Reports from DCs         ║
+║   - Progress (every 10s)           ║
+║   - Timeout (when detected)        ║
+╚═══════════════════════════════════╝
+     ↓
+Update dc_last_progress[dc]
+Update dc_status[dc]
+     ↓
+╔═══════════════════════════════════╗
+║  Periodic Global Timeout Check     ║
+║      (every 15s)                   ║
+╚═══════════════════════════════════╝
+     ↓
+Check 3 Conditions:
+  1. Global timeout exceeded?
+  2. Any DC reported timeout?
+  3. All DCs stuck (no progress 3+ min)?
+     ↓ ANY TRUE
+Declare Global Timeout
+  globally_timed_out = True
+  timeout_fence_token++
+     ↓
+Broadcast JobGlobalTimeout to ALL DCs
+     ↓
+   DC-A         DC-B         DC-C
+     ↓           ↓            ↓
+ Cancel      Cancel       Cancel
+  Job         Job          Job
+```
+
+---
+
+## Part 6: Manager Integration
+
+### Auto-Selection and State Recovery
+
+```python
+class ManagerServer:
+    def __init__(self, ...):
+        # Per-job timeout strategies
+        self._job_timeout_strategies: dict[str, TimeoutStrategy] = {}
+
+    async def receive_submit_job(self, addr, data, clock_time):
+        """Handle job submission."""
+        submission = JobSubmission.load(data)
+
+        # Auto-select strategy based on topology
+        strategy = await self._select_timeout_strategy(submission)
+
+        # ... existing job submission logic ...
+
+        # Start timeout tracking
+        await strategy.start_tracking(
+            job_id=submission.job_id,
+            timeout_seconds=submission.timeout_seconds,
+            gate_addr=getattr(submission, 'gate_addr', None)
+        )
+
+        self._job_timeout_strategies[submission.job_id] = strategy
+
+    async def _select_timeout_strategy(
+        self,
+        submission: JobSubmission
+    ) -> TimeoutStrategy:
+        """
+        Auto-detect deployment topology and select strategy.
+
+        Detection:
+        - If submission has gate_addr → Multi-DC (GateCoordinatedTimeout)
+        - If no gate_addr → Single-DC (LocalAuthorityTimeout)
+        """
+        if hasattr(submission, 'gate_addr') and submission.gate_addr:
+            return GateCoordinatedTimeout(self)
+        else:
+            return LocalAuthorityTimeout(self)
+
+    async def _on_leadership_acquired(self, job_id: str) -> None:
+        """
+        Called when this manager becomes leader for a job.
+
+        CRITICAL: Must resume timeout tracking.
+        """
+        job = self._job_manager.get_job_by_id(job_id)
+        if not job or not job.timeout_tracking:
+            return
+
+        # Resume timeout tracking with appropriate strategy
+        strategy = await self._get_or_create_timeout_strategy(job)
+        await strategy.resume_tracking(job_id)
+
+        self._job_timeout_strategies[job_id] = strategy
+
+    async def _get_or_create_timeout_strategy(
+        self,
+        job: JobInfo
+    ) -> TimeoutStrategy:
+        """Get strategy for job (resume if exists)."""
+        if not job.timeout_tracking:
+            return LocalAuthorityTimeout(self)
+
+        if job.timeout_tracking.strategy_type == "gate_coordinated":
+            return GateCoordinatedTimeout(self)
+        else:
+            return LocalAuthorityTimeout(self)
+
+    async def _unified_timeout_loop(self) -> None:
+        """Unified timeout loop for both single-DC and multi-DC."""
+        while not self._shutdown:
+            await asyncio.sleep(30.0)
+
+            if self._state != ManagerState.ACTIVE:
+                continue
+
+            for job in self._job_manager.iter_jobs():
+                # Only leader checks
+                if job.leader_node_id != self._node_id.short:
+                    continue
+
+                # Get or resume strategy
+                if job.job_id not in self._job_timeout_strategies:
+                    strategy = await self._get_or_create_timeout_strategy(job)
+                    await strategy.resume_tracking(job.job_id)
+                    self._job_timeout_strategies[job.job_id] = strategy
+                else:
+                    strategy = self._job_timeout_strategies[job.job_id]
+
+                # Check timeout
+                try:
+                    is_timed_out, reason = await strategy.check_timeout(job.job_id)
+                    if is_timed_out:
+                        await self._udp_logger.log(ServerInfo(
+                            message=f"Job {job.job_id} timed out: {reason}",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        ))
+                except Exception as e:
+                    await self._udp_logger.log(ServerError(
+                        message=f"Timeout check failed for {job.job_id}: {e}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    ))
+```
+
+### Progress Reporting Integration
+
+```python
+# Integrate with WorkflowStateMachine from AD-33
+async def _on_workflow_state_transition(
+    self,
+    job_id: str,
+    workflow_id: str,
+    from_state: WorkflowState,
+    to_state: WorkflowState
+) -> None:
+    """Called when workflow transitions state."""
+    # Report progress to timeout strategy
+    strategy = self._job_timeout_strategies.get(job_id)
+    if strategy:
+        await strategy.report_progress(job_id, f"workflow_{to_state.value}")
+```
+
+### Handling Global Timeout from Gate
+
+```python
+async def receive_job_global_timeout(self, addr, data, clock_time):
+    """
+    Receive global timeout decision from gate.
+
+    Gate has declared job timed out - cancel it locally.
+    """
+    timeout_msg = JobGlobalTimeout.load(data)
+
+    strategy = self._job_timeout_strategies.get(timeout_msg.job_id)
+    if not strategy:
+        return
+
+    # Delegate to strategy (handles fence token validation)
+    accepted = await strategy.handle_global_timeout(
+        timeout_msg.job_id,
+        timeout_msg.reason,
+        timeout_msg.fence_token
+    )
+
+    if accepted:
+        # Clean up tracking
+        self._job_timeout_strategies.pop(timeout_msg.job_id, None)
+```
+
+---
+
+## Part 7: Protocol Messages
+
+### JobProgressReport
+
+```python
+@dataclass
+class JobProgressReport(Message):
+    """Manager → Gate: Periodic progress report."""
+    job_id: str
+    datacenter: str
+    manager_id: str
+    manager_host: str  # For gate to send replies
+    manager_port: int
+    workflows_total: int
+    workflows_completed: int
+    workflows_failed: int
+    has_recent_progress: bool  # Any workflow progressed in last 10s
+    timestamp: float
+    fence_token: int  # Manager's fence token
+```
+
+### JobTimeoutReport
+
+```python
+@dataclass
+class JobTimeoutReport(Message):
+    """Manager → Gate: DC-local timeout detected."""
+    job_id: str
+    datacenter: str
+    manager_id: str
+    manager_host: str
+    manager_port: int
+    reason: str  # "timeout" | "stuck"
+    elapsed_seconds: float
+    fence_token: int
+```
+
+### JobGlobalTimeout
+
+```python
+@dataclass
+class JobGlobalTimeout(Message):
+    """Gate → Manager: Global timeout declared."""
+    job_id: str
+    reason: str  # Why gate timed out the job
+    timed_out_at: float  # Gate's timestamp
+    fence_token: int  # Gate's fence token for this decision
+```
+
+### JobLeaderTransfer
+
+```python
+@dataclass
+class JobLeaderTransfer(Message):
+    """Manager → Gate: Notify gate of leader change."""
+    job_id: str
+    datacenter: str
+    new_leader_id: str
+    fence_token: int  # New leader's fence token
+```
+
+### JobSubmission Enhancement
+
+```python
+@dataclass
+class JobSubmission(Message):
+    # ... existing fields ...
+
+    # Multi-DC coordination (optional, None for single-DC)
+    gate_addr: tuple[str, int] | None = None
+    target_datacenters: list[str] = field(default_factory=list)
+```
+
+---
+
+## Part 8: Fault Tolerance Scenarios
+
+### Scenario 1: Manager Leader Failure
+
+```
+Timeline:
+T0: Leader-A tracking job timeout (started_at = 100.0)
+T1: Leader-A fails
+T2: Leader-B elected
+T3: Leader-B receives job via state sync
+T4: Leader-B calls resume_tracking()
+     - Increments fence_token (1 → 2)
+     - Continues from started_at = 100.0 (preserved!)
+T5: Leader-B continues timeout checking
+
+Result: Timeout tracking continues seamlessly
+```
+
+**Key**: `started_at` in TimeoutTrackingState is absolute, preserved across transfers.
+
+### Scenario 2: Gate Failure (Multi-DC)
+
+```
+Timeline:
+T0: Gate tracking job across DC-A, DC-B, DC-C
+T1: Gate fails
+T2: Managers continue sending reports (stored in pending_reports)
+T3: Gate restarts/replaced
+T4: Managers resend pending timeout reports
+T5: New gate reconstructs state from reports
+T6: Gate declares global timeout
+
+Fallback:
+If gate down for 5+ minutes:
+  - Managers timeout jobs locally (fallback)
+  - Each DC independently marks job failed
+```
+
+**Key**: Managers have fallback to local timeout if gate unreachable.
+
+### Scenario 3: Timeout Detected, Job Completes (Race)
+
+```
+Timeline:
+T0: Manager detects timeout, sends JobTimeoutReport to gate
+T1: Job completes on worker before gate receives report
+T2: Manager sends JobCompletionReport to gate
+T3: Gate receives both messages
+
+Gate Resolution:
+- Use timestamp ordering:
+  if timeout_report.timestamp < completion.timestamp:
+      declare_timeout()  # Timeout happened first
+  else:
+      accept_completion()  # Completion happened first
+
+Manager Side:
+- When receive_job_global_timeout() called:
+  - Check if job already COMPLETED/FAILED
+  - If yes, send JobStatusCorrection to gate
+  - Gate reconciles
+```
+
+**Key**: Timestamps + status corrections resolve races.
+
+### Scenario 4: Stale Global Timeout (After Leader Transfer)
+
+```
+Timeline:
+T0: Leader-A (fence_token=1) reports timeout to gate
+T1: Leader-A fails
+T2: Leader-B takes over (fence_token=2)
+T3: Gate sends JobGlobalTimeout(fence_token=1) [stale!]
+T4: Leader-B receives message
+     - Validates: 1 < 2 (stale)
+     - Rejects message
+     - Sends status correction to gate
+
+Result: Stale timeout rejected, gate updates state
+```
+
+**Key**: Fence tokens prevent stale decisions.
+
+### Scenario 5: Network Partition Isolates DC from Gate
+
+```
+Timeline:
+T0: DC-A partitioned from gate
+T1: DC-A continues local timeout detection
+T2: DC-A stores pending timeout reports (can't reach gate)
+T3: Gate sees no progress reports from DC-A for 3+ minutes
+T4: Gate declares global timeout (assumes DC-A stuck)
+T5: Gate sends JobGlobalTimeout to DC-B, DC-C (cancels them)
+T6: Partition heals
+T7: DC-A receives JobGlobalTimeout
+T8: DC-A cancels job (or already done via fallback)
+
+Fallback:
+If partition lasts 5+ minutes:
+  - DC-A times out job locally
+  - When partition heals, sends status correction
+```
+
+**Key**: Gate assumes stuck if no reports, DCs have fallback.
+
+---
+
+## Part 9: Complete Workflow Integration
+
+### Progress Tracking with AD-33 State Machine
+
+```python
+# Enhance WorkflowStateMachine to track progress
+class WorkflowStateMachine:
+    def __init__(self, ...):
+        self._last_progress: dict[str, float] = {}  # workflow_id → timestamp
+        self._progress_callbacks: list[Callable] = []
+
+    def register_progress_callback(
+        self,
+        callback: Callable[[str, WorkflowState], Awaitable[None]]
+    ) -> None:
+        """Register callback for state transitions (progress events)."""
+        self._progress_callbacks.append(callback)
+
+    async def transition(
+        self,
+        workflow_id: str,
+        to_state: WorkflowState,
+        reason: str = ""
+    ) -> bool:
+        """Transition with progress tracking."""
+        success = await self._transition_impl(workflow_id, to_state, reason)
+
+        if success:
+            # Record progress
+            self._last_progress[workflow_id] = time.monotonic()
+
+            # Notify progress callbacks (timeout strategies)
+            for callback in self._progress_callbacks:
+                try:
+                    await callback(workflow_id, to_state)
+                except Exception:
+                    pass  # Don't let callback errors break transition
+
+        return success
+
+    def get_time_since_progress(self, workflow_id: str) -> float:
+        """Get seconds since workflow last made progress."""
+        last_time = self._last_progress.get(workflow_id, 0.0)
+        if last_time == 0.0:
+            return 0.0
+        return time.monotonic() - last_time
+
+    def get_stuck_workflows(self, threshold_seconds: float) -> list[str]:
+        """Find workflows with no progress for threshold_seconds."""
+        now = time.monotonic()
+        stuck = []
+        for wf_id, last_time in self._last_progress.items():
+            if now - last_time > threshold_seconds:
+                stuck.append(wf_id)
+        return stuck
+
+
+# Manager connects timeout strategy to state machine
+async def _setup_timeout_progress_tracking(self, job_id: str) -> None:
+    """Connect state machine progress events to timeout strategy."""
+    if not self._workflow_lifecycle_states:
+        return
+
+    strategy = self._job_timeout_strategies.get(job_id)
+    if not strategy:
+        return
+
+    async def on_progress(workflow_id: str, state: WorkflowState) -> None:
+        # Find job for this workflow
+        for job in self._job_manager.iter_jobs():
+            if any(str(wf.token) == workflow_id for wf in job.workflows.values()):
+                await strategy.report_progress(job.job_id, f"workflow_{state.value}")
+                break
+
+    self._workflow_lifecycle_states.register_progress_callback(on_progress)
+```
+
+---
+
+## Part 10: Observability
+
+### Metrics
+
+```python
+# Timeout detection metrics
+job_timeout_checks_total{strategy="local_authority|gate_coordinated"} 1000
+job_timeouts_detected_total{reason="overall|stuck"} 50
+job_timeout_reports_sent_total{datacenter="us-east"} 30
+job_timeout_reports_failed_total{datacenter="us-east"} 2
+
+# Gate coordination metrics
+gate_global_timeouts_declared_total{reason="dc_timeout|all_stuck|overall"} 20
+gate_dc_progress_reports_received_total{datacenter="us-east"} 5000
+gate_dc_timeout_reports_received_total{datacenter="us-east"} 10
+
+# Fence token metrics
+timeout_fence_token_rejections_total{reason="stale_global_timeout"} 5
+timeout_leader_transfers_total{job_id="..."} 3
+```
+
+### Logs
+
+```python
+# Manager logs
+ServerInfo: "Job abc123 timed out: Job timeout exceeded (310.5s > 300.0s)"
+ServerWarning: "Gate unresponsive for 302s, timing out job abc123 locally"
+ServerWarning: "Rejected stale global timeout for abc123 (fence 1 < 2)"
+ServerDebug: "Resumed timeout tracking for abc123 (fence=2)"
+
+# Gate logs
+ServerInfo: "Job abc123 globally timed out: DC timeout: us-east, eu-west"
+ServerWarning: "Failed to send global timeout to us-east: Connection refused"
+```
+
+---
+
+## Part 11: Benefits
+
+### Adaptability
+
+✅ **Single deployment, dual behavior** - Same code, auto-detects topology
+✅ **Per-job strategy** - Different jobs can use different strategies
+✅ **No configuration** - Detection via `gate_addr` in JobSubmission
+
+### Fault Tolerance
+
+✅ **Leader failure recovery** - State in JobInfo, survives transfers
+✅ **Gate failure handling** - Fallback to local timeout after 5 minutes
+✅ **Network partition resilience** - Managers continue independently
+✅ **Idempotent operations** - Safe to call check_timeout() repeatedly
+
+### Correctness
+
+✅ **Fence tokens** - Prevent stale decisions after leader transfer
+✅ **Race condition handling** - Timestamps + status corrections
+✅ **Progress detection** - Distinguishes stuck from slow
+✅ **Multi-DC consistency** - Gate ensures all DCs cancelled together
+
+### Observability
+
+✅ **Complete state tracking** - TimeoutTrackingState captures everything
+✅ **Detailed logging** - Every timeout decision logged with reason
+✅ **Metrics** - Track detection, reports, rejections
+
+---
+
+## Part 12: Files
+
+| File | Purpose |
+|------|---------|
+| `distributed_rewrite/jobs/timeout_strategy.py` | TimeoutStrategy interface, LocalAuthorityTimeout, GateCoordinatedTimeout |
+| `distributed_rewrite/models/jobs.py` | TimeoutTrackingState dataclass added to JobInfo |
+| `distributed_rewrite/models/distributed.py` | JobProgressReport, JobTimeoutReport, JobGlobalTimeout, JobLeaderTransfer messages |
+| `nodes/manager.py` | Strategy selection, unified timeout loop, leader transfer handling |
+| `nodes/gate.py` | GateJobTracker, global timeout loop, broadcast coordination |
+| `distributed_rewrite/workflow/state_machine.py` | Progress tracking integration (from AD-33) |
+
+---
+
+## Part 13: Migration Strategy
+
+**Phase 1**: Implement LocalAuthorityTimeout only (single-DC)
+- Add TimeoutTrackingState to JobInfo
+- Implement unified_timeout_loop in Manager
+- Test with single-DC deployments
+
+**Phase 2**: Add gate_addr to JobSubmission
+- Gates populate gate_addr when submitting jobs
+- Managers check for gate_addr (falls back to local if missing)
+- No behavior change yet (still uses local timeout)
+
+**Phase 3**: Implement GateCoordinatedTimeout
+- Add progress/timeout reporting to gate
+- Implement GateJobTracker and global timeout loop
+- Enable gate_addr-based strategy selection
+
+**Phase 4**: Integration with AD-33
+- Connect WorkflowStateMachine progress events
+- Timeout strategies receive workflow state transitions
+- Complete stuck workflow detection
+
+---
+
+## Summary
+
+AD-34 introduces **adaptive job timeout with multi-DC coordination** that:
+
+✅ **Auto-detects topology** - Uses local authority (single-DC) or gate coordination (multi-DC)
+✅ **Robust to failures** - Leader transfers, gate failures, network partitions
+✅ **Race condition safe** - Fence tokens, timestamps, status corrections
+✅ **Detects stuck workflows** - Progress tracking via AD-33 state machine
+✅ **Global consistency** - Gate ensures timeout cancels job in ALL DCs
+✅ **Fallback protection** - Managers timeout locally if gate unreachable (5 min)
+✅ **Zero configuration** - Strategy chosen per-job based on `gate_addr`
+✅ **State recovery** - Timeout state persists in JobInfo, survives leader transfers
+
+This architecture ensures jobs never leak resources, even when workers are alive but workflows are stuck, across both single-datacenter and multi-datacenter deployments.
+
+---
+
+## Part 14: Integration with AD-26 (Healthcheck Extensions)
+
+### The Problem
+
+**Worker extension requests (AD-26) and job timeouts (AD-34) must cooperate**. Currently, they operate independently, creating several critical issues:
+
+#### Issue 1: Extension-Timeout Race Condition
+
+```
+Timeline:
+T0:   Job starts (timeout_seconds = 300s)
+T50:  Worker executing long workflow, requests extension (+15s granted)
+T100: Worker requests 2nd extension (+7.5s granted)
+T150: Worker requests 3rd extension (+3.75s granted)
+T300: Job timeout fires! ❌
+
+Problem:
+- Worker has 26.25s of legitimately granted extensions remaining
+- Worker is making progress (each extension required progress)
+- Job timeout doesn't account for extensions
+- Job killed prematurely despite legitimate work
+```
+
+#### Issue 2: Multi-DC Extension Coordination
+
+```
+Multi-DC Scenario:
+DC-A: Worker-1 granted 3 extensions (total_extended = 26.25s)
+DC-B: Worker-2 granted 1 extension (total_extended = 15s)
+DC-C: Worker-3 granted 0 extensions (stuck, denied)
+
+Gate receives:
+- DC-A: JobProgressReport (has_recent_progress = True, extensions_granted = 26.25s)
+- DC-B: JobProgressReport (has_recent_progress = True, extensions_granted = 15s)
+- DC-C: JobTimeoutReport (reason = "stuck", extensions_granted = 0s)
+
+Gate must decide:
+- Should it declare global timeout?
+- DC-C is stuck, but DC-A and DC-B are making progress with extensions
+- Should gate account for DC-A/B's extended deadlines?
+```
+
+#### Issue 3: Progress Tracking Mismatch
+
+```
+AD-34 tracks progress: WorkflowStateMachine state transitions
+AD-26 grants extensions: Worker-reported progress metric
+
+These are DIFFERENT:
+- Worker progress: "I've completed 50% of this workflow" (incremental)
+- Workflow progress: State transition PENDING → DISPATCHED → RUNNING → COMPLETED (discrete)
+
+Scenario:
+- Worker executing long workflow (e.g., 5-minute test)
+- Worker at 50% completion (deserves extension based on progress)
+- No workflow state transition in last 2 minutes (looks stuck to AD-34)
+- AD-34 declares timeout despite legitimate progress
+```
+
+### The Solution: Extension-Aware Timeout Tracking
+
+#### Enhanced TimeoutTrackingState
+
+```python
+@dataclass
+class TimeoutTrackingState:
+    """Timeout tracking state with extension awareness."""
+    strategy_type: str
+    gate_addr: tuple[str, int] | None
+
+    # Timestamps
+    started_at: float
+    last_progress_at: float
+    last_report_at: float
+
+    # Timeout configuration
+    timeout_seconds: float
+    stuck_threshold: float = 120.0
+
+    # Extension tracking (NEW)
+    total_extensions_granted: float = 0.0  # Total seconds granted to ALL workers
+    max_worker_extension: float = 0.0      # Largest extension granted to any worker
+    last_extension_at: float = 0.0         # When last extension was granted
+    active_workers_with_extensions: set[str] = field(default_factory=set)
+
+    # State flags
+    locally_timed_out: bool = False
+    globally_timed_out: bool = False
+    timeout_reason: str = ""
+
+    # Fencing
+    timeout_fence_token: int = 0
+```
+
+**Key Design:**
+- `total_extensions_granted`: Sum of ALL extensions granted to workers executing this job
+- `max_worker_extension`: Largest single extension granted (for timeout calculation)
+- `active_workers_with_extensions`: Track which workers have active extensions
+- Extensions are **additive to timeout_seconds**, not replacements
+
+#### Extension Notification Protocol
+
+```python
+@dataclass
+class WorkerExtensionGranted(Message):
+    """
+    Manager → Timeout Strategy: Worker extension granted (internal).
+
+    When manager grants a worker extension (AD-26), it must notify
+    the job timeout strategy so the job timeout is adjusted accordingly.
+    """
+    job_id: str
+    worker_id: str
+    extension_seconds: float
+    total_worker_extensions: float  # Total extensions for this worker
+    worker_progress: float          # Progress metric that justified extension
+    timestamp: float
+```
+
+#### Updated Progress Reporting (Multi-DC)
+
+```python
+@dataclass
+class JobProgressReport(Message):
+    """Manager → Gate: Periodic progress report."""
+    job_id: str
+    datacenter: str
+    manager_id: str
+    manager_host: str
+    manager_port: int
+    workflows_total: int
+    workflows_completed: int
+    workflows_failed: int
+    has_recent_progress: bool
+    timestamp: float
+    fence_token: int
+
+    # Extension tracking (NEW)
+    total_extensions_granted: float = 0.0  # Total extensions granted to workers
+    max_worker_extension: float = 0.0      # Largest extension granted
+    workers_with_extensions: int = 0       # Count of workers with active extensions
+```
+
+### Updated Timeout Strategies
+
+#### LocalAuthorityTimeout with Extensions
+
+```python
+class LocalAuthorityTimeout(TimeoutStrategy):
+    async def record_worker_extension(
+        self,
+        job_id: str,
+        worker_id: str,
+        extension_seconds: float,
+        worker_progress: float
+    ) -> None:
+        """
+        Record that a worker was granted an extension.
+
+        This adjusts the job's effective timeout to account for
+        legitimate long-running work.
+        """
+        job = self._manager._job_manager.get_job_by_id(job_id)
+        if not job or not job.timeout_tracking:
+            return
+
+        async with job.lock:
+            tracking = job.timeout_tracking
+
+            # Update extension tracking
+            tracking.total_extensions_granted += extension_seconds
+            tracking.max_worker_extension = max(
+                tracking.max_worker_extension,
+                extension_seconds
+            )
+            tracking.last_extension_at = time.monotonic()
+            tracking.active_workers_with_extensions.add(worker_id)
+
+            # Extension = progress! Update last_progress_at
+            tracking.last_progress_at = time.monotonic()
+
+        await self._manager._udp_logger.log(ServerDebug(
+            message=f"Job {job_id} timeout extended by {extension_seconds:.1f}s "
+                    f"(worker {worker_id} progress={worker_progress:.2f})",
+            node_host=self._manager._host,
+            node_port=self._manager._tcp_port,
+            node_id=self._manager._node_id.short,
+        ))
+
+    async def check_timeout(self, job_id: str) -> tuple[bool, str]:
+        """Check timeout with extension awareness."""
+        job = self._manager._job_manager.get_job_by_id(job_id)
+        if not job or not job.timeout_tracking:
+            return False, ""
+
+        if job.timeout_tracking.locally_timed_out:
+            return False, ""
+
+        if job.status in {JobStatus.COMPLETED.value, JobStatus.FAILED.value}:
+            return False, ""
+
+        now = time.monotonic()
+        tracking = job.timeout_tracking
+
+        # Calculate effective timeout with extensions
+        effective_timeout = tracking.timeout_seconds + tracking.total_extensions_granted
+
+        # Check overall timeout (with extensions)
+        elapsed = now - tracking.started_at
+        if elapsed > effective_timeout:
+            async with job.lock:
+                tracking.locally_timed_out = True
+                tracking.timeout_reason = (
+                    f"Job timeout exceeded ({elapsed:.1f}s > {effective_timeout:.1f}s, "
+                    f"base={tracking.timeout_seconds:.1f}s + "
+                    f"extensions={tracking.total_extensions_granted:.1f}s)"
+                )
+
+            await self._manager._timeout_job(job_id, tracking.timeout_reason)
+            return True, tracking.timeout_reason
+
+        # Check for stuck (no progress AND no recent extensions)
+        time_since_progress = now - tracking.last_progress_at
+        time_since_extension = now - tracking.last_extension_at if tracking.last_extension_at > 0 else float('inf')
+
+        # If extensions granted recently, not stuck
+        if time_since_extension < tracking.stuck_threshold:
+            return False, ""
+
+        # Otherwise check progress-based stuck detection
+        if time_since_progress > tracking.stuck_threshold:
+            async with job.lock:
+                tracking.locally_timed_out = True
+                tracking.timeout_reason = (
+                    f"Job stuck (no progress for {time_since_progress:.1f}s, "
+                    f"no extensions for {time_since_extension:.1f}s)"
+                )
+
+            await self._manager._timeout_job(job_id, tracking.timeout_reason)
+            return True, tracking.timeout_reason
+
+        return False, ""
+```
+
+**Key Changes:**
+1. **Additive Extensions**: `effective_timeout = base + total_extensions`
+2. **Extension = Progress**: Granting extension updates `last_progress_at`
+3. **Recent Extension Check**: Not stuck if extension granted within `stuck_threshold`
+
+#### GateCoordinatedTimeout with Extensions
+
+```python
+class GateCoordinatedTimeout(TimeoutStrategy):
+    async def record_worker_extension(
+        self,
+        job_id: str,
+        worker_id: str,
+        extension_seconds: float,
+        worker_progress: float
+    ) -> None:
+        """Record extension and notify gate."""
+        # Update local tracking (same as LocalAuthorityTimeout)
+        job = self._manager._job_manager.get_job_by_id(job_id)
+        if not job or not job.timeout_tracking:
+            return
+
+        async with job.lock:
+            tracking = job.timeout_tracking
+            tracking.total_extensions_granted += extension_seconds
+            tracking.max_worker_extension = max(
+                tracking.max_worker_extension,
+                extension_seconds
+            )
+            tracking.last_extension_at = time.monotonic()
+            tracking.last_progress_at = time.monotonic()
+            tracking.active_workers_with_extensions.add(worker_id)
+
+        # Gate will learn about extensions via next JobProgressReport
+        # (which includes total_extensions_granted field)
+
+    async def _send_progress_report(self, job_id: str) -> None:
+        """Send progress with extension info."""
+        job = self._manager._job_manager.get_job_by_id(job_id)
+        if not job or not job.timeout_tracking:
+            return
+
+        report = JobProgressReport(
+            job_id=job_id,
+            datacenter=self._manager._datacenter,
+            manager_id=self._manager._node_id.short,
+            manager_host=self._manager._host,
+            manager_port=self._manager._tcp_port,
+            workflows_total=job.workflows_total,
+            workflows_completed=job.workflows_completed,
+            workflows_failed=job.workflows_failed,
+            has_recent_progress=(
+                time.monotonic() - job.timeout_tracking.last_progress_at < 10.0
+            ),
+            timestamp=time.monotonic(),
+            fence_token=job.timeout_tracking.timeout_fence_token,
+            # Extension info (NEW)
+            total_extensions_granted=job.timeout_tracking.total_extensions_granted,
+            max_worker_extension=job.timeout_tracking.max_worker_extension,
+            workers_with_extensions=len(job.timeout_tracking.active_workers_with_extensions),
+        )
+
+        try:
+            await self._manager.send_tcp(
+                job.timeout_tracking.gate_addr,
+                "job_progress_report",
+                report.dump()
+            )
+        except Exception as e:
+            await self._manager._udp_logger.log(ServerDebug(
+                message=f"Failed to send progress report for {job_id}: {e}",
+                node_host=self._manager._host,
+                node_port=self._manager._tcp_port,
+                node_id=self._manager._node_id.short,
+            ))
+```
+
+### Gate Extension-Aware Timeout Coordination
+
+```python
+class GateJobTrackingInfo:
+    """Gate's view with extension tracking."""
+    job_id: str
+    submitted_at: float
+    timeout_seconds: float
+    target_datacenters: list[str]
+
+    # Per-DC state
+    dc_status: dict[str, str]
+    dc_last_progress: dict[str, float]
+    dc_manager_addrs: dict[str, tuple[str, int]]
+
+    # Per-DC extension tracking (NEW)
+    dc_total_extensions: dict[str, float] = field(default_factory=dict)
+    dc_max_extension: dict[str, float] = field(default_factory=dict)
+    dc_workers_with_extensions: dict[str, int] = field(default_factory=dict)
+
+    # Global timeout decision
+    globally_timed_out: bool = False
+    timeout_reason: str = ""
+    timeout_fence_token: int = 0
+
+
+class GateJobTracker:
+    async def record_progress(self, report: JobProgressReport) -> None:
+        """Record progress with extension info."""
+        async with self._lock:
+            info = self._tracked_jobs.get(report.job_id)
+            if not info:
+                return
+
+            # Update progress
+            info.dc_last_progress[report.datacenter] = report.timestamp
+            info.dc_manager_addrs[report.datacenter] = (
+                report.manager_host,
+                report.manager_port
+            )
+
+            # Update extension tracking
+            info.dc_total_extensions[report.datacenter] = report.total_extensions_granted
+            info.dc_max_extension[report.datacenter] = report.max_worker_extension
+            info.dc_workers_with_extensions[report.datacenter] = report.workers_with_extensions
+
+            if report.workflows_completed == report.workflows_total:
+                info.dc_status[report.datacenter] = "completed"
+
+    async def check_global_timeouts(self) -> list[tuple[str, str]]:
+        """Check timeouts with extension awareness."""
+        timed_out_jobs = []
+        now = time.monotonic()
+
+        async with self._lock:
+            for info in list(self._tracked_jobs.values()):
+                if info.globally_timed_out:
+                    continue
+
+                # Calculate global effective timeout
+                # Use MAX extension across all DCs (most lenient)
+                max_dc_extension = max(
+                    info.dc_total_extensions.values(),
+                    default=0.0
+                )
+                effective_timeout = info.timeout_seconds + max_dc_extension
+
+                # Check 1: Global timeout exceeded (with extensions)
+                elapsed = now - info.submitted_at
+                if elapsed > effective_timeout:
+                    info.globally_timed_out = True
+                    info.timeout_reason = (
+                        f"Global timeout exceeded ({elapsed:.1f}s > {effective_timeout:.1f}s, "
+                        f"base={info.timeout_seconds:.1f}s + max_extension={max_dc_extension:.1f}s)"
+                    )
+                    info.timeout_fence_token += 1
+                    timed_out_jobs.append((info.job_id, info.timeout_reason))
+                    continue
+
+                # Check 2: Any DC reported timeout WITHOUT extensions
+                # If DC has extensions, it's legitimately taking longer
+                timed_out_dcs = [
+                    dc for dc, status in info.dc_status.items()
+                    if status == "timed_out" and info.dc_total_extensions.get(dc, 0.0) == 0.0
+                ]
+
+                if timed_out_dcs:
+                    info.globally_timed_out = True
+                    info.timeout_reason = f"DC timeout (no extensions): {', '.join(timed_out_dcs)}"
+                    info.timeout_fence_token += 1
+                    timed_out_jobs.append((info.job_id, info.timeout_reason))
+                    continue
+
+                # Check 3: All DCs stuck (no progress AND no extensions for 3+ min)
+                stuck_dcs = []
+                for dc in info.target_datacenters:
+                    last_progress = info.dc_last_progress.get(dc, info.submitted_at)
+                    time_since_progress = now - last_progress
+
+                    # Get last extension time for this DC
+                    # (Gate doesn't track this directly, use progress report frequency)
+                    has_recent_extensions = info.dc_workers_with_extensions.get(dc, 0) > 0
+
+                    # Stuck if: no progress for 3+ min AND no workers have extensions
+                    if time_since_progress > 180.0 and not has_recent_extensions:
+                        stuck_dcs.append(dc)
+
+                if stuck_dcs and len(stuck_dcs) == len(info.target_datacenters):
+                    info.globally_timed_out = True
+                    info.timeout_reason = f"All DCs stuck: {', '.join(stuck_dcs)}"
+                    info.timeout_fence_token += 1
+                    timed_out_jobs.append((info.job_id, info.timeout_reason))
+
+        return timed_out_jobs
+```
+
+**Key Gate Logic:**
+1. **Global Effective Timeout** = `base_timeout + MAX(dc_extensions)`
+2. **Extension-Aware Stuck Detection**: DC not stuck if workers have active extensions
+3. **Timeout Without Extensions**: Only timeout DCs that haven't been granted extensions
+
+### Manager Integration
+
+```python
+# In ManagerServer.request_extension()
+async def request_extension(
+    self,
+    addr: tuple[str, int],
+    data: bytes,
+    clock_time: int,
+):
+    """Handle extension request with timeout coordination."""
+    try:
+        request = HealthcheckExtensionRequest.load(data)
+
+        # ... existing validation ...
+
+        response = self._worker_health_manager.handle_extension_request(
+            request=request,
+            current_deadline=current_deadline,
+        )
+
+        # Update deadline if granted
+        if response.granted:
+            self._worker_deadlines[request.worker_id] = response.new_deadline
+
+            # NEW: Notify job timeout strategy about extension
+            await self._notify_timeout_strategies_of_extension(
+                worker_id=request.worker_id,
+                extension_seconds=response.extension_seconds,
+                worker_progress=request.current_progress,
+            )
+
+            await self._udp_logger.log(ServerInfo(...))
+
+        return response.dump()
+
+    except Exception as e:
+        await self.handle_exception(e, "request_extension")
+
+
+async def _notify_timeout_strategies_of_extension(
+    self,
+    worker_id: str,
+    extension_seconds: float,
+    worker_progress: float,
+) -> None:
+    """
+    Notify all job timeout strategies that a worker received an extension.
+
+    This ensures job timeouts are adjusted to account for legitimate
+    long-running work.
+    """
+    # Find all jobs this worker is executing
+    affected_jobs = []
+    for job in self._job_manager.iter_jobs():
+        # Check if this worker is executing workflows for this job
+        for workflow_info in job.workflows.values():
+            if workflow_info.assigned_worker_id == worker_id:
+                affected_jobs.append(job.job_id)
+                break
+
+    # Notify timeout strategy for each affected job
+    for job_id in affected_jobs:
+        strategy = self._job_timeout_strategies.get(job_id)
+        if strategy:
+            await strategy.record_worker_extension(
+                job_id=job_id,
+                worker_id=worker_id,
+                extension_seconds=extension_seconds,
+                worker_progress=worker_progress,
+            )
+```
+
+### Benefits of Integration
+
+✅ **No Premature Timeouts**: Job timeout extended when workers receive legitimate extensions
+✅ **Multi-DC Coordination**: Gate accounts for DC-specific extensions when declaring global timeout
+✅ **Progress Recognition**: Extension grant = progress signal (updates `last_progress_at`)
+✅ **Stuck Detection**: Not stuck if extensions granted recently, even without state transitions
+✅ **Observability**: Extension info included in progress reports to gate
+✅ **Backward Compatible**: Jobs without extensions work exactly as before
+
+### Updated State Diagram
+
+```
+Job Timeline with Extensions:
+
+T0:     Job starts (timeout = 300s)
+T50:    Worker-1 requests extension (+15s granted)
+        → total_extensions = 15s
+        → effective_timeout = 315s
+        → last_progress_at updated
+T100:   Worker-2 requests extension (+7.5s granted)
+        → total_extensions = 22.5s
+        → effective_timeout = 322.5s
+        → last_progress_at updated
+T322:   Check timeout:
+        elapsed = 322s
+        effective_timeout = 322.5s
+        Result: NOT timed out (within extended deadline)
+T330:   Check timeout:
+        elapsed = 330s
+        effective_timeout = 322.5s
+        Result: TIMED OUT (exceeded even with extensions)
+```
+
+### Fault Tolerance with Extensions
+
+**Scenario: Leader transfer with pending extensions**
+
+```
+T0: Leader-A tracking job (started_at = 100, timeout = 300)
+T50: Leader-A grants Worker-1 extension (+15s)
+     → total_extensions = 15s stored in JobInfo.timeout_tracking
+T60: Leader-A fails
+T65: Leader-B elected, receives job via state sync
+T70: Leader-B calls resume_tracking()
+     → Reads total_extensions = 15s from JobInfo
+     → Continues with effective_timeout = 315s
+     → No extension lost!
+```
+
+**Key**: Extensions stored in `TimeoutTrackingState` which is part of `JobInfo`, so they survive leader transfers.
+
+---
+
+## Summary of AD-26 Integration
+
+AD-34 now cooperates with AD-26 healthcheck extensions:
+
+✅ **Extension-Aware Timeout**: `effective_timeout = base_timeout + total_extensions_granted`
+✅ **Extension = Progress**: Granting extension updates `last_progress_at` (not stuck)
+✅ **Multi-DC Extension Tracking**: Gate uses `MAX(dc_extensions)` for global timeout
+✅ **Extension Notification**: Manager notifies timeout strategies when extensions granted
+✅ **State Persistence**: Extension data in `TimeoutTrackingState`, survives leader transfers
+✅ **Progress Reporting**: Extension info included in `JobProgressReport` to gate
+✅ **Gate Coordination**: Gate distinguishes "timed out" from "legitimately taking longer"
+
+This ensures workers executing long-running workflows with legitimate extensions are not prematurely killed by job timeouts.
+
+---
+
+## Part 15: Timeout Cleanup and Lifecycle Management
+
+### The Problem: Zombie Timeouts
+
+**Timeout tracking must be cleaned up** when jobs/workflows terminate to prevent:
+1. **Memory leaks**: Timeout state persists after job completion
+2. **Zombie timeouts**: Timeout fires for already-completed/cancelled jobs
+3. **Stale extension tracking**: Extension data remains after worker failure
+4. **Resource exhaustion**: Timeout strategies accumulate indefinitely
+
+### Cleanup Triggers
+
+Timeout tracking must be cleaned up on:
+
+1. **Job Completion** (successful)
+2. **Job Failure** (execution error)
+3. **Job Cancellation** (user/gate requested)
+4. **Job Timeout** (self-triggered)
+5. **Worker Failure** (all workflows on worker)
+6. **Manager Cleanup** (periodic cleanup of old jobs)
+
+### Enhanced TimeoutStrategy Interface
+
+```python
+class TimeoutStrategy(ABC):
+    """Base timeout strategy with lifecycle management."""
+
+    @abstractmethod
+    async def start_tracking(
+        self,
+        job_id: str,
+        timeout_seconds: float,
+        gate_addr: tuple[str, int] | None = None
+    ) -> None:
+        """Start tracking on job submission."""
+        pass
+
+    @abstractmethod
+    async def stop_tracking(self, job_id: str, reason: str) -> None:
+        """
+        Stop tracking timeout for a job.
+
+        Called when job reaches terminal state (completed, failed, cancelled, timed out).
+        Must be idempotent - safe to call multiple times.
+
+        Args:
+            job_id: Job to stop tracking
+            reason: Why tracking stopped (e.g., "completed", "cancelled", "timed_out")
+        """
+        pass
+
+    @abstractmethod
+    async def cleanup_worker_extensions(self, job_id: str, worker_id: str) -> None:
+        """
+        Clean up extension tracking for a failed/removed worker.
+
+        Called when worker dies or is removed from job.
+        Removes worker from active_workers_with_extensions.
+
+        Args:
+            job_id: Job ID
+            worker_id: Worker to remove from extension tracking
+        """
+        pass
+
+    # ... existing methods ...
+```
+
+### LocalAuthorityTimeout Cleanup
+
+```python
+class LocalAuthorityTimeout(TimeoutStrategy):
+    async def stop_tracking(self, job_id: str, reason: str) -> None:
+        """
+        Stop timeout tracking for job.
+
+        Idempotent - safe to call multiple times.
+        """
+        job = self._manager._job_manager.get_job_by_id(job_id)
+        if not job or not job.timeout_tracking:
+            return
+
+        async with job.lock:
+            # Mark as stopped to prevent further timeout checks
+            job.timeout_tracking.locally_timed_out = True
+            job.timeout_tracking.timeout_reason = f"Tracking stopped: {reason}"
+
+        await self._manager._udp_logger.log(ServerDebug(
+            message=f"Stopped timeout tracking for job {job_id}: {reason}",
+            node_host=self._manager._host,
+            node_port=self._manager._tcp_port,
+            node_id=self._manager._node_id.short,
+        ))
+
+    async def cleanup_worker_extensions(self, job_id: str, worker_id: str) -> None:
+        """Remove failed worker from extension tracking."""
+        job = self._manager._job_manager.get_job_by_id(job_id)
+        if not job or not job.timeout_tracking:
+            return
+
+        async with job.lock:
+            job.timeout_tracking.active_workers_with_extensions.discard(worker_id)
+
+        await self._manager._udp_logger.log(ServerDebug(
+            message=f"Cleaned up extensions for worker {worker_id} in job {job_id}",
+            node_host=self._manager._host,
+            node_port=self._manager._tcp_port,
+            node_id=self._manager._node_id.short,
+        ))
+```
+
+### GateCoordinatedTimeout Cleanup
+
+```python
+class GateCoordinatedTimeout(TimeoutStrategy):
+    async def stop_tracking(self, job_id: str, reason: str) -> None:
+        """
+        Stop tracking and notify gate.
+
+        Sends final status update to gate so gate can clean up tracking.
+        """
+        job = self._manager._job_manager.get_job_by_id(job_id)
+        if not job or not job.timeout_tracking:
+            return
+
+        async with job.lock:
+            job.timeout_tracking.locally_timed_out = True
+            job.timeout_tracking.timeout_reason = f"Tracking stopped: {reason}"
+
+        # Send final status to gate
+        if job.timeout_tracking.gate_addr:
+            await self._send_final_status(job_id, reason)
+
+        await self._manager._udp_logger.log(ServerDebug(
+            message=f"Stopped timeout tracking for job {job_id}: {reason}",
+            node_host=self._manager._host,
+            node_port=self._manager._tcp_port,
+            node_id=self._manager._node_id.short,
+        ))
+
+    async def cleanup_worker_extensions(self, job_id: str, worker_id: str) -> None:
+        """Remove failed worker and send update to gate."""
+        job = self._manager._job_manager.get_job_by_id(job_id)
+        if not job or not job.timeout_tracking:
+            return
+
+        async with job.lock:
+            job.timeout_tracking.active_workers_with_extensions.discard(worker_id)
+
+        # Next progress report will reflect updated worker count
+
+        await self._manager._udp_logger.log(ServerDebug(
+            message=f"Cleaned up extensions for worker {worker_id} in job {job_id}",
+            node_host=self._manager._host,
+            node_port=self._manager._tcp_port,
+            node_id=self._manager._node_id.short,
+        ))
+
+    async def _send_final_status(self, job_id: str, reason: str) -> None:
+        """Send final status to gate for cleanup."""
+        job = self._manager._job_manager.get_job_by_id(job_id)
+        if not job or not job.timeout_tracking:
+            return
+
+        # Map reason to status
+        status_map = {
+            "completed": JobStatus.COMPLETED.value,
+            "failed": JobStatus.FAILED.value,
+            "cancelled": JobStatus.CANCELLED.value,
+            "timed_out": JobStatus.TIMEOUT.value,
+        }
+        status = status_map.get(reason, JobStatus.FAILED.value)
+
+        final_report = JobFinalStatus(
+            job_id=job_id,
+            datacenter=self._manager._datacenter,
+            manager_id=self._manager._node_id.short,
+            status=status,
+            timestamp=time.monotonic(),
+            fence_token=job.timeout_tracking.timeout_fence_token,
+        )
+
+        try:
+            await self._manager.send_tcp(
+                job.timeout_tracking.gate_addr,
+                "job_final_status",
+                final_report.dump()
+            )
+        except Exception as e:
+            # Best-effort cleanup notification
+            await self._manager._udp_logger.log(ServerDebug(
+                message=f"Failed to send final status for {job_id}: {e}",
+                node_host=self._manager._host,
+                node_port=self._manager._tcp_port,
+                node_id=self._manager._node_id.short,
+            ))
+```
+
+### Manager Integration - Cleanup Hooks
+
+```python
+class ManagerServer:
+    async def receive_cancel_job(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ):
+        """Handle job cancellation with timeout cleanup."""
+        try:
+            request = JobCancelRequest.load(data)
+
+            # ... existing cancellation logic ...
+
+            # NEW: Stop timeout tracking
+            strategy = self._job_timeout_strategies.get(request.job_id)
+            if strategy:
+                await strategy.stop_tracking(request.job_id, "cancelled")
+                self._job_timeout_strategies.pop(request.job_id, None)
+
+            # ... existing response logic ...
+
+        except Exception as e:
+            await self.handle_exception(e, "receive_cancel_job")
+
+    async def _handle_job_completion(self, job_id: str) -> None:
+        """
+        Handle job completion.
+
+        Called when all workflows complete successfully.
+        """
+        # ... existing completion logic ...
+
+        # Stop timeout tracking
+        strategy = self._job_timeout_strategies.get(job_id)
+        if strategy:
+            await strategy.stop_tracking(job_id, "completed")
+            self._job_timeout_strategies.pop(job_id, None)
+
+    async def _handle_job_failure(self, job_id: str, reason: str) -> None:
+        """
+        Handle job failure.
+
+        Called when job fails due to execution error.
+        """
+        # ... existing failure logic ...
+
+        # Stop timeout tracking
+        strategy = self._job_timeout_strategies.get(job_id)
+        if strategy:
+            await strategy.stop_tracking(job_id, "failed")
+            self._job_timeout_strategies.pop(job_id, None)
+
+    async def _timeout_job(self, job_id: str, reason: str) -> None:
+        """
+        Time out a job.
+
+        NEW method - called by timeout strategies when timeout detected.
+        """
+        job = self._job_manager.get_job_by_id(job_id)
+        if not job:
+            return
+
+        # Mark job as timed out
+        async with job.lock:
+            job.status = JobStatus.TIMEOUT.value
+
+        # Cancel all workflows
+        await self._cancel_all_workflows_for_job(job_id, reason="timeout")
+
+        # Stop timeout tracking (idempotent)
+        strategy = self._job_timeout_strategies.get(job_id)
+        if strategy:
+            await strategy.stop_tracking(job_id, "timed_out")
+            self._job_timeout_strategies.pop(job_id, None)
+
+        # Notify callback (gate or client)
+        if job.callback_addr:
+            await self._send_job_timeout_notification(job_id, reason)
+
+        await self._udp_logger.log(ServerWarning(
+            message=f"Job {job_id} timed out: {reason}",
+            node_host=self._host,
+            node_port=self._tcp_port,
+            node_id=self._node_id.short,
+        ))
+
+    async def _handle_worker_failure(self, worker_id: str) -> None:
+        """
+        Handle worker failure.
+
+        Clean up extension tracking for all jobs using this worker.
+        """
+        # ... existing worker failure logic ...
+
+        # Clean up extension tracking
+        for job in self._job_manager.iter_jobs():
+            strategy = self._job_timeout_strategies.get(job.job_id)
+            if strategy:
+                # Check if this worker was executing workflows for this job
+                has_workflows = any(
+                    wf_info.assigned_worker_id == worker_id
+                    for wf_info in job.workflows.values()
+                )
+                if has_workflows:
+                    await strategy.cleanup_worker_extensions(job.job_id, worker_id)
+
+    def _cleanup_job(self, job_id: str) -> None:
+        """
+        Clean up all state associated with a job.
+
+        Called by periodic cleanup loop for old jobs.
+        """
+        # NEW: Clean up timeout strategy
+        strategy = self._job_timeout_strategies.pop(job_id, None)
+        if strategy:
+            # Fire-and-forget stop_tracking
+            self._task_runner.run(strategy.stop_tracking, job_id, "cleanup")
+
+        # ... existing cleanup logic ...
+
+        self._task_runner.run(self._job_manager.complete_job, job_id)
+        self._job_leaders.pop(job_id, None)
+        # ... rest of cleanup ...
+```
+
+### Gate Cleanup Integration
+
+```python
+class GateJobTracker:
+    async def handle_final_status(self, report: JobFinalStatus) -> None:
+        """
+        Handle final status from manager (cleanup trigger).
+
+        Removes job from tracking when it reaches terminal state.
+        """
+        async with self._lock:
+            info = self._tracked_jobs.get(report.job_id)
+            if not info:
+                return
+
+            # Update DC status
+            info.dc_status[report.datacenter] = report.status
+
+            # Check if all DCs have reached terminal state
+            all_terminal = all(
+                status in {
+                    JobStatus.COMPLETED.value,
+                    JobStatus.FAILED.value,
+                    JobStatus.CANCELLED.value,
+                    JobStatus.TIMEOUT.value,
+                }
+                for status in info.dc_status.values()
+            )
+
+            if all_terminal:
+                # Clean up tracking
+                self._tracked_jobs.pop(report.job_id, None)
+
+                await self._gate._logger.log(ServerDebug(
+                    message=f"Cleaned up timeout tracking for job {report.job_id}",
+                    node_host=self._gate._host,
+                    node_port=self._gate._tcp_port,
+                    node_id=self._gate._node_id.short,
+                ))
+
+
+class GateServer:
+    async def receive_job_final_status(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ):
+        """Receive final status from manager for cleanup."""
+        try:
+            report = JobFinalStatus.load(data)
+            await self._job_tracker.handle_final_status(report)
+        except Exception as e:
+            await self.handle_exception(e, "receive_job_final_status")
+```
+
+### New Protocol Message
+
+```python
+@dataclass
+class JobFinalStatus(Message):
+    """
+    Manager → Gate: Final job status for cleanup.
+
+    Sent when job reaches terminal state (completed/failed/cancelled/timed out).
+    Gate uses this to clean up timeout tracking for the job.
+    """
+    job_id: str
+    datacenter: str
+    manager_id: str
+    status: str  # JobStatus.COMPLETED/FAILED/CANCELLED/TIMEOUT
+    timestamp: float
+    fence_token: int
+```
+
+### Cleanup State Diagram
+
+```
+Job Lifecycle with Cleanup:
+
+                    ┌─────────────────┐
+                    │  Job Submitted  │
+                    └────────┬────────┘
+                             ↓
+                    ┌─────────────────┐
+                    │ start_tracking()│
+                    │  (Strategy)     │
+                    └────────┬────────┘
+                             ↓
+                ┌────────────┴────────────┐
+                │                         │
+                ↓                         ↓
+        ┌──────────────┐         ┌──────────────┐
+        │   Running    │         │  Cancelled   │
+        └──────┬───────┘         └──────┬───────┘
+               │                        │
+        ┌──────┴──────┐                 │
+        ↓             ↓                 ↓
+   ┌─────────┐  ┌──────────┐    ┌──────────────┐
+   │Completed│  │ Failed   │    │  Timed Out   │
+   └────┬────┘  └────┬─────┘    └──────┬───────┘
+        │            │                  │
+        └────────────┴──────────────────┘
+                     ↓
+            ┌─────────────────┐
+            │ stop_tracking() │
+            │   (Strategy)    │
+            └────────┬────────┘
+                     ↓
+            ┌─────────────────┐
+            │ Strategy removed│
+            │ from tracking   │
+            └─────────────────┘
+                     ↓
+            ┌─────────────────┐
+            │  _cleanup_job() │
+            │ (periodic loop) │
+            └─────────────────┘
+```
+
+### Cleanup Guarantees
+
+✅ **Idempotent Cleanup**: `stop_tracking()` safe to call multiple times
+✅ **No Zombie Timeouts**: Strategy removed immediately when job terminal
+✅ **Extension Cleanup**: Worker extensions removed on worker failure
+✅ **Memory Safety**: Timeout state cleaned up with job
+✅ **Multi-DC Sync**: Gate cleans up when ALL DCs report terminal state
+✅ **Graceful Degradation**: Cleanup failures logged but don't block job completion
+
+### Edge Cases Handled
+
+#### Race: Job completes while timeout check running
+
+```python
+async def check_timeout(self, job_id: str) -> tuple[bool, str]:
+    """Check with terminal state protection."""
+    job = self._manager._job_manager.get_job_by_id(job_id)
+    if not job or not job.timeout_tracking:
+        return False, ""
+
+    # Check terminal state FIRST (race protection)
+    if job.status in {
+        JobStatus.COMPLETED.value,
+        JobStatus.FAILED.value,
+        JobStatus.CANCELLED.value,
+        JobStatus.TIMEOUT.value,
+    }:
+        return False, ""  # Don't timeout terminal jobs
+
+    # ... rest of timeout check ...
+```
+
+#### Race: Worker fails while extension granted
+
+```python
+async def _handle_worker_failure(self, worker_id: str) -> None:
+    """Worker failure with extension cleanup."""
+    # Remove worker from ALL job extension tracking
+    for job in self._job_manager.iter_jobs():
+        strategy = self._job_timeout_strategies.get(job.job_id)
+        if strategy:
+            await strategy.cleanup_worker_extensions(job.job_id, worker_id)
+
+    # If job has no more workers, may need to timeout
+    # (handled by regular timeout check loop)
+```
+
+#### Double cleanup: Job cancelled then cleaned up
+
+```python
+async def stop_tracking(self, job_id: str, reason: str) -> None:
+    """Idempotent cleanup."""
+    job = self._manager._job_manager.get_job_by_id(job_id)
+    if not job or not job.timeout_tracking:
+        return  # Already cleaned up
+
+    # Safe to mark multiple times
+    async with job.lock:
+        job.timeout_tracking.locally_timed_out = True
+```
+
+### Observability for Cleanup
+
+```python
+# Cleanup metrics
+timeout_tracking_stopped_total{reason="completed|failed|cancelled|timed_out|cleanup"} 100
+timeout_strategies_active_count 50  # Current active strategies
+worker_extensions_cleaned_total{reason="worker_failure"} 10
+
+# Cleanup logs
+ServerDebug: "Stopped timeout tracking for job abc123: completed"
+ServerDebug: "Cleaned up extensions for worker worker-1 in job abc123"
+ServerDebug: "Cleaned up timeout tracking for job abc123 (all DCs terminal)"
+```
+
+---
+
+## Summary: Lifecycle Management
+
+AD-34 timeout tracking now includes comprehensive lifecycle management:
+
+✅ **Start Tracking**: `start_tracking()` called on job submission
+✅ **Stop Tracking**: `stop_tracking()` called on job completion/failure/cancellation/timeout
+✅ **Extension Cleanup**: `cleanup_worker_extensions()` called on worker failure
+✅ **Periodic Cleanup**: `_cleanup_job()` removes stale timeout strategies
+✅ **Idempotent Operations**: Safe to call cleanup multiple times
+✅ **Race Protection**: Terminal state checked before timeout
+✅ **Multi-DC Sync**: Gate cleans up when all DCs report final status
+✅ **Memory Safety**: No timeout tracking leaks
+
+**Critical Rule**: Timeout strategies MUST be removed from `_job_timeout_strategies` when job reaches terminal state to prevent zombie timeouts and memory leaks.

@@ -6,845 +6,403 @@ This document tracks the remaining work for robust job leadership transfer and w
 
 ---
 
-## 1. Fix Job Leadership Takeover When SWIM Leader IS Job Leader (Option A)
+## 10. AD-34: Adaptive Job Timeout with Multi-DC Coordination
 
-**Status**: ✅ Complete
+**Status**: 📝 Architecture Complete, Implementation Pending
 
-**Problem**: When Manager A is both the SWIM cluster leader AND job leader, and Manager A fails:
-1. SWIM detects failure (probe → suspicion → confirmed dead)
-2. `_on_node_dead` callback fires on surviving managers
-3. SWIM leader election begins (may take seconds)
-4. `_handle_job_leader_failure()` checks `is_leader()` - returns False during election
-5. **No one takes over orphaned jobs**
+**Overview**: Implement adaptive job timeout tracking that auto-detects single-DC vs multi-DC deployments and uses appropriate timeout strategies. Integrates with AD-26 (healthcheck extensions) and AD-33 (workflow state machine) to prevent resource leaks while respecting legitimate long-running work.
 
-**Solution**: Add orphaned job scanning to `_on_manager_become_leader` callback.
+**Key Features**:
+- Auto-detection via `gate_addr` field in JobSubmission
+- LocalAuthorityTimeout (single-DC) and GateCoordinatedTimeout (multi-DC)
+- Extension-aware timeout calculation: `effective_timeout = base + extensions`
+- State persistence across leader transfers
+- Comprehensive cleanup on job completion/failure/cancellation
 
-### Tasks
+### 10.1 Core Data Structures
 
-- [x] **1.1** Add `_dead_managers` tracking set to manager
-  - Track managers confirmed dead via SWIM
-  - Populate in `_on_node_dead` callback
-  - Clear entries when manager rejoins via `_on_node_join`
+#### 10.1.1 TimeoutTrackingState (Add to JobInfo)
 
-- [x] **1.2** Add `_scan_for_orphaned_jobs()` method
-  - Called from `_on_manager_become_leader`
-  - For each job in `_job_leader_addrs`, check if leader is in `_dead_managers`
-  - Take over any orphaned jobs found
+**File**: `hyperscale/distributed_rewrite/models/jobs.py`
 
-- [x] **1.3** Update `_on_manager_become_leader` to call `_scan_for_orphaned_jobs()`
-  - Run after initial leader stabilization
-  - Log jobs being taken over
-
-- [x] **1.4** Handle edge case: new leader fails during takeover
-  - The next elected leader will also scan for orphaned jobs
-  - Fencing tokens prevent duplicate takeover
-
-### Files
-- `hyperscale/distributed_rewrite/nodes/manager.py`
-
----
-
-## 2. Refactor Workflow Cancellation to Event-Based Approach
-
-**Status**: ✅ Complete
-
-**Problem**: Current cancellation uses polling and callbacks. This needs to be event-based for proper integration with job leader failure handling.
-
-### Completed: WorkflowRunner Bool Flag Cancellation
-
-The minimal-impact bool flag approach has been implemented:
-
-- [x] **2.0a** Add `_cancelled: bool` flag to `WorkflowRunner.__init__`
-- [x] **2.0b** Add `request_cancellation()` method to `WorkflowRunner`
-- [x] **2.0c** Update `_generate()` while loop: `while elapsed < duration and not self._cancelled`
-- [x] **2.0d** Update `_generate_constant()` while loop: same pattern
-- [x] **2.0e** Reset `_cancelled = False` at start of `run()`
-- [x] **2.0f** `RemoteGraphController.cancel_workflow_background()` calls `request_cancellation()` before task cancel
-- [x] **2.0g** Fix `Run.cancel()` to use timeout and always update status
-- [x] **2.0h** Add event-driven workflow completion signaling
-- [x] **2.0i** Fix `cancel_pending()` to use timeout and consistent return type
-- [x] **2.0j** Add done callback to prevent memory leaks in hung task cancellation
-
-**Files modified**:
-- `hyperscale/core/jobs/graphs/workflow_runner.py`
-- `hyperscale/core/jobs/graphs/remote_graph_controller.py` (already updated)
-- `hyperscale/core/jobs/tasks/run.py` - Added timeout parameter to prevent hangs
-- `hyperscale/core/jobs/tasks/task_hook.py` - Pass through timeout parameter
-- `hyperscale/core/jobs/tasks/task_runner.py` - Pass through timeout parameter
-
-### Completed: Task Runner Cancellation Fix
-
-**Problem**: `Run.cancel()` could hang indefinitely if a task didn't respond to cancellation. The status was only updated after awaiting the task, so timeouts left status unchanged.
-
-**Solution**:
-- Added `timeout` parameter to `Run.cancel()` (default: 5.0 seconds)
-- Uses `asyncio.wait_for(asyncio.shield(task), timeout)` to prevent indefinite hangs
-- Always updates `status = CANCELLED`, `end`, and `elapsed` regardless of timeout/exception
-- Propagated timeout parameter through `Task.cancel()` and `TaskRunner.cancel()`
-
-```python
-# Before (could hang forever):
-async def cancel(self):
-    if self._task and not self._task.done():
-        self._task.cancel()
-        await self._task  # <-- Could hang!
-    self.status = RunStatus.CANCELLED  # <-- Never reached on hang
-
-# After (bounded wait, always updates status):
-async def cancel(self, timeout: float = 5.0):
-    if self._task and not self._task.done():
-        self._task.cancel()
-        try:
-            # No shield - we already cancelled it, just waiting for cleanup
-            await asyncio.wait_for(self._task, timeout=timeout)
-        except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
-            pass
-    # Always update status, even if timeout occurred
-    self.status = RunStatus.CANCELLED
-    self.end = time.monotonic()
-    self.elapsed = self.end - self.start
-```
-
-### Completed: Event-Driven Workflow Completion Signaling
-
-**Problem**: `cancel_workflow_background()` used polling via `tasks.cancel()` to wait for workflow termination. This was converted to event-driven but had gaps.
-
-**Solution**:
-- Added `_is_cancelled: asyncio.Event` to WorkflowRunner
-- Added `await_cancellation()` method that waits on the event
-- Event is set at the end of both `_execute_test_workflow` AND `_execute_non_test_workflow`
-- Event is cleared at start of `run()` alongside the bool flag reset
-- `cancel_workflow_background()` now uses `await_cancellation()` instead of `tasks.cancel()`
-
-**Flow**:
-```
-cancel_workflow_background()
-    │
-    ├─► request_cancellation()  # Sets _cancelled = True
-    │       │
-    │       └─► Generators stop yielding new VUs
-    │
-    └─► await_cancellation()  # Waits on _is_cancelled event
-            │
-            └─► Event fires when _execute_*_workflow completes
-```
-
-### Completed: Memory-Leak-Free Task Cancellation
-
-**Problem**: Fire-and-forget task cancellation could leak memory when tasks are stuck in syscalls (SSL, network operations). Python's asyncio keeps task objects alive if their exception is never retrieved. This is critical when cancelling millions of hung network requests.
-
-**Solution**: Use `add_done_callback` to ensure exception retrieval even for stuck tasks.
-
-```python
-def _retrieve_task_exception(task: asyncio.Task) -> None:
-    """
-    Done callback to retrieve a task's exception and prevent memory leaks.
-    """
-    try:
-        task.exception()
-    except (asyncio.CancelledError, asyncio.InvalidStateError, Exception):
-        pass
-
-
-def cancel_and_release_task(pend: asyncio.Task) -> None:
-    """
-    Cancel a task and guarantee no memory leaks, even for hung tasks.
-    """
-    try:
-        if pend.done():
-            # Task already finished - retrieve exception now
-            try:
-                pend.exception()
-            except (asyncio.CancelledError, asyncio.InvalidStateError, Exception):
-                pass
-        else:
-            # Task still running - cancel and add callback for when it finishes
-            # The callback ensures exception is retrieved even if task is stuck
-            pend.add_done_callback(_retrieve_task_exception)
-            pend.cancel()
-    except Exception:
-        pass
-```
-
-**Key insight**: The done callback fires when the task eventually finishes (even if stuck for a long time), ensuring:
-1. Exception is retrieved → no "exception never retrieved" warnings
-2. Task object can be garbage collected → no memory leaks
-3. Works even for tasks stuck in SSL/network syscalls
-
-### Current Architecture Documentation
-
-#### 2.1 RemoteGraphManager.cancel_workflow() Flow
-
-**File**: `hyperscale/core/jobs/graphs/remote_graph_manager.py`
-
-```
-cancel_workflow(run_id, workflow, timeout, update_rate)
-    │
-    ▼
-RemoteGraphController.submit_workflow_cancellation()
-    │
-    ├─► Finds nodes running the workflow (status == RUNNING)
-    ├─► Sends request_workflow_cancellation() to each node
-    │   │
-    │   └─► @send() method sends to "cancel_workflow" receiver
-    │
-    └─► Starts background task: get_latest_cancelled_status()
-            │
-            ├─► Polls _cancellations dict every `rate` seconds
-            ├─► Calls update_callback with aggregated status counts
-            └─► Runs until timeout expires
-```
-
-**Key data structures**:
-- `_cancellations: NodeData[WorkflowCancellationUpdate]` - stores cancellation status per (run_id, workflow, node_id)
-- `_cancellation_write_lock` - per-node locks for cancellation updates
-- `_statuses` - tracks workflow status per node (RUNNING, COMPLETED, etc.)
-
-#### 2.2 Worker-Side Cancellation Handler
-
-**File**: `hyperscale/core/jobs/graphs/remote_graph_controller.py`
-
-```
-@receive()
-cancel_workflow(shard_id, cancelation: JobContext[WorkflowCancellation])
-    │
-    ├─► Looks up workflow_run_id from _run_workflow_run_id_map
-    │
-    └─► Spawns background task: cancel_workflow_background()
-            │
-            ├─► Calls self.tasks.cancel("run_workflow", workflow_run_id)
-            │       │
-            │       └─► This cancels the asyncio task running the workflow
-            │
-            ├─► On success: sends receive_cancellation_update with CANCELLED status
-            │
-            └─► On failure/timeout: sends receive_cancellation_update with FAILED status
-```
-
-**Cancellation statuses** (from `WorkflowCancellationStatus`):
-- `REQUESTED` - Cancellation request received
-- `IN_PROGRESS` - Cancellation in progress
-- `CANCELLED` - Successfully cancelled
-- `FAILED` - Cancellation failed
-- `NOT_FOUND` - Workflow not found on this node
-
-#### 2.3 WorkflowRunner Cancellation Handling
-
-**File**: `hyperscale/core/jobs/graphs/workflow_runner.py`
-
-The WorkflowRunner doesn't have explicit cancellation handling. Cancellation works via:
-
-1. **Task cancellation**: `tasks.cancel("run_workflow", run_id)` cancels the asyncio.Task
-2. **asyncio.CancelledError propagation**: When the task is cancelled, `CancelledError` propagates through:
-   - `_run_workflow()`
-   - `_execute_test_workflow()` or `_execute_non_test_workflow()`
-   - The `asyncio.wait()` call returns pending tasks
-
-3. **Pending task cleanup**: The `cancel_pending()` helper function cleans up remaining tasks:
-   ```python
-   async def cancel_pending(pend: asyncio.Task):
-       if pend.done():
-           pend.exception()
-           return pend
-       pend.cancel()
-       await asyncio.sleep(0)
-       if not pend.cancelled():
-           await pend
-       return pend
-   ```
-
-4. **Status tracking**: `run_statuses[run_id][workflow_name]` is set to `WorkflowStatus.FAILED` on exception
-
-**Current limitations**:
-- No explicit cancellation event/flag that generators check
-- Duration-based execution (`_generate`, `_generate_constant`) runs until elapsed time
-- CPU monitor locks can delay cancellation propagation
-
-### Refactoring Tasks
-
-- [x] **2.4** Add cancellation event to WorkflowRunner
-  - `_is_cancelled: asyncio.Event` already exists for completion signaling
-  - Bool flag `_running` is checked in `_generate()` and `_generate_constant()` loops
-  - Single workflow per runner, so event pattern is sufficient
-
-- [x] **2.5** Replace polling with event subscription in RemoteGraphController
-  - `_cancellation_completion_events: Dict[int, Dict[str, asyncio.Event]]` exists
-  - `_cancellation_expected_nodes` tracks pending workers
-  - Event fires in `receive_cancellation_update()` when all nodes report terminal status
-  - `await_workflow_cancellation()` waits on event instead of polling
-
-- [x] **2.6** Add cancellation acknowledgment flow
-  - Worker sends `WorkflowCancellationComplete` via `_push_cancellation_complete()`
-  - Manager receives and tracks via `receive_cancellation_update()`
-  - Status updates immediately on receipt
-
-- [x] **2.7** Integrate with job leader failure
-  - Worker tracks orphaned workflows in `_orphaned_workflows: dict[str, float]`
-  - `_handle_manager_failure()` marks workflows as orphaned when job leader fails
-  - `job_leader_worker_transfer()` clears orphaned workflows when transfer arrives
-  - `_orphan_check_loop()` cancels workflows after `WORKER_ORPHAN_GRACE_PERIOD` expires
-  - Configuration via `WORKER_ORPHAN_GRACE_PERIOD` (default 5.0s) and `WORKER_ORPHAN_CHECK_INTERVAL` (default 1.0s)
-
-### Files
-- `hyperscale/core/jobs/graphs/workflow_runner.py`
-- `hyperscale/core/jobs/graphs/remote_graph_controller.py`
-- `hyperscale/core/jobs/graphs/remote_graph_manager.py`
-- `hyperscale/distributed_rewrite/nodes/worker.py`
-- `hyperscale/distributed_rewrite/env/env.py`
-
----
-
-## 3. Worker-Side Job Leader Failure Handling
-
-**Status**: ✅ Complete
-
-**Problem**: When workers learn their job leader has failed, they need to:
-1. Wait for potential `JobLeaderWorkerTransfer` (new leader taking over)
-2. If transfer arrives → update `_workflow_job_leader` mapping, continue
-3. If grace period expires → trigger workflow cancellation
-
-### Tasks
-
-- [x] **3.1** Add orphaned workflow tracking to worker
-  ```python
-  _orphaned_workflows: dict[str, float]  # workflow_id -> orphan_timestamp
-  ```
-
-- [x] **3.2** Modify `_on_node_dead` to mark workflows as orphaned
-  - Find all workflows for the dead manager
-  - Add to `_orphaned_workflows` with current timestamp
-  - Do NOT immediately cancel
-
-- [x] **3.3** Modify `job_leader_worker_transfer` handler
-  - Clear workflow from `_orphaned_workflows` if present
-  - Update `_workflow_job_leader` mapping
-  - Log successful transfer
-
-- [x] **3.4** Add orphan grace period checker
-  - Periodic task or integrate with existing cleanup task
-  - For each orphaned workflow, check if grace period expired
-  - If expired → trigger cancellation via event system (from item 2)
-
-- [x] **3.5** Configuration
-  - `WORKER_ORPHAN_GRACE_PERIOD` env var (default: 5.0 seconds)
-  - Tune based on expected election + takeover time
-
-### Files
-- `hyperscale/distributed_rewrite/nodes/worker.py`
-- `hyperscale/distributed_rewrite/env.py` (for config)
-
----
-
-## 4. Integration Testing
-
-**Status**: ✅ Complete
-
-Integration tests implemented using mocks for all networking, covering:
-
-- [x] **4.1** Test: SWIM leader + job leader fails
-  - `TestIntegrationManagerAndWorker::test_full_flow_swim_leader_job_leader_fails`
-  - Verifies full flow from manager failure → workflow orphaned → transfer → workflow rescued
-
-- [x] **4.2** Test: Job leader fails (not SWIM leader)
-  - Covered in Section 1 tests (`test_job_leadership_takeover.py`)
-  - `TestFailoverScenarios::test_non_leader_job_leader_fails_scenario`
-
-- [x] **4.3** Test: Worker orphan grace period
-  - `TestWorkerOrphanGracePeriod::test_orphaned_workflow_cancelled_after_grace_period`
-  - `TestIntegrationManagerAndWorker::test_full_flow_no_transfer_workflow_cancelled`
-  - Verifies workflow cancelled after grace period expires without transfer
-
-- [x] **4.4** Test: Worker receives transfer before grace expires
-  - `TestWorkerReceivesTransferBeforeGrace::test_workflow_continues_after_transfer`
-  - `TestWorkerReceivesTransferBeforeGrace::test_transfer_clears_orphaned_workflow`
-  - Verifies transfer rescues workflow from orphan state
-
-Additional test coverage:
-- Cascading failures (multiple managers fail)
-- Partial transfers (only some workflows)
-- Edge cases (workflow completes naturally, empty orphan dict, unknown workflows)
-
-### Files
-- `tests/integration/test_job_leader_failover.py`
-- `tests/integration/test_job_leadership_takeover.py` (Section 1 tests)
-
----
-
-## 5. Event-Driven Cancellation Push Notification Chain
-
-**Status**: ✅ Complete
-
-**Architecture**: Worker → Manager → Gate → Client push notification chain (fully implemented)
-
-### Completed Tasks
-
-- [x] **5.1** `WorkflowCancellationComplete` message type
-  - Defined in `distributed.py:785-801`
-  - Contains: `job_id`, `workflow_id`, `success`, `errors`, `cancelled_at`, `node_id`
-
-- [x] **5.2** Worker `_push_cancellation_complete()` method
-  - Implemented in `worker.py:1470-1519`
-  - Sends `WorkflowCancellationComplete` to job leader manager
-  - Falls back to other healthy managers if job leader unreachable
-
-- [x] **5.3** Manager `workflow_cancellation_complete` TCP handler
-  - Implemented in `manager.py:8850+`
-  - Receives push from worker
-  - Updates workflow status and tracks cancellation
-
-- [x] **5.4** Manager `_push_cancellation_complete_to_origin()` method
-  - Implemented in `manager.py:7095-7144`
-  - Pushes `JobCancellationComplete` to origin gate or client callback
-  - Includes aggregated error information
-
-- [x] **5.5** `JobCancellationComplete` message type
-  - Defined in `distributed.py:805-822`
-  - Contains: `job_id`, `success`, `cancelled_workflow_count`, `total_workflow_count`, `errors`, `cancelled_at`
-
-- [x] **5.6** Gate `receive_job_cancellation_complete` handler
-  - Implemented in `gate.py:4588+`
-  - Receives push from manager
-  - Forwards to client callback
-
-- [x] **5.7** Client `receive_job_cancellation_complete` handler
-  - Implemented in `client.py:1506+`
-  - Receives push from gate/manager
-  - Updates local job state
-
-- [x] **5.8** Client `await_job_cancellation()` - implemented via event pattern
-- [x] **5.9** Manager cancellation tracking and cleanup - implemented
-- [x] **5.10** Worker `_cancel_workflow()` wired to push completion
-
-### Message Flow
-
-```
-Client                Gate                  Manager               Worker
-  |                    |                      |                     |
-  |--CancelJob-------->|                      |                     |
-  |                    |--CancelJob---------->|                     |
-  |                    |                      |--CancelJob--------->|
-  |                    |                      |<--CancelAck---------|
-  |                    |<--CancelAck----------|                     |
-  |<--CancelAck--------|                      |                     |
-  |                    |                      |     (cancellation   |
-  |                    |                      |      in progress)   |
-  |                    |                      |                     |
-  |                    |                      |<--CancellationComplete
-  |                    |<--JobCancellationComplete                  |
-  |<--JobCancellationComplete                 |                     |
-  |                    |                      |                     |
-```
-
-### Files
-- `hyperscale/distributed_rewrite/models/distributed.py` (new message types)
-- `hyperscale/distributed_rewrite/nodes/worker.py` (push completion)
-- `hyperscale/distributed_rewrite/nodes/manager.py` (receive & forward)
-- `hyperscale/distributed_rewrite/nodes/gate.py` (receive & forward)
-- `hyperscale/distributed_rewrite/nodes/client.py` (receive & await)
-
----
-
-## 6. Workflow-Level Cancellation from Gates (Single Workflow Cancellation)
-
-**Problem**: Currently, cancellation is at the job level. We need fine-grained workflow-level cancellation where:
-1. Clients can request cancellation of a specific workflow (not entire job)
-2. Gates dispatch to ALL datacenters with matching job
-3. Managers check workflow state (pending, running, not found)
-4. ALL dependent workflows are also cancelled
-5. Cancellation is race-condition safe with proper locking
-6. Peer notification ensures consistency across cluster
-
-### Architecture Overview
-
-```
-Client                Gate                  Manager               Worker
-  |                    |                      |                     |
-  |--CancelWorkflow--->|                      |                     |
-  |                    |--CancelWorkflow----->| (to all DCs)        |
-  |                    |                      |                     |
-  |                    |   (notify peers)     |--CancelWorkflow---->|
-  |                    |      |               |<--CancelAck---------|
-  |                    |      v               |                     |
-  |                    | Gate Peers           | Manager Peers       |
-  |                    | (register for        | (move workflow+deps |
-  |                    |  failover)           |  to cancelled bucket)|
-  |                    |                      |                     |
-  |                    |                      | (wait ALL workers)  |
-  |                    |<--CancellationResult-|                     |
-  |<--CancellationResult (aggregate all DCs) |                     |
-```
-
-**Status**: ✅ Complete
-
-### Completed Tasks
-
-#### 6.1 Message Types (distributed.py)
-
-- [x] **6.1.1** `SingleWorkflowCancelRequest` - lines 839-859
-- [x] **6.1.2** `SingleWorkflowCancelResponse` - lines 862-876
-- [x] **6.1.3** `WorkflowCancellationPeerNotification` - lines 879-893
-- [x] **6.1.4** `CancelledWorkflowInfo` - lines 896-908
-- [x] **6.1.5** `WorkflowCancellationStatus` enum - lines 829-836
-
-#### 6.2 Manager Cancellation Handler (manager.py)
-
-- [x] **6.2.1** `receive_cancel_single_workflow` handler - lines 8938-9118
-  - Checks PENDING/RUNNING/COMPLETED status
-  - Acquires per-workflow lock
-  - Dispatches cancellation to workers
-- [x] **6.2.2** `_find_dependent_workflows` - lines 9163-9202
-  - BFS traversal of dependency graph
-  - Finds all transitive dependents
-- [x] **6.2.3** `_cancelled_workflows` bucket - lines 385-392
-  - TTL via `CANCELLED_WORKFLOW_TTL` (default 1 hour)
-- [x] **6.2.4** Pre-dispatch cancellation check - lines 4277-4288
-  - Blocks dispatch of cancelled workflows
-- [x] **6.2.5** Per-workflow locks - `_workflow_cancellation_locks` dict
-
-#### 6.3 Manager Peer Notification (manager.py)
-
-- [x] **6.3.1** `_notify_peers_of_workflow_cancellation` - lines 9204-9239
-- [x] **6.3.2** `receive_workflow_cancellation_peer_notification` handler - lines 9120-9161
-- [x] **6.3.3** Atomic bucket updates implemented
-
-#### 6.4 Gate Cancellation Handler (gate.py)
-
-- [x] **6.4.1** `receive_cancel_single_workflow` - lines 4657-4771
-  - Forwards to all datacenters
-  - Aggregates responses
-- [x] **6.4.4** Aggregates and returns results to client
-
-#### 6.5-6.6 Worker Completion & Client Handling
-
-- [x] Uses existing event-driven completion tracking
-- [x] Leverages Section 5 push notification chain
-
-### Files
-
-| File | Changes |
-|------|---------|
-| `hyperscale/distributed_rewrite/models/distributed.py` | New message types (6.1) |
-| `hyperscale/distributed_rewrite/nodes/manager.py` | Cancellation handler, peer notification, cancelled bucket (6.2, 6.3) |
-| `hyperscale/distributed_rewrite/nodes/gate.py` | Cancel workflow handler, peer notification, result aggregation (6.4) |
-| `hyperscale/distributed_rewrite/nodes/worker.py` | Worker completion push (already exists, verify integration) |
-| `hyperscale/distributed_rewrite/nodes/client.py` | Multi-DC await (6.6) |
-| `hyperscale/distributed_rewrite/env.py` | `CANCELLED_WORKFLOW_CLEANUP_INTERVAL`, `CANCELLED_WORKFLOW_TTL` |
-
-### Race Condition Protection
-
-This implementation must be race-condition proof in the asyncio environment:
-
-1. **Per-workflow locks**: Each workflow has its own `asyncio.Lock`
-2. **Atomic bucket updates**: All dependents added in single operation
-3. **Pre-dispatch checks**: Always check cancelled bucket before dispatch
-4. **Peer sync before response**: Wait for peer acknowledgment before confirming to caller
-5. **Request deduplication**: Use `request_id` to prevent duplicate processing
-
----
-
-## 7. Gate Job Leadership Takeover Handling
-
-**Problem**: When a manager that is the job leader fails, gates need to handle the transition:
-1. Gates track which manager is the job leader for each job via `_job_leader_addrs`
-2. When job leader manager fails, gates receive `JobLeaderGateTransfer` from the new leader
-3. Gates need to handle edge cases: concurrent failures, delayed transfers, stale state
-
-**Solution**: Similar to Section 1's approach for managers, gates need orphaned job scanning when they become aware of manager failures.
-
-### Tasks
-
-- [ ] **7.1** Add `_dead_job_leaders` tracking set to GateServer
-  - Track managers confirmed dead that were job leaders
-  - Populate when SWIM detects manager death via `_on_node_dead`
-  - Clear entries when transfer received via `job_leader_gate_transfer`
-
-- [ ] **7.2** Add `_orphaned_jobs` tracking to GateServer
-  ```python
-  _orphaned_jobs: dict[str, float]  # job_id -> orphan_timestamp
-  ```
-  - Track jobs whose leader is in `_dead_job_leaders`
-  - Add timestamp when orphaned detected
-
-- [ ] **7.3** Add `_scan_for_orphaned_jobs()` method to GateServer
-  - Called when gate detects manager failure
-  - For each job in `_job_leader_addrs`, check if leader is dead
-  - Mark matching jobs as orphaned with current timestamp
-  - Do NOT cancel jobs immediately (wait for transfer)
-
-- [ ] **7.4** Add grace period handling for orphaned jobs
-  - `GATE_ORPHAN_GRACE_PERIOD` env var (default: 10.0 seconds)
-  - Grace period should be longer than manager election + takeover time
-  - Periodic checker (or integrate with existing task) monitors orphaned jobs
-  - If grace expires without transfer → mark job as failed
-
-- [ ] **7.5** Update `job_leader_gate_transfer` handler
-  - Clear job from `_orphaned_jobs` if present
-  - Clear old leader from `_dead_job_leaders` for this job
-  - Update `_job_leader_addrs` with new leader
-  - Log successful transfer
-
-- [ ] **7.6** Handle concurrent manager failures
-  - If new job leader also fails during transfer
-  - Gate should handle multiple transfer notifications
-  - Use fencing tokens/incarnation to determine latest valid leader
-
-- [ ] **7.7** Add `_handle_job_orphan_timeout()` method
-  - Called when grace period expires
-  - Notify client of job failure (push notification)
-  - Clean up job state from gate
-  - Log detailed failure information
-
-### Files
-- `hyperscale/distributed_rewrite/nodes/gate.py`
-- `hyperscale/distributed_rewrite/env.py` (for `GATE_ORPHAN_GRACE_PERIOD`)
-
----
-
-## 8. Worker Robust Response to Job Leadership Takeover
-
-**Status**: ✅ Complete
-
-**Problem**: When a job leader manager fails and a new manager takes over, workers must robustly handle the `JobLeaderWorkerTransfer` message. Current implementation may have edge cases:
-1. Race between transfer message and ongoing workflow operations
-2. Multiple transfers in rapid succession (cascading failures)
-3. Transfer arriving for unknown workflow (stale message)
-4. Transfer validation (is the new leader legitimate?)
-
-**Solution**: Add comprehensive validation, state machine handling, and race condition protection.
-
-### Tasks
-
-- [x] **8.1** Add `_job_leader_transfer_locks` to WorkerServer
-  ```python
-  _job_leader_transfer_locks: dict[str, asyncio.Lock]  # job_id -> lock
-  ```
-  - Per-job locks to prevent race conditions during transfer
-  - Acquire lock before processing transfer or workflow operations
-
-- [x] **8.2** Add transfer validation in `job_leader_worker_transfer` handler
-  - Verify fencing token is newer than current (prevent stale transfers)
-  - Verify new leader is in known managers list
-  - Reject invalid transfers with detailed error response
-
-- [x] **8.3** Add `_pending_transfers` tracking
-  ```python
-  _pending_transfers: dict[str, PendingTransfer]  # job_id -> transfer info
-  ```
-  - Track transfers that arrived before job was known (late arrival handling)
-  - Check pending transfers when new job is assigned
-  - Clean up stale pending transfers periodically
-
-- [x] **8.4** Add transfer acknowledgment flow
-  - After processing transfer, send explicit `JobLeaderTransferAck` to new leader
-  - Include worker's current workflow state for the job
-  - New leader can verify all workers acknowledged
-
-- [x] **8.5** Handle in-flight operations during transfer
-  - If workflow operation is in progress when transfer arrives
-  - Queue transfer, apply after operation completes
-  - Prevent partial state updates (via per-job locks)
-
-- [x] **8.6** Add transfer metrics
-  - `worker_job_transfers_received` counter
-  - `worker_job_transfers_accepted` counter
-  - `worker_job_transfers_rejected` counter (with reason labels)
-  - `worker_job_transfer_latency` histogram
-
-- [x] **8.7** Add detailed logging for transfer events
-  - Log old leader, new leader, job_id, fencing token
-  - Log rejection reasons clearly
-  - Log time between job leader death detection and transfer receipt
-
-- [x] **8.8** Update `_on_node_dead` for defensive handling
-  - When manager dies, don't immediately assume it's job leader
-  - Wait for explicit transfer or orphan timeout
-  - Handle case where dead node was NOT the job leader
-
-### Files
-- `hyperscale/distributed_rewrite/nodes/worker.py`
-- `hyperscale/distributed_rewrite/models/distributed.py` (for `JobLeaderTransferAck`, `PendingTransfer`)
-- `hyperscale/distributed_rewrite/env/env.py` (for `WORKER_PENDING_TRANSFER_TTL`)
-- `tests/integration/test_worker_robust_transfer.py`
-
----
-
-## 9. Client Robust Response to Gate and Manager Job Leadership Takeovers
-
-**Status**: ✅ Complete
-
-**Problem**: Clients interact with both gates and managers for job operations. When leadership changes occur at either level, clients must handle the transitions robustly:
-
-1. **Gate Job Leadership Transfer**: When the gate acting as job leader fails, another gate takes over
-2. **Manager Job Leadership Transfer**: When a manager job leader fails, another manager takes over
-3. Clients may have in-flight requests to the old leader
-4. Clients may receive stale responses from old leaders
-5. Clients need to re-route subsequent requests to new leaders
-
-**Solution**: Add comprehensive tracking, validation, and re-routing logic for both gate and manager leadership changes.
-
-### Tasks
-
-#### 9.1 Gate Leadership Tracking
-
-- [x] **9.1.1** Add `_gate_job_leaders` tracking to HyperscaleClient
-  ```python
-  _gate_job_leaders: dict[str, GateLeaderInfo]  # job_id -> gate info
-  # GateLeaderInfo contains: gate_addr, fencing_token, last_updated
-  ```
-  - Track which gate is the job leader for each job
-  - Update on job submission response
-  - Update on transfer notification
-
-- [x] **9.1.2** Add `receive_gate_job_leader_transfer` handler to Client
-  - Receive push notification from new gate leader
-  - Validate fencing token is newer than current
-  - Update `_gate_job_leaders` mapping
-  - Cancel any pending requests to old gate leader
-  - Re-queue failed requests to new leader
-
-- [x] **9.1.3** Add `_pending_gate_requests` tracking (deferred - basic connection state tracking added)
-  ```python
-  _pending_gate_requests: dict[str, list[PendingRequest]]  # gate_addr -> requests
-  ```
-  - Track in-flight requests per gate
-  - On gate failure, identify affected requests
-  - Re-route to new leader or fail gracefully
-
-- [x] **9.1.4** Add gate failure detection at client level
-  - Monitor connection state to gates
-  - On disconnect, mark gate as potentially failed
-  - Wait for transfer notification or timeout
-  - If timeout → fail affected jobs with clear error
-
-#### 9.2 Manager Leadership Tracking
-
-- [x] **9.2.1** Add `_manager_job_leaders` tracking to HyperscaleClient
-  ```python
-  _manager_job_leaders: dict[str, ManagerLeaderInfo]  # job_id -> manager info
-  # ManagerLeaderInfo contains: manager_addr, fencing_token, datacenter_id, last_updated
-  ```
-  - Track which manager is the job leader per datacenter
-  - Update on job dispatch acknowledgment
-  - Update on transfer notification (via gate)
-
-- [x] **9.2.2** Add `receive_manager_job_leader_transfer` handler to Client
-  - Receive notification (typically forwarded by gate)
-  - Validate fencing token
-  - Update `_manager_job_leaders` mapping
-  - Log transition for debugging
-
-- [x] **9.2.3** Handle multi-datacenter manager leadership
-  - Each datacenter has independent manager leadership
-  - Track per-datacenter manager leaders
-  - Handle partial failures (one DC's manager fails, others ok)
-
-#### 9.3 Request Re-routing and Retry Logic
-
-- [x] **9.3.1** Add automatic request re-routing on leadership change (basic job_targets update implemented)
-  - Intercept responses from old leaders
-  - Check if leadership changed during request
-  - Re-route to new leader if safe (idempotent operations)
-  - Fail with clear error if not safe (non-idempotent)
-
-- [x] **9.3.2** Add `_request_routing_locks` per job
-  ```python
-  _request_routing_locks: dict[str, asyncio.Lock]  # job_id -> lock
-  ```
-  - Prevent race between leadership update and request routing
-  - Acquire lock before sending request or processing transfer
-
-- [x] **9.3.3** Add retry policy configuration
+- [ ] **10.1.1a** Add `TimeoutTrackingState` dataclass
   ```python
   @dataclass
-  class LeadershipRetryPolicy:
-      max_retries: int = 3
-      retry_delay: float = 0.5
-      exponential_backoff: bool = True
-      max_delay: float = 5.0
+  class TimeoutTrackingState:
+      strategy_type: str  # "local_authority" | "gate_coordinated"
+      gate_addr: tuple[str, int] | None
+
+      # Timestamps (absolute, monotonic)
+      started_at: float
+      last_progress_at: float
+      last_report_at: float
+
+      # Timeout configuration
+      timeout_seconds: float
+      stuck_threshold: float = 120.0
+
+      # Extension tracking (AD-26 integration)
+      total_extensions_granted: float = 0.0
+      max_worker_extension: float = 0.0
+      last_extension_at: float = 0.0
+      active_workers_with_extensions: set[str] = field(default_factory=set)
+
+      # State flags
+      locally_timed_out: bool = False
+      globally_timed_out: bool = False
+      timeout_reason: str = ""
+
+      # Fencing (prevent stale decisions)
+      timeout_fence_token: int = 0
   ```
-  - Configurable retry behavior on leadership changes
-  - Exponential backoff to avoid thundering herd
 
-- [x] **9.3.4** Add idempotency key support (deferred - infrastructure in place)
-  - Generate unique idempotency key per request
-  - Include in request headers
-  - Leaders use key to deduplicate retried requests
-  - Safe re-routing even for non-idempotent operations
-
-#### 9.4 Stale Response Handling
-
-- [x] **9.4.1** Add fencing token validation on all responses
-  - Check response fencing token against current known leader
-  - Reject responses from stale leaders
-  - Log stale response events for debugging
-
-- [x] **9.4.2** Add response freshness timeout
-  - Track request send time
-  - If response arrives after leadership change AND after timeout
-  - Discard response, retry with new leader
-
-- [x] **9.4.3** Handle split-brain scenarios
-  - If receiving responses from multiple "leaders"
-  - Use fencing token to determine authoritative response
-  - Log split-brain detection for investigation
-
-#### 9.5 Client-Side Orphan Job Handling
-
-- [x] **9.5.1** Add `_orphaned_jobs` tracking to Client
+- [ ] **10.1.1b** Add `timeout_tracking` field to `JobInfo`
   ```python
-  _orphaned_jobs: dict[str, OrphanedJobInfo]  # job_id -> orphan info
-  # OrphanedJobInfo contains: orphan_timestamp, last_known_gate, last_known_manager
+  class JobInfo:
+      # ... existing fields ...
+      timeout_tracking: TimeoutTrackingState | None = None
   ```
-  - Track jobs whose leaders are unknown/failed
-  - Grace period before marking as failed
 
-- [x] **9.5.2** Add orphan job recovery
-  - When new leader is discovered, check orphaned jobs
-  - Query new leader for job status
-  - Resume tracking or mark as failed
+### 10.2 Protocol Messages
 
-- [x] **9.5.3** Add `CLIENT_ORPHAN_GRACE_PERIOD` configuration
-  - Default: 15.0 seconds (longer than gate/worker grace periods)
-  - Allows time for full leadership cascade: manager → gate → client
+**File**: `hyperscale/distributed_rewrite/models/distributed.py`
 
-#### 9.6 Metrics and Observability
+- [ ] **10.2.1** Add `JobProgressReport` message (Manager → Gate)
+  ```python
+  @dataclass(slots=True)
+  class JobProgressReport(Message):
+      job_id: str
+      datacenter: str
+      manager_id: str
+      manager_host: str
+      manager_port: int
+      workflows_total: int
+      workflows_completed: int
+      workflows_failed: int
+      has_recent_progress: bool
+      timestamp: float
+      fence_token: int
+      # Extension tracking
+      total_extensions_granted: float = 0.0
+      max_worker_extension: float = 0.0
+      workers_with_extensions: int = 0
+  ```
 
-- [x] **9.6.1** Add client-side leadership transfer metrics
-  - `client_gate_transfers_received` counter
-  - `client_manager_transfers_received` counter
-  - `client_requests_rerouted` counter
-  - `client_requests_failed_leadership_change` counter
-  - `client_leadership_transfer_latency` histogram
+- [ ] **10.2.2** Add `JobTimeoutReport` message (Manager → Gate)
+  ```python
+  @dataclass(slots=True)
+  class JobTimeoutReport(Message):
+      job_id: str
+      datacenter: str
+      manager_id: str
+      manager_host: str
+      manager_port: int
+      reason: str
+      elapsed_seconds: float
+      fence_token: int
+  ```
 
-- [x] **9.6.2** Add detailed logging for leadership events
-  - Log old leader, new leader, job_id, fencing token
-  - Log request re-routing decisions
-  - Log orphan job lifecycle
+- [ ] **10.2.3** Add `JobGlobalTimeout` message (Gate → Manager)
+  ```python
+  @dataclass(slots=True)
+  class JobGlobalTimeout(Message):
+      job_id: str
+      reason: str
+      timed_out_at: float
+      fence_token: int
+  ```
 
-- [x] **9.6.3** Add client health reporting
-  - Track number of healthy gate connections
-  - Track number of jobs with known leaders
-  - Expose via status endpoint or callback
+- [ ] **10.2.4** Add `JobLeaderTransfer` message (Manager → Gate)
+  ```python
+  @dataclass(slots=True)
+  class JobLeaderTransfer(Message):
+      job_id: str
+      datacenter: str
+      new_leader_id: str
+      fence_token: int
+  ```
 
-### Files
-- `hyperscale/distributed_rewrite/nodes/client.py`
-- `hyperscale/distributed_rewrite/models/distributed.py` (for `GateLeaderInfo`, `ManagerLeaderInfo`, `OrphanedJobInfo`, `LeadershipRetryPolicy`, `GateJobLeaderTransfer`, `ManagerJobLeaderTransfer`)
-- `hyperscale/distributed_rewrite/env/env.py` (for `CLIENT_ORPHAN_GRACE_PERIOD`)
-- `tests/integration/test_client_leadership_transfer.py`
+- [ ] **10.2.5** Add `JobFinalStatus` message (Manager → Gate)
+  ```python
+  @dataclass(slots=True)
+  class JobFinalStatus(Message):
+      job_id: str
+      datacenter: str
+      manager_id: str
+      status: str  # JobStatus.COMPLETED/FAILED/CANCELLED/TIMEOUT
+      timestamp: float
+      fence_token: int
+  ```
 
----
+### 10.3 Timeout Strategy Implementation
 
-## Dependencies
+**File**: `hyperscale/distributed_rewrite/jobs/timeout_strategy.py` (NEW)
 
-- Item 1 can be done independently
-- Item 2 (event-based cancellation) should be done before Item 3
-- Item 3 depends on Item 2 for the cancellation mechanism
-- Item 4 depends on Items 1, 2, 3
-- Item 5 can be done after Item 2 (uses event-driven cancellation completion)
-- Item 6 builds on Item 5's push notification chain
-- Item 7 (gate takeover) can be done after Item 1 (follows same pattern)
-- Item 8 (worker robust response) can be done after Item 3, integrates with Item 7
-- Item 9 (client robust response) depends on Items 7 and 8 (receives transfers from both gate and manager layers)
+- [ ] **10.3.1** Create `TimeoutStrategy` ABC
+  ```python
+  class TimeoutStrategy(ABC):
+      @abstractmethod
+      async def start_tracking(...) -> None: pass
+
+      @abstractmethod
+      async def resume_tracking(job_id: str) -> None: pass
+
+      @abstractmethod
+      async def report_progress(job_id: str, progress_type: str) -> None: pass
+
+      @abstractmethod
+      async def check_timeout(job_id: str) -> tuple[bool, str]: pass
+
+      @abstractmethod
+      async def handle_global_timeout(job_id: str, reason: str, fence_token: int) -> bool: pass
+
+      @abstractmethod
+      async def record_worker_extension(job_id: str, worker_id: str, extension_seconds: float, worker_progress: float) -> None: pass
+
+      @abstractmethod
+      async def stop_tracking(job_id: str, reason: str) -> None: pass
+
+      @abstractmethod
+      async def cleanup_worker_extensions(job_id: str, worker_id: str) -> None: pass
+  ```
+
+- [ ] **10.3.2** Implement `LocalAuthorityTimeout` (single-DC)
+  - Full implementation as documented in AD-34 Part 3
+  - Extension-aware timeout calculation
+  - Idempotent cleanup
+
+- [ ] **10.3.3** Implement `GateCoordinatedTimeout` (multi-DC)
+  - Full implementation as documented in AD-34 Part 4
+  - Progress reporting every 10s
+  - Timeout reporting on detection
+  - 5-minute fallback if gate unreachable
+
+### 10.4 Manager Integration
+
+**File**: `hyperscale/distributed_rewrite/nodes/manager.py`
+
+- [ ] **10.4.1** Add timeout strategy tracking
+  ```python
+  class ManagerServer:
+      def __init__(self, ...):
+          self._job_timeout_strategies: dict[str, TimeoutStrategy] = {}
+  ```
+
+- [ ] **10.4.2** Add `_select_timeout_strategy()` method
+  - Auto-detect via `gate_addr` in JobSubmission
+  - Return LocalAuthorityTimeout or GateCoordinatedTimeout
+
+- [ ] **10.4.3** Add `_unified_timeout_loop()` background task
+  - Check every 30 seconds
+  - Only leader checks
+  - Call `strategy.check_timeout()` for each job
+  - Handle timeout by calling `_timeout_job()`
+
+- [ ] **10.4.4** Update `receive_submit_job()` to start timeout tracking
+  ```python
+  strategy = await self._select_timeout_strategy(submission)
+  await strategy.start_tracking(job_id, timeout_seconds, gate_addr)
+  self._job_timeout_strategies[job_id] = strategy
+  ```
+
+- [ ] **10.4.5** Add `_on_leadership_acquired()` integration
+  - Call `strategy.resume_tracking(job_id)` when becoming leader
+  - Increment fence token
+
+- [ ] **10.4.6** Add `_timeout_job()` method
+  - Mark job as TIMEOUT status
+  - Cancel all workflows
+  - Call `strategy.stop_tracking()`
+  - Notify callback (gate or client)
+
+- [ ] **10.4.7** Add extension notification to `request_extension()`
+  ```python
+  if response.granted:
+      await self._notify_timeout_strategies_of_extension(
+          worker_id, extension_seconds, worker_progress
+      )
+  ```
+
+- [ ] **10.4.8** Add `_notify_timeout_strategies_of_extension()` method
+  - Find all jobs this worker is executing
+  - Call `strategy.record_worker_extension()` for each
+
+- [ ] **10.4.9** Add cleanup hooks
+  - `receive_cancel_job()` → `strategy.stop_tracking("cancelled")`
+  - `_handle_job_completion()` → `strategy.stop_tracking("completed")`
+  - `_handle_job_failure()` → `strategy.stop_tracking("failed")`
+  - `_handle_worker_failure()` → `strategy.cleanup_worker_extensions()`
+  - `_cleanup_job()` → remove strategy from tracking
+
+- [ ] **10.4.10** Add protocol handlers
+  - `receive_job_global_timeout()` → `strategy.handle_global_timeout()`
+
+### 10.5 Gate Integration
+
+**File**: `hyperscale/distributed_rewrite/nodes/gate.py`
+
+- [ ] **10.5.1** Add `GateJobTrackingInfo` dataclass
+  ```python
+  @dataclass
+  class GateJobTrackingInfo:
+      job_id: str
+      submitted_at: float
+      timeout_seconds: float
+      target_datacenters: list[str]
+      dc_status: dict[str, str]
+      dc_last_progress: dict[str, float]
+      dc_manager_addrs: dict[str, tuple[str, int]]
+      # Extension tracking
+      dc_total_extensions: dict[str, float]
+      dc_max_extension: dict[str, float]
+      dc_workers_with_extensions: dict[str, int]
+      # Timeout decision
+      globally_timed_out: bool = False
+      timeout_reason: str = ""
+      timeout_fence_token: int = 0
+  ```
+
+- [ ] **10.5.2** Create `GateJobTracker` class
+  - `start_tracking_job()` on submission
+  - `record_progress()` from JobProgressReport
+  - `record_timeout()` from JobTimeoutReport
+  - `check_global_timeouts()` logic
+  - `handle_final_status()` for cleanup
+
+- [ ] **10.5.3** Add `_global_timeout_loop()` background task
+  - Check every 15 seconds
+  - Call `tracker.check_global_timeouts()`
+  - Call `_declare_and_broadcast_timeout()` for timed out jobs
+
+- [ ] **10.5.4** Add `_declare_and_broadcast_timeout()` method
+  - Send `JobGlobalTimeout` to all target DCs
+  - Update tracking info
+
+- [ ] **10.5.5** Add protocol handlers
+  - `receive_job_progress_report()` → `tracker.record_progress()`
+  - `receive_job_timeout_report()` → `tracker.record_timeout()`
+  - `receive_job_final_status()` → `tracker.handle_final_status()`
+
+### 10.6 WorkflowStateMachine Integration (AD-33)
+
+**File**: `hyperscale/distributed_rewrite/workflow/state_machine.py`
+
+- [ ] **10.6.1** Add progress tracking fields
+  ```python
+  class WorkflowStateMachine:
+      def __init__(self, ...):
+          self._last_progress: dict[str, float] = {}
+          self._progress_callbacks: list[Callable] = []
+  ```
+
+- [ ] **10.6.2** Add `register_progress_callback()` method
+  - Allow timeout strategies to register for state transitions
+
+- [ ] **10.6.3** Update `transition()` to notify callbacks
+  - Record `last_progress` timestamp
+  - Call all registered callbacks with workflow_id and state
+
+- [ ] **10.6.4** Add `get_time_since_progress()` method
+  - Return seconds since last state transition
+
+- [ ] **10.6.5** Add `get_stuck_workflows()` method
+  - Return workflows with no progress for threshold_seconds
+
+### 10.7 Testing
+
+**File**: `tests/integration/test_job_timeout.py` (NEW)
+
+- [ ] **10.7.1** Test single-DC local authority timeout
+  - Submit job without gate_addr
+  - Verify LocalAuthorityTimeout selected
+  - Let job exceed timeout
+  - Verify job marked as TIMEOUT
+
+- [ ] **10.7.2** Test multi-DC gate coordinated timeout
+  - Submit job with gate_addr to multiple DCs
+  - Verify GateCoordinatedTimeout selected
+  - One DC times out
+  - Verify gate declares global timeout
+  - Verify all DCs receive cancellation
+
+- [ ] **10.7.3** Test extension-aware timeout
+  - Job with 60s timeout
+  - Worker requests 30s extension
+  - Verify effective timeout = 90s
+  - Verify job completes before extended deadline
+
+- [ ] **10.7.4** Test stuck detection
+  - Job running but no workflow progress for 2+ minutes
+  - Verify timeout triggered despite worker alive
+
+- [ ] **10.7.5** Test leader transfer with timeout state
+  - Job leader fails mid-execution
+  - New leader takes over
+  - Verify timeout tracking continues from same started_at
+
+- [ ] **10.7.6** Test fence token rejection
+  - Old leader reports timeout after being replaced
+  - New leader receives stale timeout with old fence token
+  - Verify rejection
+
+- [ ] **10.7.7** Test cleanup on job completion
+  - Job completes successfully
+  - Verify strategy removed from tracking
+  - Verify no zombie timeout fires
+
+- [ ] **10.7.8** Test cleanup on job cancellation
+  - Cancel job mid-execution
+  - Verify strategy cleaned up
+  - Verify timeout tracking stopped
+
+- [ ] **10.7.9** Test worker failure extension cleanup
+  - Worker with extensions fails
+  - Verify extensions removed from tracking
+  - Verify job doesn't rely on stale extension
+
+- [ ] **10.7.10** Test gate failure fallback
+  - Gate becomes unreachable for 5+ minutes
+  - Verify manager falls back to local timeout
+
+### 10.8 Configuration
+
+**File**: `hyperscale/distributed_rewrite/env/env.py`
+
+- [ ] **10.8.1** Add timeout configuration
+  ```python
+  # Job timeout configuration
+  JOB_TIMEOUT_CHECK_INTERVAL: float = 30.0  # Manager timeout check interval
+  JOB_STUCK_THRESHOLD: float = 120.0        # No progress threshold
+  GATE_TIMEOUT_CHECK_INTERVAL: float = 15.0 # Gate timeout check interval
+  GATE_TIMEOUT_FALLBACK: float = 300.0      # 5 min fallback if gate unreachable
+  ```
+
+### 10.9 Documentation
+
+- [ ] **10.9.1** Update CLAUDE.md with timeout patterns
+  - How to configure job timeouts
+  - Extension interaction with timeouts
+  - Multi-DC timeout coordination
+
+- [ ] **10.9.2** Add timeout observability guide
+  - Key metrics to monitor
+  - Log patterns for debugging
+  - Common timeout scenarios
+
+### Dependencies
+
+- **10.1-10.3**: Core implementation (can be done in parallel)
+- **10.4**: Depends on 10.1-10.3 (manager integration)
+- **10.5**: Depends on 10.1-10.3 (gate integration)
+- **10.6**: Can be done in parallel with 10.4-10.5
+- **10.7**: Depends on 10.1-10.6 (testing)
+- **10.8-10.9**: Can be done anytime
+
+**Key Integration Points**:
+- Integrates with AD-26 (healthcheck extensions) via `record_worker_extension()`
+- Integrates with AD-33 (workflow state machine) via progress callbacks
+- Integrates with Section 5 (cancellation) via cleanup hooks
+- Uses existing job leadership transfer mechanisms from Sections 1-3
 
 ---
 

@@ -5406,6 +5406,29 @@ class ManagerServer(HealthAwareServer):
             return parts[3]
         return workflow_id
 
+    def _extract_workflow_token_from_subworkflow_token(self, subworkflow_token_str: str) -> str:
+        """
+        Extract workflow token (without worker_id) from sub-workflow token.
+
+        Token format: DC:manager:job_id:workflow_id:worker_id (5 parts)
+        Returns workflow token: DC:manager:job_id:workflow_id (4 parts)
+
+        This is needed because SubWorkflowInfo stores the full token with worker_id,
+        but WorkflowInfo uses the parent token without worker_id. When looking up
+        workflows in job.workflows, we need the 4-part token.
+
+        Args:
+            subworkflow_token_str: Full sub-workflow token string
+
+        Returns:
+            Workflow token without worker_id
+        """
+        parts = subworkflow_token_str.split(":")
+        if len(parts) >= 5:
+            # Return first 4 parts: DC:manager:job_id:workflow_id
+            return ":".join(parts[:4])
+        return subworkflow_token_str
+
     async def _handle_workflow_completion_from_progress(
         self,
         progress: WorkflowProgress,
@@ -7926,55 +7949,61 @@ class ManagerServer(HealthAwareServer):
         self._worker_circuits.pop(worker_node_id, None)
 
         # Step 1: Find all workflows on this worker in active states
-        failed_workflow_ids: list[tuple[str, str]] = []  # (job_id, workflow_id)
+        # Store tuples of (job_id, workflow_token, subworkflow_token)
+        # - workflow_token: 4-part token for job.workflows lookups (DC:mgr:job:wf)
+        # - subworkflow_token: 5-part token for state machine operations (DC:mgr:job:wf:worker)
+        failed_workflows: list[tuple[str, str, str]] = []
 
         for job in self._job_manager.iter_jobs():
             for sub_wf in job.sub_workflows.values():
-                workflow_id = str(sub_wf.token)
+                # SubWorkflowInfo stores full token with worker_id, but WorkflowInfo uses parent token
+                subworkflow_token_str = str(sub_wf.token)
+                workflow_token = self._extract_workflow_token_from_subworkflow_token(subworkflow_token_str)
 
                 # Check if on failed worker and in active state
                 if sub_wf.worker_id == worker_node_id and self._workflow_lifecycle_states:
-                    current_state = self._workflow_lifecycle_states.get_state(workflow_id)
+                    current_state = self._workflow_lifecycle_states.get_state(subworkflow_token_str)
                     if current_state in {WorkflowState.DISPATCHED, WorkflowState.RUNNING}:
-                        failed_workflow_ids.append((job.job_id, workflow_id))
+                        failed_workflows.append((job.job_id, workflow_token, subworkflow_token_str))
 
-        if not failed_workflow_ids:
+        if not failed_workflows:
             return
 
         await self._udp_logger.log(ServerInfo(
-            message=f"Worker {worker_node_id} failed, handling {len(failed_workflow_ids)} workflows with state machine",
+            message=f"Worker {worker_node_id} failed, handling {len(failed_workflows)} workflows with state machine",
             node_host=self._host,
             node_port=self._tcp_port,
             node_id=self._node_id.short,
         ))
 
         # Step 2: Transition all failed workflows: (DISPATCHED|RUNNING) → FAILED
-        for job_id, workflow_id in failed_workflow_ids:
+        # Use subworkflow_token for state machine operations
+        for job_id, workflow_token, subworkflow_token in failed_workflows:
             if self._workflow_lifecycle_states:
                 success = await self._workflow_lifecycle_states.transition(
-                    workflow_id,
+                    subworkflow_token,
                     WorkflowState.FAILED,
                     reason=f"worker {worker_node_id} died"
                 )
                 if not success:
                     await self._udp_logger.log(ServerWarning(
-                        message=f"Failed to transition {workflow_id} to FAILED state",
+                        message=f"Failed to transition {subworkflow_token} to FAILED state",
                         node_host=self._host,
                         node_port=self._tcp_port,
                         node_id=self._node_id.short,
                     ))
 
         # Step 3-7: For each failed workflow, cancel dependents and prepare for retry
-        all_workflows_to_retry: list[tuple[str, str]] = []  # (job_id, workflow_id)
+        all_workflows_to_retry: list[tuple[str, str]] = []  # (job_id, workflow_token)
 
-        for job_id, workflow_id in failed_workflow_ids:
-            # Find all workflows that depend on this one
-            dependent_workflow_ids = self._find_dependent_workflows(job_id, workflow_id)
+        for job_id, workflow_token, subworkflow_token in failed_workflows:
+            # Find all workflows that depend on this one (use workflow_token for lookups)
+            dependent_workflow_ids = self._find_dependent_workflows(job_id, workflow_token)
 
-            # Transition: FAILED → FAILED_CANCELING_DEPENDENTS
+            # Transition: FAILED → FAILED_CANCELING_DEPENDENTS (use subworkflow_token)
             if self._workflow_lifecycle_states:
                 await self._workflow_lifecycle_states.transition(
-                    workflow_id,
+                    subworkflow_token,
                     WorkflowState.FAILED_CANCELING_DEPENDENTS,
                     reason=f"cancelling {len(dependent_workflow_ids)} dependents"
                 )
@@ -7986,16 +8015,16 @@ class ManagerServer(HealthAwareServer):
                     dependent_workflow_ids
                 )
 
-            # Transition: FAILED_CANCELING_DEPENDENTS → FAILED_READY_FOR_RETRY
+            # Transition: FAILED_CANCELING_DEPENDENTS → FAILED_READY_FOR_RETRY (use subworkflow_token)
             if self._workflow_lifecycle_states:
                 await self._workflow_lifecycle_states.transition(
-                    workflow_id,
+                    subworkflow_token,
                     WorkflowState.FAILED_READY_FOR_RETRY,
                     reason="dependents cancelled, ready for retry"
                 )
 
-            # Collect for retry
-            all_workflows_to_retry.append((job_id, workflow_id))
+            # Collect for retry (use workflow_token for requeue operations)
+            all_workflows_to_retry.append((job_id, workflow_token))
             all_workflows_to_retry.extend((job_id, dep_id) for dep_id in dependent_workflow_ids)
 
         # Step 8-9: Re-queue in dependency order
