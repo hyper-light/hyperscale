@@ -127,6 +127,8 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         *args,
         dc_id: str = "default",
         priority: int = 50,
+        # Node role for role-aware failure detection (AD-35 Task 12.4.2)
+        node_role: str | None = None,
         # State embedding (Serf-style heartbeat in SWIM messages)
         state_embedder: StateEmbedder | None = None,
         # Message deduplication settings
@@ -145,6 +147,9 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
 
         # Generate unique node identity
         self._node_id = NodeId.generate(datacenter=dc_id, priority=priority)
+
+        # Store node role for role-aware failure detection (AD-35 Task 12.4.2)
+        self._node_role: str = node_role or "worker"  # Default to worker if not specified
 
         # State embedder for Serf-style heartbeat embedding
         self._state_embedder: StateEmbedder = state_embedder or NullStateEmbedder()
@@ -298,6 +303,11 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
     def node_id(self) -> NodeId:
         """Get this server's unique node identifier."""
         return self._node_id
+
+    @property
+    def node_role(self) -> str:
+        """Get this server's node role (AD-35 Task 12.4.4)."""
+        return self._node_role
 
     def get_node_address(self) -> NodeAddress:
         """Get the full node address (ID + network location)."""

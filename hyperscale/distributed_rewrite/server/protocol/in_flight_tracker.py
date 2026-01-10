@@ -1,5 +1,5 @@
 """
-Priority-Aware In-Flight Task Tracker (AD-32).
+Priority-Aware In-Flight Task Tracker (AD-32, AD-37).
 
 Provides bounded immediate execution with priority-based load shedding for
 server-side incoming request handling. Ensures SWIM protocol messages
@@ -11,20 +11,79 @@ Key Design Points:
 - CRITICAL priority ALWAYS succeeds (SWIM probes/acks)
 - Lower priorities shed first under load (LOW → NORMAL → HIGH)
 
+AD-37 Integration:
+- MessagePriority maps directly to AD-37 MessageClass via MESSAGE_CLASS_TO_PRIORITY
+- CONTROL (MessageClass) → CRITICAL (MessagePriority) - never shed
+- DISPATCH → HIGH - shed under overload
+- DATA → NORMAL - explicit backpressure
+- TELEMETRY → LOW - shed first
+
 Usage:
     tracker = InFlightTracker(limits=PriorityLimits(...))
 
-    # In protocol callback (sync context)
+    # In protocol callback (sync context) - direct priority
     if tracker.try_acquire(MessagePriority.NORMAL):
         task = asyncio.ensure_future(handle_message(data))
         task.add_done_callback(lambda t: tracker.release(MessagePriority.NORMAL))
     else:
         # Message shed - log and drop
         pass
+
+    # AD-37 compliant usage - handler name classification
+    if tracker.try_acquire_for_handler("receive_workflow_progress"):
+        task = asyncio.ensure_future(handle_message(data))
+        task.add_done_callback(lambda t: tracker.release_for_handler("receive_workflow_progress"))
 """
 
 from dataclasses import dataclass, field
 from enum import IntEnum
+
+
+# AD-37 Handler classification sets (duplicated from message_class.py to avoid circular import)
+# message_class.py imports MessagePriority from this module, so we can't import back
+_CONTROL_HANDLERS: frozenset[str] = frozenset({
+    # SWIM protocol
+    "ping", "ping_req", "ack", "nack", "indirect_ping", "indirect_ack",
+    # Cancellation (AD-20)
+    "cancel_workflow", "cancel_job", "workflow_cancelled", "job_cancellation_complete",
+    # Leadership transfer
+    "leadership_transfer", "job_leader_transfer", "receive_job_leader_transfer", "job_leader_worker_transfer",
+    # Failure detection
+    "suspect", "alive", "dead", "leave",
+})
+
+_DISPATCH_HANDLERS: frozenset[str] = frozenset({
+    # Job dispatch
+    "submit_job", "receive_submit_job", "dispatch_workflow", "receive_workflow_dispatch",
+    # State sync
+    "state_sync_request", "state_sync_response", "request_state_sync",
+    # Registration
+    "worker_register", "receive_worker_register", "manager_register", "receive_manager_register",
+    # Workflow commands
+    "workflow_dispatch_ack", "workflow_final_result",
+})
+
+_DATA_HANDLERS: frozenset[str] = frozenset({
+    # Progress updates
+    "workflow_progress", "receive_workflow_progress", "workflow_progress_ack",
+    # Stats updates
+    "receive_stats_update", "send_stats_update",
+    # AD-34 timeout coordination
+    "receive_job_progress_report", "receive_job_timeout_report", "receive_job_global_timeout", "receive_job_final_status",
+    # Heartbeats (non-SWIM)
+    "heartbeat", "manager_heartbeat", "worker_heartbeat",
+    # Job progress (gate handlers)
+    "receive_job_progress",
+})
+
+_TELEMETRY_HANDLERS: frozenset[str] = frozenset({
+    # Metrics
+    "metrics_report", "debug_stats", "trace_event",
+    # Health probes (non-critical)
+    "health_check", "readiness_check", "liveness_check",
+    # Federated health (best-effort)
+    "xprobe", "xack",
+})
 
 
 class MessagePriority(IntEnum):
@@ -33,12 +92,43 @@ class MessagePriority(IntEnum):
 
     Priority determines load shedding order - lower priorities are shed first.
     CRITICAL messages are NEVER shed regardless of system load.
+
+    Maps to AD-37 MessageClass:
+    - CRITICAL ← CONTROL (SWIM, cancellation, leadership)
+    - HIGH ← DISPATCH (job submission, workflow dispatch)
+    - NORMAL ← DATA (progress updates, stats)
+    - LOW ← TELEMETRY (metrics, debug)
     """
 
     CRITICAL = 0  # SWIM probes/acks, leadership, failure detection - NEVER shed
     HIGH = 1  # Job dispatch, workflow commands, state sync
     NORMAL = 2  # Status updates, heartbeats (non-SWIM)
     LOW = 3  # Metrics, stats, telemetry, logs
+
+
+def _classify_handler_to_priority(handler_name: str) -> MessagePriority:
+    """
+    Classify a handler name to MessagePriority using AD-37 classification.
+
+    This is a module-internal function that duplicates the logic from
+    message_class.py to avoid circular imports.
+
+    Args:
+        handler_name: Name of the handler (e.g., "receive_workflow_progress")
+
+    Returns:
+        MessagePriority for the handler
+    """
+    if handler_name in _CONTROL_HANDLERS:
+        return MessagePriority.CRITICAL
+    if handler_name in _DISPATCH_HANDLERS:
+        return MessagePriority.HIGH
+    if handler_name in _DATA_HANDLERS:
+        return MessagePriority.NORMAL
+    if handler_name in _TELEMETRY_HANDLERS:
+        return MessagePriority.LOW
+    # Default to NORMAL for unknown handlers (conservative)
+    return MessagePriority.NORMAL
 
 
 @dataclass(slots=True)
@@ -160,6 +250,34 @@ class InFlightTracker:
         """
         if self._counts[priority] > 0:
             self._counts[priority] -= 1
+
+    def try_acquire_for_handler(self, handler_name: str) -> bool:
+        """
+        Try to acquire a slot using AD-37 MessageClass classification.
+
+        This is the preferred method for AD-37 compliant bounded execution.
+        Classifies handler name to determine priority.
+
+        Args:
+            handler_name: Name of the handler (e.g., "receive_workflow_progress")
+
+        Returns:
+            True if slot acquired, False if request should be shed.
+        """
+        priority = _classify_handler_to_priority(handler_name)
+        return self.try_acquire(priority)
+
+    def release_for_handler(self, handler_name: str) -> None:
+        """
+        Release a slot using AD-37 MessageClass classification.
+
+        Should be called from task done callback when using try_acquire_for_handler.
+
+        Args:
+            handler_name: Name of the handler that was acquired.
+        """
+        priority = _classify_handler_to_priority(handler_name)
+        self.release(priority)
 
     def _get_limit(self, priority: MessagePriority) -> int:
         """

@@ -420,7 +420,7 @@ All remaining AD-36 items deferred. Core routing subsystem must be built first.
 - [x] **14.5.2** `InFlightTracker` with `MessagePriority` for bounded execution
 - [x] **14.5.3** CRITICAL priority (CONTROL class) never shed
 
-### 14.6 InFlightTracker Priority System ✅ COMPLETE (AD-32)
+### 14.6 InFlightTracker Priority System ✅ COMPLETE (AD-32, AD-37)
 
 **File**: `hyperscale/distributed_rewrite/server/protocol/in_flight_tracker.py`
 
@@ -428,6 +428,10 @@ All remaining AD-36 items deferred. Core routing subsystem must be built first.
 - [x] **14.6.2** `PriorityLimits` configuration with per-priority caps
 - [x] **14.6.3** `try_acquire()` with CRITICAL always succeeding
 - [x] **14.6.4** Server integration in `mercury_sync_base_server.py`
+- [x] **14.6.5** AD-37 handler classification sets (`_CONTROL_HANDLERS`, `_DISPATCH_HANDLERS`, `_DATA_HANDLERS`, `_TELEMETRY_HANDLERS`)
+- [x] **14.6.6** `_classify_handler_to_priority()` function for unified classification
+- [x] **14.6.7** `try_acquire_for_handler()` method using AD-37 classification
+- [x] **14.6.8** `release_for_handler()` method using AD-37 classification
 
 ### 14.7 Unified LoadShedder Classification ✅ COMPLETE
 
@@ -448,6 +452,8 @@ All remaining AD-36 items deferred. Core routing subsystem must be built first.
 - [x] **14.8.4** `_get_dc_backpressure_level()` and `_get_max_backpressure_level()` accessors
 - [x] **14.8.5** `_should_throttle_forwarded_update()` for throttling decisions
 - [x] **14.8.6** Backpressure extraction from `ManagerHeartbeat` in status handlers
+- [x] **14.8.7** `receive_job_progress` uses `should_shed_handler()` for AD-37 classification
+- [x] **14.8.8** `_forward_job_progress_to_peers` checks backpressure before forwarding DATA messages
 
 ### 14.9 Manager Backpressure in Heartbeats ✅ COMPLETE
 

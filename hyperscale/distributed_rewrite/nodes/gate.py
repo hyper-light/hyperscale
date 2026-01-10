@@ -225,6 +225,7 @@ class GateServer(HealthAwareServer):
             udp_port=udp_port,
             env=env,
             dc_id=dc_id,
+            node_role="gate",  # AD-35 Task 12.4.2: Pass role to HealthAwareServer
         )
         
         # Datacenter -> manager addresses mapping
@@ -5311,8 +5312,9 @@ class GateServer(HealthAwareServer):
         """
         start_time = time.monotonic()
         try:
-            # Load shedding check (AD-22) - JobProgress is NORMAL priority
-            if self._should_shed_request("JobProgress"):
+            # AD-37: Load shedding using unified MessageClass classification
+            # receive_job_progress is classified as DATA (NORMAL priority)
+            if self._load_shedder.should_shed_handler("receive_job_progress"):
                 # Return minimal ack even when shedding to prevent retries
                 ack = JobProgressAck(
                     gate_id=self._node_id.full,
@@ -6391,7 +6393,18 @@ class GateServer(HealthAwareServer):
         Forward job progress to the job owner gate.
 
         Uses consistent hash ring first, then falls back to JobForwardingTracker.
+
+        AD-37: Respects backpressure signals from managers. If any manager in
+        the origin DC is signaling REJECT level backpressure, we drop the
+        forwarded update to prevent overwhelming the system.
         """
+        # AD-37: Check backpressure before forwarding DATA class messages
+        # Progress updates are DATA class - respect backpressure from origin DC
+        if self._should_throttle_forwarded_update(progress.datacenter):
+            # Manager is under REJECT level backpressure - drop this forward
+            # The manager will retry if needed
+            return False
+
         data = progress.dump()
 
         # Try hash ring first

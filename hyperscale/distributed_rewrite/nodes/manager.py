@@ -252,6 +252,7 @@ class ManagerServer(HealthAwareServer):
             udp_port=udp_port,
             env=env,
             dc_id=dc_id,
+            node_role="manager",  # AD-35 Task 12.4.2: Pass role to HealthAwareServer
         )
         
         # Gate discovery (optional) - seed addresses from config

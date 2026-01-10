@@ -349,6 +349,7 @@ class WorkerServer(HealthAwareServer):
             udp_port=udp_port,
             env=env,
             dc_id=dc_id,
+            node_role="worker",  # AD-35 Task 12.4.2: Pass role to HealthAwareServer
             state_embedder=state_embedder,
         )
         
