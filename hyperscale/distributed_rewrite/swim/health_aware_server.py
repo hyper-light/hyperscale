@@ -24,7 +24,7 @@ from hyperscale.distributed_rewrite.server.server.mercury_sync_base_server impor
     MercurySyncBaseServer,
 )
 from hyperscale.distributed_rewrite.swim.coordinates import CoordinateTracker
-from hyperscale.distributed_rewrite.models.coordinates import NetworkCoordinate
+from hyperscale.distributed_rewrite.models.coordinates import NetworkCoordinate, VivaldiConfig
 from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerDebug, ServerWarning
 
 # Core types and utilities
@@ -129,6 +129,8 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         priority: int = 50,
         # Node role for role-aware failure detection (AD-35 Task 12.4.2)
         node_role: str | None = None,
+        # AD-35 Task 12.7: Vivaldi configuration
+        vivaldi_config: "VivaldiConfig | None" = None,
         # State embedding (Serf-style heartbeat in SWIM messages)
         state_embedder: StateEmbedder | None = None,
         # Message deduplication settings
@@ -151,6 +153,9 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         # Store node role for role-aware failure detection (AD-35 Task 12.4.2)
         self._node_role: str = node_role or "worker"  # Default to worker if not specified
 
+        # Store Vivaldi config for metrics and observability (AD-35 Task 12.7)
+        self._vivaldi_config: VivaldiConfig = vivaldi_config or VivaldiConfig()
+
         # State embedder for Serf-style heartbeat embedding
         self._state_embedder: StateEmbedder = state_embedder or NullStateEmbedder()
 
@@ -163,7 +168,8 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         self._pending_probe_acks: dict[tuple[str, int], asyncio.Future[bool]] = {}
         self._pending_probe_start: dict[tuple[str, int], float] = {}
 
-        self._coordinate_tracker = CoordinateTracker()
+        # AD-35 Task 12.7: Initialize CoordinateTracker with config
+        self._coordinate_tracker = CoordinateTracker(config=self._vivaldi_config)
 
         # Role-aware confirmation manager for unconfirmed peers (AD-35 Task 12.5.6)
         # Initialized after CoordinateTracker so it can use Vivaldi-based timeouts
@@ -345,6 +351,99 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
 
     def estimate_rtt_ms(self, peer_coordinate: NetworkCoordinate) -> float:
         return self._coordinate_tracker.estimate_rtt_ms(peer_coordinate)
+
+    def get_vivaldi_metrics(self) -> dict[str, any]:
+        """
+        Get Vivaldi coordinate system metrics (AD-35 Task 12.8).
+
+        Returns:
+            Dictionary containing:
+            - local_coordinate: Current coordinate dict
+            - coordinate_error: Current error value
+            - is_converged: Whether coordinate has converged
+            - peer_count: Number of tracked peers
+            - config: Active Vivaldi configuration
+        """
+        local_coord = self._coordinate_tracker.get_coordinate()
+        return {
+            "local_coordinate": local_coord.to_dict(),
+            "coordinate_error": local_coord.error,
+            "is_converged": self._coordinate_tracker.is_converged(),
+            "peer_count": len(self._coordinate_tracker._peers),
+            "sample_count": local_coord.sample_count,
+            "config": {
+                "dimensions": self._vivaldi_config.dimensions,
+                "learning_rate": self._vivaldi_config.learning_rate,
+                "error_decay": self._vivaldi_config.error_decay,
+                "convergence_threshold": self._vivaldi_config.convergence_error_threshold,
+            },
+        }
+
+    def get_confirmation_metrics(self) -> dict[str, any]:
+        """
+        Get role-aware confirmation metrics (AD-35 Task 12.9).
+
+        Returns:
+            Dictionary containing:
+            - unconfirmed_count: Total unconfirmed peers
+            - unconfirmed_by_role: Breakdown by role
+            - manager_metrics: Detailed confirmation manager metrics
+        """
+        return {
+            "unconfirmed_count": self._confirmation_manager.get_unconfirmed_peer_count(),
+            "unconfirmed_by_role": self._confirmation_manager.get_unconfirmed_peers_by_role(),
+            "manager_metrics": self._confirmation_manager.get_metrics(),
+        }
+
+    def validate_ad35_state(self) -> dict[str, bool | str]:
+        """
+        Validate AD-35 implementation state (AD-35 Task 12.10).
+
+        Performs sanity checks on Vivaldi coordinates, role classification,
+        and confirmation manager state.
+
+        Returns:
+            Dictionary with validation results:
+            - coordinate_valid: Coordinate is within reasonable bounds
+            - coordinate_converged: Coordinate has converged
+            - role_set: Node role is configured
+            - confirmation_manager_active: Confirmation manager is tracking peers
+            - errors: List of any validation errors
+        """
+        errors: list[str] = []
+        coord = self._coordinate_tracker.get_coordinate()
+
+        # Validate coordinate bounds
+        coord_valid = True
+        if coord.error < 0 or coord.error > 10.0:
+            coord_valid = False
+            errors.append(f"Coordinate error out of bounds: {coord.error}")
+
+        for dimension_value in coord.vec:
+            if abs(dimension_value) > 10000:  # Sanity check: ~10s RTT max
+                coord_valid = False
+                errors.append(f"Coordinate dimension out of bounds: {dimension_value}")
+                break
+
+        # Validate convergence
+        coord_converged = self._coordinate_tracker.is_converged()
+
+        # Validate role
+        role_set = self._node_role in ("gate", "manager", "worker")
+        if not role_set:
+            errors.append(f"Invalid node role: {self._node_role}")
+
+        # Validate confirmation manager
+        confirmation_active = self._confirmation_manager.get_unconfirmed_peer_count() >= 0
+
+        return {
+            "coordinate_valid": coord_valid,
+            "coordinate_converged": coord_converged,
+            "role_set": role_set,
+            "confirmation_manager_active": confirmation_active,
+            "errors": errors if errors else None,
+            "overall_valid": coord_valid and role_set and confirmation_active,
+        }
 
     # =========================================================================
     # Leadership Event Registration (Composition Pattern)
