@@ -270,7 +270,7 @@ class WorkerServer(HealthAwareServer):
         # when running long workflows that may exceed the default deadline
         self._extension_requested: bool = False
         self._extension_reason: str = ""
-        self._extension_current_progress: float = 0.0  # 0.0-1.0 progress indicator
+        self._extension_current_progress: float = 0.0  # Monotonic progress (unbounded, not clamped)
         # AD-26 Issue 4: Absolute metrics for more robust progress tracking
         self._extension_completed_items: int = 0
         self._extension_total_items: int = 0
@@ -1589,14 +1589,18 @@ class WorkerServer(HealthAwareServer):
 
         Args:
             reason: Human-readable reason for the extension request.
-            progress: Current progress (0.0-1.0) to help manager make decisions.
+            progress: Monotonic progress value (not clamped to 0-1). Must strictly
+                increase between extension requests for approval. Prefer completed_items.
             completed_items: Absolute count of completed items (preferred metric).
             total_items: Total items to complete.
             estimated_completion: Estimated seconds until workflow completion.
         """
         self._extension_requested = True
         self._extension_reason = reason
-        self._extension_current_progress = max(0.0, min(1.0, progress))
+        # AD-26 Fix 2: Do NOT clamp progress to 0-1. Allow unbounded monotonic values.
+        # The "must strictly increase" rule requires values that can grow beyond 1.0
+        # for long-running jobs. Prefer completed_items (absolute) over progress (relative).
+        self._extension_current_progress = max(0.0, progress)
         # AD-26 Issue 4: Store absolute metrics
         self._extension_completed_items = completed_items
         self._extension_total_items = total_items

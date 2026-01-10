@@ -143,6 +143,11 @@ class Env(BaseModel):
     MANAGER_DEAD_NODE_CHECK_INTERVAL: StrictFloat = 60.0  # Seconds between dead node checks
     MANAGER_RATE_LIMIT_CLEANUP_INTERVAL: StrictFloat = 60.0  # Seconds between rate limit client cleanup
 
+    # AD-30: Job Responsiveness Settings
+    # Threshold for detecting stuck workflows - workers without progress for this duration are suspected
+    JOB_RESPONSIVENESS_THRESHOLD: StrictFloat = 60.0  # Seconds without progress before suspicion
+    JOB_RESPONSIVENESS_CHECK_INTERVAL: StrictFloat = 15.0  # Seconds between responsiveness checks
+
     # Manager TCP Timeout Settings
     MANAGER_TCP_TIMEOUT_SHORT: StrictFloat = 2.0  # Short timeout for quick operations (peer sync, worker queries)
     MANAGER_TCP_TIMEOUT_STANDARD: StrictFloat = 5.0  # Standard timeout for job dispatch, result forwarding

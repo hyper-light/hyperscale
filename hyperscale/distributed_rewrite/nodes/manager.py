@@ -578,6 +578,18 @@ class ManagerServer(HealthAwareServer):
         # Maps worker_id -> deadline timestamp
         self._worker_deadlines: dict[str, float] = {}
 
+        # AD-30: Worker job progress tracking for suspicion-driven failure detection
+        # Tracks last progress time per (job_id, worker_id) pair
+        # Used by _job_responsiveness_loop to detect stuck workflows
+        self._worker_job_last_progress: dict[tuple[str, str], float] = {}
+
+        # AD-30: Threshold for job responsiveness (seconds without progress)
+        # Workers that haven't made progress for this duration are suspected
+        self._job_responsiveness_threshold: float = env.JOB_RESPONSIVENESS_THRESHOLD
+
+        # AD-30: Interval between responsiveness checks
+        self._job_responsiveness_check_interval: float = env.JOB_RESPONSIVENESS_CHECK_INTERVAL
+
         # Discovery service for adaptive worker selection (AD-28)
         # Provides locality-aware, EWMA-based worker selection
         # Workers register dynamically via heartbeats, so we don't need initial seeds
@@ -2990,6 +3002,9 @@ class ManagerServer(HealthAwareServer):
 
         # Start background timeout checker (AD-34)
         self._task_runner.run(self._unified_timeout_loop)
+
+        # Start background job responsiveness checker (AD-30)
+        self._task_runner.run(self._job_responsiveness_loop)
 
         # Start background cleanup for rate limiter (AD-24)
         self._task_runner.run(self._rate_limit_cleanup_loop)
@@ -5493,6 +5508,10 @@ class ManagerServer(HealthAwareServer):
 
             # Resolve worker_id from address for windowed stats tracking
             worker_id = self._worker_addr_to_id.get(addr, f"{addr[0]}:{addr[1]}")
+
+            # AD-30: Track workflow progress for suspicion-driven failure detection
+            # Record that this worker is making progress on this job
+            self._track_workflow_progress_for_suspicion(progress.job_id, worker_id)
 
             # Add to windowed stats collector for streaming progress updates
             # Use parent workflow ID if this is a sub-workflow, so all sub-workflow
@@ -8285,6 +8304,9 @@ class ManagerServer(HealthAwareServer):
         # Clean up timeout extension tracking for this worker (AD-34 Part 10.4.9)
         await self._cleanup_worker_extensions_for_jobs(worker_node_id)
 
+        # Clean up progress tracking for job-layer suspicion (AD-30)
+        self._clear_worker_job_progress_tracking(worker_id=worker_node_id)
+
         # Step 1: Find all workflows on this worker in active states
         # Store tuples of (job_id, workflow_token, subworkflow_token)
         # - workflow_token: 4-part token for job.workflows lookups (DC:mgr:job:wf)
@@ -8922,6 +8944,9 @@ class ManagerServer(HealthAwareServer):
         # Clean up timeout strategy tracking (AD-34 Part 10.4.9)
         self._job_timeout_strategies.pop(job_id, None)
 
+        # Clean up progress tracking for job-layer suspicion (AD-30)
+        self._clear_worker_job_progress_tracking(job_id=job_id)
+
     # =========================================================================
     # Job Timeout Management (AD-34)
     # =========================================================================
@@ -9170,6 +9195,146 @@ class ManagerServer(HealthAwareServer):
                         node_id=self._node_id.short,
                     )
                 )
+
+    # =========================================================================
+    # AD-30: Job Responsiveness Tracking
+    # =========================================================================
+
+    def _track_workflow_progress_for_suspicion(
+        self,
+        job_id: str,
+        worker_id: str,
+    ) -> None:
+        """
+        Track workflow progress for suspicion-driven failure detection (AD-30).
+
+        Records the current time as the last progress time for this (job_id, worker_id)
+        pair. Called when receiving workflow progress updates.
+
+        Args:
+            job_id: The job receiving progress.
+            worker_id: The worker making progress.
+        """
+        key = (job_id, worker_id)
+        self._worker_job_last_progress[key] = time.monotonic()
+
+    def _clear_worker_job_progress_tracking(
+        self,
+        job_id: str | None = None,
+        worker_id: str | None = None,
+    ) -> None:
+        """
+        Clear progress tracking for a job, worker, or specific combination (AD-30).
+
+        Called on:
+        - Job cleanup: Clear all tracking for that job
+        - Worker failure: Clear all tracking for that worker
+
+        Args:
+            job_id: If provided, clear all tracking for this job.
+            worker_id: If provided, clear all tracking for this worker.
+        """
+        if job_id is not None and worker_id is not None:
+            # Clear specific (job_id, worker_id) pair
+            self._worker_job_last_progress.pop((job_id, worker_id), None)
+        elif job_id is not None:
+            # Clear all tracking for this job
+            keys_to_remove = [
+                key for key in self._worker_job_last_progress
+                if key[0] == job_id
+            ]
+            for key in keys_to_remove:
+                self._worker_job_last_progress.pop(key, None)
+        elif worker_id is not None:
+            # Clear all tracking for this worker
+            keys_to_remove = [
+                key for key in self._worker_job_last_progress
+                if key[1] == worker_id
+            ]
+            for key in keys_to_remove:
+                self._worker_job_last_progress.pop(key, None)
+
+    async def _job_responsiveness_loop(self) -> None:
+        """
+        Background task that checks for stuck workflows (AD-30).
+
+        Runs every JOB_RESPONSIVENESS_CHECK_INTERVAL seconds. Only leader checks.
+        Detects workers that haven't made progress for JOB_RESPONSIVENESS_THRESHOLD
+        seconds and triggers job-layer suspicion via the hierarchical detector.
+
+        This ensures job-layer suspicion is driven by actual workflow progress
+        signals, not just global liveness (worker may be alive but stuck).
+        """
+        while self._running:
+            try:
+                await asyncio.sleep(self._job_responsiveness_check_interval)
+
+                # Only leader checks responsiveness (avoid duplicate checks)
+                if not self.is_leader():
+                    continue
+
+                current_time = time.monotonic()
+                hierarchical_detector = self.get_hierarchical_detector()
+
+                if not hierarchical_detector:
+                    continue
+
+                # Check all tracked (job_id, worker_id) pairs for stale progress
+                for (job_id, worker_id), last_progress in list(self._worker_job_last_progress.items()):
+                    time_since_progress = current_time - last_progress
+
+                    if time_since_progress <= self._job_responsiveness_threshold:
+                        continue
+
+                    # Worker is alive globally but not making progress on this job
+                    worker = self._worker_pool.get_worker(worker_id)
+                    if not worker:
+                        # Worker no longer exists, clean up tracking
+                        self._worker_job_last_progress.pop((job_id, worker_id), None)
+                        continue
+
+                    # Check if job still exists and is active
+                    job = self._job_manager.get_job_by_id(job_id)
+                    if not job or job.status in {
+                        JobStatus.COMPLETED.value,
+                        JobStatus.FAILED.value,
+                        JobStatus.CANCELLED.value,
+                        JobStatus.TIMEOUT.value,
+                    }:
+                        # Job is terminal, clean up tracking
+                        self._worker_job_last_progress.pop((job_id, worker_id), None)
+                        continue
+
+                    # Check if worker is globally alive (via hierarchical detector)
+                    worker_addr = (worker.tcp_host, worker.udp_port)
+                    is_globally_alive = await hierarchical_detector.is_alive_global(worker_addr)
+
+                    if not is_globally_alive:
+                        # Worker is globally dead/suspected, no need for job-layer suspicion
+                        # The global layer will handle this
+                        continue
+
+                    # Worker is alive globally but stuck for this job - trigger job-layer suspicion
+                    await self._udp_logger.log(
+                        ServerWarning(
+                            message=f"Worker {worker_id} is alive but not making progress for job {job_id} "
+                                    f"(last progress {time_since_progress:.1f}s ago, threshold {self._job_responsiveness_threshold}s)",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
+
+                    await hierarchical_detector.suspect_node_for_job(
+                        job_id=job_id,
+                        node=worker_addr,
+                        incarnation=worker.incarnation,
+                    )
+
+            except asyncio.CancelledError:
+                break
+            except Exception as error:
+                await self.handle_exception(error, "_job_responsiveness_loop")
 
     async def _resume_timeout_tracking_for_all_jobs(self) -> None:
         """
@@ -9450,6 +9615,9 @@ class ManagerServer(HealthAwareServer):
             from_node=(self._host, self._udp_port),
         )
 
+        # AD-26 Fix 3: Emit metrics for deadline enforcement
+        self._metrics.increment("deadline_suspicions")
+
         # Log warning
         self._task_runner.run(
             self._udp_logger.log,
@@ -9472,6 +9640,9 @@ class ManagerServer(HealthAwareServer):
         Args:
             worker_id: The worker node ID to evict
         """
+        # AD-26 Fix 3: Emit metrics for deadline enforcement
+        self._metrics.increment("deadline_evictions")
+
         # Log error
         self._task_runner.run(
             self._udp_logger.log,

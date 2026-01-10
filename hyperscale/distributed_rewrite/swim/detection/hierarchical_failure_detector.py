@@ -532,6 +532,51 @@ class HierarchicalFailureDetector:
         """Clear all suspicions for a completed job."""
         return await self._job_manager.clear_job(job_id)
 
+    async def suspect_node_for_job(
+        self,
+        job_id: JobId,
+        node: NodeAddress,
+        incarnation: int,
+        min_timeout: float | None = None,
+        max_timeout: float | None = None,
+    ) -> bool:
+        """
+        Suspect a node at the job layer (AD-30).
+
+        This is used when a node is globally alive but not responsive
+        for a specific job (e.g., stuck workflows, no progress).
+
+        Unlike suspect_job(), this method is called by the manager's
+        responsiveness monitoring, not from gossip messages. The manager
+        itself is the source of the suspicion.
+
+        Args:
+            job_id: The job for which the node is unresponsive.
+            node: The node address (host, port).
+            incarnation: The node's incarnation number.
+            min_timeout: Optional minimum timeout override.
+            max_timeout: Optional maximum timeout override.
+
+        Returns:
+            True if suspicion was created/updated, False otherwise.
+        """
+        async with self._lock:
+            # Check global death first - if node is globally dead, no need
+            # for job-layer suspicion
+            if node in self._globally_dead:
+                return False
+
+        # Use node itself as the confirmer (self-suspicion from monitoring)
+        result = await self._job_manager.start_suspicion(
+            job_id=job_id,
+            node=node,
+            incarnation=incarnation,
+            from_node=node,  # Self-referential for monitoring-driven suspicion
+            min_timeout=min_timeout or self._config.job_min_timeout,
+            max_timeout=max_timeout or self._config.job_max_timeout,
+        )
+        return result is not None
+
     # =========================================================================
     # Status Queries
     # =========================================================================
