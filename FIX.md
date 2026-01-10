@@ -32,7 +32,7 @@ No fixes required. Priority-aware in-flight tracking, load shedding, and bounded
 
 ---
 
-## AD-33 (Workflow State Machine + Federated Health Monitoring) — NOT fully compliant
+## AD-33 (Workflow State Machine + Federated Health Monitoring) — compliant
 
 ### 1) Rescheduling token handling (worker-failure path) — compliant
 `_handle_worker_failure()` separates parent workflow tokens for job lookups and subworkflow tokens for lifecycle transitions.
@@ -50,30 +50,20 @@ References:
 
 ---
 
-### 3) Enforce dependent cancellation before retry
-**Problem**: `_handle_worker_failure()` logs and continues if dependent cancellation fails, allowing retries before dependents are fully cancelled.
+### 3) Enforce dependent cancellation before retry — compliant
+Dependent cancellation failures block re-queueing, and failed cancellations are retried in the background until resolved.
 
-**Exact changes**:
-- Make dependent cancellation a required gate: if cancellation fails or times out, **do not** transition to `FAILED_READY_FOR_RETRY`.
-- Persist a retryable “cancel-pending” state and reattempt cancellation until it succeeds or job is cancelled.
-
-**Acceptance**:
-- No workflow is re-queued until dependents are confirmed cancelled.
+References:
+- `hyperscale/distributed_rewrite/nodes/manager.py:8603`
+- `hyperscale/distributed_rewrite/nodes/manager.py:8840`
 
 ---
 
-### 4) FederatedHealthMonitor integration (AD-33 cross-DC) — NOT fully compliant
-**Observed**: Gate initializes `FederatedHealthMonitor` and handles `xprobe/xack`, but DC health classification is still delegated to `DatacenterHealthManager` (manager TCP heartbeats only) in `_classify_datacenter_health()`.
-
-**Exact changes**:
-- Incorporate `FederatedHealthMonitor` health signals into DC classification and routing (e.g., feed into `_dc_health_manager` or layer its result in `_classify_datacenter_health()` / `_select_datacenters_with_fallback()`).
-
-**Acceptance**:
-- Cross-DC health classification reflects `xprobe/xack` results, not only manager heartbeats.
+### 4) FederatedHealthMonitor integration (AD-33 cross-DC) — compliant
+Gate classifies DC health using both TCP heartbeat data and FederatedHealthMonitor UDP probe results.
 
 References:
-- `hyperscale/distributed_rewrite/nodes/gate.py:533`
-- `hyperscale/distributed_rewrite/nodes/gate.py:1929`
+- `hyperscale/distributed_rewrite/nodes/gate.py:2075`
 
 ---
 
