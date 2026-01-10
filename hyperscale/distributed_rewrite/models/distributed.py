@@ -1715,6 +1715,117 @@ class RateLimitResponse(Message):
 
 
 # =============================================================================
+# Job Timeout Messages (AD-34)
+# =============================================================================
+
+@dataclass(slots=True)
+class JobProgressReport(Message):
+    """
+    Manager → Gate: Periodic progress report (AD-34 multi-DC coordination).
+
+    Sent every ~10 seconds during job execution to keep gate informed of
+    DC-local progress. Used by gate to detect global timeouts and stuck DCs.
+
+    Extension Integration (AD-26):
+    - total_extensions_granted: Total seconds of extensions granted in this DC
+    - max_worker_extension: Largest extension granted to any single worker
+    - workers_with_extensions: Count of workers currently with active extensions
+    """
+    job_id: str
+    datacenter: str
+    manager_id: str
+    manager_host: str  # For gate to send replies
+    manager_port: int
+    workflows_total: int
+    workflows_completed: int
+    workflows_failed: int
+    has_recent_progress: bool  # Any workflow progressed in last 10s
+    timestamp: float
+    fence_token: int  # Manager's fence token
+
+    # Extension tracking (AD-26 integration)
+    total_extensions_granted: float = 0.0  # Total seconds granted to workers
+    max_worker_extension: float = 0.0  # Largest extension granted
+    workers_with_extensions: int = 0  # Count of workers with active extensions
+
+
+@dataclass(slots=True)
+class JobTimeoutReport(Message):
+    """
+    Manager → Gate: DC-local timeout detected (AD-34 multi-DC coordination).
+
+    Sent when manager detects job timeout or stuck workflows in its datacenter.
+    Gate aggregates timeout reports from all DCs to declare global timeout.
+
+    Manager sends this but does NOT mark job failed locally - waits for gate's
+    global timeout decision (JobGlobalTimeout).
+    """
+    job_id: str
+    datacenter: str
+    manager_id: str
+    manager_host: str
+    manager_port: int
+    reason: str  # "timeout" | "stuck" | other descriptive reason
+    elapsed_seconds: float
+    fence_token: int
+
+
+@dataclass(slots=True)
+class JobGlobalTimeout(Message):
+    """
+    Gate → Manager: Global timeout declared (AD-34 multi-DC coordination).
+
+    Gate has determined the job is globally timed out (based on timeout reports
+    from DCs, overall timeout exceeded, or all DCs stuck). Manager must cancel
+    job locally and mark as timed out.
+
+    Fence token validation prevents stale timeout decisions after leader transfers.
+    """
+    job_id: str
+    reason: str  # Why gate timed out the job
+    timed_out_at: float  # Gate's timestamp
+    fence_token: int  # Gate's fence token for this decision
+
+
+@dataclass(slots=True)
+class JobLeaderTransfer(Message):
+    """
+    Manager → Gate: Notify gate of leader change (AD-34 multi-DC coordination).
+
+    Sent by new leader after taking over job leadership. Gate updates its
+    tracking to send future timeout decisions to the new leader.
+
+    Includes incremented fence token to prevent stale operations.
+    """
+    job_id: str
+    datacenter: str
+    new_leader_id: str
+    new_leader_host: str
+    new_leader_port: int
+    fence_token: int  # New leader's fence token
+
+
+@dataclass(slots=True)
+class JobFinalStatus(Message):
+    """
+    Manager → Gate: Final job status for cleanup (AD-34 lifecycle management).
+
+    Sent when job reaches terminal state (completed/failed/cancelled/timed out).
+    Gate uses this to clean up timeout tracking for the job.
+
+    When all DCs report terminal status, gate removes job from tracking to
+    prevent memory leaks.
+    """
+    job_id: str
+    datacenter: str
+    manager_id: str
+    status: str  # JobStatus.COMPLETED/FAILED/CANCELLED/TIMEOUT value
+    timestamp: float
+    fence_token: int
+
+
+
+# =============================================================================
 # State Synchronization
 # =============================================================================
 
