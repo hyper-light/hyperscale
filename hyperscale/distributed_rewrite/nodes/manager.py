@@ -4338,6 +4338,9 @@ class ManagerServer(HealthAwareServer):
                         ack = WorkflowDispatchAck.load(response)
                         if ack.accepted:
                             circuit.record_success()
+                            # Store dispatch bytes for retry on worker failure
+                            # Key: workflow_id, Value: (retry_count, dispatch_bytes, failed_workers)
+                            self._workflow_retries[workflow_id] = (0, dispatch.dump(), set())
                             if attempt > 0:
                                 self._task_runner.run(
                                     self._udp_logger.log,
@@ -7520,9 +7523,8 @@ class ManagerServer(HealthAwareServer):
         Handle a worker becoming unavailable (detected via SWIM).
 
         Reschedules all workflows assigned to that worker on other workers.
-        The workflows must have been dispatched via _dispatch_single_workflow
-        which stores the dispatch bytes in _workflow_retries for exactly this
-        scenario.
+        The dispatch bytes are stored in _workflow_retries when the workflow
+        is successfully dispatched via _dispatch_workflow_to_worker.
         """
         # Clean up worker from WorkerPool
         await self._worker_pool.deregister_worker(worker_node_id)
@@ -7579,7 +7581,7 @@ class ManagerServer(HealthAwareServer):
                 continue
             
             # Dispatch bytes should have been stored when workflow was dispatched
-            # via _dispatch_single_workflow. If not present, we cannot retry.
+            # via _dispatch_workflow_to_worker. If not present, we cannot retry.
             retry_entry = self._workflow_retries.get(workflow_id)
             if not retry_entry:
                 self._task_runner.run(
