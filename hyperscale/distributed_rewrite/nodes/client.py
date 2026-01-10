@@ -206,6 +206,46 @@ class HyperscaleClient(MercurySyncBaseServer):
         # For selecting targets
         self._current_manager_idx = 0
         self._current_gate_idx = 0
+
+        # =======================================================================
+        # Section 9: Client robust response to leadership takeovers
+        # =======================================================================
+
+        # 9.1.1: Gate leadership tracking per job
+        self._gate_job_leaders: dict[str, GateLeaderInfo] = {}  # job_id -> gate info
+
+        # 9.2.1: Manager leadership tracking per job (with datacenter)
+        # Key is (job_id, datacenter_id) for multi-DC support
+        self._manager_job_leaders: dict[tuple[str, str], ManagerLeaderInfo] = {}
+
+        # 9.3.2: Per-job locks for request routing
+        self._request_routing_locks: dict[str, asyncio.Lock] = {}  # job_id -> lock
+
+        # 9.3.3: Leadership retry policy (configurable)
+        self._leadership_retry_policy = LeadershipRetryPolicy(
+            max_retries=3,
+            retry_delay=0.5,
+            exponential_backoff=True,
+            max_delay=5.0,
+        )
+
+        # 9.5.1: Orphaned job tracking
+        self._orphaned_jobs: dict[str, OrphanedJobInfo] = {}  # job_id -> orphan info
+        self._orphan_grace_period: float = env.CLIENT_ORPHAN_GRACE_PERIOD
+        self._orphan_check_interval: float = env.CLIENT_ORPHAN_CHECK_INTERVAL
+        self._orphan_check_task: asyncio.Task | None = None
+
+        # 9.4.2: Response freshness tracking
+        self._response_freshness_timeout: float = env.CLIENT_RESPONSE_FRESHNESS_TIMEOUT
+
+        # 9.6.1: Transfer metrics
+        self._gate_transfers_received: int = 0
+        self._manager_transfers_received: int = 0
+        self._requests_rerouted: int = 0
+        self._requests_failed_leadership_change: int = 0
+
+        # 9.1.4: Gate connection state tracking
+        self._gate_connection_state: dict[tuple[str, int], str] = {}  # addr -> "connected"/"disconnected"
     
     async def start(self) -> None:
         """Start the client and begin listening for push notifications."""
@@ -1573,4 +1613,312 @@ class HyperscaleClient(MercurySyncBaseServer):
         self._cancellation_errors.pop(job_id, None)
 
         return (success, errors)
+
+    # =========================================================================
+    # Section 9: Client Leadership Transfer Handling
+    # =========================================================================
+
+    def _get_request_routing_lock(self, job_id: str) -> asyncio.Lock:
+        """
+        Get or create a lock for request routing (Section 9.3.2).
+
+        Per-job locks prevent race conditions between leadership updates
+        and request routing.
+        """
+        if job_id not in self._request_routing_locks:
+            self._request_routing_locks[job_id] = asyncio.Lock()
+        return self._request_routing_locks[job_id]
+
+    def _validate_gate_fence_token(self, job_id: str, new_fence_token: int) -> tuple[bool, str]:
+        """
+        Validate a gate transfer's fence token (Section 9.1.2).
+
+        Returns (is_valid, rejection_reason).
+        """
+        current_leader = self._gate_job_leaders.get(job_id)
+        if current_leader and new_fence_token <= current_leader.fence_token:
+            return (
+                False,
+                f"Stale fence token: received {new_fence_token}, current {current_leader.fence_token}"
+            )
+        return (True, "")
+
+    def _validate_manager_fence_token(
+        self,
+        job_id: str,
+        datacenter_id: str,
+        new_fence_token: int,
+    ) -> tuple[bool, str]:
+        """
+        Validate a manager transfer's fence token (Section 9.2.2).
+
+        Returns (is_valid, rejection_reason).
+        """
+        key = (job_id, datacenter_id)
+        current_leader = self._manager_job_leaders.get(key)
+        if current_leader and new_fence_token <= current_leader.fence_token:
+            return (
+                False,
+                f"Stale fence token: received {new_fence_token}, current {current_leader.fence_token}"
+            )
+        return (True, "")
+
+    def _update_gate_leader(
+        self,
+        job_id: str,
+        gate_addr: tuple[str, int],
+        fence_token: int,
+    ) -> None:
+        """Update gate job leader tracking (Section 9.1.1)."""
+        self._gate_job_leaders[job_id] = GateLeaderInfo(
+            gate_addr=gate_addr,
+            fence_token=fence_token,
+            last_updated=time.monotonic(),
+        )
+        # Clear orphan status if present
+        if job_id in self._orphaned_jobs:
+            del self._orphaned_jobs[job_id]
+
+    def _update_manager_leader(
+        self,
+        job_id: str,
+        datacenter_id: str,
+        manager_addr: tuple[str, int],
+        fence_token: int,
+    ) -> None:
+        """Update manager job leader tracking (Section 9.2.1)."""
+        key = (job_id, datacenter_id)
+        self._manager_job_leaders[key] = ManagerLeaderInfo(
+            manager_addr=manager_addr,
+            fence_token=fence_token,
+            datacenter_id=datacenter_id,
+            last_updated=time.monotonic(),
+        )
+
+    def _mark_job_orphaned(
+        self,
+        job_id: str,
+        last_known_gate: tuple[str, int] | None,
+        last_known_manager: tuple[str, int] | None,
+        datacenter_id: str = "",
+    ) -> None:
+        """Mark a job as orphaned (Section 9.5.1)."""
+        if job_id not in self._orphaned_jobs:
+            self._orphaned_jobs[job_id] = OrphanedJobInfo(
+                job_id=job_id,
+                orphan_timestamp=time.monotonic(),
+                last_known_gate=last_known_gate,
+                last_known_manager=last_known_manager,
+                datacenter_id=datacenter_id,
+            )
+
+    @tcp.receive()
+    async def receive_gate_job_leader_transfer(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ) -> bytes:
+        """
+        Handle gate job leadership transfer notification (Section 9.1.2).
+
+        Received from the new gate job leader when taking over from a failed gate.
+        """
+        self._gate_transfers_received += 1
+
+        try:
+            transfer = GateJobLeaderTransfer.load(data)
+            job_id = transfer.job_id
+
+            # Acquire routing lock to prevent race with in-flight requests
+            routing_lock = self._get_request_routing_lock(job_id)
+            async with routing_lock:
+
+                # Validate fence token
+                fence_valid, fence_reason = self._validate_gate_fence_token(
+                    job_id, transfer.fence_token
+                )
+                if not fence_valid:
+                    await self._udp_logger.log(
+                        ServerInfo(
+                            message=f"Rejected gate transfer for job {job_id[:8]}...: {fence_reason}",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
+                    return GateJobLeaderTransferAck(
+                        job_id=job_id,
+                        client_id=self._node_id.full,
+                        accepted=False,
+                        rejection_reason=fence_reason,
+                    ).dump()
+
+                # Update gate leader
+                old_gate_str = f"{transfer.old_gate_addr}" if transfer.old_gate_addr else "unknown"
+                self._update_gate_leader(
+                    job_id=job_id,
+                    gate_addr=transfer.new_gate_addr,
+                    fence_token=transfer.fence_token,
+                )
+
+                # Update job target for future requests
+                if job_id in self._job_targets:
+                    self._job_targets[job_id] = transfer.new_gate_addr
+
+                await self._udp_logger.log(
+                    ServerInfo(
+                        message=f"Gate job leader transfer: job={job_id[:8]}..., "
+                                f"old={old_gate_str}, new={transfer.new_gate_addr}, "
+                                f"fence_token={transfer.fence_token}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+
+                return GateJobLeaderTransferAck(
+                    job_id=job_id,
+                    client_id=self._node_id.full,
+                    accepted=True,
+                ).dump()
+
+        except Exception as error:
+            await self._udp_logger.log(
+                ServerError(
+                    message=f"Error processing gate transfer: {error}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            return GateJobLeaderTransferAck(
+                job_id="unknown",
+                client_id=self._node_id.full,
+                accepted=False,
+                rejection_reason=str(error),
+            ).dump()
+
+    @tcp.receive()
+    async def receive_manager_job_leader_transfer(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ) -> bytes:
+        """
+        Handle manager job leadership transfer notification (Section 9.2.2).
+
+        Typically forwarded by gate to client when a manager job leader changes.
+        """
+        self._manager_transfers_received += 1
+
+        try:
+            transfer = ManagerJobLeaderTransfer.load(data)
+            job_id = transfer.job_id
+            datacenter_id = transfer.datacenter_id
+
+            # Acquire routing lock
+            routing_lock = self._get_request_routing_lock(job_id)
+            async with routing_lock:
+
+                # Validate fence token
+                fence_valid, fence_reason = self._validate_manager_fence_token(
+                    job_id, datacenter_id, transfer.fence_token
+                )
+                if not fence_valid:
+                    await self._udp_logger.log(
+                        ServerInfo(
+                            message=f"Rejected manager transfer for job {job_id[:8]}...: {fence_reason}",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
+                    return ManagerJobLeaderTransferAck(
+                        job_id=job_id,
+                        client_id=self._node_id.full,
+                        datacenter_id=datacenter_id,
+                        accepted=False,
+                        rejection_reason=fence_reason,
+                    ).dump()
+
+                # Update manager leader
+                old_manager_str = f"{transfer.old_manager_addr}" if transfer.old_manager_addr else "unknown"
+                self._update_manager_leader(
+                    job_id=job_id,
+                    datacenter_id=datacenter_id,
+                    manager_addr=transfer.new_manager_addr,
+                    fence_token=transfer.fence_token,
+                )
+
+                await self._udp_logger.log(
+                    ServerInfo(
+                        message=f"Manager job leader transfer: job={job_id[:8]}..., dc={datacenter_id}, "
+                                f"old={old_manager_str}, new={transfer.new_manager_addr}, "
+                                f"fence_token={transfer.fence_token}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+
+                return ManagerJobLeaderTransferAck(
+                    job_id=job_id,
+                    client_id=self._node_id.full,
+                    datacenter_id=datacenter_id,
+                    accepted=True,
+                ).dump()
+
+        except Exception as error:
+            await self._udp_logger.log(
+                ServerError(
+                    message=f"Error processing manager transfer: {error}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            return ManagerJobLeaderTransferAck(
+                job_id="unknown",
+                client_id=self._node_id.full,
+                datacenter_id="",
+                accepted=False,
+                rejection_reason=str(error),
+            ).dump()
+
+    def get_current_gate_leader(self, job_id: str) -> tuple[str, int] | None:
+        """Get the current gate leader address for a job (Section 9.1.1)."""
+        leader_info = self._gate_job_leaders.get(job_id)
+        if leader_info:
+            return leader_info.gate_addr
+        return None
+
+    def get_current_manager_leader(
+        self,
+        job_id: str,
+        datacenter_id: str,
+    ) -> tuple[str, int] | None:
+        """Get the current manager leader address for a job in a datacenter (Section 9.2.1)."""
+        key = (job_id, datacenter_id)
+        leader_info = self._manager_job_leaders.get(key)
+        if leader_info:
+            return leader_info.manager_addr
+        return None
+
+    def is_job_orphaned(self, job_id: str) -> bool:
+        """Check if a job is currently in orphan state (Section 9.5.1)."""
+        return job_id in self._orphaned_jobs
+
+    def get_leadership_metrics(self) -> dict[str, int]:
+        """Get leadership transfer metrics (Section 9.6.1)."""
+        return {
+            "gate_transfers_received": self._gate_transfers_received,
+            "manager_transfers_received": self._manager_transfers_received,
+            "requests_rerouted": self._requests_rerouted,
+            "requests_failed_leadership_change": self._requests_failed_leadership_change,
+            "orphaned_jobs": len(self._orphaned_jobs),
+            "tracked_gate_leaders": len(self._gate_job_leaders),
+            "tracked_manager_leaders": len(self._manager_job_leaders),
+        }
 
