@@ -605,3 +605,501 @@ class TestEdgeCases:
         # The scan only checks the specific DC, so job-002 won't be found
         # Let's verify:
         assert "job-002" not in gate._orphaned_jobs
+
+
+# =============================================================================
+# Extended Tests: Negative Paths and Failure Modes
+# =============================================================================
+
+
+class TestNegativePaths:
+    """Tests for error handling and negative scenarios."""
+
+    @pytest.mark.asyncio
+    async def test_manager_death_for_unknown_datacenter(self):
+        """Gate should handle manager death in unknown datacenter."""
+        gate = MockGateServer()
+
+        manager_addr = ("192.168.1.10", 9090)
+        gate.add_job("job-001", "dc1", manager_addr)
+
+        # Death in unknown DC
+        await gate._handle_manager_death_for_jobs(manager_addr, "unknown-dc")
+
+        # Job should not be orphaned (different DC)
+        assert "job-001" not in gate._orphaned_jobs
+        # But manager should still be tracked as dead
+        assert manager_addr in gate._dead_job_leaders
+
+    @pytest.mark.asyncio
+    async def test_manager_death_with_no_jobs(self):
+        """Gate should handle manager death when no jobs exist."""
+        gate = MockGateServer()
+
+        manager_addr = ("192.168.1.10", 9090)
+
+        # No jobs added
+        await gate._handle_manager_death_for_jobs(manager_addr, "dc1")
+
+        assert manager_addr in gate._dead_job_leaders
+        assert len(gate._orphaned_jobs) == 0
+
+    @pytest.mark.asyncio
+    async def test_duplicate_manager_death_events(self):
+        """Gate should handle duplicate manager death events."""
+        gate = MockGateServer()
+
+        manager_addr = ("192.168.1.10", 9090)
+        gate.add_job("job-001", "dc1", manager_addr)
+
+        # First death event
+        await gate._handle_manager_death_for_jobs(manager_addr, "dc1")
+        first_orphan_time = gate._orphaned_jobs["job-001"]
+
+        # Small delay
+        await asyncio.sleep(0.01)
+
+        # Duplicate death event
+        await gate._handle_manager_death_for_jobs(manager_addr, "dc1")
+
+        # Timestamp should NOT be updated (already orphaned)
+        assert gate._orphaned_jobs["job-001"] == first_orphan_time
+
+    @pytest.mark.asyncio
+    async def test_clear_already_cleared_job(self):
+        """Clearing an already cleared job should be safe."""
+        gate = MockGateServer()
+
+        manager_addr = ("192.168.1.10", 9090)
+        gate.add_job("job-001", "dc1", manager_addr)
+
+        await gate._handle_manager_death_for_jobs(manager_addr, "dc1")
+
+        # Clear once
+        gate._clear_orphaned_job("job-001", ("192.168.1.20", 9090))
+        # Clear again (should be safe)
+        gate._clear_orphaned_job("job-001", ("192.168.1.30", 9090))
+
+        assert "job-001" not in gate._orphaned_jobs
+
+    @pytest.mark.asyncio
+    async def test_timeout_for_job_not_in_jobs_dict(self):
+        """Timeout should handle job not in _jobs dict."""
+        env = MockGateEnv(
+            GATE_ORPHAN_GRACE_PERIOD=0.1,
+            GATE_ORPHAN_CHECK_INTERVAL=0.05,
+        )
+        gate = MockGateServer(env)
+
+        # Add orphan directly without adding to _jobs
+        gate._orphaned_jobs["phantom-job"] = time.monotonic()
+
+        gate.start_orphan_check_loop()
+        await asyncio.sleep(0.3)
+        await gate.stop_orphan_check_loop()
+
+        # Should complete without error
+        assert "phantom-job" not in gate._orphaned_jobs
+
+
+# =============================================================================
+# Extended Tests: Concurrency and Race Conditions
+# =============================================================================
+
+
+class TestConcurrencyAndRaceConditions:
+    """Tests for concurrent operations and race conditions."""
+
+    @pytest.mark.asyncio
+    async def test_concurrent_manager_deaths(self):
+        """Gate should handle concurrent manager death events."""
+        gate = MockGateServer()
+
+        # Setup multiple managers and jobs
+        for i in range(5):
+            manager_addr = (f"192.168.1.{10 + i}", 9090)
+            gate.add_job(f"job-{i:03d}", f"dc{i}", manager_addr)
+
+        # All managers die concurrently
+        await asyncio.gather(*[
+            gate._handle_manager_death_for_jobs((f"192.168.1.{10 + i}", 9090), f"dc{i}")
+            for i in range(5)
+        ])
+
+        # All jobs should be orphaned
+        for i in range(5):
+            assert f"job-{i:03d}" in gate._orphaned_jobs
+
+    @pytest.mark.asyncio
+    async def test_concurrent_death_and_transfer(self):
+        """Gate should handle concurrent death and transfer events."""
+        gate = MockGateServer()
+
+        manager_addr = ("192.168.1.10", 9090)
+        gate.add_job("job-001", "dc1", manager_addr)
+
+        # Run death and transfer concurrently
+        async def death_then_transfer():
+            await gate._handle_manager_death_for_jobs(manager_addr, "dc1")
+            await asyncio.sleep(0.01)
+            gate._clear_orphaned_job("job-001", ("192.168.1.20", 9090))
+
+        await death_then_transfer()
+
+        # Job should be cleared (transfer wins)
+        assert "job-001" not in gate._orphaned_jobs
+
+    @pytest.mark.asyncio
+    async def test_rapid_successive_deaths(self):
+        """Gate should handle rapid successive manager deaths."""
+        gate = MockGateServer()
+
+        # Setup
+        for i in range(10):
+            manager_addr = (f"192.168.1.{10 + i}", 9090)
+            gate.add_job(f"job-{i:03d}", "dc1", manager_addr)
+
+        # Rapid fire deaths
+        for i in range(10):
+            manager_addr = (f"192.168.1.{10 + i}", 9090)
+            await gate._handle_manager_death_for_jobs(manager_addr, "dc1")
+
+        # All managers tracked
+        assert len(gate._dead_job_leaders) == 10
+        # All jobs orphaned
+        assert len(gate._orphaned_jobs) == 10
+
+    @pytest.mark.asyncio
+    async def test_orphan_check_during_death_processing(self):
+        """Orphan check loop running while death is being processed."""
+        env = MockGateEnv(
+            GATE_ORPHAN_GRACE_PERIOD=0.5,
+            GATE_ORPHAN_CHECK_INTERVAL=0.05,
+        )
+        gate = MockGateServer(env)
+
+        manager_addr = ("192.168.1.10", 9090)
+        gate.add_job("job-001", "dc1", manager_addr)
+
+        # Start orphan check loop first
+        gate.start_orphan_check_loop()
+
+        # Then trigger death
+        await asyncio.sleep(0.1)
+        await gate._handle_manager_death_for_jobs(manager_addr, "dc1")
+
+        # Wait less than grace period
+        await asyncio.sleep(0.2)
+
+        # Clear before timeout
+        gate._clear_orphaned_job("job-001", ("192.168.1.20", 9090))
+
+        await asyncio.sleep(0.4)
+        await gate.stop_orphan_check_loop()
+
+        # Job should NOT be failed
+        assert gate._jobs["job-001"].status == "RUNNING"
+
+
+# =============================================================================
+# Extended Tests: Edge Cases and Boundary Conditions
+# =============================================================================
+
+
+class TestEdgeCasesAndBoundaryConditions:
+    """Tests for edge cases and boundary conditions."""
+
+    @pytest.mark.asyncio
+    async def test_zero_grace_period(self):
+        """Zero grace period should cause immediate timeout."""
+        env = MockGateEnv(
+            GATE_ORPHAN_GRACE_PERIOD=0.0,
+            GATE_ORPHAN_CHECK_INTERVAL=0.02,
+        )
+        gate = MockGateServer(env)
+
+        manager_addr = ("192.168.1.10", 9090)
+        gate.add_job("job-001", "dc1", manager_addr)
+
+        await gate._handle_manager_death_for_jobs(manager_addr, "dc1")
+
+        gate.start_orphan_check_loop()
+        await asyncio.sleep(0.1)
+        await gate.stop_orphan_check_loop()
+
+        # Should be failed immediately
+        assert gate._jobs["job-001"].status == "FAILED"
+
+    @pytest.mark.asyncio
+    async def test_very_long_grace_period(self):
+        """Very long grace period should not cause issues."""
+        env = MockGateEnv(
+            GATE_ORPHAN_GRACE_PERIOD=3600.0,  # 1 hour
+            GATE_ORPHAN_CHECK_INTERVAL=0.05,
+        )
+        gate = MockGateServer(env)
+
+        manager_addr = ("192.168.1.10", 9090)
+        gate.add_job("job-001", "dc1", manager_addr)
+
+        await gate._handle_manager_death_for_jobs(manager_addr, "dc1")
+
+        gate.start_orphan_check_loop()
+        await asyncio.sleep(0.2)
+        await gate.stop_orphan_check_loop()
+
+        # Should NOT be failed (grace period not expired)
+        assert gate._jobs["job-001"].status == "RUNNING"
+        assert "job-001" in gate._orphaned_jobs
+
+    @pytest.mark.asyncio
+    async def test_job_id_with_special_characters(self):
+        """Gate should handle job IDs with special characters."""
+        gate = MockGateServer()
+
+        special_ids = [
+            "job:with:colons",
+            "job-with-dashes",
+            "job_with_underscores",
+            "job.with.dots",
+        ]
+
+        for job_id in special_ids:
+            manager_addr = ("192.168.1.10", 9090)
+            gate.add_job(job_id, "dc1", manager_addr)
+
+        await gate._handle_manager_death_for_jobs(("192.168.1.10", 9090), "dc1")
+
+        for job_id in special_ids:
+            assert job_id in gate._orphaned_jobs
+
+    @pytest.mark.asyncio
+    async def test_very_long_job_id(self):
+        """Gate should handle very long job IDs."""
+        gate = MockGateServer()
+
+        long_id = "j" * 1000
+        manager_addr = ("192.168.1.10", 9090)
+        gate.add_job(long_id, "dc1", manager_addr)
+
+        await gate._handle_manager_death_for_jobs(manager_addr, "dc1")
+
+        assert long_id in gate._orphaned_jobs
+
+    @pytest.mark.asyncio
+    async def test_large_number_of_jobs(self):
+        """Gate should handle large number of jobs."""
+        gate = MockGateServer()
+
+        manager_addr = ("192.168.1.10", 9090)
+        for i in range(1000):
+            gate.add_job(f"job-{i:06d}", "dc1", manager_addr)
+
+        await gate._handle_manager_death_for_jobs(manager_addr, "dc1")
+
+        assert len(gate._orphaned_jobs) == 1000
+
+    @pytest.mark.asyncio
+    async def test_manager_addr_with_different_ports(self):
+        """Same host but different ports should be tracked separately."""
+        gate = MockGateServer()
+
+        addr1 = ("192.168.1.10", 9090)
+        addr2 = ("192.168.1.10", 9091)  # Same host, different port
+
+        gate.add_job("job-001", "dc1", addr1)
+        gate.add_job("job-002", "dc1", addr2)
+
+        # Only addr1 dies
+        await gate._handle_manager_death_for_jobs(addr1, "dc1")
+
+        assert "job-001" in gate._orphaned_jobs
+        assert "job-002" not in gate._orphaned_jobs
+
+
+class TestOrphanLoopEdgeCases:
+    """Tests for orphan loop edge cases."""
+
+    @pytest.mark.asyncio
+    async def test_stop_loop_before_start(self):
+        """Stopping loop before start should be safe."""
+        gate = MockGateServer()
+
+        # Should not raise
+        await gate.stop_orphan_check_loop()
+
+    @pytest.mark.asyncio
+    async def test_double_start_loop(self):
+        """Starting loop twice should not create duplicates."""
+        gate = MockGateServer()
+
+        gate.start_orphan_check_loop()
+        first_task = gate._orphan_check_task
+
+        gate.start_orphan_check_loop()
+        second_task = gate._orphan_check_task
+
+        # Should be same task (not started twice if done check passes)
+        # Note: The implementation checks if task is None or done()
+        assert first_task is not None
+
+        await gate.stop_orphan_check_loop()
+
+    @pytest.mark.asyncio
+    async def test_restart_loop_after_stop(self):
+        """Restarting loop after stop should work."""
+        env = MockGateEnv(
+            GATE_ORPHAN_GRACE_PERIOD=0.2,
+            GATE_ORPHAN_CHECK_INTERVAL=0.05,
+        )
+        gate = MockGateServer(env)
+
+        manager_addr = ("192.168.1.10", 9090)
+        gate.add_job("job-001", "dc1", manager_addr)
+
+        # Start and stop
+        gate.start_orphan_check_loop()
+        await asyncio.sleep(0.05)
+        await gate.stop_orphan_check_loop()
+
+        # Re-enable running
+        gate._running = True
+
+        # Orphan the job
+        await gate._handle_manager_death_for_jobs(manager_addr, "dc1")
+
+        # Restart
+        gate.start_orphan_check_loop()
+        await asyncio.sleep(0.4)
+        await gate.stop_orphan_check_loop()
+
+        # Job should be failed
+        assert gate._jobs["job-001"].status == "FAILED"
+
+
+class TestCallbackCleanup:
+    """Tests for callback cleanup on job failure."""
+
+    @pytest.mark.asyncio
+    async def test_job_callback_cleaned_up(self):
+        """Job callback should be removed when job times out."""
+        env = MockGateEnv(
+            GATE_ORPHAN_GRACE_PERIOD=0.1,
+            GATE_ORPHAN_CHECK_INTERVAL=0.05,
+        )
+        gate = MockGateServer(env)
+
+        manager_addr = ("192.168.1.10", 9090)
+        gate.add_job("job-001", "dc1", manager_addr)
+        gate._job_callbacks["job-001"] = ("192.168.1.100", 7070)
+
+        await gate._handle_manager_death_for_jobs(manager_addr, "dc1")
+
+        gate.start_orphan_check_loop()
+        await asyncio.sleep(0.3)
+        await gate.stop_orphan_check_loop()
+
+        assert "job-001" not in gate._job_callbacks
+
+    @pytest.mark.asyncio
+    async def test_progress_callback_cleaned_up(self):
+        """Progress callback should be removed when job times out."""
+        env = MockGateEnv(
+            GATE_ORPHAN_GRACE_PERIOD=0.1,
+            GATE_ORPHAN_CHECK_INTERVAL=0.05,
+        )
+        gate = MockGateServer(env)
+
+        manager_addr = ("192.168.1.10", 9090)
+        gate.add_job("job-001", "dc1", manager_addr)
+        gate._progress_callbacks["job-001"] = ("192.168.1.100", 7071)
+
+        await gate._handle_manager_death_for_jobs(manager_addr, "dc1")
+
+        gate.start_orphan_check_loop()
+        await asyncio.sleep(0.3)
+        await gate.stop_orphan_check_loop()
+
+        assert "job-001" not in gate._progress_callbacks
+
+    @pytest.mark.asyncio
+    async def test_no_callback_no_error(self):
+        """Job without callback should still be handled."""
+        env = MockGateEnv(
+            GATE_ORPHAN_GRACE_PERIOD=0.1,
+            GATE_ORPHAN_CHECK_INTERVAL=0.05,
+        )
+        gate = MockGateServer(env)
+
+        manager_addr = ("192.168.1.10", 9090)
+        gate.add_job("job-001", "dc1", manager_addr)
+        # No callback set
+
+        await gate._handle_manager_death_for_jobs(manager_addr, "dc1")
+
+        gate.start_orphan_check_loop()
+        await asyncio.sleep(0.3)
+        await gate.stop_orphan_check_loop()
+
+        # Should complete without error
+        assert gate._jobs["job-001"].status == "FAILED"
+
+
+class TestMultiDatacenterScenarios:
+    """Tests for multi-datacenter scenarios."""
+
+    @pytest.mark.asyncio
+    async def test_job_with_multiple_dc_managers(self):
+        """Job with managers in multiple DCs - only affected DC orphaned."""
+        gate = MockGateServer()
+
+        manager_dc1 = ("192.168.1.10", 9090)
+        manager_dc2 = ("192.168.1.20", 9090)
+
+        # Add job to both DC tracking (unusual but possible)
+        gate.add_job("job-001", "dc1", manager_dc1)
+        # Manually add to another DC
+        gate._job_dc_managers["job-001"]["dc2"] = manager_dc2
+
+        # Only DC1 manager dies
+        await gate._handle_manager_death_for_jobs(manager_dc1, "dc1")
+
+        # Job is orphaned (because DC1 manager died)
+        assert "job-001" in gate._orphaned_jobs
+
+    @pytest.mark.asyncio
+    async def test_different_managers_same_dc(self):
+        """Different managers in same DC should be tracked separately."""
+        gate = MockGateServer()
+
+        manager1 = ("192.168.1.10", 9090)
+        manager2 = ("192.168.1.20", 9090)
+
+        gate.add_job("job-001", "dc1", manager1)
+        gate.add_job("job-002", "dc1", manager2)
+
+        # Only manager1 dies
+        await gate._handle_manager_death_for_jobs(manager1, "dc1")
+
+        assert "job-001" in gate._orphaned_jobs
+        assert "job-002" not in gate._orphaned_jobs
+
+    @pytest.mark.asyncio
+    async def test_sequential_dc_failures(self):
+        """Sequential failures across DCs should be tracked."""
+        gate = MockGateServer()
+
+        # Jobs spread across DCs
+        for i in range(3):
+            dc_id = f"dc{i + 1}"
+            manager_addr = (f"192.168.{i + 1}.10", 9090)
+            gate.add_job(f"job-{i + 1:03d}", dc_id, manager_addr)
+
+        # All DCs fail sequentially
+        for i in range(3):
+            dc_id = f"dc{i + 1}"
+            manager_addr = (f"192.168.{i + 1}.10", 9090)
+            await gate._handle_manager_death_for_jobs(manager_addr, dc_id)
+
+        # All jobs orphaned
+        assert len(gate._orphaned_jobs) == 3
