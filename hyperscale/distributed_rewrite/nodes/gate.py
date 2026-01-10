@@ -134,6 +134,10 @@ from hyperscale.distributed_rewrite.jobs.gates import (
     JobForwardingTracker,
     ConsistentHashRing,
 )
+from hyperscale.distributed_rewrite.gates import (
+    CircuitBreakerManager,
+    LatencyTracker,
+)
 from hyperscale.distributed_rewrite.jobs import (
     WindowedStatsCollector,
     WindowedStatsPush,
@@ -218,8 +222,7 @@ class GateServer(HealthAwareServer):
             )
 
         # Per-manager circuit breakers for dispatch failures
-        # Key is manager TCP address tuple, value is ErrorStats
-        self._manager_circuits: dict[tuple[str, int], ErrorStats] = {}
+        self._circuit_breaker_manager = CircuitBreakerManager(env)
         
         # Gate peers for clustering
         self._gate_peers = gate_peers or []  # TCP
@@ -274,9 +277,10 @@ class GateServer(HealthAwareServer):
         # Latency tracking for peer gates
         # Used to detect network degradation within the gate cluster
         # High latency to all peers indicates network issues vs specific gate failures
-        self._peer_gate_latency_samples: dict[str, list[tuple[float, float]]] = {}  # gate_id -> [(timestamp, latency_ms)]
-        self._latency_sample_max_age: float = 60.0  # Keep samples for 60 seconds
-        self._latency_sample_max_count: int = 30  # Keep at most 30 samples per peer
+        self._peer_gate_latency_tracker = LatencyTracker(
+            sample_max_age=60.0,
+            sample_max_count=30,
+        )
 
         # Load shedding infrastructure (AD-22)
         # Tracks latency and sheds low-priority requests under load
@@ -1537,54 +1541,27 @@ class GateServer(HealthAwareServer):
     def _get_manager_circuit(self, manager_addr: tuple[str, int]) -> ErrorStats:
         """
         Get or create a circuit breaker for a specific manager.
-        
+
         Each manager has its own circuit breaker so that failures to one
         manager don't affect dispatch to other managers.
         """
-        if manager_addr not in self._manager_circuits:
-            cb_config = self.env.get_circuit_breaker_config()
-            self._manager_circuits[manager_addr] = ErrorStats(
-                max_errors=cb_config['max_errors'],
-                window_seconds=cb_config['window_seconds'],
-                half_open_after=cb_config['half_open_after'],
-            )
-        return self._manager_circuits[manager_addr]
-    
+        return self._circuit_breaker_manager.get_circuit(manager_addr)
+
     def _is_manager_circuit_open(self, manager_addr: tuple[str, int]) -> bool:
         """Check if a manager's circuit breaker is open."""
-        circuit = self._manager_circuits.get(manager_addr)
-        if not circuit:
-            return False
-        return circuit.circuit_state == CircuitState.OPEN
-    
+        return self._circuit_breaker_manager.is_circuit_open(manager_addr)
+
     def get_manager_circuit_status(self, manager_addr: tuple[str, int]) -> dict | None:
         """
         Get circuit breaker status for a specific manager.
-        
+
         Returns None if manager has no circuit breaker (never had failures).
         """
-        circuit = self._manager_circuits.get(manager_addr)
-        if not circuit:
-            return None
-        return {
-            "manager_addr": f"{manager_addr[0]}:{manager_addr[1]}",
-            "circuit_state": circuit.circuit_state.name,
-            "error_count": circuit.error_count,
-            "error_rate": circuit.error_rate,
-        }
-    
+        return self._circuit_breaker_manager.get_circuit_status(manager_addr)
+
     def get_all_manager_circuit_status(self) -> dict:
         """Get circuit breaker status for all managers."""
-        return {
-            "managers": {
-                f"{addr[0]}:{addr[1]}": self.get_manager_circuit_status(addr)
-                for addr in self._manager_circuits.keys()
-            },
-            "open_circuits": [
-                f"{addr[0]}:{addr[1]}" for addr in self._manager_circuits.keys()
-                if self._is_manager_circuit_open(addr)
-            ],
-        }
+        return self._circuit_breaker_manager.get_all_circuit_status()
     
     def _count_active_datacenters(self) -> int:
         """
@@ -3310,19 +3287,7 @@ class GateServer(HealthAwareServer):
             gate_id: The peer gate's node ID.
             latency_ms: Round-trip latency in milliseconds.
         """
-        now = time.monotonic()
-        if gate_id not in self._peer_gate_latency_samples:
-            self._peer_gate_latency_samples[gate_id] = []
-
-        samples = self._peer_gate_latency_samples[gate_id]
-        samples.append((now, latency_ms))
-
-        # Prune old samples
-        cutoff = now - self._latency_sample_max_age
-        self._peer_gate_latency_samples[gate_id] = [
-            (ts, lat) for ts, lat in samples
-            if ts > cutoff
-        ][-self._latency_sample_max_count:]
+        self._peer_gate_latency_tracker.record_latency(gate_id, latency_ms)
 
     def get_average_peer_gate_latency(self) -> float | None:
         """
@@ -3330,13 +3295,7 @@ class GateServer(HealthAwareServer):
 
         Returns None if no samples available.
         """
-        all_latencies = [
-            lat for samples in self._peer_gate_latency_samples.values()
-            for _, lat in samples
-        ]
-        if not all_latencies:
-            return None
-        return sum(all_latencies) / len(all_latencies)
+        return self._peer_gate_latency_tracker.get_average_latency()
 
     def get_peer_gate_latency(self, gate_id: str) -> float | None:
         """
@@ -3347,10 +3306,7 @@ class GateServer(HealthAwareServer):
 
         Returns None if no samples available.
         """
-        samples = self._peer_gate_latency_samples.get(gate_id)
-        if not samples:
-            return None
-        return sum(lat for _, lat in samples) / len(samples)
+        return self._peer_gate_latency_tracker.get_peer_latency(gate_id)
 
     async def _handle_xack_response(
         self,
