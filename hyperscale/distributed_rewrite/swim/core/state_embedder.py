@@ -27,6 +27,9 @@ from hyperscale.distributed_rewrite.models.coordinates import NetworkCoordinate
 from hyperscale.distributed_rewrite.health.tracker import HealthPiggyback
 from typing import cast
 
+# Maximum size for probe RTT cache to prevent unbounded memory growth
+_PROBE_RTT_CACHE_MAX_SIZE = 100
+
 
 class StateEmbedder(Protocol):
     """
@@ -246,6 +249,11 @@ class WorkerStateEmbedder:
         )
 
     def record_probe_rtt(self, source_addr: tuple[str, int], rtt_ms: float) -> None:
+        # Enforce max cache size to prevent unbounded memory growth
+        if len(self._probe_rtt_cache) >= _PROBE_RTT_CACHE_MAX_SIZE:
+            # Remove oldest entry (first key in dict)
+            oldest_key = next(iter(self._probe_rtt_cache))
+            del self._probe_rtt_cache[oldest_key]
         self._probe_rtt_cache[source_addr] = rtt_ms
 
 
@@ -390,22 +398,24 @@ class ManagerStateEmbedder:
         except Exception:
             return  # Invalid data
 
-        # Dispatch based on actual type
+        manager_handler = self.on_manager_heartbeat
+        gate_handler = self.on_gate_heartbeat
+
         if isinstance(obj, WorkerHeartbeat):
-            self.on_manager_heartbeat(obj, source_addr)
+            self.on_worker_heartbeat(obj, source_addr)
             if self.on_peer_coordinate and obj.coordinate:
                 rtt_ms = self._probe_rtt_cache.pop(source_addr, None)
                 if rtt_ms is not None:
                     self.on_peer_coordinate(obj.node_id, obj.coordinate, rtt_ms)
-        elif isinstance(obj, ManagerHeartbeat) and self.on_manager_heartbeat:
+        elif isinstance(obj, ManagerHeartbeat) and manager_handler:
             if obj.node_id != self.get_node_id():
-                self.on_manager_heartbeat(obj, source_addr)
+                manager_handler(obj, source_addr)
                 if self.on_peer_coordinate and obj.coordinate:
                     rtt_ms = self._probe_rtt_cache.pop(source_addr, None)
                     if rtt_ms is not None:
                         self.on_peer_coordinate(obj.node_id, obj.coordinate, rtt_ms)
-        elif isinstance(obj, GateHeartbeat) and self.on_gate_heartbeat:
-            self.on_gate_heartbeat(obj, source_addr)
+        elif isinstance(obj, GateHeartbeat) and gate_handler:
+            gate_handler(obj, source_addr)
             if self.on_peer_coordinate and obj.coordinate:
                 rtt_ms = self._probe_rtt_cache.pop(source_addr, None)
                 if rtt_ms is not None:
@@ -439,6 +449,11 @@ class ManagerStateEmbedder:
         )
 
     def record_probe_rtt(self, source_addr: tuple[str, int], rtt_ms: float) -> None:
+        # Enforce max cache size to prevent unbounded memory growth
+        if len(self._probe_rtt_cache) >= _PROBE_RTT_CACHE_MAX_SIZE:
+            # Remove oldest entry (first key in dict)
+            oldest_key = next(iter(self._probe_rtt_cache))
+            del self._probe_rtt_cache[oldest_key]
         self._probe_rtt_cache[source_addr] = rtt_ms
 
 
@@ -490,6 +505,11 @@ class GateStateEmbedder:
     # Optional fields (with defaults)
     get_tcp_host: Callable[[], str] | None = None
     get_tcp_port: Callable[[], int] | None = None
+    get_coordinate: Callable[[], NetworkCoordinate | None] | None = None
+    on_peer_coordinate: Callable[[str, NetworkCoordinate, float], None] | None = None
+    _probe_rtt_cache: dict[tuple[str, int], float] = field(
+        default_factory=dict, init=False, repr=False
+    )
     on_gate_heartbeat: Callable[[Any, tuple[str, int]], None] | None = None
     # Piggybacking callbacks for discovery
     get_known_managers: (
@@ -540,6 +560,7 @@ class GateStateEmbedder:
             manager_count=self.get_manager_count(),
             tcp_host=self.get_tcp_host() if self.get_tcp_host else "",
             tcp_port=self.get_tcp_port() if self.get_tcp_port else 0,
+            coordinate=self.get_coordinate() if self.get_coordinate else None,
             known_managers=known_managers,
             known_gates=known_gates,
             # Job leadership piggybacking (Serf-style like managers)
@@ -579,13 +600,21 @@ class GateStateEmbedder:
         except Exception as e:
             return  # Invalid data
 
-        # Dispatch based on actual type
+        handler = self.on_gate_heartbeat
+
         if isinstance(obj, ManagerHeartbeat):
             self.on_manager_heartbeat(obj, source_addr)
-        elif isinstance(obj, GateHeartbeat) and self.on_gate_heartbeat:
-            # Don't process our own heartbeat
+            if self.on_peer_coordinate and obj.coordinate:
+                rtt_ms = self._probe_rtt_cache.pop(source_addr, None)
+                if rtt_ms is not None:
+                    self.on_peer_coordinate(obj.node_id, obj.coordinate, rtt_ms)
+        elif isinstance(obj, GateHeartbeat) and handler:
             if obj.node_id != self.get_node_id():
-                self.on_gate_heartbeat(obj, source_addr)
+                handler(obj, source_addr)
+                if self.on_peer_coordinate and obj.coordinate:
+                    rtt_ms = self._probe_rtt_cache.pop(source_addr, None)
+                    if rtt_ms is not None:
+                        self.on_peer_coordinate(obj.node_id, obj.coordinate, rtt_ms)
 
     def get_health_piggyback(self) -> HealthPiggyback | None:
         """
@@ -620,3 +649,11 @@ class GateStateEmbedder:
             else "healthy",
             timestamp=time.monotonic(),
         )
+
+    def record_probe_rtt(self, source_addr: tuple[str, int], rtt_ms: float) -> None:
+        # Enforce max cache size to prevent unbounded memory growth
+        if len(self._probe_rtt_cache) >= _PROBE_RTT_CACHE_MAX_SIZE:
+            # Remove oldest entry (first key in dict)
+            oldest_key = next(iter(self._probe_rtt_cache))
+            del self._probe_rtt_cache[oldest_key]
+        self._probe_rtt_cache[source_addr] = rtt_ms
