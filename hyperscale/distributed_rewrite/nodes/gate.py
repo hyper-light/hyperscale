@@ -31,6 +31,7 @@ from typing import Any
 import cloudpickle
 
 from hyperscale.distributed_rewrite.server import tcp, udp
+from hyperscale.distributed_rewrite.server.protocol.utils import get_peer_certificate_der
 from hyperscale.distributed_rewrite.leases import JobLease, LeaseManager as JobLeaseManager
 from hyperscale.reporting.results import Results
 from hyperscale.reporting.reporter import Reporter
@@ -4059,6 +4060,7 @@ class GateServer(HealthAwareServer):
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
+        transport: asyncio.Transport,
     ):
         """
         Handle manager status update via TCP.
@@ -4092,13 +4094,14 @@ class GateServer(HealthAwareServer):
         except Exception as e:
             await self.handle_exception(e, "manager_status_update")
             return b'error'
-    
+
     @tcp.receive()
     async def manager_register(
         self,
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
+        transport: asyncio.Transport,
     ):
         """
         Handle manager registration.
@@ -4294,10 +4297,11 @@ class GateServer(HealthAwareServer):
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
+        transport: asyncio.Transport,
     ):
         """
         Handle manager discovery broadcast from a peer gate.
-        
+
         When another gate receives a manager registration, it broadcasts
         to all peers. This handler adds the manager to our tracking and
         updates datacenter status from the included manager heartbeat info.
@@ -4386,6 +4390,7 @@ class GateServer(HealthAwareServer):
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
+        transport: asyncio.Transport,
     ):
         """Handle job submission from client.
 
@@ -4758,6 +4763,7 @@ class GateServer(HealthAwareServer):
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
+        transport: asyncio.Transport,
     ):
         """Handle job status request from client."""
         start_time = time.monotonic()
@@ -4785,17 +4791,18 @@ class GateServer(HealthAwareServer):
         finally:
             latency_ms = (time.monotonic() - start_time) * 1000
             self._record_request_latency(latency_ms)
-    
+
     # =========================================================================
     # TCP Handlers - Job Progress (from Manager)
     # =========================================================================
-    
+
     @tcp.receive()
     async def receive_job_progress(
         self,
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
+        transport: asyncio.Transport,
     ):
         """
         Handle job progress update from manager.
@@ -4968,6 +4975,7 @@ class GateServer(HealthAwareServer):
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
+        transport: asyncio.Transport,
     ):
         """
         Handle job cancellation from client (AD-20).
@@ -5113,6 +5121,7 @@ class GateServer(HealthAwareServer):
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
+        transport: asyncio.Transport,
     ) -> bytes:
         """
         Handle job cancellation completion push from manager (AD-20).
@@ -5196,6 +5205,7 @@ class GateServer(HealthAwareServer):
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
+        transport: asyncio.Transport,
     ) -> bytes:
         """
         Handle single workflow cancellation request from client (Section 6).
@@ -5336,11 +5346,12 @@ class GateServer(HealthAwareServer):
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
+        transport: asyncio.Transport,
     ):
         """Handle lease transfer during gate scaling."""
         try:
             transfer = LeaseTransfer.load(data)
-            
+
             # Accept the lease
             lease = DatacenterLease(
                 job_id=transfer.job_id,
@@ -5352,9 +5363,9 @@ class GateServer(HealthAwareServer):
             )
             self._leases[f"{transfer.job_id}:{transfer.datacenter}"] = lease
             self._increment_version()
-            
+
             return b'ok'
-            
+
         except Exception as e:
             await self.handle_exception(e, "receive_lease_transfer")
             return b'error'
@@ -5389,6 +5400,7 @@ class GateServer(HealthAwareServer):
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
+        transport: asyncio.Transport,
     ):
         """
         Handle state sync request from another gate (usually new leader).
@@ -5415,17 +5427,18 @@ class GateServer(HealthAwareServer):
         except Exception as e:
             await self.handle_exception(e, "receive_gate_state_sync_request")
             return b''
-    
+
     # =========================================================================
     # Job Final Result Handling (Manager -> Gate -> Client)
     # =========================================================================
-    
+
     @tcp.receive()
     async def job_final_result(
         self,
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
+        transport: asyncio.Transport,
     ):
         """
         Handle final result from a manager for a datacenter.
@@ -5510,6 +5523,7 @@ class GateServer(HealthAwareServer):
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
+        transport: asyncio.Transport,
     ):
         """
         Handle workflow result push from manager.
@@ -6256,6 +6270,7 @@ class GateServer(HealthAwareServer):
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
+        transport: asyncio.Transport,
     ):
         """
         Handle ping request from client.
@@ -6326,6 +6341,7 @@ class GateServer(HealthAwareServer):
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
+        transport: asyncio.Transport,
     ):
         """
         Handle client callback registration for job reconnection.
@@ -6399,6 +6415,7 @@ class GateServer(HealthAwareServer):
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
+        transport: asyncio.Transport,
     ):
         """
         Handle workflow status query from client.
@@ -6514,6 +6531,7 @@ class GateServer(HealthAwareServer):
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
+        transport: asyncio.Transport,
     ):
         """
         Handle datacenter list request from client.
@@ -6583,6 +6601,7 @@ class GateServer(HealthAwareServer):
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
+        transport: asyncio.Transport,
     ):
         """
         Handle job leadership announcement from peer gate.
@@ -6636,6 +6655,7 @@ class GateServer(HealthAwareServer):
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
+        transport: asyncio.Transport,
     ):
         """
         Handle DC leader announcement from peer gate.
@@ -6682,6 +6702,7 @@ class GateServer(HealthAwareServer):
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
+        transport: asyncio.Transport,
     ):
         """
         Handle job leadership manager transfer notification from manager (AD-31).
@@ -6793,6 +6814,7 @@ class GateServer(HealthAwareServer):
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
+        transport: asyncio.Transport,
     ):
         """
         Handle windowed stats push from Manager.

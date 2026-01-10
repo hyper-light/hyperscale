@@ -76,6 +76,7 @@ Handler = Callable[
         tuple[str, int],
         bytes | msgspec.Struct,
         int,
+        asyncio.Transport,  # AD-28: Transport for certificate extraction
     ],
     Awaitable[
         tuple[bytes, msgspec.Struct | bytes],
@@ -1348,6 +1349,7 @@ class MercurySyncBaseServer(Generic[T]):
                 addr,
                 payload,
                 clock_time,
+                transport,  # AD-28: Pass transport for certificate extraction
             )
 
             if isinstance(response, Message):

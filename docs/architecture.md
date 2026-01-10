@@ -19480,6 +19480,144 @@ Inspired by:
 
 ---
 
+## Part 5: Confidence-Aware RTT Estimation (Routing-Safe)
+
+Vivaldi estimates must be used **conservatively** for routing and failure detection. The robust approach is to use an
+**upper-confidence-bound (UCB)** RTT that incorporates coordinate error and staleness.
+
+### Coordinate Quality
+
+```python
+def coordinate_quality(sample_count: int, error_ms: float, staleness_s: float) -> float:
+    sample_quality = min(1.0, sample_count / MIN_SAMPLES_FOR_ROUTING)
+    error_quality = min(1.0, ERROR_GOOD_MS / max(error_ms, 1.0))
+    staleness_quality = 1.0 if staleness_s <= COORD_TTL_S else COORD_TTL_S / staleness_s
+    return max(0.0, min(1.0, sample_quality * error_quality * staleness_quality))
+```
+
+### RTT UCB Formula
+
+```python
+def estimate_rtt_ucb_ms(local, remote) -> float:
+    if local is None or remote is None:
+        rtt_hat_ms = RTT_DEFAULT_MS
+        sigma_ms = SIGMA_DEFAULT_MS
+    else:
+        rtt_hat_ms = vivaldi_distance(local, remote)
+        sigma_ms = clamp(local.error_ms + remote.error_ms, SIGMA_MIN_MS, SIGMA_MAX_MS)
+
+    return clamp(rtt_hat_ms + K_SIGMA * sigma_ms, RTT_MIN_MS, RTT_MAX_MS)
+```
+
+**Robustness rules**:
+- Missing or low-quality coordinates **never exclude** a peer/DC.
+- Use conservative defaults until coordinates converge.
+- Always cap RTT estimates to avoid score blowups.
+
+---
+
+## Part 6: Timing Diagram (Ping/Ack, Confirmation, and Cleanup)
+
+```
+Time →
+
+Gate                     Manager
+ |---- gossip --------->|  (UNCONFIRMED)
+ |---- ping + coord ---->|
+ |<--- ack + coord + RTT |
+ |  update coord         |
+ |  confirm peer         |
+ |  cancel timeout       |
+ |                       |
+ |---- periodic ping ---->|
+ |<--- ack --------------|
+ |  adaptive timeout      |
+ |  suspicion timer tuned |
+
+Unconfirmed path:
+ |---- gossip --------->|  (UNCONFIRMED)
+ |---- ping + coord ---->|
+ |  (no ack)             |
+ |---- retry (role-based)|
+ |  (no ack)             |
+ |-- timeout expires --> remove from membership
+```
+
+---
+
+## Part 7: AD-17/AD-36 Integration Invariants
+
+The AD-17 fallback chain is the safety backbone. Vivaldi inputs must **never override** the health buckets.
+
+**Invariant rules**:
+1. **Bucket-first ordering**: HEALTHY > BUSY > DEGRADED (UNHEALTHY excluded)
+2. **Vivaldi only ranks within a chosen bucket**
+3. **Confidence-aware RTT** is used for ranking and timeouts (UCB)
+4. **Hysteresis** required to prevent routing churn (see AD-36)
+
+---
+
+## Part 8: Routing-Safe Inputs and Defaults
+
+**Inputs used by AD-35/AD-36**:
+- Vivaldi coordinate: position, height, error, sample_count, updated_at
+- LHM load multiplier and recent probe health
+- Peer role (Gate/Manager/Worker)
+- Coordinate staleness (seconds since update)
+
+**Defaults when missing**:
+- RTT defaults to conservative `RTT_DEFAULT_MS`
+- Error defaults to `SIGMA_DEFAULT_MS`
+- Quality defaults to 0 (no penalty removal until samples arrive)
+
+---
+
+## Part 9: Hysteresis and Coordinate Quality Gates
+
+To avoid routing churn and false positives, the system must:
+
+- Enter **Coordinate-Unaware Mode** if local coordinate quality is below thresholds
+- Apply **hold-down** windows for routing decisions
+- Require **minimum improvement** before switching primary DCs
+- Use **cooldowns** after dispatch failure to a DC
+
+These mechanisms are mandatory for robustness under high load and WAN variability.
+
+---
+
+## Part 10: Failure-Detection Timing Diagram (Role-Aware)
+
+```
+Time →
+
+Gate (role-aware)          Manager (role-aware)
+ |-- ping (coord) -------->|
+ |<-- ack (coord + RTT) ----|
+ |-- adaptive timeout ------|
+ |-- proactive confirm (N) ->|
+ |-- role-aware cleanup -----|
+```
+
+Workers skip proactive confirmation and rely on passive timeouts only.
+
+---
+
+## Part 11: Observability
+
+**Metrics**:
+- `vivaldi_coord_quality{peer}`
+- `vivaldi_rtt_ucb_ms{peer}`
+- `peer_confirmation_attempts_total{role}`
+- `unconfirmed_cleanup_total{role,reason}`
+- `adaptive_timeout_seconds{role}`
+
+**Logs**:
+- `RoleConfirmationAttempt` with role, attempts, outcome
+- `PeerConfirmed` with RTT, error, samples
+- `PeerUnconfirmedCleanup` with reason and elapsed
+
+---
+
 ## Part 12: Alternatives Considered
 
 ### Alternative 1: Static Per-Datacenter Timeouts
@@ -19573,7 +19711,7 @@ This architecture provides the foundation for globally-distributed, multi-tier f
 
 ## Problem Statement
 
-Gates need to route jobs to the optimal datacenter based on multiple criteria:
+Gates need to route jobs to the optimal datacenter while respecting safety and stability constraints:
 
 ### Current Challenges
 
@@ -19601,360 +19739,227 @@ Gates need to route jobs to the optimal datacenter based on multiple criteria:
 
 ## Solution: Vivaldi-Based Multi-Factor Routing
 
-Use Vivaldi network coordinates (from AD-35) combined with datacenter health and load metrics to make intelligent routing decisions.
+AD-36 extends AD-17 by using AD-35's confidence-aware RTT estimation to rank candidates **within** health buckets.
+This keeps safety monotonic while improving latency and load efficiency.
 
-### Core Algorithm
+### Design Goals
+
+1. **Monotonic safety**: Never route to a worse health bucket because it is closer
+2. **Confidence-aware latency**: Use RTT UCB, not raw RTT
+3. **Graceful bootstrapping**: Missing coordinates never exclude a DC
+4. **Low churn**: Hysteresis prevents routing oscillations
+5. **Deterministic fallback**: Clear, ordered fallback chain
+
+---
+
+## Part 1: Routing Inputs
+
+**Per-datacenter inputs**:
+- Health bucket: HEALTHY / BUSY / DEGRADED (AD-16)
+- Capacity: available_cores, total_cores
+- Load signals: queue_depth, LHM multiplier, circuit-breaker pressure
+- Vivaldi: leader coordinate, error, sample_count, updated_at
+
+**Per-manager inputs** (within a DC):
+- Circuit state (OPEN/HALF/closed)
+- Manager health and capacity
+- Vivaldi RTT to manager
+
+---
+
+## Part 2: Candidate Filtering
+
+**DC hard excludes**:
+- `UNHEALTHY` status
+- No registered managers
+- All managers circuit-open
+
+**DC soft demotions**:
+- Stale health → treat as DEGRADED (do not exclude)
+- Missing coordinates → keep, but apply conservative RTT defaults
+
+**Manager hard excludes**:
+- Circuit breaker OPEN
+- Heartbeat stale beyond TTL
+
+---
+
+## Part 3: Bucket Selection (AD-17 Preserved)
+
+```
+primary_bucket = first_non_empty([HEALTHY, BUSY, DEGRADED])
+```
+
+- Only candidates in `primary_bucket` are eligible for primary selection.
+- Lower buckets are **fallback only**.
+- Health ordering is never violated by RTT scoring.
+
+---
+
+## Part 4: Authoritative Scoring Function
+
+### Step 1: RTT UCB (from AD-35)
+
+```
+rtt_ucb_ms = estimate_rtt_ucb_ms(local_coord, dc_leader_coord)
+```
+
+### Step 2: Load Factor (monotonic, capped)
 
 ```python
-class GateJobRouter:
-    """
-    Routes jobs to optimal datacenter using Vivaldi coordinates.
+util = 1.0 - clamp01(available_cores / max(total_cores, 1))
+queue = queue_depth / (queue_depth + QUEUE_SMOOTHING)
+cb = open_managers / max(total_managers, 1)
 
-    Balances three factors:
-    1. Network proximity (Vivaldi RTT estimate)
-    2. Datacenter health (from AD-33 FederatedHealthMonitor)
-    3. Datacenter load (from LHM and capacity metrics)
-    """
+load_factor = 1.0 + A_UTIL * util + A_QUEUE * queue + A_CB * cb
+load_factor = min(load_factor, LOAD_FACTOR_MAX)
+```
 
-    def select_datacenter_for_job(
-        self,
-        job_id: str,
-        job_requirements: JobRequirements,
-    ) -> str | None:
-        """
-        Select optimal datacenter for job execution.
+### Step 3: Coordinate Quality Penalty
 
-        Returns datacenter name, or None if no suitable datacenter available.
-        """
-        candidates: list[tuple[str, float]] = []
+```python
+quality = coordinate_quality(sample_count, error_ms, staleness_s)
+quality_penalty = 1.0 + A_QUALITY * (1.0 - quality)
+quality_penalty = min(quality_penalty, QUALITY_PENALTY_MAX)
+```
 
-        for dc_name in self.get_known_datacenters():
-            # Filter unhealthy/unreachable datacenters
-            dc_health = self.get_datacenter_health(dc_name)
-            if dc_health.status in ["UNREACHABLE", "DEAD"]:
-                continue
+### Final Score
 
-            # Get DC leader address for RTT estimation
-            dc_leader_addr = self.get_datacenter_leader_address(dc_name)
-            if dc_leader_addr is None:
-                continue
+```python
+score = rtt_ucb_ms * load_factor * quality_penalty
+```
 
-            # Estimate network RTT using Vivaldi coordinates
-            estimated_rtt_ms = self.vivaldi.estimate_rtt(dc_leader_addr)
-            if estimated_rtt_ms is None:
-                # No coordinate data yet - use conservative estimate
-                estimated_rtt_ms = 500.0  # Assume intercontinental
+**Preferred DCs** (if provided) apply a bounded multiplier **within the primary bucket only**:
 
-            # Get datacenter load metrics
-            dc_load = self.get_datacenter_load(dc_name)
-
-            # Calculate composite score (lower is better)
-            score = self._calculate_routing_score(
-                rtt_ms=estimated_rtt_ms,
-                health=dc_health,
-                load=dc_load,
-                requirements=job_requirements,
-            )
-
-            candidates.append((dc_name, score))
-
-        if not candidates:
-            return None
-
-        # Sort by score (lower is better) and select best
-        candidates.sort(key=lambda x: x[1])
-        best_datacenter, best_score = candidates[0]
-
-        # Log routing decision for observability
-        self._log_routing_decision(
-            job_id=job_id,
-            selected_dc=best_datacenter,
-            score=best_score,
-            candidates=candidates,
-        )
-
-        return best_datacenter
-
-    def _calculate_routing_score(
-        self,
-        rtt_ms: float,
-        health: DatacenterHealth,
-        load: DatacenterLoad,
-        requirements: JobRequirements,
-    ) -> float:
-        """
-        Calculate composite routing score balancing latency, health, and load.
-
-        Score components:
-        - Latency score: Based on Vivaldi RTT estimate
-        - Health score: Based on datacenter health classification (AD-16)
-        - Load score: Based on available capacity and current utilization
-
-        Lower score is better.
-        """
-        # 1. Latency score (normalized to 0-100)
-        # Reference: 10ms = excellent, 500ms = poor
-        latency_score = min(100.0, (rtt_ms / 5.0))
-
-        # 2. Health score (0-100)
-        health_score = self._health_to_score(health)
-
-        # 3. Load score (0-100)
-        # Based on available cores vs. required cores
-        required_cores = requirements.cores_needed
-        available_cores = load.available_cores
-
-        if available_cores < required_cores:
-            # Insufficient capacity - heavily penalize
-            load_score = 200.0
-        else:
-            # Score based on utilization
-            utilization = 1.0 - (available_cores / load.total_cores)
-            load_score = utilization * 100.0
-
-        # 4. Weighted composite score
-        # Weights can be tuned based on deployment priorities
-        weights = self._get_routing_weights(requirements)
-
-        composite_score = (
-            weights.latency * latency_score +
-            weights.health * health_score +
-            weights.load * load_score
-        )
-
-        return composite_score
-
-    def _health_to_score(self, health: DatacenterHealth) -> float:
-        """
-        Convert datacenter health to a score (0-100, lower is better).
-
-        Maps health status from AD-16 classification:
-        - HEALTHY: 0 (best)
-        - DEGRADED: 30
-        - BUSY: 50
-        - UNHEALTHY: 80
-        - UNREACHABLE/DEAD: filtered out before scoring
-        """
-        health_map = {
-            "HEALTHY": 0.0,
-            "DEGRADED": 30.0,
-            "BUSY": 50.0,
-            "UNHEALTHY": 80.0,
-        }
-        return health_map.get(health.status, 100.0)
-
-    def _get_routing_weights(
-        self,
-        requirements: JobRequirements,
-    ) -> RoutingWeights:
-        """
-        Get routing weights based on job requirements.
-
-        Different job types may prioritize different factors:
-        - Latency-sensitive jobs: Higher latency weight
-        - Large batch jobs: Higher load weight (prefer less-utilized DCs)
-        - Critical jobs: Higher health weight
-        """
-        if requirements.latency_sensitive:
-            return RoutingWeights(latency=0.6, health=0.2, load=0.2)
-        elif requirements.batch_job:
-            return RoutingWeights(latency=0.2, health=0.2, load=0.6)
-        else:
-            # Balanced default
-            return RoutingWeights(latency=0.4, health=0.3, load=0.3)
+```python
+if dc in preferred:
+    score *= PREFERENCE_MULT
 ```
 
 ---
 
-## Part 1: Routing Decision Flow
+## Part 5: Hysteresis and Stickiness
+
+Routing decisions must be stable to avoid oscillation:
+
+1. **Hold-down**: keep current primary for `HOLD_DOWN_S` unless it becomes excluded
+2. **Switch threshold**: only switch if new best improves by `IMPROVEMENT_RATIO`
+3. **Forced switch** if:
+   - current DC drops bucket
+   - current DC is excluded
+   - score degrades by `DEGRADE_RATIO` for `DEGRADE_CONFIRM_S`
+4. **Cooldown after failover**: add a temporary penalty to recently failed DCs
+
+### State Diagram
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         Gate Receives Job                               │
-│                      (Client submits job)                               │
-└─────────────────────────────┬───────────────────────────────────────────┘
-                              ↓
-                    ┌──────────────────────┐
-                    │ GateJobRouter        │
-                    │ .select_datacenter() │
-                    └──────���──┬────────────┘
-                              ↓
-          ┌───────────────────┴────────────────────┐
-          │  For each known datacenter:            │
-          │                                        │
-          │  1. Check health status (AD-33)        │
-          │     └─> Filter UNREACHABLE/DEAD        │
-          │                                        │
-          │  2. Estimate RTT (Vivaldi from AD-35)  │
-          │     └─> Latency score                  │
-          │                                        │
-          │  3. Get load metrics (LHM + capacity)  │
-          │     └─> Load score                     │
-          │                                        │
-          │  4. Calculate composite score          │
-          │     └─> score = weighted(latency,      │
-          │                         health,        │
-          │                         load)          │
-          └───────────────────┬────────────────────┘
-                              ↓
-                    ┌─────────────────┐
-                    │ Sort by score   │
-                    │ (lower = better)│
-                    └────────┬────────┘
-                              ↓
-                    ┌─────────────────┐
-                    │ Select best DC  │
-                    └────────┬────────┘
-                              ↓
-          ┌───────────────────┴────────────────────┐
-          │                                        │
-          ▼                                        ▼
-     [Route job to DC]                    [Log routing decision]
+[Selected]
+   │ hold-down
+   │
+   ├─(forced switch)───────────────► [Switch]
+   │                                  │
+   ├─(improvement >= threshold)────► [Switch]
+   │                                  │
+   └─(no change)────────────────────► [Selected]
+
+[Switch] ──► [Cooldown] ──(cooldown expires)──► [Selected]
 ```
 
 ---
 
-## Part 2: Routing Decision Examples
+## Part 6: Bootstrapping and Convergence
 
-### Example 1: Latency-Optimized Routing
+When coordinates are missing or immature:
 
-**Scenario**: User submits latency-sensitive job from US-East
+- Enter **Coordinate-Unaware Mode**
+- Rank by capacity, then queue depth, then circuit pressure
+- Exit when:
+  - `sample_count >= MIN_SAMPLES_FOR_ROUTING` and
+  - `error_ms <= ERROR_MAX_FOR_ROUTING`
 
-**Datacenter State**:
-```
-DC-East:    RTT=5ms,   Health=HEALTHY,  Load=60%,  Available=400 cores
-DC-West:    RTT=50ms,  Health=HEALTHY,  Load=30%,  Available=700 cores
-DC-Europe:  RTT=100ms, Health=DEGRADED, Load=20%,  Available=800 cores
-DC-Asia:    RTT=200ms, Health=HEALTHY,  Load=10%,  Available=900 cores
-```
-
-**Scoring** (weights: latency=0.6, health=0.2, load=0.2):
-```
-DC-East:   (0.6 × 1.0)  + (0.2 × 0)   + (0.2 × 60)  = 0.6 + 0 + 12  = 12.6  ← Best
-DC-West:   (0.6 × 10.0) + (0.2 × 0)   + (0.2 × 30)  = 6.0 + 0 + 6   = 12.0
-DC-Europe: (0.6 × 20.0) + (0.2 × 30)  + (0.2 × 20)  = 12 + 6 + 4    = 22.0
-DC-Asia:   (0.6 × 40.0) + (0.2 × 0)   + (0.2 × 10)  = 24 + 0 + 2    = 26.0
-```
-
-**Result**: Route to **DC-East** (closest, despite higher load)
+This prevents early-stage noise from destabilizing routing.
 
 ---
 
-### Example 2: Load-Balanced Routing
+## Part 7: Fallback Chain Construction
 
-**Scenario**: User submits large batch job (not latency-sensitive)
+1. Select `primary_dcs` from `primary_bucket` in score order (with hysteresis)
+2. Add remaining DCs from `primary_bucket` as fallback
+3. Append next buckets in order (BUSY, then DEGRADED), each sorted by score
 
-**Datacenter State**:
-```
-DC-East:    RTT=5ms,   Health=BUSY,     Load=90%,  Available=100 cores
-DC-West:    RTT=50ms,  Health=HEALTHY,  Load=30%,  Available=700 cores
-DC-Europe:  RTT=100ms, Health=HEALTHY,  Load=20%,  Available=800 cores
-```
-
-**Scoring** (weights: latency=0.2, health=0.2, load=0.6):
-```
-DC-East:   (0.2 × 1.0)  + (0.2 × 50)  + (0.6 × 90)  = 0.2 + 10 + 54  = 64.2
-DC-West:   (0.2 × 10.0) + (0.2 × 0)   + (0.6 × 30)  = 2.0 + 0 + 18   = 20.0  ← Best
-DC-Europe: (0.2 × 20.0) + (0.2 × 0)   + (0.6 × 20)  = 4.0 + 0 + 12   = 16.0  ← Close
-```
-
-**Result**: Route to **DC-West** (good balance of latency and available capacity)
+This yields a deterministic fallback chain that preserves AD-17 semantics.
 
 ---
 
-### Example 3: Failover Routing
+## Part 8: Manager Selection Within a Datacenter
 
-**Scenario**: Primary datacenter becomes unhealthy
+Managers are ranked similarly (within a DC):
 
-**Datacenter State**:
-```
-DC-East:    RTT=5ms,   Health=UNHEALTHY, Load=95%,  Available=50 cores
-DC-West:    RTT=50ms,  Health=HEALTHY,   Load=40%,  Available=600 cores
-DC-Europe:  RTT=100ms, Health=HEALTHY,   Load=35%,  Available=650 cores
-```
-
-**Scoring** (weights: latency=0.4, health=0.3, load=0.3):
-```
-DC-East:   (0.4 × 1.0)  + (0.3 × 80)  + (0.3 × 95)  = 0.4 + 24 + 28.5 = 52.9
-DC-West:   (0.4 × 10.0) + (0.3 × 0)   + (0.3 × 40)  = 4.0 + 0 + 12    = 16.0  ← Best
-DC-Europe: (0.4 × 20.0) + (0.3 × 0)   + (0.3 × 35)  = 8.0 + 0 + 10.5  = 18.5
-```
-
-**Result**: Route to **DC-West** (avoid unhealthy DC-East, prefer closer of two healthy options)
+- Exclude circuit-open or stale managers
+- Score by RTT UCB + manager load + quality penalty
+- Apply per-job stickiness: reuse the manager that already accepted the job in this DC
 
 ---
 
-## Part 3: Benefits
+## Part 9: Routing Decision Flow
 
-### 1. **Automatic Latency Optimization**
-- ✅ Routes to closest datacenter automatically (no manual configuration)
-- ✅ Adapts to network topology changes (Vivaldi learns actual paths)
-- ✅ 3-10x latency reduction compared to random/round-robin routing
-
-**Example**: User in London submits job:
-- Before: Random routing → 50% chance of US datacenter (120ms RTT)
-- After: Vivaldi routing → Always routes to EU datacenter (15ms RTT)
-
-### 2. **Intelligent Load Balancing**
-- ✅ Automatically spreads load across underutilized datacenters
-- ✅ Prevents hot-spots and overload scenarios
-- ✅ Maximizes global throughput
-
-**Example**: DC-East at 90% load, DC-West at 30% load:
-- Before: Static priority → All jobs to DC-East (overload, job queuing)
-- After: Load-aware routing → New jobs to DC-West (better performance)
-
-### 3. **Automatic Failover**
-- ✅ Detects unhealthy datacenters via AD-33
-- ✅ Automatically routes around failures
-- ✅ No manual intervention required
-
-**Example**: DC-East becomes UNHEALTHY:
-- Before: Manual config update required, jobs fail during outage
-- After: Automatic routing to DC-West within 1 probe cycle (~3 seconds)
-
-### 4. **Multi-Factor Optimization**
-- ✅ Balances latency, health, and load simultaneously
-- ✅ Tunable per job type (latency-sensitive vs. batch)
-- ✅ Adaptive to changing conditions
-
-### 5. **Zero Configuration**
-- ✅ No manual datacenter priority lists
-- ✅ No static routing tables
-- ✅ Self-learning via Vivaldi coordinates
+```
+┌──────────────────────────────────────────────────────────────┐
+│ Gate receives job                                            │
+├──────────────────────────────────────────────────────────────┤
+│ 1) Filter DCs (exclude UNHEALTHY)                            │
+│ 2) Bucket by health (AD-17)                                  │
+│ 3) Score within primary bucket (RTT UCB × load × quality)    │
+│ 4) Apply hysteresis/stickiness                               │
+│ 5) Select primary_dcs and fallback_dcs                        │
+└──────────────────────────────────────────────────────────────┘
+```
 
 ---
 
-## Part 4: Success Criteria
+## Part 10: Timing Diagram (Dispatch + Fallback)
 
-1. ✅ **Latency Reduction**
-   - Measured: Average job RTT to assigned datacenter
-   - Target: 50% reduction compared to random routing
+```
+Time →
 
-2. ✅ **Load Distribution**
-   - Measured: Coefficient of variation in datacenter load
-   - Target: <0.3 (even distribution)
+Gate               DC-A Manager          DC-B Manager
+ |-- dispatch A -->|
+ |<-- reject -------|
+ |-- fallback B ------------------------->|
+ |<-- accept --------------------------------|
+ |-- record leader ------------------------>|
+```
 
-3. ✅ **Failover Speed**
-   - Measured: Time from DC failure to routing around it
-   - Target: <10 seconds
+---
 
-4. ✅ **Routing Accuracy**
-   - Measured: % of jobs routed to best datacenter (offline analysis)
-   - Target: >90% optimal routing decisions
+## Part 11: Observability
 
-5. ✅ **Zero Configuration**
-   - Measured: No manual datacenter priority configuration required
-   - Target: 100% automatic routing
+**Metrics**:
+- `routing_decisions_total{bucket,reason}`
+- `routing_score{dc_id}`
+- `routing_score_component{dc_id,component="rtt_ucb|load|quality"}`
+- `routing_switch_total{reason}`
+- `routing_hold_down_blocks_total`
+- `routing_fallback_used_total{from_dc,to_dc}`
+
+**Logs**:
+- `RoutingDecision` with candidate list and score components
+- `RoutingSwitch` with old/new DC and improvement ratio
+- `RoutingCooldown` when a DC fails dispatch
+
+---
+
+## Part 12: Success Criteria
+
+1. **Latency Reduction**: 50% lower median RTT than random routing
+2. **Load Distribution**: load variation coefficient < 0.3
+3. **Failover Speed**: < 10 seconds from DC failure to routing around it
+4. **Stability**: switch rate < 1% of routing decisions
+5. **Zero Configuration**: no static priority lists required
 
 ---
 
 ## Conclusion
 
-**AD-36 leverages Vivaldi coordinates (AD-35)** for intelligent, automatic, multi-factor job routing across global datacenters.
-
-**Key Innovation**: Single coordinate system serves dual purpose:
-1. **AD-35**: Adaptive failure detection timeouts
-2. **AD-36**: Latency-aware job routing
-
-**Result**: Gates automatically route jobs to optimal datacenters balancing latency, health, and load—with zero manual configuration and automatic adaptation to changing conditions.
+AD-36 uses AD-35's conservative RTT UCB and AD-17's health ordering to route jobs safely and efficiently.
+The combination is robust against noisy coordinates, high load, and WAN variability, while avoiding routing churn.

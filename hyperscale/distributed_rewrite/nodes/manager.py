@@ -38,6 +38,7 @@ from hyperscale.core.state.context import Context
 from hyperscale.core.jobs.workers.stage_priority import StagePriority
 from hyperscale.core.hooks import HookType
 from hyperscale.distributed_rewrite.server import tcp, udp
+from hyperscale.distributed_rewrite.server.protocol.utils import get_peer_certificate_der
 from hyperscale.distributed_rewrite.server.events import VersionedStateClock
 from hyperscale.distributed_rewrite.swim import HealthAwareServer, ManagerStateEmbedder
 from hyperscale.distributed_rewrite.swim.health import (
@@ -4756,6 +4757,7 @@ class ManagerServer(HealthAwareServer):
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
+        transport: asyncio.Transport,
     ):
         """Handle worker registration via TCP."""
         try:
@@ -4804,8 +4806,80 @@ class ManagerServer(HealthAwareServer):
                 return response.dump()
 
             # Role-based mTLS validation (AD-28 Issue 1)
-            # TODO: Extract certificate from transport when handler signatures are updated
-            # For now, validate role expectations without certificate
+            # Extract certificate from transport for validation
+            cert_der = get_peer_certificate_der(transport)
+            if cert_der is not None:
+                # Certificate is available - validate claims
+                claims = RoleValidator.extract_claims_from_cert(
+                    cert_der,
+                    default_cluster=self._env.CLUSTER_ID,
+                    default_environment=self._env.ENVIRONMENT_ID,
+                )
+
+                # Validate claims against expected cluster/environment
+                validation_result = self._role_validator.validate_claims(claims)
+                if not validation_result.allowed:
+                    self._task_runner.run(
+                        self._udp_logger.log,
+                        ServerWarning(
+                            message=f"Worker {registration.node.node_id} rejected: certificate claims validation failed - {validation_result.reason}",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
+                    response = RegistrationResponse(
+                        accepted=False,
+                        manager_id=self._node_id.full,
+                        healthy_managers=[],
+                        error=f"Certificate claims validation failed: {validation_result.reason}",
+                        protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+                        protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+                    )
+                    return response.dump()
+
+                # Validate role matrix: Worker -> Manager must be allowed
+                if not self._role_validator.is_allowed(claims.role, SecurityNodeRole.MANAGER):
+                    self._task_runner.run(
+                        self._udp_logger.log,
+                        ServerWarning(
+                            message=f"Worker {registration.node.node_id} rejected: role-based access denied ({claims.role.value}->manager not allowed)",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
+                    response = RegistrationResponse(
+                        accepted=False,
+                        manager_id=self._node_id.full,
+                        healthy_managers=[],
+                        error=f"Role-based access denied: {claims.role.value} cannot register with managers",
+                        protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+                        protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+                    )
+                    return response.dump()
+            elif self._env.get("MTLS_STRICT_MODE", "false").lower() == "true":
+                # In strict mode, certificate is required
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerWarning(
+                        message=f"Worker {registration.node.node_id} rejected: mTLS strict mode requires certificate",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+                response = RegistrationResponse(
+                    accepted=False,
+                    manager_id=self._node_id.full,
+                    healthy_managers=[],
+                    error="mTLS strict mode requires client certificate",
+                    protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+                    protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+                )
+                return response.dump()
+
+            # Fallback role validation when no certificate is available (non-strict mode)
             # Expected flow: Worker (source) -> Manager (target)
             if not self._role_validator.is_allowed(SecurityNodeRole.WORKER, SecurityNodeRole.MANAGER):
                 self._task_runner.run(
@@ -4946,6 +5020,7 @@ class ManagerServer(HealthAwareServer):
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
+        transport: asyncio.Transport,
     ):
         """
         Handle gate registration via TCP.
@@ -5121,6 +5196,7 @@ class ManagerServer(HealthAwareServer):
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
+        transport: asyncio.Transport,
     ):
         """
         Handle registration from a peer manager.
@@ -5268,6 +5344,7 @@ class ManagerServer(HealthAwareServer):
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
+        transport: asyncio.Transport,
     ):
         """
         Handle worker discovery broadcast from a peer manager.
@@ -5327,6 +5404,7 @@ class ManagerServer(HealthAwareServer):
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
+        transport: asyncio.Transport,
     ):
         """
         Handle worker status update via TCP.
@@ -5360,6 +5438,7 @@ class ManagerServer(HealthAwareServer):
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
+        transport: asyncio.Transport,
     ):
         """
         Handle worker heartbeat via TCP.
@@ -5394,6 +5473,7 @@ class ManagerServer(HealthAwareServer):
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
+        transport: asyncio.Transport,
     ):
         """
         Handle workflow progress update from worker.
@@ -5916,6 +5996,7 @@ class ManagerServer(HealthAwareServer):
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
+        transport: asyncio.Transport,
     ):
         """
         Handle workflow final result from worker.
@@ -6917,16 +6998,17 @@ class ManagerServer(HealthAwareServer):
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
+        transport: asyncio.Transport,
     ):
         """
         Handle context forwarded from a non-leader manager.
-        
+
         Only the job leader should receive these messages. The leader applies
         the context updates using LWW conflict resolution.
         """
         try:
             forward = ContextForward.load(data)
-            
+
             # Verify we are the job leader
             if not self._is_job_leader(forward.job_id):
                 # We're not the leader - this shouldn't happen normally
@@ -7172,16 +7254,17 @@ class ManagerServer(HealthAwareServer):
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
+        transport: asyncio.Transport,
     ):
         """
         Handle context layer sync from job leader.
-        
+
         The job leader broadcasts this at layer completion to ensure all
         managers have the latest context before dependent workflows dispatch.
         """
         try:
             sync = ContextLayerSync.load(data)
-            
+
             # Check if this is a newer layer version
             current_version = self._job_layer_version.get(sync.job_id, -1)
             if sync.layer_version <= current_version:
@@ -9654,6 +9737,7 @@ class ManagerServer(HealthAwareServer):
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
+        transport: asyncio.Transport,
     ):
         """
         Handle job submission from gate or client.
@@ -9962,6 +10046,7 @@ class ManagerServer(HealthAwareServer):
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
+        transport: asyncio.Transport,
     ):
         """Handle provision request from leader for quorum."""
         try:
@@ -10003,6 +10088,7 @@ class ManagerServer(HealthAwareServer):
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
+        transport: asyncio.Transport,
     ):
         """Handle provision commit from leader."""
         try:
@@ -10047,6 +10133,7 @@ class ManagerServer(HealthAwareServer):
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
+        transport: asyncio.Transport,
     ):
         """Handle state sync request (when new leader needs current state).
 
@@ -10101,6 +10188,7 @@ class ManagerServer(HealthAwareServer):
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
+        transport: asyncio.Transport,
     ):
         """
         Handle job cancellation (from gate or client) (AD-20).
@@ -10299,6 +10387,7 @@ class ManagerServer(HealthAwareServer):
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
+        transport: asyncio.Transport,
     ):
         """
         Handle workflow cancellation query from a worker.
@@ -10374,6 +10463,7 @@ class ManagerServer(HealthAwareServer):
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
+        transport: asyncio.Transport,
     ) -> bytes:
         """
         Handle workflow cancellation completion push from worker (AD-20).
@@ -10448,6 +10538,7 @@ class ManagerServer(HealthAwareServer):
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
+        transport: asyncio.Transport,
     ) -> bytes:
         """
         Handle single workflow cancellation request (Section 6).
@@ -10667,6 +10758,7 @@ class ManagerServer(HealthAwareServer):
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
+        transport: asyncio.Transport,
     ) -> bytes:
         """
         Handle workflow cancellation peer notification (Section 6).
@@ -10811,6 +10903,7 @@ class ManagerServer(HealthAwareServer):
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
+        transport: asyncio.Transport,
     ):
         """
         Handle deadline extension request from worker (AD-26).
@@ -10967,6 +11060,7 @@ class ManagerServer(HealthAwareServer):
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
+        transport: asyncio.Transport,
     ):
         """
         Handle job leadership announcement from another manager.
@@ -10977,7 +11071,7 @@ class ManagerServer(HealthAwareServer):
         """
         try:
             announcement = JobLeadershipAnnouncement.load(data)
-        
+
             # Don't accept if we're already the leader for this job
             if self._is_job_leader(announcement.job_id):
                 ack = JobLeadershipAck(
@@ -11036,6 +11130,7 @@ class ManagerServer(HealthAwareServer):
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
+        transport: asyncio.Transport,
     ):
         """
         Handle job state sync from job leader.
@@ -11096,6 +11191,7 @@ class ManagerServer(HealthAwareServer):
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
+        transport: asyncio.Transport,
     ):
         """
         Handle job leader gate transfer notification from a gate.
@@ -11159,6 +11255,7 @@ class ManagerServer(HealthAwareServer):
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
+        transport: asyncio.Transport,
     ):
         """
         Handle ping request from client.
@@ -11241,6 +11338,7 @@ class ManagerServer(HealthAwareServer):
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
+        transport: asyncio.Transport,
     ):
         """
         Handle client callback registration for job reconnection.
@@ -11324,6 +11422,7 @@ class ManagerServer(HealthAwareServer):
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
+        transport: asyncio.Transport,
     ):
         """
         Handle workflow status query from client.

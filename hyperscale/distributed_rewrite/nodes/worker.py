@@ -46,6 +46,7 @@ from hyperscale.ui import InterfaceUpdatesController
 from hyperscale.core.monitoring import CPUMonitor, MemoryMonitor
 
 from hyperscale.distributed_rewrite.server import tcp
+from hyperscale.distributed_rewrite.server.protocol.utils import get_peer_certificate_der
 from hyperscale.distributed_rewrite.swim import HealthAwareServer, WorkerStateEmbedder
 from hyperscale.distributed_rewrite.swim.core import ErrorStats, CircuitState
 from hyperscale.distributed_rewrite.models import (
