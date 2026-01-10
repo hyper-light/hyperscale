@@ -7,7 +7,7 @@ This document tracks the remaining implementation work for AD-34, AD-35, AD-36, 
 **Implementation Status** (as of 2026-01-10):
 - **AD-34**: ✅ **100% COMPLETE** - All critical gaps fixed, fully functional for multi-DC deployments
 - **AD-35**: ✅ **100% COMPLETE** - Vivaldi coordinates, SWIM integration, UNCONFIRMED lifecycle, adaptive timeouts, role classification, role gossip, and RoleAwareConfirmationManager all implemented and integrated
-- **AD-36**: 65% COMPLETE - Full routing module implemented, needs gate.py integration
+- **AD-36**: ✅ **100% COMPLETE** - Full routing module implemented and integrated into gate.py
 - **AD-37**: ✅ **100% COMPLETE** - Message classification, backpressure levels, BATCH aggregation implemented
 
 ---
@@ -315,20 +315,23 @@ Per CLAUDE.md: "DO NOT RUN THE INTEGRATION TESTS YOURSELF. Ask me to."
 
 ## 13. AD-36: Vivaldi-Based Cross-Datacenter Job Routing
 
-**Status**: ✅ **95% COMPLETE** - All routing components implemented and AD-36 spec compliant, gate.py integration pending
+**Status**: ✅ **100% COMPLETE** - All routing components implemented and fully integrated into gate.py
 
 **Overview**: Vivaldi-based multi-factor job routing maintaining AD-17 health bucket safety while optimizing for latency and load.
 
-### 13.1 Current State ✅ AD-17 COMPLIANT
+### 13.1 Gate Integration ✅ COMPLETE
 
 **File**: `hyperscale/distributed_rewrite/nodes/gate.py`
 
 **Implemented:**
-- [x] Health bucket selection (lines 2567-2608): HEALTHY > BUSY > DEGRADED priority
-- [x] UNHEALTHY datacenters excluded (line 2617)
-- [x] Basic fallback chain (lines 2607-2623): primary + remaining in health order
-
-**Missing:** Integration with new routing module (GateJobRouter not wired to gate.py)
+- [x] GateJobRouter initialization in start() (lines 3850-3855) with CoordinateTracker and candidate callback
+- [x] _build_datacenter_candidates() helper (lines 2215-2290) populating Vivaldi + load metrics
+- [x] _select_datacenters_with_fallback() replaced with router.route_job() (lines 2741-2799)
+- [x] Dispatch failure tracking wired to router.record_dispatch_failure() (lines 3009-3013)
+- [x] Job completion cleanup wired to router.cleanup_job_state() (lines 4418-4420)
+- [x] AD-17 compliant: HEALTHY > BUSY > DEGRADED priority preserved
+- [x] Multi-factor scoring: RTT UCB × load_factor × quality_penalty
+- [x] Hysteresis: hold-down timers and improvement thresholds prevent routing churn
 
 ### 13.2 Routing Infrastructure ✅ COMPLETE
 
