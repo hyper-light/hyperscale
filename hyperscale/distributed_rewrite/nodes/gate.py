@@ -2212,6 +2212,82 @@ class GateServer(HealthAwareServer):
                 result[dc_id] = self._classify_datacenter_health(dc_id)
         return result
 
+    def _build_datacenter_candidates(self) -> list[DatacenterCandidate]:
+        """
+        Build DatacenterCandidate objects for AD-36 routing (REFACTOR.md compliance).
+
+        Converts gate's internal datacenter state into candidates for GateJobRouter.
+        Populates all required fields: health, capacity, queue, circuit pressure,
+        Vivaldi coordinates, and manager counts.
+
+        Returns:
+            List of DatacenterCandidate objects for routing decisions
+        """
+        candidates: list[DatacenterCandidate] = []
+        dc_health_map = self._get_all_datacenter_health()
+
+        for dc_id, status in dc_health_map.items():
+            # Get manager addresses for this DC
+            manager_addrs = self._datacenter_managers.get(dc_id, [])
+            if not manager_addrs:
+                continue
+
+            # Calculate circuit breaker pressure (fraction of managers with open circuits)
+            total_managers = len(manager_addrs)
+            circuit_open_count = 0
+            healthy_managers = 0
+
+            for manager_addr in manager_addrs:
+                circuit = self._circuit_breaker_manager.get_circuit_stats(manager_addr)
+                if circuit and circuit.state == CircuitState.OPEN:
+                    circuit_open_count += 1
+                else:
+                    healthy_managers += 1
+
+            circuit_breaker_pressure = circuit_open_count / total_managers if total_managers > 0 else 0.0
+
+            # Get Vivaldi coordinate data for this DC (if available)
+            # Use the first manager's UDP address as the peer identifier
+            has_coordinate = False
+            rtt_ucb_ms = 100.0  # Conservative default
+            coordinate_quality = 0.0
+
+            manager_udp_addrs = self._datacenter_manager_udp.get(dc_id, [])
+            if manager_udp_addrs and self._coordinate_tracker:
+                # Use first manager as DC representative for coordinates
+                peer_coord = self._coordinate_tracker.get_peer_coordinate(manager_udp_addrs[0])
+                if peer_coord is not None:
+                    has_coordinate = True
+                    rtt_ucb_ms = self._coordinate_tracker.estimate_rtt_ucb_ms(peer_coord)
+                    coordinate_quality = self._coordinate_tracker.coordinate_quality(peer_coord)
+
+            # Calculate total cores (estimate from available + queue depth)
+            # If we have TCP status, use it to estimate total cores
+            total_cores = status.available_capacity
+            if status.queue_depth > 0:
+                # Rough estimate: total = available + queue
+                total_cores = status.available_capacity + status.queue_depth
+
+            # Create DatacenterCandidate
+            candidate = DatacenterCandidate(
+                datacenter_id=dc_id,
+                health_bucket=status.health.upper(),  # HEALTHY, BUSY, DEGRADED, UNHEALTHY
+                available_cores=status.available_capacity,
+                total_cores=max(total_cores, status.available_capacity),  # Ensure total >= available
+                queue_depth=status.queue_depth,
+                lhm_multiplier=1.0,  # Gates don't track LHM per DC, use default
+                circuit_breaker_pressure=circuit_breaker_pressure,
+                has_coordinate=has_coordinate,
+                rtt_ucb_ms=rtt_ucb_ms,
+                coordinate_quality=coordinate_quality,
+                total_managers=total_managers,
+                healthy_managers=healthy_managers,
+            )
+
+            candidates.append(candidate)
+
+        return candidates
+
     # =========================================================================
     # Three-Signal Manager Health (AD-19)
     # =========================================================================
