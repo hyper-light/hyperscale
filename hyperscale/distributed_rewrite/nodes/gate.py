@@ -304,6 +304,14 @@ class GateServer(HealthAwareServer):
         # Handles: job status, DC results, target DCs, callbacks, fence tokens
         self._job_manager = GateJobManager()
 
+        # Consistent hash ring for deterministic job-to-gate ownership
+        # Used to:
+        # - Route job submissions to the correct owner gate
+        # - Forward job results/progress to the owner gate
+        # - Determine backup gates for failover
+        # Ring is populated from known gates as they join/leave
+        self._job_hash_ring = ConsistentHashRing(replicas=150)
+
         # Per-workflow results from all DCs for cross-DC aggregation
         # job_id -> workflow_id -> datacenter -> WorkflowResultPush
         self._workflow_dc_results: dict[str, dict[str, dict[str, WorkflowResultPush]]] = {}
@@ -575,6 +583,15 @@ class GateServer(HealthAwareServer):
             peer_id = f"{peer_host}:{peer_port}"
             self._peer_discovery.remove_peer(peer_id)
 
+            # Remove from consistent hash ring for job ownership routing
+            # Look up the real node_id from stored heartbeat info
+            peer_heartbeat = self._gate_peer_info.get(udp_addr)
+            if peer_heartbeat:
+                self._job_hash_ring.remove_node(peer_heartbeat.node_id)
+            else:
+                # Fallback: try removing by synthetic ID (host:port)
+                self._job_hash_ring.remove_node(peer_id)
+
         # Check if this was the leader
         current_leader = self.get_current_leader()
         was_leader = current_leader == udp_addr
@@ -840,6 +857,14 @@ class GateServer(HealthAwareServer):
             role="gate",
         )
 
+        # Add peer gate to consistent hash ring for job ownership routing
+        # If node already exists, ConsistentHashRing.add_node will update it
+        self._job_hash_ring.add_node(
+            node_id=heartbeat.node_id,
+            tcp_host=peer_tcp_host,
+            tcp_port=peer_tcp_port,
+        )
+
         # Update three-signal health state for peer gate (AD-19)
         gate_id = heartbeat.node_id
         health_state = self._gate_peer_health.get(gate_id)
@@ -1022,6 +1047,30 @@ class GateServer(HealthAwareServer):
     def _get_job_leader_addr(self, job_id: str) -> tuple[str, int] | None:
         """Get the TCP address of the job leader, or None if unknown."""
         return self._job_leadership_tracker.get_leader_addr(job_id)
+
+    def _is_job_hash_owner(self, job_id: str) -> bool:
+        """
+        Check if this gate is the consistent hash owner for a job.
+
+        This is different from job leadership:
+        - Hash owner: Deterministic based on job_id and ring membership
+        - Job leader: Dynamic based on which gate first accepted the job
+
+        The hash owner is the "expected" owner for routing purposes.
+        """
+        owner_id = self._job_hash_ring.get_owner_id(job_id)
+        return owner_id == self._node_id.full
+
+    def _get_job_hash_owner(self, job_id: str) -> tuple[str, int] | None:
+        """
+        Get the TCP address of the consistent hash owner for a job.
+
+        Returns (host, port) tuple or None if ring is empty.
+        """
+        owner = self._job_hash_ring.get_node(job_id)
+        if owner:
+            return (owner.tcp_host, owner.tcp_port)
+        return None
 
     async def _handle_job_leader_failure(
         self,
@@ -2923,6 +2972,14 @@ class GateServer(HealthAwareServer):
         # Now that node_id is available, initialize the job leadership tracker
         self._job_leadership_tracker.node_id = self._node_id.full
         self._job_leadership_tracker.node_addr = (self._host, self._tcp_port)
+
+        # Add this gate to the consistent hash ring
+        # Other gates will be added as they send heartbeats
+        self._job_hash_ring.add_node(
+            node_id=self._node_id.full,
+            tcp_host=self._host,
+            tcp_port=self._tcp_port,
+        )
 
         self._task_runner.run(
             self._udp_logger.log,
@@ -5240,7 +5297,31 @@ class GateServer(HealthAwareServer):
             self._workflow_dc_results[job_id].pop(workflow_id, None)
 
     async def _forward_workflow_result_to_peers(self, push: WorkflowResultPush) -> bool:
-        """Forward workflow result to peer gates that may own the job."""
+        """
+        Forward workflow result to the job owner gate using consistent hashing.
+
+        Uses the consistent hash ring to route to the correct job owner.
+        """
+        # Get owner and backup gates from hash ring
+        candidates = self._job_hash_ring.get_nodes(push.job_id, count=3)
+
+        for candidate in candidates:
+            if candidate.node_id == self._node_id.full:
+                continue
+
+            try:
+                gate_addr = (candidate.tcp_host, candidate.tcp_port)
+                await self.send_tcp(
+                    gate_addr,
+                    "workflow_result_push",
+                    push.dump(),
+                    timeout=3.0,
+                )
+                return True
+            except Exception:
+                continue
+
+        # Fallback: try known gates if hash ring is empty or all candidates failed
         for gate_id, gate_info in list(self._known_gates.items()):
             if gate_id == self._node_id.full:
                 continue
@@ -5255,18 +5336,41 @@ class GateServer(HealthAwareServer):
                 return True
             except Exception:
                 continue
+
         return False
 
     async def _forward_job_result_to_peers(self, result: JobFinalResult) -> bool:
         """
-        Forward a job final result to peer gates that may own the job.
+        Forward a job final result to the job owner gate using consistent hashing.
+
+        Uses the consistent hash ring to determine the owner and backup gates,
+        attempting them in order until one succeeds.
 
         Returns True if forwarded to at least one peer.
         """
-        forwarded = False
+        # Get owner and backup gates from hash ring
+        candidates = self._job_hash_ring.get_nodes(result.job_id, count=3)
+
+        for candidate in candidates:
+            if candidate.node_id == self._node_id.full:
+                continue  # Don't forward to self
+
+            try:
+                gate_addr = (candidate.tcp_host, candidate.tcp_port)
+                await self.send_tcp(
+                    gate_addr,
+                    "job_final_result",
+                    result.dump(),
+                    timeout=3.0,
+                )
+                return True
+            except Exception:
+                continue  # Try next candidate
+
+        # Fallback: try known gates if hash ring is empty or all candidates failed
         for gate_id, gate_info in list(self._known_gates.items()):
             if gate_id == self._node_id.full:
-                continue  # Don't forward to self
+                continue
             try:
                 gate_addr = (gate_info.tcp_host, gate_info.tcp_port)
                 await self.send_tcp(
@@ -5275,22 +5379,44 @@ class GateServer(HealthAwareServer):
                     result.dump(),
                     timeout=3.0,
                 )
-                forwarded = True
-                break  # Only forward to one peer, they'll handle routing
+                return True
             except Exception:
-                continue  # Try next peer
-        return forwarded
+                continue
+
+        return False
 
     async def _forward_job_progress_to_peers(self, progress: JobProgress) -> bool:
         """
-        Forward job progress to peer gates that may own the job.
+        Forward job progress to the job owner gate using consistent hashing.
+
+        Uses the consistent hash ring to determine the owner and backup gates,
+        attempting them in order until one succeeds.
 
         Returns True if forwarded to at least one peer.
         """
-        forwarded = False
+        # Get owner and backup gates from hash ring
+        candidates = self._job_hash_ring.get_nodes(progress.job_id, count=3)
+
+        for candidate in candidates:
+            if candidate.node_id == self._node_id.full:
+                continue  # Don't forward to self
+
+            try:
+                gate_addr = (candidate.tcp_host, candidate.tcp_port)
+                await self.send_tcp(
+                    gate_addr,
+                    "job_progress",
+                    progress.dump(),
+                    timeout=2.0,
+                )
+                return True
+            except Exception:
+                continue  # Try next candidate
+
+        # Fallback: try known gates if hash ring is empty or all candidates failed
         for gate_id, gate_info in list(self._known_gates.items()):
             if gate_id == self._node_id.full:
-                continue  # Don't forward to self
+                continue
             try:
                 gate_addr = (gate_info.tcp_host, gate_info.tcp_port)
                 await self.send_tcp(
@@ -5299,11 +5425,11 @@ class GateServer(HealthAwareServer):
                     progress.dump(),
                     timeout=2.0,
                 )
-                forwarded = True
-                break  # Only forward to one peer, they'll handle routing
+                return True
             except Exception:
-                continue  # Try next peer
-        return forwarded
+                continue
+
+        return False
     
     async def _send_global_job_result(self, job_id: str) -> None:
         """
