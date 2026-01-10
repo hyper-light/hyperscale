@@ -1,18 +1,27 @@
 """
-Workflow State Machine (AD-33).
+Workflow State Machine (AD-33, AD-34).
 
 Complete lifecycle state management for workflows, from pending through
 completion, failure, cancellation, and retry. Enforces valid state transitions,
 prevents race conditions, and provides observability.
+
+AD-34 Integration: Progress callbacks notify timeout strategies of workflow
+state changes, enabling stuck workflow detection and adaptive timeout handling.
 """
 
 import asyncio
 import time
 from dataclasses import dataclass
 from enum import Enum
+from typing import Callable, Awaitable
 
 from hyperscale.logging import Logger
 from hyperscale.logging.hyperscale_logging_models import ServerDebug, ServerWarning
+
+
+# Type alias for progress callbacks (AD-34 Task 11.6.1)
+# Callback signature: async def callback(workflow_id: str, old_state: WorkflowState, new_state: WorkflowState) -> None
+ProgressCallback = Callable[[str, "WorkflowState", "WorkflowState"], Awaitable[None]]
 
 
 class WorkflowState(Enum):
@@ -133,6 +142,14 @@ class WorkflowStateMachine:
         # Lock for atomic state transitions
         self._lock = asyncio.Lock()
 
+        # AD-34 Task 11.6.1: Progress callbacks for timeout tracking
+        # Called on every state transition to notify timeout strategies
+        self._progress_callbacks: list[ProgressCallback] = []
+
+        # AD-34 Task 11.6.4: Track last progress time per workflow
+        # Updated on every state transition for stuck detection
+        self._last_progress_time: dict[str, float] = {}
+
     async def transition(
         self,
         workflow_id: str,
@@ -142,7 +159,8 @@ class WorkflowStateMachine:
         """
         Attempt to transition workflow to new state.
 
-        Validates transition is allowed, records in history, and logs.
+        Validates transition is allowed, records in history, logs, and
+        notifies registered progress callbacks (AD-34 Task 11.6.3).
 
         Args:
             workflow_id: Workflow to transition
@@ -170,8 +188,13 @@ class WorkflowStateMachine:
 
             transition_duration_ms = (time.monotonic() - previous_transition_time) * 1000.0
 
+            now = time.monotonic()
+
             # Record transition
             self._states[workflow_id] = to_state
+
+            # AD-34 Task 11.6.4: Update last progress time
+            self._last_progress_time[workflow_id] = now
 
             # Record in history
             if workflow_id not in self._state_history:
@@ -180,14 +203,45 @@ class WorkflowStateMachine:
             self._state_history[workflow_id].append(StateTransition(
                 from_state=current_state,
                 to_state=to_state,
-                timestamp=time.monotonic(),
+                timestamp=now,
                 reason=reason
             ))
 
             await self._log_transition(
                 workflow_id, current_state, to_state, reason, transition_duration_ms
             )
-            return True
+
+        # AD-34 Task 11.6.3: Call progress callbacks OUTSIDE the lock
+        # to avoid deadlocks with timeout strategy locks
+        await self._invoke_progress_callbacks(workflow_id, current_state, to_state)
+
+        return True
+
+    async def _invoke_progress_callbacks(
+        self,
+        workflow_id: str,
+        from_state: WorkflowState,
+        to_state: WorkflowState,
+    ) -> None:
+        """
+        Invoke all registered progress callbacks (AD-34 Task 11.6.3).
+
+        Callbacks are invoked outside the main lock to prevent deadlocks.
+        Errors in callbacks are logged but do not prevent other callbacks.
+        """
+        for callback in self._progress_callbacks:
+            try:
+                await callback(workflow_id, from_state, to_state)
+            except Exception as error:
+                await self._logger.log(
+                    ServerWarning(
+                        message=f"Progress callback error for workflow {workflow_id[:8]}...: "
+                                f"{type(error).__name__}: {error}",
+                        node_host=self._node_host,
+                        node_port=self._node_port,
+                        node_id=self._node_id,
+                    )
+                )
 
     def get_state(self, workflow_id: str) -> WorkflowState:
         """
@@ -235,6 +289,136 @@ class WorkflowStateMachine:
         """
         self._states.pop(workflow_id, None)
         self._state_history.pop(workflow_id, None)
+        self._last_progress_time.pop(workflow_id, None)
+
+    def register_progress_callback(self, callback: ProgressCallback) -> None:
+        """
+        Register a callback to be notified on workflow state transitions (AD-34 Task 11.6.2).
+
+        Callbacks are invoked after every successful state transition.
+        Use this to connect timeout strategies to workflow progress.
+
+        Args:
+            callback: Async function taking (workflow_id, from_state, to_state)
+
+        Example:
+            async def on_progress(workflow_id, from_state, to_state):
+                timeout_strategy.record_progress(workflow_id)
+
+            state_machine.register_progress_callback(on_progress)
+        """
+        if callback not in self._progress_callbacks:
+            self._progress_callbacks.append(callback)
+
+    def unregister_progress_callback(self, callback: ProgressCallback) -> bool:
+        """
+        Remove a previously registered progress callback.
+
+        Args:
+            callback: The callback to remove
+
+        Returns:
+            True if callback was found and removed
+        """
+        try:
+            self._progress_callbacks.remove(callback)
+            return True
+        except ValueError:
+            return False
+
+    def get_time_since_progress(self, workflow_id: str) -> float | None:
+        """
+        Get time elapsed since last progress for a workflow (AD-34 Task 11.6.4).
+
+        Progress is defined as any state transition. Use this to detect
+        workflows that may be stuck (no state changes for extended period).
+
+        Args:
+            workflow_id: Workflow to check
+
+        Returns:
+            Seconds since last progress, or None if workflow not tracked
+        """
+        last_progress = self._last_progress_time.get(workflow_id)
+        if last_progress is None:
+            return None
+        return time.monotonic() - last_progress
+
+    def get_stuck_workflows(
+        self,
+        threshold_seconds: float,
+        exclude_terminal: bool = True,
+    ) -> list[tuple[str, WorkflowState, float]]:
+        """
+        Get workflows that haven't made progress within threshold (AD-34 Task 11.6.5).
+
+        Stuck workflows are those that haven't transitioned state for longer
+        than the threshold. This helps identify workflows that may need
+        timeout intervention.
+
+        Args:
+            threshold_seconds: Consider stuck if no progress for this long
+            exclude_terminal: If True, exclude COMPLETED/CANCELLED/AGGREGATED states
+
+        Returns:
+            List of (workflow_id, current_state, seconds_since_progress) tuples
+            for workflows exceeding threshold, sorted by staleness (oldest first)
+        """
+        terminal_states = {
+            WorkflowState.COMPLETED,
+            WorkflowState.CANCELLED,
+            WorkflowState.AGGREGATED,
+        }
+
+        now = time.monotonic()
+        stuck_workflows: list[tuple[str, WorkflowState, float]] = []
+
+        for workflow_id, last_progress in self._last_progress_time.items():
+            elapsed = now - last_progress
+            if elapsed < threshold_seconds:
+                continue
+
+            state = self._states.get(workflow_id)
+            if state is None:
+                continue
+
+            # Skip terminal states if requested
+            if exclude_terminal and state in terminal_states:
+                continue
+
+            stuck_workflows.append((workflow_id, state, elapsed))
+
+        # Sort by elapsed time descending (oldest/most stuck first)
+        stuck_workflows.sort(key=lambda x: x[2], reverse=True)
+        return stuck_workflows
+
+    def get_workflows_in_state(
+        self,
+        *states: WorkflowState,
+    ) -> list[str]:
+        """
+        Get all workflows currently in any of the specified states.
+
+        Args:
+            *states: States to filter by
+
+        Returns:
+            List of workflow IDs in those states
+        """
+        target_states = set(states)
+        return [
+            workflow_id
+            for workflow_id, state in self._states.items()
+            if state in target_states
+        ]
+
+    def get_running_workflows(self) -> list[str]:
+        """Get all workflows currently in RUNNING state."""
+        return self.get_workflows_in_state(WorkflowState.RUNNING)
+
+    def get_pending_workflows(self) -> list[str]:
+        """Get all workflows currently in PENDING state."""
+        return self.get_workflows_in_state(WorkflowState.PENDING)
 
     def get_state_counts(self) -> dict[WorkflowState, int]:
         """

@@ -165,6 +165,25 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
 
         self._coordinate_tracker = CoordinateTracker()
 
+        # Role-aware confirmation manager for unconfirmed peers (AD-35 Task 12.5.6)
+        # Initialized after CoordinateTracker so it can use Vivaldi-based timeouts
+        from hyperscale.distributed_rewrite.swim.roles.confirmation_manager import (
+            RoleAwareConfirmationManager,
+        )
+        from hyperscale.distributed_rewrite.models.distributed import NodeRole
+
+        self._confirmation_manager = RoleAwareConfirmationManager(
+            coordinator_tracker=self._coordinate_tracker,
+            send_ping=self._send_confirmation_ping,
+            get_lhm_multiplier=lambda: self._local_health.get_multiplier(),
+            on_peer_confirmed=self._on_confirmation_manager_peer_confirmed,
+            on_peer_removed=self._on_confirmation_manager_peer_removed,
+        )
+
+        # Peer role tracking for role-aware confirmation (AD-35 Task 12.4.2)
+        # Maps peer address to role. Default to WORKER if unknown (gossip pending)
+        self._peer_roles: dict[tuple[str, int], NodeRole] = {}
+
         self._gossip_buffer = GossipBuffer()
         self._gossip_buffer.set_overflow_callback(self._on_gossip_overflow)
         self._probe_scheduler = ProbeScheduler()
@@ -411,9 +430,11 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
     # Peer Confirmation (AD-29)
     # =========================================================================
 
-    def add_unconfirmed_peer(self, peer: tuple[str, int]) -> None:
+    def add_unconfirmed_peer(
+        self, peer: tuple[str, int], role: str | None = None
+    ) -> None:
         """
-        Add a peer from configuration as unconfirmed (AD-29 compliant).
+        Add a peer from configuration as unconfirmed (AD-29 & AD-35 compliant).
 
         Unconfirmed peers are probed but failure detection does NOT apply
         until we successfully communicate with them at least once.
@@ -423,6 +444,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
 
         Args:
             peer: The UDP address of the peer to track.
+            role: Optional role hint (gate/manager/worker). Defaults to worker.
         """
         if peer == self._get_self_udp_addr():
             return  # Don't track self
@@ -439,6 +461,29 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             self._unconfirmed_peer_added_at[peer] = time.monotonic()
             # AD-29: Add to incarnation tracker with formal UNCONFIRMED state
             self._incarnation_tracker.add_unconfirmed_node(peer)
+
+            # AD-35 Task 12.5.6: Track with RoleAwareConfirmationManager
+            from hyperscale.distributed_rewrite.models.distributed import NodeRole
+
+            # Store peer role (default to WORKER if unknown)
+            if role:
+                try:
+                    self._peer_roles[peer] = NodeRole(role.lower())
+                except ValueError:
+                    self._peer_roles[peer] = NodeRole.WORKER
+            else:
+                self._peer_roles[peer] = NodeRole.WORKER
+
+            # Generate peer_id from address
+            peer_id = f"{peer[0]}:{peer[1]}"
+
+            # Track with confirmation manager (async operation - run in background)
+            self._task_runner.run(
+                self._confirmation_manager.track_unconfirmed_peer,
+                peer_id,
+                peer,
+                self._peer_roles[peer],
+            )
 
     def confirm_peer(self, peer: tuple[str, int], incarnation: int = 0) -> bool:
         """
@@ -469,6 +514,10 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         # AD-29: Update incarnation tracker with formal state transition
         # This transitions UNCONFIRMED → OK in the state machine
         self._incarnation_tracker.confirm_node(peer, incarnation)
+
+        # AD-35 Task 12.5.6: Notify RoleAwareConfirmationManager
+        peer_id = f"{peer[0]}:{peer[1]}"
+        self._task_runner.run(self._confirmation_manager.confirm_peer, peer_id)
 
         # Invoke confirmation callbacks
         for callback in self._peer_confirmation_callbacks:
@@ -522,6 +571,71 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             True if peer can be suspected
         """
         return self._incarnation_tracker.can_suspect_node(peer)
+
+    async def _send_confirmation_ping(
+        self, peer_id: str, peer_address: tuple[str, int]
+    ) -> bool:
+        """
+        Send a confirmation ping to an unconfirmed peer (AD-35 Task 12.5.4).
+
+        Used by RoleAwareConfirmationManager for proactive confirmation.
+
+        Args:
+            peer_id: Peer node ID
+            peer_address: Peer UDP address
+
+        Returns:
+            True if ping was sent successfully, False otherwise
+        """
+        try:
+            # Send a direct probe (which will include gossip updates)
+            await self._send_probe(peer_address)
+            return True
+        except Exception as send_error:
+            await self._logger.log(
+                ServerDebug(
+                    message=f"Confirmation ping to {peer_id} failed: {send_error}",
+                    node_host=self._host,
+                    node_port=self._udp_port,
+                    node_id=self._node_id.full,
+                )
+            )
+            return False
+
+    async def _on_confirmation_manager_peer_confirmed(self, peer_id: str) -> None:
+        """
+        Callback when RoleAwareConfirmationManager confirms a peer (AD-35 Task 12.5.6).
+
+        Args:
+            peer_id: Peer node ID that was confirmed
+        """
+        await self._logger.log(
+            ServerDebug(
+                message=f"RoleAwareConfirmationManager confirmed peer {peer_id}",
+                node_host=self._host,
+                node_port=self._udp_port,
+                node_id=self._node_id.full,
+            )
+        )
+
+    async def _on_confirmation_manager_peer_removed(
+        self, peer_id: str, reason: str
+    ) -> None:
+        """
+        Callback when RoleAwareConfirmationManager removes a peer (AD-35 Task 12.5.6).
+
+        Args:
+            peer_id: Peer node ID that was removed
+            reason: Reason for removal
+        """
+        await self._logger.log(
+            ServerDebug(
+                message=f"RoleAwareConfirmationManager removed peer {peer_id}: {reason}",
+                node_host=self._host,
+                node_port=self._udp_port,
+                node_id=self._node_id.full,
+            )
+        )
 
     def remove_peer_tracking(self, peer: tuple[str, int]) -> None:
         """
@@ -1282,6 +1396,17 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         # AD-29: Check for stale unconfirmed peers and log warnings
         async with ErrorContext(self._error_handler, "stale_unconfirmed_cleanup"):
             await self._check_stale_unconfirmed_peers()
+
+        # AD-35 Task 12.5.6: Run RoleAwareConfirmationManager cleanup
+        async with ErrorContext(self._error_handler, "confirmation_manager_cleanup"):
+            confirmation_results = (
+                await self._confirmation_manager.check_and_cleanup_unconfirmed_peers()
+            )
+            stats["confirmation_manager"] = {
+                "total": len(confirmation_results),
+                "confirmed": sum(1 for r in confirmation_results if r.confirmed),
+                "removed": sum(1 for r in confirmation_results if r.removed),
+            }
 
         # Check for counter overflow and reset if needed
         # (Python handles big ints, but we reset periodically for monitoring clarity)

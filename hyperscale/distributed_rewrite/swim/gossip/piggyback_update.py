@@ -31,12 +31,14 @@ _MAX_HOST_CACHE_SIZE = 1000
 class PiggybackUpdate:
     """
     A membership update to be piggybacked on probe messages.
-    
+
     In SWIM, membership updates are disseminated by "piggybacking" them
     onto the protocol messages (probes, acks). This achieves O(log n)
     dissemination without additional message overhead.
-    
+
     Uses __slots__ for memory efficiency since many instances are created.
+
+    AD-35 Task 12.4.3: Extended with optional role field for role-aware failure detection.
     """
     update_type: UpdateType
     node: tuple[str, int]
@@ -46,6 +48,8 @@ class PiggybackUpdate:
     broadcast_count: int = 0
     # Maximum number of times to piggyback (lambda * log(n))
     max_broadcasts: int = 10
+    # AD-35 Task 12.4.3: Optional node role (gate/manager/worker)
+    role: str | None = None
     
     def should_broadcast(self) -> bool:
         """Check if this update should still be piggybacked."""
