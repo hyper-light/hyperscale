@@ -165,6 +165,9 @@ class WorkerStateEmbedder:
     # AD-26 Issue 4: Absolute metrics fields
     get_extension_completed_items: Callable[[], int] | None = None
     get_extension_total_items: Callable[[], int] | None = None
+    # AD-26: Required fields for HealthcheckExtensionRequest
+    get_extension_estimated_completion: Callable[[], float] | None = None
+    get_extension_active_workflow_count: Callable[[], int] | None = None
 
     def get_state(self) -> bytes | None:
         """Get WorkerHeartbeat to embed in SWIM messages."""
@@ -209,6 +212,13 @@ class WorkerStateEmbedder:
             else 0,
             extension_total_items=self.get_extension_total_items()
             if self.get_extension_total_items
+            else 0,
+            # AD-26: Required fields for HealthcheckExtensionRequest
+            extension_estimated_completion=self.get_extension_estimated_completion()
+            if self.get_extension_estimated_completion
+            else 0.0,
+            extension_active_workflow_count=self.get_extension_active_workflow_count()
+            if self.get_extension_active_workflow_count
             else 0,
         )
         return heartbeat.dump()

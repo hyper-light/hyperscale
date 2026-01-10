@@ -273,6 +273,9 @@ class WorkerServer(HealthAwareServer):
         # AD-26 Issue 4: Absolute metrics for more robust progress tracking
         self._extension_completed_items: int = 0
         self._extension_total_items: int = 0
+        # AD-26: Required fields for HealthcheckExtensionRequest
+        self._extension_estimated_completion: float = 0.0  # Estimated seconds until completion
+        self._extension_active_workflow_count: int = 0  # Number of active workflows
 
         # Overload detection (AD-18)
         # Workers use HybridOverloadDetector to track CPU/memory/latency
@@ -321,6 +324,9 @@ class WorkerServer(HealthAwareServer):
             # AD-26 Issue 4: Absolute metrics fields
             get_extension_completed_items=lambda: self._extension_completed_items,
             get_extension_total_items=lambda: self._extension_total_items,
+            # AD-26: Required fields for HealthcheckExtensionRequest
+            get_extension_estimated_completion=lambda: self._extension_estimated_completion,
+            get_extension_active_workflow_count=lambda: self._extension_active_workflow_count,
         )
         
         # Initialize parent HealthAwareServer
@@ -1556,6 +1562,9 @@ class WorkerServer(HealthAwareServer):
             # AD-26 Issue 4: Absolute metrics
             extension_completed_items=self._extension_completed_items,
             extension_total_items=self._extension_total_items,
+            # AD-26: Required fields for HealthcheckExtensionRequest
+            extension_estimated_completion=self._extension_estimated_completion,
+            extension_active_workflow_count=self._extension_active_workflow_count,
         )
 
     def request_extension(
@@ -1564,6 +1573,7 @@ class WorkerServer(HealthAwareServer):
         progress: float = 0.0,
         completed_items: int = 0,
         total_items: int = 0,
+        estimated_completion: float = 0.0,
     ) -> None:
         """
         Request a deadline extension via heartbeat piggyback (AD-26).
@@ -1581,6 +1591,7 @@ class WorkerServer(HealthAwareServer):
             progress: Current progress (0.0-1.0) to help manager make decisions.
             completed_items: Absolute count of completed items (preferred metric).
             total_items: Total items to complete.
+            estimated_completion: Estimated seconds until workflow completion.
         """
         self._extension_requested = True
         self._extension_reason = reason
@@ -1588,6 +1599,9 @@ class WorkerServer(HealthAwareServer):
         # AD-26 Issue 4: Store absolute metrics
         self._extension_completed_items = completed_items
         self._extension_total_items = total_items
+        # AD-26: Required fields - estimate completion and active workflow count
+        self._extension_estimated_completion = estimated_completion
+        self._extension_active_workflow_count = len(self._active_workflows)
 
     def clear_extension_request(self) -> None:
         """
@@ -1602,6 +1616,9 @@ class WorkerServer(HealthAwareServer):
         # AD-26 Issue 4: Clear absolute metrics
         self._extension_completed_items = 0
         self._extension_total_items = 0
+        # AD-26: Clear required fields
+        self._extension_estimated_completion = 0.0
+        self._extension_active_workflow_count = 0
     
     # =========================================================================
     # Core Allocation (delegates to CoreAllocator)
