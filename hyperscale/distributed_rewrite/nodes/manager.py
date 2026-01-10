@@ -5353,8 +5353,8 @@ class ManagerServer(HealthAwareServer):
         if not job:
             return
 
-        # Update workflow status
-        self._update_workflow_status_from_progress(job, progress)
+        # Update workflow status (now async to use AD-33 lifecycle machine)
+        await self._update_workflow_status_from_progress(job, progress)
 
         job.timestamp = time.monotonic()
 
@@ -5374,12 +5374,43 @@ class ManagerServer(HealthAwareServer):
         # Forward to gates or check job completion
         self._forward_progress_to_gates_or_check_completion(job, progress.job_id)
 
-    def _update_workflow_status_from_progress(
+    def _map_workflow_status_to_lifecycle_state(self, status: WorkflowStatus) -> WorkflowState | None:
+        """
+        Map WorkflowStatus (old status validator) to WorkflowState (AD-33 lifecycle machine).
+
+        This enables gradual migration from the dual state machine architecture to
+        unified AD-33 lifecycle management (Issue 4 fix).
+
+        Args:
+            status: WorkflowStatus from progress update
+
+        Returns:
+            Corresponding WorkflowState, or None if no mapping exists
+        """
+        mapping = {
+            WorkflowStatus.PENDING: WorkflowState.PENDING,
+            WorkflowStatus.ASSIGNED: WorkflowState.DISPATCHED,
+            WorkflowStatus.RUNNING: WorkflowState.RUNNING,
+            WorkflowStatus.COMPLETED: WorkflowState.COMPLETED,
+            WorkflowStatus.FAILED: WorkflowState.FAILED,
+            WorkflowStatus.CANCELLED: WorkflowState.CANCELLED,
+            WorkflowStatus.AGGREGATED: WorkflowState.AGGREGATED,
+            # AGGREGATION_FAILED doesn't have direct equivalent, map to FAILED
+            WorkflowStatus.AGGREGATION_FAILED: WorkflowState.FAILED,
+        }
+        return mapping.get(status)
+
+    async def _update_workflow_status_from_progress(
         self,
         job: JobInfo,
         progress: WorkflowProgress,
     ) -> None:
-        """Update WorkflowInfo status based on progress, using state machine."""
+        """
+        Update WorkflowInfo status based on progress.
+
+        Uses AD-33 lifecycle state machine when available, falls back to
+        old status validator for backward compatibility (Issue 4 fix).
+        """
         workflow_id = self._extract_workflow_id_from_token(progress.workflow_id)
         workflow_token_str = str(self._job_manager.create_workflow_token(progress.job_id, workflow_id))
         wf_info = job.workflows.get(workflow_token_str)
@@ -5392,6 +5423,36 @@ class ManagerServer(HealthAwareServer):
         except ValueError:
             new_status = WorkflowStatus.RUNNING
 
+        # Try to use AD-33 lifecycle machine first (unified approach)
+        if self._workflow_lifecycle_states:
+            # Map status to lifecycle state
+            target_state = self._map_workflow_status_to_lifecycle_state(new_status)
+
+            if target_state:
+                # Get current state (use subworkflow token from progress)
+                current_state = self._workflow_lifecycle_states.get_state(progress.workflow_id)
+
+                # Attempt transition
+                success = await self._workflow_lifecycle_states.transition(
+                    progress.workflow_id,
+                    target_state,
+                    reason=f"progress update from worker: {progress.status}"
+                )
+
+                if success:
+                    # Also update the old status field for backward compatibility
+                    wf_info.status = new_status
+                    return
+
+                # If transition failed, log and fall back to old validator
+                await self._udp_logger.log(ServerDebug(
+                    message=f"Lifecycle state transition failed for {progress.workflow_id}: {current_state} -> {target_state}, using status validator fallback",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                ))
+
+        # Fallback to old status validator (for gradual migration)
         wf_info.status = WorkflowStateMachine.advance_state(wf_info.status, new_status)
 
     def _extract_workflow_id_from_token(self, workflow_id: str) -> str:
