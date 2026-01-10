@@ -161,6 +161,12 @@ from .distributed import (
     DatacenterListResponse as DatacenterListResponse,
     WorkflowCancellationComplete as WorkflowCancellationComplete,
     JobCancellationComplete as JobCancellationComplete,
+    # AD-34: Multi-DC timeout coordination
+    JobProgressReport as JobProgressReport,
+    JobTimeoutReport as JobTimeoutReport,
+    JobGlobalTimeout as JobGlobalTimeout,
+    JobLeaderTransfer as JobLeaderTransfer,
+    JobFinalStatus as JobFinalStatus,
 )
 
 # CRDTs for cross-datacenter synchronization

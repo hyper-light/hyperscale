@@ -13,10 +13,8 @@ import time
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING
 
-from hyperscale.logging.hyperscale_logger import HyperscaleLogger
 from hyperscale.logging.hyperscale_logging_models import (
     ServerDebug,
-    ServerError,
     ServerInfo,
     ServerWarning,
 )

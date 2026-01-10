@@ -290,6 +290,11 @@ class WorkflowProgressAck(Message):
 
     Also includes job_leader_addr for the specific job, enabling workers
     to route progress updates to the correct manager even after failover.
+
+    Backpressure fields (AD-23):
+    When the manager's stats buffer fill level reaches thresholds, it signals
+    backpressure to workers via these fields. Workers should adjust their
+    update behavior accordingly (throttle, batch-only, or drop non-critical).
     """
     manager_id: str                         # Responding manager's node_id
     is_leader: bool                         # Whether this manager is cluster leader
@@ -298,6 +303,10 @@ class WorkflowProgressAck(Message):
     # None if the job is unknown or this manager doesn't track it.
     # Workers should update their routing to send progress to this address.
     job_leader_addr: tuple[str, int] | None = None
+    # AD-23: Backpressure fields for stats update throttling
+    backpressure_level: int = 0             # BackpressureLevel enum value (0=NONE, 1=THROTTLE, 2=BATCH, 3=REJECT)
+    backpressure_delay_ms: int = 0          # Suggested delay before next update (milliseconds)
+    backpressure_batch_only: bool = False   # Should sender switch to batch mode?
 
 
 # =============================================================================

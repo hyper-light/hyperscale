@@ -147,6 +147,7 @@ from hyperscale.distributed_rewrite.jobs.gates import (
     GateJobManager,
     JobForwardingTracker,
     ConsistentHashRing,
+    GateJobTimeoutTracker,
 )
 from hyperscale.distributed_rewrite.health import (
     CircuitBreakerManager,
@@ -455,6 +456,14 @@ class GateServer(HealthAwareServer):
         self._orphan_grace_period: float = env.GATE_ORPHAN_GRACE_PERIOD
         self._orphan_check_interval: float = env.GATE_ORPHAN_CHECK_INTERVAL
         self._orphan_check_task: asyncio.Task | None = None
+
+        # AD-34: Multi-DC job timeout coordination
+        # Tracks job timeout state across all DCs and declares global timeouts
+        self._job_timeout_tracker = GateJobTimeoutTracker(
+            gate=self,
+            check_interval=getattr(env, 'GATE_TIMEOUT_CHECK_INTERVAL', 15.0),
+            stuck_threshold=getattr(env, 'GATE_ALL_DC_STUCK_THRESHOLD', 180.0),
+        )
 
         # State versioning (local gate state version)
         self._state_version = 0
@@ -3699,6 +3708,9 @@ class GateServer(HealthAwareServer):
         # Start discovery maintenance loop (AD-28)
         self._discovery_maintenance_task = asyncio.create_task(self._discovery_maintenance_loop())
 
+        # Start AD-34 multi-DC job timeout tracker
+        await self._job_timeout_tracker.start()
+
         # Register with all managers (symmetric to managers registering with all gates)
         # This ensures managers know about all gates for proper routing and health tracking
         if self._datacenter_managers:
@@ -3735,6 +3747,9 @@ class GateServer(HealthAwareServer):
 
         # Stop federated health monitor
         await self._dc_health_monitor.stop()
+
+        # Stop AD-34 job timeout tracker
+        await self._job_timeout_tracker.stop()
 
         await super().stop(
             drain_timeout=drain_timeout,
@@ -5750,6 +5765,98 @@ class GateServer(HealthAwareServer):
 
         except Exception as e:
             await self.handle_exception(e, "receive_gate_state_sync_request")
+            return b''
+
+    # =========================================================================
+    # AD-34: Multi-DC Job Timeout Coordination (Manager -> Gate)
+    # =========================================================================
+
+    @tcp.receive()
+    async def receive_job_progress_report(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+        transport: asyncio.Transport,
+    ):
+        """
+        Receive progress report from manager (AD-34 multi-DC coordination).
+
+        Managers send periodic progress reports to keep gate informed.
+        Best-effort - lost reports are tolerated.
+        """
+        try:
+            report = JobProgressReport.load(data)
+            await self._job_timeout_tracker.record_progress(report)
+            return b'ok'
+        except Exception as error:
+            await self.handle_exception(error, "receive_job_progress_report")
+            return b''
+
+    @tcp.receive()
+    async def receive_job_timeout_report(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+        transport: asyncio.Transport,
+    ):
+        """
+        Receive DC-local timeout report from manager (AD-34 multi-DC coordination).
+
+        Manager detected timeout but waits for gate's global decision.
+        Gate aggregates across DCs to decide on global timeout.
+        """
+        try:
+            report = JobTimeoutReport.load(data)
+            await self._job_timeout_tracker.record_timeout(report)
+            return b'ok'
+        except Exception as error:
+            await self.handle_exception(error, "receive_job_timeout_report")
+            return b''
+
+    @tcp.receive()
+    async def receive_job_leader_transfer(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+        transport: asyncio.Transport,
+    ):
+        """
+        Receive manager leader transfer notification (AD-34 multi-DC coordination).
+
+        Manager notifies gate that job leadership transferred to a new manager.
+        Gate updates tracking to send future timeout decisions to new leader.
+        """
+        try:
+            report = JobLeaderTransfer.load(data)
+            await self._job_timeout_tracker.record_leader_transfer(report)
+            return b'ok'
+        except Exception as error:
+            await self.handle_exception(error, "receive_job_leader_transfer")
+            return b''
+
+    @tcp.receive()
+    async def receive_job_final_status(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+        transport: asyncio.Transport,
+    ):
+        """
+        Receive final job status from manager (AD-34 lifecycle cleanup).
+
+        Manager reports terminal status (completed/failed/cancelled/timeout).
+        When all DCs report terminal status, gate removes job from tracking.
+        """
+        try:
+            report = JobFinalStatus.load(data)
+            await self._job_timeout_tracker.handle_final_status(report)
+            return b'ok'
+        except Exception as error:
+            await self.handle_exception(error, "receive_job_final_status")
             return b''
 
     # =========================================================================

@@ -19,3 +19,7 @@ from hyperscale.distributed_rewrite.jobs.gates.consistent_hash_ring import (
     ConsistentHashRing as ConsistentHashRing,
     HashRingNode as HashRingNode,
 )
+from hyperscale.distributed_rewrite.jobs.gates.gate_job_timeout_tracker import (
+    GateJobTimeoutTracker as GateJobTimeoutTracker,
+    GateJobTrackingInfo as GateJobTrackingInfo,
+)

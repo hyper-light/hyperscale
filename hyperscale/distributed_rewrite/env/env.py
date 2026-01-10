@@ -278,6 +278,15 @@ class Env(BaseModel):
     CLIENT_PROGRESS_BURST: StrictInt = 20  # Burst allowance for progress callbacks
 
     # ==========================================================================
+    # Manager Stats Buffer Settings (AD-23)
+    # ==========================================================================
+    # Tiered retention for stats with backpressure based on buffer fill levels
+    MANAGER_STATS_HOT_MAX_ENTRIES: StrictInt = 1000  # Max entries in hot tier ring buffer
+    MANAGER_STATS_THROTTLE_THRESHOLD: StrictFloat = 0.70  # Throttle at 70% fill
+    MANAGER_STATS_BATCH_THRESHOLD: StrictFloat = 0.85  # Batch-only at 85% fill
+    MANAGER_STATS_REJECT_THRESHOLD: StrictFloat = 0.95  # Reject non-critical at 95% fill
+
+    # ==========================================================================
     # Cross-DC Correlation Settings (Phase 7)
     # ==========================================================================
     # These settings control correlation detection for cascade eviction prevention
@@ -535,6 +544,11 @@ class Env(BaseModel):
             "STATUS_UPDATE_POLL_INTERVAL": float,
             "CLIENT_PROGRESS_RATE_LIMIT": float,
             "CLIENT_PROGRESS_BURST": int,
+            # Manager stats buffer settings (AD-23)
+            "MANAGER_STATS_HOT_MAX_ENTRIES": int,
+            "MANAGER_STATS_THROTTLE_THRESHOLD": float,
+            "MANAGER_STATS_BATCH_THRESHOLD": float,
+            "MANAGER_STATS_REJECT_THRESHOLD": float,
             # Cluster and environment isolation (AD-28 Issue 2)
             "CLUSTER_ID": str,
             "ENVIRONMENT_ID": str,

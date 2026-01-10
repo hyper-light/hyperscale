@@ -155,6 +155,10 @@ from hyperscale.distributed_rewrite.reliability import (
     RetryExecutor,
     RetryConfig,
     JitterStrategy,
+    StatsBuffer,
+    StatsBufferConfig,
+    BackpressureSignal,
+    BackpressureLevel,
 )
 from hyperscale.distributed_rewrite.health import (
     WorkerHealthManager,
@@ -639,6 +643,15 @@ class ManagerServer(HealthAwareServer):
             drift_tolerance_ms=env.STATS_DRIFT_TOLERANCE_MS,
             max_window_age_ms=env.STATS_MAX_WINDOW_AGE_MS,
         )
+
+        # AD-23: Stats buffer with tiered retention and backpressure
+        # Records progress stats and signals backpressure to workers when buffer fills
+        self._stats_buffer = StatsBuffer(StatsBufferConfig(
+            hot_max_entries=env.MANAGER_STATS_HOT_MAX_ENTRIES,
+            throttle_threshold=env.MANAGER_STATS_THROTTLE_THRESHOLD,
+            batch_threshold=env.MANAGER_STATS_BATCH_THRESHOLD,
+            reject_threshold=env.MANAGER_STATS_REJECT_THRESHOLD,
+        ))
 
         # Stats push interval from config (in milliseconds)
         self._stats_push_interval_ms = env.STATS_PUSH_INTERVAL_MS
@@ -5705,6 +5718,10 @@ class ManagerServer(HealthAwareServer):
         try:
             progress = WorkflowProgress.load(data)
 
+            # AD-23: Record progress to stats buffer for backpressure tracking
+            # Use rate_per_second as the value metric to track load
+            self._stats_buffer.record(progress.rate_per_second or 0.0)
+
             # Confirm worker is alive for this job (AD-30 job-layer detection)
             # Receiving progress proves the worker is responsive for this job
             self._task_runner.run(self._confirm_worker_for_job, progress.job_id, addr)
@@ -6038,17 +6055,28 @@ class ManagerServer(HealthAwareServer):
         Args:
             job_id: If provided, includes the current job leader address so the worker
                     can route future progress updates correctly (esp. after failover).
+
+        Returns:
+            WorkflowProgressAck with topology info and AD-23 backpressure signal.
         """
         # Get job leader address if job_id is provided
         job_leader_addr: tuple[str, int] | None = None
         if job_id:
             job_leader_addr = self._get_job_leader_addr(job_id)
 
+        # AD-23: Get current backpressure level from stats buffer and create signal
+        backpressure_level = self._stats_buffer.get_backpressure_level()
+        backpressure_signal = BackpressureSignal.from_level(backpressure_level)
+
         return WorkflowProgressAck(
             manager_id=self._node_id.full,
             is_leader=self.is_leader(),
             healthy_managers=self._get_healthy_managers(),
             job_leader_addr=job_leader_addr,
+            # AD-23: Include backpressure signal for worker throttling
+            backpressure_level=backpressure_signal.level.value,
+            backpressure_delay_ms=backpressure_signal.suggested_delay_ms,
+            backpressure_batch_only=backpressure_signal.batch_only,
         )
     
     def _parse_workflow_token(self, workflow_id: str) -> tuple[str, str] | None:

@@ -11,7 +11,7 @@ import time
 from dataclasses import dataclass
 from enum import Enum
 
-from hyperscale.logging.hyperscale_logger import HyperscaleLogger
+from hyperscale.logging import Logger
 from hyperscale.logging.hyperscale_logging_models import ServerDebug, ServerWarning
 
 
@@ -109,7 +109,7 @@ class WorkflowStateMachine:
     Thread-safe via asyncio.Lock.
     """
 
-    def __init__(self, logger: HyperscaleLogger, node_host: str, node_port: int, node_id: str):
+    def __init__(self, logger: Logger, node_host: str, node_port: int, node_id: str):
         """
         Initialize workflow state machine.
 
