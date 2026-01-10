@@ -270,6 +270,9 @@ class WorkerServer(HealthAwareServer):
         self._extension_requested: bool = False
         self._extension_reason: str = ""
         self._extension_current_progress: float = 0.0  # 0.0-1.0 progress indicator
+        # AD-26 Issue 4: Absolute metrics for more robust progress tracking
+        self._extension_completed_items: int = 0
+        self._extension_total_items: int = 0
 
         # Overload detection (AD-18)
         # Workers use HybridOverloadDetector to track CPU/memory/latency
@@ -315,6 +318,9 @@ class WorkerServer(HealthAwareServer):
             get_extension_requested=lambda: self._extension_requested,
             get_extension_reason=lambda: self._extension_reason,
             get_extension_current_progress=lambda: self._extension_current_progress,
+            # AD-26 Issue 4: Absolute metrics fields
+            get_extension_completed_items=lambda: self._extension_completed_items,
+            get_extension_total_items=lambda: self._extension_total_items,
         )
         
         # Initialize parent HealthAwareServer
@@ -1545,9 +1551,18 @@ class WorkerServer(HealthAwareServer):
             extension_requested=self._extension_requested,
             extension_reason=self._extension_reason,
             extension_current_progress=self._extension_current_progress,
+            # AD-26 Issue 4: Absolute metrics
+            extension_completed_items=self._extension_completed_items,
+            extension_total_items=self._extension_total_items,
         )
 
-    def request_extension(self, reason: str, progress: float = 0.0) -> None:
+    def request_extension(
+        self,
+        reason: str,
+        progress: float = 0.0,
+        completed_items: int = 0,
+        total_items: int = 0,
+    ) -> None:
         """
         Request a deadline extension via heartbeat piggyback (AD-26).
 
@@ -1556,13 +1571,21 @@ class WorkerServer(HealthAwareServer):
         received. This is more efficient than a separate TCP call for
         extension requests.
 
+        AD-26 Issue 4: Supports absolute metrics (completed_items, total_items)
+        which are preferred over relative progress for robustness.
+
         Args:
             reason: Human-readable reason for the extension request.
             progress: Current progress (0.0-1.0) to help manager make decisions.
+            completed_items: Absolute count of completed items (preferred metric).
+            total_items: Total items to complete.
         """
         self._extension_requested = True
         self._extension_reason = reason
         self._extension_current_progress = max(0.0, min(1.0, progress))
+        # AD-26 Issue 4: Store absolute metrics
+        self._extension_completed_items = completed_items
+        self._extension_total_items = total_items
 
     def clear_extension_request(self) -> None:
         """
@@ -1574,6 +1597,9 @@ class WorkerServer(HealthAwareServer):
         self._extension_requested = False
         self._extension_reason = ""
         self._extension_current_progress = 0.0
+        # AD-26 Issue 4: Clear absolute metrics
+        self._extension_completed_items = 0
+        self._extension_total_items = 0
     
     # =========================================================================
     # Core Allocation (delegates to CoreAllocator)

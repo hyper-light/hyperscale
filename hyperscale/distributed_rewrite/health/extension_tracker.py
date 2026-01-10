@@ -30,6 +30,10 @@ class ExtensionTracker:
     Extensions require progress since the last extension to be granted.
     This prevents stuck workers from getting unlimited extensions.
 
+    AD-26 Issue 4: Supports both absolute metrics (completed_items) and
+    relative metrics (current_progress). Absolute metrics are preferred
+    as they avoid float precision issues with values close to 1.0.
+
     Graceful Exhaustion:
     - When remaining extensions hit warning_threshold, sends warning
     - After exhaustion, grace_period gives final time before eviction
@@ -44,6 +48,7 @@ class ExtensionTracker:
         grace_period: Seconds of grace after exhaustion before kill (default 10.0).
         extension_count: Number of extensions granted so far.
         last_progress: Progress value at last extension (for comparison).
+        last_completed_items: Absolute completed items at last extension (for comparison).
         total_extended: Total seconds extended so far.
         last_extension_time: Timestamp of last extension grant.
         exhaustion_time: Timestamp when extensions were exhausted (None if not exhausted).
@@ -58,6 +63,7 @@ class ExtensionTracker:
     grace_period: float = 10.0
     extension_count: int = 0
     last_progress: float = 0.0
+    last_completed_items: int | None = None  # AD-26 Issue 4: Track absolute metrics
     total_extended: float = 0.0
     last_extension_time: float = field(default_factory=time.monotonic)
     exhaustion_time: float | None = None
@@ -67,6 +73,8 @@ class ExtensionTracker:
         self,
         reason: str,
         current_progress: float,
+        completed_items: int | None = None,
+        total_items: int | None = None,
     ) -> tuple[bool, float, str | None, bool]:
         """
         Request a deadline extension.
@@ -75,12 +83,18 @@ class ExtensionTracker:
         1. max_extensions has not been reached
         2. Progress has been made since the last extension
 
+        AD-26 Issue 4: Prioritizes absolute metrics (completed_items) over
+        relative progress (current_progress) when available. This avoids
+        float precision issues with values close to 1.0.
+
         The extension amount uses logarithmic decay:
         grant = max(min_grant, base_deadline / 2^(extension_count + 1))
 
         Args:
             reason: Reason for requesting extension (for logging).
             current_progress: Current progress metric (must increase to show progress).
+            completed_items: Absolute count of completed items (preferred metric).
+            total_items: Total items to complete (for validation).
 
         Returns:
             Tuple of (granted, extension_seconds, denial_reason, is_warning).
@@ -102,14 +116,26 @@ class ExtensionTracker:
             )
 
         # Check for progress since last extension
-        # Progress must strictly increase to demonstrate the worker is not stuck
-        if self.extension_count > 0 and current_progress <= self.last_progress:
-            return (
-                False,
-                0.0,
-                f"No progress since last extension (current={current_progress}, last={self.last_progress})",
-                False,
-            )
+        # AD-26 Issue 4: Prioritize absolute metrics when available
+        if self.extension_count > 0:
+            # Use absolute metrics if both current and last values are available
+            if completed_items is not None and self.last_completed_items is not None:
+                # Strict increase required for absolute metrics
+                if completed_items <= self.last_completed_items:
+                    return (
+                        False,
+                        0.0,
+                        f"No progress since last extension (completed_items={completed_items}, last={self.last_completed_items})",
+                        False,
+                    )
+            # Fall back to relative progress if absolute metrics not available
+            elif current_progress <= self.last_progress:
+                return (
+                    False,
+                    0.0,
+                    f"No progress since last extension (current_progress={current_progress}, last={self.last_progress})",
+                    False,
+                )
 
         # Calculate extension grant with logarithmic decay
         # grant = base / 2^(n+1) where n = extension_count
@@ -119,6 +145,8 @@ class ExtensionTracker:
         # Update state
         self.extension_count += 1
         self.last_progress = current_progress
+        if completed_items is not None:
+            self.last_completed_items = completed_items
         self.total_extended += grant
         self.last_extension_time = time.monotonic()
 
@@ -139,6 +167,7 @@ class ExtensionTracker:
         """
         self.extension_count = 0
         self.last_progress = 0.0
+        self.last_completed_items = None  # AD-26 Issue 4: Reset absolute metrics
         self.total_extended = 0.0
         self.last_extension_time = time.monotonic()
         self.exhaustion_time = None

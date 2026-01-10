@@ -162,6 +162,9 @@ class WorkerStateEmbedder:
     get_extension_requested: Callable[[], bool] | None = None
     get_extension_reason: Callable[[], str] | None = None
     get_extension_current_progress: Callable[[], float] | None = None
+    # AD-26 Issue 4: Absolute metrics fields
+    get_extension_completed_items: Callable[[], int] | None = None
+    get_extension_total_items: Callable[[], int] | None = None
 
     def get_state(self) -> bytes | None:
         """Get WorkerHeartbeat to embed in SWIM messages."""
@@ -200,6 +203,13 @@ class WorkerStateEmbedder:
             extension_current_progress=self.get_extension_current_progress()
             if self.get_extension_current_progress
             else 0.0,
+            # AD-26 Issue 4: Absolute metrics fields
+            extension_completed_items=self.get_extension_completed_items()
+            if self.get_extension_completed_items
+            else 0,
+            extension_total_items=self.get_extension_total_items()
+            if self.get_extension_total_items
+            else 0,
         )
         return heartbeat.dump()
 

@@ -554,9 +554,12 @@ class WorkerHeartbeat(Message):
     # Workers can request deadline extensions via heartbeat instead of separate TCP call
     extension_requested: bool = False
     extension_reason: str = ""
-    extension_current_progress: float = 0.0  # 0.0-1.0 progress indicator
+    extension_current_progress: float = 0.0  # 0.0-1.0 progress indicator (backward compatibility)
     extension_estimated_completion: float = 0.0  # Estimated seconds until completion
     extension_active_workflow_count: int = 0  # Number of workflows currently executing
+    # AD-26 Issue 4: Absolute progress metrics (preferred over relative progress)
+    extension_completed_items: int = 0  # Absolute count of completed items
+    extension_total_items: int = 0      # Total items to complete
 
 
 @dataclass(slots=True)
@@ -982,12 +985,20 @@ class HealthcheckExtensionRequest(Message):
     - Continues until min_grant is reached
 
     Sent from: Worker -> Manager
+
+    AD-26 Issue 4: Absolute metrics provide more robust progress tracking
+    than relative 0-1 progress values. For long-running work, absolute
+    metrics (100 items → 101 items) are easier to track than relative
+    progress (0.995 → 0.996) and avoid float precision issues.
     """
     worker_id: str               # Worker requesting extension
     reason: str                  # Why extension is needed
-    current_progress: float      # Progress metric (must increase for approval)
+    current_progress: float      # Progress metric (must increase for approval) - kept for backward compatibility
     estimated_completion: float  # Estimated seconds until completion
     active_workflow_count: int   # Number of workflows currently executing
+    # AD-26 Issue 4: Absolute progress metrics (preferred over relative progress)
+    completed_items: int | None = None  # Absolute count of completed items
+    total_items: int | None = None      # Total items to complete
 
 
 @dataclass(slots=True)

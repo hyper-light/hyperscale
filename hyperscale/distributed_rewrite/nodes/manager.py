@@ -2023,12 +2023,15 @@ class ManagerServer(HealthAwareServer):
         )
 
         # Create extension request from heartbeat data (AD-26 Issue 1 fix)
+        # AD-26 Issue 4: Pass absolute metrics from heartbeat
         request = HealthcheckExtensionRequest(
             worker_id=heartbeat.node_id,
             reason=heartbeat.extension_reason or "heartbeat_piggyback",
             current_progress=heartbeat.extension_current_progress,
             estimated_completion=heartbeat.extension_estimated_completion,
             active_workflow_count=heartbeat.extension_active_workflow_count,
+            completed_items=heartbeat.extension_completed_items if heartbeat.extension_completed_items > 0 else None,
+            total_items=heartbeat.extension_total_items if heartbeat.extension_total_items > 0 else None,
         )
 
         # Handle extension request

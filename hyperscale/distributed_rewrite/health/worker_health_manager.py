@@ -124,9 +124,12 @@ class WorkerHealthManager:
         tracker = self._get_tracker(request.worker_id)
 
         # Attempt to grant extension
+        # AD-26 Issue 4: Pass absolute metrics to prioritize over relative progress
         granted, extension_seconds, denial_reason, is_warning = tracker.request_extension(
             reason=request.reason,
             current_progress=request.current_progress,
+            completed_items=request.completed_items,
+            total_items=request.total_items,
         )
 
         if granted:
