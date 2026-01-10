@@ -169,6 +169,7 @@ class FederatedHealthMonitor:
     _send_udp: Callable[[tuple[str, int], bytes], Awaitable[bool]] | None = None
     _on_dc_health_change: Callable[[str, str], None] | None = None  # (dc, new_health)
     _on_dc_latency: Callable[[str, float], None] | None = None  # (dc, latency_ms) - Phase 7
+    _on_dc_leader_change: Callable[[str, str, tuple[str, int], tuple[str, int], int], None] | None = None  # (dc, leader_node_id, tcp_addr, udp_addr, term)
     
     # State
     _dc_health: dict[str, DCHealthState] = field(default_factory=dict)
@@ -182,6 +183,7 @@ class FederatedHealthMonitor:
         node_id: str,
         on_dc_health_change: Callable[[str, str], None] | None = None,
         on_dc_latency: Callable[[str, float], None] | None = None,
+        on_dc_leader_change: Callable[[str, str, tuple[str, int], tuple[str, int], int], None] | None = None,
     ) -> None:
         """
         Set callback functions.
@@ -193,12 +195,15 @@ class FederatedHealthMonitor:
             on_dc_health_change: Called when DC health changes (dc, new_health).
             on_dc_latency: Called with latency measurements (dc, latency_ms).
                 Used for cross-DC correlation to distinguish network issues.
+            on_dc_leader_change: Called when DC leader changes (dc, leader_node_id, tcp_addr, udp_addr, term).
+                Used to propagate DC leadership changes to peer gates.
         """
         self._send_udp = send_udp
         self.cluster_id = cluster_id
         self.node_id = node_id
         self._on_dc_health_change = on_dc_health_change
         self._on_dc_latency = on_dc_latency
+        self._on_dc_leader_change = on_dc_leader_change
     
     def add_datacenter(
         self,
@@ -238,31 +243,54 @@ class FederatedHealthMonitor:
         leader_tcp_addr: tuple[str, int] | None = None,
         leader_node_id: str = "",
         leader_term: int = 0,
-    ) -> None:
-        """Update DC leader address (from leader announcement)."""
+    ) -> bool:
+        """
+        Update DC leader address (from leader announcement).
+
+        Returns True if leader actually changed (term is higher), False otherwise.
+        """
         if datacenter not in self._dc_health:
             self.add_datacenter(
                 datacenter, leader_udp_addr, leader_tcp_addr,
                 leader_node_id, leader_term
             )
-            return
-        
+            # New DC is considered a change
+            if self._on_dc_leader_change and leader_tcp_addr:
+                self._on_dc_leader_change(
+                    datacenter, leader_node_id, leader_tcp_addr, leader_udp_addr, leader_term
+                )
+            return True
+
         state = self._dc_health[datacenter]
-        
+
         # Only update if term is higher (prevent stale updates)
         if leader_term < state.leader_term:
-            return
-        
+            return False
+
+        # Check if this is an actual leader change (term increased or node changed)
+        leader_changed = (
+            leader_term > state.leader_term or
+            leader_node_id != state.leader_node_id
+        )
+
         state.leader_udp_addr = leader_udp_addr
         if leader_tcp_addr:
             state.leader_tcp_addr = leader_tcp_addr
         state.leader_node_id = leader_node_id
         state.leader_term = leader_term
-        
+
         # Reset suspicion on leader change
         if state.reachability == DCReachability.SUSPECTED:
             state.reachability = DCReachability.UNREACHABLE
             state.consecutive_failures = 0
+
+        # Fire callback if leader actually changed
+        if leader_changed and self._on_dc_leader_change and leader_tcp_addr:
+            self._on_dc_leader_change(
+                datacenter, leader_node_id, leader_tcp_addr, leader_udp_addr, leader_term
+            )
+
+        return leader_changed
     
     def get_dc_health(self, datacenter: str) -> DCHealthState | None:
         """Get current health state for a datacenter."""

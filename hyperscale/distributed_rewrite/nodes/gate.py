@@ -30,6 +30,7 @@ from typing import Any
 import cloudpickle
 
 from hyperscale.distributed_rewrite.server import tcp, udp
+from hyperscale.distributed_rewrite.leases import JobLease
 from hyperscale.reporting.results import Results
 from hyperscale.reporting.reporter import Reporter
 from hyperscale.reporting.common import ReporterTypes
@@ -2975,8 +2976,9 @@ class GateServer(HealthAwareServer):
             node_id=self._node_id.full,
             on_dc_health_change=self._on_dc_health_change,
             on_dc_latency=self._on_dc_latency,
+            on_dc_leader_change=self._on_dc_leader_change,
         )
-        
+
         # Add known DC leaders to monitor (will be updated via TCP registrations)
         for dc, manager_udp_addrs in list(self._datacenter_manager_udp.items()):
             if manager_udp_addrs:
@@ -3146,6 +3148,101 @@ class GateServer(HealthAwareServer):
             latency_ms=latency_ms,
             probe_type="federated",
         )
+
+    def _on_dc_leader_change(
+        self,
+        datacenter: str,
+        leader_node_id: str,
+        leader_tcp_addr: tuple[str, int],
+        leader_udp_addr: tuple[str, int],
+        term: int,
+    ) -> None:
+        """
+        Called when a datacenter's leader changes.
+
+        Broadcasts the leadership change to all peer gates so they can update
+        their FederatedHealthMonitor with the new leader information.
+
+        Args:
+            datacenter: The datacenter whose leader changed.
+            leader_node_id: Node ID of the new leader.
+            leader_tcp_addr: TCP address (host, port) of the new leader.
+            leader_udp_addr: UDP address (host, port) of the new leader.
+            term: The leader's term number.
+        """
+        self._task_runner.run(
+            self._udp_logger.log,
+            ServerInfo(
+                message=(
+                    f"DC {datacenter} leader changed to {leader_node_id} "
+                    f"at {leader_tcp_addr[0]}:{leader_tcp_addr[1]} (term {term})"
+                ),
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+
+        # Broadcast DC leader change to peer gates
+        self._task_runner.run(
+            self._broadcast_dc_leader_announcement,
+            datacenter,
+            leader_node_id,
+            leader_tcp_addr,
+            leader_udp_addr,
+            term,
+        )
+
+    async def _broadcast_dc_leader_announcement(
+        self,
+        datacenter: str,
+        leader_node_id: str,
+        leader_tcp_addr: tuple[str, int],
+        leader_udp_addr: tuple[str, int],
+        term: int,
+    ) -> None:
+        """
+        Broadcast a DC leader announcement to all peer gates.
+
+        Ensures all gates in the cluster learn about DC leadership changes,
+        even if they don't directly observe the change via probes.
+        """
+        if not self._active_gate_peers:
+            return
+
+        announcement = DCLeaderAnnouncement(
+            datacenter=datacenter,
+            leader_node_id=leader_node_id,
+            leader_tcp_addr=leader_tcp_addr,
+            leader_udp_addr=leader_udp_addr,
+            term=term,
+        )
+
+        broadcast_count = 0
+        for peer_addr in self._active_gate_peers:
+            try:
+                await self.send_tcp(
+                    peer_addr,
+                    "dc_leader_announcement",
+                    announcement.dump(),
+                    timeout=2.0,
+                )
+                broadcast_count += 1
+            except Exception:
+                # Best effort - peer may be down
+                pass
+
+        if broadcast_count > 0:
+            await self._udp_logger.log(
+                ServerInfo(
+                    message=(
+                        f"Broadcast DC {datacenter} leader change to {broadcast_count} peer gates"
+                    ),
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
 
     def _record_peer_gate_latency(self, gate_id: str, latency_ms: float) -> None:
         """
@@ -6054,6 +6151,52 @@ class GateServer(HealthAwareServer):
                 responder_id=self._node_id.full,
                 error=str(e),
             ).dump()
+
+    @tcp.receive()
+    async def dc_leader_announcement(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ):
+        """
+        Handle DC leader announcement from peer gate.
+
+        When a gate observes a DC leadership change (via FederatedHealthMonitor),
+        it broadcasts to peers. Receiving gates update their FederatedHealthMonitor
+        with the new leader information to enable faster discovery.
+        """
+        try:
+            announcement = DCLeaderAnnouncement.load(data)
+
+            # Update our FederatedHealthMonitor with the new leader info
+            # update_leader will reject stale announcements (lower term)
+            updated = self._dc_health_monitor.update_leader(
+                datacenter=announcement.datacenter,
+                leader_udp_addr=announcement.leader_udp_addr,
+                leader_tcp_addr=announcement.leader_tcp_addr,
+                leader_node_id=announcement.leader_node_id,
+                leader_term=announcement.term,
+            )
+
+            if updated:
+                await self._udp_logger.log(
+                    ServerDebug(
+                        message=(
+                            f"Updated DC {announcement.datacenter} leader from peer: "
+                            f"{announcement.leader_node_id[:8]}... (term {announcement.term})"
+                        ),
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+
+            return b'ok'
+
+        except Exception as e:
+            await self.handle_exception(e, "dc_leader_announcement")
+            return b'error'
 
     @tcp.receive()
     async def job_leader_manager_transfer(
