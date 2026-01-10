@@ -373,7 +373,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             "sample_count": local_coord.sample_count,
             "config": {
                 "dimensions": self._vivaldi_config.dimensions,
-                "learning_rate": self._vivaldi_config.learning_rate,
+                "ce": self._vivaldi_config.ce,
                 "error_decay": self._vivaldi_config.error_decay,
                 "convergence_threshold": self._vivaldi_config.convergence_error_threshold,
             },

@@ -7,7 +7,7 @@ This document tracks the remaining implementation work for AD-34, AD-35, AD-36, 
 **Implementation Status** (as of 2026-01-10):
 - **AD-34**: ✅ **100% COMPLETE** - All critical gaps fixed, fully functional for multi-DC deployments
 - **AD-35**: ✅ **100% COMPLETE** - Vivaldi coordinates, SWIM integration, UNCONFIRMED lifecycle, adaptive timeouts, role classification, role gossip, and RoleAwareConfirmationManager all implemented and integrated
-- **AD-36**: 5% complete - Only basic health bucket selection implemented, entire routing subsystem missing
+- **AD-36**: 65% COMPLETE - Full routing module implemented, needs gate.py integration
 - **AD-37**: ✅ **100% COMPLETE** - Message classification, backpressure levels, BATCH aggregation implemented
 
 ---
