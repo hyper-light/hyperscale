@@ -62,15 +62,15 @@ class PiggybackUpdate:
     def to_bytes(self) -> bytes:
         """
         Serialize update for transmission.
-        
+
         Uses pre-allocated constants and caching for performance.
-        Format: type:incarnation:host:port
+        Format: type:incarnation:host:port[:role] (role is optional, AD-35 Task 12.4.3)
         """
         # Use cached update type bytes
         type_bytes = _UPDATE_TYPE_CACHE.get(self.update_type)
         if type_bytes is None:
             type_bytes = self.update_type.encode()
-        
+
         # Use cached host encoding (module-level shared cache)
         host = self.node[0]
         host_bytes = _HOST_BYTES_CACHE.get(host)
@@ -79,26 +79,35 @@ class PiggybackUpdate:
             # Limit cache size
             if len(_HOST_BYTES_CACHE) < _MAX_HOST_CACHE_SIZE:
                 _HOST_BYTES_CACHE[host] = host_bytes
-        
+
         # Use pre-allocated delimiter and integer encoding
-        return (
+        result = (
             type_bytes + DELIM_COLON +
             encode_int(self.incarnation) + DELIM_COLON +
             host_bytes + DELIM_COLON +
             encode_int(self.node[1])
         )
+
+        # AD-35 Task 12.4.3: Append role if present (backward compatible)
+        if self.role:
+            result += DELIM_COLON + self.role.encode()
+
+        return result
     
     @classmethod
     def from_bytes(cls, data: bytes) -> 'PiggybackUpdate | None':
         """
         Deserialize an update from bytes.
-        
+
         Uses string interning for hosts to reduce memory when
         the same hosts appear in many updates.
+
+        AD-35 Task 12.4.3: Parses optional 5th field (role) if present.
+        Backward compatible - defaults role to None if not present.
         """
         try:
-            # Use maxsplit for efficiency - we only need 4 parts
-            parts = data.decode().split(':', maxsplit=3)
+            # Split into parts - maxsplit=4 to get up to 5 parts (type:inc:host:port:role)
+            parts = data.decode().split(':', maxsplit=4)
             if len(parts) < 4:
                 return None
             update_type = parts[0]
@@ -106,11 +115,14 @@ class PiggybackUpdate:
             # Intern host string to share memory across updates
             host = sys.intern(parts[2])
             port = int(parts[3])
+            # AD-35 Task 12.4.3: Parse role if present (backward compatible)
+            role = parts[4] if len(parts) >= 5 else None
             return cls(
                 update_type=update_type,
                 node=(host, port),
                 incarnation=incarnation,
                 timestamp=time.monotonic(),
+                role=role,
             )
         except (ValueError, UnicodeDecodeError):
             return None

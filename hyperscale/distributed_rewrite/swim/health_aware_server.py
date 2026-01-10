@@ -1786,7 +1786,12 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             self._metrics.increment("leaves_propagated")
 
         n_members = self._get_member_count()
-        self._gossip_buffer.add_update(update_type, node, incarnation, n_members)
+        # AD-35 Task 12.4.3: Include role in gossip updates
+        role = self._peer_roles.get(node, None) if hasattr(self, "_peer_roles") else None
+        # If this is our own node, use our role
+        if node == self._get_self_udp_addr():
+            role = self._node_role
+        self._gossip_buffer.add_update(update_type, node, incarnation, n_members, role)
 
     def get_piggyback_data(self, max_updates: int = 5) -> bytes:
         """Get piggybacked membership updates to append to a message."""
@@ -1797,6 +1802,16 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         updates = GossipBuffer.decode_piggyback(data)
         self._metrics.increment("gossip_updates_received", len(updates))
         for update in updates:
+            # AD-35 Task 12.4.3: Extract and store peer role from gossip
+            if update.role and hasattr(self, "_peer_roles"):
+                from hyperscale.distributed_rewrite.models.distributed import NodeRole
+
+                try:
+                    self._peer_roles[update.node] = NodeRole(update.role.lower())
+                except ValueError:
+                    # Invalid role, ignore
+                    pass
+
             status_map = {
                 "alive": b"OK",
                 "join": b"OK",

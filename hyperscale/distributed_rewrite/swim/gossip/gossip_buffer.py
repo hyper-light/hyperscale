@@ -70,14 +70,22 @@ class GossipBuffer:
         node: tuple[str, int],
         incarnation: int,
         n_members: int = 1,
+        role: str | None = None,
     ) -> bool:
         """
         Add or update a membership update in the buffer.
-        
+
         If an update for the same node exists with lower incarnation,
         it is replaced. Updates with equal or higher incarnation are
         only replaced if the new status has higher priority.
-        
+
+        Args:
+            update_type: Type of update (alive, suspect, dead, etc.)
+            node: Node address (host, port)
+            incarnation: Incarnation number
+            n_members: Number of members (for broadcast count calculation)
+            role: Optional node role (AD-35 Task 12.4.3)
+
         Returns:
             True if update was added, False if rejected due to limits.
         """
@@ -99,23 +107,25 @@ class GossipBuffer:
         existing = self.updates.get(node)
         
         if existing is None:
-            # New update
+            # New update (AD-35: include role)
             self.updates[node] = PiggybackUpdate(
                 update_type=update_type,
                 node=node,
                 incarnation=incarnation,
                 timestamp=time.monotonic(),
                 max_broadcasts=max_broadcasts,
+                role=role,
             )
             return True
         elif incarnation > existing.incarnation:
-            # Higher incarnation replaces
+            # Higher incarnation replaces (AD-35: include role)
             self.updates[node] = PiggybackUpdate(
                 update_type=update_type,
                 node=node,
                 incarnation=incarnation,
                 timestamp=time.monotonic(),
                 max_broadcasts=max_broadcasts,
+                role=role,
             )
             return True
         elif incarnation == existing.incarnation:
