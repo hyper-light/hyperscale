@@ -558,6 +558,13 @@ class ManagerServer(HealthAwareServer):
         self._overload_detector = HybridOverloadDetector()
         self._load_shedder = LoadShedder(self._overload_detector)
 
+        # Throughput tracking for AD-19 Three-Signal Health Model
+        # Tracks workflow dispatches per interval for health signal calculation
+        self._dispatch_throughput_count: int = 0
+        self._dispatch_throughput_interval_start: float = time.monotonic()
+        self._dispatch_throughput_last_value: float = 0.0
+        self._dispatch_throughput_interval_seconds: float = getattr(env, 'MANAGER_THROUGHPUT_INTERVAL_SECONDS', 10.0)
+
         # Rate limiting infrastructure (AD-24)
         # Per-client rate limiting with automatic cleanup
         self._rate_limiter = ServerRateLimiter(
@@ -669,8 +676,8 @@ class ManagerServer(HealthAwareServer):
             # Health piggyback fields (AD-19)
             get_health_accepting_jobs=lambda: self._manager_state == ManagerState.ACTIVE,
             get_health_has_quorum=self._has_quorum_available,
-            get_health_throughput=lambda: 0.0,  # Actual throughput tracking deferred
-            get_health_expected_throughput=lambda: 0.0,  # Expected throughput calculation deferred
+            get_health_throughput=self._get_dispatch_throughput,
+            get_health_expected_throughput=self._get_expected_dispatch_throughput,
             get_health_overload_state=lambda: self._overload_detector.get_state(0.0, 0.0),
             # Gate leader tracking for propagation among managers
             get_current_gate_leader_id=lambda: self._current_gate_leader_id,
@@ -2626,7 +2633,61 @@ class ManagerServer(HealthAwareServer):
         
         active_count = len(self._active_manager_peers) + 1  # Include self
         return active_count >= self._quorum_size
-    
+
+    def _record_dispatch_throughput_event(self) -> None:
+        """
+        Record a workflow dispatch event for throughput tracking (AD-19).
+
+        Called when a workflow is successfully dispatched to a worker.
+        """
+        self._dispatch_throughput_count += 1
+
+    def _get_dispatch_throughput(self) -> float:
+        """
+        Get current dispatch throughput (dispatches per second) for AD-19 health signal.
+
+        Calculates throughput as dispatches within the current measurement interval.
+        When the interval expires, resets the counter and caches the last value.
+
+        Returns:
+            Throughput in workflows per second.
+        """
+        current_time = time.monotonic()
+        elapsed = current_time - self._dispatch_throughput_interval_start
+
+        # If interval has expired, calculate final throughput and reset
+        if elapsed >= self._dispatch_throughput_interval_seconds:
+            if elapsed > 0:
+                self._dispatch_throughput_last_value = self._dispatch_throughput_count / elapsed
+            self._dispatch_throughput_count = 0
+            self._dispatch_throughput_interval_start = current_time
+            return self._dispatch_throughput_last_value
+
+        # Within interval - calculate running throughput
+        if elapsed > 0:
+            return self._dispatch_throughput_count / elapsed
+        return self._dispatch_throughput_last_value
+
+    def _get_expected_dispatch_throughput(self) -> float:
+        """
+        Get expected dispatch throughput based on available worker capacity (AD-19).
+
+        Expected throughput is calculated based on total available cores across
+        all healthy workers. This represents the theoretical maximum dispatch
+        capacity if all workers are utilized.
+
+        Returns:
+            Expected throughput in workflows per second (based on core availability).
+        """
+        total_available_cores = self._get_available_cores_for_healthy_workers()
+        if total_available_cores == 0:
+            return 0.0
+
+        # Assume each core can complete a workflow in ~30 seconds on average
+        # This gives us an expected "workflows per second" based on capacity
+        average_workflow_seconds = 30.0
+        return total_available_cores / average_workflow_seconds
+
     def get_quorum_status(self) -> dict:
         """
         Get current quorum and circuit breaker status.
@@ -4432,7 +4493,11 @@ class ManagerServer(HealthAwareServer):
             True if the worker accepted the dispatch, False otherwise
         """
         ack = await self._dispatch_workflow_to_worker(worker_node_id, dispatch)
-        return ack is not None and ack.accepted
+        success = ack is not None and ack.accepted
+        if success:
+            # Record throughput event for AD-19 Three-Signal Health Model
+            self._record_dispatch_throughput_event()
+        return success
 
     async def _dispatch_workflow_to_worker(
         self,

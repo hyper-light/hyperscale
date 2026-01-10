@@ -301,6 +301,13 @@ class GateServer(HealthAwareServer):
         self._overload_detector = HybridOverloadDetector()
         self._load_shedder = LoadShedder(self._overload_detector)
 
+        # Throughput tracking for AD-19 Three-Signal Health Model
+        # Tracks job forwards per interval for health signal calculation
+        self._forward_throughput_count: int = 0
+        self._forward_throughput_interval_start: float = time.monotonic()
+        self._forward_throughput_last_value: float = 0.0
+        self._forward_throughput_interval_seconds: float = getattr(env, 'GATE_THROUGHPUT_INTERVAL_SECONDS', 10.0)
+
         # Rate limiting infrastructure (AD-24)
         # Per-client rate limiting with automatic cleanup
         self._rate_limiter = ServerRateLimiter(
@@ -500,8 +507,8 @@ class GateServer(HealthAwareServer):
             # Health piggyback fields (AD-19)
             get_health_has_dc_connectivity=lambda: len(self._datacenter_managers) > 0,
             get_health_connected_dc_count=self._count_active_datacenters,
-            get_health_throughput=lambda: 0.0,  # Actual throughput tracking deferred
-            get_health_expected_throughput=lambda: 0.0,  # Expected throughput calculation deferred
+            get_health_throughput=self._get_forward_throughput,
+            get_health_expected_throughput=self._get_expected_forward_throughput,
             get_health_overload_state=lambda: self._overload_detector.get_state(0.0, 0.0),
         ))
         
@@ -1813,6 +1820,69 @@ class GateServer(HealthAwareServer):
                     break  # Only count DC once
         return active_count
 
+    def _record_forward_throughput_event(self) -> None:
+        """
+        Record a job forward event for throughput tracking (AD-19).
+
+        Called when a job is successfully forwarded to a datacenter manager.
+        """
+        self._forward_throughput_count += 1
+
+    def _get_forward_throughput(self) -> float:
+        """
+        Get current forward throughput (jobs per second) for AD-19 health signal.
+
+        Calculates throughput as job forwards within the current measurement interval.
+        When the interval expires, resets the counter and caches the last value.
+
+        Returns:
+            Throughput in jobs per second.
+        """
+        current_time = time.monotonic()
+        elapsed = current_time - self._forward_throughput_interval_start
+
+        # If interval has expired, calculate final throughput and reset
+        if elapsed >= self._forward_throughput_interval_seconds:
+            if elapsed > 0:
+                self._forward_throughput_last_value = self._forward_throughput_count / elapsed
+            self._forward_throughput_count = 0
+            self._forward_throughput_interval_start = current_time
+            return self._forward_throughput_last_value
+
+        # Within interval - calculate running throughput
+        if elapsed > 0:
+            return self._forward_throughput_count / elapsed
+        return self._forward_throughput_last_value
+
+    def _get_expected_forward_throughput(self) -> float:
+        """
+        Get expected forward throughput based on connected DC capacity (AD-19).
+
+        Expected throughput is calculated based on the number of active datacenters
+        and their available manager capacity. Each active DC contributes to the
+        expected throughput based on manager count.
+
+        Returns:
+            Expected throughput in jobs per second (based on DC capacity).
+        """
+        active_dc_count = self._count_active_datacenters()
+        if active_dc_count == 0:
+            return 0.0
+
+        # Calculate total manager count across active DCs
+        total_managers = 0
+        for datacenter_id, managers in self._datacenter_managers.items():
+            if datacenter_id in self._datacenter_manager_status:
+                total_managers += len(managers)
+
+        if total_managers == 0:
+            return 0.0
+
+        # Assume each manager can handle ~10 jobs per second
+        # This gives us an expected "jobs per second" based on capacity
+        jobs_per_manager_per_second = 10.0
+        return total_managers * jobs_per_manager_per_second
+
     def _get_known_managers_for_piggyback(self) -> dict[str, tuple[str, int, str, int, str]]:
         """
         Get known managers for piggybacking in SWIM heartbeats.
@@ -2595,6 +2665,8 @@ class GateServer(HealthAwareServer):
             if success:
                 # Confirm manager is responsive for this DC (AD-30)
                 self._task_runner.run(self._confirm_manager_for_dc, dc, manager_addr)
+                # Record throughput event for AD-19 Three-Signal Health Model
+                self._record_forward_throughput_event()
                 # Return the accepting manager address for job leader tracking
                 return (True, None, manager_addr)
             else:

@@ -286,6 +286,16 @@ class WorkerServer(HealthAwareServer):
         self._overload_poll_interval: float = getattr(env, 'WORKER_OVERLOAD_POLL_INTERVAL', 0.25)  # 250ms default
         self._overload_poll_task: asyncio.Task | None = None
 
+        # Throughput tracking for AD-19 Three-Signal Health Model
+        # Tracks workflow completions per interval for health signal calculation
+        self._throughput_completions: int = 0
+        self._throughput_interval_start: float = time.monotonic()
+        self._throughput_last_value: float = 0.0
+        self._throughput_interval_seconds: float = getattr(env, 'WORKER_THROUGHPUT_INTERVAL_SECONDS', 10.0)
+        # Track average completion time for expected throughput calculation
+        self._completion_times: list[float] = []  # Recent completion times in seconds
+        self._completion_times_max_samples: int = 50
+
         # Protocol version negotiation result (AD-25)
         # Set during registration response handling
         self._negotiated_capabilities: NegotiatedCapabilities | None = None
@@ -315,8 +325,8 @@ class WorkerServer(HealthAwareServer):
             get_tcp_port=lambda: self._tcp_port,
             # Health piggyback fields (AD-19)
             get_health_accepting_work=lambda: self._get_worker_state() in (WorkerState.HEALTHY, WorkerState.DEGRADED),
-            get_health_throughput=lambda: 0.0,  # Actual throughput tracking deferred
-            get_health_expected_throughput=lambda: 0.0,  # Expected throughput calculation deferred
+            get_health_throughput=self._get_current_throughput,
+            get_health_expected_throughput=self._get_expected_throughput,
             get_health_overload_state=self._get_overload_state_str,
             # Extension request fields (AD-26)
             get_extension_requested=lambda: self._extension_requested,
@@ -1558,6 +1568,78 @@ class WorkerServer(HealthAwareServer):
         """
         self._overload_detector.record_latency(latency_ms)
 
+    def _record_throughput_event(self, completion_time_seconds: float) -> None:
+        """
+        Record a workflow completion event for throughput tracking (AD-19).
+
+        Called when a workflow completes. Updates the completion counter
+        and records completion time for expected throughput calculation.
+
+        Args:
+            completion_time_seconds: Time taken to complete the workflow in seconds.
+        """
+        self._throughput_completions += 1
+        self._completion_times.append(completion_time_seconds)
+        # Keep only the most recent samples
+        if len(self._completion_times) > self._completion_times_max_samples:
+            self._completion_times = self._completion_times[-self._completion_times_max_samples:]
+
+    def _get_current_throughput(self) -> float:
+        """
+        Get current throughput (completions per second) for AD-19 health signal.
+
+        Calculates throughput as completions within the current measurement interval.
+        When the interval expires, resets the counter and caches the last value.
+
+        Returns:
+            Throughput in workflows per second.
+        """
+        current_time = time.monotonic()
+        elapsed = current_time - self._throughput_interval_start
+
+        # If interval has expired, calculate final throughput and reset
+        if elapsed >= self._throughput_interval_seconds:
+            if elapsed > 0:
+                self._throughput_last_value = self._throughput_completions / elapsed
+            self._throughput_completions = 0
+            self._throughput_interval_start = current_time
+            return self._throughput_last_value
+
+        # Within interval - calculate running throughput
+        if elapsed > 0:
+            return self._throughput_completions / elapsed
+        return self._throughput_last_value
+
+    def _get_expected_throughput(self) -> float:
+        """
+        Get expected throughput based on active workflows and historical completion times (AD-19).
+
+        Expected throughput is calculated as:
+        - active_workflow_count / average_completion_time
+
+        This represents the theoretical maximum throughput if all active workflows
+        complete at the historical average rate.
+
+        Returns:
+            Expected throughput in workflows per second.
+        """
+        active_count = len(self._active_workflows)
+        if active_count == 0:
+            return 0.0
+
+        # Calculate average completion time from recent samples
+        if not self._completion_times:
+            # No historical data - use a reasonable default (30 seconds)
+            average_completion_time = 30.0
+        else:
+            average_completion_time = sum(self._completion_times) / len(self._completion_times)
+
+        # Prevent division by zero
+        if average_completion_time <= 0:
+            average_completion_time = 1.0
+
+        return active_count / average_completion_time
+
     def _get_state_snapshot(self) -> WorkerStateSnapshot:
         """Get a complete state snapshot."""
         return WorkerStateSnapshot(
@@ -2452,6 +2534,8 @@ class WorkerServer(HealthAwareServer):
             if new_status == WorkflowStatus.COMPLETED:
                 latency_ms = progress.elapsed_seconds * 1000.0
                 self._record_workflow_latency(latency_ms)
+                # Record throughput event for AD-19 Three-Signal Health Model
+                self._record_throughput_event(progress.elapsed_seconds)
 
         # Always send lifecycle transitions immediately (not buffered)
         # This ensures short-running workflows still get all state updates
