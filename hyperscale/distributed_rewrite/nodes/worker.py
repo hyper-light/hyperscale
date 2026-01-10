@@ -745,24 +745,26 @@ class WorkerServer(HealthAwareServer):
         Called periodically to prevent memory leaks from abandoned transfers.
         """
         current_time = time.monotonic()
-        stale_job_ids = []
+        stale_job_ids = [
+            job_id
+            for job_id, pending in self._pending_transfers.items()
+            if current_time - pending.received_at > self._pending_transfer_ttl
+        ]
 
-        for job_id, pending in self._pending_transfers.items():
-            if current_time - pending.received_at > self._pending_transfer_ttl:
-                stale_job_ids.append(job_id)
+        if not stale_job_ids:
+            return
 
         for job_id in stale_job_ids:
             del self._pending_transfers[job_id]
 
-        if stale_job_ids:
-            await self._udp_logger.log(
-                ServerDebug(
-                    message=f"Cleaned up {len(stale_job_ids)} stale pending transfers",
-                    node_host=self._host,
-                    node_port=self._tcp_port,
-                    node_id=self._node_id.short,
-                )
+        await self._udp_logger.log(
+            ServerDebug(
+                message=f"Cleaned up {len(stale_job_ids)} stale pending transfers",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
             )
+        )
 
     def _on_node_dead(self, node_addr: tuple[str, int]) -> None:
         """
@@ -976,86 +978,96 @@ class WorkerServer(HealthAwareServer):
         status changes, workers can immediately update their primary manager.
         """
         # AD-29: Confirm this peer in the SWIM layer since we received their heartbeat
-        # This allows the suspicion subprotocol to function properly
         self.confirm_peer(source_addr)
 
-        # Find or create manager info for this address
         manager_id = heartbeat.node_id
-        
-        # Check if this is a known manager
         existing_manager = self._known_managers.get(manager_id)
-        
-        if existing_manager:
-            # Update is_leader status if it changed
-            old_is_leader = existing_manager.is_leader
-            if heartbeat.is_leader != old_is_leader:
-                # Update the manager info with new leadership status
-                self._known_managers[manager_id] = ManagerInfo(
-                    node_id=existing_manager.node_id,
-                    tcp_host=existing_manager.tcp_host,
-                    tcp_port=existing_manager.tcp_port,
-                    udp_host=existing_manager.udp_host,
-                    udp_port=existing_manager.udp_port,
-                    datacenter=heartbeat.datacenter,
-                    is_leader=heartbeat.is_leader,
-                )
-                
-                # If this manager became the leader, switch primary
-                if heartbeat.is_leader and self._primary_manager_id != manager_id:
-                    old_primary = self._primary_manager_id
-                    self._primary_manager_id = manager_id
-                    
-                    self._task_runner.run(
-                        self._udp_logger.log,
-                        ServerInfo(
-                            message=f"Leadership change via SWIM: {old_primary} -> {manager_id}",
-                            node_host=self._host,
-                            node_port=self._tcp_port,
-                            node_id=self._node_id.short,
-                        )
-                    )
-        else:
-            # New manager discovered via SWIM - create entry
-            # Use TCP address from heartbeat if available, fallback to convention
-            tcp_host = heartbeat.tcp_host if heartbeat.tcp_host else source_addr[0]
-            tcp_port = heartbeat.tcp_port if heartbeat.tcp_port else source_addr[1] - 1
-            new_manager = ManagerInfo(
-                node_id=manager_id,
-                tcp_host=tcp_host,
-                tcp_port=tcp_port,
-                udp_host=source_addr[0],
-                udp_port=source_addr[1],
-                datacenter=heartbeat.datacenter,
-                is_leader=heartbeat.is_leader,
-            )
-            self._known_managers[manager_id] = new_manager
-            self._healthy_manager_ids.add(manager_id)
 
+        if existing_manager:
+            self._update_existing_manager_from_heartbeat(heartbeat, manager_id, existing_manager)
+        else:
+            self._register_new_manager_from_heartbeat(heartbeat, manager_id, source_addr)
+
+        # Process job leadership updates from this manager
+        if heartbeat.job_leaderships:
+            self._process_job_leadership_heartbeat(heartbeat, source_addr)
+
+    def _update_existing_manager_from_heartbeat(
+        self,
+        heartbeat: ManagerHeartbeat,
+        manager_id: str,
+        existing_manager: ManagerInfo,
+    ) -> None:
+        """Update existing manager info from heartbeat if leadership changed."""
+        if heartbeat.is_leader == existing_manager.is_leader:
+            return
+
+        # Update the manager info with new leadership status
+        self._known_managers[manager_id] = ManagerInfo(
+            node_id=existing_manager.node_id,
+            tcp_host=existing_manager.tcp_host,
+            tcp_port=existing_manager.tcp_port,
+            udp_host=existing_manager.udp_host,
+            udp_port=existing_manager.udp_port,
+            datacenter=heartbeat.datacenter,
+            is_leader=heartbeat.is_leader,
+        )
+
+        # If this manager became the leader, switch primary
+        if heartbeat.is_leader and self._primary_manager_id != manager_id:
+            old_primary = self._primary_manager_id
+            self._primary_manager_id = manager_id
             self._task_runner.run(
                 self._udp_logger.log,
                 ServerInfo(
-                    message=f"Discovered new manager via SWIM: {manager_id} (leader={heartbeat.is_leader})",
+                    message=f"Leadership change via SWIM: {old_primary} -> {manager_id}",
                     node_host=self._host,
                     node_port=self._tcp_port,
                     node_id=self._node_id.short,
                 )
             )
 
-            # Register with the newly discovered manager for consistency
-            # This ensures all managers know about this worker
-            self._task_runner.run(
-                self._register_with_manager,
-                (new_manager.tcp_host, new_manager.tcp_port),
+    def _register_new_manager_from_heartbeat(
+        self,
+        heartbeat: ManagerHeartbeat,
+        manager_id: str,
+        source_addr: tuple[str, int],
+    ) -> None:
+        """Register a new manager discovered via SWIM heartbeat."""
+        tcp_host = heartbeat.tcp_host or source_addr[0]
+        tcp_port = heartbeat.tcp_port or (source_addr[1] - 1)
+
+        new_manager = ManagerInfo(
+            node_id=manager_id,
+            tcp_host=tcp_host,
+            tcp_port=tcp_port,
+            udp_host=source_addr[0],
+            udp_port=source_addr[1],
+            datacenter=heartbeat.datacenter,
+            is_leader=heartbeat.is_leader,
+        )
+        self._known_managers[manager_id] = new_manager
+        self._healthy_manager_ids.add(manager_id)
+
+        self._task_runner.run(
+            self._udp_logger.log,
+            ServerInfo(
+                message=f"Discovered new manager via SWIM: {manager_id} (leader={heartbeat.is_leader})",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
             )
+        )
 
-            # If this is a leader and we don't have one, use it
-            if heartbeat.is_leader and not self._primary_manager_id:
-                self._primary_manager_id = manager_id
+        # Register with the newly discovered manager for consistency
+        self._task_runner.run(
+            self._register_with_manager,
+            (new_manager.tcp_host, new_manager.tcp_port),
+        )
 
-        # Process job leadership updates from this manager
-        # This enables proactive job leader discovery via UDP heartbeats
-        if heartbeat.job_leaderships:
-            self._process_job_leadership_heartbeat(heartbeat, source_addr)
+        # If this is a leader and we don't have one, use it
+        if heartbeat.is_leader and not self._primary_manager_id:
+            self._primary_manager_id = manager_id
 
     def _process_job_leadership_heartbeat(
         self,
@@ -1284,62 +1296,23 @@ class WorkerServer(HealthAwareServer):
         # Set _running to False early to stop all background loops
         self._running = False
 
-        # Cancel progress flush loop
-        if self._progress_flush_task and not self._progress_flush_task.done():
+        # Cancel all background tasks
+        for task in self._get_background_tasks():
+            self._cancel_background_task_sync(task)
+
+        # Abort monitors and pools with exception handling
+        abort_targets = [
+            self._cpu_monitor.abort_all_background_monitors,
+            self._memory_monitor.abort_all_background_monitors,
+            self._remote_manger.abort,
+            self._server_pool.abort,
+        ]
+
+        for abort_func in abort_targets:
             try:
-                self._progress_flush_task.cancel()
-            except Exception:
+                abort_func()
+            except (Exception, asyncio.CancelledError):
                 pass
-
-        # Cancel dead manager reap loop
-        if self._dead_manager_reap_task and not self._dead_manager_reap_task.done():
-            try:
-                self._dead_manager_reap_task.cancel()
-            except Exception:
-                pass
-
-        # Cancel cancellation poll loop
-        if self._cancellation_poll_task and not self._cancellation_poll_task.done():
-            try:
-                self._cancellation_poll_task.cancel()
-            except Exception:
-                pass
-
-        # Cancel orphan check loop (Section 2.7)
-        if self._orphan_check_task and not self._orphan_check_task.done():
-            try:
-                self._orphan_check_task.cancel()
-            except Exception:
-                pass
-
-        # Cancel discovery maintenance loop (AD-28)
-        if self._discovery_maintenance_task and not self._discovery_maintenance_task.done():
-            try:
-                self._discovery_maintenance_task.cancel()
-            except Exception:
-                pass
-
-        try:
-            self._cpu_monitor.abort_all_background_monitors()
-
-        except Exception:
-            pass
-
-        try:
-            self._memory_monitor.abort_all_background_monitors()
-
-        except Exception:
-            pass
-
-        try:
-            self._remote_manger.abort()
-        except (Exception, asyncio.CancelledError):
-            pass
-
-        try:
-            self._server_pool.abort()
-        except (Exception, asyncio.CancelledError):
-            pass
 
         return super().abort()
     
@@ -3168,6 +3141,119 @@ class WorkerServer(HealthAwareServer):
     # TCP Handlers - Job Leadership Transfer (AD-31, Section 8)
     # =========================================================================
 
+    async def _log_transfer_start(
+        self,
+        transfer: JobLeaderWorkerTransfer,
+        job_id: str,
+    ) -> None:
+        """Log the start of job leadership transfer processing."""
+        old_manager_str = transfer.old_manager_id[:8] if transfer.old_manager_id else "unknown"
+        await self._udp_logger.log(
+            ServerDebug(
+                message=(
+                    f"Processing job leadership transfer: job={job_id[:8]}..., "
+                    f"new_manager={transfer.new_manager_id[:8]}..., "
+                    f"old_manager={old_manager_str}..., "
+                    f"fence_token={transfer.fence_token}, "
+                    f"workflows={len(transfer.workflow_ids)}"
+                ),
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+
+    async def _validate_and_reject_transfer(
+        self,
+        transfer: JobLeaderWorkerTransfer,
+        job_id: str,
+    ) -> bytes | None:
+        """
+        Validate transfer and return rejection response if invalid, None if valid.
+        """
+        # Validate fence token
+        fence_valid, fence_reason = self._validate_transfer_fence_token(
+            job_id, transfer.fence_token
+        )
+        if not fence_valid:
+            self._transfer_metrics_rejected_stale_token += 1
+            await self._udp_logger.log(
+                ServerWarning(
+                    message=f"Rejected job leadership transfer for job {job_id[:8]}...: {fence_reason}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            return JobLeaderWorkerTransferAck(
+                job_id=job_id,
+                worker_id=self._node_id.full,
+                workflows_updated=0,
+                accepted=False,
+                rejection_reason=fence_reason,
+                fence_token_received=transfer.fence_token,
+            ).dump()
+
+        # Validate new manager is known
+        manager_valid, manager_reason = self._validate_transfer_manager(
+            transfer.new_manager_id
+        )
+        if not manager_valid:
+            self._transfer_metrics_rejected_unknown_manager += 1
+            await self._udp_logger.log(
+                ServerWarning(
+                    message=f"Rejected job leadership transfer for job {job_id[:8]}...: {manager_reason}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            return JobLeaderWorkerTransferAck(
+                job_id=job_id,
+                worker_id=self._node_id.full,
+                workflows_updated=0,
+                accepted=False,
+                rejection_reason=manager_reason,
+                fence_token_received=transfer.fence_token,
+            ).dump()
+
+        return None
+
+    def _apply_workflow_routing_updates(
+        self,
+        transfer: JobLeaderWorkerTransfer,
+    ) -> tuple[int, int, list[str], dict[str, str]]:
+        """
+        Apply routing updates to workflows for a transfer.
+
+        Returns: (workflows_updated, workflows_rescued, workflows_not_found, workflow_states)
+        """
+        workflows_updated = 0
+        workflows_rescued_from_orphan = 0
+        workflows_not_found: list[str] = []
+        workflow_states: dict[str, str] = {}
+
+        for workflow_id in transfer.workflow_ids:
+            if workflow_id not in self._active_workflows:
+                workflows_not_found.append(workflow_id)
+                continue
+
+            # Update routing if leader changed
+            current_leader = self._workflow_job_leader.get(workflow_id)
+            if current_leader != transfer.new_manager_addr:
+                self._workflow_job_leader[workflow_id] = transfer.new_manager_addr
+                workflows_updated += 1
+
+            # Clear from orphaned workflows if present (Section 2.7)
+            if workflow_id in self._orphaned_workflows:
+                del self._orphaned_workflows[workflow_id]
+                workflows_rescued_from_orphan += 1
+
+            # Collect workflow state for ack
+            workflow_states[workflow_id] = self._active_workflows[workflow_id].status
+
+        return (workflows_updated, workflows_rescued_from_orphan, workflows_not_found, workflow_states)
+
     @tcp.receive()
     async def job_leader_worker_transfer(
         self,
@@ -3201,101 +3287,26 @@ class WorkerServer(HealthAwareServer):
             transfer = JobLeaderWorkerTransfer.load(data)
             job_id = transfer.job_id
 
-            # 8.7: Detailed logging - start of transfer processing
-            await self._udp_logger.log(
-                ServerDebug(
-                    message=f"Processing job leadership transfer: job={job_id[:8]}..., "
-                            f"new_manager={transfer.new_manager_id[:8]}..., "
-                            f"old_manager={transfer.old_manager_id[:8] if transfer.old_manager_id else 'unknown'}..., "
-                            f"fence_token={transfer.fence_token}, "
-                            f"workflows={len(transfer.workflow_ids)}",
-                    node_host=self._host,
-                    node_port=self._tcp_port,
-                    node_id=self._node_id.short,
-                )
-            )
+            await self._log_transfer_start(transfer, job_id)
 
             # 8.1: Acquire per-job lock to prevent race conditions
             job_lock = self._get_job_transfer_lock(job_id)
             async with job_lock:
-
-                # 8.2: Validate fence token (reject stale transfers)
-                fence_valid, fence_reason = self._validate_transfer_fence_token(
-                    job_id, transfer.fence_token
-                )
-                if not fence_valid:
-                    self._transfer_metrics_rejected_stale_token += 1
-                    await self._udp_logger.log(
-                        ServerWarning(
-                            message=f"Rejected job leadership transfer for job {job_id[:8]}...: {fence_reason}",
-                            node_host=self._host,
-                            node_port=self._tcp_port,
-                            node_id=self._node_id.short,
-                        )
-                    )
-                    return JobLeaderWorkerTransferAck(
-                        job_id=job_id,
-                        worker_id=self._node_id.full,
-                        workflows_updated=0,
-                        accepted=False,
-                        rejection_reason=fence_reason,
-                        fence_token_received=transfer.fence_token,
-                    ).dump()
-
-                # 8.2: Validate new manager is known
-                manager_valid, manager_reason = self._validate_transfer_manager(
-                    transfer.new_manager_id
-                )
-                if not manager_valid:
-                    self._transfer_metrics_rejected_unknown_manager += 1
-                    await self._udp_logger.log(
-                        ServerWarning(
-                            message=f"Rejected job leadership transfer for job {job_id[:8]}...: {manager_reason}",
-                            node_host=self._host,
-                            node_port=self._tcp_port,
-                            node_id=self._node_id.short,
-                        )
-                    )
-                    return JobLeaderWorkerTransferAck(
-                        job_id=job_id,
-                        worker_id=self._node_id.full,
-                        workflows_updated=0,
-                        accepted=False,
-                        rejection_reason=manager_reason,
-                        fence_token_received=transfer.fence_token,
-                    ).dump()
+                # 8.2: Validate transfer
+                rejection = await self._validate_and_reject_transfer(transfer, job_id)
+                if rejection is not None:
+                    return rejection
 
                 # Update fence token now that we've validated
                 self._job_fence_tokens[job_id] = transfer.fence_token
 
-                workflows_updated = 0
-                workflows_rescued_from_orphan = 0
-                workflows_not_found: list[str] = []
-                workflow_states: dict[str, str] = {}
-
-                # Update routing for each workflow mentioned in the transfer
-                for workflow_id in transfer.workflow_ids:
-                    # Check if we have this workflow active
-                    if workflow_id in self._active_workflows:
-                        current_leader = self._workflow_job_leader.get(workflow_id)
-                        new_leader = transfer.new_manager_addr
-
-                        if current_leader != new_leader:
-                            self._workflow_job_leader[workflow_id] = new_leader
-                            workflows_updated += 1
-
-                        # Clear from orphaned workflows if present (Section 2.7)
-                        # Transfer arrived before grace period expired - workflow is rescued
-                        if workflow_id in self._orphaned_workflows:
-                            del self._orphaned_workflows[workflow_id]
-                            workflows_rescued_from_orphan += 1
-
-                        # 8.4: Collect workflow state for ack
-                        workflow_progress = self._active_workflows[workflow_id]
-                        workflow_states[workflow_id] = workflow_progress.status
-                    else:
-                        # Workflow not found - might arrive later
-                        workflows_not_found.append(workflow_id)
+                # Process workflow routing updates
+                (
+                    workflows_updated,
+                    workflows_rescued_from_orphan,
+                    workflows_not_found,
+                    workflow_states,
+                ) = self._apply_workflow_routing_updates(transfer)
 
                 # 8.3: Store as pending transfer if some workflows weren't found
                 # This handles the edge case where transfer arrives before workflow dispatch
@@ -3396,6 +3407,20 @@ class WorkerServer(HealthAwareServer):
             )
             return ack.dump()
 
+    def _build_already_completed_response(
+        self,
+        job_id: str,
+        workflow_id: str,
+    ) -> bytes:
+        """Build a WorkflowCancelResponse for already completed/cancelled workflows."""
+        return WorkflowCancelResponse(
+            job_id=job_id,
+            workflow_id=workflow_id,
+            success=True,
+            was_running=False,
+            already_completed=True,
+        ).dump()
+
     @tcp.receive()
     async def cancel_workflow(
         self,
@@ -3411,56 +3436,33 @@ class WorkerServer(HealthAwareServer):
         """
         try:
             request = WorkflowCancelRequest.load(data)
-
-            # Check if workflow exists
             progress = self._active_workflows.get(request.workflow_id)
-            if not progress:
-                # Workflow not found - check if it was already completed/cancelled
-                # Return success with already_completed=True if we have no record
-                response = WorkflowCancelResponse(
-                    job_id=request.job_id,
-                    workflow_id=request.workflow_id,
-                    success=True,
-                    was_running=False,
-                    already_completed=True,
-                )
-                return response.dump()
 
-            # Check if workflow is for the specified job (safety check)
+            # Workflow not found - already completed/cancelled
+            if not progress:
+                return self._build_already_completed_response(request.job_id, request.workflow_id)
+
+            # Safety check: verify workflow belongs to specified job
             if progress.job_id != request.job_id:
-                response = WorkflowCancelResponse(
+                return WorkflowCancelResponse(
                     job_id=request.job_id,
                     workflow_id=request.workflow_id,
                     success=False,
                     error=f"Workflow {request.workflow_id} belongs to job {progress.job_id}, not {request.job_id}",
-                )
-                return response.dump()
+                ).dump()
 
-            # Check if already cancelled
-            if progress.status == WorkflowStatus.CANCELLED.value:
-                response = WorkflowCancelResponse(
-                    job_id=request.job_id,
-                    workflow_id=request.workflow_id,
-                    success=True,
-                    was_running=False,
-                    already_completed=True,
-                )
-                return response.dump()
-
-            # Check if already completed or failed
-            if progress.status in (WorkflowStatus.COMPLETED.value, WorkflowStatus.FAILED.value):
-                response = WorkflowCancelResponse(
-                    job_id=request.job_id,
-                    workflow_id=request.workflow_id,
-                    success=True,
-                    was_running=False,
-                    already_completed=True,
-                )
-                return response.dump()
+            # Already in terminal state
+            terminal_statuses = (
+                WorkflowStatus.CANCELLED.value,
+                WorkflowStatus.COMPLETED.value,
+                WorkflowStatus.FAILED.value,
+            )
+            if progress.status in terminal_statuses:
+                return self._build_already_completed_response(request.job_id, request.workflow_id)
 
             # Cancel the workflow
             was_running = progress.status == WorkflowStatus.RUNNING.value
-            cancelled, cancel_errors = await self._cancel_workflow(request.workflow_id, "manager_cancel_request")
+            cancelled, _ = await self._cancel_workflow(request.workflow_id, "manager_cancel_request")
 
             if cancelled:
                 await self._udp_logger.log(
@@ -3472,31 +3474,29 @@ class WorkerServer(HealthAwareServer):
                     )
                 )
 
-            response = WorkflowCancelResponse(
+            return WorkflowCancelResponse(
                 job_id=request.job_id,
                 workflow_id=request.workflow_id,
                 success=cancelled,
                 was_running=was_running,
                 already_completed=False,
-            )
-            return response.dump()
+            ).dump()
 
-        except Exception as e:
+        except Exception as error:
             await self._udp_logger.log(
                 ServerError(
-                    message=f"Failed to cancel workflow: {e}",
+                    message=f"Failed to cancel workflow: {error}",
                     node_host=self._host,
                     node_port=self._tcp_port,
                     node_id=self._node_id.short,
                 )
             )
-            response = WorkflowCancelResponse(
+            return WorkflowCancelResponse(
                 job_id="unknown",
                 workflow_id="unknown",
                 success=False,
-                error=str(e),
-            )
-            return response.dump()
+                error=str(error),
+            ).dump()
 
     @tcp.receive()
     async def workflow_status_query(
