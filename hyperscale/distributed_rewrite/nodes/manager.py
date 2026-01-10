@@ -53,6 +53,7 @@ from hyperscale.distributed_rewrite.swim.core import (
 )
 from hyperscale.distributed_rewrite.swim.detection import (
     HierarchicalConfig,
+    NodeStatus,
 )
 from hyperscale.distributed_rewrite.models import (
     NodeInfo,
@@ -702,6 +703,9 @@ class ManagerServer(HealthAwareServer):
         # This catches jobs that couldn't be taken over during the election
         # period when is_leader() returned False in _handle_job_leader_failure()
         self._task_runner.run(self._scan_for_orphaned_jobs)
+
+        # AD-34 Part 10.4.5: Resume timeout tracking for all jobs as new leader
+        self._task_runner.run(self._resume_timeout_tracking_for_all_jobs)
     
     def _on_manager_lose_leadership(self) -> None:
         """Called when this manager loses leadership."""
@@ -2938,6 +2942,9 @@ class ManagerServer(HealthAwareServer):
         # Start background cleanup for completed jobs
         self._task_runner.run(self._job_cleanup_loop)
 
+        # Start background timeout checker (AD-34)
+        self._task_runner.run(self._unified_timeout_loop)
+
         # Start background cleanup for rate limiter (AD-24)
         self._task_runner.run(self._rate_limit_cleanup_loop)
 
@@ -2949,6 +2956,9 @@ class ManagerServer(HealthAwareServer):
 
         # Start discovery maintenance loop (AD-28)
         self._discovery_maintenance_task = asyncio.create_task(self._discovery_maintenance_loop())
+
+        # Start deadline enforcement loop (AD-26 Issue 2)
+        self._task_runner.run(self._deadline_enforcement_loop)
 
         # Start periodic job state sync to peer managers
         self._task_runner.run(self._peer_job_state_sync_loop)
@@ -7274,7 +7284,14 @@ class ManagerServer(HealthAwareServer):
                 wf_info.status in failed_statuses
                 for wf_info in job.workflows.values()
             )
-            job.status = JobStatus.FAILED.value if any_failed else JobStatus.COMPLETED.value
+            final_status = JobStatus.FAILED.value if any_failed else JobStatus.COMPLETED.value
+            job.status = final_status
+
+            # Stop timeout tracking (AD-34 Part 10.4.9)
+            strategy = self._job_timeout_strategies.get(job_id)
+            if strategy:
+                reason = "failed" if any_failed else "completed"
+                await strategy.stop_tracking(job_id, reason)
 
             # Clear job-layer suspicions for this job (AD-30)
             # Job is complete, no need to track per-job suspicions anymore
@@ -8025,6 +8042,9 @@ class ManagerServer(HealthAwareServer):
         # Clean up circuit breaker for this worker
         self._worker_circuits.pop(worker_node_id, None)
 
+        # Clean up timeout extension tracking for this worker (AD-34 Part 10.4.9)
+        await self._cleanup_worker_extensions_for_jobs(worker_node_id)
+
         # Step 1: Find all workflows on this worker in active states
         # Store tuples of (job_id, workflow_token, subworkflow_token)
         # - workflow_token: 4-part token for job.workflows lookups (DC:mgr:job:wf)
@@ -8659,6 +8679,322 @@ class ManagerServer(HealthAwareServer):
         self._cancellation_completion_events.pop(job_id, None)
         self._cancellation_initiated_at.pop(job_id, None)
 
+        # Clean up timeout strategy tracking (AD-34 Part 10.4.9)
+        self._job_timeout_strategies.pop(job_id, None)
+
+    # =========================================================================
+    # Job Timeout Management (AD-34)
+    # =========================================================================
+
+    def _select_timeout_strategy(
+        self, submission: JobSubmission
+    ) -> TimeoutStrategy:
+        """
+        Auto-detect timeout strategy based on deployment type (AD-34 Part 10.4.2).
+
+        Single-DC (no gate): LocalAuthorityTimeout - manager has full authority
+        Multi-DC (with gate): GateCoordinatedTimeout - gate coordinates globally
+
+        Args:
+            submission: Job submission with optional gate_addr
+
+        Returns:
+            Appropriate TimeoutStrategy instance
+        """
+        if submission.gate_addr:
+            # Multi-DC: Gate coordinates timeout across datacenters
+            return GateCoordinatedTimeout(self)
+        else:
+            # Single-DC: Manager has full authority
+            return LocalAuthorityTimeout(self)
+
+    async def _unified_timeout_loop(self) -> None:
+        """
+        Background task that checks for job timeouts (AD-34 Part 10.4.3).
+
+        Runs every 30 seconds (configurable). Only leader checks timeouts.
+        Delegates to strategy.check_timeout() which handles both:
+        - Extension-aware timeout (base_timeout + extensions)
+        - Stuck detection (no progress for 2+ minutes)
+
+        Each strategy implements its own timeout logic:
+        - LocalAuthorityTimeout: Immediately marks job as timed out
+        - GateCoordinatedTimeout: Reports to gate and waits for decision
+        """
+        check_interval = 30.0  # TODO: Move to env.py config
+
+        while self._running:
+            try:
+                await asyncio.sleep(check_interval)
+
+                # Only leader checks timeouts (avoid duplicate checks)
+                if not self.is_leader():
+                    continue
+
+                # Check all tracked jobs
+                for job_id, strategy in list(self._job_timeout_strategies.items()):
+                    try:
+                        timed_out, reason = await strategy.check_timeout(job_id)
+
+                        if timed_out:
+                            await self._udp_logger.log(
+                                ServerWarning(
+                                    message=f"Job {job_id} timed out: {reason}",
+                                    node_host=self._host,
+                                    node_port=self._tcp_port,
+                                    node_id=self._node_id.short,
+                                )
+                            )
+
+                    except Exception as error:
+                        await self._udp_logger.log(
+                            ServerError(
+                                message=f"Error checking timeout for job {job_id}: {error}",
+                                node_host=self._host,
+                                node_port=self._tcp_port,
+                                node_id=self._node_id.short,
+                            )
+                        )
+
+            except Exception as error:
+                await self.handle_exception(error, "_unified_timeout_loop")
+
+    async def _timeout_job(self, job_id: str, reason: str) -> None:
+        """
+        Execute job timeout (AD-34 Part 10.4.6).
+
+        Actions:
+        1. Mark job as TIMEOUT status
+        2. Cancel all workflows (pending and running)
+        3. Notify callback (gate or client)
+        4. Strategy cleanup handled by caller
+
+        Args:
+            job_id: Job to timeout
+            reason: Timeout reason for logging/reporting
+        """
+        job = self._job_manager.get_job_by_id(job_id)
+        if not job:
+            return
+
+        # Check if already terminal (race protection)
+        if job.status in {
+            JobStatus.COMPLETED.value,
+            JobStatus.FAILED.value,
+            JobStatus.CANCELLED.value,
+            JobStatus.TIMEOUT.value,
+        }:
+            return
+
+        # Mark job as timed out
+        async with job.lock:
+            job.status = JobStatus.TIMEOUT.value
+
+        await self._udp_logger.log(
+            ServerWarning(
+                message=f"Timing out job {job_id}: {reason}",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+
+        # Cancel all workflows for this job
+        if self._workflow_dispatcher:
+            try:
+                # Remove pending workflows
+                await self._workflow_dispatcher.remove_pending_workflows_for_job(job_id)
+
+                # Cancel running workflows (via workers)
+                # This is handled by the same flow as job cancellation
+                # We need to notify workers to cancel their workflows
+                workflow_ids = [wf_id for wf_id in job.workflows.keys()]
+
+                for workflow_id in workflow_ids:
+                    # Find worker executing this workflow
+                    worker_id = None
+                    for wid, worker_workflows in self._worker_assignments.items():
+                        if workflow_id in worker_workflows:
+                            worker_id = wid
+                            break
+
+                    if worker_id:
+                        # Send cancellation to worker
+                        worker = self._worker_pool.get_worker(worker_id)
+                        if worker and worker.node:
+                            try:
+                                await self.send_tcp(
+                                    (worker.node.host, worker.node.port),
+                                    "cancel_workflow",
+                                    {
+                                        "job_id": job_id,
+                                        "workflow_id": workflow_id,
+                                        "reason": f"Job timeout: {reason}",
+                                    },
+                                )
+                            except Exception as cancel_error:
+                                await self._udp_logger.log(
+                                    ServerDebug(
+                                        message=f"Failed to send cancellation for {workflow_id} to worker {worker_id}: {cancel_error}",
+                                        node_host=self._host,
+                                        node_port=self._tcp_port,
+                                        node_id=self._node_id.short,
+                                    )
+                                )
+
+            except Exception as error:
+                await self._udp_logger.log(
+                    ServerError(
+                        message=f"Error cancelling workflows for timed out job {job_id}: {error}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+
+        # Notify callback (gate or client)
+        await self._notify_job_callback(job_id)
+
+    async def _notify_timeout_strategies_of_extension(
+        self,
+        worker_id: str,
+        extension_seconds: float,
+        worker_progress: float,
+    ) -> None:
+        """
+        Notify timeout strategies when a worker receives an extension (AD-34 Part 10.4.8).
+
+        Extensions affect timeout calculations:
+        - Extend effective timeout for all jobs this worker is executing
+        - Extension grant = progress signal (updates last_progress_at)
+        - Prevents stuck detection while extensions are being granted
+
+        Args:
+            worker_id: Worker that received extension
+            extension_seconds: Extension duration granted
+            worker_progress: Worker's progress metric (0.0-1.0)
+        """
+        # Find all jobs this worker is executing
+        worker_jobs: set[str] = set()
+
+        for wid, workflow_ids in self._worker_assignments.items():
+            if wid == worker_id:
+                # Extract job_id from workflow_id (format: "job_id:workflow_idx")
+                for workflow_id in workflow_ids:
+                    if ":" in workflow_id:
+                        job_id = workflow_id.split(":", 1)[0]
+                        worker_jobs.add(job_id)
+
+        # Notify strategies for all affected jobs
+        for job_id in worker_jobs:
+            strategy = self._job_timeout_strategies.get(job_id)
+            if strategy:
+                try:
+                    await strategy.record_worker_extension(
+                        job_id=job_id,
+                        worker_id=worker_id,
+                        extension_seconds=extension_seconds,
+                        worker_progress=worker_progress,
+                    )
+                except Exception as error:
+                    await self._udp_logger.log(
+                        ServerError(
+                            message=f"Error recording extension for job {job_id}: {error}",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
+
+    async def _cleanup_worker_extensions_for_jobs(
+        self, worker_id: str
+    ) -> None:
+        """
+        Clean up worker extension tracking when worker fails (AD-34 Part 10.4.9).
+
+        Called from worker failure handler to remove worker from
+        active_workers_with_extensions tracking in all jobs.
+
+        Args:
+            worker_id: Failed worker to remove from extension tracking
+        """
+        for job_id, strategy in list(self._job_timeout_strategies.items()):
+            try:
+                await strategy.cleanup_worker_extensions(job_id, worker_id)
+            except Exception as error:
+                await self._udp_logger.log(
+                    ServerDebug(
+                        message=f"Error cleaning up extensions for worker {worker_id} in job {job_id}: {error}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+
+    async def _resume_timeout_tracking_for_all_jobs(self) -> None:
+        """
+        Resume timeout tracking for all jobs after becoming leader (AD-34 Part 10.4.5).
+
+        When a new manager becomes leader:
+        1. Iterate through all active jobs
+        2. Check if they have timeout_tracking state (from previous leader)
+        3. Resume tracking by incrementing fence token
+        4. If no strategy exists, create new one and call resume_tracking()
+
+        This ensures timeout tracking continues across leader transfers.
+        """
+        all_jobs = self._job_manager.get_all_jobs()
+
+        for job_id, job_info in all_jobs.items():
+            # Skip terminal jobs
+            if job_info.status in {
+                JobStatus.COMPLETED.value,
+                JobStatus.FAILED.value,
+                JobStatus.CANCELLED.value,
+                JobStatus.TIMEOUT.value,
+            }:
+                continue
+
+            # Check if job has timeout tracking state
+            if not job_info.timeout_tracking:
+                continue
+
+            try:
+                # Get or create strategy based on persisted state
+                strategy = self._job_timeout_strategies.get(job_id)
+
+                if not strategy:
+                    # Create strategy based on persisted strategy_type
+                    if job_info.timeout_tracking.strategy_type == "local_authority":
+                        strategy = LocalAuthorityTimeout(self)
+                    elif job_info.timeout_tracking.strategy_type == "gate_coordinated":
+                        strategy = GateCoordinatedTimeout(self)
+                    else:
+                        await self._udp_logger.log(
+                            ServerWarning(
+                                message=f"Unknown timeout strategy type for job {job_id}: {job_info.timeout_tracking.strategy_type}",
+                                node_host=self._host,
+                                node_port=self._tcp_port,
+                                node_id=self._node_id.short,
+                            )
+                        )
+                        continue
+
+                    self._job_timeout_strategies[job_id] = strategy
+
+                # Resume tracking (increments fence token)
+                await strategy.resume_tracking(job_id)
+
+            except Exception as error:
+                await self._udp_logger.log(
+                    ServerError(
+                        message=f"Error resuming timeout tracking for job {job_id}: {error}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+
     async def _dead_node_reap_loop(self) -> None:
         """
         Background loop that reaps dead nodes after the configured intervals.
@@ -8794,6 +9130,124 @@ class ManagerServer(HealthAwareServer):
                 break
             except Exception:
                 pass
+
+    async def _deadline_enforcement_loop(self) -> None:
+        """
+        Background loop for worker deadline enforcement (AD-26 Issue 2).
+
+        Checks worker deadlines every 5 seconds and takes action:
+        - If deadline expired but within grace period: mark worker as SUSPECTED
+        - If deadline expired beyond grace period: evict worker
+
+        The grace period is defined as the base_deadline from WorkerHealthManager config.
+        """
+        while self._running:
+            try:
+                await asyncio.sleep(5.0)
+
+                current_time = time.monotonic()
+                grace_period = self._worker_health_manager._config.base_deadline
+
+                # Snapshot deadlines to avoid modification during iteration
+                deadlines_snapshot = list(self._worker_deadlines.items())
+
+                for worker_id, deadline in deadlines_snapshot:
+                    if current_time <= deadline:
+                        # Deadline not yet expired
+                        continue
+
+                    time_since_deadline = current_time - deadline
+
+                    if time_since_deadline <= grace_period:
+                        # Within grace period - suspect the worker
+                        await self._suspect_worker_deadline_expired(worker_id)
+                    else:
+                        # Beyond grace period - evict the worker
+                        await self._evict_worker_deadline_expired(worker_id)
+
+            except asyncio.CancelledError:
+                break
+            except Exception as exception:
+                await self.handle_exception(exception, "deadline_enforcement_loop")
+
+    async def _suspect_worker_deadline_expired(self, worker_id: str) -> None:
+        """
+        Mark a worker as suspected when its deadline expires (AD-26 Issue 2).
+
+        This is called when a worker's deadline has expired but is still within
+        the grace period. The worker will be marked as SUSPECTED unless it's
+        already in a suspected or dead state.
+
+        Args:
+            worker_id: The worker node ID that missed its deadline
+        """
+        # Get worker info from pool
+        worker = self._worker_pool.get_worker(worker_id)
+        if worker is None:
+            # Worker no longer exists, clean up deadline tracking
+            self._worker_deadlines.pop(worker_id, None)
+            return
+
+        # Get hierarchical detector to check current status
+        hierarchical_detector = self.get_hierarchical_detector()
+        if hierarchical_detector is None:
+            return
+
+        # Construct worker address
+        worker_addr = (worker.tcp_host, worker.udp_port)
+
+        # Check current status
+        current_status = await hierarchical_detector.get_node_status(worker_addr)
+
+        # Don't re-suspect if already suspected or dead
+        if current_status in (NodeStatus.SUSPECTED_GLOBAL, NodeStatus.DEAD_GLOBAL):
+            return
+
+        # Suspect the worker globally
+        await self.suspect_node_global(
+            node=worker_addr,
+            incarnation=worker.incarnation,
+            from_node=(self._host, self._udp_port),
+        )
+
+        # Log warning
+        self._task_runner.run(
+            self._udp_logger.log,
+            ServerWarning(
+                message=f"Worker {worker_id[:8]}... deadline expired, marked as SUSPECTED (within grace period)",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+
+    async def _evict_worker_deadline_expired(self, worker_id: str) -> None:
+        """
+        Evict a worker when its deadline expires beyond the grace period (AD-26 Issue 2).
+
+        This is called when a worker's deadline has been expired for longer than
+        the grace period. The worker is considered failed and all its workflows
+        are re-queued.
+
+        Args:
+            worker_id: The worker node ID to evict
+        """
+        # Log error
+        self._task_runner.run(
+            self._udp_logger.log,
+            ServerError(
+                message=f"Worker {worker_id[:8]}... deadline expired beyond grace period, evicting",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+
+        # Handle worker failure (this will re-queue workflows)
+        await self._handle_worker_failure(worker_id)
+
+        # Clean up deadline tracking
+        self._worker_deadlines.pop(worker_id, None)
 
     def _select_best_worker(self, key: str) -> tuple[str, int] | None:
         """
@@ -9155,6 +9609,16 @@ class ManagerServer(HealthAwareServer):
 
             # Store submission for eager dispatch
             self._job_submissions[submission.job_id] = submission
+
+            # Start timeout tracking (AD-34 Part 10.4.4)
+            # Auto-detect strategy based on gate_addr presence
+            timeout_strategy = self._select_timeout_strategy(submission)
+            await timeout_strategy.start_tracking(
+                job_id=submission.job_id,
+                timeout_seconds=submission.timeout_seconds,
+                gate_addr=tuple(submission.gate_addr) if submission.gate_addr else None,
+            )
+            self._job_timeout_strategies[submission.job_id] = timeout_strategy
 
             # Set this manager as job leader (first to accept = job leader)
             self._job_leaders[submission.job_id] = self._node_id.full
@@ -9642,6 +10106,11 @@ class ManagerServer(HealthAwareServer):
             total_workflows = len(all_workflow_ids)
             total_cancelled = len(successfully_cancelled)
             total_errors = len(workflow_errors)
+
+            # Stop timeout tracking (AD-34 Part 10.4.9)
+            strategy = self._job_timeout_strategies.get(job_id)
+            if strategy:
+                await strategy.stop_tracking(job_id, "cancelled")
 
             # Update job status
             job.status = JobStatus.CANCELLED.value
@@ -10237,6 +10706,13 @@ class ManagerServer(HealthAwareServer):
             # Update stored deadline if granted
             if response.granted:
                 self._worker_deadlines[request.worker_id] = response.new_deadline
+
+                # Notify timeout strategies of extension (AD-34 Part 10.4.7)
+                await self._notify_timeout_strategies_of_extension(
+                    worker_id=request.worker_id,
+                    extension_seconds=response.extension_seconds,
+                    worker_progress=request.progress,
+                )
 
                 await self._udp_logger.log(
                     ServerInfo(
