@@ -154,27 +154,71 @@ class JobManager:
         )
 
     # =========================================================================
-    # Fence Token Management
+    # Fence Token Management (AD-10 compliant)
     # =========================================================================
 
-    def get_next_fence_token(self, job_id: str) -> int:
+    def get_next_fence_token(self, job_id: str, leader_term: int = 0) -> int:
         """
-        Get the next fence token for a job and increment the counter.
+        Get the next fence token for a job, incorporating leader term (AD-10).
 
-        Fence tokens are monotonically increasing per job. Workers use these
-        to reject stale/duplicate dispatch requests, ensuring at-most-once
-        delivery even when network issues cause retries.
+        Token format: (term << 32) | per_job_counter
+
+        This ensures:
+        1. Any fence token from term N+1 is always > any token from term N
+        2. Within a term, per-job counters provide uniqueness
+        3. Workers can validate tokens by comparing against previously seen tokens
+
+        The high 32 bits contain the leader election term, ensuring term-level
+        monotonicity. The low 32 bits contain a per-job counter for dispatch-level
+        uniqueness within a term.
+
+        Args:
+            job_id: Job ID
+            leader_term: Current leader election term (AD-10 requirement)
+
+        Returns:
+            Fence token incorporating term and job-specific counter
 
         Thread-safe: uses simple dict operations which are atomic in CPython.
         """
         current = self._job_fence_tokens.get(job_id, 0)
-        next_token = current + 1
+        # Extract current counter (low 32 bits) and increment
+        current_counter = current & 0xFFFFFFFF
+        next_counter = current_counter + 1
+        # Combine term (high bits) with counter (low bits)
+        next_token = (leader_term << 32) | next_counter
         self._job_fence_tokens[job_id] = next_token
         return next_token
 
     def get_current_fence_token(self, job_id: str) -> int:
         """Get the current fence token for a job without incrementing."""
         return self._job_fence_tokens.get(job_id, 0)
+
+    @staticmethod
+    def extract_term_from_fence_token(fence_token: int) -> int:
+        """
+        Extract leader term from a fence token (AD-10).
+
+        Args:
+            fence_token: A fence token in format (term << 32) | counter
+
+        Returns:
+            The leader term from the high 32 bits
+        """
+        return fence_token >> 32
+
+    @staticmethod
+    def extract_counter_from_fence_token(fence_token: int) -> int:
+        """
+        Extract per-job counter from a fence token (AD-10).
+
+        Args:
+            fence_token: A fence token in format (term << 32) | counter
+
+        Returns:
+            The per-job counter from the low 32 bits
+        """
+        return fence_token & 0xFFFFFFFF
 
     # =========================================================================
     # Job Lifecycle

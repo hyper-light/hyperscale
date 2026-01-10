@@ -66,6 +66,7 @@ class WorkflowDispatcher:
         max_dispatch_attempts: int = 5,
         on_workflow_evicted: Callable[[str, str, str], Coroutine[Any, Any, None]] | None = None,
         on_dispatch_failed: Callable[[str, str, str], Coroutine[Any, Any, None]] | None = None,
+        get_leader_term: Callable[[], int] | None = None,
     ):
         """
         Initialize WorkflowDispatcher.
@@ -83,6 +84,8 @@ class WorkflowDispatcher:
                                Takes (job_id, workflow_id, reason) and is awaited
             on_dispatch_failed: Optional callback when dispatch permanently fails after retries
                                Takes (job_id, workflow_id, reason) and is awaited
+            get_leader_term: Callback to get current leader election term (AD-10 requirement).
+                            Returns the current term for fence token generation.
         """
         self._job_manager = job_manager
         self._worker_pool = worker_pool
@@ -93,6 +96,7 @@ class WorkflowDispatcher:
         self._max_dispatch_attempts = max_dispatch_attempts
         self._on_workflow_evicted = on_workflow_evicted
         self._on_dispatch_failed = on_dispatch_failed
+        self._get_leader_term = get_leader_term
         self._logger = Logger()
 
         # Pending workflows waiting for dependencies/cores
@@ -560,8 +564,9 @@ class WorkflowDispatcher:
                 # Create sub-workflow token
                 sub_token = workflow_token.to_sub_workflow_token(worker_id)
 
-                # Get fence token for at-most-once dispatch
-                fence_token = self._job_manager.get_next_fence_token(pending.job_id)
+                # Get fence token for at-most-once dispatch (AD-10: incorporate leader term)
+                leader_term = self._get_leader_term() if self._get_leader_term else 0
+                fence_token = self._job_manager.get_next_fence_token(pending.job_id, leader_term)
 
                 # Create dispatch message
                 dispatch = WorkflowDispatch(

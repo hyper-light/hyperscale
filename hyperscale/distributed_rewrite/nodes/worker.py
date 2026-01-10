@@ -88,6 +88,9 @@ from hyperscale.distributed_rewrite.reliability import (
     BackpressureLevel,
     BackpressureSignal,
     HybridOverloadDetector,
+    RetryExecutor,
+    RetryConfig,
+    JitterStrategy,
 )
 from hyperscale.distributed_rewrite.protocol.version import (
     CURRENT_PROTOCOL_VERSION,

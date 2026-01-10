@@ -3085,6 +3085,7 @@ class ManagerServer(HealthAwareServer):
                 send_dispatch=self._send_workflow_dispatch,
                 datacenter=self._node_id.datacenter,
                 manager_id=self._node_id.short,
+                get_leader_term=lambda: self._leader_election.state.current_term,  # AD-10
             )
 
             # Wire up event-driven dispatch: when a workflow completes in JobManager,

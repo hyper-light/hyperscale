@@ -113,50 +113,41 @@ References:
 
 ## AD-17 to AD-25 Compliance Fixes
 
-### AD-19 (Three-Signal Health Model) — NOT fully compliant
-**Problem**: Progress/throughput signals are stubbed (`health_throughput` and `health_expected_throughput` return `0.0`) in gate/manager/worker, so the progress signal is effectively disabled.
+### AD-19 (Three-Signal Health Model) — compliant
 
-**Exact changes**:
-- **Worker**: Compute real completions per interval and expected rate, then feed `WorkerHealthState.update_progress()` and SWIM health piggyback.
-  - File: `hyperscale/distributed_rewrite/nodes/worker.py` (`get_health_throughput`, `get_health_expected_throughput` lambdas)
-- **Manager**: Track workflows dispatched per interval and expected throughput from worker capacity; feed `ManagerHealthState.update_progress()` and SWIM health piggyback.
-  - File: `hyperscale/distributed_rewrite/nodes/manager.py` (health embedder lambdas)
-- **Gate**: Track jobs forwarded per interval and expected forward rate; feed `GateHealthState.update_progress()` and SWIM health piggyback.
-  - File: `hyperscale/distributed_rewrite/nodes/gate.py` (health embedder lambdas)
+Progress/throughput signals are implemented and wired to SWIM health piggyback across workers, managers, and gates.
 
-**Acceptance**:
-- Progress state transitions (NORMAL/SLOW/DEGRADED/STUCK) activate based on real rates.
-- Health routing/decision logic can evict or drain based on progress signal.
+References:
+- `hyperscale/distributed_rewrite/nodes/worker.py:1570`
+- `hyperscale/distributed_rewrite/nodes/manager.py:2676`
+- `hyperscale/distributed_rewrite/nodes/gate.py:1898`
 
 ---
 
 ### AD-21 (Unified Retry Framework with Jitter) — NOT fully compliant
-**Problem**: Multiple custom retry loops with fixed exponential backoff exist instead of the unified `RetryExecutor` with jitter.
+**Problem**: Worker code still uses bespoke retry loops with exponential backoff instead of `RetryExecutor`.
+
+**Exact areas**:
+- Worker registration retry loop: `hyperscale/distributed_rewrite/nodes/worker.py:1450` (manual retry + jitter).
+- Progress direct send retry loop: `hyperscale/distributed_rewrite/nodes/worker.py:3017` (manual retry, no jitter helper).
+- Final result send retry loop: `hyperscale/distributed_rewrite/nodes/worker.py:3269` (manual retry, no jitter helper).
 
 **Exact changes**:
-- Replace manual retry loops with `RetryExecutor` in:
-  - `hyperscale/distributed_rewrite/nodes/gate.py:_try_dispatch_to_manager()`
-  - `hyperscale/distributed_rewrite/nodes/manager.py` state sync, peer registration, gate registration, manager registration, worker dispatch paths (all loops using `max_retries` + `base_delay`).
+- Replace these worker loops with `RetryExecutor` using `RetryConfig` (full jitter).
 - Standardize retry configs (base delay, max delay, jitter strategy) via shared helper.
 
 **Acceptance**:
-- All network operations use the unified retry framework with jitter.
-- No bespoke retry loops remain in node code.
+- All worker network retries use `RetryExecutor` with jitter.
 
 ---
 
-### AD-23 (Backpressure for Stats Updates) — NOT fully compliant
-**Problem**: Workers honor `BackpressureSignal`, but managers do not emit backpressure or maintain tiered stats buffers as specified.
+### AD-23 (Backpressure for Stats Updates) — compliant
 
-**Exact changes**:
-- Implement `StatsBuffer` tiered retention (hot/warm/cold) and compute `BackpressureLevel` based on fill ratio.
-  - File: `hyperscale/distributed_rewrite/nodes/manager.py` (stats ingestion + windowed stats processing)
-- Emit `BackpressureSignal` to workers when stats buffers cross thresholds (THROTTLE/BATCH/REJECT).
-- Ensure worker updates respect backpressure signals (already present in `_handle_backpressure_signal`).
+Managers use `StatsBuffer` to compute backpressure levels and send signals in progress acks; workers adjust update behavior based on backpressure.
 
-**Acceptance**:
-- Managers send backpressure signals during stats overload.
-- Workers throttle/batch/drop stats updates accordingly.
+References:
+- `hyperscale/distributed_rewrite/nodes/manager.py:5720`
+- `hyperscale/distributed_rewrite/nodes/worker.py:3325`
 
 ---
 
