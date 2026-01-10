@@ -17,11 +17,11 @@ import asyncio
 import random
 import time
 from base64 import b64decode, b64encode
-from typing import Callable, Literal
+from typing import Callable
 
-from hyperscale.distributed_rewrite.server import tcp, udp, task
+from hyperscale.distributed_rewrite.server import udp
 from hyperscale.distributed_rewrite.server.server.mercury_sync_base_server import MercurySyncBaseServer
-from hyperscale.logging.hyperscale_logging_models import ServerInfo
+from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerDebug
 
 # Core types and utilities
 from .core.types import Status, Nodes, Ctx, UpdateType, Message
@@ -35,12 +35,10 @@ from .core.errors import (
     IndirectProbeTimeoutError,
     ProtocolError,
     MalformedMessageError,
-    UnexpectedMessageError,
     UnexpectedError,
     QueueFullError,
     StaleMessageError,
     ConnectionRefusedError as SwimConnectionRefusedError,
-    SplitBrainError,
     ResourceError,
     TaskOverloadError,
     NotEligibleError,
@@ -50,12 +48,10 @@ from .core.resource_limits import BoundedDict
 from .core.metrics import Metrics
 from .core.audit import AuditLog, AuditEventType
 from .core.retry import (
-    retry_with_backoff,
     retry_with_result,
     PROBE_RETRY_POLICY,
     ELECTION_RETRY_POLICY,
 )
-from .core.error_handler import ErrorContext
 
 # Health monitoring
 from .health.local_health_multiplier import LocalHealthMultiplier
@@ -73,7 +69,6 @@ from .detection.hierarchical_failure_detector import (
     HierarchicalFailureDetector,
     HierarchicalConfig,
     NodeStatus,
-    FailureSource,
 )
 
 # Gossip
@@ -1958,7 +1953,6 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                         except Exception as e:
                             # Best effort - log but don't fail shutdown for send errors
                             send_failures += 1
-                            from hyperscale.logging.hyperscale_logging_models import ServerDebug
                             self._udp_logger.log(ServerDebug(
                                 message=f"Leave broadcast to {node[0]}:{node[1]} failed: {type(e).__name__}",
                                 node_host=self._host,
@@ -1967,7 +1961,6 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                             ))
                 
                 if send_failures > 0:
-                    from hyperscale.logging.hyperscale_logging_models import ServerDebug
                     self._udp_logger.log(ServerDebug(
                         message=f"Leave broadcast: {send_failures}/{len(nodes)-1} sends failed",
                         node_host=self._host,
