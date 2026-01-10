@@ -602,6 +602,36 @@ class GateServer(HealthAwareServer):
             strict_mode=env.get("MTLS_STRICT_MODE", "false").lower() == "true",
         )
 
+        # AD-29: Register peer confirmation callback to activate peers only after
+        # successful SWIM communication (probe/ack or heartbeat reception)
+        self.register_on_peer_confirmed(self._on_peer_confirmed)
+
+    def _on_peer_confirmed(self, peer: tuple[str, int]) -> None:
+        """
+        Add confirmed peer to active peer sets (AD-29).
+
+        Called when a peer is confirmed via successful SWIM communication.
+        This is the ONLY place where peers should be added to active sets,
+        ensuring failure detection only applies to peers we've communicated with.
+
+        Args:
+            peer: The UDP address of the confirmed peer.
+        """
+        # Check if this is a gate peer
+        tcp_addr = self._gate_udp_to_tcp.get(peer)
+        if tcp_addr:
+            # Add to active gate peers since peer is now confirmed
+            self._active_gate_peers.add(tcp_addr)
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerDebug(
+                    message=f"AD-29: Gate peer {tcp_addr[0]}:{tcp_addr[1]} confirmed via SWIM, added to active sets",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+
     def _on_node_dead(self, node_addr: tuple[str, int]) -> None:
         """
         Called when a node is marked as DEAD via SWIM.
@@ -1050,14 +1080,14 @@ class GateServer(HealthAwareServer):
         udp_addr = source_addr  # SWIM source address is always UDP
         if udp_addr not in self._gate_udp_to_tcp:
             self._gate_udp_to_tcp[udp_addr] = peer_tcp_addr
-            # Also add to active peers since this is a new discovery via heartbeat
-            self._active_gate_peers.add(peer_tcp_addr)
+            # AD-29: Do NOT add to active peers here directly - this is handled by
+            # the confirmation callback (_on_peer_confirmed) when confirm_peer() is called above.
         elif self._gate_udp_to_tcp[udp_addr] != peer_tcp_addr:
             # TCP address changed (rare but possible) - update mapping
             old_tcp_addr = self._gate_udp_to_tcp[udp_addr]
             self._active_gate_peers.discard(old_tcp_addr)
             self._gate_udp_to_tcp[udp_addr] = peer_tcp_addr
-            self._active_gate_peers.add(peer_tcp_addr)
+            # AD-29: The new TCP address will be added to active peers via confirmation callback
 
         # Update peer discovery service (AD-28)
         self._peer_discovery.add_peer(

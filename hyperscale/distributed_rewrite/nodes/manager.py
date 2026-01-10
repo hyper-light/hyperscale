@@ -711,7 +711,57 @@ class ManagerServer(HealthAwareServer):
             environment_id=env.get("ENVIRONMENT_ID", "default"),
             strict_mode=env.get("MTLS_STRICT_MODE", "false").lower() == "true",
         )
-    
+
+        # AD-29: Register peer confirmation callback to activate peers only after
+        # successful SWIM communication (probe/ack or heartbeat reception)
+        self.register_on_peer_confirmed(self._on_peer_confirmed)
+
+    def _on_peer_confirmed(self, peer: tuple[str, int]) -> None:
+        """
+        Add confirmed peer to active peer sets (AD-29).
+
+        Called when a peer is confirmed via successful SWIM communication.
+        This is the ONLY place where peers should be added to active sets,
+        ensuring failure detection only applies to peers we've communicated with.
+
+        Args:
+            peer: The UDP address of the confirmed peer.
+        """
+        # Check if this is a manager peer
+        tcp_addr = self._manager_udp_to_tcp.get(peer)
+        if tcp_addr:
+            # Find the peer info by UDP address
+            for peer_id, peer_info in self._known_manager_peers.items():
+                if (peer_info.udp_host, peer_info.udp_port) == peer:
+                    # NOW add to active sets since peer is confirmed
+                    self._active_manager_peer_ids.add(peer_id)
+                    self._active_manager_peers.add(tcp_addr)
+                    self._task_runner.run(
+                        self._udp_logger.log,
+                        ServerDebug(
+                            message=f"AD-29: Manager peer {peer_id[:8]}... confirmed via SWIM, added to active sets",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
+                    break
+            return
+
+        # Check if this is a worker - workers don't have a separate "active" set
+        # but we log confirmation for debugging
+        worker_id = self._worker_addr_to_id.get(peer)
+        if worker_id:
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerDebug(
+                    message=f"AD-29: Worker {worker_id[:8]}... confirmed via SWIM",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+
     def _on_manager_become_leader(self) -> None:
         """
         Called when this manager becomes the leader.
@@ -2171,9 +2221,10 @@ class ManagerServer(HealthAwareServer):
             is_leader=heartbeat.is_leader,
         )
         self._known_manager_peers[heartbeat.node_id] = peer_info
-        self._active_manager_peer_ids.add(heartbeat.node_id)
+        # AD-29: Do NOT add to active sets here directly - this is handled by
+        # the confirmation callback (_on_peer_confirmed) when confirm_peer() is called.
+        # The confirm_peer() call at the top of this method triggers the callback.
         self._manager_udp_to_tcp[source_addr] = tcp_addr
-        self._active_manager_peers.add(tcp_addr)
 
         # Update peer discovery service (AD-28)
         self._peer_discovery.add_peer(
@@ -2746,13 +2797,19 @@ class ManagerServer(HealthAwareServer):
                     for peer_info in response.known_peers:
                         if peer_info.node_id != self._node_id.full:
                             self._known_manager_peers[peer_info.node_id] = peer_info
-                            self._active_manager_peer_ids.add(peer_info.node_id)
+                            # AD-29: Do NOT add to active sets here - defer until confirmed
 
                             # Update UDP -> TCP mapping
                             udp_addr = (peer_info.udp_host, peer_info.udp_port)
                             tcp_addr = (peer_info.tcp_host, peer_info.tcp_port)
                             self._manager_udp_to_tcp[udp_addr] = tcp_addr
-                            self._active_manager_peers.add(tcp_addr)
+
+                            # AD-29: Track as unconfirmed peer - will be moved to active
+                            # sets when we receive successful SWIM communication
+                            self.add_unconfirmed_peer(udp_addr)
+
+                            # Add to SWIM probing so we can confirm the peer
+                            self._probe_scheduler.add_member(udp_addr)
 
                             # Also populate _manager_peer_info for _get_active_manager_peer_addrs()
                             # Create initial heartbeat that will be updated by SWIM
@@ -4978,6 +5035,9 @@ class ManagerServer(HealthAwareServer):
 
             # Add worker to SWIM cluster for UDP healthchecks
             worker_udp_addr = (registration.node.host, registration.node.port)
+
+            # AD-29: Track as unconfirmed peer until we receive successful SWIM communication
+            self.add_unconfirmed_peer(worker_udp_addr)
             self._probe_scheduler.add_member(worker_udp_addr)
 
             self._task_runner.run(
@@ -5277,15 +5337,19 @@ class ManagerServer(HealthAwareServer):
             # Add to known peers if not already tracked
             if peer_info.node_id not in self._known_manager_peers:
                 self._known_manager_peers[peer_info.node_id] = peer_info
-                self._active_manager_peer_ids.add(peer_info.node_id)
+                # AD-29: Do NOT add to active sets here - defer until peer is confirmed
+                # via the confirmation callback. Only add to known_manager_peers for info tracking.
 
                 # Update mappings
                 udp_addr = (peer_info.udp_host, peer_info.udp_port)
                 tcp_addr = (peer_info.tcp_host, peer_info.tcp_port)
                 self._manager_udp_to_tcp[udp_addr] = tcp_addr
-                self._active_manager_peers.add(tcp_addr)
 
-                # Add to SWIM probing
+                # AD-29: Track as unconfirmed peer - will be moved to active sets
+                # when we receive successful SWIM communication (confirm_peer)
+                self.add_unconfirmed_peer(udp_addr)
+
+                # Add to SWIM probing so we can confirm the peer
                 self._probe_scheduler.add_member(udp_addr)
 
                 # Also populate _manager_peer_info so _get_active_manager_peer_addrs() works

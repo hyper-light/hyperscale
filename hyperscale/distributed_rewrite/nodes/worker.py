@@ -374,7 +374,37 @@ class WorkerServer(HealthAwareServer):
         self._cpu_monitor = CPUMonitor(env)
         self._memory_monitor = MemoryMonitor(env)
         self._logging_config: LoggingConfig | None = None
-    
+
+        # AD-29: Register peer confirmation callback to activate managers only after
+        # successful SWIM communication (probe/ack or heartbeat reception)
+        self.register_on_peer_confirmed(self._on_peer_confirmed)
+
+    def _on_peer_confirmed(self, peer: tuple[str, int]) -> None:
+        """
+        Add confirmed peer to active peer sets (AD-29).
+
+        Called when a peer is confirmed via successful SWIM communication.
+        This is the ONLY place where managers should be added to _healthy_manager_ids,
+        ensuring failure detection only applies to managers we've communicated with.
+
+        Args:
+            peer: The UDP address of the confirmed peer (manager).
+        """
+        # Find the manager by UDP address
+        for manager_id, manager_info in self._known_managers.items():
+            if (manager_info.udp_host, manager_info.udp_port) == peer:
+                # NOW add to healthy managers since peer is confirmed
+                self._healthy_manager_ids.add(manager_id)
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerDebug(
+                        message=f"AD-29: Manager {manager_id[:8]}... confirmed via SWIM, added to healthy set",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+                break
 
     def _bin_and_check_socket_range(self):
         base_worker_port = self._local_udp_port + (self._total_cores ** 2)
@@ -1071,7 +1101,9 @@ class WorkerServer(HealthAwareServer):
             is_leader=heartbeat.is_leader,
         )
         self._known_managers[manager_id] = new_manager
-        self._healthy_manager_ids.add(manager_id)
+        # AD-29: Do NOT add to _healthy_manager_ids here directly - this is handled by
+        # the confirmation callback (_on_peer_confirmed) when confirm_peer() is called
+        # in the parent _handle_manager_heartbeat method.
 
         self._task_runner.run(
             self._udp_logger.log,
@@ -1878,8 +1910,16 @@ class WorkerServer(HealthAwareServer):
         """Update known managers from a list (e.g., from registration or ack)."""
         for manager in managers:
             self._known_managers[manager.node_id] = manager
-            # Mark as healthy since we just received this info
-            self._healthy_manager_ids.add(manager.node_id)
+            # AD-29: Do NOT add to _healthy_manager_ids here - defer until confirmed
+            # via the confirmation callback when we receive successful SWIM communication.
+
+            # Track as unconfirmed peer if we have UDP address info
+            if manager.udp_host and manager.udp_port:
+                manager_udp_addr = (manager.udp_host, manager.udp_port)
+                self.add_unconfirmed_peer(manager_udp_addr)
+                # Add to SWIM probing so we can confirm the peer
+                self._probe_scheduler.add_member(manager_udp_addr)
+
             # Add to discovery service for adaptive selection (AD-28)
             self._discovery_service.add_peer(
                 peer_id=manager.node_id,
@@ -1908,7 +1948,9 @@ class WorkerServer(HealthAwareServer):
 
             # Add this manager to our known managers
             self._known_managers[registration.manager.node_id] = registration.manager
-            self._healthy_manager_ids.add(registration.manager.node_id)
+            # AD-29: Do NOT add to _healthy_manager_ids here - defer until confirmed
+            # via the confirmation callback when we receive successful SWIM communication.
+
             # Add to discovery service for adaptive selection (AD-28)
             self._discovery_service.add_peer(
                 peer_id=registration.manager.node_id,
@@ -1929,6 +1971,8 @@ class WorkerServer(HealthAwareServer):
             # Add manager's UDP address to SWIM for probing
             manager_udp_addr = (registration.manager.udp_host, registration.manager.udp_port)
             if manager_udp_addr[0] and manager_udp_addr[1]:
+                # AD-29: Track as unconfirmed peer until we receive successful SWIM communication
+                self.add_unconfirmed_peer(manager_udp_addr)
                 self._probe_scheduler.add_member(manager_udp_addr)
 
             self._task_runner.run(

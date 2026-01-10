@@ -25,7 +25,7 @@ from hyperscale.distributed_rewrite.server.server.mercury_sync_base_server impor
 )
 from hyperscale.distributed_rewrite.swim.coordinates import CoordinateTracker
 from hyperscale.distributed_rewrite.models.coordinates import NetworkCoordinate
-from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerDebug
+from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerDebug, ServerWarning
 
 # Core types and utilities
 from .core.types import Status, Nodes, Ctx, UpdateType, Message
@@ -1150,6 +1150,10 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         async with ErrorContext(self._error_handler, "rate_limit_cleanup"):
             self._rate_limits.cleanup_older_than(60.0)  # 1 minute
 
+        # AD-29: Check for stale unconfirmed peers and log warnings
+        async with ErrorContext(self._error_handler, "stale_unconfirmed_cleanup"):
+            await self._check_stale_unconfirmed_peers()
+
         # Check for counter overflow and reset if needed
         # (Python handles big ints, but we reset periodically for monitoring clarity)
         self._check_and_reset_stats()
@@ -1187,6 +1191,39 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             or self._rate_limit_stats["rejected"] > MAX_COUNTER
         ):
             self._rate_limit_stats = {"accepted": 0, "rejected": 0}
+
+    async def _check_stale_unconfirmed_peers(self) -> None:
+        """
+        Check for unconfirmed peers that have exceeded the stale threshold (AD-29).
+
+        Unconfirmed peers are peers we've been told about but haven't successfully
+        communicated with via SWIM. If they remain unconfirmed for too long, this
+        may indicate network issues or misconfiguration.
+
+        Logs a warning for each stale peer to aid debugging cluster formation issues.
+        """
+        # Threshold: peers unconfirmed for more than 60 seconds are considered stale
+        STALE_UNCONFIRMED_THRESHOLD = 60.0
+
+        stale_count = 0
+        now = time.monotonic()
+
+        for peer, added_at in list(self._unconfirmed_peer_added_at.items()):
+            age = now - added_at
+            if age > STALE_UNCONFIRMED_THRESHOLD:
+                stale_count += 1
+                await self._udp_logger.log(
+                    ServerWarning(
+                        message=f"Unconfirmed peer {peer[0]}:{peer[1]} stale for {age:.1f}s (AD-29)",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short if hasattr(self, '_node_id') else "unknown",
+                    )
+                )
+
+        # Update metrics for stale unconfirmed peers
+        if stale_count > 0:
+            self._metrics.record_counter("stale_unconfirmed_peers", stale_count)
 
     def _setup_leader_election(self) -> None:
         """Initialize leader election callbacks after server is started."""
