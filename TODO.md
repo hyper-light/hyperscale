@@ -6,7 +6,7 @@ This document tracks the remaining implementation work for AD-34, AD-35, AD-36, 
 
 **Implementation Status** (as of 2026-01-10):
 - **AD-34**: ✅ **100% COMPLETE** - All critical gaps fixed, fully functional for multi-DC deployments
-- **AD-35**: 🟢 **~92% COMPLETE** - Vivaldi coordinates, SWIM integration, UNCONFIRMED lifecycle, adaptive timeouts, and role classification all implemented. Remaining: RoleAwareConfirmationManager integration (optional enhancement)
+- **AD-35**: ✅ **100% COMPLETE** - Vivaldi coordinates, SWIM integration, UNCONFIRMED lifecycle, adaptive timeouts, role classification, role gossip, and RoleAwareConfirmationManager all implemented and integrated
 - **AD-36**: 5% complete - Only basic health bucket selection implemented, entire routing subsystem missing
 - **AD-37**: ✅ **100% COMPLETE** - Message classification, backpressure levels, BATCH aggregation implemented
 
@@ -137,7 +137,7 @@ Per CLAUDE.md: "DO NOT RUN THE INTEGRATION TESTS YOURSELF. Ask me to."
 
 ## 12. AD-35: Vivaldi Network Coordinates with Role-Aware Failure Detection
 
-**Status**: ~92% COMPLETE - Core functionality implemented, only RoleAwareConfirmationManager integration pending
+**Status**: ✅ **100% COMPLETE** - All components implemented and fully integrated
 
 **Overview**: Vivaldi network coordinates for latency-aware failure detection, role-aware confirmation strategies for Gates/Managers/Workers, and an explicit UNCONFIRMED lifecycle state.
 
@@ -210,16 +210,20 @@ Per CLAUDE.md: "DO NOT RUN THE INTEGRATION TESTS YOURSELF. Ask me to."
   - Added `node_role` property for external access (lines 307-310)
   - Accessible via `server.node_role` for role-aware behavior
 
-**Missing:**
-- [ ] **12.4.3** Gossip role in SWIM messages - DEFERRED (not required for failure detection)
+**Completed:**
+- [x] **12.4.3** Gossip role in SWIM messages - Commit a1c632e6
+  - Extended PiggybackUpdate with optional role field (backward compatible)
+  - Format: `type:incarnation:host:port[:role]`
+  - Role extracted and stored in process_piggyback_data()
 
-### 12.5 Role-Aware Confirmation Manager ✅ COMPLETE (except integration)
+### 12.5 Role-Aware Confirmation Manager ✅ COMPLETE
 
 **Files**:
 - `hyperscale/distributed_rewrite/swim/roles/confirmation_strategy.py`
 - `hyperscale/distributed_rewrite/swim/roles/confirmation_manager.py`
+- `hyperscale/distributed_rewrite/swim/health_aware_server.py` ✅ (Commit a1c632e6)
 
-✅ **IMPLEMENTED**: Core components exist, integration with HealthAwareServer pending
+✅ **COMPLETE**: Fully integrated into HealthAwareServer - Commit a1c632e6
 
 - [x] **12.5.1** Create `RoleBasedConfirmationStrategy` dataclass - Complete
 - [x] **12.5.2** Define strategy constants: - Complete
@@ -229,7 +233,12 @@ Per CLAUDE.md: "DO NOT RUN THE INTEGRATION TESTS YOURSELF. Ask me to."
 - [x] **12.5.3** Implement `RoleAwareConfirmationManager` class - Complete (lines 47-406 in confirmation_manager.py)
 - [x] **12.5.4** Implement proactive confirmation for Gates/Managers - Complete (see _attempt_proactive_confirmation)
 - [x] **12.5.5** Implement passive-only strategy for Workers - Complete (WORKER_STRATEGY.enable_proactive_confirmation=False)
-- [ ] **12.5.6** Integrate with HealthAwareServer - NOT DONE (no references in health_aware_server.py)
+- [x] **12.5.6** Integrate with HealthAwareServer - Commit a1c632e6
+  - Initialized in __init__ with callbacks (lines 168-181)
+  - Wired to CoordinateTracker and LHM
+  - add_unconfirmed_peer() tracks with confirmation manager (lines 465-486)
+  - confirm_peer() notifies confirmation manager (lines 518-520)
+  - Cleanup task integrated (lines 1400-1409)
 
 ### 12.6 Adaptive Timeouts ✅ COMPLETE
 
