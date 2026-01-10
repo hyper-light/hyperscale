@@ -414,12 +414,11 @@ class TestPerJobLocks:
         execution_order: list[int] = []
         original_validate = client._validate_gate_fence_token
 
-        async def slow_validate(job_id: str, token: int):
+        def tracking_validate(job_id: str, token: int) -> tuple[bool, str]:
             execution_order.append(token)
-            await asyncio.sleep(0.05)  # Simulate slow validation
             return original_validate(job_id, token)
 
-        client._validate_gate_fence_token = slow_validate
+        client._validate_gate_fence_token = tracking_validate
 
         # Two concurrent transfers
         transfer1 = GateJobLeaderTransfer(

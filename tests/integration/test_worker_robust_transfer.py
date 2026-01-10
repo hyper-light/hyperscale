@@ -192,6 +192,7 @@ class TestTransferValidation:
             tcp_port=8001,
             udp_host="127.0.0.1",
             udp_port=8002,
+            datacenter="dc-default",
         )
 
         # Set current fence token
@@ -245,6 +246,7 @@ class TestTransferValidation:
             tcp_port=8001,
             udp_host="127.0.0.1",
             udp_port=8002,
+            datacenter="dc-default",
         )
 
         # Add active workflow
@@ -291,6 +293,7 @@ class TestPendingTransfers:
             tcp_port=8001,
             udp_host="127.0.0.1",
             udp_port=8002,
+            datacenter="dc-default",
         )
 
         # Don't add any active workflows
@@ -324,6 +327,7 @@ class TestPendingTransfers:
             tcp_port=8001,
             udp_host="127.0.0.1",
             udp_port=8002,
+            datacenter="dc-default",
         )
 
         # Add one active workflow
@@ -374,6 +378,7 @@ class TestTransferMetrics:
             tcp_port=8001,
             udp_host="127.0.0.1",
             udp_port=8002,
+            datacenter="dc-default",
         )
 
         # Accepted transfer
@@ -425,6 +430,7 @@ class TestTransferAcknowledgment:
             tcp_port=8001,
             udp_host="127.0.0.1",
             udp_port=8002,
+            datacenter="dc-default",
         )
 
         # Add workflows in different states
@@ -481,6 +487,7 @@ class TestTransferAcknowledgment:
             tcp_port=8001,
             udp_host="127.0.0.1",
             udp_port=8002,
+            datacenter="dc-default",
         )
 
         transfer = JobLeaderWorkerTransfer(
@@ -509,6 +516,7 @@ class TestPerJobLocks:
             tcp_port=8001,
             udp_host="127.0.0.1",
             udp_port=8002,
+            datacenter="dc-default",
         )
         worker.known_managers["manager-2"] = ManagerInfo(
             node_id="manager-2",
@@ -516,6 +524,7 @@ class TestPerJobLocks:
             tcp_port=8003,
             udp_host="127.0.0.1",
             udp_port=8004,
+            datacenter="dc-default",
         )
 
         execution_order: list[int] = []
@@ -571,6 +580,7 @@ class TestPerJobLocks:
             tcp_port=8001,
             udp_host="127.0.0.1",
             udp_port=8002,
+            datacenter="dc-default",
         )
 
         # Track execution timing
@@ -630,6 +640,7 @@ class TestOrphanedWorkflowRescue:
             tcp_port=8001,
             udp_host="127.0.0.1",
             udp_port=8002,
+            datacenter="dc-default",
         )
 
         # Add orphaned workflow
@@ -726,6 +737,7 @@ class TestLogging:
             tcp_port=8001,
             udp_host="127.0.0.1",
             udp_port=8002,
+            datacenter="dc-default",
         )
 
         transfer = JobLeaderWorkerTransfer(
@@ -779,6 +791,7 @@ class TestNegativePaths:
             tcp_port=8001,
             udp_host="127.0.0.1",
             udp_port=8002,
+            datacenter="dc-default",
         )
 
         transfer = JobLeaderWorkerTransfer(
@@ -804,6 +817,7 @@ class TestNegativePaths:
             tcp_port=8001,
             udp_host="127.0.0.1",
             udp_port=8002,
+            datacenter="dc-default",
         )
 
         # Set current fence token
@@ -833,6 +847,7 @@ class TestNegativePaths:
             tcp_port=8001,
             udp_host="127.0.0.1",
             udp_port=8002,
+            datacenter="dc-default",
         )
 
         transfer = JobLeaderWorkerTransfer(
@@ -858,6 +873,7 @@ class TestNegativePaths:
             tcp_port=8001,
             udp_host="127.0.0.1",
             udp_port=8002,
+            datacenter="dc-default",
         )
 
         transfer = JobLeaderWorkerTransfer(
@@ -883,6 +899,7 @@ class TestNegativePaths:
             tcp_port=8001,
             udp_host="127.0.0.1",
             udp_port=8002,
+            datacenter="dc-default",
         )
 
         worker.active_workflows["wf-1"] = WorkflowProgress(
@@ -926,6 +943,7 @@ class TestConcurrencyRaceConditions:
             tcp_port=8001,
             udp_host="127.0.0.1",
             udp_port=8002,
+            datacenter="dc-default",
         )
 
         transfers = [
@@ -957,6 +975,7 @@ class TestConcurrencyRaceConditions:
             tcp_port=8001,
             udp_host="127.0.0.1",
             udp_port=8002,
+            datacenter="dc-default",
         )
 
         # Sequential transfers with increasing tokens
@@ -983,6 +1002,7 @@ class TestConcurrencyRaceConditions:
             tcp_port=8001,
             udp_host="127.0.0.1",
             udp_port=8002,
+            datacenter="dc-default",
         )
 
         # Set initial fence token
@@ -1027,6 +1047,7 @@ class TestEdgeCasesAndBoundaryConditions:
             tcp_port=8001,
             udp_host="127.0.0.1",
             udp_port=8002,
+            datacenter="dc-default",
         )
 
         transfer = JobLeaderWorkerTransfer(
@@ -1052,6 +1073,7 @@ class TestEdgeCasesAndBoundaryConditions:
             tcp_port=8001,
             udp_host="127.0.0.1",
             udp_port=8002,
+            datacenter="dc-default",
         )
 
         special_ids = [
@@ -1098,6 +1120,7 @@ class TestEdgeCasesAndBoundaryConditions:
             tcp_port=8001,
             udp_host="127.0.0.1",
             udp_port=8002,
+            datacenter="dc-default",
         )
 
         long_id = "w" * 1000
@@ -1138,6 +1161,7 @@ class TestEdgeCasesAndBoundaryConditions:
             tcp_port=8001,
             udp_host="127.0.0.1",
             udp_port=8002,
+            datacenter="dc-default",
         )
 
         # Add 1000 workflows
@@ -1183,6 +1207,7 @@ class TestPendingTransferEdgeCases:
             tcp_port=8001,
             udp_host="127.0.0.1",
             udp_port=8002,
+            datacenter="dc-default",
         )
         worker.known_managers["manager-2"] = ManagerInfo(
             node_id="manager-2",
@@ -1190,6 +1215,7 @@ class TestPendingTransferEdgeCases:
             tcp_port=8003,
             udp_host="127.0.0.1",
             udp_port=8004,
+            datacenter="dc-default",
         )
 
         # First transfer creates pending
@@ -1227,6 +1253,7 @@ class TestPendingTransferEdgeCases:
             tcp_port=8001,
             udp_host="127.0.0.1",
             udp_port=8002,
+            datacenter="dc-default",
         )
 
         # Add all workflows
@@ -1271,6 +1298,7 @@ class TestMultipleWorkflowStates:
             tcp_port=8001,
             udp_host="127.0.0.1",
             udp_port=8002,
+            datacenter="dc-default",
         )
 
         states = [
@@ -1321,6 +1349,7 @@ class TestMultipleWorkflowStates:
             tcp_port=8001,
             udp_host="127.0.0.1",
             udp_port=8002,
+            datacenter="dc-default",
         )
 
         # Add workflows
