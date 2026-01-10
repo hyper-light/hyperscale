@@ -43,7 +43,7 @@ class VivaldiConfig:
 
 @dataclass(slots=True)
 class NetworkCoordinate:
-    """Network coordinate for RTT estimation."""
+    """Network coordinate for RTT estimation (AD-35)."""
 
     vec: list[float]
     height: float
@@ -51,3 +51,38 @@ class NetworkCoordinate:
     error: float
     updated_at: float = field(default_factory=time.monotonic)
     sample_count: int = 0
+
+    def to_dict(self) -> dict[str, float | list[float] | int]:
+        """
+        Serialize coordinate to dictionary for message embedding (AD-35 Task 12.2.1).
+
+        Returns:
+            Dict with position, height, adjustment, error, and sample_count
+        """
+        return {
+            "vec": self.vec,
+            "height": self.height,
+            "adjustment": self.adjustment,
+            "error": self.error,
+            "sample_count": self.sample_count,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "NetworkCoordinate":
+        """
+        Deserialize coordinate from dictionary (AD-35 Task 12.2.1).
+
+        Args:
+            data: Dictionary from message with coordinate fields
+
+        Returns:
+            NetworkCoordinate instance (updated_at set to current time)
+        """
+        return cls(
+            vec=list(data.get("vec", [])),
+            height=float(data.get("height", 0.0)),
+            adjustment=float(data.get("adjustment", 0.0)),
+            error=float(data.get("error", 1.0)),
+            updated_at=time.monotonic(),
+            sample_count=int(data.get("sample_count", 0)),
+        )
