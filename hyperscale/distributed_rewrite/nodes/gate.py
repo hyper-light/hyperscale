@@ -166,6 +166,12 @@ from hyperscale.distributed_rewrite.protocol.version import (
     get_features_for_version,
 )
 from hyperscale.distributed_rewrite.discovery import DiscoveryService
+from hyperscale.distributed_rewrite.discovery.security.role_validator import (
+    RoleValidator,
+    CertificateClaims,
+    NodeRole as SecurityNodeRole,
+    RoleValidationError,
+)
 from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerWarning, ServerError, ServerDebug
 
 
@@ -585,6 +591,15 @@ class GateServer(HealthAwareServer):
                 port=port,
                 role="gate",
             )
+
+        # Role-based mTLS validation (AD-28 Issue 1)
+        # Validates manager/gate connections based on certificate claims
+        # Falls back gracefully when mTLS is not configured
+        self._role_validator = RoleValidator(
+            cluster_id=env.get("CLUSTER_ID", "hyperscale"),
+            environment_id=env.get("ENVIRONMENT_ID", "default"),
+            strict_mode=env.get("MTLS_STRICT_MODE", "false").lower() == "true",
+        )
 
     def _on_node_dead(self, node_addr: tuple[str, int]) -> None:
         """
@@ -4101,6 +4116,30 @@ class GateServer(HealthAwareServer):
             # Store per-datacenter, per-manager using manager's self-reported address
             dc = heartbeat.datacenter
             manager_addr = (heartbeat.tcp_host, heartbeat.tcp_port)
+
+            # Role-based mTLS validation (AD-28 Issue 1)
+            # TODO: Extract certificate from transport when handler signatures are updated
+            # For now, validate role expectations without certificate
+            # Expected flow: Manager (source) -> Gate (target)
+            if not self._role_validator.is_allowed(SecurityNodeRole.MANAGER, SecurityNodeRole.GATE):
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerWarning(
+                        message=f"Manager {heartbeat.node_id} registration rejected: role-based access denied (manager->gate not allowed)",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+                response = ManagerRegistrationResponse(
+                    accepted=False,
+                    gate_id=self._node_id.full,
+                    healthy_gates=[],
+                    error="Role-based access denied: managers cannot register with gates in this configuration",
+                    protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+                    protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+                )
+                return response.dump()
 
             # Protocol version negotiation (AD-25)
             manager_version = ProtocolVersion(

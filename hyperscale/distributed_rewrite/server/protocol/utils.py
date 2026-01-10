@@ -1,4 +1,31 @@
 import asyncio
+import ssl
+
+
+def get_peer_certificate_der(transport: asyncio.Transport) -> bytes | None:
+    """
+    Extract the peer's DER-encoded certificate from an SSL/TLS transport.
+
+    Args:
+        transport: The asyncio transport (must be SSL/TLS)
+
+    Returns:
+        DER-encoded certificate bytes, or None if not available
+    """
+    if not is_ssl(transport):
+        return None
+
+    ssl_object = transport.get_extra_info("ssl_object")
+    if ssl_object is None:
+        return None
+
+    try:
+        # Get the peer certificate in DER format
+        peer_cert_der = ssl_object.getpeercert(binary_form=True)
+        return peer_cert_der
+    except (AttributeError, ssl.SSLError):
+        # Certificate not available (e.g., client didn't provide one)
+        return None
 
 
 def get_remote_addr(transport: asyncio.Transport) -> tuple[str, int] | None:

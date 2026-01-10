@@ -164,6 +164,12 @@ from hyperscale.distributed_rewrite.protocol.version import (
     get_features_for_version,
 )
 from hyperscale.distributed_rewrite.discovery import DiscoveryService
+from hyperscale.distributed_rewrite.discovery.security.role_validator import (
+    RoleValidator,
+    CertificateClaims,
+    NodeRole as SecurityNodeRole,
+    RoleValidationError,
+)
 from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerWarning, ServerError, ServerDebug
 from hyperscale.reporting.results import Results
 from hyperscale.reporting.reporter import Reporter
@@ -682,6 +688,15 @@ class ManagerServer(HealthAwareServer):
             on_global_death=self._on_worker_globally_dead,
             on_job_death=self._on_worker_dead_for_job,
             get_job_n_members=self._get_job_worker_count,
+        )
+
+        # Role-based mTLS validation (AD-28 Issue 1)
+        # Validates worker/manager/gate connections based on certificate claims
+        # Falls back gracefully when mTLS is not configured
+        self._role_validator = RoleValidator(
+            cluster_id=env.get("CLUSTER_ID", "hyperscale"),
+            environment_id=env.get("ENVIRONMENT_ID", "default"),
+            strict_mode=env.get("MTLS_STRICT_MODE", "false").lower() == "true",
         )
     
     def _on_manager_become_leader(self) -> None:
@@ -4743,6 +4758,30 @@ class ManagerServer(HealthAwareServer):
         """Handle worker registration via TCP."""
         try:
             registration = WorkerRegistration.load(data)
+
+            # Role-based mTLS validation (AD-28 Issue 1)
+            # TODO: Extract certificate from transport when handler signatures are updated
+            # For now, validate role expectations without certificate
+            # Expected flow: Worker (source) -> Manager (target)
+            if not self._role_validator.is_allowed(SecurityNodeRole.WORKER, SecurityNodeRole.MANAGER):
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerWarning(
+                        message=f"Worker {registration.node.node_id} rejected: role-based access denied (worker->manager not allowed)",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+                response = RegistrationResponse(
+                    accepted=False,
+                    manager_id=self._node_id.full,
+                    healthy_managers=[],
+                    error="Role-based access denied: workers cannot register with managers in this configuration",
+                    protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+                    protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+                )
+                return response.dump()
 
             # Protocol version validation (AD-25)
             worker_version = ProtocolVersion(
