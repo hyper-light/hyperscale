@@ -109,17 +109,20 @@ This document tracks the remaining implementation work for AD-34, AD-35, AD-36, 
   - Gate now coordinates global timeout across all datacenters
   - **FIXED** in commit 9a2813e0
 
-### 11.6 WorkflowStateMachine Integration ❌ NOT IMPLEMENTED
+### 11.6 WorkflowStateMachine Integration ✅ COMPLETE
 
 **File**: `hyperscale/distributed_rewrite/workflow/state_machine.py`
 
-- [ ] **11.6.1** Add `_progress_callbacks: list[Callable]` field
-- [ ] **11.6.2** Implement `register_progress_callback(callback)`
-- [ ] **11.6.3** Update `transition()` to call registered callbacks
-- [ ] **11.6.4** Implement `get_time_since_progress(workflow_id)`
-- [ ] **11.6.5** Implement `get_stuck_workflows(threshold_seconds)`
+- [x] **11.6.1** Add `_progress_callbacks: list[ProgressCallback]` field (line 147)
+- [x] **11.6.2** Implement `register_progress_callback(callback)` (lines 294-311)
+- [x] **11.6.3** Update `transition()` to call registered callbacks via `_invoke_progress_callbacks()` (lines 216, 220-244)
+- [x] **11.6.4** Implement `get_time_since_progress(workflow_id)` (lines 329-345)
+- [x] **11.6.5** Implement `get_stuck_workflows(threshold_seconds)` (lines 347-393)
 
-**Note**: This is optional - AD-34 can work with manual progress reporting in manager.py instead of state machine callbacks
+**Additional Features**:
+- `unregister_progress_callback()` for cleanup (lines 313-327)
+- `_last_progress_time` tracking dict (line 151)
+- Progress callbacks invoked outside lock to prevent deadlocks (line 216)
 
 ### 11.7 Configuration ⏭️ SKIP (Uses Defaults)
 
