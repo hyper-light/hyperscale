@@ -4,7 +4,7 @@ import statistics
 import time
 from collections import Counter, defaultdict
 from socket import socket
-from typing import Any, Awaitable, Callable, Dict, List, Set, Tuple, TypeVar
+from typing import Any, Dict, List, Set, Tuple, TypeVar
 
 from hyperscale.core.engines.client.time_parser import TimeParser
 from hyperscale.core.graph import Workflow
