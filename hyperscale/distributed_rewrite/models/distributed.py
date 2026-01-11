@@ -538,9 +538,9 @@ class WorkerRegistration(Message):
     total_cores: int             # Total CPU cores available
     available_cores: int         # Currently free cores
     memory_mb: int               # Total memory in MB
-    available_memory_mb: int     # Currently free memory
-    cluster_id: str              # Cluster identifier for isolation
-    environment_id: str          # Environment identifier for isolation
+    available_memory_mb: int = 0 # Currently free memory
+    cluster_id: str = ""         # Cluster identifier for isolation
+    environment_id: str = ""     # Environment identifier for isolation
     # Protocol version fields (AD-25) - defaults for backwards compatibility
     protocol_version_major: int = 1
     protocol_version_minor: int = 0
