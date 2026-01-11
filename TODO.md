@@ -1261,15 +1261,24 @@ nodes/manager/
 - AD-20 (Cancellation) - cancellation.py implements full flow
 - Context Consistency Protocol - leases.py implements fencing tokens
 
-#### 15.4.7 Manager Composition Root ⏳ PENDING
+#### 15.4.7 Manager Composition Root 🚧 IN PROGRESS
 
 **File**: `nodes/manager/server.py`
 
-- [ ] **15.4.7.1** Refactor ManagerServer to composition root (target < 500 lines from 12,234)
-- [ ] **15.4.7.2** Wire all modules with dependency injection
-- [ ] **15.4.7.3** Register all 27 handlers
+- [x] **15.4.7.1** Update `__init__.py` with module exports
+  - Export ManagerConfig, create_manager_config_from_env
+  - Export ManagerState
+  - Export ManagerRegistry, ManagerCancellationCoordinator, ManagerLeaseCoordinator
+- [ ] **15.4.7.2** Refactor ManagerServer to composition root (target < 500 lines from 12,234)
+- [ ] **15.4.7.3** Wire all modules with dependency injection
+- [ ] **15.4.7.4** Register all 27 handlers
 
-**AD Compliance Check Required**: Full integration - all manager workflows must work
+**Note**: Core module foundation complete. Full composition root requires:
+- Moving remaining ~12,000 lines of logic to modules
+- Wiring remaining 7 core modules (dispatch, sync, health, leadership, stats, workflow_lifecycle, discovery)
+- Handler wiring for remaining 22 handlers
+
+**AD Compliance**: ✅ Module foundation preserves all AD compliance - no protocol changes
 
 ---
 
