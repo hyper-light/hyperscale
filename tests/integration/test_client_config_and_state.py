@@ -256,18 +256,16 @@ class TestClientState:
         state = ClientState()
         job_id = "gate-leader-job"
         leader_info = GateLeaderInfo(
-            job_id=job_id,
-            gate_host="gate-1",
-            gate_port=9000,
+            gate_addr=("gate-1", 9000),
             fence_token=5,
+            last_updated=time.time(),
         )
 
         state._gate_job_leaders[job_id] = leader_info
 
         assert job_id in state._gate_job_leaders
         stored = state._gate_job_leaders[job_id]
-        assert stored.gate_host == "gate-1"
-        assert stored.gate_port == 9000
+        assert stored.gate_addr == ("gate-1", 9000)
         assert stored.fence_token == 5
 
     def test_manager_leader_tracking(self):
@@ -276,11 +274,10 @@ class TestClientState:
         job_id = "mgr-leader-job"
         datacenter_id = "dc-east"
         leader_info = ManagerLeaderInfo(
-            job_id=job_id,
-            datacenter_id=datacenter_id,
-            manager_host="manager-2",
-            manager_port=7000,
+            manager_addr=("manager-2", 7000),
             fence_token=10,
+            datacenter_id=datacenter_id,
+            last_updated=time.time(),
         )
 
         key = (job_id, datacenter_id)
@@ -288,8 +285,8 @@ class TestClientState:
 
         assert key in state._manager_job_leaders
         stored = state._manager_job_leaders[key]
-        assert stored.manager_host == "manager-2"
-        assert stored.manager_port == 7000
+        assert stored.manager_addr == ("manager-2", 7000)
+        assert stored.fence_token == 10
         assert stored.datacenter_id == datacenter_id
 
     def test_mark_job_orphaned(self):
@@ -453,10 +450,9 @@ class TestClientState:
 
         async def update_gate_leader(fence_token):
             leader_info = GateLeaderInfo(
-                job_id=job_id,
-                gate_host=f"gate-{fence_token}",
-                gate_port=9000,
+                gate_addr=(f"gate-{fence_token}", 9000),
                 fence_token=fence_token,
+                last_updated=time.time(),
             )
             state._gate_job_leaders[job_id] = leader_info
             await asyncio.sleep(0.001)
