@@ -70,6 +70,10 @@ class ManagerConfig:
     dead_node_check_interval_seconds: float = 10.0
     rate_limit_cleanup_interval_seconds: float = 300.0
 
+    # Rate limiting settings (AD-24, from env)
+    rate_limit_default_max_requests: int = 100
+    rate_limit_default_window_seconds: float = 10.0
+
     # TCP timeout settings (from env)
     tcp_timeout_short_seconds: float = 2.0
     tcp_timeout_standard_seconds: float = 5.0
@@ -194,6 +198,8 @@ def create_manager_config_from_env(
         job_cleanup_interval_seconds=env.JOB_CLEANUP_INTERVAL,
         dead_node_check_interval_seconds=env.MANAGER_DEAD_NODE_CHECK_INTERVAL,
         rate_limit_cleanup_interval_seconds=env.MANAGER_RATE_LIMIT_CLEANUP_INTERVAL,
+        rate_limit_default_max_requests=getattr(env, 'MANAGER_RATE_LIMIT_DEFAULT_MAX_REQUESTS', 100),
+        rate_limit_default_window_seconds=getattr(env, 'MANAGER_RATE_LIMIT_DEFAULT_WINDOW_SECONDS', 10.0),
         tcp_timeout_short_seconds=env.MANAGER_TCP_TIMEOUT_SHORT,
         tcp_timeout_standard_seconds=env.MANAGER_TCP_TIMEOUT_STANDARD,
         batch_push_interval_seconds=env.MANAGER_BATCH_PUSH_INTERVAL,
