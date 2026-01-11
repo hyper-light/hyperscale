@@ -762,18 +762,18 @@ nodes/client/
 
 **AD Compliance**: ✅ AD-16 (Leadership Transfer) fence token semantics preserved - monotonicity validation intact
 
-#### 15.1.8 Client Job Tracking ⏳ PENDING
+#### 15.1.8 Client Job Tracking ✅ COMPLETE
 
 **File**: `nodes/client/tracking.py`
 
-- [ ] **15.1.8.1** Create ClientJobTracker class
-  - initialize_job_tracking() - Setup job structures
-  - update_job_status() - Update status, signal if final
-  - mark_job_failed() - Set FAILED status with error
-  - wait_for_job() - Async wait with timeout
+- [x] **15.1.8.1** Create ClientJobTracker class
+  - initialize_job_tracking() - Setup job structures, register callbacks
+  - update_job_status() - Update status, signal completion event
+  - mark_job_failed() - Set FAILED status with error, signal completion
+  - wait_for_job() - Async wait with optional timeout
   - get_job_status() - Non-blocking status retrieval
 
-**AD Compliance Check Required**: No AD violations expected - job lifecycle tracking
+**AD Compliance**: ✅ No AD violations - job lifecycle tracking only, no protocol changes
 
 #### 15.1.9 Client Job Submission ⏳ PENDING
 
