@@ -990,20 +990,21 @@ class WorkerServer(HealthAwareServer):
             increment_version=self._increment_version,
         )
 
-        # Push cancellation complete to manager
+        # Push cancellation complete to manager (fire-and-forget via task runner)
         progress = self._active_workflows.get(workflow_id)
-        if progress:
-            await self._progress_reporter.send_cancellation_complete(
-                job_id=progress.job_id,
-                workflow_id=workflow_id,
-                success=success,
-                errors=errors,
-                cancelled_at=time.time(),
-                node_id=self._node_id.full,
-                send_tcp=self.send_tcp,
-                node_host=self._host,
-                node_port=self._tcp_port,
-                node_id_short=self._node_id.short,
+        if progress and progress.job_id:
+            self._task_runner.run(
+                self._progress_reporter.send_cancellation_complete,
+                progress.job_id,
+                workflow_id,
+                success,
+                errors,
+                time.time(),
+                self._node_id.full,
+                self.send_tcp,
+                self._host,
+                self._tcp_port,
+                self._node_id.short,
             )
 
         return (success, errors)
