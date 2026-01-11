@@ -1,11 +1,13 @@
-import msgspec
-import threading
 import datetime
+import threading
 from typing import Generic, TypeVar
+
+import msgspec
+
 from .entry import Entry
 
 
-T = TypeVar('T')
+T = TypeVar("T")
 
 
 class Log(msgspec.Struct, Generic[T], kw_only=True):
@@ -19,3 +21,4 @@ class Log(msgspec.Struct, Generic[T], kw_only=True):
     timestamp: str = msgspec.field(
         default_factory=lambda: datetime.datetime.now(datetime.UTC).isoformat()
     )
+    lsn: int | None = None
