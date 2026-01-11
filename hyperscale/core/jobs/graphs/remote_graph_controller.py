@@ -45,7 +45,6 @@ from hyperscale.logging.hyperscale_logging_models import (
     ServerFatal,
     ServerInfo,
     ServerTrace,
-    ServerWarning,
 )
 from hyperscale.reporting.common.results_types import WorkflowStats
 from hyperscale.ui.actions import update_active_workflow_message, update_workflow_executions_total_rate
