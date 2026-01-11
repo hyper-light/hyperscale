@@ -18,7 +18,7 @@ from hyperscale.distributed_rewrite.swim.message_handling.suspicion import (
 )
 from hyperscale.distributed_rewrite.swim.message_handling.models import MessageContext
 
-from tests.integration.messaging.mocks import MockServerInterface
+from tests.distributed.messaging.mocks import MockServerInterface
 
 
 class TestAliveHandlerHappyPath:
