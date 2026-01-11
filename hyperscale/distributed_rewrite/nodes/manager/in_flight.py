@@ -244,7 +244,7 @@ class InFlightTracker:
         priority = classify_handler_to_priority(handler_name)
         self.release_sync(priority)
 
-    def track_task(self, task: asyncio.Task, priority: "RequestPriority") -> None:
+    def track_task(self, task: asyncio.Task, priority: RequestPriority) -> None:
         """
         Track an asyncio task and auto-release on completion.
 
@@ -260,7 +260,7 @@ class InFlightTracker:
 
         task.add_done_callback(on_done)
 
-    def get_available(self, priority: "RequestPriority") -> int:
+    def get_available(self, priority: RequestPriority) -> int:
         """
         Get number of available slots for priority.
 
@@ -270,12 +270,11 @@ class InFlightTracker:
         Returns:
             Number of available slots
         """
-        priority_val = priority.value
-        if priority_val == 0:
+        if priority == RequestPriority.CRITICAL:
             return 999999  # Unlimited
 
-        limit = self._limits[priority_val]
-        current = self._counts[priority_val]
+        limit = self._limits[priority]
+        current = self._counts[priority]
         return int(max(0, limit - current))
 
     def get_fill_ratio(self) -> float:
@@ -285,7 +284,13 @@ class InFlightTracker:
         Returns:
             Fill ratio 0.0-1.0
         """
-        non_critical = sum(self._counts[p] for p in range(1, 4))
+        non_critical = sum(
+            self._counts[p] for p in [
+                RequestPriority.HIGH,
+                RequestPriority.NORMAL,
+                RequestPriority.LOW,
+            ]
+        )
         return non_critical / self._global_limit if self._global_limit > 0 else 0.0
 
     def get_metrics(self) -> dict:
@@ -294,16 +299,16 @@ class InFlightTracker:
             "global_count": self._global_count,
             "global_limit": self._global_limit,
             "fill_ratio": self.get_fill_ratio(),
-            "critical_count": self._counts[0],
-            "high_count": self._counts[1],
-            "normal_count": self._counts[2],
-            "low_count": self._counts[3],
+            "critical_count": self._counts[RequestPriority.CRITICAL],
+            "high_count": self._counts[RequestPriority.HIGH],
+            "normal_count": self._counts[RequestPriority.NORMAL],
+            "low_count": self._counts[RequestPriority.LOW],
             "acquired_total": self._acquired_total,
             "rejected_total": self._rejected_total,
-            "rejected_critical": self._rejected_by_priority[0],
-            "rejected_high": self._rejected_by_priority[1],
-            "rejected_normal": self._rejected_by_priority[2],
-            "rejected_low": self._rejected_by_priority[3],
+            "rejected_critical": self._rejected_by_priority[RequestPriority.CRITICAL],
+            "rejected_high": self._rejected_by_priority[RequestPriority.HIGH],
+            "rejected_normal": self._rejected_by_priority[RequestPriority.NORMAL],
+            "rejected_low": self._rejected_by_priority[RequestPriority.LOW],
             "pending_tasks": len(self._pending_tasks),
         }
 
@@ -325,6 +330,7 @@ class BoundedRequestExecutor:
     Executes requests with bounded concurrency and priority awareness (AD-32).
 
     Combines InFlightTracker with LoadShedder for complete protection.
+    Uses AD-37 message classification for consistent priority handling.
     """
 
     def __init__(
@@ -343,7 +349,7 @@ class BoundedRequestExecutor:
 
     async def execute_if_allowed(
         self,
-        priority: "RequestPriority",
+        priority: RequestPriority,
         coro,
         message_type: str = "unknown",
     ):
@@ -373,9 +379,29 @@ class BoundedRequestExecutor:
             await self._in_flight.release(priority)
             self._load_shedder.on_request_end()
 
+    async def execute_if_allowed_for_handler(
+        self,
+        handler_name: str,
+        coro,
+    ):
+        """
+        Execute coroutine using AD-37 MessageClass classification.
+
+        This is the preferred method for AD-37 compliant bounded execution.
+
+        Args:
+            handler_name: Name of the handler (e.g., "receive_workflow_progress")
+            coro: Coroutine to execute
+
+        Returns:
+            Result of coroutine or None if shed/rejected
+        """
+        priority = classify_handler_to_priority(handler_name)
+        return await self.execute_if_allowed(priority, coro, handler_name)
+
     def execute_if_allowed_sync(
         self,
-        priority: "RequestPriority",
+        priority: RequestPriority,
         handler,
         *args,
         message_type: str = "unknown",
@@ -431,3 +457,29 @@ class BoundedRequestExecutor:
             self._in_flight.release_sync(priority)
             self._load_shedder.on_request_end()
             raise
+
+    def execute_if_allowed_sync_for_handler(
+        self,
+        handler_name: str,
+        handler,
+        *args,
+        **kwargs,
+    ):
+        """
+        Execute sync handler using AD-37 MessageClass classification.
+
+        This is the preferred method for AD-37 compliant bounded execution.
+
+        Args:
+            handler_name: Name of the handler
+            handler: Handler function
+            *args: Handler args
+            **kwargs: Handler kwargs
+
+        Returns:
+            Task if async handler, or result if sync, or None if rejected
+        """
+        priority = classify_handler_to_priority(handler_name)
+        return self.execute_if_allowed_sync(
+            priority, handler, *args, message_type=handler_name, **kwargs
+        )
