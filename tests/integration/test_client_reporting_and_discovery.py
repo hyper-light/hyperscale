@@ -193,7 +193,8 @@ class TestClientReportingManager:
         )
         # Mock non-local config (e.g., database reporter)
         db_config = MagicMock()
-        db_config.reporter_type = "postgres"
+        db_config.reporter_type = MagicMock()
+        db_config.reporter_type.name = "postgres"
 
         state._job_reporting_configs[job_id] = [json_config, csv_config, db_config]
 
@@ -352,7 +353,7 @@ class TestClientDiscovery:
         result = await discovery.ping_manager(("manager1", 7000))
 
         assert result.manager_id == "mgr-1"
-        assert result.status == "healthy"
+        assert result.state == "healthy"
         assert result.worker_count == 5
         send_tcp.assert_called_once()
 
@@ -376,8 +377,8 @@ class TestClientDiscovery:
         result = await discovery.ping_gate(("gate1", 9000))
 
         assert result.gate_id == "gate-1"
-        assert result.status == "healthy"
-        assert result.datacenter_count == 3
+        assert result.state == "healthy"
+        assert result.active_datacenter_count == 3
 
     @pytest.mark.asyncio
     async def test_ping_manager_no_targets_configured(self, state, logger, send_tcp):
@@ -721,7 +722,7 @@ class TestClientDiscovery:
 
         assert result.gate_id == "gate-1"
         assert len(result.datacenters) == 1
-        assert result.datacenters[0].datacenter_id == "dc-east"
+        assert result.datacenters[0].dc_id == "dc-east"
         assert result.total_available_cores == 100
 
     @pytest.mark.asyncio
