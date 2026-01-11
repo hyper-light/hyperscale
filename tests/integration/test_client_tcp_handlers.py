@@ -40,11 +40,11 @@ from hyperscale.distributed_rewrite.models import (
     GlobalJobResult,
     ReporterResultPush,
     WorkflowResultPush,
-    WindowedStatsPush,
     JobCancellationComplete,
     GateJobLeaderTransfer,
     ManagerJobLeaderTransfer,
 )
+from hyperscale.distributed_rewrite.jobs import WindowedStatsPush
 from hyperscale.logging import Logger
 
 

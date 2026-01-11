@@ -22,7 +22,7 @@ from hyperscale.distributed_rewrite.nodes.client.reporting import ClientReportin
 from hyperscale.distributed_rewrite.nodes.client.discovery import ClientDiscovery
 from hyperscale.distributed_rewrite.nodes.client.state import ClientState
 from hyperscale.distributed_rewrite.nodes.client.config import ClientConfig
-from hyperscale.distributed_rewrite.nodes.client.target_selector import ClientTargetSelector
+from hyperscale.distributed_rewrite.nodes.client.targets import ClientTargetSelector
 from hyperscale.distributed_rewrite.models import (
     PingRequest,
     ManagerPingResponse,
