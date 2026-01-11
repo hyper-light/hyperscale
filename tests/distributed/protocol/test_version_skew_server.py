@@ -13,9 +13,8 @@ Tests version negotiation in realistic server scenarios with:
 import asyncio
 import pytest
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
-from typing import Any
 
 from hyperscale.distributed.protocol import (
     ProtocolVersion,

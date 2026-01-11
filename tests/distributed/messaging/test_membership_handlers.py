@@ -9,7 +9,6 @@ Covers:
 """
 
 import asyncio
-import time
 
 import pytest
 
