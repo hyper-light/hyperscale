@@ -122,8 +122,14 @@ class ConnectionPool(Generic[T]):
     _total_connections: int = field(default=0, repr=False)
     """Total number of connections across all peers."""
 
-    _lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
-    """Lock for thread-safe operations."""
+    _lock: asyncio.Lock | None = field(default=None, repr=False)
+    """Lock for thread-safe operations (lazily initialized)."""
+
+    def _get_lock(self) -> asyncio.Lock:
+        """Get or create the lock (lazy initialization for event loop compatibility)."""
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
 
     async def acquire(
         self,
@@ -151,7 +157,7 @@ class ConnectionPool(Generic[T]):
 
         timeout = timeout or self.config.connection_timeout_seconds
 
-        async with self._lock:
+        async with self._get_lock():
             # Try to get existing idle connection
             peer_connections = self._connections.get(peer_id, [])
             for pooled in peer_connections:
@@ -196,7 +202,7 @@ class ConnectionPool(Generic[T]):
             use_count=1,
         )
 
-        async with self._lock:
+        async with self._get_lock():
             if peer_id not in self._connections:
                 self._connections[peer_id] = []
             self._connections[peer_id].append(pooled)
@@ -266,7 +272,7 @@ class ConnectionPool(Generic[T]):
         pooled.state = ConnectionState.DISCONNECTED
 
         # Remove from pool
-        async with self._lock:
+        async with self._get_lock():
             peer_conns = self._connections.get(pooled.peer_id)
             if peer_conns and pooled in peer_conns:
                 peer_conns.remove(pooled)
@@ -284,7 +290,7 @@ class ConnectionPool(Generic[T]):
         Returns:
             Number of connections closed
         """
-        async with self._lock:
+        async with self._get_lock():
             peer_conns = self._connections.pop(peer_id, [])
 
         closed = 0
@@ -300,7 +306,7 @@ class ConnectionPool(Generic[T]):
 
             closed += 1
 
-        async with self._lock:
+        async with self._get_lock():
             self._total_connections -= closed
 
         return closed
@@ -319,7 +325,7 @@ class ConnectionPool(Generic[T]):
 
         to_close: list[PooledConnection[T]] = []
 
-        async with self._lock:
+        async with self._get_lock():
             for peer_id, connections in list(self._connections.items()):
                 for pooled in list(connections):
                     conn_id = id(pooled.connection)
@@ -415,7 +421,7 @@ class ConnectionPool(Generic[T]):
         Returns:
             Number of connections closed
         """
-        async with self._lock:
+        async with self._get_lock():
             all_connections: list[PooledConnection[T]] = []
             for connections in self._connections.values():
                 all_connections.extend(connections)
