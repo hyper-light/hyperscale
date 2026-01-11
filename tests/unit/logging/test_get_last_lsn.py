@@ -7,6 +7,8 @@ from hyperscale.logging.config.durability_mode import DurabilityMode
 from hyperscale.logging.models import Entry, LogLevel
 from hyperscale.logging.streams.logger_stream import LoggerStream
 
+from .conftest import create_mock_stream_writer
+
 
 class TestGetLastLsnBasic:
     @pytest.mark.asyncio
@@ -117,7 +119,10 @@ class TestGetLastLsnRecovery:
             enable_lsn=True,
             instance_id=1,
         )
-        await stream1.initialize()
+        await stream1.initialize(
+            stdout_writer=create_mock_stream_writer(),
+            stderr_writer=create_mock_stream_writer(),
+        )
 
         written_lsns = []
         for idx in range(10):
@@ -136,7 +141,10 @@ class TestGetLastLsnRecovery:
             enable_lsn=True,
             instance_id=1,
         )
-        await stream2.initialize()
+        await stream2.initialize(
+            stdout_writer=create_mock_stream_writer(),
+            stderr_writer=create_mock_stream_writer(),
+        )
 
         log_path = os.path.join(temp_log_directory, "recovery.wal")
         last_lsn = await stream2.get_last_lsn(log_path)
@@ -159,7 +167,10 @@ class TestGetLastLsnRecovery:
             enable_lsn=True,
             instance_id=1,
         )
-        await stream1.initialize()
+        await stream1.initialize(
+            stdout_writer=create_mock_stream_writer(),
+            stderr_writer=create_mock_stream_writer(),
+        )
 
         for idx in range(5):
             entry = sample_entry_factory(message=f"first batch {idx}")
@@ -179,7 +190,10 @@ class TestGetLastLsnRecovery:
             enable_lsn=True,
             instance_id=1,
         )
-        await stream2.initialize()
+        await stream2.initialize(
+            stdout_writer=create_mock_stream_writer(),
+            stderr_writer=create_mock_stream_writer(),
+        )
 
         last_lsn_before = await stream2.get_last_lsn(log_path)
 
@@ -190,6 +204,8 @@ class TestGetLastLsnRecovery:
 
         last_lsn_after = await stream2.get_last_lsn(log_path)
 
+        assert last_lsn_after is not None
+        assert last_lsn_before is not None
         assert last_lsn_after > last_lsn_before
         await stream2.close()
 
