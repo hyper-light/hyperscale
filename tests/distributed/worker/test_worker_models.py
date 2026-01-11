@@ -13,7 +13,6 @@ Covers:
 """
 
 import time
-from dataclasses import FrozenInstanceError
 
 import pytest
 

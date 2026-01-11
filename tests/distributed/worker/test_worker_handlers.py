@@ -14,7 +14,7 @@ Covers:
 
 import asyncio
 import time
-from unittest.mock import MagicMock, AsyncMock, patch, PropertyMock
+from unittest.mock import MagicMock, AsyncMock, patch
 
 import pytest
 

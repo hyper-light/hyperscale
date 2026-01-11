@@ -15,7 +15,7 @@ These tests verify that workers handle job leadership transfers robustly:
 import asyncio
 import pytest
 import time
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 from dataclasses import dataclass, field
 
 from hyperscale.distributed.models import (

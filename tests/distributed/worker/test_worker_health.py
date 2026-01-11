@@ -9,7 +9,6 @@ These tests verify that:
 5. Health state updates work correctly
 """
 
-import pytest
 import time
 
 from hyperscale.distributed.health import (

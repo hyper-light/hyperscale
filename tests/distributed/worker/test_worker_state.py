@@ -13,7 +13,7 @@ Covers:
 
 import asyncio
 import time
-from unittest.mock import MagicMock, AsyncMock
+from unittest.mock import MagicMock
 
 import pytest
 
