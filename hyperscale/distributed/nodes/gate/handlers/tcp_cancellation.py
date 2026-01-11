@@ -22,8 +22,8 @@ from hyperscale.distributed.models import (
     SingleWorkflowCancelResponse,
     WorkflowCancellationStatus,
 )
+from hyperscale.distributed.models import RateLimitResponse
 from hyperscale.distributed.reliability import (
-    RateLimitResponse,
     JitterStrategy,
     RetryConfig,
     RetryExecutor,

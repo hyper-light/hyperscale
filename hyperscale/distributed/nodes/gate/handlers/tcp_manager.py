@@ -24,11 +24,9 @@ from hyperscale.distributed.protocol.version import (
     negotiate_capabilities,
 )
 from hyperscale.distributed.reliability import BackpressureLevel, BackpressureSignal
-from hyperscale.distributed.security import (
-    RoleValidator,
-    SecurityNodeRole,
-    get_peer_certificate_der,
-)
+from hyperscale.distributed.discovery.security import RoleValidator
+from hyperscale.distributed.discovery.security.role_validator import NodeRole as SecurityNodeRole
+from hyperscale.distributed.server.protocol.utils import get_peer_certificate_der
 from hyperscale.logging import Logger
 from hyperscale.logging.hyperscale_logging_models import (
     ServerInfo,
