@@ -18,8 +18,8 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from hyperscale.distributed_rewrite.env import Env
-from hyperscale.distributed_rewrite.nodes import GateServer
+from hyperscale.distributed.env import Env
+from hyperscale.distributed.nodes import GateServer
 
 
 # Port allocation for gates (TCP, UDP pairs)

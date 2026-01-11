@@ -18,7 +18,7 @@ import time
 
 import pytest
 
-from hyperscale.distributed_rewrite.health.probes import (
+from hyperscale.distributed.health.probes import (
     CompositeProbe,
     HealthProbe,
     LivenessProbe,

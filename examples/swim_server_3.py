@@ -27,7 +27,7 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from collections import defaultdict
-from hyperscale.distributed_rewrite.env import Env
+from hyperscale.distributed.env import Env
 
 # Import the SWIM server implementation from the swim package
 from swim import UDPServer

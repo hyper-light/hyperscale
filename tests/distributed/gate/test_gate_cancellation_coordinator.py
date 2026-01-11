@@ -9,11 +9,11 @@ import pytest
 from dataclasses import dataclass, field
 from unittest.mock import AsyncMock, MagicMock
 
-from hyperscale.distributed_rewrite.nodes.gate.cancellation_coordinator import (
+from hyperscale.distributed.nodes.gate.cancellation_coordinator import (
     GateCancellationCoordinator,
 )
-from hyperscale.distributed_rewrite.nodes.gate.state import GateRuntimeState
-from hyperscale.distributed_rewrite.models import CancelAck
+from hyperscale.distributed.nodes.gate.state import GateRuntimeState
+from hyperscale.distributed.models import CancelAck
 
 
 # =============================================================================

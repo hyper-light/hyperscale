@@ -17,15 +17,15 @@ import time
 
 import pytest
 
-from hyperscale.distributed_rewrite.health.extension_tracker import (
+from hyperscale.distributed.health.extension_tracker import (
     ExtensionTracker,
     ExtensionTrackerConfig,
 )
-from hyperscale.distributed_rewrite.health.worker_health_manager import (
+from hyperscale.distributed.health.worker_health_manager import (
     WorkerHealthManager,
     WorkerHealthManagerConfig,
 )
-from hyperscale.distributed_rewrite.models import (
+from hyperscale.distributed.models import (
     HealthcheckExtensionRequest,
     HealthcheckExtensionResponse,
 )

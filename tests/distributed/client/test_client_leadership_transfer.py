@@ -15,7 +15,7 @@ import pytest
 import time
 from dataclasses import dataclass, field
 
-from hyperscale.distributed_rewrite.models import (
+from hyperscale.distributed.models import (
     GateLeaderInfo,
     ManagerLeaderInfo,
     OrphanedJobInfo,

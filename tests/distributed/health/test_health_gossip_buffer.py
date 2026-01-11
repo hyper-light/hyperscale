@@ -20,8 +20,8 @@ from unittest.mock import MagicMock, call
 
 import pytest
 
-from hyperscale.distributed_rewrite.health.tracker import HealthPiggyback
-from hyperscale.distributed_rewrite.swim.gossip.health_gossip_buffer import (
+from hyperscale.distributed.health.tracker import HealthPiggyback
+from hyperscale.distributed.swim.gossip.health_gossip_buffer import (
     HealthGossipBuffer,
     HealthGossipBufferConfig,
     HealthGossipEntry,

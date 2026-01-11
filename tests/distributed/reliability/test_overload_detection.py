@@ -13,7 +13,7 @@ These tests verify that:
 import pytest
 import time
 
-from hyperscale.distributed_rewrite.reliability import (
+from hyperscale.distributed.reliability import (
     OverloadState,
     OverloadConfig,
     HybridOverloadDetector,

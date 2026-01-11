@@ -18,7 +18,7 @@ import time
 from unittest.mock import AsyncMock, MagicMock, patch
 from dataclasses import dataclass, field
 
-from hyperscale.distributed_rewrite.models import (
+from hyperscale.distributed.models import (
     JobLeaderWorkerTransfer,
     JobLeaderWorkerTransferAck,
     PendingTransfer,

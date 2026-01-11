@@ -14,7 +14,7 @@ import time
 
 import pytest
 
-from hyperscale.distributed_rewrite.swim.detection.job_suspicion_manager import (
+from hyperscale.distributed.swim.detection.job_suspicion_manager import (
     JobSuspicionManager,
     JobSuspicionConfig,
     JobSuspicion,

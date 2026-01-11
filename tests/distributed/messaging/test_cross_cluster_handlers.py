@@ -12,12 +12,12 @@ import asyncio
 
 import pytest
 
-from hyperscale.distributed_rewrite.swim.message_handling.cross_cluster import (
+from hyperscale.distributed.swim.message_handling.cross_cluster import (
     XProbeHandler,
     XAckHandler,
     XNackHandler,
 )
-from hyperscale.distributed_rewrite.swim.message_handling.models import MessageContext
+from hyperscale.distributed.swim.message_handling.models import MessageContext
 
 from tests.distributed.messaging.mocks import MockServerInterface
 

@@ -11,7 +11,7 @@ import asyncio
 import time
 import pytest
 
-from hyperscale.distributed_rewrite.datacenters import (
+from hyperscale.distributed.datacenters import (
     DatacenterHealthManager,
     ManagerInfo,
     ManagerDispatcher,
@@ -20,7 +20,7 @@ from hyperscale.distributed_rewrite.datacenters import (
     LeaseManager,
     LeaseStats,
 )
-from hyperscale.distributed_rewrite.models import (
+from hyperscale.distributed.models import (
     ManagerHeartbeat,
     DatacenterHealth,
     DatacenterStatus,

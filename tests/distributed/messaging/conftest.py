@@ -6,10 +6,7 @@ import asyncio
 
 import pytest
 
-from tests.distributed.messaging.mocks import (
-    MockServerInterface,
-    MockLeaderState,
-)
+from tests.distributed.messaging.mocks import MockServerInterface
 
 
 @pytest.fixture

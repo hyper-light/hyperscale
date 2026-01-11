@@ -12,7 +12,7 @@ These tests verify that the DiscoveryService correctly:
 import pytest
 import time
 
-from hyperscale.distributed_rewrite.discovery import (
+from hyperscale.distributed.discovery import (
     DiscoveryConfig,
     DiscoveryService,
     PeerInfo,

@@ -17,8 +17,8 @@ from unittest.mock import MagicMock, AsyncMock, patch
 
 import pytest
 
-from hyperscale.distributed_rewrite.nodes.worker.backpressure import WorkerBackpressureManager
-from hyperscale.distributed_rewrite.reliability import BackpressureLevel
+from hyperscale.distributed.nodes.worker.backpressure import WorkerBackpressureManager
+from hyperscale.distributed.reliability import BackpressureLevel
 
 
 def _create_mock_state():

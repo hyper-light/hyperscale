@@ -97,7 +97,7 @@ print("=" * 60)
 
 @test("LamportClock: initial time is 0")
 async def test_lamport_initial():
-    from hyperscale.distributed_rewrite.server.events import LamportClock
+    from hyperscale.distributed.server.events import LamportClock
     
     clock = LamportClock()
     assert clock.time == 0, f"Expected 0, got {clock.time}"
@@ -105,7 +105,7 @@ async def test_lamport_initial():
 
 @test("LamportClock: increment advances time")
 async def test_lamport_increment():
-    from hyperscale.distributed_rewrite.server.events import LamportClock
+    from hyperscale.distributed.server.events import LamportClock
     
     clock = LamportClock()
     t1 = await clock.increment()
@@ -119,7 +119,7 @@ async def test_lamport_increment():
 
 @test("LamportClock: tick is alias for increment")
 async def test_lamport_tick():
-    from hyperscale.distributed_rewrite.server.events import LamportClock
+    from hyperscale.distributed.server.events import LamportClock
     
     clock = LamportClock()
     t1 = await clock.tick()
@@ -130,7 +130,7 @@ async def test_lamport_tick():
 
 @test("LamportClock: update advances to max+1")
 async def test_lamport_update():
-    from hyperscale.distributed_rewrite.server.events import LamportClock
+    from hyperscale.distributed.server.events import LamportClock
     
     clock = LamportClock()
     await clock.increment()  # time = 1
@@ -146,7 +146,7 @@ async def test_lamport_update():
 
 @test("LamportClock: ack updates without increment")
 async def test_lamport_ack():
-    from hyperscale.distributed_rewrite.server.events import LamportClock
+    from hyperscale.distributed.server.events import LamportClock
     
     clock = LamportClock()
     await clock.increment()  # time = 1
@@ -162,7 +162,7 @@ async def test_lamport_ack():
 
 @test("LamportClock: is_stale detects old times")
 async def test_lamport_is_stale():
-    from hyperscale.distributed_rewrite.server.events import LamportClock
+    from hyperscale.distributed.server.events import LamportClock
     
     clock = LamportClock()
     await clock.increment()
@@ -177,7 +177,7 @@ async def test_lamport_is_stale():
 
 @test("LamportClock: compare returns correct ordering")
 async def test_lamport_compare():
-    from hyperscale.distributed_rewrite.server.events import LamportClock
+    from hyperscale.distributed.server.events import LamportClock
     
     clock = LamportClock()
     await clock.update(5)  # time = 6
@@ -189,7 +189,7 @@ async def test_lamport_compare():
 
 @test("LamportClock: initial time can be set")
 async def test_lamport_initial_time():
-    from hyperscale.distributed_rewrite.server.events import LamportClock
+    from hyperscale.distributed.server.events import LamportClock
     
     clock = LamportClock(initial_time=100)
     assert clock.time == 100
@@ -220,7 +220,7 @@ print("=" * 60)
 
 @test("VersionedStateClock: initial state")
 async def test_vclock_initial():
-    from hyperscale.distributed_rewrite.server.events import VersionedStateClock
+    from hyperscale.distributed.server.events import VersionedStateClock
     
     clock = VersionedStateClock()
     assert clock.time == 0
@@ -229,7 +229,7 @@ async def test_vclock_initial():
 
 @test("VersionedStateClock: update_entity tracks versions")
 async def test_vclock_update_entity():
-    from hyperscale.distributed_rewrite.server.events import VersionedStateClock
+    from hyperscale.distributed.server.events import VersionedStateClock
     
     clock = VersionedStateClock()
     
@@ -246,7 +246,7 @@ async def test_vclock_update_entity():
 
 @test("VersionedStateClock: is_entity_stale detects stale updates")
 async def test_vclock_is_stale():
-    from hyperscale.distributed_rewrite.server.events import VersionedStateClock
+    from hyperscale.distributed.server.events import VersionedStateClock
     
     clock = VersionedStateClock()
     await clock.update_entity("worker-1", 10)
@@ -266,7 +266,7 @@ async def test_vclock_is_stale():
 
 @test("VersionedStateClock: should_accept_update is inverse of is_stale")
 async def test_vclock_should_accept():
-    from hyperscale.distributed_rewrite.server.events import VersionedStateClock
+    from hyperscale.distributed.server.events import VersionedStateClock
     
     clock = VersionedStateClock()
     await clock.update_entity("worker-1", 10)
@@ -284,7 +284,7 @@ async def test_vclock_should_accept():
 
 @test("VersionedStateClock: get_all_versions returns all tracked")
 async def test_vclock_get_all():
-    from hyperscale.distributed_rewrite.server.events import VersionedStateClock
+    from hyperscale.distributed.server.events import VersionedStateClock
     
     clock = VersionedStateClock()
     await clock.update_entity("worker-1", 5)
@@ -297,7 +297,7 @@ async def test_vclock_get_all():
 
 @test("VersionedStateClock: remove_entity removes tracking")
 async def test_vclock_remove():
-    from hyperscale.distributed_rewrite.server.events import VersionedStateClock
+    from hyperscale.distributed.server.events import VersionedStateClock
     
     clock = VersionedStateClock()
     await clock.update_entity("worker-1", 5)
@@ -315,7 +315,7 @@ async def test_vclock_remove():
 
 @test("VersionedStateClock: underlying clock updates")
 async def test_vclock_underlying():
-    from hyperscale.distributed_rewrite.server.events import VersionedStateClock
+    from hyperscale.distributed.server.events import VersionedStateClock
     
     clock = VersionedStateClock()
     
@@ -350,7 +350,7 @@ print("=" * 60)
 
 @test("NullStateEmbedder: returns None state")
 def test_null_embedder():
-    from hyperscale.distributed_rewrite.swim.core.state_embedder import NullStateEmbedder
+    from hyperscale.distributed.swim.core.state_embedder import NullStateEmbedder
     
     embedder = NullStateEmbedder()
     assert embedder.get_state() is None
@@ -361,7 +361,7 @@ def test_null_embedder():
 
 @test("WorkerStateEmbedder: embeds WorkerHeartbeat")
 def test_worker_embedder():
-    from hyperscale.distributed_rewrite.swim.core.state_embedder import WorkerStateEmbedder
+    from hyperscale.distributed.swim.core.state_embedder import WorkerStateEmbedder
     
     embedder = WorkerStateEmbedder(
         get_node_id=lambda: "worker-1",
@@ -379,7 +379,7 @@ def test_worker_embedder():
     assert len(state) > 0
     
     # Deserialize and verify
-    from hyperscale.distributed_rewrite.models import WorkerHeartbeat
+    from hyperscale.distributed.models import WorkerHeartbeat
     heartbeat = WorkerHeartbeat.load(state)
     assert heartbeat.node_id == "worker-1"
     assert heartbeat.state == "healthy"
@@ -390,7 +390,7 @@ def test_worker_embedder():
 
 @test("WorkerStateEmbedder: process_state is no-op")
 def test_worker_embedder_process():
-    from hyperscale.distributed_rewrite.swim.core.state_embedder import WorkerStateEmbedder
+    from hyperscale.distributed.swim.core.state_embedder import WorkerStateEmbedder
     
     embedder = WorkerStateEmbedder(
         get_node_id=lambda: "worker-1",
@@ -409,7 +409,7 @@ def test_worker_embedder_process():
 
 @test("ManagerStateEmbedder: embeds ManagerHeartbeat")
 def test_manager_embedder():
-    from hyperscale.distributed_rewrite.swim.core.state_embedder import ManagerStateEmbedder
+    from hyperscale.distributed.swim.core.state_embedder import ManagerStateEmbedder
     
     received = []
     
@@ -430,7 +430,7 @@ def test_manager_embedder():
     assert state is not None
     
     # Deserialize and verify
-    from hyperscale.distributed_rewrite.models import ManagerHeartbeat
+    from hyperscale.distributed.models import ManagerHeartbeat
     heartbeat = ManagerHeartbeat.load(state)
     assert heartbeat.node_id == "manager-1"
     assert heartbeat.datacenter == "dc-east"
@@ -441,7 +441,7 @@ def test_manager_embedder():
 
 @test("ManagerStateEmbedder: processes WorkerHeartbeat")
 def test_manager_embedder_process():
-    from hyperscale.distributed_rewrite.swim.core.state_embedder import (
+    from hyperscale.distributed.swim.core.state_embedder import (
         ManagerStateEmbedder,
         WorkerStateEmbedder,
     )
@@ -485,8 +485,8 @@ def test_manager_embedder_process():
 
 @test("GateStateEmbedder: embeds GateHeartbeat state")
 def test_gate_embedder():
-    from hyperscale.distributed_rewrite.swim.core.state_embedder import GateStateEmbedder
-    from hyperscale.distributed_rewrite.models import GateHeartbeat
+    from hyperscale.distributed.swim.core.state_embedder import GateStateEmbedder
+    from hyperscale.distributed.models import GateHeartbeat
     
     received = []
     
@@ -514,7 +514,7 @@ def test_gate_embedder():
 
 @test("GateStateEmbedder: processes ManagerHeartbeat")
 def test_gate_embedder_process():
-    from hyperscale.distributed_rewrite.swim.core.state_embedder import (
+    from hyperscale.distributed.swim.core.state_embedder import (
         GateStateEmbedder,
         ManagerStateEmbedder,
     )
@@ -580,7 +580,7 @@ print("=" * 60)
 
 @test("WorkerHeartbeat: serialization round-trip")
 def test_worker_heartbeat_serde():
-    from hyperscale.distributed_rewrite.models import WorkerHeartbeat
+    from hyperscale.distributed.models import WorkerHeartbeat
     
     original = WorkerHeartbeat(
         node_id="worker-123",
@@ -612,7 +612,7 @@ def test_worker_heartbeat_serde():
 
 @test("ManagerHeartbeat: serialization round-trip")
 def test_manager_heartbeat_serde():
-    from hyperscale.distributed_rewrite.models import ManagerHeartbeat
+    from hyperscale.distributed.models import ManagerHeartbeat
     
     original = ManagerHeartbeat(
         node_id="manager-456",
@@ -640,7 +640,7 @@ def test_manager_heartbeat_serde():
 
 @test("JobSubmission: serialization with bytes field")
 def test_job_submission_serde():
-    from hyperscale.distributed_rewrite.models import JobSubmission
+    from hyperscale.distributed.models import JobSubmission
     import cloudpickle
     
     # Simulate pickled workflow data
@@ -668,7 +668,7 @@ def test_job_submission_serde():
 
 @test("WorkflowProgress: serialization with nested StepStats")
 def test_workflow_progress_serde():
-    from hyperscale.distributed_rewrite.models import WorkflowProgress, StepStats
+    from hyperscale.distributed.models import WorkflowProgress, StepStats
     
     original = WorkflowProgress(
         job_id="job-1",
@@ -699,7 +699,7 @@ def test_workflow_progress_serde():
 
 @test("ProvisionRequest: quorum message serialization")
 def test_provision_request_serde():
-    from hyperscale.distributed_rewrite.models import ProvisionRequest
+    from hyperscale.distributed.models import ProvisionRequest
     
     original = ProvisionRequest(
         job_id="job-1",
@@ -723,7 +723,7 @@ def test_provision_request_serde():
 
 @test("GlobalJobStatus: complex nested serialization")
 def test_global_job_status_serde():
-    from hyperscale.distributed_rewrite.models import (
+    from hyperscale.distributed.models import (
         GlobalJobStatus,
         JobProgress,
         WorkflowProgress,
@@ -792,8 +792,8 @@ print("=" * 60)
 @test("Manager rejects stale worker heartbeats")
 async def test_manager_stale_rejection():
     """Simulate manager receiving out-of-order worker heartbeats."""
-    from hyperscale.distributed_rewrite.server.events import VersionedStateClock
-    from hyperscale.distributed_rewrite.models import WorkerHeartbeat
+    from hyperscale.distributed.server.events import VersionedStateClock
+    from hyperscale.distributed.models import WorkerHeartbeat
     
     # Simulate manager's versioned clock
     clock = VersionedStateClock()
@@ -854,8 +854,8 @@ async def test_manager_stale_rejection():
 @test("Gate rejects stale manager heartbeats")
 async def test_gate_stale_rejection():
     """Simulate gate receiving out-of-order DC manager heartbeats."""
-    from hyperscale.distributed_rewrite.server.events import VersionedStateClock
-    from hyperscale.distributed_rewrite.models import ManagerHeartbeat
+    from hyperscale.distributed.server.events import VersionedStateClock
+    from hyperscale.distributed.models import ManagerHeartbeat
     
     clock = VersionedStateClock()
     dc_status = {}
@@ -919,7 +919,7 @@ print("=" * 60)
 
 @test("LamportClock: concurrent increments are serialized")
 async def test_lamport_concurrent():
-    from hyperscale.distributed_rewrite.server.events import LamportClock
+    from hyperscale.distributed.server.events import LamportClock
     
     clock = LamportClock()
     
@@ -937,7 +937,7 @@ async def test_lamport_concurrent():
 
 @test("VersionedStateClock: concurrent entity updates")
 async def test_vclock_concurrent():
-    from hyperscale.distributed_rewrite.server.events import VersionedStateClock
+    from hyperscale.distributed.server.events import VersionedStateClock
     
     clock = VersionedStateClock()
     
@@ -963,7 +963,7 @@ async def test_vclock_concurrent():
 
 @test("VersionedStateClock: concurrent different entities")
 async def test_vclock_concurrent_different():
-    from hyperscale.distributed_rewrite.server.events import VersionedStateClock
+    from hyperscale.distributed.server.events import VersionedStateClock
     
     clock = VersionedStateClock()
     
@@ -1005,7 +1005,7 @@ print("=" * 60)
 
 @test("HealthAwareServer: has callback registration methods")
 def test_health_aware_server_callback_methods():
-    from hyperscale.distributed_rewrite.swim import HealthAwareServer
+    from hyperscale.distributed.swim import HealthAwareServer
     
     assert hasattr(HealthAwareServer, 'register_on_become_leader')
     assert hasattr(HealthAwareServer, 'register_on_lose_leadership')
@@ -1023,7 +1023,7 @@ def test_health_aware_server_callback_lists():
     # We can't instantiate HealthAwareServer easily without full setup,
     # but we can check the __init__ signature/code
     import inspect
-    from hyperscale.distributed_rewrite.swim import HealthAwareServer
+    from hyperscale.distributed.swim import HealthAwareServer
     
     source = inspect.getsource(HealthAwareServer.__init__)
     assert '_on_become_leader_callbacks' in source
@@ -1033,7 +1033,7 @@ def test_health_aware_server_callback_lists():
 
 @test("ManagerServer: has state sync methods")
 def test_manager_state_sync_methods():
-    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    from hyperscale.distributed.nodes import ManagerServer
     
     assert hasattr(ManagerServer, '_on_manager_become_leader')
     assert hasattr(ManagerServer, '_on_manager_lose_leadership')
@@ -1043,7 +1043,7 @@ def test_manager_state_sync_methods():
 
 @test("StateSyncRequest: serialization")
 def test_state_sync_request_serde():
-    from hyperscale.distributed_rewrite.models import StateSyncRequest
+    from hyperscale.distributed.models import StateSyncRequest
     
     original = StateSyncRequest(
         requester_id="manager-1",
@@ -1061,7 +1061,7 @@ def test_state_sync_request_serde():
 
 @test("StateSyncResponse: serialization with worker state")
 def test_state_sync_response_worker_serde():
-    from hyperscale.distributed_rewrite.models import (
+    from hyperscale.distributed.models import (
         StateSyncResponse,
         WorkerStateSnapshot,
     )
@@ -1093,7 +1093,7 @@ def test_state_sync_response_worker_serde():
 
 @test("StateSyncResponse: serialization with manager state")
 def test_state_sync_response_manager_serde():
-    from hyperscale.distributed_rewrite.models import (
+    from hyperscale.distributed.models import (
         StateSyncResponse,
         ManagerStateSnapshot,
     )
@@ -1143,7 +1143,7 @@ print("=" * 60)
 
 @test("HealthAwareServer: has node dead callback registration")
 def test_health_aware_server_node_dead_callback():
-    from hyperscale.distributed_rewrite.swim import HealthAwareServer
+    from hyperscale.distributed.swim import HealthAwareServer
 
     assert hasattr(HealthAwareServer, 'register_on_node_dead')
     assert callable(getattr(HealthAwareServer, 'register_on_node_dead'))
@@ -1152,7 +1152,7 @@ def test_health_aware_server_node_dead_callback():
 @test("HealthAwareServer: node dead callback list initialized")
 def test_health_aware_server_node_dead_list():
     import inspect
-    from hyperscale.distributed_rewrite.swim import HealthAwareServer
+    from hyperscale.distributed.swim import HealthAwareServer
     
     source = inspect.getsource(HealthAwareServer.__init__)
     assert '_on_node_dead_callbacks' in source
@@ -1160,7 +1160,7 @@ def test_health_aware_server_node_dead_list():
 
 @test("ManagerServer: has retry mechanism methods")
 def test_manager_retry_methods():
-    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    from hyperscale.distributed.nodes import ManagerServer
     
     assert hasattr(ManagerServer, '_on_node_dead')
     assert hasattr(ManagerServer, '_handle_workflow_failure')
@@ -1172,7 +1172,7 @@ def test_manager_retry_methods():
 @test("ManagerServer: has retry configuration")
 def test_manager_retry_config():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    from hyperscale.distributed.nodes import ManagerServer
     
     # Check __init__ signature has retry params
     sig = inspect.signature(ManagerServer.__init__)
@@ -1204,7 +1204,7 @@ print("=" * 60)
 
 @test("WorkerServer: has per-core tracking methods")
 def test_worker_per_core_methods():
-    from hyperscale.distributed_rewrite.nodes import WorkerServer
+    from hyperscale.distributed.nodes import WorkerServer
     
     assert hasattr(WorkerServer, '_allocate_cores')
     assert hasattr(WorkerServer, '_free_cores')
@@ -1217,7 +1217,7 @@ def test_worker_per_core_methods():
 @test("WorkerServer: has per-core data structures")
 def test_worker_per_core_data():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import WorkerServer
+    from hyperscale.distributed.nodes import WorkerServer
     
     source = inspect.getsource(WorkerServer.__init__)
     assert '_core_assignments' in source
@@ -1226,7 +1226,7 @@ def test_worker_per_core_data():
 
 @test("WorkflowProgress: has assigned_cores field")
 def test_workflow_progress_cores():
-    from hyperscale.distributed_rewrite.models import WorkflowProgress
+    from hyperscale.distributed.models import WorkflowProgress
     
     # Create with default (empty list)
     progress = WorkflowProgress(
@@ -1258,7 +1258,7 @@ def test_workflow_progress_cores():
 
 @test("WorkflowProgress: serialization with assigned_cores")
 def test_workflow_progress_cores_serde():
-    from hyperscale.distributed_rewrite.models import WorkflowProgress
+    from hyperscale.distributed.models import WorkflowProgress
     
     original = WorkflowProgress(
         job_id="job-1",
@@ -1298,7 +1298,7 @@ print("=" * 60)
 
 @test("WorkflowProgress: has cores_completed field")
 def test_workflow_progress_cores_completed():
-    from hyperscale.distributed_rewrite.models import WorkflowProgress
+    from hyperscale.distributed.models import WorkflowProgress
     
     # Create with default (0)
     progress = WorkflowProgress(
@@ -1332,7 +1332,7 @@ def test_workflow_progress_cores_completed():
 
 @test("WorkflowProgress: has avg_cpu_percent and avg_memory_mb fields")
 def test_workflow_progress_system_stats():
-    from hyperscale.distributed_rewrite.models import WorkflowProgress
+    from hyperscale.distributed.models import WorkflowProgress
     
     progress = WorkflowProgress(
         job_id="job-1",
@@ -1352,7 +1352,7 @@ def test_workflow_progress_system_stats():
 
 @test("WorkflowProgress: serialization with cores_completed")
 def test_workflow_progress_cores_completed_serde():
-    from hyperscale.distributed_rewrite.models import WorkflowProgress
+    from hyperscale.distributed.models import WorkflowProgress
     
     original = WorkflowProgress(
         job_id="job-1",
@@ -1381,7 +1381,7 @@ def test_workflow_progress_cores_completed_serde():
 @test("WorkerServer: has workflow runner integration")
 def test_worker_workflow_runner_integration():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import WorkerServer
+    from hyperscale.distributed.nodes import WorkerServer
     
     # Check for WorkflowRunner-related methods and fields
     assert hasattr(WorkerServer, '_get_workflow_runner')
@@ -1398,7 +1398,7 @@ def test_worker_workflow_runner_integration():
 @test("WorkerServer: _execute_workflow uses WorkflowRunner")
 def test_worker_execute_uses_runner():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import WorkerServer
+    from hyperscale.distributed.nodes import WorkerServer
     
     source = inspect.getsource(WorkerServer._execute_workflow)
     
@@ -1412,7 +1412,7 @@ def test_worker_execute_uses_runner():
 @test("ManagerServer: has cores_completed progress handler")
 def test_manager_cores_completed_handler():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    from hyperscale.distributed.nodes import ManagerServer
     
     # Check the method exists
     assert hasattr(ManagerServer, '_update_worker_cores_from_progress')
@@ -1431,7 +1431,7 @@ def test_manager_cores_completed_handler():
 @test("ManagerServer: _update_worker_cores_from_progress updates available cores")
 def test_manager_update_cores_method():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    from hyperscale.distributed.nodes import ManagerServer
     
     source = inspect.getsource(ManagerServer._update_worker_cores_from_progress)
     
@@ -1454,7 +1454,7 @@ def test_cores_completed_provisioning_scenario():
     - After some time, 2 cores complete their portion of Workflow A
     - Manager should see 2 + 4 = 6 available cores for new workflows
     """
-    from hyperscale.distributed_rewrite.models import (
+    from hyperscale.distributed.models import (
         WorkflowProgress,
         WorkerHeartbeat,
         WorkerState,
@@ -1535,7 +1535,7 @@ print("=" * 60)
 @test("ManagerServer: _handle_worker_failure properly validates retry data")
 def test_manager_handle_worker_failure():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    from hyperscale.distributed.nodes import ManagerServer
     
     assert hasattr(ManagerServer, '_handle_worker_failure')
     
@@ -1552,7 +1552,7 @@ def test_manager_handle_worker_failure():
 @test("ManagerServer: _retry_workflow uses correct VUs from dispatch")
 def test_manager_retry_uses_correct_vus():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    from hyperscale.distributed.nodes import ManagerServer
     
     source = inspect.getsource(ManagerServer._retry_workflow)
     
@@ -1568,7 +1568,7 @@ def test_manager_retry_uses_correct_vus():
 @test("WorkerServer: has manager failure detection")
 def test_worker_manager_failure_detection():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import WorkerServer
+    from hyperscale.distributed.nodes import WorkerServer
     
     assert hasattr(WorkerServer, '_on_node_dead')
     assert hasattr(WorkerServer, '_select_new_primary_manager')
@@ -1582,7 +1582,7 @@ def test_worker_manager_failure_detection():
 @test("WorkerServer: manager tracking uses new architecture")
 def test_worker_manager_tracking():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import WorkerServer
+    from hyperscale.distributed.nodes import WorkerServer
     
     # Check for new manager tracking attributes
     assert hasattr(WorkerServer, '_update_known_managers')
@@ -1608,7 +1608,7 @@ def test_worker_failure_scenario():
     5. _retry_workflow selects Worker B with enough VUs
     6. Workflow is re-dispatched to Worker B
     """
-    from hyperscale.distributed_rewrite.models import (
+    from hyperscale.distributed.models import (
         WorkflowDispatch,
         WorkflowProgress,
         WorkflowStatus,
@@ -1653,7 +1653,7 @@ def test_manager_failure_scenario():
     5. _select_new_primary_manager picks Manager B
     6. Worker continues with Manager B as primary
     """
-    from hyperscale.distributed_rewrite.models import (
+    from hyperscale.distributed.models import (
         WorkflowProgress,
         WorkflowStatus,
     )
@@ -1685,7 +1685,7 @@ def test_retry_preserves_resources():
     """
     Verify that workflow retry preserves the original VUs requirement.
     """
-    from hyperscale.distributed_rewrite.models import WorkflowDispatch
+    from hyperscale.distributed.models import WorkflowDispatch
     
     # Create workflows with different VU requirements
     workflows = [
@@ -1748,7 +1748,7 @@ print("=" * 40)
 
 @test("HealthAwareServer: has register_on_node_join callback")
 def test_health_aware_server_has_node_join_callback():
-    from hyperscale.distributed_rewrite.swim.health_aware_server import HealthAwareServer
+    from hyperscale.distributed.swim.health_aware_server import HealthAwareServer
     
     assert hasattr(HealthAwareServer, 'register_on_node_join'), \
         "HealthAwareServer must have register_on_node_join method"
@@ -1763,7 +1763,7 @@ def test_health_aware_server_has_node_join_callback():
 
 @test("ManagerServer: tracks manager UDP to TCP mapping")
 def test_manager_tracks_peer_mapping():
-    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    from hyperscale.distributed.nodes import ManagerServer
     
     # These are instance attributes set in __init__
     import inspect
@@ -1778,7 +1778,7 @@ def test_manager_tracks_peer_mapping():
 
 @test("ManagerServer: has _on_node_join callback")
 def test_manager_has_on_node_join():
-    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    from hyperscale.distributed.nodes import ManagerServer
     
     assert hasattr(ManagerServer, '_on_node_join'), \
         "ManagerServer must have _on_node_join method for peer recovery"
@@ -1786,7 +1786,7 @@ def test_manager_has_on_node_join():
 
 @test("ManagerServer: has _handle_manager_peer_failure method")
 def test_manager_has_handle_peer_failure():
-    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    from hyperscale.distributed.nodes import ManagerServer
     
     assert hasattr(ManagerServer, '_handle_manager_peer_failure'), \
         "ManagerServer must have _handle_manager_peer_failure method"
@@ -1794,7 +1794,7 @@ def test_manager_has_handle_peer_failure():
 
 @test("ManagerServer: has _handle_manager_peer_recovery method")
 def test_manager_has_handle_peer_recovery():
-    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    from hyperscale.distributed.nodes import ManagerServer
     
     assert hasattr(ManagerServer, '_handle_manager_peer_recovery'), \
         "ManagerServer must have _handle_manager_peer_recovery method"
@@ -1802,7 +1802,7 @@ def test_manager_has_handle_peer_recovery():
 
 @test("ManagerServer: has _has_quorum_available method")
 def test_manager_has_quorum_available():
-    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    from hyperscale.distributed.nodes import ManagerServer
     
     assert hasattr(ManagerServer, '_has_quorum_available'), \
         "ManagerServer must have _has_quorum_available method"
@@ -1811,7 +1811,7 @@ def test_manager_has_quorum_available():
 @test("ManagerServer: _on_node_dead checks for manager peers")
 def test_manager_on_node_dead_checks_peers():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    from hyperscale.distributed.nodes import ManagerServer
     
     source = inspect.getsource(ManagerServer._on_node_dead)
     
@@ -1834,7 +1834,7 @@ def test_manager_peer_failure_updates_active():
     4. _handle_manager_peer_failure removes B from active set
     5. _has_quorum_available reflects new state
     """
-    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    from hyperscale.distributed.nodes import ManagerServer
     
     # Check the method logic conceptually via inspection
     import inspect
@@ -1860,7 +1860,7 @@ def test_manager_peer_recovery_restores_active():
     3. _on_node_join fires on Manager A
     4. _handle_manager_peer_recovery adds B back to active set
     """
-    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    from hyperscale.distributed.nodes import ManagerServer
     
     import inspect
     
@@ -1878,7 +1878,7 @@ def test_manager_quorum_uses_configured_size():
     This prevents split-brain where a partition thinks it has quorum.
     """
     import inspect
-    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    from hyperscale.distributed.nodes import ManagerServer
     
     # Get the method - need to handle if it's a property
     quorum_method = ManagerServer._quorum_size
@@ -1902,7 +1902,7 @@ def test_has_quorum_uses_active():
     Verify _has_quorum_available checks active count vs quorum requirement.
     """
     import inspect
-    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    from hyperscale.distributed.nodes import ManagerServer
     
     source = inspect.getsource(ManagerServer._has_quorum_available)
     
@@ -1938,7 +1938,7 @@ print("=" * 50)
 @test("ManagerServer: _request_worker_state has retry logic")
 def test_manager_worker_state_retry():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    from hyperscale.distributed.nodes import ManagerServer
     
     source = inspect.getsource(ManagerServer._request_worker_state)
     
@@ -1953,7 +1953,7 @@ def test_manager_worker_state_retry():
 
 @test("ManagerServer: has _sync_state_from_manager_peers")
 def test_manager_has_peer_sync():
-    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    from hyperscale.distributed.nodes import ManagerServer
     
     assert hasattr(ManagerServer, '_sync_state_from_manager_peers'), \
         "ManagerServer must have _sync_state_from_manager_peers method"
@@ -1962,7 +1962,7 @@ def test_manager_has_peer_sync():
 @test("ManagerServer: _on_manager_become_leader syncs from peers")
 def test_manager_become_leader_syncs_peers():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    from hyperscale.distributed.nodes import ManagerServer
     
     source = inspect.getsource(ManagerServer._on_manager_become_leader)
     
@@ -1975,7 +1975,7 @@ def test_manager_become_leader_syncs_peers():
 @test("ManagerServer: has _request_manager_peer_state with retries")
 def test_manager_has_peer_state_request():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    from hyperscale.distributed.nodes import ManagerServer
     
     assert hasattr(ManagerServer, '_request_manager_peer_state'), \
         "ManagerServer must have _request_manager_peer_state method"
@@ -1989,7 +1989,7 @@ def test_manager_has_peer_state_request():
 
 @test("ManagerServer: has _process_manager_state_response")
 def test_manager_has_process_peer_response():
-    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    from hyperscale.distributed.nodes import ManagerServer
     
     assert hasattr(ManagerServer, '_process_manager_state_response'), \
         "ManagerServer must have _process_manager_state_response method"
@@ -1998,7 +1998,7 @@ def test_manager_has_process_peer_response():
 @test("GateServer: tracks gate peer addresses")
 def test_gate_tracks_peer_mapping():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import GateServer
+    from hyperscale.distributed.nodes import GateServer
     
     source = inspect.getsource(GateServer.__init__)
     
@@ -2010,7 +2010,7 @@ def test_gate_tracks_peer_mapping():
 
 @test("GateServer: has _on_node_dead callback")
 def test_gate_has_on_node_dead():
-    from hyperscale.distributed_rewrite.nodes import GateServer
+    from hyperscale.distributed.nodes import GateServer
     
     assert hasattr(GateServer, '_on_node_dead'), \
         "GateServer must have _on_node_dead method"
@@ -2018,7 +2018,7 @@ def test_gate_has_on_node_dead():
 
 @test("GateServer: has _on_node_join callback")
 def test_gate_has_on_node_join():
-    from hyperscale.distributed_rewrite.nodes import GateServer
+    from hyperscale.distributed.nodes import GateServer
     
     assert hasattr(GateServer, '_on_node_join'), \
         "GateServer must have _on_node_join method"
@@ -2026,7 +2026,7 @@ def test_gate_has_on_node_join():
 
 @test("GateServer: has _handle_gate_peer_failure method")
 def test_gate_has_handle_peer_failure():
-    from hyperscale.distributed_rewrite.nodes import GateServer
+    from hyperscale.distributed.nodes import GateServer
     
     assert hasattr(GateServer, '_handle_gate_peer_failure'), \
         "GateServer must have _handle_gate_peer_failure method"
@@ -2034,7 +2034,7 @@ def test_gate_has_handle_peer_failure():
 
 @test("GateServer: has _handle_gate_peer_recovery method")
 def test_gate_has_handle_peer_recovery():
-    from hyperscale.distributed_rewrite.nodes import GateServer
+    from hyperscale.distributed.nodes import GateServer
     
     assert hasattr(GateServer, '_handle_gate_peer_recovery'), \
         "GateServer must have _handle_gate_peer_recovery method"
@@ -2043,7 +2043,7 @@ def test_gate_has_handle_peer_recovery():
 @test("GateServer: _on_node_dead checks for gate peers")
 def test_gate_on_node_dead_checks_peers():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import GateServer
+    from hyperscale.distributed.nodes import GateServer
     
     source = inspect.getsource(GateServer._on_node_dead)
     
@@ -2056,7 +2056,7 @@ def test_gate_on_node_dead_checks_peers():
 @test("GateServer: peer failure updates active peers")
 def test_gate_peer_failure_updates_active():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import GateServer
+    from hyperscale.distributed.nodes import GateServer
     
     source = inspect.getsource(GateServer._handle_gate_peer_failure)
     
@@ -2067,7 +2067,7 @@ def test_gate_peer_failure_updates_active():
 @test("GateServer: peer recovery restores active peers")
 def test_gate_peer_recovery_restores_active():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import GateServer
+    from hyperscale.distributed.nodes import GateServer
     
     source = inspect.getsource(GateServer._handle_gate_peer_recovery)
     
@@ -2101,7 +2101,7 @@ print("=" * 50)
 
 @test("GCounter: initial value is 0")
 def test_gcounter_initial():
-    from hyperscale.distributed_rewrite.models import GCounter
+    from hyperscale.distributed.models import GCounter
     
     counter = GCounter()
     assert counter.value == 0, "Initial GCounter value should be 0"
@@ -2109,7 +2109,7 @@ def test_gcounter_initial():
 
 @test("GCounter: increment increases value")
 def test_gcounter_increment():
-    from hyperscale.distributed_rewrite.models import GCounter
+    from hyperscale.distributed.models import GCounter
     
     counter = GCounter()
     counter.increment("dc-east", 5)
@@ -2122,7 +2122,7 @@ def test_gcounter_increment():
 
 @test("GCounter: merge takes max of each slot")
 def test_gcounter_merge():
-    from hyperscale.distributed_rewrite.models import GCounter
+    from hyperscale.distributed.models import GCounter
     
     counter1 = GCounter()
     counter1.increment("dc-east", 5)
@@ -2142,7 +2142,7 @@ def test_gcounter_merge():
 
 @test("GCounter: merge is commutative")
 def test_gcounter_merge_commutative():
-    from hyperscale.distributed_rewrite.models import GCounter
+    from hyperscale.distributed.models import GCounter
     
     counter1 = GCounter(counts={"a": 5, "b": 3})
     counter2 = GCounter(counts={"a": 10, "c": 2})
@@ -2156,7 +2156,7 @@ def test_gcounter_merge_commutative():
 
 @test("GCounter: merge is idempotent")
 def test_gcounter_merge_idempotent():
-    from hyperscale.distributed_rewrite.models import GCounter
+    from hyperscale.distributed.models import GCounter
     
     counter = GCounter(counts={"a": 5, "b": 3})
     
@@ -2168,7 +2168,7 @@ def test_gcounter_merge_idempotent():
 
 @test("GCounter: serialization round-trip")
 def test_gcounter_serialization():
-    from hyperscale.distributed_rewrite.models import GCounter
+    from hyperscale.distributed.models import GCounter
     
     counter = GCounter()
     counter.increment("dc-east", 100)
@@ -2183,7 +2183,7 @@ def test_gcounter_serialization():
 
 @test("LWWRegister: set and get value")
 def test_lww_register_basic():
-    from hyperscale.distributed_rewrite.models import LWWRegister
+    from hyperscale.distributed.models import LWWRegister
     
     reg = LWWRegister()
     reg.set(100.5, 1, "node-1")
@@ -2194,7 +2194,7 @@ def test_lww_register_basic():
 
 @test("LWWRegister: higher timestamp wins")
 def test_lww_register_timestamp():
-    from hyperscale.distributed_rewrite.models import LWWRegister
+    from hyperscale.distributed.models import LWWRegister
     
     reg = LWWRegister()
     reg.set(100.5, 1, "node-1")
@@ -2209,7 +2209,7 @@ def test_lww_register_timestamp():
 
 @test("LWWRegister: node_id breaks ties")
 def test_lww_register_tiebreak():
-    from hyperscale.distributed_rewrite.models import LWWRegister
+    from hyperscale.distributed.models import LWWRegister
     
     reg = LWWRegister()
     reg.set(100.0, 5, "aaa")
@@ -2220,7 +2220,7 @@ def test_lww_register_tiebreak():
 
 @test("LWWRegister: merge keeps winner")
 def test_lww_register_merge():
-    from hyperscale.distributed_rewrite.models import LWWRegister
+    from hyperscale.distributed.models import LWWRegister
     
     reg1 = LWWRegister()
     reg1.set(100.0, 1, "node-1")
@@ -2236,7 +2236,7 @@ def test_lww_register_merge():
 
 @test("LWWMap: set and get values")
 def test_lww_map_basic():
-    from hyperscale.distributed_rewrite.models import LWWMap
+    from hyperscale.distributed.models import LWWMap
     
     m = LWWMap()
     m.set("dc-east", "RUNNING", 1, "manager-1")
@@ -2249,7 +2249,7 @@ def test_lww_map_basic():
 
 @test("LWWMap: merge combines entries")
 def test_lww_map_merge():
-    from hyperscale.distributed_rewrite.models import LWWMap
+    from hyperscale.distributed.models import LWWMap
     
     m1 = LWWMap()
     m1.set("dc-east", "RUNNING", 1, "m1")
@@ -2266,7 +2266,7 @@ def test_lww_map_merge():
 
 @test("JobStatsCRDT: basic operations")
 def test_job_stats_crdt_basic():
-    from hyperscale.distributed_rewrite.models import JobStatsCRDT
+    from hyperscale.distributed.models import JobStatsCRDT
     
     stats = JobStatsCRDT(job_id="job-123")
     
@@ -2285,7 +2285,7 @@ def test_job_stats_crdt_basic():
 
 @test("JobStatsCRDT: merge combines stats")
 def test_job_stats_crdt_merge():
-    from hyperscale.distributed_rewrite.models import JobStatsCRDT
+    from hyperscale.distributed.models import JobStatsCRDT
     
     stats1 = JobStatsCRDT(job_id="job-123")
     stats1.record_completed("dc-east", 100)
@@ -2304,7 +2304,7 @@ def test_job_stats_crdt_merge():
 
 @test("JobStatsCRDT: serialization round-trip")
 def test_job_stats_crdt_serialization():
-    from hyperscale.distributed_rewrite.models import JobStatsCRDT
+    from hyperscale.distributed.models import JobStatsCRDT
     
     stats = JobStatsCRDT(job_id="job-123")
     stats.record_completed("dc-east", 100)
@@ -2327,7 +2327,7 @@ def test_job_stats_crdt_cross_dc_merge():
     Simulate a scenario where two gates have different views
     of the same job's stats, then merge.
     """
-    from hyperscale.distributed_rewrite.models import JobStatsCRDT
+    from hyperscale.distributed.models import JobStatsCRDT
     
     # Gate A's view
     gate_a_stats = JobStatsCRDT(job_id="job-123")
@@ -2384,7 +2384,7 @@ print("=" * 50)
 
 @test("DatacenterHealth: enum has all required states")
 def test_dc_health_enum():
-    from hyperscale.distributed_rewrite.models import DatacenterHealth
+    from hyperscale.distributed.models import DatacenterHealth
     
     assert hasattr(DatacenterHealth, 'HEALTHY')
     assert hasattr(DatacenterHealth, 'BUSY')
@@ -2399,7 +2399,7 @@ def test_dc_health_enum():
 
 @test("DatacenterStatus: has all required fields")
 def test_dc_status_fields():
-    from hyperscale.distributed_rewrite.models import DatacenterStatus, DatacenterHealth
+    from hyperscale.distributed.models import DatacenterStatus, DatacenterHealth
     
     status = DatacenterStatus(
         dc_id="us-east-1",
@@ -2421,7 +2421,7 @@ def test_dc_status_fields():
 
 @test("DatacenterStatus: serialization round-trip")
 def test_dc_status_serialization():
-    from hyperscale.distributed_rewrite.models import DatacenterStatus, DatacenterHealth
+    from hyperscale.distributed.models import DatacenterStatus, DatacenterHealth
     
     status = DatacenterStatus(
         dc_id="eu-west-1",
@@ -2442,7 +2442,7 @@ def test_dc_status_serialization():
 
 @test("GateServer: has _classify_datacenter_health method")
 def test_gate_has_classify_dc_health():
-    from hyperscale.distributed_rewrite.nodes import GateServer
+    from hyperscale.distributed.nodes import GateServer
     
     assert hasattr(GateServer, '_classify_datacenter_health'), \
         "GateServer must have _classify_datacenter_health method"
@@ -2450,7 +2450,7 @@ def test_gate_has_classify_dc_health():
 
 @test("GateServer: has _get_all_datacenter_health method")
 def test_gate_has_get_all_dc_health():
-    from hyperscale.distributed_rewrite.nodes import GateServer
+    from hyperscale.distributed.nodes import GateServer
     
     assert hasattr(GateServer, '_get_all_datacenter_health'), \
         "GateServer must have _get_all_datacenter_health method"
@@ -2458,7 +2458,7 @@ def test_gate_has_get_all_dc_health():
 
 @test("GateServer: has _select_datacenters_with_fallback method")
 def test_gate_has_select_dc_fallback():
-    from hyperscale.distributed_rewrite.nodes import GateServer
+    from hyperscale.distributed.nodes import GateServer
     
     assert hasattr(GateServer, '_select_datacenters_with_fallback'), \
         "GateServer must have _select_datacenters_with_fallback method"
@@ -2466,7 +2466,7 @@ def test_gate_has_select_dc_fallback():
 
 @test("GateServer: has _try_dispatch_to_dc method")
 def test_gate_has_try_dispatch():
-    from hyperscale.distributed_rewrite.nodes import GateServer
+    from hyperscale.distributed.nodes import GateServer
     
     assert hasattr(GateServer, '_try_dispatch_to_dc'), \
         "GateServer must have _try_dispatch_to_dc method"
@@ -2474,7 +2474,7 @@ def test_gate_has_try_dispatch():
 
 @test("GateServer: has _dispatch_job_with_fallback method")
 def test_gate_has_dispatch_fallback():
-    from hyperscale.distributed_rewrite.nodes import GateServer
+    from hyperscale.distributed.nodes import GateServer
     
     assert hasattr(GateServer, '_dispatch_job_with_fallback'), \
         "GateServer must have _dispatch_job_with_fallback method"
@@ -2483,7 +2483,7 @@ def test_gate_has_dispatch_fallback():
 @test("GateServer: _classify_datacenter_health returns DatacenterStatus")
 def test_gate_classify_dc_returns_status():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import GateServer
+    from hyperscale.distributed.nodes import GateServer
     
     source = inspect.getsource(GateServer._classify_datacenter_health)
     
@@ -2504,7 +2504,7 @@ def test_gate_classify_dc_returns_status():
 @test("GateServer: _select_datacenters_with_fallback returns tuple")
 def test_gate_select_dc_returns_tuple():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import GateServer
+    from hyperscale.distributed.nodes import GateServer
     
     source = inspect.getsource(GateServer._select_datacenters_with_fallback)
     
@@ -2519,7 +2519,7 @@ def test_gate_select_dc_returns_tuple():
 @test("GateServer: _dispatch_job_to_datacenters uses fallback")
 def test_gate_dispatch_uses_fallback():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import GateServer
+    from hyperscale.distributed.nodes import GateServer
     
     source = inspect.getsource(GateServer._dispatch_job_to_datacenters)
     
@@ -2536,7 +2536,7 @@ def test_smart_dispatch_only_fail_if_all_unhealthy():
     BUSY DCs should still accept jobs (they will be queued).
     """
     import inspect
-    from hyperscale.distributed_rewrite.nodes import GateServer
+    from hyperscale.distributed.nodes import GateServer
     
     # Check _try_dispatch_to_manager handles BUSY correctly
     # (this is where the actual dispatch logic lives now)
@@ -2564,7 +2564,7 @@ def test_health_classification_busy():
     - But no immediate capacity (available_cores = 0)
     """
     import inspect
-    from hyperscale.distributed_rewrite.nodes import GateServer
+    from hyperscale.distributed.nodes import GateServer
     
     source = inspect.getsource(GateServer._classify_datacenter_health)
     
@@ -2600,7 +2600,7 @@ print("=" * 50)
 
 @test("UpdateTier: enum has all required values")
 def test_update_tier_enum():
-    from hyperscale.distributed_rewrite.models import UpdateTier
+    from hyperscale.distributed.models import UpdateTier
     
     assert hasattr(UpdateTier, 'IMMEDIATE')
     assert hasattr(UpdateTier, 'PERIODIC')
@@ -2613,7 +2613,7 @@ def test_update_tier_enum():
 
 @test("GateServer: has _classify_update_tier method")
 def test_gate_has_classify_tier():
-    from hyperscale.distributed_rewrite.nodes import GateServer
+    from hyperscale.distributed.nodes import GateServer
     
     assert hasattr(GateServer, '_classify_update_tier'), \
         "GateServer must have _classify_update_tier method"
@@ -2621,7 +2621,7 @@ def test_gate_has_classify_tier():
 
 @test("GateServer: has _send_immediate_update method")
 def test_gate_has_immediate_update():
-    from hyperscale.distributed_rewrite.nodes import GateServer
+    from hyperscale.distributed.nodes import GateServer
     
     assert hasattr(GateServer, '_send_immediate_update'), \
         "GateServer must have _send_immediate_update method"
@@ -2629,7 +2629,7 @@ def test_gate_has_immediate_update():
 
 @test("GateServer: has _batch_stats_loop method")
 def test_gate_has_batch_stats_loop():
-    from hyperscale.distributed_rewrite.nodes import GateServer
+    from hyperscale.distributed.nodes import GateServer
     
     assert hasattr(GateServer, '_batch_stats_loop'), \
         "GateServer must have _batch_stats_loop method"
@@ -2637,7 +2637,7 @@ def test_gate_has_batch_stats_loop():
 
 @test("GateServer: has _batch_stats_update method")
 def test_gate_has_batch_stats_update():
-    from hyperscale.distributed_rewrite.nodes import GateServer
+    from hyperscale.distributed.nodes import GateServer
     
     assert hasattr(GateServer, '_batch_stats_update'), \
         "GateServer must have _batch_stats_update method"
@@ -2645,7 +2645,7 @@ def test_gate_has_batch_stats_update():
 
 @test("GateServer: has _handle_update_by_tier method")
 def test_gate_has_handle_update_tier():
-    from hyperscale.distributed_rewrite.nodes import GateServer
+    from hyperscale.distributed.nodes import GateServer
     
     assert hasattr(GateServer, '_handle_update_by_tier'), \
         "GateServer must have _handle_update_by_tier method"
@@ -2654,8 +2654,8 @@ def test_gate_has_handle_update_tier():
 @test("GateServer: _classify_update_tier returns IMMEDIATE for completion")
 def test_classify_tier_completion_is_immediate():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import GateServer
-    from hyperscale.distributed_rewrite.models import JobStatus
+    from hyperscale.distributed.nodes import GateServer
+    from hyperscale.distributed.models import JobStatus
     
     source = inspect.getsource(GateServer._classify_update_tier)
     
@@ -2668,7 +2668,7 @@ def test_classify_tier_completion_is_immediate():
 @test("GateServer: _classify_update_tier returns PERIODIC for progress")
 def test_classify_tier_progress_is_periodic():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import GateServer
+    from hyperscale.distributed.nodes import GateServer
     
     source = inspect.getsource(GateServer._classify_update_tier)
     
@@ -2680,7 +2680,7 @@ def test_classify_tier_progress_is_periodic():
 def test_receive_progress_uses_tiers():
     import inspect
     import pathlib
-    from hyperscale.distributed_rewrite.nodes import GateServer
+    from hyperscale.distributed.nodes import GateServer
     
     # The receive_job_progress method is decorated, so we need to read the file directly
     gate_path = pathlib.Path(inspect.getfile(GateServer))
@@ -2707,7 +2707,7 @@ def test_receive_progress_uses_tiers():
 @test("GateServer: start() runs batch stats loop")
 def test_gate_start_runs_batch_loop():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import GateServer
+    from hyperscale.distributed.nodes import GateServer
     
     source = inspect.getsource(GateServer.start)
     
@@ -2739,7 +2739,7 @@ print("=" * 50)
 
 @test("WorkflowProgressAck: model exists with expected fields")
 def test_workflow_progress_ack_model():
-    from hyperscale.distributed_rewrite.models import WorkflowProgressAck, ManagerInfo
+    from hyperscale.distributed.models import WorkflowProgressAck, ManagerInfo
     
     # Create a sample ack
     managers = [
@@ -2768,7 +2768,7 @@ def test_workflow_progress_ack_model():
 
 @test("WorkflowProgressAck: serialization round-trip")
 def test_workflow_progress_ack_serialization():
-    from hyperscale.distributed_rewrite.models import WorkflowProgressAck, ManagerInfo
+    from hyperscale.distributed.models import WorkflowProgressAck, ManagerInfo
     
     ack = WorkflowProgressAck(
         manager_id="manager-1",
@@ -2803,10 +2803,10 @@ def test_manager_progress_returns_ack():
     decorator wraps the method, and inspect.getsource() returns the wrapper.
     """
     import pathlib
-    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    from hyperscale.distributed.nodes import ManagerServer
     
     # Get the source file path
-    import hyperscale.distributed_rewrite.nodes.manager as manager_module
+    import hyperscale.distributed.nodes.manager as manager_module
     source_file = pathlib.Path(manager_module.__file__)
     source = source_file.read_text()
     
@@ -2823,7 +2823,7 @@ def test_manager_progress_returns_ack():
 @test("Worker: processes WorkflowProgressAck from manager")
 def test_worker_processes_progress_ack():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import WorkerServer
+    from hyperscale.distributed.nodes import WorkerServer
     
     # Check that worker has method to process ack
     assert hasattr(WorkerServer, '_process_workflow_progress_ack'), \
@@ -2843,7 +2843,7 @@ def test_worker_processes_progress_ack():
 @test("Worker: _send_progress_update processes ack response")
 def test_worker_send_progress_processes_ack():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import WorkerServer
+    from hyperscale.distributed.nodes import WorkerServer
     
     source = inspect.getsource(WorkerServer._send_progress_update)
     
@@ -2870,7 +2870,7 @@ print("=" * 50)
 
 @test("ManagerStateEmbedder: has on_manager_heartbeat callback")
 def test_manager_embedder_has_peer_callback():
-    from hyperscale.distributed_rewrite.swim.core.state_embedder import ManagerStateEmbedder
+    from hyperscale.distributed.swim.core.state_embedder import ManagerStateEmbedder
     import inspect
     
     # Check that on_manager_heartbeat is a field
@@ -2884,7 +2884,7 @@ def test_manager_embedder_has_peer_callback():
 @test("ManagerStateEmbedder: process_state handles ManagerHeartbeat")
 def test_manager_embedder_processes_manager_heartbeat():
     import inspect
-    from hyperscale.distributed_rewrite.swim.core.state_embedder import ManagerStateEmbedder
+    from hyperscale.distributed.swim.core.state_embedder import ManagerStateEmbedder
     
     source = inspect.getsource(ManagerStateEmbedder.process_state)
     
@@ -2898,7 +2898,7 @@ def test_manager_embedder_processes_manager_heartbeat():
 @test("Manager: has _manager_peer_info tracking")
 def test_manager_has_peer_info_tracking():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    from hyperscale.distributed.nodes import ManagerServer
     
     source = inspect.getsource(ManagerServer.__init__)
     
@@ -2908,7 +2908,7 @@ def test_manager_has_peer_info_tracking():
 
 @test("Manager: has _handle_manager_peer_heartbeat method")
 def test_manager_has_peer_heartbeat_handler():
-    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    from hyperscale.distributed.nodes import ManagerServer
     import inspect
     
     assert hasattr(ManagerServer, '_handle_manager_peer_heartbeat'), \
@@ -2925,7 +2925,7 @@ def test_manager_has_peer_heartbeat_handler():
 @test("Manager: _get_healthy_managers uses real peer info")
 def test_manager_get_healthy_uses_peer_info():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    from hyperscale.distributed.nodes import ManagerServer
     
     source = inspect.getsource(ManagerServer._get_healthy_managers)
     
@@ -2939,7 +2939,7 @@ def test_manager_get_healthy_uses_peer_info():
 @test("Manager: state embedder includes on_manager_heartbeat")
 def test_manager_embedder_includes_callback():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    from hyperscale.distributed.nodes import ManagerServer
     
     source = inspect.getsource(ManagerServer.__init__)
     
@@ -2967,7 +2967,7 @@ print("=" * 50)
 
 @test("WorkerStateEmbedder: has on_manager_heartbeat callback")
 def test_worker_embedder_has_manager_callback():
-    from hyperscale.distributed_rewrite.swim.core.state_embedder import WorkerStateEmbedder
+    from hyperscale.distributed.swim.core.state_embedder import WorkerStateEmbedder
     import inspect
     
     sig = inspect.signature(WorkerStateEmbedder)
@@ -2980,7 +2980,7 @@ def test_worker_embedder_has_manager_callback():
 @test("WorkerStateEmbedder: process_state handles ManagerHeartbeat")
 def test_worker_embedder_processes_manager_heartbeat():
     import inspect
-    from hyperscale.distributed_rewrite.swim.core.state_embedder import WorkerStateEmbedder
+    from hyperscale.distributed.swim.core.state_embedder import WorkerStateEmbedder
     
     source = inspect.getsource(WorkerStateEmbedder.process_state)
     
@@ -2993,7 +2993,7 @@ def test_worker_embedder_processes_manager_heartbeat():
 
 @test("Worker: has _handle_manager_heartbeat method")
 def test_worker_has_manager_heartbeat_handler():
-    from hyperscale.distributed_rewrite.nodes import WorkerServer
+    from hyperscale.distributed.nodes import WorkerServer
     import inspect
     
     assert hasattr(WorkerServer, '_handle_manager_heartbeat'), \
@@ -3012,7 +3012,7 @@ def test_worker_has_manager_heartbeat_handler():
 @test("Worker: state embedder includes on_manager_heartbeat")
 def test_worker_embedder_includes_callback():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import WorkerServer
+    from hyperscale.distributed.nodes import WorkerServer
     
     source = inspect.getsource(WorkerServer.__init__)
     
@@ -3024,7 +3024,7 @@ def test_worker_embedder_includes_callback():
 @test("Worker: _handle_manager_heartbeat updates leadership tracking")
 def test_worker_heartbeat_updates_leader():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import WorkerServer
+    from hyperscale.distributed.nodes import WorkerServer
     
     source = inspect.getsource(WorkerServer._handle_manager_heartbeat)
     
@@ -3040,7 +3040,7 @@ def test_worker_heartbeat_updates_leader():
 @test("Worker: _handle_manager_heartbeat discovers new managers via SWIM")
 def test_worker_heartbeat_discovers_new_managers():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import WorkerServer
+    from hyperscale.distributed.nodes import WorkerServer
     
     source = inspect.getsource(WorkerServer._handle_manager_heartbeat)
     
@@ -3070,7 +3070,7 @@ print("=" * 50)
 
 @test("GateInfo: model exists with expected fields")
 def test_gate_info_model():
-    from hyperscale.distributed_rewrite.models import GateInfo
+    from hyperscale.distributed.models import GateInfo
     
     gate = GateInfo(
         node_id="gate-1",
@@ -3088,7 +3088,7 @@ def test_gate_info_model():
 
 @test("GateHeartbeat: model exists with expected fields")
 def test_gate_heartbeat_model():
-    from hyperscale.distributed_rewrite.models import GateHeartbeat
+    from hyperscale.distributed.models import GateHeartbeat
     
     heartbeat = GateHeartbeat(
         node_id="gate-1",
@@ -3109,7 +3109,7 @@ def test_gate_heartbeat_model():
 
 @test("ManagerRegistrationResponse: model exists")
 def test_manager_registration_response_model():
-    from hyperscale.distributed_rewrite.models import ManagerRegistrationResponse, GateInfo
+    from hyperscale.distributed.models import ManagerRegistrationResponse, GateInfo
     
     gates = [
         GateInfo(
@@ -3135,7 +3135,7 @@ def test_manager_registration_response_model():
 
 @test("JobProgressAck: model exists with expected fields")
 def test_job_progress_ack_model():
-    from hyperscale.distributed_rewrite.models import JobProgressAck, GateInfo
+    from hyperscale.distributed.models import JobProgressAck, GateInfo
     
     ack = JobProgressAck(
         gate_id="gate-1",
@@ -3160,7 +3160,7 @@ def test_job_progress_ack_model():
 @test("GateStateEmbedder: embeds GateHeartbeat")
 def test_gate_embedder_embeds_heartbeat():
     import inspect
-    from hyperscale.distributed_rewrite.swim.core.state_embedder import GateStateEmbedder
+    from hyperscale.distributed.swim.core.state_embedder import GateStateEmbedder
     
     source = inspect.getsource(GateStateEmbedder.get_state)
     
@@ -3170,7 +3170,7 @@ def test_gate_embedder_embeds_heartbeat():
 
 @test("GateStateEmbedder: has on_gate_heartbeat callback")
 def test_gate_embedder_has_gate_callback():
-    from hyperscale.distributed_rewrite.swim.core.state_embedder import GateStateEmbedder
+    from hyperscale.distributed.swim.core.state_embedder import GateStateEmbedder
     import inspect
     
     sig = inspect.signature(GateStateEmbedder)
@@ -3183,7 +3183,7 @@ def test_gate_embedder_has_gate_callback():
 @test("GateStateEmbedder: process_state handles GateHeartbeat")
 def test_gate_embedder_processes_gate_heartbeat():
     import inspect
-    from hyperscale.distributed_rewrite.swim.core.state_embedder import GateStateEmbedder
+    from hyperscale.distributed.swim.core.state_embedder import GateStateEmbedder
     
     source = inspect.getsource(GateStateEmbedder.process_state)
     
@@ -3194,7 +3194,7 @@ def test_gate_embedder_processes_gate_heartbeat():
 @test("Gate: has _gate_peer_info tracking")
 def test_gate_has_peer_info_tracking():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import GateServer
+    from hyperscale.distributed.nodes import GateServer
     
     source = inspect.getsource(GateServer.__init__)
     
@@ -3204,7 +3204,7 @@ def test_gate_has_peer_info_tracking():
 
 @test("Gate: has _handle_gate_peer_heartbeat method")
 def test_gate_has_peer_heartbeat_handler():
-    from hyperscale.distributed_rewrite.nodes import GateServer
+    from hyperscale.distributed.nodes import GateServer
     import inspect
     
     assert hasattr(GateServer, '_handle_gate_peer_heartbeat'), \
@@ -3218,7 +3218,7 @@ def test_gate_has_peer_heartbeat_handler():
 
 @test("Gate: has _get_healthy_gates method")
 def test_gate_has_get_healthy_gates():
-    from hyperscale.distributed_rewrite.nodes import GateServer
+    from hyperscale.distributed.nodes import GateServer
     import inspect
     
     assert hasattr(GateServer, '_get_healthy_gates'), \
@@ -3233,9 +3233,9 @@ def test_gate_has_get_healthy_gates():
 @test("Gate: receive_job_progress returns JobProgressAck")
 def test_gate_progress_returns_ack():
     import pathlib
-    from hyperscale.distributed_rewrite.nodes import GateServer
+    from hyperscale.distributed.nodes import GateServer
     
-    import hyperscale.distributed_rewrite.nodes.gate as gate_module
+    import hyperscale.distributed.nodes.gate as gate_module
     source_file = pathlib.Path(gate_module.__file__)
     source = source_file.read_text()
     
@@ -3248,9 +3248,9 @@ def test_gate_progress_returns_ack():
 @test("Gate: receive_manager_register returns ManagerRegistrationResponse")
 def test_gate_manager_register():
     import pathlib
-    from hyperscale.distributed_rewrite.nodes import GateServer
+    from hyperscale.distributed.nodes import GateServer
     
-    import hyperscale.distributed_rewrite.nodes.gate as gate_module
+    import hyperscale.distributed.nodes.gate as gate_module
     source_file = pathlib.Path(gate_module.__file__)
     source = source_file.read_text()
     
@@ -3260,7 +3260,7 @@ def test_gate_manager_register():
 
 @test("ManagerStateEmbedder: has on_gate_heartbeat callback")
 def test_manager_embedder_has_gate_callback():
-    from hyperscale.distributed_rewrite.swim.core.state_embedder import ManagerStateEmbedder
+    from hyperscale.distributed.swim.core.state_embedder import ManagerStateEmbedder
     import inspect
     
     sig = inspect.signature(ManagerStateEmbedder)
@@ -3273,7 +3273,7 @@ def test_manager_embedder_has_gate_callback():
 @test("ManagerStateEmbedder: process_state handles GateHeartbeat")
 def test_manager_embedder_processes_gate_heartbeat():
     import inspect
-    from hyperscale.distributed_rewrite.swim.core.state_embedder import ManagerStateEmbedder
+    from hyperscale.distributed.swim.core.state_embedder import ManagerStateEmbedder
     
     source = inspect.getsource(ManagerStateEmbedder.process_state)
     
@@ -3284,7 +3284,7 @@ def test_manager_embedder_processes_gate_heartbeat():
 @test("Manager: has gate tracking structures")
 def test_manager_has_gate_tracking():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    from hyperscale.distributed.nodes import ManagerServer
     
     source = inspect.getsource(ManagerServer.__init__)
     
@@ -3298,7 +3298,7 @@ def test_manager_has_gate_tracking():
 
 @test("Manager: has _handle_gate_heartbeat method")
 def test_manager_has_gate_heartbeat_handler():
-    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    from hyperscale.distributed.nodes import ManagerServer
     import inspect
     
     assert hasattr(ManagerServer, '_handle_gate_heartbeat'), \
@@ -3314,7 +3314,7 @@ def test_manager_has_gate_heartbeat_handler():
 
 @test("Manager: has _process_job_progress_ack method")
 def test_manager_has_process_job_progress_ack():
-    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    from hyperscale.distributed.nodes import ManagerServer
     import inspect
     
     assert hasattr(ManagerServer, '_process_job_progress_ack'), \
@@ -3328,7 +3328,7 @@ def test_manager_has_process_job_progress_ack():
 
 @test("Manager: has _update_known_gates method")
 def test_manager_has_update_known_gates():
-    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    from hyperscale.distributed.nodes import ManagerServer
     
     assert hasattr(ManagerServer, '_update_known_gates'), \
         "ManagerServer should have _update_known_gates method"
@@ -3336,7 +3336,7 @@ def test_manager_has_update_known_gates():
 
 @test("Manager: has gate registration at startup")
 def test_manager_has_gate_registration():
-    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    from hyperscale.distributed.nodes import ManagerServer
     import inspect
     
     assert hasattr(ManagerServer, '_register_with_gates'), \
@@ -3351,7 +3351,7 @@ def test_manager_has_gate_registration():
 @test("Manager: state embedder includes on_gate_heartbeat")
 def test_manager_embedder_includes_gate_callback():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    from hyperscale.distributed.nodes import ManagerServer
     
     source = inspect.getsource(ManagerServer.__init__)
     
@@ -3362,7 +3362,7 @@ def test_manager_embedder_includes_gate_callback():
 @test("Manager: _send_job_progress_to_gate processes ack")
 def test_manager_send_progress_processes_ack():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    from hyperscale.distributed.nodes import ManagerServer
     
     source = inspect.getsource(ManagerServer._send_job_progress_to_gate)
     
@@ -3404,7 +3404,7 @@ print("=" * 50)
 
 @test("ManagerState: enum exists with expected values")
 def test_manager_state_enum():
-    from hyperscale.distributed_rewrite.models import ManagerState
+    from hyperscale.distributed.models import ManagerState
     
     assert hasattr(ManagerState, 'SYNCING'), "ManagerState should have SYNCING"
     assert hasattr(ManagerState, 'ACTIVE'), "ManagerState should have ACTIVE"
@@ -3417,8 +3417,8 @@ def test_manager_state_enum():
 @test("Manager: starts in SYNCING state")
 def test_manager_starts_syncing():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import ManagerServer
-    from hyperscale.distributed_rewrite.models import ManagerState
+    from hyperscale.distributed.nodes import ManagerServer
+    from hyperscale.distributed.models import ManagerState
     
     source = inspect.getsource(ManagerServer.__init__)
     
@@ -3429,7 +3429,7 @@ def test_manager_starts_syncing():
 @test("Manager: _has_quorum_available excludes SYNCING managers")
 def test_manager_quorum_excludes_syncing():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    from hyperscale.distributed.nodes import ManagerServer
     
     source = inspect.getsource(ManagerServer._has_quorum_available)
     
@@ -3442,7 +3442,7 @@ def test_manager_quorum_excludes_syncing():
 
 @test("Manager: has _complete_startup_sync method")
 def test_manager_has_startup_sync():
-    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    from hyperscale.distributed.nodes import ManagerServer
     import inspect
     
     assert hasattr(ManagerServer, '_complete_startup_sync'), \
@@ -3462,9 +3462,9 @@ def test_manager_has_startup_sync():
 @test("Manager: start() calls _complete_startup_sync")
 def test_manager_start_calls_sync():
     import pathlib
-    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    from hyperscale.distributed.nodes import ManagerServer
     
-    import hyperscale.distributed_rewrite.nodes.manager as manager_module
+    import hyperscale.distributed.nodes.manager as manager_module
     source_file = pathlib.Path(manager_module.__file__)
     source = source_file.read_text()
     
@@ -3474,7 +3474,7 @@ def test_manager_start_calls_sync():
 
 @test("ManagerHeartbeat: has state field")
 def test_manager_heartbeat_has_state():
-    from hyperscale.distributed_rewrite.models import ManagerHeartbeat
+    from hyperscale.distributed.models import ManagerHeartbeat
     import inspect
     
     sig = inspect.signature(ManagerHeartbeat)
@@ -3487,7 +3487,7 @@ def test_manager_heartbeat_has_state():
 @test("Manager: _build_manager_heartbeat includes state")
 def test_manager_heartbeat_includes_state():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    from hyperscale.distributed.nodes import ManagerServer
     
     source = inspect.getsource(ManagerServer._build_manager_heartbeat)
     
@@ -3497,7 +3497,7 @@ def test_manager_heartbeat_includes_state():
 
 @test("ManagerStateEmbedder: has get_manager_state callback")
 def test_manager_embedder_has_state_callback():
-    from hyperscale.distributed_rewrite.swim.core.state_embedder import ManagerStateEmbedder
+    from hyperscale.distributed.swim.core.state_embedder import ManagerStateEmbedder
     import inspect
     
     sig = inspect.signature(ManagerStateEmbedder)
@@ -3510,7 +3510,7 @@ def test_manager_embedder_has_state_callback():
 @test("Manager: state embedder includes get_manager_state")
 def test_manager_embedder_includes_state_callback():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    from hyperscale.distributed.nodes import ManagerServer
     
     source = inspect.getsource(ManagerServer.__init__)
     
@@ -3540,7 +3540,7 @@ print("=" * 50)
 
 @test("QuorumError: error hierarchy exists")
 def test_quorum_error_hierarchy():
-    from hyperscale.distributed_rewrite.swim.core import (
+    from hyperscale.distributed.swim.core import (
         QuorumError,
         QuorumUnavailableError,
         QuorumTimeoutError,
@@ -3561,7 +3561,7 @@ def test_quorum_error_hierarchy():
 
 @test("QuorumTimeoutError: contains relevant info")
 def test_quorum_timeout_error():
-    from hyperscale.distributed_rewrite.swim.core import QuorumTimeoutError
+    from hyperscale.distributed.swim.core import QuorumTimeoutError
     
     err = QuorumTimeoutError(
         confirmations_received=1,
@@ -3576,7 +3576,7 @@ def test_quorum_timeout_error():
 
 @test("QuorumCircuitOpenError: contains retry info")
 def test_quorum_circuit_open_error():
-    from hyperscale.distributed_rewrite.swim.core import QuorumCircuitOpenError
+    from hyperscale.distributed.swim.core import QuorumCircuitOpenError
     
     err = QuorumCircuitOpenError(
         recent_failures=5,
@@ -3592,7 +3592,7 @@ def test_quorum_circuit_open_error():
 @test("Manager: has _quorum_circuit")
 def test_manager_has_quorum_circuit():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    from hyperscale.distributed.nodes import ManagerServer
     
     source = inspect.getsource(ManagerServer.__init__)
     
@@ -3605,7 +3605,7 @@ def test_manager_has_quorum_circuit():
 @test("Manager: _request_quorum_confirmation checks circuit")
 def test_manager_quorum_checks_circuit():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    from hyperscale.distributed.nodes import ManagerServer
     
     source = inspect.getsource(ManagerServer._request_quorum_confirmation)
     
@@ -3621,7 +3621,7 @@ def test_manager_quorum_checks_circuit():
 @test("Manager: _request_quorum_confirmation records failures")
 def test_manager_quorum_records_failures():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    from hyperscale.distributed.nodes import ManagerServer
     
     source = inspect.getsource(ManagerServer._request_quorum_confirmation)
     
@@ -3633,7 +3633,7 @@ def test_manager_quorum_records_failures():
 
 @test("Manager: has get_quorum_status method")
 def test_manager_has_quorum_status():
-    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    from hyperscale.distributed.nodes import ManagerServer
     import inspect
     
     assert hasattr(ManagerServer, 'get_quorum_status'), \
@@ -3650,9 +3650,9 @@ def test_manager_has_quorum_status():
 @test("Manager: workflow dispatch handles quorum errors")
 def test_manager_dispatch_handles_quorum_errors():
     import pathlib
-    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    from hyperscale.distributed.nodes import ManagerServer
     
-    import hyperscale.distributed_rewrite.nodes.manager as manager_module
+    import hyperscale.distributed.nodes.manager as manager_module
     source_file = pathlib.Path(manager_module.__file__)
     source = source_file.read_text()
     
@@ -3684,7 +3684,7 @@ print("=" * 70 + "\n")
 
 @test("JobSubmission: has callback_addr field")
 def test_job_submission_callback_addr():
-    from hyperscale.distributed_rewrite.models import JobSubmission
+    from hyperscale.distributed.models import JobSubmission
     import dataclasses
     
     fields = {f.name for f in dataclasses.fields(JobSubmission)}
@@ -3695,7 +3695,7 @@ def test_job_submission_callback_addr():
 
 @test("JobStatusPush: model exists")
 def test_job_status_push_model():
-    from hyperscale.distributed_rewrite.models import JobStatusPush
+    from hyperscale.distributed.models import JobStatusPush
     import dataclasses
     
     fields = {f.name for f in dataclasses.fields(JobStatusPush)}
@@ -3708,7 +3708,7 @@ def test_job_status_push_model():
 
 @test("JobBatchPush: model exists")
 def test_job_batch_push_model():
-    from hyperscale.distributed_rewrite.models import JobBatchPush
+    from hyperscale.distributed.models import JobBatchPush
     import dataclasses
     
     fields = {f.name for f in dataclasses.fields(JobBatchPush)}
@@ -3721,7 +3721,7 @@ def test_job_batch_push_model():
 @test("GateServer: has _job_callbacks dict")
 def test_gate_has_job_callbacks():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import GateServer
+    from hyperscale.distributed.nodes import GateServer
     
     source = inspect.getsource(GateServer.__init__)
     
@@ -3732,9 +3732,9 @@ def test_gate_has_job_callbacks():
 @test("GateServer: receive_job_submission stores callback")
 def test_gate_stores_callback():
     import pathlib
-    from hyperscale.distributed_rewrite.nodes import GateServer
+    from hyperscale.distributed.nodes import GateServer
     
-    import hyperscale.distributed_rewrite.nodes.gate as gate_module
+    import hyperscale.distributed.nodes.gate as gate_module
     source_file = pathlib.Path(gate_module.__file__)
     source = source_file.read_text()
     
@@ -3747,7 +3747,7 @@ def test_gate_stores_callback():
 @test("GateServer: _send_immediate_update pushes to client")
 def test_gate_immediate_push():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import GateServer
+    from hyperscale.distributed.nodes import GateServer
     
     source = inspect.getsource(GateServer._send_immediate_update)
     
@@ -3762,7 +3762,7 @@ def test_gate_immediate_push():
 @test("GateServer: _batch_stats_update pushes to clients")
 def test_gate_batch_push():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import GateServer
+    from hyperscale.distributed.nodes import GateServer
     
     source = inspect.getsource(GateServer._batch_stats_update)
     
@@ -3775,7 +3775,7 @@ def test_gate_batch_push():
 @test("ManagerServer: has _job_callbacks dict")
 def test_manager_has_job_callbacks():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    from hyperscale.distributed.nodes import ManagerServer
     
     source = inspect.getsource(ManagerServer.__init__)
     
@@ -3786,9 +3786,9 @@ def test_manager_has_job_callbacks():
 @test("ManagerServer: receive_job_submission stores callback")
 def test_manager_stores_callback():
     import pathlib
-    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    from hyperscale.distributed.nodes import ManagerServer
     
-    import hyperscale.distributed_rewrite.nodes.manager as manager_module
+    import hyperscale.distributed.nodes.manager as manager_module
     source_file = pathlib.Path(manager_module.__file__)
     source = source_file.read_text()
     
@@ -3798,7 +3798,7 @@ def test_manager_stores_callback():
 
 @test("ManagerServer: has _push_job_status_to_client method")
 def test_manager_has_push_status():
-    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    from hyperscale.distributed.nodes import ManagerServer
     import inspect
     
     assert hasattr(ManagerServer, '_push_job_status_to_client'), \
@@ -3812,7 +3812,7 @@ def test_manager_has_push_status():
 
 @test("ManagerServer: has _push_batch_stats_to_clients method")
 def test_manager_has_push_batch():
-    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    from hyperscale.distributed.nodes import ManagerServer
     import inspect
     
     assert hasattr(ManagerServer, '_push_batch_stats_to_clients'), \
@@ -3826,7 +3826,7 @@ def test_manager_has_push_batch():
 
 @test("ManagerServer: has _client_batch_push_loop method")
 def test_manager_has_batch_loop():
-    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    from hyperscale.distributed.nodes import ManagerServer
     import inspect
     
     assert hasattr(ManagerServer, '_client_batch_push_loop'), \
@@ -3839,7 +3839,7 @@ def test_manager_has_batch_loop():
 
 @test("ManagerServer: has _check_job_completion method")
 def test_manager_has_check_completion():
-    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    from hyperscale.distributed.nodes import ManagerServer
     import inspect
     
     assert hasattr(ManagerServer, '_check_job_completion'), \
@@ -3853,9 +3853,9 @@ def test_manager_has_check_completion():
 @test("ManagerServer: start enables batch push loop when no gates")
 def test_manager_start_enables_batch_loop():
     import pathlib
-    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    from hyperscale.distributed.nodes import ManagerServer
     
-    import hyperscale.distributed_rewrite.nodes.manager as manager_module
+    import hyperscale.distributed.nodes.manager as manager_module
     source_file = pathlib.Path(manager_module.__file__)
     source = source_file.read_text()
     
@@ -3891,7 +3891,7 @@ print("=" * 70 + "\n")
 
 @test("GateState: enum exists with expected values")
 def test_gate_state_enum():
-    from hyperscale.distributed_rewrite.models import GateState
+    from hyperscale.distributed.models import GateState
     
     assert hasattr(GateState, 'SYNCING')
     assert hasattr(GateState, 'ACTIVE')
@@ -3904,7 +3904,7 @@ def test_gate_state_enum():
 
 @test("GateHeartbeat: has state field")
 def test_gate_heartbeat_has_state():
-    from hyperscale.distributed_rewrite.models import GateHeartbeat
+    from hyperscale.distributed.models import GateHeartbeat
     import dataclasses
     
     fields = {f.name for f in dataclasses.fields(GateHeartbeat)}
@@ -3914,7 +3914,7 @@ def test_gate_heartbeat_has_state():
 
 @test("GateStateEmbedder: has get_gate_state callback")
 def test_gate_embedder_has_state_callback():
-    from hyperscale.distributed_rewrite.swim import GateStateEmbedder
+    from hyperscale.distributed.swim import GateStateEmbedder
     import dataclasses
     
     fields = {f.name for f in dataclasses.fields(GateStateEmbedder)}
@@ -3926,7 +3926,7 @@ def test_gate_embedder_has_state_callback():
 @test("GateServer: starts in SYNCING state")
 def test_gate_starts_syncing():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import GateServer
+    from hyperscale.distributed.nodes import GateServer
     
     source = inspect.getsource(GateServer.__init__)
     
@@ -3938,7 +3938,7 @@ def test_gate_starts_syncing():
 
 @test("GateServer: has _has_quorum_available method")
 def test_gate_has_quorum_available():
-    from hyperscale.distributed_rewrite.nodes import GateServer
+    from hyperscale.distributed.nodes import GateServer
     import inspect
     
     assert hasattr(GateServer, '_has_quorum_available'), \
@@ -3952,7 +3952,7 @@ def test_gate_has_quorum_available():
 
 @test("GateServer: has _quorum_size method")
 def test_gate_has_quorum_size():
-    from hyperscale.distributed_rewrite.nodes import GateServer
+    from hyperscale.distributed.nodes import GateServer
     
     assert hasattr(GateServer, '_quorum_size'), \
         "GateServer should have _quorum_size method"
@@ -3960,7 +3960,7 @@ def test_gate_has_quorum_size():
 
 @test("GateServer: has get_quorum_status method")
 def test_gate_has_quorum_status():
-    from hyperscale.distributed_rewrite.nodes import GateServer
+    from hyperscale.distributed.nodes import GateServer
     import inspect
     
     assert hasattr(GateServer, 'get_quorum_status'), \
@@ -3976,7 +3976,7 @@ def test_gate_has_quorum_status():
 
 @test("GateServer: has _complete_startup_sync method")
 def test_gate_has_startup_sync():
-    from hyperscale.distributed_rewrite.nodes import GateServer
+    from hyperscale.distributed.nodes import GateServer
     import inspect
     
     assert hasattr(GateServer, '_complete_startup_sync'), \
@@ -3991,7 +3991,7 @@ def test_gate_has_startup_sync():
 @test("GateServer: has _quorum_circuit")
 def test_gate_has_quorum_circuit():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import GateServer
+    from hyperscale.distributed.nodes import GateServer
     
     source = inspect.getsource(GateServer.__init__)
     
@@ -4002,7 +4002,7 @@ def test_gate_has_quorum_circuit():
 @test("GateServer: receive_job_submission checks circuit")
 def test_gate_job_submission_checks_circuit():
     import pathlib
-    import hyperscale.distributed_rewrite.nodes.gate as gate_module
+    import hyperscale.distributed.nodes.gate as gate_module
     
     source_file = pathlib.Path(gate_module.__file__)
     source = source_file.read_text()
@@ -4014,7 +4014,7 @@ def test_gate_job_submission_checks_circuit():
 @test("GateServer: receive_job_submission checks quorum")
 def test_gate_job_submission_checks_quorum():
     import pathlib
-    import hyperscale.distributed_rewrite.nodes.gate as gate_module
+    import hyperscale.distributed.nodes.gate as gate_module
     
     source_file = pathlib.Path(gate_module.__file__)
     source = source_file.read_text()
@@ -4025,7 +4025,7 @@ def test_gate_job_submission_checks_quorum():
 @test("GateServer: start() calls _complete_startup_sync")
 def test_gate_start_calls_sync():
     import pathlib
-    import hyperscale.distributed_rewrite.nodes.gate as gate_module
+    import hyperscale.distributed.nodes.gate as gate_module
     
     source_file = pathlib.Path(gate_module.__file__)
     source = source_file.read_text()
@@ -4036,7 +4036,7 @@ def test_gate_start_calls_sync():
 @test("GateServer: state embedder includes get_gate_state")
 def test_gate_embedder_includes_state():
     import pathlib
-    import hyperscale.distributed_rewrite.nodes.gate as gate_module
+    import hyperscale.distributed.nodes.gate as gate_module
     
     source_file = pathlib.Path(gate_module.__file__)
     source = source_file.read_text()
@@ -4047,7 +4047,7 @@ def test_gate_embedder_includes_state():
 @test("GateServer: dispatch records circuit success/failure")
 def test_gate_dispatch_records_circuit():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import GateServer
+    from hyperscale.distributed.nodes import GateServer
     
     source = inspect.getsource(GateServer._dispatch_job_to_datacenters)
     
@@ -4058,7 +4058,7 @@ def test_gate_dispatch_records_circuit():
 @test("GateServer: raises QuorumCircuitOpenError when circuit is open")
 def test_gate_raises_circuit_open_error():
     import pathlib
-    import hyperscale.distributed_rewrite.nodes.gate as gate_module
+    import hyperscale.distributed.nodes.gate as gate_module
     
     source_file = pathlib.Path(gate_module.__file__)
     source = source_file.read_text()
@@ -4070,7 +4070,7 @@ def test_gate_raises_circuit_open_error():
 @test("GateServer: raises QuorumUnavailableError when quorum unavailable")
 def test_gate_raises_quorum_unavailable_error():
     import pathlib
-    import hyperscale.distributed_rewrite.nodes.gate as gate_module
+    import hyperscale.distributed.nodes.gate as gate_module
     
     source_file = pathlib.Path(gate_module.__file__)
     source = source_file.read_text()
@@ -4082,7 +4082,7 @@ def test_gate_raises_quorum_unavailable_error():
 @test("GateServer: handles QuorumCircuitOpenError without recording error")
 def test_gate_handles_circuit_open_error():
     import pathlib
-    import hyperscale.distributed_rewrite.nodes.gate as gate_module
+    import hyperscale.distributed.nodes.gate as gate_module
     
     source_file = pathlib.Path(gate_module.__file__)
     source = source_file.read_text()
@@ -4124,7 +4124,7 @@ print("=" * 70 + "\n")
 @test("Worker: has _manager_circuit")
 def test_worker_has_manager_circuit():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import WorkerServer
+    from hyperscale.distributed.nodes import WorkerServer
     
     source = inspect.getsource(WorkerServer.__init__)
     
@@ -4136,7 +4136,7 @@ def test_worker_has_manager_circuit():
 
 @test("Worker: has _is_manager_circuit_open method")
 def test_worker_has_circuit_open_check():
-    from hyperscale.distributed_rewrite.nodes import WorkerServer
+    from hyperscale.distributed.nodes import WorkerServer
     
     assert hasattr(WorkerServer, '_is_manager_circuit_open'), \
         "WorkerServer should have _is_manager_circuit_open method"
@@ -4144,7 +4144,7 @@ def test_worker_has_circuit_open_check():
 
 @test("Worker: has get_manager_circuit_status method")
 def test_worker_has_circuit_status():
-    from hyperscale.distributed_rewrite.nodes import WorkerServer
+    from hyperscale.distributed.nodes import WorkerServer
     import inspect
     
     assert hasattr(WorkerServer, 'get_manager_circuit_status'), \
@@ -4161,7 +4161,7 @@ def test_worker_has_circuit_status():
 @test("Worker: _send_progress_update checks circuit")
 def test_worker_progress_checks_circuit():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import WorkerServer
+    from hyperscale.distributed.nodes import WorkerServer
     
     source = inspect.getsource(WorkerServer._send_progress_update)
     
@@ -4172,7 +4172,7 @@ def test_worker_progress_checks_circuit():
 @test("Worker: _send_progress_update records circuit state")
 def test_worker_progress_records_circuit():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import WorkerServer
+    from hyperscale.distributed.nodes import WorkerServer
     
     source = inspect.getsource(WorkerServer._send_progress_update)
     
@@ -4185,7 +4185,7 @@ def test_worker_progress_records_circuit():
 @test("Worker: _send_progress_to_all_managers checks circuit")
 def test_worker_progress_all_checks_circuit():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import WorkerServer
+    from hyperscale.distributed.nodes import WorkerServer
     
     source = inspect.getsource(WorkerServer._send_progress_to_all_managers)
     
@@ -4214,7 +4214,7 @@ print("=" * 70 + "\n")
 @test("Worker: _register_with_manager has retry parameters")
 def test_worker_register_has_retry_params():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import WorkerServer
+    from hyperscale.distributed.nodes import WorkerServer
     
     sig = inspect.signature(WorkerServer._register_with_manager)
     params = list(sig.parameters.keys())
@@ -4228,7 +4228,7 @@ def test_worker_register_has_retry_params():
 @test("Worker: _register_with_manager uses exponential backoff")
 def test_worker_register_uses_backoff():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import WorkerServer
+    from hyperscale.distributed.nodes import WorkerServer
     
     source = inspect.getsource(WorkerServer._register_with_manager)
     
@@ -4248,7 +4248,7 @@ def test_worker_register_uses_backoff():
 @test("Worker: _register_with_manager checks circuit breaker")
 def test_worker_register_checks_circuit():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import WorkerServer
+    from hyperscale.distributed.nodes import WorkerServer
     
     source = inspect.getsource(WorkerServer._register_with_manager)
     
@@ -4259,7 +4259,7 @@ def test_worker_register_checks_circuit():
 @test("Worker: _register_with_manager records circuit state")
 def test_worker_register_records_circuit():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import WorkerServer
+    from hyperscale.distributed.nodes import WorkerServer
     
     source = inspect.getsource(WorkerServer._register_with_manager)
     
@@ -4279,7 +4279,7 @@ test_worker_register_records_circuit()
 @test("Worker: _send_progress_update has retry parameters")
 def test_worker_progress_has_retry_params():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import WorkerServer
+    from hyperscale.distributed.nodes import WorkerServer
     
     sig = inspect.signature(WorkerServer._send_progress_update)
     params = list(sig.parameters.keys())
@@ -4293,7 +4293,7 @@ def test_worker_progress_has_retry_params():
 @test("Worker: _send_progress_update uses exponential backoff")
 def test_worker_progress_uses_backoff():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import WorkerServer
+    from hyperscale.distributed.nodes import WorkerServer
     
     source = inspect.getsource(WorkerServer._send_progress_update)
     
@@ -4327,7 +4327,7 @@ print("=" * 70 + "\n")
 @test("Manager: has _worker_circuits dict")
 def test_manager_has_worker_circuits():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    from hyperscale.distributed.nodes import ManagerServer
     
     source = inspect.getsource(ManagerServer.__init__)
     
@@ -4337,7 +4337,7 @@ def test_manager_has_worker_circuits():
 
 @test("Manager: has _get_worker_circuit method")
 def test_manager_has_get_worker_circuit():
-    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    from hyperscale.distributed.nodes import ManagerServer
     
     assert hasattr(ManagerServer, '_get_worker_circuit'), \
         "ManagerServer should have _get_worker_circuit method"
@@ -4345,7 +4345,7 @@ def test_manager_has_get_worker_circuit():
 
 @test("Manager: has _is_worker_circuit_open method")
 def test_manager_has_is_worker_circuit_open():
-    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    from hyperscale.distributed.nodes import ManagerServer
     
     assert hasattr(ManagerServer, '_is_worker_circuit_open'), \
         "ManagerServer should have _is_worker_circuit_open method"
@@ -4353,7 +4353,7 @@ def test_manager_has_is_worker_circuit_open():
 
 @test("Manager: has get_worker_circuit_status method")
 def test_manager_has_worker_circuit_status():
-    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    from hyperscale.distributed.nodes import ManagerServer
     
     assert hasattr(ManagerServer, 'get_worker_circuit_status'), \
         "ManagerServer should have get_worker_circuit_status method"
@@ -4361,7 +4361,7 @@ def test_manager_has_worker_circuit_status():
 
 @test("Manager: has get_all_worker_circuit_status method")
 def test_manager_has_all_worker_circuit_status():
-    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    from hyperscale.distributed.nodes import ManagerServer
     
     assert hasattr(ManagerServer, 'get_all_worker_circuit_status'), \
         "ManagerServer should have get_all_worker_circuit_status method"
@@ -4370,7 +4370,7 @@ def test_manager_has_all_worker_circuit_status():
 @test("Manager: _select_worker_for_workflow checks circuit")
 def test_manager_select_worker_checks_circuit():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    from hyperscale.distributed.nodes import ManagerServer
     
     source = inspect.getsource(ManagerServer._select_worker_for_workflow)
     
@@ -4381,7 +4381,7 @@ def test_manager_select_worker_checks_circuit():
 @test("Manager: _select_worker_for_workflow_excluding checks circuit")
 def test_manager_select_excluding_checks_circuit():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    from hyperscale.distributed.nodes import ManagerServer
     
     source = inspect.getsource(ManagerServer._select_worker_for_workflow_excluding)
     
@@ -4392,7 +4392,7 @@ def test_manager_select_excluding_checks_circuit():
 @test("Manager: _dispatch_workflow_to_worker uses circuit")
 def test_manager_dispatch_uses_circuit():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    from hyperscale.distributed.nodes import ManagerServer
     
     source = inspect.getsource(ManagerServer._dispatch_workflow_to_worker)
     
@@ -4429,7 +4429,7 @@ print("=" * 70 + "\n")
 @test("Manager: _dispatch_workflow_to_worker has retry parameters")
 def test_manager_dispatch_has_retry_params():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    from hyperscale.distributed.nodes import ManagerServer
     
     sig = inspect.signature(ManagerServer._dispatch_workflow_to_worker)
     params = list(sig.parameters.keys())
@@ -4443,7 +4443,7 @@ def test_manager_dispatch_has_retry_params():
 @test("Manager: _dispatch_workflow_to_worker uses exponential backoff")
 def test_manager_dispatch_uses_backoff():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    from hyperscale.distributed.nodes import ManagerServer
     
     source = inspect.getsource(ManagerServer._dispatch_workflow_to_worker)
     
@@ -4477,7 +4477,7 @@ print("=" * 70 + "\n")
 @test("Manager: has _gate_circuit")
 def test_manager_has_gate_circuit():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    from hyperscale.distributed.nodes import ManagerServer
     
     source = inspect.getsource(ManagerServer.__init__)
     
@@ -4489,7 +4489,7 @@ def test_manager_has_gate_circuit():
 
 @test("Manager: has _is_gate_circuit_open method")
 def test_manager_has_gate_circuit_open():
-    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    from hyperscale.distributed.nodes import ManagerServer
     
     assert hasattr(ManagerServer, '_is_gate_circuit_open'), \
         "ManagerServer should have _is_gate_circuit_open method"
@@ -4497,7 +4497,7 @@ def test_manager_has_gate_circuit_open():
 
 @test("Manager: has get_gate_circuit_status method")
 def test_manager_has_gate_circuit_status():
-    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    from hyperscale.distributed.nodes import ManagerServer
     import inspect
     
     assert hasattr(ManagerServer, 'get_gate_circuit_status'), \
@@ -4520,7 +4520,7 @@ test_manager_has_gate_circuit_status()
 @test("Manager: _try_register_with_gate has retry parameters")
 def test_manager_gate_register_has_retry_params():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    from hyperscale.distributed.nodes import ManagerServer
     
     sig = inspect.signature(ManagerServer._try_register_with_gate)
     params = list(sig.parameters.keys())
@@ -4534,7 +4534,7 @@ def test_manager_gate_register_has_retry_params():
 @test("Manager: _try_register_with_gate uses exponential backoff")
 def test_manager_gate_register_uses_backoff():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    from hyperscale.distributed.nodes import ManagerServer
     
     source = inspect.getsource(ManagerServer._try_register_with_gate)
     
@@ -4549,7 +4549,7 @@ def test_manager_gate_register_uses_backoff():
 @test("Manager: _try_register_with_gate checks circuit")
 def test_manager_gate_register_checks_circuit():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    from hyperscale.distributed.nodes import ManagerServer
     
     source = inspect.getsource(ManagerServer._try_register_with_gate)
     
@@ -4560,7 +4560,7 @@ def test_manager_gate_register_checks_circuit():
 @test("Manager: _try_register_with_gate records circuit state")
 def test_manager_gate_register_records_circuit():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    from hyperscale.distributed.nodes import ManagerServer
     
     source = inspect.getsource(ManagerServer._try_register_with_gate)
     
@@ -4580,7 +4580,7 @@ test_manager_gate_register_records_circuit()
 @test("Manager: _send_job_progress_to_gate has retry parameters")
 def test_manager_job_progress_has_retry_params():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    from hyperscale.distributed.nodes import ManagerServer
     
     sig = inspect.signature(ManagerServer._send_job_progress_to_gate)
     params = list(sig.parameters.keys())
@@ -4594,7 +4594,7 @@ def test_manager_job_progress_has_retry_params():
 @test("Manager: _send_job_progress_to_gate uses exponential backoff")
 def test_manager_job_progress_uses_backoff():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    from hyperscale.distributed.nodes import ManagerServer
     
     source = inspect.getsource(ManagerServer._send_job_progress_to_gate)
     
@@ -4609,7 +4609,7 @@ def test_manager_job_progress_uses_backoff():
 @test("Manager: _send_job_progress_to_gate checks circuit")
 def test_manager_job_progress_checks_circuit():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    from hyperscale.distributed.nodes import ManagerServer
     
     source = inspect.getsource(ManagerServer._send_job_progress_to_gate)
     
@@ -4620,7 +4620,7 @@ def test_manager_job_progress_checks_circuit():
 @test("Manager: _send_job_progress_to_gate records circuit state")
 def test_manager_job_progress_records_circuit():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    from hyperscale.distributed.nodes import ManagerServer
     
     source = inspect.getsource(ManagerServer._send_job_progress_to_gate)
     
@@ -4649,7 +4649,7 @@ print("=" * 70 + "\n")
 @test("Gate: has _manager_circuits dict")
 def test_gate_has_manager_circuits():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import GateServer
+    from hyperscale.distributed.nodes import GateServer
     
     source = inspect.getsource(GateServer.__init__)
     
@@ -4659,7 +4659,7 @@ def test_gate_has_manager_circuits():
 
 @test("Gate: has _get_manager_circuit method")
 def test_gate_has_get_manager_circuit():
-    from hyperscale.distributed_rewrite.nodes import GateServer
+    from hyperscale.distributed.nodes import GateServer
     
     assert hasattr(GateServer, '_get_manager_circuit'), \
         "GateServer should have _get_manager_circuit method"
@@ -4667,7 +4667,7 @@ def test_gate_has_get_manager_circuit():
 
 @test("Gate: has _is_manager_circuit_open method")
 def test_gate_has_is_manager_circuit_open():
-    from hyperscale.distributed_rewrite.nodes import GateServer
+    from hyperscale.distributed.nodes import GateServer
     
     assert hasattr(GateServer, '_is_manager_circuit_open'), \
         "GateServer should have _is_manager_circuit_open method"
@@ -4675,7 +4675,7 @@ def test_gate_has_is_manager_circuit_open():
 
 @test("Gate: has get_manager_circuit_status method")
 def test_gate_has_manager_circuit_status():
-    from hyperscale.distributed_rewrite.nodes import GateServer
+    from hyperscale.distributed.nodes import GateServer
     
     assert hasattr(GateServer, 'get_manager_circuit_status'), \
         "GateServer should have get_manager_circuit_status method"
@@ -4683,7 +4683,7 @@ def test_gate_has_manager_circuit_status():
 
 @test("Gate: has get_all_manager_circuit_status method")
 def test_gate_has_all_manager_circuit_status():
-    from hyperscale.distributed_rewrite.nodes import GateServer
+    from hyperscale.distributed.nodes import GateServer
     
     assert hasattr(GateServer, 'get_all_manager_circuit_status'), \
         "GateServer should have get_all_manager_circuit_status method"
@@ -4692,7 +4692,7 @@ def test_gate_has_all_manager_circuit_status():
 @test("Gate: _try_dispatch_to_dc uses retry helper")
 def test_gate_dispatch_uses_retry_helper():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import GateServer
+    from hyperscale.distributed.nodes import GateServer
     
     source = inspect.getsource(GateServer._try_dispatch_to_dc)
     
@@ -4704,7 +4704,7 @@ def test_gate_dispatch_uses_retry_helper():
 @test("Gate: dispatch flow has circuit and retry support")
 def test_gate_dispatch_flow_has_circuit_retry():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import GateServer
+    from hyperscale.distributed.nodes import GateServer
     
     # Check _try_dispatch_to_manager has circuit and retry logic
     source = inspect.getsource(GateServer._try_dispatch_to_manager)
@@ -4740,7 +4740,7 @@ print("=" * 70 + "\n")
 
 @test("Gate: has _try_dispatch_to_manager method")
 def test_gate_has_dispatch_to_manager():
-    from hyperscale.distributed_rewrite.nodes import GateServer
+    from hyperscale.distributed.nodes import GateServer
     
     assert hasattr(GateServer, '_try_dispatch_to_manager'), \
         "GateServer should have _try_dispatch_to_manager method"
@@ -4749,7 +4749,7 @@ def test_gate_has_dispatch_to_manager():
 @test("Gate: _try_dispatch_to_manager has retry parameters")
 def test_gate_dispatch_manager_has_retry_params():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import GateServer
+    from hyperscale.distributed.nodes import GateServer
     
     sig = inspect.signature(GateServer._try_dispatch_to_manager)
     params = list(sig.parameters.keys())
@@ -4763,7 +4763,7 @@ def test_gate_dispatch_manager_has_retry_params():
 @test("Gate: _try_dispatch_to_manager uses exponential backoff")
 def test_gate_dispatch_manager_uses_backoff():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import GateServer
+    from hyperscale.distributed.nodes import GateServer
     
     source = inspect.getsource(GateServer._try_dispatch_to_manager)
     
@@ -4778,7 +4778,7 @@ def test_gate_dispatch_manager_uses_backoff():
 @test("Gate: _try_dispatch_to_manager checks circuit")
 def test_gate_dispatch_manager_checks_circuit():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import GateServer
+    from hyperscale.distributed.nodes import GateServer
     
     source = inspect.getsource(GateServer._try_dispatch_to_manager)
     
@@ -4789,7 +4789,7 @@ def test_gate_dispatch_manager_checks_circuit():
 @test("Gate: _try_dispatch_to_manager records circuit state")
 def test_gate_dispatch_manager_records_circuit():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import GateServer
+    from hyperscale.distributed.nodes import GateServer
     
     source = inspect.getsource(GateServer._try_dispatch_to_manager)
     
@@ -4802,7 +4802,7 @@ def test_gate_dispatch_manager_records_circuit():
 @test("Gate: _try_dispatch_to_dc uses _try_dispatch_to_manager")
 def test_gate_dispatch_dc_uses_dispatch_manager():
     import inspect
-    from hyperscale.distributed_rewrite.nodes import GateServer
+    from hyperscale.distributed.nodes import GateServer
     
     source = inspect.getsource(GateServer._try_dispatch_to_dc)
     
@@ -4831,7 +4831,7 @@ print("=" * 70 + "\n")
 @test("Message.load: uses RestrictedUnpickler")
 def test_message_load_uses_restricted():
     import inspect
-    from hyperscale.distributed_rewrite.models import Message
+    from hyperscale.distributed.models import Message
     
     source = inspect.getsource(Message.load)
     
@@ -4842,7 +4842,7 @@ def test_message_load_uses_restricted():
 @test("Message.load: imports RestrictedUnpickler")
 def test_message_imports_restricted():
     import pathlib
-    import hyperscale.distributed_rewrite.models.message as message_module
+    import hyperscale.distributed.models.message as message_module
     
     source_file = pathlib.Path(message_module.__file__)
     source = source_file.read_text()
@@ -4853,7 +4853,7 @@ def test_message_imports_restricted():
 
 @test("Message subclass serialization roundtrip")
 def test_message_roundtrip():
-    from hyperscale.distributed_rewrite.models import JobAck
+    from hyperscale.distributed.models import JobAck
     
     # Create a message
     original = JobAck(

@@ -24,21 +24,21 @@ import time
 from unittest.mock import MagicMock, AsyncMock, patch
 from dataclasses import dataclass
 
-from hyperscale.distributed_rewrite.nodes.manager.state import ManagerState
-from hyperscale.distributed_rewrite.nodes.manager.config import ManagerConfig
-from hyperscale.distributed_rewrite.nodes.manager.registry import ManagerRegistry
-from hyperscale.distributed_rewrite.nodes.manager.cancellation import ManagerCancellationCoordinator
-from hyperscale.distributed_rewrite.nodes.manager.leases import ManagerLeaseCoordinator
-from hyperscale.distributed_rewrite.nodes.manager.workflow_lifecycle import ManagerWorkflowLifecycle
-from hyperscale.distributed_rewrite.nodes.manager.dispatch import ManagerDispatchCoordinator
-from hyperscale.distributed_rewrite.nodes.manager.health import (
+from hyperscale.distributed.nodes.manager.state import ManagerState
+from hyperscale.distributed.nodes.manager.config import ManagerConfig
+from hyperscale.distributed.nodes.manager.registry import ManagerRegistry
+from hyperscale.distributed.nodes.manager.cancellation import ManagerCancellationCoordinator
+from hyperscale.distributed.nodes.manager.leases import ManagerLeaseCoordinator
+from hyperscale.distributed.nodes.manager.workflow_lifecycle import ManagerWorkflowLifecycle
+from hyperscale.distributed.nodes.manager.dispatch import ManagerDispatchCoordinator
+from hyperscale.distributed.nodes.manager.health import (
     ManagerHealthMonitor,
     NodeStatus,
     JobSuspicion,
     ExtensionTracker,
     HealthcheckExtensionManager,
 )
-from hyperscale.distributed_rewrite.nodes.manager.stats import (
+from hyperscale.distributed.nodes.manager.stats import (
     ManagerStatsCoordinator,
     ProgressState,
     BackpressureLevel,

@@ -14,7 +14,7 @@ import time
 
 import pytest
 
-from hyperscale.distributed_rewrite.swim.detection.hierarchical_failure_detector import (
+from hyperscale.distributed.swim.detection.hierarchical_failure_detector import (
     HierarchicalFailureDetector,
     HierarchicalConfig,
     NodeStatus,

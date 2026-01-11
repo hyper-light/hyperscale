@@ -19,7 +19,7 @@ The Cancellation Propagation pattern ensures:
 import time
 import pytest
 
-from hyperscale.distributed_rewrite.models import (
+from hyperscale.distributed.models import (
     JobCancelRequest,
     JobCancelResponse,
     WorkflowCancelRequest,

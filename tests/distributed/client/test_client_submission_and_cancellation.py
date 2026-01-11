@@ -19,19 +19,19 @@ from unittest.mock import Mock, AsyncMock, patch
 import pytest
 import cloudpickle
 
-from hyperscale.distributed_rewrite.nodes.client.submission import ClientJobSubmitter
-from hyperscale.distributed_rewrite.nodes.client.cancellation import ClientCancellationManager
-from hyperscale.distributed_rewrite.nodes.client.config import ClientConfig
-from hyperscale.distributed_rewrite.nodes.client.state import ClientState
-from hyperscale.distributed_rewrite.nodes.client.targets import ClientTargetSelector
-from hyperscale.distributed_rewrite.nodes.client.protocol import ClientProtocol
-from hyperscale.distributed_rewrite.nodes.client.tracking import ClientJobTracker
-from hyperscale.distributed_rewrite.models import (
+from hyperscale.distributed.nodes.client.submission import ClientJobSubmitter
+from hyperscale.distributed.nodes.client.cancellation import ClientCancellationManager
+from hyperscale.distributed.nodes.client.config import ClientConfig
+from hyperscale.distributed.nodes.client.state import ClientState
+from hyperscale.distributed.nodes.client.targets import ClientTargetSelector
+from hyperscale.distributed.nodes.client.protocol import ClientProtocol
+from hyperscale.distributed.nodes.client.tracking import ClientJobTracker
+from hyperscale.distributed.models import (
     JobAck,
     JobCancelResponse,
     RateLimitResponse,
 )
-from hyperscale.distributed_rewrite.errors import MessageTooLargeError
+from hyperscale.distributed.errors import MessageTooLargeError
 from hyperscale.logging import Logger
 
 

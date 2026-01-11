@@ -16,7 +16,7 @@ import asyncio
 import pytest
 import time
 
-from hyperscale.distributed_rewrite.reliability import (
+from hyperscale.distributed.reliability import (
     AdaptiveRateLimitConfig,
     AdaptiveRateLimiter,
     CooperativeRateLimiter,
@@ -29,14 +29,14 @@ from hyperscale.distributed_rewrite.reliability import (
     SlidingWindowCounter,
     TokenBucket,
 )
-from hyperscale.distributed_rewrite.reliability.rate_limiting import (
+from hyperscale.distributed.reliability.rate_limiting import (
     RateLimitRetryConfig,
     RateLimitRetryResult,
     execute_with_rate_limit_retry,
     is_rate_limit_response,
 )
-from hyperscale.distributed_rewrite.reliability.load_shedding import RequestPriority
-from hyperscale.distributed_rewrite.models import RateLimitResponse
+from hyperscale.distributed.reliability.load_shedding import RequestPriority
+from hyperscale.distributed.models import RateLimitResponse
 
 
 class TestSlidingWindowCounterEdgeCases:

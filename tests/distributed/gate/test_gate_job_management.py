@@ -10,7 +10,7 @@ Tests:
 import asyncio
 import pytest
 
-from hyperscale.distributed_rewrite.jobs.gates import (
+from hyperscale.distributed.jobs.gates import (
     GateJobManager,
     JobForwardingTracker,
     GatePeerInfo,
@@ -18,7 +18,7 @@ from hyperscale.distributed_rewrite.jobs.gates import (
     ConsistentHashRing,
     HashRingNode,
 )
-from hyperscale.distributed_rewrite.models import (
+from hyperscale.distributed.models import (
     GlobalJobStatus,
     JobFinalResult,
     JobProgress,

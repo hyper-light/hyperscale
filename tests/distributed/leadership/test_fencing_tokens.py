@@ -10,16 +10,10 @@ The fencing token pattern prevents stale updates from old job owners
 after lease transfer (e.g., slow network delivering delayed updates).
 """
 
-import asyncio
-import pytest
-import time
-
-from hyperscale.distributed_rewrite.models import (
+from hyperscale.distributed.models import (
     JobProgress,
     JobFinalResult,
     JobStatus,
-    WorkflowProgress,
-    WorkflowStatus,
 )
 
 

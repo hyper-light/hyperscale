@@ -26,33 +26,33 @@ from typing import Any
 
 import pytest
 
-from hyperscale.distributed_rewrite.reliability.overload import (
+from hyperscale.distributed.reliability.overload import (
     HybridOverloadDetector,
     OverloadConfig,
     OverloadState,
 )
-from hyperscale.distributed_rewrite.reliability.load_shedding import (
+from hyperscale.distributed.reliability.load_shedding import (
     LoadShedder,
     LoadShedderConfig,
     RequestPriority,
 )
-from hyperscale.distributed_rewrite.reliability.rate_limiting import (
+from hyperscale.distributed.reliability.rate_limiting import (
     TokenBucket,
     RateLimitConfig,
     ServerRateLimiter,
     CooperativeRateLimiter,
 )
-from hyperscale.distributed_rewrite.health.probes import (
+from hyperscale.distributed.health.probes import (
     HealthProbe,
     ProbeConfig,
     ProbeResult,
     CompositeProbe,
 )
-from hyperscale.distributed_rewrite.health.extension_tracker import (
+from hyperscale.distributed.health.extension_tracker import (
     ExtensionTracker,
     ExtensionTrackerConfig,
 )
-from hyperscale.distributed_rewrite.health.worker_health_manager import (
+from hyperscale.distributed.health.worker_health_manager import (
     WorkerHealthManager,
     WorkerHealthManagerConfig,
 )
@@ -525,7 +525,7 @@ class TestStateCorruptionRecovery:
         )
 
         # Worker requests extensions until exhausted
-        from hyperscale.distributed_rewrite.models import (
+        from hyperscale.distributed.models import (
             HealthcheckExtensionRequest,
         )
 
@@ -1184,7 +1184,7 @@ class TestRecoveryPatterns:
             WorkerHealthManagerConfig(max_extensions=3, grace_period=0.0)
         )
 
-        from hyperscale.distributed_rewrite.models import (
+        from hyperscale.distributed.models import (
             HealthcheckExtensionRequest,
         )
 
@@ -1658,7 +1658,7 @@ class TestPartialFailureSplitBrain:
             WorkerHealthManagerConfig(max_extensions=2, grace_period=0.0)
         )
 
-        from hyperscale.distributed_rewrite.models import HealthcheckExtensionRequest
+        from hyperscale.distributed.models import HealthcheckExtensionRequest
 
         # Exhaust worker-1
         for i in range(2):
@@ -1995,7 +1995,7 @@ class TestErrorMessageQuality:
             WorkerHealthManagerConfig(max_extensions=2, eviction_threshold=1, grace_period=0.0)
         )
 
-        from hyperscale.distributed_rewrite.models import HealthcheckExtensionRequest
+        from hyperscale.distributed.models import HealthcheckExtensionRequest
 
         # Exhaust extensions
         for i in range(2):
@@ -2332,7 +2332,7 @@ class TestDiagnosticsObservability:
         """Test extension tracker state includes all expected fields."""
         manager = WorkerHealthManager()
 
-        from hyperscale.distributed_rewrite.models import HealthcheckExtensionRequest
+        from hyperscale.distributed.models import HealthcheckExtensionRequest
 
         request = HealthcheckExtensionRequest(
             worker_id="worker-1",

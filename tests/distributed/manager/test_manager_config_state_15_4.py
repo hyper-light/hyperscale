@@ -19,12 +19,12 @@ import pytest
 import time
 from unittest.mock import MagicMock, patch
 
-from hyperscale.distributed_rewrite.nodes.manager.config import (
+from hyperscale.distributed.nodes.manager.config import (
     ManagerConfig,
     create_manager_config_from_env,
 )
-from hyperscale.distributed_rewrite.nodes.manager.state import ManagerState
-from hyperscale.distributed_rewrite.models import ManagerState as ManagerStateEnum
+from hyperscale.distributed.nodes.manager.state import ManagerState
+from hyperscale.distributed.models import ManagerState as ManagerStateEnum
 
 
 # =============================================================================

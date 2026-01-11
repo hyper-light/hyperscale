@@ -13,12 +13,12 @@ import pytest
 from dataclasses import dataclass, field
 from unittest.mock import AsyncMock, MagicMock
 
-from hyperscale.distributed_rewrite.nodes.gate.dispatch_coordinator import (
+from hyperscale.distributed.nodes.gate.dispatch_coordinator import (
     GateDispatchCoordinator,
 )
-from hyperscale.distributed_rewrite.nodes.gate.state import GateRuntimeState
-from hyperscale.distributed_rewrite.models import JobStatus
-from hyperscale.distributed_rewrite.swim.core import CircuitState
+from hyperscale.distributed.nodes.gate.state import GateRuntimeState
+from hyperscale.distributed.models import JobStatus
+from hyperscale.distributed.swim.core import CircuitState
 
 
 # =============================================================================

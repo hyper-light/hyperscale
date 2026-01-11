@@ -15,13 +15,13 @@ from unittest.mock import MagicMock, AsyncMock
 
 import pytest
 
-from hyperscale.distributed_rewrite.swim.detection.timing_wheel import (
+from hyperscale.distributed.swim.detection.timing_wheel import (
     TimingWheel,
     TimingWheelConfig,
     TimingWheelBucket,
     WheelEntry,
 )
-from hyperscale.distributed_rewrite.swim.detection.suspicion_state import SuspicionState
+from hyperscale.distributed.swim.detection.suspicion_state import SuspicionState
 
 
 # =============================================================================

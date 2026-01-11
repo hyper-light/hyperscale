@@ -28,9 +28,9 @@ from typing import Callable, Any
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Import hyperscale components
-from hyperscale.distributed_rewrite.nodes import WorkerServer, ManagerServer, GateServer
-from hyperscale.distributed_rewrite.env import Env
-from hyperscale.distributed_rewrite.models import (
+from hyperscale.distributed.nodes import WorkerServer, ManagerServer, GateServer
+from hyperscale.distributed.env import Env
+from hyperscale.distributed.models import (
     JobSubmission,
     JobAck,
     WorkflowDispatch,

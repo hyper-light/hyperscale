@@ -16,7 +16,7 @@ from unittest.mock import patch
 
 import pytest
 
-from hyperscale.distributed_rewrite.health.latency_tracker import (
+from hyperscale.distributed.health.latency_tracker import (
     LatencyTracker,
     LatencyConfig,
 )

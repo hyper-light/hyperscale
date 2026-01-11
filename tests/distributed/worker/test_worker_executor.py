@@ -17,9 +17,9 @@ from unittest.mock import MagicMock, AsyncMock
 
 import pytest
 
-from hyperscale.distributed_rewrite.nodes.worker.execution import WorkerExecutor
-from hyperscale.distributed_rewrite.models import WorkflowProgress, WorkflowStatus
-from hyperscale.distributed_rewrite.reliability import BackpressureLevel
+from hyperscale.distributed.nodes.worker.execution import WorkerExecutor
+from hyperscale.distributed.models import WorkflowProgress, WorkflowStatus
+from hyperscale.distributed.reliability import BackpressureLevel
 
 
 class MockCoreAllocator:

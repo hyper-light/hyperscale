@@ -19,8 +19,8 @@ import time
 from base64 import b64decode, b64encode
 from typing import Callable, Literal
 
-from hyperscale.distributed_rewrite.server import tcp, udp, task
-from hyperscale.distributed_rewrite.server.server.mercury_sync_base_server import MercurySyncBaseServer
+from hyperscale.distributed.server import tcp, udp, task
+from hyperscale.distributed.server.server.mercury_sync_base_server import MercurySyncBaseServer
 from hyperscale.logging.hyperscale_logging_models import ServerInfo
 
 # Core types and utilities
@@ -88,7 +88,7 @@ from .core.state_embedder import StateEmbedder, NullStateEmbedder
 
 # Protocol version for SWIM (AD-25)
 # Used to detect incompatible nodes during join
-from hyperscale.distributed_rewrite.protocol.version import CURRENT_PROTOCOL_VERSION
+from hyperscale.distributed.protocol.version import CURRENT_PROTOCOL_VERSION
 
 # SWIM protocol version prefix (included in join messages)
 # Format: "v{major}.{minor}" - allows detection of incompatible nodes
@@ -177,8 +177,8 @@ class HealthAwareServerOld(MercurySyncBaseServer[Ctx]):
         )
 
         # Initialize leader election with configurable parameters from Env
-        from hyperscale.distributed_rewrite.swim.leadership.leader_state import LeaderState
-        from hyperscale.distributed_rewrite.swim.leadership.leader_eligibility import LeaderEligibility
+        from hyperscale.distributed.swim.leadership.leader_state import LeaderState
+        from hyperscale.distributed.swim.leadership.leader_eligibility import LeaderEligibility
         
         # Get leader election config from Env if available
         env = kwargs.get('env')

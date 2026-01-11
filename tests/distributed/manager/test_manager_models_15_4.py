@@ -21,7 +21,7 @@ import pytest
 import time
 from dataclasses import FrozenInstanceError
 
-from hyperscale.distributed_rewrite.nodes.manager.models import (
+from hyperscale.distributed.nodes.manager.models import (
     PeerState,
     GatePeerState,
     WorkerSyncState,

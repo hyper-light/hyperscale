@@ -18,7 +18,7 @@ import asyncio
 import pytest
 import time
 
-from hyperscale.distributed_rewrite.models import (
+from hyperscale.distributed.models import (
     RegisterCallback,
     RegisterCallbackResponse,
     JobSubmission,

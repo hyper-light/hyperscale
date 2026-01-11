@@ -19,7 +19,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-from hyperscale.distributed_rewrite.routing import ConsistentHashRing
+from hyperscale.distributed.routing import ConsistentHashRing
 
 
 def generate_job_ids(count: int) -> list[str]:

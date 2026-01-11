@@ -13,7 +13,7 @@ import time
 import pytest
 from dataclasses import is_dataclass
 
-from hyperscale.distributed_rewrite.nodes.gate.models import (
+from hyperscale.distributed.nodes.gate.models import (
     GatePeerState,
     GatePeerTracking,
     DCHealthState,
@@ -23,7 +23,7 @@ from hyperscale.distributed_rewrite.nodes.gate.models import (
     LeaseState,
     LeaseTracking,
 )
-from hyperscale.distributed_rewrite.reliability import BackpressureLevel
+from hyperscale.distributed.reliability import BackpressureLevel
 
 
 # =============================================================================

@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
-from hyperscale.distributed_rewrite.models import (
+from hyperscale.distributed.models import (
     JobCancelRequest,
     JobCancelResponse,
     WorkflowCancelRequest,

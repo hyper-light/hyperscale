@@ -19,9 +19,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 import cloudpickle
 
 from hyperscale.logging.config import LoggingConfig
-from hyperscale.distributed_rewrite.env.env import Env
-from hyperscale.distributed_rewrite.nodes.worker import WorkerServer
-from hyperscale.distributed_rewrite.models import (
+from hyperscale.distributed.env.env import Env
+from hyperscale.distributed.nodes.worker import WorkerServer
+from hyperscale.distributed.models import (
     WorkflowDispatch,
     WorkflowProgress,
     WorkflowStatus,

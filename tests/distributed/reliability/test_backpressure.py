@@ -13,7 +13,7 @@ from unittest.mock import patch
 
 import pytest
 
-from hyperscale.distributed_rewrite.reliability import (
+from hyperscale.distributed.reliability import (
     BackpressureLevel,
     BackpressureSignal,
     StatsBuffer,

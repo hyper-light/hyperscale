@@ -8,9 +8,9 @@ import asyncio
 import time
 import pytest
 
-from hyperscale.distributed_rewrite.nodes.gate.state import GateRuntimeState
-from hyperscale.distributed_rewrite.models import GateState as GateStateEnum
-from hyperscale.distributed_rewrite.reliability import BackpressureLevel
+from hyperscale.distributed.nodes.gate.state import GateRuntimeState
+from hyperscale.distributed.models import GateState as GateStateEnum
+from hyperscale.distributed.reliability import BackpressureLevel
 
 
 # =============================================================================

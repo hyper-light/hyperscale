@@ -16,11 +16,11 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from hyperscale.distributed_rewrite.health.circuit_breaker_manager import (
+from hyperscale.distributed.health.circuit_breaker_manager import (
     CircuitBreakerManager,
     CircuitBreakerConfig,
 )
-from hyperscale.distributed_rewrite.swim.core import CircuitState
+from hyperscale.distributed.swim.core import CircuitState
 
 
 class MockEnv:

@@ -17,13 +17,13 @@ from unittest.mock import MagicMock, AsyncMock
 
 import pytest
 
-from hyperscale.distributed_rewrite.nodes.worker.state import WorkerState
-from hyperscale.distributed_rewrite.models import (
+from hyperscale.distributed.nodes.worker.state import WorkerState
+from hyperscale.distributed.models import (
     ManagerInfo,
     WorkflowProgress,
     PendingTransfer,
 )
-from hyperscale.distributed_rewrite.reliability import BackpressureLevel
+from hyperscale.distributed.reliability import BackpressureLevel
 
 
 class MockCoreAllocator:

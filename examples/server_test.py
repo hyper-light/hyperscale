@@ -7,9 +7,9 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Literal, Callable
 from pydantic import BaseModel, StrictStr
-from hyperscale.distributed_rewrite.env import Env
-from hyperscale.distributed_rewrite.server import tcp, udp, task
-from hyperscale.distributed_rewrite.server.server.mercury_sync_base_server import MercurySyncBaseServer
+from hyperscale.distributed.env import Env
+from hyperscale.distributed.server import tcp, udp, task
+from hyperscale.distributed.server.server.mercury_sync_base_server import MercurySyncBaseServer
 
 Message = Literal[
     b'ack', 

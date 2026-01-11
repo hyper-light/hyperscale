@@ -16,14 +16,14 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from hyperscale.distributed_rewrite.health.tracker import HealthPiggyback
-from hyperscale.distributed_rewrite.swim.core.state_embedder import (
+from hyperscale.distributed.health.tracker import HealthPiggyback
+from hyperscale.distributed.swim.core.state_embedder import (
     GateStateEmbedder,
     ManagerStateEmbedder,
     NullStateEmbedder,
     WorkerStateEmbedder,
 )
-from hyperscale.distributed_rewrite.swim.gossip.health_gossip_buffer import (
+from hyperscale.distributed.swim.gossip.health_gossip_buffer import (
     HealthGossipBuffer,
     HealthGossipBufferConfig,
     HealthGossipEntry,

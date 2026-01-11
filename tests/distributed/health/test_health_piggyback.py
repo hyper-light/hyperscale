@@ -16,13 +16,13 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from hyperscale.distributed_rewrite.health.tracker import HealthPiggyback
-from hyperscale.distributed_rewrite.models import (
+from hyperscale.distributed.health.tracker import HealthPiggyback
+from hyperscale.distributed.models import (
     GateHeartbeat,
     ManagerHeartbeat,
     WorkerHeartbeat,
 )
-from hyperscale.distributed_rewrite.swim.core.state_embedder import (
+from hyperscale.distributed.swim.core.state_embedder import (
     GateStateEmbedder,
     ManagerStateEmbedder,
     WorkerStateEmbedder,

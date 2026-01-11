@@ -18,7 +18,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from hyperscale.distributed_rewrite.models import (
+from hyperscale.distributed.models import (
     JobLeaderWorkerTransfer,
     JobLeaderWorkerTransferAck,
     ManagerInfo,
@@ -784,14 +784,14 @@ class TestOrphanConfiguration:
     
     @pytest.mark.asyncio
     async def test_default_grace_period(self) -> None:
-        from hyperscale.distributed_rewrite.env import Env
+        from hyperscale.distributed.env import Env
         
         env = Env()
         assert env.WORKER_ORPHAN_GRACE_PERIOD == 5.0
     
     @pytest.mark.asyncio
     async def test_default_check_interval(self) -> None:
-        from hyperscale.distributed_rewrite.env import Env
+        from hyperscale.distributed.env import Env
         
         env = Env()
         assert env.WORKER_ORPHAN_CHECK_INTERVAL == 1.0

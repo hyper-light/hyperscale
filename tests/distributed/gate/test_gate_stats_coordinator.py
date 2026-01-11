@@ -10,10 +10,10 @@ import pytest
 from dataclasses import dataclass, field
 from unittest.mock import AsyncMock, MagicMock
 
-from hyperscale.distributed_rewrite.nodes.gate.stats_coordinator import GateStatsCoordinator
-from hyperscale.distributed_rewrite.nodes.gate.state import GateRuntimeState
-from hyperscale.distributed_rewrite.models import JobStatus, UpdateTier
-from hyperscale.distributed_rewrite.reliability import BackpressureLevel
+from hyperscale.distributed.nodes.gate.stats_coordinator import GateStatsCoordinator
+from hyperscale.distributed.nodes.gate.state import GateRuntimeState
+from hyperscale.distributed.models import JobStatus, UpdateTier
+from hyperscale.distributed.reliability import BackpressureLevel
 
 
 # =============================================================================

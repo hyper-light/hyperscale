@@ -15,7 +15,7 @@ from unittest.mock import AsyncMock, MagicMock, PropertyMock
 
 import pytest
 
-from hyperscale.distributed_rewrite.swim.message_handling.server_adapter import (
+from hyperscale.distributed.swim.message_handling.server_adapter import (
     ServerAdapter,
 )
 

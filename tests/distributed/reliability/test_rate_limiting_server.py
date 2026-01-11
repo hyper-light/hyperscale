@@ -21,7 +21,7 @@ import time
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from hyperscale.distributed_rewrite.reliability import (
+from hyperscale.distributed.reliability import (
     TokenBucket,
     RateLimitConfig,
     RateLimitResult,

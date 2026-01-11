@@ -25,12 +25,12 @@ LoggingConfig().update(log_directory=os.getcwd(), log_level="info")
 
 from hyperscale.graph import Workflow, step
 from hyperscale.testing import URL, HTTPResponse
-from hyperscale.distributed_rewrite.nodes.gate import GateServer
-from hyperscale.distributed_rewrite.nodes.manager import ManagerServer
-from hyperscale.distributed_rewrite.nodes.worker import WorkerServer
-from hyperscale.distributed_rewrite.env.env import Env
-from hyperscale.distributed_rewrite.routing import ConsistentHashRing
-from hyperscale.distributed_rewrite.models import (
+from hyperscale.distributed.nodes.gate import GateServer
+from hyperscale.distributed.nodes.manager import ManagerServer
+from hyperscale.distributed.nodes.worker import WorkerServer
+from hyperscale.distributed.env.env import Env
+from hyperscale.distributed.routing import ConsistentHashRing
+from hyperscale.distributed.models import (
     JobSubmission,
     JobAck,
 )

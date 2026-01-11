@@ -15,12 +15,12 @@ Tests cover:
 
 import pytest
 
-from hyperscale.distributed_rewrite.reliability.overload import (
+from hyperscale.distributed.reliability.overload import (
     HybridOverloadDetector,
     OverloadConfig,
     OverloadState,
 )
-from hyperscale.distributed_rewrite.reliability.load_shedding import (
+from hyperscale.distributed.reliability.load_shedding import (
     DEFAULT_MESSAGE_PRIORITIES,
     LoadShedder,
     LoadShedderConfig,
@@ -933,7 +933,7 @@ class TestStateOrdering:
 
     def test_state_ordering_correct(self):
         """State ordering HEALTHY < BUSY < STRESSED < OVERLOADED."""
-        from hyperscale.distributed_rewrite.reliability.overload import _STATE_ORDER
+        from hyperscale.distributed.reliability.overload import _STATE_ORDER
 
         assert _STATE_ORDER[OverloadState.HEALTHY] < _STATE_ORDER[OverloadState.BUSY]
         assert _STATE_ORDER[OverloadState.BUSY] < _STATE_ORDER[OverloadState.STRESSED]
@@ -941,7 +941,7 @@ class TestStateOrdering:
 
     def test_max_state_comparison(self):
         """max() comparison works for states."""
-        from hyperscale.distributed_rewrite.reliability.overload import _STATE_ORDER
+        from hyperscale.distributed.reliability.overload import _STATE_ORDER
 
         states = [OverloadState.HEALTHY, OverloadState.BUSY, OverloadState.STRESSED]
         worst = max(states, key=lambda s: _STATE_ORDER[s])

@@ -16,7 +16,7 @@ from unittest.mock import patch, MagicMock
 
 import pytest
 
-from hyperscale.distributed_rewrite.nodes.worker.config import (
+from hyperscale.distributed.nodes.worker.config import (
     WorkerConfig,
     create_worker_config_from_env,
     _get_os_cpus,

@@ -9,8 +9,8 @@ Covers:
 
 import pytest
 
-from hyperscale.distributed_rewrite.swim.message_handling.core import ResponseBuilder
-from hyperscale.distributed_rewrite.swim.message_handling.models import HandlerResult
+from hyperscale.distributed.swim.message_handling.core import ResponseBuilder
+from hyperscale.distributed.swim.message_handling.models import HandlerResult
 
 from tests.distributed.messaging.mocks import MockServerInterface
 

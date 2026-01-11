@@ -13,13 +13,13 @@ from typing import ClassVar
 
 import pytest
 
-from hyperscale.distributed_rewrite.swim.message_handling.core import (
+from hyperscale.distributed.swim.message_handling.core import (
     BaseHandler,
     MessageDispatcher,
     MessageParser,
     ResponseBuilder,
 )
-from hyperscale.distributed_rewrite.swim.message_handling.models import (
+from hyperscale.distributed.swim.message_handling.models import (
     HandlerResult,
     MessageContext,
 )

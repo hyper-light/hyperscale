@@ -9,9 +9,9 @@ import pytest
 from dataclasses import dataclass, field
 from unittest.mock import AsyncMock, MagicMock
 
-from hyperscale.distributed_rewrite.nodes.gate.handlers.tcp_ping import GatePingHandler
-from hyperscale.distributed_rewrite.nodes.gate.state import GateRuntimeState
-from hyperscale.distributed_rewrite.models import GateState as GateStateEnum
+from hyperscale.distributed.nodes.gate.handlers.tcp_ping import GatePingHandler
+from hyperscale.distributed.nodes.gate.state import GateRuntimeState
+from hyperscale.distributed.models import GateState as GateStateEnum
 
 
 # =============================================================================
@@ -91,7 +91,7 @@ class TestGatePingHandlerHappyPath:
         )
 
         # Mock the PingRequest.load method
-        import hyperscale.distributed_rewrite.nodes.gate.handlers.tcp_ping as ping_module
+        import hyperscale.distributed.nodes.gate.handlers.tcp_ping as ping_module
         original_load = None
         if hasattr(ping_module, 'PingRequest'):
             original_load = ping_module.PingRequest.load

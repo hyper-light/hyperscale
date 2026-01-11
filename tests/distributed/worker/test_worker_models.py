@@ -17,7 +17,7 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 
-from hyperscale.distributed_rewrite.nodes.worker.models import (
+from hyperscale.distributed.nodes.worker.models import (
     ManagerPeerState,
     WorkflowRuntimeState,
     CancelState,

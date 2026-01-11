@@ -17,9 +17,9 @@ from unittest.mock import MagicMock, AsyncMock
 
 import pytest
 
-from hyperscale.distributed_rewrite.nodes.worker.registry import WorkerRegistry
-from hyperscale.distributed_rewrite.models import ManagerInfo
-from hyperscale.distributed_rewrite.swim.core import CircuitState
+from hyperscale.distributed.nodes.worker.registry import WorkerRegistry
+from hyperscale.distributed.models import ManagerInfo
+from hyperscale.distributed.swim.core import CircuitState
 
 
 class TestWorkerRegistryInitialization:

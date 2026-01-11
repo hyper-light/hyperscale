@@ -18,12 +18,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from hyperscale.distributed_rewrite.nodes.client.reporting import ClientReportingManager
-from hyperscale.distributed_rewrite.nodes.client.discovery import ClientDiscovery
-from hyperscale.distributed_rewrite.nodes.client.state import ClientState
-from hyperscale.distributed_rewrite.nodes.client.config import ClientConfig
-from hyperscale.distributed_rewrite.nodes.client.targets import ClientTargetSelector
-from hyperscale.distributed_rewrite.models import (
+from hyperscale.distributed.nodes.client.reporting import ClientReportingManager
+from hyperscale.distributed.nodes.client.discovery import ClientDiscovery
+from hyperscale.distributed.nodes.client.state import ClientState
+from hyperscale.distributed.nodes.client.config import ClientConfig
+from hyperscale.distributed.nodes.client.targets import ClientTargetSelector
+from hyperscale.distributed.models import (
     PingRequest,
     ManagerPingResponse,
     GatePingResponse,

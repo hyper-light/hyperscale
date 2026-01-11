@@ -16,7 +16,7 @@ from unittest.mock import MagicMock, AsyncMock
 
 import pytest
 
-from hyperscale.distributed_rewrite.nodes.worker.cancellation import WorkerCancellationHandler
+from hyperscale.distributed.nodes.worker.cancellation import WorkerCancellationHandler
 
 
 class TestWorkerCancellationHandlerInitialization:

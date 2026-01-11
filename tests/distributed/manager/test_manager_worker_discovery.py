@@ -31,10 +31,10 @@ from dataclasses import dataclass, field
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from hyperscale.distributed_rewrite.nodes.manager import ManagerServer
-from hyperscale.distributed_rewrite.nodes.worker import WorkerServer
-from hyperscale.distributed_rewrite.env.env import Env
-from hyperscale.distributed_rewrite.models import WorkerHeartbeat, WorkerRegistration, RegistrationResponse
+from hyperscale.distributed.nodes.manager import ManagerServer
+from hyperscale.distributed.nodes.worker import WorkerServer
+from hyperscale.distributed.env.env import Env
+from hyperscale.distributed.models import WorkerHeartbeat, WorkerRegistration, RegistrationResponse
 from hyperscale.logging.config.logging_config import LoggingConfig
 
 # Initialize logging directory

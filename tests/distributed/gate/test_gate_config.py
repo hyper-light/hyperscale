@@ -7,7 +7,7 @@ Tests the gate configuration dataclass and factory function.
 import pytest
 from dataclasses import fields
 
-from hyperscale.distributed_rewrite.nodes.gate.config import (
+from hyperscale.distributed.nodes.gate.config import (
     GateConfig,
     create_gate_config,
 )

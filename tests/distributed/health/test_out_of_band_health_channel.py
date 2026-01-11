@@ -17,7 +17,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from hyperscale.distributed_rewrite.swim.health.out_of_band_health_channel import (
+from hyperscale.distributed.swim.health.out_of_band_health_channel import (
     OutOfBandHealthChannel,
     OOBHealthChannelConfig,
     OOBProbeResult,

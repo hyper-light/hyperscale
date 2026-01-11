@@ -12,10 +12,10 @@ import pytest
 from dataclasses import dataclass, field
 from unittest.mock import AsyncMock, MagicMock
 
-from hyperscale.distributed_rewrite.nodes.gate.leadership_coordinator import (
+from hyperscale.distributed.nodes.gate.leadership_coordinator import (
     GateLeadershipCoordinator,
 )
-from hyperscale.distributed_rewrite.nodes.gate.state import GateRuntimeState
+from hyperscale.distributed.nodes.gate.state import GateRuntimeState
 
 
 # =============================================================================

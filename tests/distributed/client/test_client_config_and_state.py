@@ -18,13 +18,13 @@ from unittest.mock import patch
 
 import pytest
 
-from hyperscale.distributed_rewrite.nodes.client.config import (
+from hyperscale.distributed.nodes.client.config import (
     ClientConfig,
     create_client_config,
     TRANSIENT_ERRORS,
 )
-from hyperscale.distributed_rewrite.nodes.client.state import ClientState
-from hyperscale.distributed_rewrite.models import (
+from hyperscale.distributed.nodes.client.state import ClientState
+from hyperscale.distributed.models import (
     ClientJobResult,
     GateLeaderInfo,
     ManagerLeaderInfo,

@@ -18,13 +18,13 @@ The Adaptive Healthcheck Extension pattern ensures:
 import time
 import pytest
 
-from hyperscale.distributed_rewrite.health import (
+from hyperscale.distributed.health import (
     ExtensionTracker,
     ExtensionTrackerConfig,
     WorkerHealthManager,
     WorkerHealthManagerConfig,
 )
-from hyperscale.distributed_rewrite.models import (
+from hyperscale.distributed.models import (
     HealthcheckExtensionRequest,
     HealthcheckExtensionResponse,
 )

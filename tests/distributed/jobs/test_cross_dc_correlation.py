@@ -16,7 +16,7 @@ Test Categories:
 import time
 import pytest
 
-from hyperscale.distributed_rewrite.datacenters import (
+from hyperscale.distributed.datacenters import (
     CrossDCCorrelationDetector,
     CrossDCCorrelationConfig,
     CorrelationDecision,

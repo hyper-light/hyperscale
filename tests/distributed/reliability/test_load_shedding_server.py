@@ -17,7 +17,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from hyperscale.distributed_rewrite.reliability import (
+from hyperscale.distributed.reliability import (
     HybridOverloadDetector,
     LoadShedder,
     LoadShedderConfig,

@@ -12,13 +12,13 @@ Tests edge cases, error conditions, and boundary behaviors for:
 import asyncio
 import pytest
 
-from hyperscale.distributed_rewrite.reliability.load_shedding import (
+from hyperscale.distributed.reliability.load_shedding import (
     DEFAULT_MESSAGE_PRIORITIES,
     LoadShedder,
     LoadShedderConfig,
     RequestPriority,
 )
-from hyperscale.distributed_rewrite.reliability.overload import (
+from hyperscale.distributed.reliability.overload import (
     HybridOverloadDetector,
     OverloadConfig,
     OverloadState,

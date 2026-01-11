@@ -21,7 +21,7 @@ import asyncio
 
 import pytest
 
-from hyperscale.distributed_rewrite.swim.message_handling.leadership import (
+from hyperscale.distributed.swim.message_handling.leadership import (
     LeaderClaimHandler,
     LeaderVoteHandler,
     LeaderElectedHandler,
@@ -30,7 +30,7 @@ from hyperscale.distributed_rewrite.swim.message_handling.leadership import (
     PreVoteReqHandler,
     PreVoteRespHandler,
 )
-from hyperscale.distributed_rewrite.swim.message_handling.models import MessageContext
+from hyperscale.distributed.swim.message_handling.models import MessageContext
 
 from tests.distributed.messaging.mocks import MockServerInterface, MockLeaderState
 

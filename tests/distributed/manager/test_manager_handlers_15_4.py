@@ -19,14 +19,14 @@ import pytest
 import time
 from unittest.mock import MagicMock, AsyncMock, patch
 
-from hyperscale.distributed_rewrite.nodes.manager.state import ManagerState
-from hyperscale.distributed_rewrite.nodes.manager.config import ManagerConfig
-from hyperscale.distributed_rewrite.nodes.manager.handlers.tcp_cancellation import (
+from hyperscale.distributed.nodes.manager.state import ManagerState
+from hyperscale.distributed.nodes.manager.config import ManagerConfig
+from hyperscale.distributed.nodes.manager.handlers.tcp_cancellation import (
     CancelJobHandler,
     JobCancelRequestHandler,
     WorkflowCancellationCompleteHandler,
 )
-from hyperscale.distributed_rewrite.models import (
+from hyperscale.distributed.models import (
     CancelJob,
     JobCancelRequest,
     JobCancelResponse,

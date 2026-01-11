@@ -15,7 +15,7 @@ Tests cover:
 import pytest
 import math
 
-from hyperscale.distributed_rewrite.reliability.overload import (
+from hyperscale.distributed.reliability.overload import (
     HybridOverloadDetector,
     OverloadConfig,
     OverloadState,
@@ -589,7 +589,7 @@ class TestDriftInteractionWithOtherMethods:
         state_with_drift = detector.get_state()
 
         # State with drift should be at least as severe
-        from hyperscale.distributed_rewrite.reliability.overload import _STATE_ORDER
+        from hyperscale.distributed.reliability.overload import _STATE_ORDER
         assert _STATE_ORDER[state_with_drift] >= _STATE_ORDER[state_without_drift]
 
 
@@ -790,7 +790,7 @@ class TestRealWorldDriftScenarios:
         # Should detect degradation via absolute bounds (current_avg > 200)
         final_state = detector.get_state()
 
-        from hyperscale.distributed_rewrite.reliability.overload import _STATE_ORDER
+        from hyperscale.distributed.reliability.overload import _STATE_ORDER
         assert _STATE_ORDER[final_state] >= _STATE_ORDER[OverloadState.BUSY], \
             f"Expected at least BUSY, got {final_state}, drift={detector.baseline_drift}"
 
@@ -1156,7 +1156,7 @@ class TestHighDriftEscalation:
         if diagnostics["delta"] > config.delta_thresholds[0]:
             state = detector.get_state()
             # Should be at least BUSY, possibly STRESSED due to drift escalation
-            from hyperscale.distributed_rewrite.reliability.overload import _STATE_ORDER
+            from hyperscale.distributed.reliability.overload import _STATE_ORDER
             assert _STATE_ORDER[state] >= _STATE_ORDER[OverloadState.BUSY]
 
     def test_boiled_frog_real_world_scenario(self):
@@ -1212,7 +1212,7 @@ class TestHighDriftEscalation:
         state = detector.get_state()
 
         # Should be at least BUSY (via high drift) or higher (via absolute bounds)
-        from hyperscale.distributed_rewrite.reliability.overload import _STATE_ORDER
+        from hyperscale.distributed.reliability.overload import _STATE_ORDER
         assert _STATE_ORDER[state] >= _STATE_ORDER[OverloadState.BUSY], \
             f"Expected at least BUSY, got {state}, drift={final_drift}"
 

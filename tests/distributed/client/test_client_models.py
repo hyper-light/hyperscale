@@ -18,7 +18,7 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 
-from hyperscale.distributed_rewrite.nodes.client.models import (
+from hyperscale.distributed.nodes.client.models import (
     JobTrackingState,
     CancellationState,
     GateLeaderTracking,

@@ -12,7 +12,7 @@ These tests verify that:
 import pytest
 import time
 
-from hyperscale.distributed_rewrite.health import (
+from hyperscale.distributed.health import (
     ProgressState,
     RoutingDecision,
     WorkerHealthConfig,

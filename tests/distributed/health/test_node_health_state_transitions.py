@@ -15,7 +15,7 @@ import time
 from dataclasses import replace
 from unittest.mock import patch
 
-from hyperscale.distributed_rewrite.health.worker_health import (
+from hyperscale.distributed.health.worker_health import (
     WorkerHealthState,
     WorkerHealthConfig,
     ProgressState,

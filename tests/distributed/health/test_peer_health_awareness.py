@@ -18,8 +18,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from hyperscale.distributed_rewrite.health.tracker import HealthPiggyback
-from hyperscale.distributed_rewrite.swim.health.peer_health_awareness import (
+from hyperscale.distributed.health.tracker import HealthPiggyback
+from hyperscale.distributed.swim.health.peer_health_awareness import (
     PeerHealthAwareness,
     PeerHealthAwarenessConfig,
     PeerHealthInfo,

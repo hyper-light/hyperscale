@@ -16,7 +16,7 @@ from unittest.mock import patch
 
 import pytest
 
-from hyperscale.distributed_rewrite.reliability import (
+from hyperscale.distributed.reliability import (
     AdaptiveRateLimitConfig,
     AdaptiveRateLimiter,
     CooperativeRateLimiter,
@@ -29,7 +29,7 @@ from hyperscale.distributed_rewrite.reliability import (
     SlidingWindowCounter,
     TokenBucket,
 )
-from hyperscale.distributed_rewrite.reliability.load_shedding import RequestPriority
+from hyperscale.distributed.reliability.load_shedding import RequestPriority
 
 
 class TestSlidingWindowCounter:
@@ -800,8 +800,8 @@ class TestRetryAfterHelpers:
 
     def test_is_rate_limit_response_positive(self) -> None:
         """Test detection of rate limit response data."""
-        from hyperscale.distributed_rewrite.reliability import is_rate_limit_response
-        from hyperscale.distributed_rewrite.models import RateLimitResponse
+        from hyperscale.distributed.reliability import is_rate_limit_response
+        from hyperscale.distributed.models import RateLimitResponse
 
         response = RateLimitResponse(
             operation="job_submit",
@@ -813,7 +813,7 @@ class TestRetryAfterHelpers:
 
     def test_is_rate_limit_response_negative(self) -> None:
         """Test non-rate-limit response is not detected."""
-        from hyperscale.distributed_rewrite.reliability import is_rate_limit_response
+        from hyperscale.distributed.reliability import is_rate_limit_response
 
         data = b"not a rate limit response"
 
@@ -822,7 +822,7 @@ class TestRetryAfterHelpers:
     @pytest.mark.asyncio
     async def test_handle_rate_limit_response_with_wait(self) -> None:
         """Test handling rate limit response with wait."""
-        from hyperscale.distributed_rewrite.reliability import (
+        from hyperscale.distributed.reliability import (
             CooperativeRateLimiter,
             handle_rate_limit_response,
         )
@@ -848,7 +848,7 @@ class TestExecuteWithRateLimitRetry:
     @pytest.mark.asyncio
     async def test_success_on_first_try(self) -> None:
         """Test successful operation without rate limiting."""
-        from hyperscale.distributed_rewrite.reliability import (
+        from hyperscale.distributed.reliability import (
             CooperativeRateLimiter,
             execute_with_rate_limit_retry,
         )
@@ -875,12 +875,12 @@ class TestExecuteWithRateLimitRetry:
     @pytest.mark.asyncio
     async def test_retry_after_rate_limit(self) -> None:
         """Test automatic retry after rate limit response."""
-        from hyperscale.distributed_rewrite.reliability import (
+        from hyperscale.distributed.reliability import (
             CooperativeRateLimiter,
             RateLimitRetryConfig,
             execute_with_rate_limit_retry,
         )
-        from hyperscale.distributed_rewrite.models import RateLimitResponse
+        from hyperscale.distributed.models import RateLimitResponse
 
         limiter = CooperativeRateLimiter()
         call_count = 0
@@ -916,7 +916,7 @@ class TestExecuteWithRateLimitRetry:
     @pytest.mark.asyncio
     async def test_exception_handling(self) -> None:
         """Test that exceptions are properly handled."""
-        from hyperscale.distributed_rewrite.reliability import (
+        from hyperscale.distributed.reliability import (
             CooperativeRateLimiter,
             execute_with_rate_limit_retry,
         )

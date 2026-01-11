@@ -20,7 +20,7 @@ from unittest.mock import Mock, AsyncMock
 
 import pytest
 
-from hyperscale.distributed_rewrite.nodes.client.handlers import (
+from hyperscale.distributed.nodes.client.handlers import (
     JobStatusPushHandler,
     JobBatchPushHandler,
     JobFinalResultHandler,
@@ -32,9 +32,9 @@ from hyperscale.distributed_rewrite.nodes.client.handlers import (
     GateLeaderTransferHandler,
     ManagerLeaderTransferHandler,
 )
-from hyperscale.distributed_rewrite.nodes.client.state import ClientState
-from hyperscale.distributed_rewrite.nodes.client.leadership import ClientLeadershipTracker
-from hyperscale.distributed_rewrite.models import (
+from hyperscale.distributed.nodes.client.state import ClientState
+from hyperscale.distributed.nodes.client.leadership import ClientLeadershipTracker
+from hyperscale.distributed.models import (
     JobStatusPush,
     JobBatchPush,
     JobFinalResult,
@@ -47,8 +47,8 @@ from hyperscale.distributed_rewrite.models import (
     GateJobLeaderTransferAck,
     ManagerJobLeaderTransferAck,
 )
-from hyperscale.distributed_rewrite.models.client import ClientJobResult
-from hyperscale.distributed_rewrite.jobs import WindowedStatsPush
+from hyperscale.distributed.models.client import ClientJobResult
+from hyperscale.distributed.jobs import WindowedStatsPush
 from hyperscale.logging import Logger
 
 

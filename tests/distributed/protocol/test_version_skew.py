@@ -16,7 +16,7 @@ The Version Skew Handling pattern ensures:
 
 import pytest
 
-from hyperscale.distributed_rewrite.protocol import (
+from hyperscale.distributed.protocol import (
     ProtocolVersion,
     CURRENT_PROTOCOL_VERSION,
     FEATURE_VERSIONS,
@@ -26,7 +26,7 @@ from hyperscale.distributed_rewrite.protocol import (
     NegotiatedCapabilities,
     negotiate_capabilities,
 )
-from hyperscale.distributed_rewrite.models import (
+from hyperscale.distributed.models import (
     WorkerRegistration,
     ManagerPeerRegistration,
     ManagerPeerRegistrationResponse,

@@ -18,7 +18,7 @@ from unittest.mock import MagicMock, AsyncMock, patch, PropertyMock
 
 import pytest
 
-from hyperscale.distributed_rewrite.models import (
+from hyperscale.distributed.models import (
     WorkflowDispatch,
     WorkflowDispatchAck,
     WorkflowCancelRequest,
@@ -116,7 +116,7 @@ class TestWorkflowDispatchHandler:
     @pytest.mark.asyncio
     async def test_happy_path_dispatch(self, mock_server):
         """Test successful workflow dispatch."""
-        from hyperscale.distributed_rewrite.nodes.worker.handlers.tcp_dispatch import (
+        from hyperscale.distributed.nodes.worker.handlers.tcp_dispatch import (
             WorkflowDispatchHandler,
         )
 
@@ -150,7 +150,7 @@ class TestWorkflowDispatchHandler:
     @pytest.mark.asyncio
     async def test_dispatch_stale_fence_token(self, mock_server):
         """Test dispatch with stale fence token."""
-        from hyperscale.distributed_rewrite.nodes.worker.handlers.tcp_dispatch import (
+        from hyperscale.distributed.nodes.worker.handlers.tcp_dispatch import (
             WorkflowDispatchHandler,
         )
 
@@ -181,7 +181,7 @@ class TestWorkflowDispatchHandler:
     @pytest.mark.asyncio
     async def test_dispatch_queue_depth_limit(self, mock_server):
         """Test dispatch when queue depth limit reached."""
-        from hyperscale.distributed_rewrite.nodes.worker.handlers.tcp_dispatch import (
+        from hyperscale.distributed.nodes.worker.handlers.tcp_dispatch import (
             WorkflowDispatchHandler,
         )
 
@@ -212,7 +212,7 @@ class TestWorkflowDispatchHandler:
     @pytest.mark.asyncio
     async def test_dispatch_core_allocation_failure(self, mock_server):
         """Test dispatch with core allocation failure."""
-        from hyperscale.distributed_rewrite.nodes.worker.handlers.tcp_dispatch import (
+        from hyperscale.distributed.nodes.worker.handlers.tcp_dispatch import (
             WorkflowDispatchHandler,
         )
 
@@ -256,7 +256,7 @@ class TestJobLeaderTransferHandler:
     @pytest.mark.asyncio
     async def test_happy_path_transfer(self, mock_server):
         """Test successful job leadership transfer."""
-        from hyperscale.distributed_rewrite.nodes.worker.handlers.tcp_leader_transfer import (
+        from hyperscale.distributed.nodes.worker.handlers.tcp_leader_transfer import (
             JobLeaderTransferHandler,
         )
 
@@ -299,7 +299,7 @@ class TestJobLeaderTransferHandler:
     @pytest.mark.asyncio
     async def test_transfer_stale_fence_token(self, mock_server):
         """Test transfer with stale fence token."""
-        from hyperscale.distributed_rewrite.nodes.worker.handlers.tcp_leader_transfer import (
+        from hyperscale.distributed.nodes.worker.handlers.tcp_leader_transfer import (
             JobLeaderTransferHandler,
         )
 
@@ -330,7 +330,7 @@ class TestJobLeaderTransferHandler:
     @pytest.mark.asyncio
     async def test_transfer_unknown_manager(self, mock_server):
         """Test transfer from unknown manager."""
-        from hyperscale.distributed_rewrite.nodes.worker.handlers.tcp_leader_transfer import (
+        from hyperscale.distributed.nodes.worker.handlers.tcp_leader_transfer import (
             JobLeaderTransferHandler,
         )
 
@@ -359,7 +359,7 @@ class TestJobLeaderTransferHandler:
     @pytest.mark.asyncio
     async def test_transfer_clears_orphan_status(self, mock_server):
         """Test transfer clears orphan status (Section 2.7)."""
-        from hyperscale.distributed_rewrite.nodes.worker.handlers.tcp_leader_transfer import (
+        from hyperscale.distributed.nodes.worker.handlers.tcp_leader_transfer import (
             JobLeaderTransferHandler,
         )
 
@@ -394,7 +394,7 @@ class TestJobLeaderTransferHandler:
     @pytest.mark.asyncio
     async def test_transfer_stores_pending_for_unknown_workflows(self, mock_server):
         """Test transfer stores pending for unknown workflows (Section 8.3)."""
-        from hyperscale.distributed_rewrite.nodes.worker.handlers.tcp_leader_transfer import (
+        from hyperscale.distributed.nodes.worker.handlers.tcp_leader_transfer import (
             JobLeaderTransferHandler,
         )
 
@@ -438,7 +438,7 @@ class TestWorkflowProgressHandler:
 
     def test_process_ack_updates_known_managers(self, mock_server):
         """Test progress ack updates known managers."""
-        from hyperscale.distributed_rewrite.nodes.worker.handlers.tcp_progress import (
+        from hyperscale.distributed.nodes.worker.handlers.tcp_progress import (
             WorkflowProgressHandler,
         )
 
@@ -473,7 +473,7 @@ class TestWorkflowStatusQueryHandler:
     @pytest.mark.asyncio
     async def test_happy_path_query(self, mock_server):
         """Test successful workflow status query."""
-        from hyperscale.distributed_rewrite.nodes.worker.handlers.tcp_status_query import (
+        from hyperscale.distributed.nodes.worker.handlers.tcp_status_query import (
             WorkflowStatusQueryHandler,
         )
 
@@ -501,7 +501,7 @@ class TestWorkflowStatusQueryHandler:
     @pytest.mark.asyncio
     async def test_query_no_workflows(self, mock_server):
         """Test query with no active workflows."""
-        from hyperscale.distributed_rewrite.nodes.worker.handlers.tcp_status_query import (
+        from hyperscale.distributed.nodes.worker.handlers.tcp_status_query import (
             WorkflowStatusQueryHandler,
         )
 
@@ -531,7 +531,7 @@ class TestWorkflowCancelHandler:
     @pytest.mark.asyncio
     async def test_happy_path_cancel(self, mock_server):
         """Test successful workflow cancellation."""
-        from hyperscale.distributed_rewrite.nodes.worker.handlers.tcp_cancel import (
+        from hyperscale.distributed.nodes.worker.handlers.tcp_cancel import (
             WorkflowCancelHandler,
         )
 
@@ -563,7 +563,7 @@ class TestWorkflowCancelHandler:
     @pytest.mark.asyncio
     async def test_cancel_unknown_workflow(self, mock_server):
         """Test cancellation of unknown workflow (idempotent - treated as already completed)."""
-        from hyperscale.distributed_rewrite.nodes.worker.handlers.tcp_cancel import (
+        from hyperscale.distributed.nodes.worker.handlers.tcp_cancel import (
             WorkflowCancelHandler,
         )
 
@@ -595,7 +595,7 @@ class TestHandlersConcurrency:
     @pytest.mark.asyncio
     async def test_concurrent_transfers_serialized(self):
         """Test that concurrent transfers to same job are serialized."""
-        from hyperscale.distributed_rewrite.nodes.worker.handlers.tcp_leader_transfer import (
+        from hyperscale.distributed.nodes.worker.handlers.tcp_leader_transfer import (
             JobLeaderTransferHandler,
         )
 
@@ -649,7 +649,7 @@ class TestHandlersEdgeCases:
     @pytest.mark.asyncio
     async def test_handler_with_invalid_data(self):
         """Test handler with invalid serialized data."""
-        from hyperscale.distributed_rewrite.nodes.worker.handlers.tcp_dispatch import (
+        from hyperscale.distributed.nodes.worker.handlers.tcp_dispatch import (
             WorkflowDispatchHandler,
         )
 
@@ -668,7 +668,7 @@ class TestHandlersEdgeCases:
     @pytest.mark.asyncio
     async def test_transfer_with_many_workflows(self):
         """Test transfer with many workflows."""
-        from hyperscale.distributed_rewrite.nodes.worker.handlers.tcp_leader_transfer import (
+        from hyperscale.distributed.nodes.worker.handlers.tcp_leader_transfer import (
             JobLeaderTransferHandler,
         )
 

@@ -10,7 +10,7 @@ Tests:
 
 import pytest
 
-from hyperscale.distributed_rewrite.reliability import (
+from hyperscale.distributed.reliability import (
     HybridOverloadDetector,
     LoadShedder,
     LoadShedderConfig,

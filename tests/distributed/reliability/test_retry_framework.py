@@ -14,12 +14,12 @@ import asyncio
 import pytest
 import time
 
-from hyperscale.distributed_rewrite.reliability import (
+from hyperscale.distributed.reliability import (
     JitterStrategy,
     RetryConfig,
     RetryExecutor,
 )
-from hyperscale.distributed_rewrite.reliability.retry import (
+from hyperscale.distributed.reliability.retry import (
     calculate_jittered_delay,
     add_jitter,
 )

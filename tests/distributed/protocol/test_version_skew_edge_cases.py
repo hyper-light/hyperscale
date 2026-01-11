@@ -14,7 +14,7 @@ Tests cover:
 
 import pytest
 
-from hyperscale.distributed_rewrite.protocol.version import (
+from hyperscale.distributed.protocol.version import (
     CURRENT_PROTOCOL_VERSION,
     FEATURE_VERSIONS,
     NegotiatedCapabilities,

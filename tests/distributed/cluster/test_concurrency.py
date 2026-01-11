@@ -23,32 +23,32 @@ from collections import Counter
 
 import pytest
 
-from hyperscale.distributed_rewrite.reliability.overload import (
+from hyperscale.distributed.reliability.overload import (
     HybridOverloadDetector,
     OverloadConfig,
     OverloadState,
 )
-from hyperscale.distributed_rewrite.reliability.load_shedding import (
+from hyperscale.distributed.reliability.load_shedding import (
     LoadShedder,
     RequestPriority,
 )
-from hyperscale.distributed_rewrite.reliability.rate_limiting import (
+from hyperscale.distributed.reliability.rate_limiting import (
     SlidingWindowCounter,
     TokenBucket,
     ServerRateLimiter,
     RateLimitConfig,
 )
-from hyperscale.distributed_rewrite.reliability.backpressure import (
+from hyperscale.distributed.reliability.backpressure import (
     StatsBuffer,
     BackpressureLevel,
 )
-from hyperscale.distributed_rewrite.health.worker_health import WorkerHealthState
-from hyperscale.distributed_rewrite.health.manager_health import ManagerHealthState
-from hyperscale.distributed_rewrite.health.gate_health import GateHealthState
-from hyperscale.distributed_rewrite.health.tracker import NodeHealthTracker
-from hyperscale.distributed_rewrite.health.extension_tracker import ExtensionTracker
-from hyperscale.distributed_rewrite.health.worker_health_manager import WorkerHealthManager
-from hyperscale.distributed_rewrite.models import HealthcheckExtensionRequest
+from hyperscale.distributed.health.worker_health import WorkerHealthState
+from hyperscale.distributed.health.manager_health import ManagerHealthState
+from hyperscale.distributed.health.gate_health import GateHealthState
+from hyperscale.distributed.health.tracker import NodeHealthTracker
+from hyperscale.distributed.health.extension_tracker import ExtensionTracker
+from hyperscale.distributed.health.worker_health_manager import WorkerHealthManager
+from hyperscale.distributed.models import HealthcheckExtensionRequest
 
 
 # =============================================================================

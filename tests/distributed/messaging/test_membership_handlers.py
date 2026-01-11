@@ -13,13 +13,13 @@ import time
 
 import pytest
 
-from hyperscale.distributed_rewrite.swim.message_handling.membership import (
+from hyperscale.distributed.swim.message_handling.membership import (
     AckHandler,
     NackHandler,
     JoinHandler,
     LeaveHandler,
 )
-from hyperscale.distributed_rewrite.swim.message_handling.models import MessageContext
+from hyperscale.distributed.swim.message_handling.models import MessageContext
 
 from tests.distributed.messaging.mocks import MockServerInterface
 

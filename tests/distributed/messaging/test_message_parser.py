@@ -10,8 +10,8 @@ Covers:
 
 import pytest
 
-from hyperscale.distributed_rewrite.swim.message_handling.core import MessageParser
-from hyperscale.distributed_rewrite.swim.message_handling.models import MessageContext
+from hyperscale.distributed.swim.message_handling.core import MessageParser
+from hyperscale.distributed.swim.message_handling.models import MessageContext
 
 from tests.distributed.messaging.mocks import MockServerInterface
 

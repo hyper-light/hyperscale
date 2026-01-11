@@ -17,14 +17,14 @@ import asyncio
 import pytest
 from dataclasses import dataclass
 
-from hyperscale.distributed_rewrite.reliability.robust_queue import (
+from hyperscale.distributed.reliability.robust_queue import (
     RobustMessageQueue,
     RobustQueueConfig,
     QueuePutResult,
     QueueState,
     QueueFullError,
 )
-from hyperscale.distributed_rewrite.reliability.backpressure import (
+from hyperscale.distributed.reliability.backpressure import (
     BackpressureLevel,
 )
 
