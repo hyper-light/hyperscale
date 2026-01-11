@@ -22299,6 +22299,699 @@ class CheckpointManager:
         return self._last_checkpoint_lsn
 ```
 
+### Data Plane Stats Aggregator (Uses Logger)
+
+```python
+"""
+hyperscale/distributed_rewrite/ledger/data_plane/stats_aggregator.py
+
+This component uses the hyperscale/logging Logger for stats streaming.
+Unlike the WAL (Control Plane), stats do NOT require:
+- fsync guarantees
+- Sequence numbers
+- Binary format
+- Read-back capability
+
+Stats are fire-and-forget with eventual consistency.
+"""
+
+import asyncio
+import time
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+
+from hyperscale.logging import Logger
+from hyperscale.logging.models import Entry, LogLevel
+
+if TYPE_CHECKING:
+    from hyperscale.taskex import TaskRunner
+
+
+@dataclass
+class AggregatedJobStats:
+    """Aggregated stats for a job, sent Manager → Gate."""
+
+    job_id: str
+    dc_id: str
+    timestamp: float
+
+    # Counts
+    workflows_running: int = 0
+    workflows_completed: int = 0
+    workflows_failed: int = 0
+
+    # Rates
+    requests_per_second: float = 0.0
+    errors_per_second: float = 0.0
+
+    # Latencies (percentiles)
+    latency_p50_ms: float = 0.0
+    latency_p95_ms: float = 0.0
+    latency_p99_ms: float = 0.0
+
+    # Resource usage
+    cpu_percent_avg: float = 0.0
+    memory_mb_avg: float = 0.0
+
+
+@dataclass
+class StatsAggregatorConfig:
+    """Configuration for stats aggregation."""
+
+    # Aggregation intervals
+    worker_batch_interval_ms: int = 100
+    worker_batch_max_events: int = 1000
+    manager_aggregate_interval_ms: int = 500
+    manager_sample_rate: float = 0.1
+
+    # Storage
+    stats_log_path: str = "hyperscale.stats.log.json"
+    stats_retention_seconds: int = 3600
+
+
+@dataclass
+class StatsAggregator:
+    """
+    Aggregates stats from workers and streams to gates.
+
+    Uses Logger for storage - NOT the WAL. Stats are:
+    - High volume (10,000+ events/second)
+    - Eventually consistent (OK to lose some)
+    - JSON format (human readable)
+    - No durability guarantees needed
+
+    This is the DATA PLANE component.
+    """
+
+    node_id: str
+    dc_id: str
+    config: StatsAggregatorConfig
+    task_runner: "TaskRunner"
+
+    _logger: Logger = field(default_factory=Logger, repr=False)
+    _pending_stats: dict[str, list[dict]] = field(default_factory=dict, repr=False)
+    _aggregated_stats: dict[str, AggregatedJobStats] = field(default_factory=dict, repr=False)
+    _lock: asyncio.Lock | None = field(default=None, repr=False)
+    _flush_task: asyncio.Task | None = field(default=None, repr=False)
+    _running: bool = field(default=False, repr=False)
+
+    def _get_lock(self) -> asyncio.Lock:
+        """Lazy lock initialization."""
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
+
+    async def start(self) -> None:
+        """Start the stats aggregation loop."""
+        self._running = True
+
+        # Configure logger for stats (uses Logger, NOT WAL)
+        self._logger.configure(
+            name="stats_aggregator",
+            path=self.config.stats_log_path,
+            template="{timestamp} - {level} - {message}",
+            models={
+                "stats": (Entry, {"level": LogLevel.INFO}),
+            },
+        )
+
+        # Start aggregation loop
+        self._flush_task = self.task_runner.run(self._aggregation_loop)
+
+    async def stop(self) -> None:
+        """Stop the stats aggregation loop."""
+        self._running = False
+        if self._flush_task:
+            self._flush_task.cancel()
+            try:
+                await self._flush_task
+            except asyncio.CancelledError:
+                pass
+
+        # Final flush
+        await self._flush_aggregated_stats()
+
+    async def record_progress(
+        self,
+        job_id: str,
+        workflow_id: str,
+        status: str,
+        latency_ms: float | None = None,
+        cpu_percent: float | None = None,
+        memory_mb: float | None = None,
+    ) -> None:
+        """
+        Record progress update from worker.
+
+        This is fire-and-forget - no durability guarantees.
+        Stats are batched and aggregated before sending to gate.
+        """
+        async with self._get_lock():
+            if job_id not in self._pending_stats:
+                self._pending_stats[job_id] = []
+
+            self._pending_stats[job_id].append({
+                "workflow_id": workflow_id,
+                "status": status,
+                "latency_ms": latency_ms,
+                "cpu_percent": cpu_percent,
+                "memory_mb": memory_mb,
+                "timestamp": time.time(),
+            })
+
+            # Check if batch threshold reached
+            if len(self._pending_stats[job_id]) >= self.config.worker_batch_max_events:
+                await self._aggregate_job_stats(job_id)
+
+    async def _aggregation_loop(self) -> None:
+        """Periodic aggregation loop."""
+        interval_seconds = self.config.manager_aggregate_interval_ms / 1000
+
+        while self._running:
+            await asyncio.sleep(interval_seconds)
+            await self._flush_aggregated_stats()
+
+    async def _aggregate_job_stats(self, job_id: str) -> None:
+        """Aggregate pending stats for a job."""
+        pending = self._pending_stats.pop(job_id, [])
+        if not pending:
+            return
+
+        # Initialize or get existing aggregated stats
+        if job_id not in self._aggregated_stats:
+            self._aggregated_stats[job_id] = AggregatedJobStats(
+                job_id=job_id,
+                dc_id=self.dc_id,
+                timestamp=time.time(),
+            )
+
+        stats = self._aggregated_stats[job_id]
+
+        # Aggregate counts
+        for event in pending:
+            match event["status"]:
+                case "running":
+                    stats.workflows_running += 1
+                case "completed":
+                    stats.workflows_completed += 1
+                    stats.workflows_running = max(0, stats.workflows_running - 1)
+                case "failed":
+                    stats.workflows_failed += 1
+                    stats.workflows_running = max(0, stats.workflows_running - 1)
+
+        # Aggregate latencies (sample for percentile estimation)
+        latencies = [e["latency_ms"] for e in pending if e.get("latency_ms") is not None]
+        if latencies:
+            sorted_latencies = sorted(latencies)
+            count = len(sorted_latencies)
+            stats.latency_p50_ms = sorted_latencies[int(count * 0.5)]
+            stats.latency_p95_ms = sorted_latencies[int(count * 0.95)]
+            stats.latency_p99_ms = sorted_latencies[int(count * 0.99)]
+
+        # Aggregate resource usage
+        cpu_samples = [e["cpu_percent"] for e in pending if e.get("cpu_percent") is not None]
+        if cpu_samples:
+            stats.cpu_percent_avg = sum(cpu_samples) / len(cpu_samples)
+
+        memory_samples = [e["memory_mb"] for e in pending if e.get("memory_mb") is not None]
+        if memory_samples:
+            stats.memory_mb_avg = sum(memory_samples) / len(memory_samples)
+
+        stats.timestamp = time.time()
+
+    async def _flush_aggregated_stats(self) -> None:
+        """Flush aggregated stats to Logger and send to gate."""
+        async with self._get_lock():
+            # Aggregate any remaining pending stats
+            for job_id in list(self._pending_stats.keys()):
+                await self._aggregate_job_stats(job_id)
+
+            # Log and send aggregated stats
+            async with self._logger.context(name="stats_aggregator") as ctx:
+                for job_id, stats in self._aggregated_stats.items():
+                    # Log to file (uses Logger - JSON, no fsync)
+                    await ctx.log(
+                        Entry(
+                            message=f"job={stats.job_id} dc={stats.dc_id} "
+                                    f"running={stats.workflows_running} "
+                                    f"completed={stats.workflows_completed} "
+                                    f"failed={stats.workflows_failed} "
+                                    f"p50={stats.latency_p50_ms:.1f}ms "
+                                    f"p99={stats.latency_p99_ms:.1f}ms",
+                            level=LogLevel.INFO,
+                        )
+                    )
+
+            # Clear after flush (stats are fire-and-forget)
+            self._aggregated_stats.clear()
+
+    async def get_current_stats(self, job_id: str) -> AggregatedJobStats | None:
+        """Get current aggregated stats for a job (local query)."""
+        async with self._get_lock():
+            return self._aggregated_stats.get(job_id)
+```
+
+### Acknowledgment Window Manager
+
+```python
+"""
+hyperscale/distributed_rewrite/ledger/coordination/ack_window_manager.py
+
+Manages acknowledgment windows for worker communication.
+Workers don't provide immediate acks - instead we use time windows.
+"""
+
+import asyncio
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import TYPE_CHECKING
+
+from hyperscale.logging import Logger
+from hyperscale.logging.models import Entry, LogLevel
+
+if TYPE_CHECKING:
+    from hyperscale.taskex import TaskRunner
+
+
+class AckWindowState(Enum):
+    """State of an acknowledgment window."""
+    DISPATCHED = "dispatched"        # Workflow sent, window started
+    AWAITING_ACK = "awaiting_ack"    # Waiting for any communication
+    CONFIRMED = "confirmed"          # Worker communicated, workflow running
+    WINDOW_EXPIRED = "window_expired"  # No communication within window
+    EXTEND_WINDOW = "extend_window"  # Worker healthy, extending window
+    RESCHEDULE = "reschedule"        # Worker unhealthy, needs reschedule
+
+
+@dataclass
+class AckWindow:
+    """Single acknowledgment window."""
+    workflow_id: str
+    job_id: str
+    worker_id: str
+    state: AckWindowState
+    created_at: float
+    last_communication: float | None = None
+    extensions: int = 0
+
+
+@dataclass
+class AckWindowConfig:
+    """Configuration for acknowledgment windows."""
+    initial_window_seconds: float = 5.0    # Initial window duration
+    max_extensions: int = 3                 # Max window extensions
+    extension_duration_seconds: float = 5.0 # Duration per extension
+    health_check_on_expire: bool = True     # Health check when window expires
+
+
+@dataclass
+class AckWindowManager:
+    """
+    Manages acknowledgment windows for worker communication.
+
+    Workers under load cannot provide timely acks. Instead of blocking,
+    we use time windows and infer state from any communication.
+
+    State Transitions:
+    - DISPATCHED → AWAITING_ACK (window started)
+    - AWAITING_ACK → CONFIRMED (got progress/completion)
+    - AWAITING_ACK → WINDOW_EXPIRED (no communication)
+    - WINDOW_EXPIRED → EXTEND_WINDOW (worker healthy)
+    - WINDOW_EXPIRED → RESCHEDULE (worker unhealthy)
+    """
+
+    config: AckWindowConfig
+    health_checker: callable  # async fn(worker_id) -> bool
+    task_runner: "TaskRunner"
+
+    _windows: dict[str, AckWindow] = field(default_factory=dict, repr=False)
+    _lock: asyncio.Lock | None = field(default=None, repr=False)
+    _logger: Logger = field(default_factory=Logger, repr=False)
+    _expiry_tasks: dict[str, asyncio.Task] = field(default_factory=dict, repr=False)
+
+    def _get_lock(self) -> asyncio.Lock:
+        """Lazy lock initialization."""
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
+
+    async def start_window(
+        self,
+        workflow_id: str,
+        job_id: str,
+        worker_id: str,
+    ) -> None:
+        """
+        Start acknowledgment window for a dispatched workflow.
+
+        Called after sending workflow to worker. Does NOT wait for ack.
+        """
+        import time
+
+        async with self._get_lock():
+            window = AckWindow(
+                workflow_id=workflow_id,
+                job_id=job_id,
+                worker_id=worker_id,
+                state=AckWindowState.AWAITING_ACK,
+                created_at=time.time(),
+            )
+            self._windows[workflow_id] = window
+
+            # Schedule expiry check (non-blocking)
+            self._expiry_tasks[workflow_id] = self.task_runner.run(
+                self._window_expiry_check,
+                workflow_id,
+            )
+
+    async def on_worker_communication(
+        self,
+        workflow_id: str,
+        communication_type: str,  # "progress", "completion", "error"
+    ) -> AckWindowState:
+        """
+        Handle any communication from worker about a workflow.
+
+        Any communication confirms the workflow is being processed.
+        """
+        import time
+
+        async with self._get_lock():
+            window = self._windows.get(workflow_id)
+            if window is None:
+                return AckWindowState.CONFIRMED  # Already completed
+
+            window.last_communication = time.time()
+            window.state = AckWindowState.CONFIRMED
+
+            # Cancel expiry task
+            if workflow_id in self._expiry_tasks:
+                self._expiry_tasks[workflow_id].cancel()
+                del self._expiry_tasks[workflow_id]
+
+            return window.state
+
+    async def _window_expiry_check(self, workflow_id: str) -> None:
+        """Check if window has expired and take action."""
+        import time
+
+        await asyncio.sleep(self.config.initial_window_seconds)
+
+        async with self._get_lock():
+            window = self._windows.get(workflow_id)
+            if window is None or window.state == AckWindowState.CONFIRMED:
+                return  # Already handled
+
+            window.state = AckWindowState.WINDOW_EXPIRED
+
+        # Health check worker (outside lock)
+        if self.config.health_check_on_expire:
+            is_healthy = await self.health_checker(window.worker_id)
+
+            async with self._get_lock():
+                window = self._windows.get(workflow_id)
+                if window is None:
+                    return
+
+                if is_healthy and window.extensions < self.config.max_extensions:
+                    # Extend window
+                    window.state = AckWindowState.EXTEND_WINDOW
+                    window.extensions += 1
+
+                    # Schedule another expiry check
+                    self._expiry_tasks[workflow_id] = self.task_runner.run(
+                        self._window_expiry_check,
+                        workflow_id,
+                    )
+                else:
+                    # Need to reschedule
+                    window.state = AckWindowState.RESCHEDULE
+
+    async def get_workflows_to_reschedule(self) -> list[AckWindow]:
+        """Get workflows that need rescheduling."""
+        async with self._get_lock():
+            return [
+                window for window in self._windows.values()
+                if window.state == AckWindowState.RESCHEDULE
+            ]
+
+    async def complete_window(self, workflow_id: str) -> None:
+        """Mark window as complete and clean up."""
+        async with self._get_lock():
+            if workflow_id in self._windows:
+                del self._windows[workflow_id]
+            if workflow_id in self._expiry_tasks:
+                self._expiry_tasks[workflow_id].cancel()
+                del self._expiry_tasks[workflow_id]
+```
+
+### Circuit Breaker for Cross-DC Communication
+
+```python
+"""
+hyperscale/distributed_rewrite/ledger/reliability/circuit_breaker.py
+
+Circuit breaker for cross-DC communication.
+Prevents cascading failures when a DC is unavailable.
+"""
+
+import asyncio
+import time
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Callable, Awaitable, TypeVar
+
+from hyperscale.logging import Logger
+from hyperscale.logging.models import Entry, LogLevel
+
+
+T = TypeVar("T")
+
+
+class CircuitState(Enum):
+    """Circuit breaker states."""
+    CLOSED = "closed"        # Normal operation
+    OPEN = "open"           # Failing fast, queueing requests
+    HALF_OPEN = "half_open"  # Testing if service recovered
+
+
+@dataclass
+class CircuitBreakerConfig:
+    """Configuration for circuit breaker."""
+    failure_threshold: int = 5
+    success_threshold: int = 3
+    open_timeout_seconds: float = 30.0
+    half_open_max_probes: int = 1
+    queue_max_size: int = 1000
+    queue_timeout_seconds: float = 60.0
+
+
+@dataclass
+class CircuitBreaker:
+    """
+    Circuit breaker for cross-DC communication.
+
+    States:
+    - CLOSED: Normal operation, requests pass through
+    - OPEN: Service is failing, reject immediately and queue
+    - HALF_OPEN: Testing recovery, allow limited probes
+
+    When OPEN, operations are queued and replayed when circuit closes.
+    """
+
+    dc_id: str
+    config: CircuitBreakerConfig
+
+    _state: CircuitState = field(default=CircuitState.CLOSED, repr=False)
+    _failure_count: int = field(default=0, repr=False)
+    _success_count: int = field(default=0, repr=False)
+    _last_failure_time: float = field(default=0.0, repr=False)
+    _queue: asyncio.Queue = field(default_factory=asyncio.Queue, repr=False)
+    _lock: asyncio.Lock | None = field(default=None, repr=False)
+    _probe_in_progress: bool = field(default=False, repr=False)
+    _logger: Logger = field(default_factory=Logger, repr=False)
+
+    def _get_lock(self) -> asyncio.Lock:
+        """Lazy lock initialization."""
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
+
+    @property
+    def state(self) -> CircuitState:
+        """Get current circuit state."""
+        return self._state
+
+    async def execute(
+        self,
+        operation: Callable[[], Awaitable[T]],
+        fallback: Callable[[], Awaitable[T]] | None = None,
+    ) -> T:
+        """
+        Execute operation through circuit breaker.
+
+        Args:
+            operation: The operation to execute
+            fallback: Optional fallback if circuit is open
+
+        Returns:
+            Operation result
+
+        Raises:
+            CircuitOpenError: If circuit is open and no fallback provided
+        """
+        async with self._get_lock():
+            # Check if we should transition from OPEN to HALF_OPEN
+            if self._state == CircuitState.OPEN:
+                if time.time() - self._last_failure_time >= self.config.open_timeout_seconds:
+                    self._state = CircuitState.HALF_OPEN
+                    self._success_count = 0
+
+            current_state = self._state
+
+        # Handle based on state
+        match current_state:
+            case CircuitState.CLOSED:
+                return await self._execute_closed(operation)
+
+            case CircuitState.OPEN:
+                return await self._handle_open(operation, fallback)
+
+            case CircuitState.HALF_OPEN:
+                return await self._execute_half_open(operation)
+
+    async def _execute_closed(
+        self,
+        operation: Callable[[], Awaitable[T]],
+    ) -> T:
+        """Execute in CLOSED state."""
+        try:
+            result = await operation()
+            await self._on_success()
+            return result
+        except Exception as err:
+            await self._on_failure()
+            raise
+
+    async def _execute_half_open(
+        self,
+        operation: Callable[[], Awaitable[T]],
+    ) -> T:
+        """Execute probe in HALF_OPEN state."""
+        async with self._get_lock():
+            if self._probe_in_progress:
+                raise CircuitOpenError(f"Circuit to {self.dc_id} is half-open, probe in progress")
+            self._probe_in_progress = True
+
+        try:
+            result = await operation()
+            await self._on_probe_success()
+            return result
+        except Exception as err:
+            await self._on_probe_failure()
+            raise
+        finally:
+            async with self._get_lock():
+                self._probe_in_progress = False
+
+    async def _handle_open(
+        self,
+        operation: Callable[[], Awaitable[T]],
+        fallback: Callable[[], Awaitable[T]] | None,
+    ) -> T:
+        """Handle request when circuit is OPEN."""
+        # Queue the operation for later
+        if self._queue.qsize() < self.config.queue_max_size:
+            await self._queue.put((operation, time.time()))
+
+        if fallback is not None:
+            return await fallback()
+
+        raise CircuitOpenError(f"Circuit to {self.dc_id} is open")
+
+    async def _on_success(self) -> None:
+        """Handle successful operation."""
+        async with self._get_lock():
+            self._failure_count = 0
+
+    async def _on_failure(self) -> None:
+        """Handle failed operation."""
+        async with self._get_lock():
+            self._failure_count += 1
+            self._last_failure_time = time.time()
+
+            if self._failure_count >= self.config.failure_threshold:
+                self._state = CircuitState.OPEN
+
+                async with self._logger.context(name="circuit_breaker") as ctx:
+                    await ctx.log(
+                        Entry(
+                            message=f"Circuit to {self.dc_id} OPENED after {self._failure_count} failures",
+                            level=LogLevel.WARNING,
+                        )
+                    )
+
+    async def _on_probe_success(self) -> None:
+        """Handle successful probe in HALF_OPEN state."""
+        async with self._get_lock():
+            self._success_count += 1
+
+            if self._success_count >= self.config.success_threshold:
+                self._state = CircuitState.CLOSED
+                self._failure_count = 0
+
+                async with self._logger.context(name="circuit_breaker") as ctx:
+                    await ctx.log(
+                        Entry(
+                            message=f"Circuit to {self.dc_id} CLOSED after recovery",
+                            level=LogLevel.INFO,
+                        )
+                    )
+
+                # Replay queued operations
+                asyncio.create_task(self._replay_queue())
+
+    async def _on_probe_failure(self) -> None:
+        """Handle failed probe in HALF_OPEN state."""
+        async with self._get_lock():
+            self._state = CircuitState.OPEN
+            self._last_failure_time = time.time()
+
+    async def _replay_queue(self) -> None:
+        """Replay queued operations after circuit closes."""
+        now = time.time()
+        replayed = 0
+
+        while not self._queue.empty():
+            try:
+                operation, queued_time = self._queue.get_nowait()
+
+                # Skip expired entries
+                if now - queued_time > self.config.queue_timeout_seconds:
+                    continue
+
+                # Execute with circuit breaker (may re-open if fails)
+                await self.execute(operation)
+                replayed += 1
+
+            except Exception:
+                break  # Stop replay on failure
+
+        if replayed > 0:
+            async with self._logger.context(name="circuit_breaker") as ctx:
+                await ctx.log(
+                    Entry(
+                        message=f"Replayed {replayed} queued operations to {self.dc_id}",
+                        level=LogLevel.INFO,
+                    )
+                )
+
+
+class CircuitOpenError(Exception):
+    """Raised when circuit breaker is open."""
+    pass
+```
+
 ---
 
 ## Part 10: Output Examples
