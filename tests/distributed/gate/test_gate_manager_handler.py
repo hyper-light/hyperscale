@@ -147,16 +147,19 @@ class TestHandleStatusUpdateHappyPath:
         handler = create_mock_handler(state=state)
 
         heartbeat = ManagerHeartbeat(
-            manager_id="manager-001",
+            node_id="manager-001",
             datacenter="dc-east",
+            is_leader=True,
+            term=1,
+            version=1,
+            active_jobs=0,
+            active_workflows=10,
+            worker_count=5,
+            healthy_worker_count=5,
+            available_cores=40,
+            total_cores=60,
             tcp_host="10.0.0.1",
             tcp_port=8000,
-            is_leader=True,
-            worker_count=5,
-            available_cores=40,
-            used_cores=20,
-            pending_workflows=10,
-            active_jobs=[],
         )
 
         async def mock_handle_exception(error, context):
@@ -203,16 +206,19 @@ class TestHandleStatusUpdateHappyPath:
         )
 
         heartbeat = ManagerHeartbeat(
-            manager_id="manager-001",
+            node_id="manager-001",
             datacenter="dc-east",
+            is_leader=True,
+            term=1,
+            version=1,
+            active_jobs=0,
+            active_workflows=10,
+            worker_count=5,
+            healthy_worker_count=5,
+            available_cores=40,
+            total_cores=60,
             tcp_host="10.0.0.1",
             tcp_port=8000,
-            is_leader=True,
-            worker_count=5,
-            available_cores=40,
-            used_cores=20,
-            pending_workflows=10,
-            active_jobs=[],
         )
 
         async def mock_handle_exception(error, context):
@@ -262,16 +268,19 @@ class TestHandleStatusUpdateBackpressure:
         )
 
         heartbeat = ManagerHeartbeat(
-            manager_id="manager-001",
+            node_id="manager-001",
             datacenter="dc-east",
+            is_leader=True,
+            term=1,
+            version=1,
+            active_jobs=0,
+            active_workflows=10,
+            worker_count=5,
+            healthy_worker_count=5,
+            available_cores=40,
+            total_cores=60,
             tcp_host="10.0.0.1",
             tcp_port=8000,
-            is_leader=True,
-            worker_count=5,
-            available_cores=40,
-            used_cores=20,
-            pending_workflows=10,
-            active_jobs=[],
         )
 
         async def mock_handle_exception(error, context):
@@ -329,16 +338,19 @@ class TestHandleRegisterHappyPath:
         handler = create_mock_handler(state=state)
 
         heartbeat = ManagerHeartbeat(
-            manager_id="manager-001",
+            node_id="manager-001",
             datacenter="dc-east",
+            is_leader=True,
+            term=1,
+            version=1,
+            active_jobs=0,
+            active_workflows=0,
+            worker_count=5,
+            healthy_worker_count=5,
+            available_cores=40,
+            total_cores=60,
             tcp_host="10.0.0.1",
             tcp_port=8000,
-            is_leader=True,
-            worker_count=5,
-            available_cores=40,
-            used_cores=20,
-            pending_workflows=0,
-            active_jobs=[],
         )
 
         async def mock_handle_exception(error, context):
@@ -380,16 +392,19 @@ class TestHandleRegisterHappyPath:
         )
 
         heartbeat = ManagerHeartbeat(
-            manager_id="manager-001",
+            node_id="manager-001",
             datacenter="dc-east",
+            is_leader=True,
+            term=1,
+            version=1,
+            active_jobs=0,
+            active_workflows=0,
+            worker_count=5,
+            healthy_worker_count=5,
+            available_cores=40,
+            total_cores=60,
             tcp_host="10.0.0.1",
             tcp_port=8000,
-            is_leader=True,
-            worker_count=5,
-            available_cores=40,
-            used_cores=20,
-            pending_workflows=0,
-            active_jobs=[],
         )
 
         async def mock_handle_exception(error, context):
@@ -559,16 +574,19 @@ class TestConcurrency:
         heartbeats = []
         for i in range(10):
             heartbeats.append(ManagerHeartbeat(
-                manager_id=f"manager-{i:03d}",
+                node_id=f"manager-{i:03d}",
                 datacenter=f"dc-{i % 3}",
+                is_leader=(i == 0),
+                term=1,
+                version=1,
+                active_jobs=0,
+                active_workflows=10,
+                worker_count=5,
+                healthy_worker_count=5,
+                available_cores=40,
+                total_cores=60,
                 tcp_host=f"10.0.0.{i}",
                 tcp_port=8000,
-                is_leader=(i == 0),
-                worker_count=5,
-                available_cores=40,
-                used_cores=20,
-                pending_workflows=10,
-                active_jobs=[],
             ))
 
         async def mock_handle_exception(error, context):
@@ -595,16 +613,19 @@ class TestConcurrency:
         heartbeats = []
         for i in range(10):
             heartbeats.append(ManagerHeartbeat(
-                manager_id=f"manager-{i:03d}",
+                node_id=f"manager-{i:03d}",
                 datacenter=f"dc-{i % 3}",
+                is_leader=(i == 0),
+                term=1,
+                version=1,
+                active_jobs=0,
+                active_workflows=0,
+                worker_count=5,
+                healthy_worker_count=5,
+                available_cores=40,
+                total_cores=60,
                 tcp_host=f"10.0.0.{i}",
                 tcp_port=8000,
-                is_leader=(i == 0),
-                worker_count=5,
-                available_cores=40,
-                used_cores=20,
-                pending_workflows=0,
-                active_jobs=[],
             ))
 
         async def mock_handle_exception(error, context):
@@ -640,16 +661,19 @@ class TestEdgeCases:
         handler = create_mock_handler()
 
         heartbeat = ManagerHeartbeat(
-            manager_id="",
+            node_id="",
             datacenter="dc-east",
+            is_leader=True,
+            term=1,
+            version=1,
+            active_jobs=0,
+            active_workflows=10,
+            worker_count=5,
+            healthy_worker_count=5,
+            available_cores=40,
+            total_cores=60,
             tcp_host="10.0.0.1",
             tcp_port=8000,
-            is_leader=True,
-            worker_count=5,
-            available_cores=40,
-            used_cores=20,
-            pending_workflows=10,
-            active_jobs=[],
         )
 
         async def mock_handle_exception(error, context):
@@ -669,16 +693,19 @@ class TestEdgeCases:
         handler = create_mock_handler()
 
         heartbeat = ManagerHeartbeat(
-            manager_id="manager-001",
+            node_id="manager-001",
             datacenter="dc-east",
+            is_leader=True,
+            term=1,
+            version=1,
+            active_jobs=0,
+            active_workflows=0,
+            worker_count=0,
+            healthy_worker_count=0,
+            available_cores=0,
+            total_cores=0,
             tcp_host="10.0.0.1",
             tcp_port=8000,
-            is_leader=True,
-            worker_count=0,
-            available_cores=0,
-            used_cores=0,
-            pending_workflows=0,
-            active_jobs=[],
         )
 
         async def mock_handle_exception(error, context):
@@ -698,16 +725,19 @@ class TestEdgeCases:
         handler = create_mock_handler()
 
         heartbeat = ManagerHeartbeat(
-            manager_id="manager-001",
+            node_id="manager-001",
             datacenter="dc-east",
+            is_leader=True,
+            term=1,
+            version=1,
+            active_jobs=0,
+            active_workflows=100000,
+            worker_count=10000,
+            healthy_worker_count=10000,
+            available_cores=800000,
+            total_cores=1200000,
             tcp_host="10.0.0.1",
             tcp_port=8000,
-            is_leader=True,
-            worker_count=10000,
-            available_cores=800000,
-            used_cores=400000,
-            pending_workflows=100000,
-            active_jobs=[],
         )
 
         async def mock_handle_exception(error, context):
@@ -738,16 +768,19 @@ class TestEdgeCases:
 
         for dc in special_dcs:
             heartbeat = ManagerHeartbeat(
-                manager_id="manager-001",
+                node_id="manager-001",
                 datacenter=dc,
+                is_leader=True,
+                term=1,
+                version=1,
+                active_jobs=0,
+                active_workflows=10,
+                worker_count=5,
+                healthy_worker_count=5,
+                available_cores=40,
+                total_cores=60,
                 tcp_host="10.0.0.1",
                 tcp_port=8000,
-                is_leader=True,
-                worker_count=5,
-                available_cores=40,
-                used_cores=20,
-                pending_workflows=10,
-                active_jobs=[],
             )
 
             result = await handler.handle_status_update(
@@ -766,16 +799,19 @@ class TestEdgeCases:
         active_jobs = [f"job-{i}" for i in range(1000)]
 
         heartbeat = ManagerHeartbeat(
-            manager_id="manager-001",
+            node_id="manager-001",
             datacenter="dc-east",
+            is_leader=True,
+            term=1,
+            version=1,
+            active_jobs=1000,
+            active_workflows=500,
+            worker_count=100,
+            healthy_worker_count=100,
+            available_cores=800,
+            total_cores=1200,
             tcp_host="10.0.0.1",
             tcp_port=8000,
-            is_leader=True,
-            worker_count=100,
-            available_cores=800,
-            used_cores=400,
-            pending_workflows=500,
-            active_jobs=active_jobs,
         )
 
         async def mock_handle_exception(error, context):
@@ -824,16 +860,19 @@ class TestFailureModes:
         )
 
         heartbeat = ManagerHeartbeat(
-            manager_id="manager-001",
+            node_id="manager-001",
             datacenter="dc-east",
+            is_leader=True,
+            term=1,
+            version=1,
+            active_jobs=0,
+            active_workflows=10,
+            worker_count=5,
+            healthy_worker_count=5,
+            available_cores=40,
+            total_cores=60,
             tcp_host="10.0.0.1",
             tcp_port=8000,
-            is_leader=True,
-            worker_count=5,
-            available_cores=40,
-            used_cores=20,
-            pending_workflows=10,
-            active_jobs=[],
         )
 
         errors_handled = []
@@ -874,16 +913,19 @@ class TestFailureModes:
         )
 
         heartbeat = ManagerHeartbeat(
-            manager_id="manager-001",
+            node_id="manager-001",
             datacenter="dc-east",
+            is_leader=True,
+            term=1,
+            version=1,
+            active_jobs=0,
+            active_workflows=0,
+            worker_count=5,
+            healthy_worker_count=5,
+            available_cores=40,
+            total_cores=60,
             tcp_host="10.0.0.1",
             tcp_port=8000,
-            is_leader=True,
-            worker_count=5,
-            available_cores=40,
-            used_cores=20,
-            pending_workflows=0,
-            active_jobs=[],
         )
 
         async def mock_handle_exception(error, context):
