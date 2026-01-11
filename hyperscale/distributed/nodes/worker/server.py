@@ -25,6 +25,8 @@ from hyperscale.distributed.protocol.version import (
     NegotiatedCapabilities,
 )
 from hyperscale.distributed.server import tcp
+from hyperscale.logging import LoggingConfig
+from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerError
 
 from .config import WorkerConfig
 from .state import WorkerState
@@ -261,6 +263,154 @@ class WorkerServer(HealthAwareServer):
     # =========================================================================
     # Lifecycle Methods
     # =========================================================================
+    async def start(self, timeout: float | None = None) -> None:
+
+        if self._logging_config is None:
+            self._logging_config = LoggingConfig()
+            self._logging_config.update(
+                log_directory=self._env.MERCURY_SYNC_LOGS_DIRECTORY,
+                log_level=self._env.MERCURY_SYNC_LOG_LEVEL,
+            )
+        # Start the worker server (TCP/UDP listeners, task runner, etc.)
+        # Start the underlying server (TCP/UDP listeners, task runner, etc.)
+        # Uses SWIM settings from Env configuration
+        await self.start_server(init_context=self.env.get_swim_init_context())
+
+        # Now that node_id is available, update node capabilities with proper version
+        self._node_capabilities = NodeCapabilities.current(
+            node_version=f"worker-{self._node_id.short}"
+        )
+
+        # Mark as started for stop() guard
+        self._started = True
+
+        """Start the worker server and register with managers."""
+        if timeout is None:
+            timeout = self._worker_connect_timeout
+        
+        worker_ips = self._bin_and_check_socket_range()
+
+        await self._cpu_monitor.start_background_monitor(
+            self._node_id.datacenter,
+            self._node_id.full,
+        )
+
+        await self._memory_monitor.start_background_monitor(
+            self._node_id.datacenter,
+            self._node_id.full,
+        )
+
+        await self._server_pool.setup()
+
+        await self._remote_manger.start(
+            self._host,
+            self._local_udp_port,
+            self._local_env,
+        )
+
+        # Register callback for instant core availability notifications
+        # This enables event-driven dispatch when workflows complete
+        self._remote_manger.set_on_cores_available(self._on_cores_available)
+
+        # IMPORTANT: leader_address must match where RemoteGraphManager is listening
+        # This was previously using self._udp_port which caused workers to connect
+        # to the wrong port and hang forever in poll_for_start
+        await self._server_pool.run_pool(
+            (self._host, self._local_udp_port),  # Must match remote_manger.start() port!
+            worker_ips,
+            self._local_env,
+            enable_server_cleanup=True,
+        )
+
+        # Add timeout wrapper since poll_for_start has no internal timeout
+        try:
+            await asyncio.wait_for(
+                self._remote_manger.connect_to_workers(
+                    worker_ips,
+                    timeout=timeout,
+                ),
+                timeout=timeout + 10.0,  # Extra buffer for poll_for_start
+            )
+        except asyncio.TimeoutError:
+
+            await self._udp_logger.log(
+                ServerError(
+                    message=f"Timeout waiting for {len(worker_ips)} worker processes to start. "
+                            f"This may indicate process spawn failures.",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+
+            raise RuntimeError(
+                f"Worker process pool failed to start within {timeout + 10.0}s. "
+                f"Check logs for process spawn errors."
+            )
+        
+        # Register with ALL seed managers for failover and consistency
+        # Each manager needs to know about this worker directly
+        successful_registrations = 0
+        for seed_addr in self._seed_managers:
+            success = await self._register_with_manager(seed_addr)
+            if success:
+                successful_registrations += 1
+
+        if successful_registrations == 0:
+            await self._udp_logger.log(
+                ServerError(
+                    message=f"Failed to register with any seed manager: {self._seed_managers}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+        elif successful_registrations < len(self._seed_managers):
+            await self._udp_logger.log(
+                ServerInfo(
+                    message=f"Registered with {successful_registrations}/{len(self._seed_managers)} seed managers",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+        
+        # Join SWIM cluster with all known managers for healthchecks
+        for manager in list(self._known_managers.values()):
+            udp_addr = (manager.udp_host, manager.udp_port)
+            await self.join_cluster(udp_addr)
+        
+        # Start SWIM probe cycle (UDP healthchecks)
+        self._task_runner.run(self.start_probe_cycle)
+
+        # Start buffered progress flush loop
+        self._progress_flush_task = asyncio.create_task(self._progress_flush_loop())
+
+        # Start dead manager reap loop
+        self._dead_manager_reap_task = asyncio.create_task(self._dead_manager_reap_loop())
+
+        # Start cancellation polling loop
+        self._cancellation_poll_task = asyncio.create_task(self._cancellation_poll_loop())
+
+        # Start orphan grace period checker loop (Section 2.7)
+        self._orphan_check_task = asyncio.create_task(self._orphan_check_loop())
+
+        # Start discovery maintenance loop (AD-28)
+        self._discovery_maintenance_task = asyncio.create_task(self._discovery_maintenance_loop())
+
+        # Start overload detection polling loop (AD-18)
+        # Fast polling ensures immediate escalation when CPU/memory thresholds are crossed
+        self._overload_poll_task = asyncio.create_task(self._overload_poll_loop())
+
+        manager_count = len(self._known_managers)
+        await self._udp_logger.log(
+            ServerInfo(
+                message=f"Worker started with {self._total_cores} cores, registered with {manager_count} managers",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
 
     async def start(self, timeout: float | None = None) -> None:
         """Start the worker server."""
