@@ -389,7 +389,8 @@ class TestGateLeaderTransferHandler:
         result = await handler.handle(("gate-1", 9000), data, 100)
 
         # Should reject stale token
-        assert result.startswith(b'error')
+        ack = GateJobLeaderTransferAck.load(result)
+        assert ack.accepted is False
 
     @pytest.mark.asyncio
     async def test_edge_case_first_leader_transfer(self):
@@ -480,7 +481,8 @@ class TestManagerLeaderTransferHandler:
 
         result = await handler.handle(("manager-1", 7000), data, 100)
 
-        assert result.startswith(b'error')
+        ack = ManagerJobLeaderTransferAck.load(result)
+        assert ack.accepted is False
 
 
 class TestWindowedStatsPushHandler:
