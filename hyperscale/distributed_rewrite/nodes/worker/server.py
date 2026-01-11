@@ -15,7 +15,7 @@ from hyperscale.distributed_rewrite.models import (
     NodeInfo,
     NodeRole,
     ManagerInfo,
-    WorkerState,
+    WorkerState as WorkerStateEnum,
     WorkerStateSnapshot,
     WorkflowProgress,
 )
@@ -27,6 +27,7 @@ from hyperscale.distributed_rewrite.protocol.version import (
 from hyperscale.distributed_rewrite.server import tcp
 
 from .config import WorkerConfig
+from .state import WorkerState
 from .registry import WorkerRegistry
 from .execution import WorkerExecutor
 from .sync import WorkerStateSync
@@ -82,6 +83,9 @@ class WorkerServer(HealthAwareServer):
         self._total_cores = self._config.total_cores
         self._core_allocator = CoreAllocator(self._total_cores)
 
+        # Centralized runtime state (single source of truth)
+        self._worker_state = WorkerState(self._core_allocator)
+
         # Initialize modules (will be fully wired after super().__init__)
         self._registry = WorkerRegistry(
             logger=None,  # Set after parent init
@@ -91,6 +95,7 @@ class WorkerServer(HealthAwareServer):
         )
 
         self._backpressure_manager = WorkerBackpressureManager(
+            state=self._worker_state,
             logger=None,
             registry=self._registry,
         )
@@ -98,6 +103,7 @@ class WorkerServer(HealthAwareServer):
         self._executor = WorkerExecutor(
             core_allocator=self._core_allocator,
             logger=None,
+            state=self._worker_state,
             progress_update_interval=self._config.progress_update_interval,
             progress_flush_interval=self._config.progress_flush_interval,
             backpressure_manager=self._backpressure_manager,
@@ -166,7 +172,7 @@ class WorkerServer(HealthAwareServer):
             get_tcp_host=lambda: self._host,
             get_tcp_port=lambda: self._tcp_port,
             get_health_accepting_work=lambda: self._get_worker_state() in (
-                WorkerState.HEALTHY, WorkerState.DEGRADED
+                WorkerStateEnum.HEALTHY, WorkerStateEnum.DEGRADED
             ),
             get_health_throughput=self._executor.get_throughput,
             get_health_expected_throughput=self._executor.get_expected_throughput,

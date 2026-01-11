@@ -208,7 +208,7 @@ class WorkerBackpressureManager:
         Returns delay in seconds based on backpressure state.
         """
         level = self.get_max_backpressure_level()
-        delay_ms = self._backpressure_delay_ms
+        delay_ms = self.get_backpressure_delay_ms()
 
         if level == BackpressureLevel.NONE:
             return 0.0
