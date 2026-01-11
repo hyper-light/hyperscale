@@ -48,7 +48,7 @@ from hyperscale.logging.hyperscale_logging_models import (
     ServerWarning,
 )
 from hyperscale.reporting.common.results_types import WorkflowStats
-from hyperscale.ui.actions import update_active_workflow_message, update_workflow_run_timer, update_workflow_executions_total_rate
+from hyperscale.ui.actions import update_active_workflow_message, update_workflow_executions_total_rate
 
 from .workflow_runner import WorkflowRunner
 

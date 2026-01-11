@@ -23042,8 +23042,8 @@ hyperscale/distributed_rewrite/ledger/
 │   └── completion.py             # JobCompleted, JobFailed, JobTimedOut
 ├── storage/
 │   ├── __init__.py
-│   ├── wal_segment.py            # WALSegment
-│   ├── node_wal.py               # NodeWAL manager
+│   ├── wal_segment.py            # WALSegment (memory-mapped)
+│   ├── node_wal.py               # NodeWAL manager (Control Plane)
 │   └── ledger_storage.py         # LSM-tree storage for global ledger
 ├── consensus/
 │   ├── __init__.py
@@ -23063,6 +23063,16 @@ hyperscale/distributed_rewrite/ledger/
 ├── session/
 │   ├── __init__.py
 │   └── read_session.py           # Session consistency guarantees
+├── data_plane/                   # NEW: Stats streaming (uses Logger)
+│   ├── __init__.py
+│   ├── stats_aggregator.py       # StatsAggregator (uses Logger, not WAL)
+│   └── stats_models.py           # AggregatedJobStats, StatsCoalescingConfig
+├── coordination/                 # NEW: Worker coordination
+│   ├── __init__.py
+│   └── ack_window_manager.py     # AckWindowManager (no blocking acks)
+├── reliability/                  # NEW: Cross-DC reliability
+│   ├── __init__.py
+│   └── circuit_breaker.py        # CircuitBreaker for DC communication
 └── global_ledger.py              # GlobalJobLedger facade
 ```
 
@@ -23070,37 +23080,82 @@ hyperscale/distributed_rewrite/ledger/
 
 ## Part 12: Integration with Existing Components
 
-**Gate Integration**:
+**Gate Integration** (TIER 1 - Global Consensus):
 ```
 GateNode
-├── CommitPipeline (AD-38)
-│   ├── NodeWAL (local durability)
+├── CommitPipeline (AD-38 Control Plane)
+│   ├── NodeWAL (local durability with fsync)
 │   ├── RegionalConsensus (DC durability)
 │   └── GlobalLedger (global durability)
+├── CircuitBreaker (AD-38)
+│   └── Per-DC circuit breakers for cross-DC calls
 ├── GateCancellationCoordinator (AD-20)
 │   └── Uses CommitPipeline with GLOBAL durability
 ├── JobRouter (AD-36)
 │   └── Reads from GlobalLedger for job state
+├── StatsAggregator (AD-38 Data Plane)
+│   └── Receives aggregated stats from Managers (uses Logger)
 └── BackpressureManager (AD-37)
     └── Shapes update traffic to ledger
 ```
 
-**Manager Integration**:
+**Manager Integration** (TIER 2 - Regional Consensus):
 ```
 ManagerNode
-├── NodeWAL (local operations)
+├── NodeWAL (workflow operations with fsync)
+├── AckWindowManager (AD-38)
+│   └── Non-blocking acknowledgment windows for workers
+├── StatsAggregator (AD-38 Data Plane)
+│   └── Aggregates worker progress (uses Logger)
+├── CircuitBreaker (AD-38)
+│   └── For cross-DC gate communication
 ├── WorkflowStateMachine (AD-33)
 │   └── Persists state transitions to WAL
 ├── FederatedHealthMonitor (AD-33)
 │   └── Reads global ledger for cross-DC state
+│   └── Worker health checks (NOT consensus-based)
 └── JobLeaderManager (AD-8)
     └── Uses ledger for leader election state
+```
+
+**Worker Integration** (TIER 3 - No Consensus):
+```
+WorkerNode
+├── NO WAL (workers don't persist durability state)
+├── NO Consensus participation
+├── Progress reporting (fire-and-forget to Manager)
+│   └── Manager's StatsAggregator receives updates
+└── Health check responses (passive - Manager initiates)
+```
+
+**Data Flow Summary**:
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                            CONTROL PLANE                                 │
+│               (NodeWAL with fsync, consensus, CRC)                      │
+└─────────────────────────────────────────────────────────────────────────┘
+                              │
+   Gate ◄────────────────────►│◄────────────────────► Manager
+   (Job lifecycle)            │                       (Workflow lifecycle)
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                            DATA PLANE                                    │
+│               (Logger - JSON, no fsync, fire-and-forget)                │
+└─────────────────────────────────────────────────────────────────────────┘
+                              │
+   Gate ◄────────────────────►│◄──────────────────── Manager ◄──── Workers
+   (Stats query)              │                     (Stats aggregation)
+                              │
+                              ▼
+                    [StatsAggregator uses Logger]
 ```
 
 ---
 
 ## Part 13: Success Criteria
 
+**Control Plane (Job/Workflow Operations)**:
 1. **Durability**: Zero job loss under any single failure (node, rack, region)
 2. **Latency**: LOCAL <1ms, REGIONAL <10ms, GLOBAL <300ms (p99)
 3. **Throughput**: >100K job events/second per region
@@ -23109,21 +23164,59 @@ ManagerNode
 6. **Audit**: Complete event history queryable for any time range
 7. **Compaction**: WAL size bounded to 2x active job state
 
+**Data Plane (Stats/Metrics)**:
+8. **Stats Throughput**: >1M progress events/second per manager
+9. **Stats Latency**: <10ms from worker to manager (fire-and-forget)
+10. **Cross-DC Stats**: 5000x reduction via coalescing (10K/s → 2/s per job)
+11. **Stats Loss Tolerance**: <1% loss acceptable under normal operation
+
+**Operational Model**:
+12. **Worker Independence**: Workers NEVER block consensus or ack paths
+13. **Circuit Breaker Recovery**: <60 seconds to replay queued operations after DC recovery
+14. **Acknowledgment Windows**: Workers confirmed within 5 seconds via any communication
+15. **Health Check Overhead**: <1% of manager CPU for worker health monitoring
+
 ---
 
 ## Conclusion
 
-AD-38 provides a robust, multi-tier durability architecture that:
-- Combines per-node WAL for immediate crash recovery
-- Uses regional consensus for datacenter-level durability
-- Employs a global ledger for cross-region consistency
-- Supports event sourcing for audit, debugging, and temporal queries
-- Integrates with existing AD components (AD-20, AD-33, AD-36, AD-37)
+AD-38 provides a robust, multi-tier durability architecture optimized for hyperscale's operational model:
+
+**Three-Tier Node Hierarchy**:
+- **Gates** (GLOBAL): Job lifecycle, cross-DC coordination, full consensus participation
+- **Managers** (REGIONAL): Workflow lifecycle, stats aggregation, DC-level consensus
+- **Workers** (NONE): High CPU/memory load testing, fire-and-forget reporting, NO consensus
+
+**Separate Control and Data Planes**:
+- **Control Plane**: Job/workflow commands via NodeWAL with fsync, consensus, CRC checksums
+- **Data Plane**: Stats/metrics via Logger (JSON, no fsync), eventual consistency acceptable
+
+**Key Design Decisions**:
+- Workers excluded from all consensus paths (slow under load testing)
+- Operation-specific durability (GLOBAL for jobs, REGIONAL for workflows, NONE for stats)
+- Acknowledgment windows replace blocking acks for worker communication
+- Circuit breakers prevent cascading failures across DCs
+- Coalesced stats reduce cross-DC traffic by 5000x
+
+**Logger vs NodeWAL**:
+- **Logger** (hyperscale/logging): Suitable for Data Plane stats - no fsync needed, JSON format, eventual consistency
+- **NodeWAL** (new): Required for Control Plane - explicit fsync, binary format, CRC checksums, sequence numbers, read-back capability
 
 The architecture balances latency, throughput, and durability through configurable commit levels, allowing callers to choose the appropriate tradeoff for each operation type.
 
 **References**:
+
+*Control Plane (WAL - NOT using Logger)*:
 - `hyperscale/distributed_rewrite/ledger/models/hlc.py` (HybridLogicalClock)
 - `hyperscale/distributed_rewrite/ledger/storage/node_wal.py` (NodeWAL)
+- `hyperscale/distributed_rewrite/ledger/storage/wal_segment.py` (WALSegment)
 - `hyperscale/distributed_rewrite/ledger/pipeline/commit_pipeline.py` (CommitPipeline)
 - `hyperscale/distributed_rewrite/ledger/checkpoint/checkpoint_manager.py` (CheckpointManager)
+
+*Data Plane (Uses Logger)*:
+- `hyperscale/distributed_rewrite/ledger/data_plane/stats_aggregator.py` (StatsAggregator)
+- `hyperscale/logging/streams/logger_stream.py` (Logger)
+
+*Coordination and Reliability*:
+- `hyperscale/distributed_rewrite/ledger/coordination/ack_window_manager.py` (AckWindowManager)
+- `hyperscale/distributed_rewrite/ledger/reliability/circuit_breaker.py` (CircuitBreaker)
