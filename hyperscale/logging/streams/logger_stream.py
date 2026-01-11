@@ -83,6 +83,10 @@ class LoggerStream:
             ],
         ]
         | None = None,
+        durability: DurabilityMode = DurabilityMode.FLUSH,
+        log_format: Literal["json", "binary"] = "json",
+        enable_lsn: bool = False,
+        instance_id: int = 0,
     ) -> None:
         if name is None:
             name = "default"
@@ -120,7 +124,7 @@ class LoggerStream:
         self._transports: List[asyncio.Transport] = []
 
         self._models: Dict[str, Callable[..., Entry]] = {}
-        self._queue: asyncio.Queue[asyncio.Future] = asyncio.Queue()
+        self._queue: asyncio.Queue[asyncio.Future[None]] = asyncio.Queue()
 
         if models is None:
             models = {}
@@ -131,6 +135,25 @@ class LoggerStream:
             self._models[name] = (model, defaults)
 
         self._models.update({"default": (Entry, {"level": LogLevel.INFO})})
+
+        self._durability = durability
+        self._log_format = log_format
+        self._enable_lsn = enable_lsn
+        self._instance_id = instance_id
+
+        self._sequence_generator: SnowflakeGenerator | None = None
+        if enable_lsn:
+            self._sequence_generator = SnowflakeGenerator(instance_id)
+
+        self._pending_batch: list[tuple[str, asyncio.Future[None]]] = []
+        self._batch_lock: asyncio.Lock | None = None
+        self._batch_timeout_ms: int = 10
+        self._batch_max_size: int = 100
+        self._batch_timer_handle: asyncio.TimerHandle | None = None
+        self._batch_flush_task: asyncio.Task[None] | None = None
+
+        self._read_files: Dict[str, io.FileIO] = {}
+        self._read_locks: Dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 
     @property
     def has_active_subscriptions(self):
@@ -433,17 +456,20 @@ class LoggerStream:
     ):
         filename_path = pathlib.Path(filename)
 
-        assert filename_path.suffix == ".json", (
-            "Err. - file must be JSON file for logs."
-        )
+        valid_extensions = {".json", ".wal", ".log", ".bin"}
+        if filename_path.suffix not in valid_extensions:
+            raise ValueError(
+                f"Invalid log file extension '{filename_path.suffix}'. "
+                f"Valid extensions: {valid_extensions}"
+            )
 
         if self._config.directory:
             directory = self._config.directory
 
         elif directory is None:
-            directory: str = os.path.join(self._cwd)
+            directory = str(self._cwd) if self._cwd else os.getcwd()
 
-        logfile_path: str = os.path.join(directory, filename_path)
+        logfile_path: str = os.path.join(directory, str(filename_path))
 
         return logfile_path
 
@@ -833,16 +859,77 @@ class LoggerStream:
 
     def _write_to_file(
         self,
-        log: Log,
+        log: Log[T],
         logfile_path: str,
-    ):
-        try:
-            if (logfile := self._files.get(logfile_path)) and (logfile.closed is False):
-                logfile.write(msgspec.json.encode(log) + b"\n")
+        durability: DurabilityMode | None = None,
+    ) -> int | None:
+        if durability is None:
+            durability = self._durability
+
+        logfile = self._files.get(logfile_path)
+        if logfile is None or logfile.closed:
+            return None
+
+        lsn: int | None = None
+        if self._enable_lsn and self._sequence_generator:
+            lsn = self._sequence_generator.generate()
+            if lsn is not None:
+                log.lsn = lsn
+
+        if self._log_format == "binary":
+            data = self._encode_binary(log, lsn)
+        else:
+            data = msgspec.json.encode(log) + b"\n"
+
+        logfile.write(data)
+
+        match durability:
+            case DurabilityMode.NONE:
+                pass
+
+            case DurabilityMode.FLUSH:
                 logfile.flush()
 
-        except Exception:
-            pass
+            case DurabilityMode.FSYNC:
+                logfile.flush()
+                os.fsync(logfile.fileno())
+
+            case DurabilityMode.FSYNC_BATCH:
+                logfile.flush()
+
+        return lsn
+
+    def _encode_binary(self, log: Log[T], lsn: int | None) -> bytes:
+        payload = msgspec.json.encode(log)
+        lsn_value = lsn if lsn is not None else 0
+
+        header = struct.pack("<IQ", len(payload), lsn_value)
+        crc = hashlib.crc32(header + payload) & 0xFFFFFFFF
+
+        return struct.pack("<I", crc) + header + payload
+
+    def _decode_binary(self, data: bytes) -> tuple[Log[T], int]:
+        if len(data) < BINARY_HEADER_SIZE:
+            raise ValueError(f"Entry too short: {len(data)} < {BINARY_HEADER_SIZE}")
+
+        crc_stored = struct.unpack("<I", data[:4])[0]
+        length, lsn = struct.unpack("<IQ", data[4:16])
+
+        if len(data) < BINARY_HEADER_SIZE + length:
+            raise ValueError(
+                f"Truncated entry: have {len(data)}, need {BINARY_HEADER_SIZE + length}"
+            )
+
+        crc_computed = hashlib.crc32(data[4 : 16 + length]) & 0xFFFFFFFF
+        if crc_stored != crc_computed:
+            raise ValueError(
+                f"CRC mismatch: stored={crc_stored:#x}, computed={crc_computed:#x}"
+            )
+
+        payload = data[16 : 16 + length]
+        log = msgspec.json.decode(payload, type=Log)
+
+        return log, lsn
 
     def _find_caller(self):
         """
