@@ -20,7 +20,7 @@ Supporting Classes (re-exported from hyperscale.distributed_rewrite.jobs):
 
 from hyperscale.distributed_rewrite.nodes.worker import WorkerServer as WorkerServer
 from hyperscale.distributed_rewrite.nodes.manager import ManagerServer as ManagerServer
-from hyperscale.distributed_rewrite.nodes.gate import GateServer as GateServer
+from hyperscale.distributed_rewrite.nodes.gate.server import GateServer as GateServer
 from hyperscale.distributed_rewrite.nodes.client import HyperscaleClient as HyperscaleClient
 
 # Re-export supporting classes from jobs module for backwards compatibility

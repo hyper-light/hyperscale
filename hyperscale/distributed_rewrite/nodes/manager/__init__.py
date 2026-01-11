@@ -11,12 +11,28 @@ from .state import ManagerState
 from .registry import ManagerRegistry
 from .cancellation import ManagerCancellationCoordinator
 from .leases import ManagerLeaseCoordinator
+from .workflow_lifecycle import ManagerWorkflowLifecycle
+from .dispatch import ManagerDispatchCoordinator
+from .sync import ManagerStateSync
+from .health import ManagerHealthMonitor
+from .leadership import ManagerLeadershipCoordinator
+from .stats import ManagerStatsCoordinator
+from .discovery import ManagerDiscoveryCoordinator
 
 __all__ = [
+    # Configuration and State
     "ManagerConfig",
     "create_manager_config_from_env",
     "ManagerState",
+    # Core Modules
     "ManagerRegistry",
     "ManagerCancellationCoordinator",
     "ManagerLeaseCoordinator",
+    "ManagerWorkflowLifecycle",
+    "ManagerDispatchCoordinator",
+    "ManagerStateSync",
+    "ManagerHealthMonitor",
+    "ManagerLeadershipCoordinator",
+    "ManagerStatsCoordinator",
+    "ManagerDiscoveryCoordinator",
 ]
