@@ -75,7 +75,7 @@ class ManagerCancellationCoordinator:
         if job_id not in self._state._job_submissions:
             return JobCancelResponse(
                 job_id=job_id,
-                accepted=False,
+                success=False,
                 error="Job not found",
             ).dump()
 
@@ -90,8 +90,8 @@ class ManagerCancellationCoordinator:
         if not workflow_ids:
             return JobCancelResponse(
                 job_id=job_id,
-                accepted=True,
-                workflow_count=0,
+                success=True,
+                cancelled_workflow_count=0,
             ).dump()
 
         # Track pending cancellations
@@ -115,8 +115,8 @@ class ManagerCancellationCoordinator:
 
         return JobCancelResponse(
             job_id=job_id,
-            accepted=True,
-            workflow_count=cancel_count,
+            success=True,
+            cancelled_workflow_count=cancel_count,
         ).dump()
 
     async def _cancel_workflow(
@@ -167,8 +167,8 @@ class ManagerCancellationCoordinator:
         pending.discard(workflow_id)
 
         # Track any errors
-        if notification.error:
-            self._state._cancellation_errors[job_id].append(notification.error)
+        if notification.errors:
+            self._state._cancellation_errors[job_id].extend(notification.errors)
 
         self._task_runner.run(
             self._logger.log,
