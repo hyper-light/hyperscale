@@ -51,6 +51,35 @@ class ClientCancellationManager:
         self._tracker = tracker
         self._send_tcp = send_tcp_func
 
+    async def _apply_retry_delay(
+        self,
+        retry: int,
+        max_retries: int,
+        base_delay: float,
+    ) -> None:
+        """Apply exponential backoff with jitter (AD-21) before retry."""
+        if retry < max_retries:
+            calculated_delay = base_delay * (2 ** retry)
+            jittered_delay = calculated_delay * (0.5 + random.random())
+            await asyncio.sleep(jittered_delay)
+
+    def _handle_successful_response(
+        self,
+        job_id: str,
+        response: JobCancelResponse,
+    ) -> JobCancelResponse | None:
+        """Handle successful or already-completed responses. Returns response if handled."""
+        if response.success:
+            self._tracker.update_job_status(job_id, JobStatus.CANCELLED.value)
+            return response
+        if response.already_cancelled:
+            self._tracker.update_job_status(job_id, JobStatus.CANCELLED.value)
+            return response
+        if response.already_completed:
+            self._tracker.update_job_status(job_id, JobStatus.COMPLETED.value)
+            return response
+        return None
+
     async def cancel_job(
         self,
         job_id: str,
@@ -82,96 +111,81 @@ class ClientCancellationManager:
             RuntimeError: If no gates/managers configured or cancellation fails.
             KeyError: If job not found (never submitted through this client).
         """
-        # Build request
         request = JobCancelRequest(
             job_id=job_id,
             requester_id=f"client-{self._config.host}:{self._config.tcp_port}",
             timestamp=time.time(),
-            fence_token=0,  # Client doesn't track fence tokens
+            fence_token=0,
             reason=reason,
         )
 
-        # Determine targets - prefer the manager/gate that accepted the job
         all_targets = self._targets.get_targets_for_job(job_id)
         if not all_targets:
             raise RuntimeError("No managers or gates configured")
 
         last_error: str | None = None
 
-        # Retry loop with exponential backoff
         for retry in range(max_retries + 1):
-            target_idx = retry % len(all_targets)
-            target = all_targets[target_idx]
-
-            # Send cancellation request
-            response_data, _ = await self._send_tcp(
-                target,
-                "cancel_job",
-                request.dump(),
-                timeout=timeout,
+            target = all_targets[retry % len(all_targets)]
+            result = await self._attempt_cancel(
+                target, request, job_id, timeout, retry, max_retries, retry_base_delay
             )
 
-            if isinstance(response_data, Exception):
-                last_error = str(response_data)
-                # Wait before retry with exponential backoff and jitter (AD-21)
-                if retry < max_retries:
-                    base_delay = retry_base_delay * (2 ** retry)
-                    delay = base_delay * (0.5 + random.random())  # Add 0-100% jitter
-                    await asyncio.sleep(delay)
-                continue
+            if isinstance(result, JobCancelResponse):
+                return result
+            last_error = result
 
-            if response_data == b'error':
-                last_error = "Server returned error"
-                # Wait before retry with exponential backoff and jitter (AD-21)
-                if retry < max_retries:
-                    base_delay = retry_base_delay * (2 ** retry)
-                    delay = base_delay * (0.5 + random.random())  # Add 0-100% jitter
-                    await asyncio.sleep(delay)
-                continue
-
-            # Check for rate limiting response (AD-32)
-            try:
-                rate_limit_response = RateLimitResponse.load(response_data)
-                # Server is rate limiting - honor retry_after and treat as transient
-                last_error = rate_limit_response.error
-                if retry < max_retries:
-                    await asyncio.sleep(rate_limit_response.retry_after_seconds)
-                continue
-            except Exception:
-                # Not a RateLimitResponse, continue to parse as JobCancelResponse
-                pass
-
-            response = JobCancelResponse.load(response_data)
-
-            if response.success:
-                self._tracker.update_job_status(job_id, JobStatus.CANCELLED.value)
-                return response
-
-            # Check for already completed/cancelled (not an error)
-            if response.already_cancelled:
-                self._tracker.update_job_status(job_id, JobStatus.CANCELLED.value)
-                return response
-            if response.already_completed:
-                self._tracker.update_job_status(job_id, JobStatus.COMPLETED.value)
-                return response
-
-            # Check for transient error
-            if response.error and self._is_transient_error(response.error):
-                last_error = response.error
-                # Wait before retry with exponential backoff and jitter (AD-21)
-                if retry < max_retries:
-                    base_delay = retry_base_delay * (2 ** retry)
-                    delay = base_delay * (0.5 + random.random())  # Add 0-100% jitter
-                    await asyncio.sleep(delay)
-                continue
-
-            # Permanent error
-            raise RuntimeError(f"Job cancellation failed: {response.error}")
-
-        # All retries exhausted
         raise RuntimeError(
             f"Job cancellation failed after {max_retries} retries: {last_error}"
         )
+
+    async def _attempt_cancel(
+        self,
+        target: tuple[str, int],
+        request: JobCancelRequest,
+        job_id: str,
+        timeout: float,
+        retry: int,
+        max_retries: int,
+        retry_base_delay: float,
+    ) -> JobCancelResponse | str:
+        """Attempt a single cancellation. Returns response on success, error string on failure."""
+        response_data, _ = await self._send_tcp(
+            target, "cancel_job", request.dump(), timeout=timeout
+        )
+
+        if isinstance(response_data, Exception):
+            await self._apply_retry_delay(retry, max_retries, retry_base_delay)
+            return str(response_data)
+
+        if response_data == b'error':
+            await self._apply_retry_delay(retry, max_retries, retry_base_delay)
+            return "Server returned error"
+
+        rate_limit_delay = self._check_rate_limit(response_data)
+        if rate_limit_delay is not None:
+            if retry < max_retries:
+                await asyncio.sleep(rate_limit_delay)
+            return "Rate limited"
+
+        response = JobCancelResponse.load(response_data)
+        handled = self._handle_successful_response(job_id, response)
+        if handled:
+            return handled
+
+        if response.error and self._is_transient_error(response.error):
+            await self._apply_retry_delay(retry, max_retries, retry_base_delay)
+            return response.error
+
+        raise RuntimeError(f"Job cancellation failed: {response.error}")
+
+    def _check_rate_limit(self, response_data: bytes) -> float | None:
+        """Check if response is rate limiting. Returns delay if so, None otherwise."""
+        try:
+            rate_limit = RateLimitResponse.load(response_data)
+            return rate_limit.retry_after_seconds
+        except Exception:
+            return None
 
     async def await_job_cancellation(
         self,
