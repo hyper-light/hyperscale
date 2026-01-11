@@ -2011,6 +2011,30 @@ class StateSyncResponse(Message):
     gate_state: "GateStateSnapshot | None" = None
 
 
+@dataclass(slots=True)
+class GateStateSyncRequest(Message):
+    """
+    Request for gate-to-gate state synchronization.
+
+    Sent when a gate needs to sync state with a peer gate.
+    """
+    requester_id: str            # Requesting gate node ID
+    known_version: int = 0       # Last known state version
+
+
+@dataclass(slots=True)
+class GateStateSyncResponse(Message):
+    """
+    Response to gate state sync request.
+    """
+    responder_id: str            # Responding gate node ID
+    is_leader: bool              # Whether responder is the SWIM cluster leader
+    term: int                    # Current leadership term
+    state_version: int           # Current state version
+    snapshot: "GateStateSnapshot | None" = None  # Full state snapshot
+    error: str | None = None     # Error message if sync failed
+
+
 # =============================================================================
 # Context Synchronization (Layer-Boundary Sync Protocol)
 # =============================================================================

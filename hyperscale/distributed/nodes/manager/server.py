@@ -1137,7 +1137,16 @@ class ManagerServer(HealthAwareServer):
                 )
 
     async def _orphan_scan_loop(self) -> None:
-        """Periodically scan for orphaned workflows."""
+        """
+        Periodically scan for orphaned workflows.
+
+        An orphaned workflow is one that:
+        1. The manager thinks is running on a worker, but
+        2. The worker no longer has it (worker restarted, crashed, etc.)
+
+        This reconciliation ensures no workflows are "lost" due to state
+        inconsistencies between manager and workers.
+        """
         while self._running:
             try:
                 await asyncio.sleep(self._config.orphan_scan_interval_seconds)
@@ -1145,8 +1154,63 @@ class ManagerServer(HealthAwareServer):
                 if not self.is_leader():
                     continue
 
-                # Implementation: Scan workers for workflows not tracked by JobManager
-                # and trigger cleanup or takeover
+                # Query each worker for their active workflows
+                for worker_id, worker in list(self._manager_state._workers.items()):
+                    try:
+                        worker_addr = (worker.node.host, worker.node.tcp_port)
+
+                        # Request workflow query from worker
+                        request = WorkflowQueryRequest(
+                            requester_id=self._node_id.full,
+                            query_type="active",
+                        )
+
+                        response = await self._send_to_worker(
+                            worker_addr,
+                            "workflow_query",
+                            request.dump(),
+                            timeout=self._config.orphan_scan_worker_timeout_seconds,
+                        )
+
+                        if not response or isinstance(response, Exception):
+                            continue
+
+                        # Parse response and compare with our tracking
+                        query_response = WorkflowQueryResponse.load(response)
+                        worker_workflow_ids = set(query_response.workflow_ids or [])
+
+                        # Find workflows we think are on this worker
+                        manager_tracked_ids: set[str] = set()
+                        for job in self._job_manager.iter_jobs():
+                            for wf_id, wf in job.workflows.items():
+                                if wf.worker_id == worker_id and wf.status == WorkflowStatus.RUNNING:
+                                    manager_tracked_ids.add(wf_id)
+
+                        # Workflows we track but worker doesn't have = orphaned
+                        orphaned = manager_tracked_ids - worker_workflow_ids
+
+                        for orphaned_id in orphaned:
+                            await self._udp_logger.log(
+                                ServerWarning(
+                                    message=f"Orphaned workflow {orphaned_id[:8]}... detected on worker {worker_id[:8]}..., scheduling retry",
+                                    node_host=self._host,
+                                    node_port=self._tcp_port,
+                                    node_id=self._node_id.short,
+                                )
+                            )
+                            # Re-queue for dispatch
+                            if self._workflow_dispatcher:
+                                await self._workflow_dispatcher.requeue_workflow(orphaned_id)
+
+                    except Exception as worker_error:
+                        await self._udp_logger.log(
+                            ServerDebug(
+                                message=f"Orphan scan for worker {worker_id[:8]}... failed: {worker_error}",
+                                node_host=self._host,
+                                node_port=self._tcp_port,
+                                node_id=self._node_id.short,
+                            )
+                        )
 
             except asyncio.CancelledError:
                 break

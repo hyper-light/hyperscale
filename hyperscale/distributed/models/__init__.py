@@ -128,6 +128,8 @@ from .distributed import (
     GateStateSnapshot as GateStateSnapshot,
     StateSyncRequest as StateSyncRequest,
     StateSyncResponse as StateSyncResponse,
+    GateStateSyncRequest as GateStateSyncRequest,
+    GateStateSyncResponse as GateStateSyncResponse,
     # Context sync (layer-boundary protocol)
     ContextForward as ContextForward,
     ContextLayerSync as ContextLayerSync,
