@@ -37720,3 +37720,1071 @@ hyperscale/distributed/
 │                                                                          │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
+
+---
+
+## AD-45: Adaptive Route Learning
+
+### Part 1: Problem Statement
+
+**Current Limitation**:
+
+AD-36 routes jobs using **predicted latency** from Vivaldi coordinates (RTT UCB). While this works well for network topology awareness, it doesn't learn from **actual job execution latency** - the real metric that matters for user experience.
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                     ROUTING LATENCY GAP                                  │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  CURRENT: Vivaldi RTT UCB only                                          │
+│  ─────────────────────────────                                          │
+│                                                                          │
+│  Vivaldi estimates: dc-east 45ms RTT, dc-west 80ms RTT                  │
+│  → Route to dc-east (lower RTT)                                         │
+│                                                                          │
+│  BUT reality:                                                            │
+│    dc-east: congested network, slow workers                             │
+│    Actual job completion: 2.5 seconds                                   │
+│                                                                          │
+│    dc-west: idle network, fast workers                                  │
+│    Actual job completion: 0.8 seconds                                   │
+│                                                                          │
+│  PROBLEM: RTT predicts network latency, not end-to-end execution        │
+│                                                                          │
+│  Missing factors:                                                        │
+│    • Worker execution speed (CPU, memory contention)                    │
+│    • Queue wait time (pending workflows)                                │
+│    • Serialization/deserialization overhead                             │
+│    • Workflow graph complexity differences                              │
+│    • DC-specific resource constraints                                   │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+**Why RTT Alone Is Insufficient**:
+
+1. **RTT measures network round-trip**: Just one component of total latency
+2. **No execution context**: Two DCs with same RTT can have very different execution times
+3. **No learning from outcomes**: System never improves from actual results
+4. **Queue time invisible**: AD-43 adds capacity awareness, but actual wait time may differ
+
+### Part 2: Design Overview
+
+**Solution: Blended Latency Scoring**
+
+Combine **predicted latency** (Vivaldi RTT UCB) with **observed latency** (EWMA of actual job completions):
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    AD-45 BLENDED LATENCY MODEL                          │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  PREDICTED LATENCY (from AD-35/AD-36):                                  │
+│  ──────────────────────────────────────                                 │
+│  rtt_ucb_ms = estimate_rtt_ucb_ms(local_coord, dc_coord)                │
+│                                                                          │
+│  OBSERVED LATENCY (new in AD-45):                                       │
+│  ─────────────────────────────────                                      │
+│  observed_ms = EWMA of actual job completion times per DC               │
+│                                                                          │
+│  BLENDED LATENCY:                                                        │
+│  ─────────────────                                                       │
+│  confidence = min(1.0, sample_count / MIN_SAMPLES_FOR_CONFIDENCE)       │
+│                                                                          │
+│  blended_ms = (confidence × observed_ms) + ((1 - confidence) × rtt_ucb) │
+│                                                                          │
+│                                                                          │
+│  INTEGRATION WITH AD-36:                                                 │
+│  ────────────────────────                                               │
+│  final_score = blended_ms × load_factor × quality_penalty               │
+│                                                                          │
+│  (Replaces rtt_ucb_ms in existing scoring formula)                      │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+**Key Properties**:
+
+1. **Cold Start Safe**: New DCs use RTT UCB (confidence = 0)
+2. **Progressive Learning**: As samples accumulate, observed latency gains weight
+3. **Never Forgets Prediction**: RTT UCB always contributes via (1 - confidence)
+4. **Adapts to Changes**: EWMA decays old observations, responds to DC state changes
+5. **Integrates Cleanly**: Replaces one input to existing AD-36 scoring
+
+### Part 3: Observed Latency Tracking
+
+#### EWMA Model
+
+```python
+# New file: distributed/routing/observed_latency.py
+from dataclasses import dataclass, field
+from time import monotonic
+
+
+@dataclass(slots=True)
+class ObservedLatencyState:
+    """
+    Tracks observed job completion latency per datacenter using EWMA.
+
+    EWMA (Exponentially Weighted Moving Average) gives more weight to
+    recent observations while still considering history.
+    """
+    datacenter_id: str
+    ewma_ms: float = 0.0                    # Current EWMA estimate
+    sample_count: int = 0                   # Total samples recorded
+    last_update: float = 0.0                # Monotonic time of last update
+
+    # Variance tracking for confidence intervals
+    ewma_variance: float = 0.0
+
+    def record_latency(
+        self,
+        latency_ms: float,
+        alpha: float,
+        now: float | None = None,
+    ) -> None:
+        """
+        Record an observed job completion latency.
+
+        Args:
+            latency_ms: Observed latency in milliseconds
+            alpha: EWMA decay factor (0.0-1.0, higher = more responsive)
+            now: Current monotonic time (for testing)
+        """
+        now = now or monotonic()
+
+        if self.sample_count == 0:
+            # First sample - initialize directly
+            self.ewma_ms = latency_ms
+            self.ewma_variance = 0.0
+        else:
+            # EWMA update: new = alpha * observation + (1-alpha) * previous
+            delta = latency_ms - self.ewma_ms
+            self.ewma_ms = self.ewma_ms + alpha * delta
+
+            # Variance update (Welford-like for EWMA)
+            self.ewma_variance = (1 - alpha) * (
+                self.ewma_variance + alpha * delta * delta
+            )
+
+        self.sample_count += 1
+        self.last_update = now
+
+    def get_confidence(self, min_samples: int) -> float:
+        """
+        Get confidence in observed latency estimate.
+
+        Confidence ramps from 0 to 1 as samples increase.
+        """
+        if self.sample_count == 0:
+            return 0.0
+        return min(1.0, self.sample_count / min_samples)
+
+    def get_stddev_ms(self) -> float:
+        """Get estimated standard deviation."""
+        if self.ewma_variance <= 0:
+            return 0.0
+        return self.ewma_variance ** 0.5
+
+    def is_stale(self, max_age_seconds: float, now: float | None = None) -> bool:
+        """Check if observations are stale."""
+        now = now or monotonic()
+        if self.last_update == 0:
+            return True
+        return (now - self.last_update) > max_age_seconds
+
+
+@dataclass
+class ObservedLatencyTracker:
+    """
+    Gate-level tracker for observed latencies across all datacenters.
+
+    Each gate maintains its own view of DC latencies based on jobs
+    it has routed and received results for.
+    """
+    alpha: float = 0.1                      # EWMA decay (lower = smoother)
+    min_samples_for_confidence: int = 10    # Samples before full confidence
+    max_staleness_seconds: float = 300.0    # 5 minutes before stale
+
+    _latencies: dict[str, ObservedLatencyState] = field(default_factory=dict)
+
+    def record_job_latency(
+        self,
+        datacenter_id: str,
+        latency_ms: float,
+        now: float | None = None,
+    ) -> None:
+        """Record observed job completion latency for a datacenter."""
+        if datacenter_id not in self._latencies:
+            self._latencies[datacenter_id] = ObservedLatencyState(
+                datacenter_id=datacenter_id
+            )
+
+        self._latencies[datacenter_id].record_latency(
+            latency_ms=latency_ms,
+            alpha=self.alpha,
+            now=now,
+        )
+
+    def get_observed_latency(
+        self,
+        datacenter_id: str,
+    ) -> tuple[float, float]:
+        """
+        Get observed latency and confidence for a datacenter.
+
+        Returns:
+            (ewma_ms, confidence) - confidence is 0.0 if no data
+        """
+        state = self._latencies.get(datacenter_id)
+        if state is None:
+            return 0.0, 0.0
+
+        now = monotonic()
+        if state.is_stale(self.max_staleness_seconds, now):
+            # Decay confidence for stale data
+            staleness = now - state.last_update
+            staleness_factor = max(0.0, 1.0 - (staleness / self.max_staleness_seconds))
+            confidence = state.get_confidence(self.min_samples_for_confidence) * staleness_factor
+            return state.ewma_ms, confidence
+
+        return state.ewma_ms, state.get_confidence(self.min_samples_for_confidence)
+
+    def get_blended_latency(
+        self,
+        datacenter_id: str,
+        predicted_rtt_ms: float,
+    ) -> float:
+        """
+        Get blended latency combining prediction and observation.
+
+        blended = (confidence × observed) + ((1 - confidence) × predicted)
+        """
+        observed_ms, confidence = self.get_observed_latency(datacenter_id)
+
+        if confidence == 0.0:
+            # No observations - use prediction only
+            return predicted_rtt_ms
+
+        return (confidence * observed_ms) + ((1 - confidence) * predicted_rtt_ms)
+
+    def get_metrics(self) -> dict:
+        """Get tracker metrics."""
+        return {
+            "tracked_dcs": len(self._latencies),
+            "per_dc": {
+                dc_id: {
+                    "ewma_ms": state.ewma_ms,
+                    "sample_count": state.sample_count,
+                    "confidence": state.get_confidence(self.min_samples_for_confidence),
+                    "stddev_ms": state.get_stddev_ms(),
+                }
+                for dc_id, state in self._latencies.items()
+            },
+        }
+```
+
+### Part 4: Job Latency Measurement
+
+**What We Measure**:
+
+Job completion latency from the gate's perspective:
+- **Start**: Gate dispatches job to datacenter
+- **End**: Gate receives final result from datacenter
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    JOB LATENCY MEASUREMENT                              │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  CLIENT                                                                  │
+│    │                                                                     │
+│    │ JobSubmission                                                       │
+│    ▼                                                                     │
+│  GATE                                                                    │
+│    │                                                                     │
+│    │ ┌─────────────────────────────────────────────────┐                │
+│    │ │ LATENCY MEASUREMENT WINDOW                       │                │
+│    │ ├─────────────────────────────────────────────────┤                │
+│    │ │                                                  │                │
+│    │ │ dispatch_time = monotonic()                     │                │
+│    │ │                                                  │                │
+│    │ │ ──► Dispatch to DC-A ──►                        │                │
+│    │ │                                                  │                │
+│    │ │     (network + queue + execution + network)     │                │
+│    │ │                                                  │                │
+│    │ │ ◄── Receive result ◄──                          │                │
+│    │ │                                                  │                │
+│    │ │ completion_time = monotonic()                   │                │
+│    │ │ latency_ms = (completion_time - dispatch_time)  │                │
+│    │ │               × 1000                            │                │
+│    │ │                                                  │                │
+│    │ │ tracker.record_job_latency("dc-a", latency_ms)  │                │
+│    │ │                                                  │                │
+│    │ └─────────────────────────────────────────────────┘                │
+│    │                                                                     │
+│    ▼                                                                     │
+│  Return result to client                                                 │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+**Implementation**:
+
+```python
+# Extension to distributed/jobs/gates/gate_job_manager.py
+class GateJobManager:
+    def __init__(
+        self,
+        # ... existing params ...
+        observed_latency_tracker: ObservedLatencyTracker | None = None,
+    ) -> None:
+        # ... existing init ...
+        self._observed_latency_tracker = observed_latency_tracker or ObservedLatencyTracker()
+
+        # Track dispatch times per job×DC
+        self._dispatch_times: dict[tuple[str, str], float] = {}
+
+    async def dispatch_to_datacenter(
+        self,
+        job_id: str,
+        datacenter_id: str,
+        # ... existing params ...
+    ) -> bool:
+        """Dispatch job to datacenter, recording dispatch time."""
+        dispatch_time = monotonic()
+        self._dispatch_times[(job_id, datacenter_id)] = dispatch_time
+
+        # ... existing dispatch logic ...
+
+    async def record_datacenter_result(
+        self,
+        job_id: str,
+        datacenter_id: str,
+        success: bool,
+        # ... existing params ...
+    ) -> None:
+        """Record result and observed latency."""
+        completion_time = monotonic()
+
+        # Calculate and record latency
+        key = (job_id, datacenter_id)
+        if key in self._dispatch_times:
+            dispatch_time = self._dispatch_times.pop(key)
+            latency_ms = (completion_time - dispatch_time) * 1000
+
+            # Only record successful completions
+            # (failed jobs may have been terminated early)
+            if success:
+                self._observed_latency_tracker.record_job_latency(
+                    datacenter_id=datacenter_id,
+                    latency_ms=latency_ms,
+                )
+
+        # ... existing result handling ...
+```
+
+### Part 5: Integration with AD-36 Routing
+
+**Modification to RoutingScorer**:
+
+```python
+# Extension to distributed/routing/scoring.py
+from hyperscale.distributed.routing.observed_latency import ObservedLatencyTracker
+
+
+@dataclass
+class ScoringConfig:
+    # ... existing fields ...
+
+    # AD-45: Blended latency
+    use_blended_latency: bool = True
+    # When True, use observed + predicted blending.
+    # When False, use RTT UCB only (AD-36 behavior).
+
+
+class RoutingScorer:
+    def __init__(
+        self,
+        config: ScoringConfig | None = None,
+        observed_latency_tracker: ObservedLatencyTracker | None = None,
+    ) -> None:
+        self._config = config or ScoringConfig()
+        self._observed_latency_tracker = observed_latency_tracker
+
+    def score_datacenters(
+        self,
+        candidates: list[DatacenterCandidate],
+        preferred: set[str] | None = None,
+    ) -> list[DatacenterRoutingScore]:
+        """Score candidates using blended latency (AD-45)."""
+        scores = []
+
+        for candidate in candidates:
+            # Step 1: Get latency estimate
+            if (
+                self._config.use_blended_latency
+                and self._observed_latency_tracker is not None
+            ):
+                # AD-45: Blended latency
+                latency_ms = self._observed_latency_tracker.get_blended_latency(
+                    datacenter_id=candidate.datacenter_id,
+                    predicted_rtt_ms=candidate.rtt_ucb_ms,
+                )
+            else:
+                # AD-36: RTT UCB only
+                latency_ms = candidate.rtt_ucb_ms
+
+            # Step 2: Calculate load factor (unchanged from AD-36)
+            load_factor = self._calculate_load_factor(candidate)
+
+            # Step 3: Calculate quality penalty (unchanged from AD-36)
+            quality_penalty = self._calculate_quality_penalty(candidate)
+
+            # Step 4: Final score (lower is better)
+            final_score = latency_ms * load_factor * quality_penalty
+
+            # Step 5: Apply preference (unchanged from AD-36)
+            if preferred and candidate.datacenter_id in preferred:
+                final_score *= self._config.preference_multiplier
+
+            scores.append(DatacenterRoutingScore(
+                datacenter_id=candidate.datacenter_id,
+                health_bucket=candidate.health_bucket,
+                rtt_ucb_ms=candidate.rtt_ucb_ms,
+                blended_latency_ms=latency_ms,  # New field
+                load_factor=load_factor,
+                quality_penalty=quality_penalty,
+                final_score=final_score,
+                is_preferred=candidate.datacenter_id in (preferred or set()),
+            ))
+
+        # Sort by final score (lower is better)
+        scores.sort(key=lambda s: s.final_score)
+        return scores
+```
+
+### Part 6: EWMA Tuning and Decay
+
+**EWMA Alpha Selection**:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                      EWMA ALPHA EFFECTS                                 │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  alpha = 0.1 (low, smoother)                                            │
+│  ────────────────────────────                                           │
+│  • Slow to respond to changes                                           │
+│  • Stable under noise                                                   │
+│  • Good for steady-state routing                                        │
+│  • Half-life ≈ 7 samples                                                │
+│                                                                          │
+│  alpha = 0.3 (medium)                                                   │
+│  ───────────────────                                                    │
+│  • Balanced responsiveness                                              │
+│  • Moderate noise sensitivity                                           │
+│  • Good default choice                                                  │
+│  • Half-life ≈ 2 samples                                                │
+│                                                                          │
+│  alpha = 0.5 (high, more responsive)                                    │
+│  ───────────────────────────────────                                    │
+│  • Quick to respond to changes                                          │
+│  • Sensitive to outliers                                                │
+│  • Good for dynamic environments                                        │
+│  • Half-life ≈ 1 sample                                                 │
+│                                                                          │
+│  RECOMMENDED DEFAULT: alpha = 0.2                                       │
+│  ─────────────────────────────────                                      │
+│  • Balances stability and responsiveness                                │
+│  • Half-life ≈ 3-4 samples                                              │
+│  • Recovers from sudden changes in ~10-15 samples                       │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+**Staleness Decay**:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                     STALENESS CONFIDENCE DECAY                          │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  When no jobs are routed to a DC, observations become stale:            │
+│                                                                          │
+│  Time since last update    Confidence multiplier                        │
+│  ───────────────────────────────────────────────                        │
+│  0 seconds                 1.0 (full confidence)                        │
+│  60 seconds                0.8                                          │
+│  120 seconds               0.6                                          │
+│  180 seconds               0.4                                          │
+│  240 seconds               0.2                                          │
+│  300+ seconds              0.0 (fall back to prediction only)           │
+│                                                                          │
+│  Formula:                                                                │
+│  staleness_factor = max(0, 1 - (staleness_seconds / max_staleness))     │
+│  effective_confidence = base_confidence × staleness_factor               │
+│                                                                          │
+│  WHY DECAY:                                                              │
+│  • DC conditions change when idle (workers restart, network heals)      │
+│  • Stale observations may be misleading                                 │
+│  • Graceful fallback to prediction when no fresh data                   │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Part 7: Cold Start and Bootstrap
+
+**Cold Start Behavior**:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    COLD START PROGRESSION                               │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  Samples    Confidence    Blended Latency                               │
+│  ────────────────────────────────────────                               │
+│  0          0.0           100% RTT UCB (pure prediction)                │
+│  1          0.1           90% RTT UCB + 10% observed                    │
+│  2          0.2           80% RTT UCB + 20% observed                    │
+│  5          0.5           50% RTT UCB + 50% observed                    │
+│  10         1.0           0% RTT UCB + 100% observed                    │
+│                                                                          │
+│  Example with dc-east:                                                  │
+│  ─────────────────────                                                  │
+│  RTT UCB: 45ms                                                           │
+│  True observed latency: 120ms (includes execution time)                 │
+│                                                                          │
+│  Sample 0:  blended = 45ms (pure RTT)                                   │
+│  Sample 1:  observed = 120ms, confidence = 0.1                          │
+│             blended = 0.1(120) + 0.9(45) = 52.5ms                       │
+│  Sample 5:  observed ≈ 120ms (EWMA stabilized)                          │
+│             blended = 0.5(120) + 0.5(45) = 82.5ms                       │
+│  Sample 10: blended = 1.0(120) + 0.0(45) = 120ms                        │
+│                                                                          │
+│  System learns dc-east is slower than RTT suggests!                     │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+**Integration with AD-36 Bootstrap Mode**:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                 BOOTSTRAP MODE INTERACTION                              │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  AD-36 Bootstrap Mode (Coordinate-Unaware):                             │
+│  ──────────────────────────────────────────                             │
+│  • Triggered when local Vivaldi coordinates immature                    │
+│  • Routes by capacity, not RTT                                          │
+│  • AD-45 observations still recorded during bootstrap                   │
+│                                                                          │
+│  When Bootstrap Mode Exits:                                              │
+│  ───────────────────────────                                            │
+│  • RTT UCB becomes available                                            │
+│  • AD-45 observations may have accumulated                              │
+│  • Blended latency uses both immediately                                │
+│                                                                          │
+│  Scenario:                                                               │
+│  ─────────                                                              │
+│  1. Gate starts, coordinates immature → bootstrap mode                  │
+│  2. Jobs routed by capacity to dc-east, dc-west                        │
+│  3. AD-45 records: dc-east 80ms avg, dc-west 150ms avg                 │
+│  4. Coordinates mature → exit bootstrap mode                            │
+│  5. RTT UCB: dc-east 40ms, dc-west 45ms                                │
+│  6. Blended (10 samples each):                                          │
+│       dc-east: 80ms (observed dominates)                                │
+│       dc-west: 150ms (observed dominates)                               │
+│  7. Route to dc-east (lower blended latency)                           │
+│                                                                          │
+│  BENEFIT: Learning continues during bootstrap, ready when RTT available │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Part 8: Extended DatacenterRoutingScore
+
+```python
+# Extension to distributed/routing/routing_state.py
+@dataclass(slots=True)
+class DatacenterRoutingScore:
+    """Score for a datacenter candidate."""
+
+    datacenter_id: str
+    health_bucket: str
+
+    # Latency components
+    rtt_ucb_ms: float                       # AD-35: Vivaldi RTT UCB
+    blended_latency_ms: float = 0.0         # AD-45: Blended (observed + predicted)
+    observed_latency_ms: float = 0.0        # AD-45: Raw observed EWMA
+    observed_confidence: float = 0.0        # AD-45: Confidence in observation
+
+    # Other scoring factors (unchanged from AD-36)
+    load_factor: float = 1.0
+    quality_penalty: float = 1.0
+
+    # Final score
+    final_score: float = 0.0
+
+    is_preferred: bool = False
+```
+
+### Part 9: Environment Configuration
+
+```python
+# Extension to distributed/env/env.py
+class Env(BaseModel):
+    # ... existing fields ...
+
+    # AD-45: Adaptive Route Learning
+    ADAPTIVE_ROUTING_ENABLED: StrictBool = True
+    # Enable blended latency scoring. When False, uses RTT UCB only.
+
+    ADAPTIVE_ROUTING_EWMA_ALPHA: StrictFloat = 0.2
+    # EWMA decay factor for observed latency.
+    # Higher = more responsive to recent observations.
+    # Range: 0.05 to 0.5 recommended.
+
+    ADAPTIVE_ROUTING_MIN_SAMPLES: StrictInt = 10
+    # Minimum samples before observed latency reaches full confidence.
+    # Lower = faster learning, potentially less stable.
+
+    ADAPTIVE_ROUTING_MAX_STALENESS_SECONDS: StrictFloat = 300.0
+    # Maximum age of observations before confidence decays to zero.
+    # After this, falls back to RTT UCB prediction only.
+
+    ADAPTIVE_ROUTING_LATENCY_CAP_MS: StrictFloat = 60000.0
+    # Maximum observed latency to record (1 minute).
+    # Outliers above this are capped to prevent EWMA distortion.
+```
+
+### Part 10: Data Flow Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                      AD-45 COMPLETE DATA FLOW                           │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │                         GATE                                     │    │
+│  │  ┌─────────────────┐      ┌─────────────────────────────────┐   │    │
+│  │  │ GateJobRouter   │      │ ObservedLatencyTracker          │   │    │
+│  │  │ (AD-36)         │◄────►│ (AD-45)                         │   │    │
+│  │  │                 │      │                                  │   │    │
+│  │  │ route_job()     │      │ _latencies: {dc_id: State}      │   │    │
+│  │  │     │           │      │   • ewma_ms                     │   │    │
+│  │  │     ▼           │      │   • sample_count                │   │    │
+│  │  │ get_blended_    │      │   • last_update                 │   │    │
+│  │  │ latency()       │      │                                  │   │    │
+│  │  └────────┬────────┘      └──────────────┬──────────────────┘   │    │
+│  │           │                              │                       │    │
+│  │           │ Routing                      │ record_job_latency()  │    │
+│  │           │ Decision                     │                       │    │
+│  │           ▼                              │                       │    │
+│  │  ┌─────────────────────────────────────────────────────────┐    │    │
+│  │  │                 GateJobManager                           │    │    │
+│  │  │                                                          │    │    │
+│  │  │  dispatch():                   on_result():              │    │    │
+│  │  │    _dispatch_times[(job,dc)]     latency = now - start   │    │    │
+│  │  │      = monotonic()               tracker.record(dc, lat) │    │    │
+│  │  │                                                          │    │    │
+│  │  └───────────────────────┬──────────────────────────────────┘    │    │
+│  │                          │                                       │    │
+│  └──────────────────────────┼───────────────────────────────────────┘    │
+│                             │                                            │
+│                             │ Dispatch / Results                         │
+│                             ▼                                            │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │                    DATACENTER (MANAGER)                          │    │
+│  │                                                                  │    │
+│  │  Receives job → Queues workflows → Executes → Returns result    │    │
+│  │                                                                  │    │
+│  │  (Observed latency = dispatch-to-result time, includes all)     │    │
+│  │                                                                  │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+│                                                                          │
+│  SCORING FORMULA (in RoutingScorer):                                    │
+│  ───────────────────────────────────                                    │
+│  blended_ms = (confidence × observed) + ((1-confidence) × rtt_ucb)      │
+│  final_score = blended_ms × load_factor × quality_penalty               │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Part 11: Example Scenarios
+
+#### Scenario 1: New DC Discovery
+
+```
+Initial state:
+  dc-east: RTT UCB 40ms, no observations (confidence 0.0)
+  dc-west: RTT UCB 80ms, no observations (confidence 0.0)
+
+Route decision:
+  dc-east blended = 0×0 + 1×40 = 40ms
+  dc-west blended = 0×0 + 1×80 = 80ms
+  → Route to dc-east (lower latency)
+
+After 5 jobs to each DC:
+  dc-east: observed EWMA 150ms (workers slow), confidence 0.5
+  dc-west: observed EWMA 90ms (workers fast), confidence 0.5
+
+Route decision:
+  dc-east blended = 0.5×150 + 0.5×40 = 95ms
+  dc-west blended = 0.5×90 + 0.5×80 = 85ms
+  → Route to dc-west (better actual performance)
+
+Learning detected dc-east is slower despite lower RTT!
+```
+
+#### Scenario 2: DC Degradation
+
+```
+Steady state:
+  dc-east: RTT UCB 40ms, observed 80ms (confidence 1.0)
+  dc-west: RTT UCB 45ms, observed 90ms (confidence 1.0)
+
+dc-east blended = 80ms, dc-west blended = 90ms
+→ Routing to dc-east
+
+dc-east experiences congestion:
+  Next 10 jobs: 200ms, 250ms, 300ms, ...
+  EWMA with alpha=0.2:
+    After 1: 80 + 0.2×(200-80) = 104ms
+    After 2: 104 + 0.2×(250-104) = 133ms
+    After 5: ≈180ms (approaching new steady state)
+
+Route decision changes:
+  dc-east blended = 180ms
+  dc-west blended = 90ms
+  → Switch to dc-west
+
+Adaptive routing detected and avoided degraded DC.
+```
+
+#### Scenario 3: DC Recovery
+
+```
+Previous state:
+  dc-east: observed 250ms (was congested), confidence 1.0
+  dc-west: observed 90ms, confidence 1.0
+
+dc-east congestion clears:
+  New observations: 60ms, 55ms, 70ms, ...
+  EWMA decay:
+    After 1: 250 + 0.2×(60-250) = 212ms
+    After 5: ≈120ms
+    After 15: ≈70ms (approaching new steady state)
+
+Route decision evolves:
+  Initially: dc-west (90ms < 212ms)
+  After ~8 samples: dc-east (105ms < 90ms)
+  Stable: dc-east (70ms < 90ms)
+
+Learning detected recovery, gradually shifted traffic back.
+```
+
+#### Scenario 4: Staleness Handling
+
+```
+State:
+  dc-east: observed 80ms, last_update 200s ago
+  dc-west: observed 90ms, last_update 10s ago
+  max_staleness = 300s
+
+Confidence adjustment:
+  dc-east staleness_factor = 1 - (200/300) = 0.33
+  dc-east effective_confidence = 1.0 × 0.33 = 0.33
+
+  dc-west staleness_factor = 1 - (10/300) = 0.97
+  dc-west effective_confidence = 1.0 × 0.97 = 0.97
+
+Blended latency:
+  dc-east: 0.33×80 + 0.67×40 = 53ms (more RTT weight)
+  dc-west: 0.97×90 + 0.03×45 = 88ms (mostly observed)
+
+Stale observations decay toward prediction-only.
+```
+
+### Part 12: Observability
+
+**Metrics**:
+
+```python
+# New metrics for AD-45
+observed_latency_ewma_ms{datacenter_id}
+# Current EWMA estimate per DC
+
+observed_latency_samples_total{datacenter_id}
+# Total samples recorded per DC
+
+observed_latency_confidence{datacenter_id}
+# Current confidence (0.0-1.0) per DC
+
+blended_latency_ms{datacenter_id}
+# Final blended latency used in scoring
+
+routing_latency_source{datacenter_id, source="predicted|observed|blended"}
+# Which latency source dominated decision
+# source="predicted" when confidence < 0.3
+# source="observed" when confidence > 0.7
+# source="blended" otherwise
+
+observed_latency_stddev_ms{datacenter_id}
+# Standard deviation of observations (variance tracking)
+```
+
+**Logs**:
+
+```python
+# On significant latency change
+ServerInfo(
+    message=f"DC {dc_id} observed latency shifted: {old_ms:.1f}ms → {new_ms:.1f}ms",
+    node_id=gate_id,
+    metadata={
+        "datacenter_id": dc_id,
+        "old_ewma_ms": old_ms,
+        "new_ewma_ms": new_ms,
+        "sample_count": sample_count,
+        "rtt_ucb_ms": rtt_ucb_ms,
+    },
+)
+
+# On confidence threshold crossings
+ServerInfo(
+    message=f"DC {dc_id} reached full learning confidence ({samples} samples)",
+    node_id=gate_id,
+)
+```
+
+### Part 13: Implementation Guide
+
+#### File Structure
+
+```
+hyperscale/distributed/
+├── routing/
+│   ├── observed_latency.py            # NEW: ObservedLatencyState, ObservedLatencyTracker
+│   ├── scoring.py                     # MODIFY: Use blended latency
+│   ├── routing_state.py               # MODIFY: Add blended_latency_ms to DatacenterRoutingScore
+│   └── gate_job_router.py             # MODIFY: Wire up tracker
+├── jobs/
+│   └── gates/
+│       └── gate_job_manager.py        # MODIFY: Record dispatch times, report latencies
+├── nodes/
+│   └── gate/
+│       └── server.py                  # MODIFY: Create and inject tracker
+└── env/
+    └── env.py                         # MODIFY: Add AD-45 configuration
+```
+
+#### Integration Points
+
+1. **ObservedLatencyTracker** (new file):
+   - Create `distributed/routing/observed_latency.py`
+   - Implement `ObservedLatencyState` and `ObservedLatencyTracker`
+
+2. **Gate Server** (distributed/nodes/gate/server.py):
+   - Create `ObservedLatencyTracker` on startup
+   - Pass to `GateJobRouter` and `GateJobManager`
+
+3. **GateJobRouter** (distributed/routing/gate_job_router.py):
+   - Accept `ObservedLatencyTracker` in constructor
+   - Pass to `RoutingScorer`
+
+4. **RoutingScorer** (distributed/routing/scoring.py):
+   - Add `observed_latency_tracker` parameter
+   - Use `get_blended_latency()` instead of raw RTT UCB
+
+5. **GateJobManager** (distributed/jobs/gates/gate_job_manager.py):
+   - Track dispatch times in `_dispatch_times` dict
+   - Record latency on job completion
+
+6. **DatacenterRoutingScore** (distributed/routing/routing_state.py):
+   - Add `blended_latency_ms`, `observed_latency_ms`, `observed_confidence` fields
+
+7. **Env** (distributed/env/env.py):
+   - Add `ADAPTIVE_ROUTING_*` configuration
+
+### Part 14: Testing Strategy
+
+```python
+# Test file: tests/distributed/routing/test_observed_latency.py
+
+class TestObservedLatencyState:
+    def test_first_sample_initializes_ewma(self):
+        """First sample sets EWMA directly."""
+        state = ObservedLatencyState(datacenter_id="dc-1")
+        state.record_latency(100.0, alpha=0.2, now=1000.0)
+
+        assert state.ewma_ms == 100.0
+        assert state.sample_count == 1
+
+    def test_ewma_converges_to_steady_state(self):
+        """EWMA approaches steady state value."""
+        state = ObservedLatencyState(datacenter_id="dc-1")
+
+        # Record 20 samples of 100ms
+        for i in range(20):
+            state.record_latency(100.0, alpha=0.2, now=float(i))
+
+        assert 99.0 < state.ewma_ms < 101.0
+
+    def test_ewma_responds_to_change(self):
+        """EWMA tracks when latency changes."""
+        state = ObservedLatencyState(datacenter_id="dc-1")
+
+        # Establish baseline at 100ms
+        for i in range(10):
+            state.record_latency(100.0, alpha=0.2, now=float(i))
+
+        initial_ewma = state.ewma_ms
+
+        # Shift to 200ms
+        for i in range(10, 20):
+            state.record_latency(200.0, alpha=0.2, now=float(i))
+
+        # Should have moved significantly toward 200ms
+        assert state.ewma_ms > 150.0
+        assert state.ewma_ms < 200.0
+
+
+class TestObservedLatencyTracker:
+    def test_blended_latency_cold_start(self):
+        """Cold start uses prediction only."""
+        tracker = ObservedLatencyTracker(min_samples_for_confidence=10)
+
+        blended = tracker.get_blended_latency("dc-1", predicted_rtt_ms=50.0)
+        assert blended == 50.0  # Pure prediction
+
+    def test_blended_latency_partial_confidence(self):
+        """Partial samples blend prediction and observation."""
+        tracker = ObservedLatencyTracker(
+            alpha=0.5,  # High alpha for faster convergence in test
+            min_samples_for_confidence=10,
+        )
+
+        # Record 5 samples of 100ms → 50% confidence
+        for _ in range(5):
+            tracker.record_job_latency("dc-1", 100.0)
+
+        blended = tracker.get_blended_latency("dc-1", predicted_rtt_ms=50.0)
+
+        # Expected: 0.5 × 100 + 0.5 × 50 = 75
+        assert 70.0 < blended < 80.0
+
+    def test_blended_latency_full_confidence(self):
+        """Full samples use observation."""
+        tracker = ObservedLatencyTracker(
+            alpha=0.5,
+            min_samples_for_confidence=10,
+        )
+
+        # Record 10+ samples of 100ms → 100% confidence
+        for _ in range(15):
+            tracker.record_job_latency("dc-1", 100.0)
+
+        blended = tracker.get_blended_latency("dc-1", predicted_rtt_ms=50.0)
+
+        # Expected: 1.0 × 100 + 0.0 × 50 = 100
+        assert 95.0 < blended < 105.0
+
+
+class TestRoutingScorerWithBlending:
+    def test_scorer_uses_blended_latency(self):
+        """Scorer integrates blended latency into final score."""
+        tracker = ObservedLatencyTracker(min_samples_for_confidence=10)
+
+        # DC-A: low RTT but high observed latency
+        for _ in range(15):
+            tracker.record_job_latency("dc-a", 200.0)
+
+        # DC-B: high RTT but low observed latency
+        for _ in range(15):
+            tracker.record_job_latency("dc-b", 80.0)
+
+        scorer = RoutingScorer(
+            config=ScoringConfig(use_blended_latency=True),
+            observed_latency_tracker=tracker,
+        )
+
+        candidates = [
+            DatacenterCandidate(
+                datacenter_id="dc-a",
+                health_bucket="HEALTHY",
+                rtt_ucb_ms=40.0,  # Low RTT
+            ),
+            DatacenterCandidate(
+                datacenter_id="dc-b",
+                health_bucket="HEALTHY",
+                rtt_ucb_ms=100.0,  # High RTT
+            ),
+        ]
+
+        scores = scorer.score_datacenters(candidates)
+
+        # DC-B should win despite higher RTT (better observed latency)
+        assert scores[0].datacenter_id == "dc-b"
+        assert scores[1].datacenter_id == "dc-a"
+```
+
+### Part 15: Failure Mode Analysis
+
+| Failure | Impact | Mitigation |
+|---------|--------|------------|
+| Gate crash | Observed latency state lost | Rebuild from scratch; cold start safe |
+| Outlier latency spike | EWMA distorted | Cap outliers at `LATENCY_CAP_MS` |
+| All jobs fail to a DC | No positive observations | Failures not recorded; RTT fallback |
+| DC removed from cluster | Stale observations | Staleness decay removes confidence |
+| Clock skew | Latency miscalculated | Use monotonic time for all measurements |
+| Network partition | Missing observations | Staleness decay; RTT fallback |
+| EWMA alpha too high | Oscillating decisions | Lower alpha for stability |
+| EWMA alpha too low | Slow adaptation | Higher alpha for responsiveness |
+
+### Part 16: Design Decision Summary
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                   AD-45 DESIGN DECISION SUMMARY                          │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  DECISION                CHOICE                 RATIONALE                │
+│  ───────────────────────────────────────────────────────────────────────│
+│                                                                          │
+│  Learning algorithm      EWMA                   Simple, memory-efficient,│
+│                                                 proven, tunable          │
+│                                                                          │
+│  Blending formula        Linear interpolation   Smooth transition,       │
+│                          by confidence          mathematically simple    │
+│                                                                          │
+│  Measurement point       Gate dispatch-to-      Captures full user       │
+│                          result                 experience               │
+│                                                                          │
+│  Cold start behavior     Pure prediction        Safe; never worse than   │
+│                          (confidence=0)         AD-36 baseline           │
+│                                                                          │
+│  Staleness handling      Confidence decay       Graceful fallback to     │
+│                                                 prediction               │
+│                                                                          │
+│  Failure recording       Exclude failures       Failures terminate       │
+│                                                 early, distort latency   │
+│                                                                          │
+│  State location          Per-gate               Local view appropriate;  │
+│                                                 no cross-gate sync needed│
+│                                                                          │
+│  Outlier handling        Cap at max latency     Prevents EWMA distortion │
+│                                                                          │
+│  WHY THIS IS CORRECT:                                                    │
+│                                                                          │
+│  1. Learning from real outcomes improves routing over time              │
+│  2. EWMA is simple, proven, and requires O(1) space per DC             │
+│  3. Confidence blending prevents cold start instability                │
+│  4. Staleness decay handles DCs that stop receiving traffic            │
+│  5. Integration is minimal - replaces one input to AD-36 scoring       │
+│  6. All parameters Env-configurable for operational tuning             │
+│  7. Failure modes degrade gracefully to RTT-only (AD-36 baseline)      │
+│  8. Per-gate state is appropriate (gates see different job mixes)      │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
