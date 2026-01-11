@@ -12,6 +12,7 @@ All networking I/O is mocked to enable pure asyncio unit testing.
 
 import asyncio
 import time
+import inspect
 from dataclasses import dataclass
 from typing import Any
 from unittest.mock import MagicMock
@@ -63,7 +64,7 @@ class MockTaskRunner:
     
     def run(self, coro_or_func, *args, **kwargs) -> str:
         token = f"task-{len(self.tasks)}"
-        if asyncio.iscoroutinefunction(coro_or_func):
+        if inspect.iscoroutinefunction(coro_or_func):
             coro = coro_or_func(*args, **kwargs)
             try:
                 loop = asyncio.get_running_loop()

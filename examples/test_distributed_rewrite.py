@@ -10,7 +10,7 @@ Tests cover:
 """
 
 import asyncio
-import time
+import inspect
 from dataclasses import dataclass
 from typing import Any
 
@@ -73,7 +73,7 @@ def test(name: str):
     def decorator(func):
         def wrapper():
             try:
-                if asyncio.iscoroutinefunction(func):
+                if inspect.iscoroutinefunction(func):
                     run_async(func())
                 else:
                     func()

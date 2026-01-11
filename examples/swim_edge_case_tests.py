@@ -82,7 +82,7 @@ def test(name: str):
     def decorator(func):
         async def wrapper():
             try:
-                await func() if asyncio.iscoroutinefunction(func) else func()
+                await func() if inspect.iscoroutinefunction(func) else func()
                 results.record_pass(name)
             except AssertionError as e:
                 results.record_fail(name, str(e) or "Assertion failed")

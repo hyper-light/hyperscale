@@ -10,6 +10,7 @@ Tests job dispatch coordination to datacenter managers including:
 
 import asyncio
 import pytest
+import inspect
 from dataclasses import dataclass, field
 from unittest.mock import AsyncMock
 
@@ -40,7 +41,7 @@ class MockTaskRunner:
     tasks: list = field(default_factory=list)
 
     def run(self, coro, *args, **kwargs):
-        if asyncio.iscoroutinefunction(coro):
+        if inspect.iscoroutinefunction(coro):
             task = asyncio.create_task(coro(*args, **kwargs))
         else:
             task = asyncio.create_task(asyncio.coroutine(lambda: None)())

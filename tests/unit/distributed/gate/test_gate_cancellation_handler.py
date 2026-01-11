@@ -10,6 +10,7 @@ Tests job and workflow cancellation including:
 
 import asyncio
 import pytest
+import inspect
 from dataclasses import dataclass, field
 from unittest.mock import AsyncMock, MagicMock
 
@@ -47,7 +48,7 @@ class MockTaskRunner:
     tasks: list = field(default_factory=list)
 
     def run(self, coro, *args, **kwargs):
-        if asyncio.iscoroutinefunction(coro):
+        if inspect.iscoroutinefunction(coro):
             task = asyncio.create_task(coro(*args, **kwargs))
             self.tasks.append(task)
             return task
