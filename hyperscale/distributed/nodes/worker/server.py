@@ -943,6 +943,26 @@ class WorkerServer(HealthAwareServer):
 
         return (success, errors)
 
+    async def get_workflows_on_cores(self, core_indices: list[int]) -> set[str]:
+        """Get workflows running on specific cores."""
+        return await self._core_allocator.get_workflows_on_cores(core_indices)
+
+    async def stop_workflows_on_cores(
+        self,
+        core_indices: list[int],
+        reason: str = "core_stop",
+    ) -> list[str]:
+        """Stop all workflows running on specific cores (hierarchical stop)."""
+        workflows = await self.get_workflows_on_cores(core_indices)
+        stopped = []
+
+        for workflow_id in workflows:
+            success, _ = await self._cancel_workflow(workflow_id, reason)
+            if success:
+                stopped.append(workflow_id)
+
+        return stopped
+
     # =========================================================================
     # Progress Reporting
     # =========================================================================
@@ -980,6 +1000,20 @@ class WorkerServer(HealthAwareServer):
                 aggregated[best_update.workflow_id] = best_update
 
         return aggregated
+
+    async def _report_active_workflows_to_managers(self) -> None:
+        """Report all active workflows to all healthy managers."""
+        if not self._registry._healthy_manager_ids:
+            return
+
+        for workflow_id, progress in list(self._active_workflows.items()):
+            try:
+                await self._progress_reporter.send_progress_to_all_managers(
+                    progress=progress,
+                    send_tcp=self.send_tcp,
+                )
+            except Exception:
+                pass
 
     # =========================================================================
     # Environment Property (for tcp_dispatch.py)
