@@ -35,16 +35,51 @@ class ManagerDiscoveryCoordinator:
         logger: "Logger",
         node_id: str,
         task_runner,
-        worker_discovery: "DiscoveryService",
-        peer_discovery: "DiscoveryService",
+        env,
+        worker_discovery: "DiscoveryService | None" = None,
+        peer_discovery: "DiscoveryService | None" = None,
     ) -> None:
+        from hyperscale.distributed.discovery import DiscoveryService
+
         self._state = state
         self._config = config
         self._logger = logger
         self._node_id = node_id
         self._task_runner = task_runner
-        self._worker_discovery = worker_discovery
-        self._peer_discovery = peer_discovery
+        self._env = env
+
+        # Initialize discovery services if not provided
+        if worker_discovery is None:
+            worker_config = env.get_discovery_config(
+                node_role="manager",
+                static_seeds=[],
+                allow_dynamic_registration=True,
+            )
+            self._worker_discovery = DiscoveryService(worker_config)
+        else:
+            self._worker_discovery = worker_discovery
+
+        if peer_discovery is None:
+            peer_static_seeds = [
+                f"{host}:{port}"
+                for host, port in config.seed_managers
+            ]
+            peer_config = env.get_discovery_config(
+                node_role="manager",
+                static_seeds=peer_static_seeds,
+            )
+            self._peer_discovery = DiscoveryService(peer_config)
+            # Pre-register seed managers
+            for host, port in config.seed_managers:
+                self._peer_discovery.add_peer(
+                    peer_id=f"{host}:{port}",
+                    host=host,
+                    port=port,
+                    role="manager",
+                    datacenter_id=config.datacenter_id,
+                )
+        else:
+            self._peer_discovery = peer_discovery
 
     def add_worker(
         self,
@@ -181,7 +216,7 @@ class ManagerDiscoveryCoordinator:
         Runs periodic failure decay and cleanup.
         """
         self._state._discovery_maintenance_task = asyncio.create_task(
-            self._maintenance_loop()
+            self.maintenance_loop()
         )
 
     async def stop_maintenance_loop(self) -> None:
@@ -194,7 +229,7 @@ class ManagerDiscoveryCoordinator:
                 pass
             self._state._discovery_maintenance_task = None
 
-    async def _maintenance_loop(self) -> None:
+    async def maintenance_loop(self) -> None:
         """
         Background loop for discovery maintenance.
 

@@ -236,6 +236,26 @@ class ManagerStatsCoordinator:
             )
         )
 
+    async def push_batch_stats(self) -> None:
+        """
+        Push batched stats to gates/clients.
+
+        Called periodically by the stats push loop.
+        """
+        # In full implementation, this would:
+        # 1. Aggregate windowed stats
+        # 2. Push to registered callbacks
+        # 3. Clear processed entries
+        self._task_runner.run(
+            self._logger.log,
+            ServerDebug(
+                message=f"Batch stats push (buffer={self._stats_buffer_count})",
+                node_host=self._config.host,
+                node_port=self._config.tcp_port,
+                node_id=self._node_id,
+            )
+        )
+
     def get_stats_metrics(self) -> dict:
         """Get stats-related metrics."""
         # Capture count before get_dispatch_throughput() which may reset it
