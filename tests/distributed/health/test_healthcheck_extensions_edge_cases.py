@@ -15,8 +15,6 @@ Tests cover:
 
 import time
 
-import pytest
-
 from hyperscale.distributed.health.extension_tracker import (
     ExtensionTracker,
     ExtensionTrackerConfig,

@@ -10,7 +10,6 @@ Tests cover:
 """
 
 import asyncio
-import time
 
 import pytest
 

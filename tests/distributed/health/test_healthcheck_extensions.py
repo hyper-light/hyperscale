@@ -16,7 +16,6 @@ The Adaptive Healthcheck Extension pattern ensures:
 """
 
 import time
-import pytest
 
 from hyperscale.distributed.health import (
     ExtensionTracker,

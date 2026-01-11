@@ -10,10 +10,7 @@ Tests all state transitions and recovery scenarios for worker health:
 - Edge cases in state transitions
 """
 
-import pytest
 import time
-from dataclasses import replace
-from unittest.mock import patch
 
 from hyperscale.distributed.health.worker_health import (
     WorkerHealthState,

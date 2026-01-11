@@ -13,7 +13,6 @@ Tests the out-of-band health channel for high-priority probes including:
 
 import asyncio
 import time
-from unittest.mock import MagicMock
 
 import pytest
 
