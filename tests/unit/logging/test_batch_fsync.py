@@ -7,6 +7,8 @@ from hyperscale.logging.config.durability_mode import DurabilityMode
 from hyperscale.logging.models import Entry, LogLevel
 from hyperscale.logging.streams.logger_stream import LoggerStream
 
+from .conftest import create_mock_stream_writer
+
 
 class TestBatchFsyncScheduling:
     @pytest.mark.asyncio
@@ -52,7 +54,10 @@ class TestBatchFsyncTimeout:
             instance_id=1,
         )
         stream._batch_timeout_ms = 50
-        await stream.initialize()
+        await stream.initialize(
+            stdout_writer=create_mock_stream_writer(),
+            stderr_writer=create_mock_stream_writer(),
+        )
 
         entry = Entry(message="timeout test", level=LogLevel.INFO)
         await stream.log(entry)
@@ -82,7 +87,10 @@ class TestBatchFsyncMaxSize:
         )
         stream._batch_max_size = 10
         stream._batch_timeout_ms = 60000
-        await stream.initialize()
+        await stream.initialize(
+            stdout_writer=create_mock_stream_writer(),
+            stderr_writer=create_mock_stream_writer(),
+        )
 
         for idx in range(10):
             entry = sample_entry_factory(message=f"batch message {idx}")
@@ -109,7 +117,10 @@ class TestBatchFsyncMaxSize:
         )
         stream._batch_max_size = 5
         stream._batch_timeout_ms = 60000
-        await stream.initialize()
+        await stream.initialize(
+            stdout_writer=create_mock_stream_writer(),
+            stderr_writer=create_mock_stream_writer(),
+        )
 
         for idx in range(5):
             entry = sample_entry_factory(message=f"first batch {idx}")
@@ -157,7 +168,10 @@ class TestBatchFsyncWithOtherModes:
             durability=DurabilityMode.NONE,
             log_format="json",
         )
-        await stream.initialize()
+        await stream.initialize(
+            stdout_writer=create_mock_stream_writer(),
+            stderr_writer=create_mock_stream_writer(),
+        )
 
         entry = Entry(message="no batching", level=LogLevel.INFO)
         await stream.log(entry)
@@ -184,7 +198,10 @@ class TestBatchFsyncDataIntegrity:
             instance_id=1,
         )
         stream._batch_max_size = 5
-        await stream.initialize()
+        await stream.initialize(
+            stdout_writer=create_mock_stream_writer(),
+            stderr_writer=create_mock_stream_writer(),
+        )
 
         written_lsns = []
         for idx in range(12):
@@ -204,7 +221,10 @@ class TestBatchFsyncDataIntegrity:
             enable_lsn=True,
             instance_id=1,
         )
-        await read_stream.initialize()
+        await read_stream.initialize(
+            stdout_writer=create_mock_stream_writer(),
+            stderr_writer=create_mock_stream_writer(),
+        )
 
         log_path = os.path.join(temp_log_directory, "integrity_test.wal")
         read_lsns = []

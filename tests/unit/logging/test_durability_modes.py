@@ -1,11 +1,12 @@
 import os
-import tempfile
 
 import pytest
 
 from hyperscale.logging.config.durability_mode import DurabilityMode
 from hyperscale.logging.models import Entry, LogLevel
 from hyperscale.logging.streams.logger_stream import LoggerStream
+
+from .conftest import create_mock_stream_writer
 
 
 class TestDurabilityModeEnum:
@@ -65,7 +66,10 @@ class TestDurabilityModeNone:
             durability=DurabilityMode.NONE,
             log_format="json",
         )
-        await stream.initialize()
+        await stream.initialize(
+            stdout_writer=create_mock_stream_writer(),
+            stderr_writer=create_mock_stream_writer(),
+        )
 
         entry = Entry(message="test message", level=LogLevel.INFO)
         await stream.log(entry)
