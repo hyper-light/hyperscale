@@ -282,15 +282,15 @@ class WorkerServer(HealthAwareServer):
     # State Methods
     # =========================================================================
 
-    def _get_worker_state(self) -> WorkerState:
+    def _get_worker_state(self) -> WorkerStateEnum:
         """Determine current worker state."""
         if not self._running:
-            return WorkerState.OFFLINE
+            return WorkerStateEnum.OFFLINE
         if self._degradation.current_level.value >= 3:
-            return WorkerState.DRAINING
+            return WorkerStateEnum.DRAINING
         if self._degradation.current_level.value >= 2:
-            return WorkerState.DEGRADED
-        return WorkerState.HEALTHY
+            return WorkerStateEnum.DEGRADED
+        return WorkerStateEnum.HEALTHY
 
     def _increment_version(self) -> int:
         """Increment and return the state version."""
