@@ -79,6 +79,79 @@ class GateDispatchCoordinator:
         self._broadcast_leadership = broadcast_leadership
         self._dispatch_to_dcs = dispatch_to_dcs
 
+    def _check_rate_and_load(
+        self,
+        client_id: str,
+        job_id: str,
+    ) -> JobAck | None:
+        """Check rate limit and load shedding. Returns rejection JobAck if rejected."""
+        allowed, retry_after = self._check_rate_limit(client_id, "job_submit")
+        if not allowed:
+            return JobAck(job_id=job_id, accepted=False,
+                          error=f"Rate limited, retry after {retry_after}s")
+
+        if self._should_shed_request("JobSubmission"):
+            return JobAck(job_id=job_id, accepted=False,
+                          error="System under load, please retry later")
+        return None
+
+    def _check_protocol_version(
+        self,
+        submission: JobSubmission,
+    ) -> tuple[JobAck | None, str]:
+        """Check protocol compatibility. Returns (rejection_ack, negotiated_caps)."""
+        client_version = ProtocolVersion(
+            major=getattr(submission, 'protocol_version_major', 1),
+            minor=getattr(submission, 'protocol_version_minor', 0),
+        )
+
+        if client_version.major != CURRENT_PROTOCOL_VERSION.major:
+            return (JobAck(
+                job_id=submission.job_id, accepted=False,
+                error=f"Incompatible protocol version: {client_version}",
+                protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+                protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+            ), "")
+
+        client_caps = getattr(submission, 'capabilities', '')
+        client_features = set(client_caps.split(',')) if client_caps else set()
+        our_features = get_features_for_version(CURRENT_PROTOCOL_VERSION)
+        negotiated = ','.join(sorted(client_features & our_features))
+        return (None, negotiated)
+
+    def _check_circuit_and_quorum(self, job_id: str) -> JobAck | None:
+        """Check circuit breaker and quorum. Returns rejection JobAck if unavailable."""
+        if self._quorum_circuit.circuit_state == CircuitState.OPEN:
+            retry_after = self._quorum_circuit.half_open_after
+            return JobAck(job_id=job_id, accepted=False,
+                          error=f"Circuit open, retry after {retry_after}s")
+
+        if self._state.get_active_peer_count() > 0 and not self._has_quorum_available():
+            return JobAck(job_id=job_id, accepted=False, error="Quorum unavailable")
+        return None
+
+    def _setup_job_tracking(self, submission: JobSubmission, primary_dcs: list[str]) -> None:
+        """Initialize job tracking state for a new submission."""
+        job = GlobalJobStatus(
+            job_id=submission.job_id, status=JobStatus.SUBMITTED.value,
+            datacenters=[], timestamp=time.monotonic(),
+        )
+        self._job_manager.set_job(submission.job_id, job)
+        self._job_manager.set_target_dcs(submission.job_id, set(primary_dcs))
+
+        try:
+            workflows = cloudpickle.loads(submission.workflows)
+            self._state._job_workflow_ids[submission.job_id] = {wf_id for wf_id, _, _ in workflows}
+        except Exception:
+            self._state._job_workflow_ids[submission.job_id] = set()
+
+        if submission.callback_addr:
+            self._job_manager.set_callback(submission.job_id, submission.callback_addr)
+            self._state._progress_callbacks[submission.job_id] = submission.callback_addr
+
+        if submission.reporting_configs:
+            self._state._job_submissions[submission.job_id] = submission
+
     async def submit_job(
         self,
         addr: tuple[str, int],
@@ -94,126 +167,46 @@ class GateDispatchCoordinator:
         Returns:
             JobAck with acceptance status
         """
-        # Check rate limit (AD-24)
         client_id = f"{addr[0]}:{addr[1]}"
-        allowed, retry_after = self._check_rate_limit(client_id, "job_submit")
-        if not allowed:
-            return JobAck(
-                job_id=submission.job_id,
-                accepted=False,
-                error=f"Rate limited, retry after {retry_after}s",
-            )
 
-        # Check load shedding (AD-22)
-        if self._should_shed_request("JobSubmission"):
-            return JobAck(
-                job_id=submission.job_id,
-                accepted=False,
-                error="System under load, please retry later",
-            )
+        # Validate rate limit and load (AD-22, AD-24)
+        if rejection := self._check_rate_and_load(client_id, submission.job_id):
+            return rejection
 
-        # Protocol version check (AD-25)
-        client_version = ProtocolVersion(
-            major=getattr(submission, 'protocol_version_major', 1),
-            minor=getattr(submission, 'protocol_version_minor', 0),
-        )
+        # Validate protocol version (AD-25)
+        rejection, negotiated = self._check_protocol_version(submission)
+        if rejection:
+            return rejection
 
-        if client_version.major != CURRENT_PROTOCOL_VERSION.major:
-            return JobAck(
-                job_id=submission.job_id,
-                accepted=False,
-                error=f"Incompatible protocol version: {client_version}",
-                protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
-                protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
-            )
+        # Check circuit breaker and quorum
+        if rejection := self._check_circuit_and_quorum(submission.job_id):
+            return rejection
 
-        # Negotiate capabilities
-        client_caps = getattr(submission, 'capabilities', '')
-        client_features = set(client_caps.split(',')) if client_caps else set()
-        our_features = get_features_for_version(CURRENT_PROTOCOL_VERSION)
-        negotiated = ','.join(sorted(client_features & our_features))
-
-        # Check circuit breaker
-        if self._quorum_circuit.circuit_state == CircuitState.OPEN:
-            retry_after = self._quorum_circuit.half_open_after
-            return JobAck(
-                job_id=submission.job_id,
-                accepted=False,
-                error=f"Circuit open, retry after {retry_after}s",
-            )
-
-        # Check quorum (multi-gate deployments)
-        if (self._state.get_active_peer_count() > 0 and
-            not self._has_quorum_available()):
-            return JobAck(
-                job_id=submission.job_id,
-                accepted=False,
-                error="Quorum unavailable",
-            )
-
-        # Select datacenters (AD-36 if router available)
-        primary_dcs, fallback_dcs, worst_health = self._select_datacenters(
+        # Select datacenters (AD-36)
+        primary_dcs, _, worst_health = self._select_datacenters(
             submission.datacenter_count,
             submission.datacenters if submission.datacenters else None,
             job_id=submission.job_id,
         )
 
         if worst_health == "initializing":
-            return JobAck(
-                job_id=submission.job_id,
-                accepted=False,
-                error="initializing",  # Client will retry
-            )
-
+            return JobAck(job_id=submission.job_id, accepted=False, error="initializing")
         if not primary_dcs:
-            return JobAck(
-                job_id=submission.job_id,
-                accepted=False,
-                error="No available datacenters",
-            )
+            return JobAck(job_id=submission.job_id, accepted=False, error="No available datacenters")
 
-        # Create global job tracking
-        job = GlobalJobStatus(
-            job_id=submission.job_id,
-            status=JobStatus.SUBMITTED.value,
-            datacenters=[],
-            timestamp=time.monotonic(),
-        )
-        self._job_manager.set_job(submission.job_id, job)
-        self._job_manager.set_target_dcs(submission.job_id, set(primary_dcs))
+        # Setup job tracking
+        self._setup_job_tracking(submission, primary_dcs)
 
-        # Extract and track workflow IDs
-        try:
-            workflows = cloudpickle.loads(submission.workflows)
-            workflow_ids = {wf_id for wf_id, _, _ in workflows}
-            self._state._job_workflow_ids[submission.job_id] = workflow_ids
-        except Exception:
-            self._state._job_workflow_ids[submission.job_id] = set()
-
-        # Store callback for push notifications
-        if submission.callback_addr:
-            self._job_manager.set_callback(submission.job_id, submission.callback_addr)
-            self._state._progress_callbacks[submission.job_id] = submission.callback_addr
-
-        # Store submission for reporter configs
-        if submission.reporting_configs:
-            self._state._job_submissions[submission.job_id] = submission
-
-        # Assume leadership for this job
+        # Assume and broadcast leadership
         self._assume_leadership(submission.job_id, len(primary_dcs))
-
-        # Broadcast leadership to peer gates
         await self._broadcast_leadership(submission.job_id, len(primary_dcs))
-
-        # Record success for circuit breaker
         self._quorum_circuit.record_success()
 
-        # Dispatch to DCs in background
+        # Dispatch in background
         self._task_runner.run(self._dispatch_to_dcs, submission, primary_dcs)
 
         return JobAck(
-            job_id=submission.job_id,
-            accepted=True,
+            job_id=submission.job_id, accepted=True,
             queued_position=self._job_manager.job_count(),
             protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
             protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
