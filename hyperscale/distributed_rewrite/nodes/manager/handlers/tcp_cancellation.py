@@ -87,7 +87,7 @@ class CancelJobHandler:
         except Exception as e:
             return JobCancelResponse(
                 job_id="unknown",
-                accepted=False,
+                success=False,
                 error=str(e),
             ).dump()
 
@@ -151,7 +151,7 @@ class JobCancelRequestHandler:
         except Exception as e:
             return JobCancelResponse(
                 job_id="unknown",
-                accepted=False,
+                success=False,
                 error=str(e),
             ).dump()
 
