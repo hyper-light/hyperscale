@@ -366,6 +366,8 @@ class GateHeartbeat(Message):
     manager_count: int           # Number of registered managers
     tcp_host: str = ""           # Gate's TCP host (for proper storage/routing)
     tcp_port: int = 0            # Gate's TCP port (for proper storage/routing)
+    # Network coordinate for RTT estimation (AD-35)
+    coordinate: "NetworkCoordinate | None" = None
     # Piggybacked discovery info - managers learn about other managers/gates
     # Maps node_id -> (tcp_host, tcp_port, udp_host, udp_port, datacenter)
     known_managers: dict[str, tuple[str, int, str, int, str]] = field(default_factory=dict)
@@ -644,6 +646,8 @@ class ManagerHeartbeat(Message):
     tcp_port: int = 0            # Manager's TCP port (for proper storage key)
     udp_host: str = ""           # Manager's UDP host (for SWIM registration)
     udp_port: int = 0            # Manager's UDP port (for SWIM registration)
+    # Network coordinate for RTT estimation (AD-35)
+    coordinate: "NetworkCoordinate | None" = None
     # Per-job leadership - piggybacked on SWIM UDP for distributed consistency
     # Maps job_id -> (fencing_token, layer_version) for jobs this manager leads
     job_leaderships: dict[str, tuple[int, int]] = field(default_factory=dict)
