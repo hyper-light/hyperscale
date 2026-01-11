@@ -1192,6 +1192,309 @@ class ManagerServer(HealthAwareServer):
                     )
                 )
 
+    async def _gate_heartbeat_loop(self) -> None:
+        """
+        Periodically send ManagerHeartbeat to gates via TCP.
+
+        This supplements the Serf-style SWIM embedding for reliability.
+        Gates use this for datacenter health classification.
+        """
+        heartbeat_interval = self._config.gate_heartbeat_interval_seconds
+
+        await self._udp_logger.log(
+            ServerInfo(
+                message="Gate heartbeat loop started",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+
+        while self._running:
+            try:
+                await asyncio.sleep(heartbeat_interval)
+
+                heartbeat = self._build_manager_heartbeat()
+
+                # Send to all healthy gates (use known gates if available, else seed gates)
+                gate_addrs = self._get_healthy_gate_tcp_addrs() or self._seed_gates
+
+                sent_count = 0
+                for gate_addr in gate_addrs:
+                    try:
+                        response = await self.send_tcp(
+                            gate_addr,
+                            "manager_status_update",
+                            heartbeat.dump(),
+                            timeout=2.0,
+                        )
+                        if not isinstance(response, Exception):
+                            sent_count += 1
+                    except Exception:
+                        pass
+
+                if sent_count > 0:
+                    await self._udp_logger.log(
+                        ServerDebug(
+                            message=f"Sent heartbeat to {sent_count}/{len(gate_addrs)} gates",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
+
+            except asyncio.CancelledError:
+                break
+            except Exception as error:
+                await self._udp_logger.log(
+                    ServerError(
+                        message=f"Gate heartbeat error: {error}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+
+    async def _rate_limit_cleanup_loop(self) -> None:
+        """
+        Periodically clean up inactive clients from the rate limiter.
+
+        Removes token buckets for clients that haven't made requests
+        within the inactive_cleanup_seconds window to prevent memory leaks.
+        """
+        cleanup_interval = self._config.rate_limit_cleanup_interval_seconds
+
+        while self._running:
+            try:
+                await asyncio.sleep(cleanup_interval)
+
+                cleaned = self._cleanup_inactive_rate_limit_clients()
+
+                if cleaned > 0:
+                    await self._udp_logger.log(
+                        ServerDebug(
+                            message=f"Rate limiter: cleaned up {cleaned} inactive clients",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
+
+            except asyncio.CancelledError:
+                break
+            except Exception as error:
+                await self._udp_logger.log(
+                    ServerError(
+                        message=f"Rate limit cleanup error: {error}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+
+    async def _job_cleanup_loop(self) -> None:
+        """
+        Periodically clean up completed/failed jobs and their associated state.
+
+        Runs at JOB_CLEANUP_INTERVAL (default 60s).
+        Jobs are eligible for cleanup when:
+        - Status is COMPLETED or FAILED
+        - More than JOB_RETENTION_SECONDS have elapsed since completion
+        """
+        cleanup_interval = self._config.job_cleanup_interval_seconds
+        retention_seconds = self._config.job_retention_seconds
+
+        while self._running:
+            try:
+                await asyncio.sleep(cleanup_interval)
+
+                current_time = time.monotonic()
+                jobs_cleaned = 0
+
+                for job in list(self._job_manager.iter_jobs()):
+                    if job.status in (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED):
+                        if job.completed_at and (current_time - job.completed_at) > retention_seconds:
+                            self._cleanup_job(job.job_id)
+                            jobs_cleaned += 1
+
+                if jobs_cleaned > 0:
+                    await self._udp_logger.log(
+                        ServerInfo(
+                            message=f"Cleaned up {jobs_cleaned} completed jobs",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
+
+            except asyncio.CancelledError:
+                break
+            except Exception as error:
+                await self._udp_logger.log(
+                    ServerError(
+                        message=f"Job cleanup error: {error}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+
+    async def _unified_timeout_loop(self) -> None:
+        """
+        Background task that checks for job timeouts (AD-34 Part 10.4.3).
+
+        Runs at JOB_TIMEOUT_CHECK_INTERVAL (default 30s). Only leader checks timeouts.
+        Delegates to strategy.check_timeout() which handles both:
+        - Extension-aware timeout (base_timeout + extensions)
+        - Stuck detection (no progress for 2+ minutes)
+        """
+        check_interval = self._config.job_timeout_check_interval_seconds
+
+        while self._running:
+            try:
+                await asyncio.sleep(check_interval)
+
+                # Only leader checks timeouts
+                if not self.is_leader():
+                    continue
+
+                for job_id, strategy in list(self._manager_state._job_timeout_strategies.items()):
+                    try:
+                        timed_out, reason = await strategy.check_timeout(job_id)
+                        if timed_out:
+                            await self._udp_logger.log(
+                                ServerWarning(
+                                    message=f"Job {job_id[:8]}... timed out: {reason}",
+                                    node_host=self._host,
+                                    node_port=self._tcp_port,
+                                    node_id=self._node_id.short,
+                                )
+                            )
+                            # Cancel the job due to timeout
+                            job = self._job_manager.get_job(job_id)
+                            if job and job.status not in (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED):
+                                job.status = JobStatus.FAILED
+                                self._manager_state.increment_state_version()
+                    except Exception as check_error:
+                        await self._udp_logger.log(
+                            ServerError(
+                                message=f"Timeout check error for job {job_id[:8]}...: {check_error}",
+                                node_host=self._host,
+                                node_port=self._tcp_port,
+                                node_id=self._node_id.short,
+                            )
+                        )
+
+            except asyncio.CancelledError:
+                break
+            except Exception as error:
+                await self._udp_logger.log(
+                    ServerError(
+                        message=f"Unified timeout loop error: {error}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+
+    async def _deadline_enforcement_loop(self) -> None:
+        """
+        Background loop for worker deadline enforcement (AD-26 Issue 2).
+
+        Checks worker deadlines every 5 seconds and takes action:
+        - If deadline expired but within grace period: mark worker as SUSPECTED
+        - If deadline expired beyond grace period: evict worker
+        """
+        check_interval = 5.0
+
+        while self._running:
+            try:
+                await asyncio.sleep(check_interval)
+
+                current_time = time.monotonic()
+                grace_period = self._worker_health_manager._config.base_deadline
+
+                deadlines_snapshot = list(self._manager_state._worker_deadlines.items())
+
+                for worker_id, deadline in deadlines_snapshot:
+                    if current_time <= deadline:
+                        continue
+
+                    time_since_deadline = current_time - deadline
+
+                    if time_since_deadline <= grace_period:
+                        await self._suspect_worker_deadline_expired(worker_id)
+                    else:
+                        await self._evict_worker_deadline_expired(worker_id)
+
+            except asyncio.CancelledError:
+                break
+            except Exception as error:
+                await self._udp_logger.log(
+                    ServerError(
+                        message=f"Deadline enforcement error: {error}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+
+    async def _peer_job_state_sync_loop(self) -> None:
+        """
+        Background loop for periodic job state sync to peer managers.
+
+        Syncs job state (leadership, fencing tokens, context versions)
+        to ensure consistency across manager cluster.
+        """
+        sync_interval = self._config.peer_job_sync_interval_seconds
+
+        while self._running:
+            try:
+                await asyncio.sleep(sync_interval)
+
+                if not self.is_leader():
+                    continue
+
+                led_jobs = self._leases.get_led_job_ids()
+                if not led_jobs:
+                    continue
+
+                for peer_addr in self._manager_state._active_manager_peers:
+                    try:
+                        sync_msg = JobStateSyncMessage(
+                            source_id=self._node_id.full,
+                            job_leaderships={
+                                job_id: self._node_id.full
+                                for job_id in led_jobs
+                            },
+                            fence_tokens={
+                                job_id: self._manager_state._job_fencing_tokens.get(job_id, 0)
+                                for job_id in led_jobs
+                            },
+                            state_version=self._manager_state._state_version,
+                        )
+
+                        await self._send_to_peer(
+                            peer_addr,
+                            "job_state_sync",
+                            sync_msg.dump(),
+                            timeout=2.0,
+                        )
+                    except Exception:
+                        pass
+
+            except asyncio.CancelledError:
+                break
+            except Exception as error:
+                await self._udp_logger.log(
+                    ServerError(
+                        message=f"Peer job state sync error: {error}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+
     # =========================================================================
     # State Sync
     # =========================================================================
