@@ -12,7 +12,7 @@ import pytest
 from hyperscale.distributed.swim.message_handling.core import ResponseBuilder
 from hyperscale.distributed.swim.message_handling.models import HandlerResult
 
-from tests.distributed.messaging.mocks import MockServerInterface
+from tests.unit.distributed.messaging.mocks import MockServerInterface
 
 
 class TestResponseBuilderHappyPath:

@@ -6,7 +6,7 @@ import asyncio
 
 import pytest
 
-from tests.distributed.messaging.mocks import MockServerInterface
+from tests.unit.distributed.messaging.mocks import MockServerInterface
 
 
 @pytest.fixture
