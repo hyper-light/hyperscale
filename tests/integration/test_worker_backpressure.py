@@ -430,7 +430,8 @@ class TestWorkerBackpressureManagerEdgeCases:
 
     def test_many_managers(self):
         """Test with many manager backpressure levels."""
-        manager = WorkerBackpressureManager()
+        state = _create_mock_state()
+        manager = WorkerBackpressureManager(state)
 
         for i in range(100):
             level = BackpressureLevel.NONE if i < 90 else BackpressureLevel.THROTTLE
@@ -441,7 +442,8 @@ class TestWorkerBackpressureManagerEdgeCases:
 
     def test_update_manager_backpressure(self):
         """Test updating manager backpressure level."""
-        manager = WorkerBackpressureManager()
+        state = _create_mock_state()
+        manager = WorkerBackpressureManager(state)
 
         manager.set_manager_backpressure("mgr-1", BackpressureLevel.NONE)
         assert manager.get_max_backpressure_level() == BackpressureLevel.NONE
@@ -451,9 +453,10 @@ class TestWorkerBackpressureManagerEdgeCases:
 
     def test_special_characters_in_manager_id(self):
         """Test manager IDs with special characters."""
-        manager = WorkerBackpressureManager()
+        state = _create_mock_state()
+        manager = WorkerBackpressureManager(state)
 
         special_id = "mgr-🚀-test"
         manager.set_manager_backpressure(special_id, BackpressureLevel.THROTTLE)
 
-        assert manager._manager_backpressure[special_id] == BackpressureLevel.THROTTLE
+        assert manager._state._manager_backpressure[special_id] == BackpressureLevel.THROTTLE
