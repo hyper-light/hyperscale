@@ -221,8 +221,6 @@ class TestWorkerRegistrationHandlerRegisterWithManager:
                 raise RuntimeError("Connection failed")
             return b"OK"
 
-        send_func = AsyncMock(side_effect=failing_send)
-
         result = await handler.register_with_manager(
             manager_addr=("192.168.1.100", 8000),
             node_info=node_info,
@@ -232,7 +230,7 @@ class TestWorkerRegistrationHandlerRegisterWithManager:
             available_memory_mb=15000,
             cluster_id="cluster-1",
             environment_id="env-1",
-            send_func=send_func,
+            send_func=failing_send,
             max_retries=3,
             base_delay=0.01,
         )
