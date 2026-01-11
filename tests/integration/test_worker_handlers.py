@@ -28,6 +28,7 @@ from hyperscale.distributed_rewrite.models import (
     WorkflowProgressAck,
     WorkflowProgress,
     WorkflowStatus,
+    WorkerState,
     PendingTransfer,
 )
 
@@ -76,7 +77,7 @@ class MockServerForHandlers:
         self._job_fence_tokens = {}
 
     def _get_worker_state(self):
-        return WorkflowStatus.RUNNING
+        return WorkerState.HEALTHY
 
     def _get_job_transfer_lock(self, job_id):
         if job_id not in self._job_transfer_locks:
