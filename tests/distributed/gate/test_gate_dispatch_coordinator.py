@@ -11,13 +11,12 @@ Tests job dispatch coordination to datacenter managers including:
 import asyncio
 import pytest
 from dataclasses import dataclass, field
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 from hyperscale.distributed.nodes.gate.dispatch_coordinator import (
     GateDispatchCoordinator,
 )
 from hyperscale.distributed.nodes.gate.state import GateRuntimeState
-from hyperscale.distributed.models import JobStatus
 from hyperscale.distributed.swim.core import CircuitState
 
 

@@ -7,7 +7,7 @@ Tests job cancellation coordination across datacenters (AD-20).
 import asyncio
 import pytest
 from dataclasses import dataclass, field
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 from hyperscale.distributed.nodes.gate.cancellation_coordinator import (
     GateCancellationCoordinator,

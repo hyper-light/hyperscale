@@ -4,7 +4,6 @@ Integration tests for GateConfig (Section 15.3.3).
 Tests the gate configuration dataclass and factory function.
 """
 
-import pytest
 from dataclasses import fields
 
 from hyperscale.distributed.nodes.gate.config import (

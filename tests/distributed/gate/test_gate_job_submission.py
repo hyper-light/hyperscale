@@ -26,7 +26,6 @@ from hyperscale.distributed.nodes.manager import ManagerServer
 from hyperscale.distributed.nodes.worker import WorkerServer
 from hyperscale.distributed.nodes.client import HyperscaleClient
 from hyperscale.distributed.env.env import Env
-from hyperscale.distributed.models import GateState, ManagerState, JobStatus
 
 
 # ==========================================================================

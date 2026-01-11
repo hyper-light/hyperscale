@@ -10,7 +10,7 @@ Tests job leadership coordination across peer gates including:
 import asyncio
 import pytest
 from dataclasses import dataclass, field
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 from hyperscale.distributed.nodes.gate.leadership_coordinator import (
     GateLeadershipCoordinator,

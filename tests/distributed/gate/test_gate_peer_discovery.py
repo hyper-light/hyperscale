@@ -23,7 +23,6 @@ This validates:
 import asyncio
 import sys
 import os
-import time
 from dataclasses import dataclass, field
 
 # Add project root to path
