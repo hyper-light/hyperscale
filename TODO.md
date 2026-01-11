@@ -727,19 +727,21 @@ nodes/client/
 
 **Commit**: `ad553e0c` "Extract client targets.py per REFACTOR.md Phase 1.2"
 
-#### 15.1.6 Client Protocol Negotiation ⏳ PENDING
+#### 15.1.6 Client Protocol Negotiation ✅ COMPLETE
 
 **File**: `nodes/client/protocol.py`
 
-- [ ] **15.1.6.1** Create ClientProtocol class
+- [x] **15.1.6.1** Create ClientProtocol class
   - negotiate_capabilities() - Protocol version negotiation
   - get_features_for_version() - Feature set extraction
   - handle_rate_limit_response() - Rate limit response processing
   - validate_server_compatibility() - Check protocol compatibility
-- [ ] **15.1.6.2** Store negotiated capabilities in state._server_negotiated_caps
-- [ ] **15.1.6.3** Build capabilities string from CURRENT_PROTOCOL_VERSION
+  - get_negotiated_capabilities() - Retrieve cached negotiations
+  - has_feature() - Check feature support
+- [x] **15.1.6.2** Store negotiated capabilities in state._server_negotiated_caps
+- [x] **15.1.6.3** Build capabilities string from CURRENT_PROTOCOL_VERSION
 
-**AD Compliance Check Required**: Protocol negotiation must not break message serialization
+**AD Compliance**: ✅ AD-25 (Protocol Version Negotiation) preserved - no message serialization changes
 
 #### 15.1.7 Client Leadership Tracking ⏳ PENDING
 
