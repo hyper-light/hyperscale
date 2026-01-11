@@ -564,3 +564,640 @@ Per CLAUDE.md: "DO NOT RUN THE INTEGRATION TESTS YOURSELF. Ask me to."
 - ✅ AD-22 (Load Shedding) - Gate uses load shedding for job submission
 - ✅ AD-23 (Stats Backpressure) - StatsBuffer and BackpressureLevel integrated
 - ✅ AD-32 (Bounded Execution) - InFlightTracker with MessagePriority
+
+
+---
+
+## 15. REFACTOR.md: Modular Server Architecture
+
+**Status**: 🚧 **IN PROGRESS** (15% complete) - Client extraction started 2026-01-10
+
+**Overview**: Large-scale refactoring to enforce one-class-per-file across gate/manager/worker/client code. Group related logic into cohesive submodules with explicit boundaries. All dataclasses use slots=True.
+
+**Constraints**:
+- One class per file (including nested helper classes)
+- Dataclasses must be defined in models/ submodules with slots=True
+- Keep async patterns, TaskRunner usage, and logging patterns intact
+- Maximum cyclic complexity: 5 for classes, 4 for functions
+- **Must not break AD-10 through AD-37 compliance**
+- Generate commit after each file or tangible unit
+
+**Scope**: 26,114 lines across 4 servers → 50-100 new files
+- Client: 1,957 lines → ~15 modules
+- Worker: 3,830 lines → ~15 modules
+- Gate: 8,093 lines → ~20 modules
+- Manager: 12,234 lines → ~25 modules
+
+---
+
+### 15.1 Client Refactoring (Phase 1)
+
+**Status**: 🚧 **40% COMPLETE** - Models, config, state, handlers, targets done
+
+**Target Structure**:
+```
+nodes/client/
+  __init__.py
+  client.py (composition root)
+  config.py
+  state.py
+  models/
+  handlers/
+  targets.py
+  protocol.py
+  leadership.py
+  tracking.py
+  submission.py
+  cancellation.py
+  reporting.py
+  discovery.py
+```
+
+#### 15.1.1 Client Models ✅ COMPLETE
+
+**Files**: `nodes/client/models/*.py`
+
+- [x] **15.1.1.1** Create `models/__init__.py` with exports
+- [x] **15.1.1.2** Create `models/job_tracking_state.py` - JobTrackingState dataclass (slots=True)
+  - Fields: job_id, job_result, completion_event, callback, target_addr
+- [x] **15.1.1.3** Create `models/cancellation_state.py` - CancellationState dataclass (slots=True)
+  - Fields: job_id, completion_event, success, errors
+- [x] **15.1.1.4** Create `models/leader_tracking.py` - GateLeaderTracking, ManagerLeaderTracking, OrphanedJob (slots=True)
+  - GateLeaderTracking: job_id, leader_info, last_updated
+  - ManagerLeaderTracking: job_id, datacenter_id, leader_info, last_updated
+  - OrphanedJob: job_id, orphan_info, orphaned_at
+- [x] **15.1.1.5** Create `models/request_routing.py` - RequestRouting dataclass (slots=True)
+  - Fields: job_id, routing_lock, selected_target
+
+**AD Compliance**: ✅ No AD violations - state containers only
+
+**Commit**: `1575bd02` "Create client models/ with slots=True dataclasses per REFACTOR.md"
+
+#### 15.1.2 Client Configuration ✅ COMPLETE
+
+**File**: `nodes/client/config.py`
+
+- [x] **15.1.2.1** Create ClientConfig dataclass (slots=True)
+  - Network: host, tcp_port, env, managers, gates
+  - Timeouts: orphan_grace_period, orphan_check_interval, response_freshness_timeout
+  - Leadership: max_retries, retry_delay, exponential_backoff, max_delay
+  - Submission: max_retries, max_redirects_per_attempt
+  - Rate limiting: enabled, health_gated
+  - Protocol: negotiate_capabilities
+  - Reporters: local_reporter_types
+- [x] **15.1.2.2** Load environment variables (CLIENT_ORPHAN_GRACE_PERIOD, etc.)
+- [x] **15.1.2.3** Define TRANSIENT_ERRORS frozenset
+- [x] **15.1.2.4** Create `create_client_config()` factory function
+
+**AD Compliance**: ✅ No AD violations - configuration only
+
+**Commit**: `83f99343` "Extract client config.py and state.py per REFACTOR.md"
+
+#### 15.1.3 Client State ✅ COMPLETE
+
+**File**: `nodes/client/state.py`
+
+- [x] **15.1.3.1** Create ClientState class with all mutable tracking structures
+  - Job tracking: _jobs, _job_events, _job_callbacks, _job_targets
+  - Cancellation: _cancellation_events, _cancellation_errors, _cancellation_success
+  - Callbacks: _reporter_callbacks, _workflow_callbacks, _job_reporting_configs, _progress_callbacks
+  - Protocol: _server_negotiated_caps
+  - Target selection: _current_manager_idx, _current_gate_idx
+  - Leadership: _gate_job_leaders, _manager_job_leaders, _request_routing_locks, _orphaned_jobs
+  - Metrics: _gate_transfers_received, _manager_transfers_received, _requests_rerouted, _requests_failed_leadership_change
+  - Gate connection: _gate_connection_state
+- [x] **15.1.3.2** Helper methods: initialize_job_tracking(), initialize_cancellation_tracking(), mark_job_target(), etc.
+- [x] **15.1.3.3** Metrics methods: increment_gate_transfers(), get_leadership_metrics(), etc.
+
+**AD Compliance**: ✅ No AD violations - state management only
+
+**Commit**: `83f99343` "Extract client config.py and state.py per REFACTOR.md"
+
+#### 15.1.4 Client TCP Handlers ✅ COMPLETE
+
+**Files**: `nodes/client/handlers/*.py`
+
+- [x] **15.1.4.1** Create `handlers/__init__.py` with all handler exports
+- [x] **15.1.4.2** Create `tcp_job_status_push.py` - JobStatusPushHandler, JobBatchPushHandler
+  - Handle JobStatusPush and JobBatchPush messages
+  - Update job status, call callbacks, signal completion
+- [x] **15.1.4.3** Create `tcp_job_result.py` - JobFinalResultHandler, GlobalJobResultHandler
+  - Handle JobFinalResult (single-DC) and GlobalJobResult (multi-DC)
+  - Update final results, signal completion
+- [x] **15.1.4.4** Create `tcp_reporter_result.py` - ReporterResultPushHandler
+  - Handle ReporterResultPush messages
+  - Store reporter results, invoke callbacks
+- [x] **15.1.4.5** Create `tcp_workflow_result.py` - WorkflowResultPushHandler
+  - Handle WorkflowResultPush messages
+  - Convert per-DC results, invoke callbacks, submit to local reporters
+- [x] **15.1.4.6** Create `tcp_windowed_stats.py` - WindowedStatsPushHandler
+  - Handle WindowedStatsPush (cloudpickle)
+  - Rate limiting with AdaptiveRateLimiter
+  - Invoke progress callbacks
+- [x] **15.1.4.7** Create `tcp_cancellation_complete.py` - CancellationCompleteHandler
+  - Handle JobCancellationComplete (AD-20)
+  - Store success/errors, fire completion event
+- [x] **15.1.4.8** Create `tcp_leadership_transfer.py` - GateLeaderTransferHandler, ManagerLeaderTransferHandler
+  - Handle GateJobLeaderTransfer and ManagerJobLeaderTransfer
+  - Fence token validation, leader updates, routing lock acquisition
+  - Update job targets for sticky routing
+
+**AD Compliance**: ✅ Verified - preserves all push notification protocols
+- AD-20 (Cancellation): JobCancellationComplete handling intact
+- AD-16 (Leadership Transfer): Fence token validation preserved
+
+**Commits**:
+- `bc326f44` "Extract client TCP handlers (batch 1 of 2)"
+- `3bbcf57a` "Extract client TCP handlers (batch 2 of 2)"
+
+#### 15.1.5 Client Target Selection ✅ COMPLETE
+
+**File**: `nodes/client/targets.py`
+
+- [x] **15.1.5.1** Create ClientTargetSelector class
+  - get_callback_addr() - Client TCP address for push notifications
+  - get_next_manager() - Round-robin manager selection
+  - get_next_gate() - Round-robin gate selection
+  - get_all_targets() - Combined gates + managers list
+  - get_targets_for_job() - Sticky routing with job target first
+  - get_preferred_gate_for_job() - Gate leader from leadership tracker
+  - get_preferred_manager_for_job() - Manager leader from leadership tracker
+
+**AD Compliance**: ✅ No AD violations - target selection logic unchanged
+
+**Commit**: `ad553e0c` "Extract client targets.py per REFACTOR.md Phase 1.2"
+
+#### 15.1.6 Client Protocol Negotiation ⏳ PENDING
+
+**File**: `nodes/client/protocol.py`
+
+- [ ] **15.1.6.1** Create ClientProtocol class
+  - negotiate_capabilities() - Protocol version negotiation
+  - get_features_for_version() - Feature set extraction
+  - handle_rate_limit_response() - Rate limit response processing
+  - validate_server_compatibility() - Check protocol compatibility
+- [ ] **15.1.6.2** Store negotiated capabilities in state._server_negotiated_caps
+- [ ] **15.1.6.3** Build capabilities string from CURRENT_PROTOCOL_VERSION
+
+**AD Compliance Check Required**: Protocol negotiation must not break message serialization
+
+#### 15.1.7 Client Leadership Tracking ⏳ PENDING
+
+**File**: `nodes/client/leadership.py`
+
+- [ ] **15.1.7.1** Create ClientLeadershipTracker class
+  - validate_gate_fence_token() - Fence token monotonicity check
+  - validate_manager_fence_token() - Fence token check for job+DC
+  - update_gate_leader() - Store GateLeaderInfo with timestamp
+  - update_manager_leader() - Store ManagerLeaderInfo keyed by (job_id, datacenter_id)
+  - mark_job_orphaned() - Create OrphanedJobInfo
+  - clear_job_orphaned() - Remove orphan status
+  - is_job_orphaned() - Check orphan state
+  - get_current_gate_leader() - Retrieve gate leader address
+  - get_current_manager_leader() - Retrieve manager leader address
+  - orphan_check_loop() - Background task for orphan detection
+
+**AD Compliance Check Required**: Must preserve AD-16 (Leadership Transfer) fence token semantics
+
+#### 15.1.8 Client Job Tracking ⏳ PENDING
+
+**File**: `nodes/client/tracking.py`
+
+- [ ] **15.1.8.1** Create ClientJobTracker class
+  - initialize_job_tracking() - Setup job structures
+  - update_job_status() - Update status, signal if final
+  - mark_job_failed() - Set FAILED status with error
+  - wait_for_job() - Async wait with timeout
+  - get_job_status() - Non-blocking status retrieval
+
+**AD Compliance Check Required**: No AD violations expected - job lifecycle tracking
+
+#### 15.1.9 Client Job Submission ⏳ PENDING
+
+**File**: `nodes/client/submission.py`
+
+- [ ] **15.1.9.1** Create ClientJobSubmitter class
+  - submit_job() - Main submission flow with retry logic
+  - _extract_reporter_configs() - Extract from workflow.reporting
+  - _validate_submission_size() - 5MB pre-submission check
+  - _build_job_submission() - Create JobSubmission message
+  - _handle_leader_redirect() - Process redirect responses
+  - _is_transient_error() - Detect syncing/not ready/election errors
+  - _retry_with_exponential_backoff() - 5 retries with backoff
+
+**AD Compliance Check Required**: Must preserve job submission protocol integrity
+
+#### 15.1.10 Client Cancellation ⏳ PENDING
+
+**File**: `nodes/client/cancellation.py`
+
+- [ ] **15.1.10.1** Create ClientCancellationManager class
+  - cancel_job() - Send JobCancelRequest with retry
+  - await_job_cancellation() - Wait for completion with timeout
+  - _handle_cancel_response() - Process JobCancelResponse
+
+**AD Compliance Check Required**: Must preserve AD-20 (Cancellation) protocol
+
+#### 15.1.11 Client Reporting ⏳ PENDING
+
+**File**: `nodes/client/reporting.py`
+
+- [ ] **15.1.11.1** Create ClientReportingManager class
+  - submit_to_local_reporters() - File-based reporter submission
+  - _submit_single_reporter() - Create Reporter, connect, submit, close
+  - _get_local_reporter_configs() - Filter for JSON/CSV/XML
+  - _create_default_reporter_configs() - Default JSONConfig per workflow
+
+**AD Compliance Check Required**: No AD violations expected - local file handling
+
+#### 15.1.12 Client Discovery ⏳ PENDING
+
+**File**: `nodes/client/discovery.py`
+
+- [ ] **15.1.12.1** Create ClientDiscovery class
+  - ping_manager() - Single manager ping
+  - ping_gate() - Single gate ping
+  - ping_all_managers() - Concurrent ping with gather
+  - ping_all_gates() - Concurrent ping with gather
+  - query_workflows() - Query from managers (job-aware)
+  - query_workflows_via_gate() - Query single gate
+  - query_all_gates_workflows() - Concurrent gate query
+  - get_datacenters() - Query datacenter list from gate
+  - get_datacenters_from_all_gates() - Concurrent datacenter query
+
+**AD Compliance Check Required**: No AD violations expected - discovery/query operations
+
+#### 15.1.13 Client Composition Root ⏳ PENDING
+
+**File**: `nodes/client/client.py` (refactor existing)
+
+- [ ] **15.1.13.1** Transform HyperscaleClient into thin orchestration layer
+  - Initialize config and state
+  - Create all module instances with dependency injection
+  - Wire handlers with module dependencies
+  - Public API delegates to modules
+  - Target: < 500 lines (currently 1,957 lines)
+- [ ] **15.1.13.2** Register all TCP handlers with @tcp.receive() delegation
+- [ ] **15.1.13.3** Implement _register_handlers() helper
+
+**AD Compliance Check Required**: Full integration test - must not break any client functionality
+
+---
+
+### 15.2 Worker Refactoring (Phase 2)
+
+**Status**: ⏳ **0% COMPLETE** - Not started
+
+**Target Structure**:
+```
+nodes/worker/
+  __init__.py
+  server.py (composition root)
+  config.py
+  state.py
+  models/
+  handlers/
+  registry.py
+  execution.py
+  health.py
+  sync.py
+  cancellation.py
+  discovery.py
+  backpressure.py
+```
+
+#### 15.2.1 Worker Module Structure ⏳ PENDING
+
+- [ ] **15.2.1.1** Create `nodes/worker/` directory tree
+- [ ] **15.2.1.2** Create `models/`, `handlers/` subdirectories
+- [ ] **15.2.1.3** Create `__init__.py` with WorkerServer export
+
+#### 15.2.2 Worker Models ⏳ PENDING
+
+**Files**: `nodes/worker/models/*.py`
+
+- [ ] **15.2.2.1** Create ManagerPeerState dataclass (slots=True)
+  - Fields: manager_addr, udp_addr, last_seen, health_status
+- [ ] **15.2.2.2** Create WorkflowRuntimeState dataclass (slots=True)
+  - Fields: workflow_id, status, allocated_cores, start_time
+- [ ] **15.2.2.3** Create CancelState dataclass (slots=True)
+  - Fields: workflow_id, cancel_requested_at, cancel_completed
+- [ ] **15.2.2.4** Create ExecutionMetrics dataclass (slots=True)
+  - Fields: workflows_executed, cores_allocated, avg_duration
+
+**AD Compliance Check Required**: No AD violations expected - state containers
+
+#### 15.2.3 Worker Configuration ⏳ PENDING
+
+**File**: `nodes/worker/config.py`
+
+- [ ] **15.2.3.1** Create WorkerConfig dataclass (slots=True)
+  - Core allocation: total_cores, max_workflow_cores
+  - Timeouts: workflow_timeout, cancel_timeout
+  - Health: heartbeat_interval, health_check_interval
+  - Discovery: discovery_interval
+  - Backpressure: overload_threshold, shed_load_threshold
+
+**AD Compliance Check Required**: No AD violations - configuration
+
+#### 15.2.4 Worker State ⏳ PENDING
+
+**File**: `nodes/worker/state.py`
+
+- [ ] **15.2.4.1** Create WorkerState class with mutable structures
+  - Active workflows: _workflows, _workflow_fence_tokens
+  - Core allocation: _allocated_cores, _core_allocator
+  - Manager tracking: _manager_peers, _circuits
+  - Execution: _workflow_results, _cancel_requests
+
+**AD Compliance Check Required**: No AD violations - state management
+
+#### 15.2.5 Worker TCP Handlers ⏳ PENDING
+
+**Files**: `nodes/worker/handlers/*.py`
+
+- [ ] **15.2.5.1** Create `tcp_dispatch.py` - WorkflowDispatchHandler
+- [ ] **15.2.5.2** Create `tcp_cancel.py` - WorkflowCancelHandler
+- [ ] **15.2.5.3** Create `tcp_state_sync.py` - StateSyncHandler
+- [ ] **15.2.5.4** Create `tcp_leader_transfer.py` - LeaderTransferHandler
+- [ ] **15.2.5.5** Create `tcp_manager_registration.py` - ManagerRegistrationHandler
+
+**AD Compliance Check Required**: Must preserve workflow dispatch protocol (AD-33)
+
+#### 15.2.6 Worker Core Modules ⏳ PENDING
+
+**Files**: `nodes/worker/*.py`
+
+- [ ] **15.2.6.1** Create `execution.py` - WorkerExecutor
+  - handle_dispatch(), allocate_cores(), report_progress(), cleanup()
+- [ ] **15.2.6.2** Create `registry.py` - WorkerRegistry
+  - register_manager(), track_health(), peer_discovery()
+- [ ] **15.2.6.3** Create `sync.py` - WorkerStateSync
+  - generate_snapshot(), handle_sync_request()
+- [ ] **15.2.6.4** Create `cancellation.py` - WorkerCancellationHandler
+  - handle_cancel(), notify_completion()
+- [ ] **15.2.6.5** Create `health.py` - WorkerHealthIntegration
+  - swim_callbacks(), health_embedding(), overload_detection()
+- [ ] **15.2.6.6** Create `backpressure.py` - WorkerBackpressureManager
+  - overload_signals(), circuit_breakers(), load_shedding()
+- [ ] **15.2.6.7** Create `discovery.py` - WorkerDiscoveryManager
+  - discovery_integration(), maintenance_loop()
+
+**AD Compliance Check Required**: Must preserve AD-33 (Workflow State Machine) transitions
+
+#### 15.2.7 Worker Composition Root ⏳ PENDING
+
+**File**: `nodes/worker/server.py`
+
+- [ ] **15.2.7.1** Refactor WorkerServer to composition root (target < 500 lines)
+- [ ] **15.2.7.2** Wire all modules with dependency injection
+- [ ] **15.2.7.3** Register all handlers
+
+**AD Compliance Check Required**: Full integration - worker dispatch must work end-to-end
+
+---
+
+### 15.3 Gate Refactoring (Phase 3)
+
+**Status**: ⏳ **0% COMPLETE** - Not started (8,093 lines to refactor)
+
+**Target Structure**:
+```
+nodes/gate/
+  __init__.py
+  server.py (composition root)
+  config.py
+  state.py
+  models/
+  handlers/
+  registry.py
+  discovery.py
+  routing.py
+  dispatch.py
+  sync.py
+  health.py
+  leadership.py
+  stats.py
+  cancellation.py
+  leases.py
+```
+
+#### 15.3.1 Gate Module Structure ⏳ PENDING
+
+- [ ] **15.3.1.1** Create `nodes/gate/` directory tree
+- [ ] **15.3.1.2** Create `models/`, `handlers/` subdirectories
+
+#### 15.3.2 Gate Models ⏳ PENDING
+
+**Files**: `nodes/gate/models/*.py`
+
+- [ ] **15.3.2.1** Create GatePeerState (slots=True)
+- [ ] **15.3.2.2** Create DCHealthState (slots=True)
+- [ ] **15.3.2.3** Create JobForwardingState (slots=True)
+- [ ] **15.3.2.4** Create LeaseState (slots=True)
+
+**AD Compliance Check Required**: No AD violations - state containers
+
+#### 15.3.3 Gate Configuration ⏳ PENDING
+
+**File**: `nodes/gate/config.py`
+
+- [ ] **15.3.3.1** Create GateConfig dataclass (slots=True)
+
+**AD Compliance Check Required**: No AD violations - configuration
+
+#### 15.3.4 Gate State ⏳ PENDING
+
+**File**: `nodes/gate/state.py`
+
+- [ ] **15.3.4.1** Create GateState class with all mutable structures
+
+**AD Compliance Check Required**: No AD violations - state management
+
+#### 15.3.5 Gate TCP/UDP Handlers ⏳ PENDING
+
+**Files**: `nodes/gate/handlers/*.py` (25 handlers)
+
+- [ ] **15.3.5.1** Extract job submission handlers (3 handlers)
+- [ ] **15.3.5.2** Extract DC status/progress handlers (5 handlers)
+- [ ] **15.3.5.3** Extract gate peer coordination handlers (4 handlers)
+- [ ] **15.3.5.4** Extract cancellation handlers (3 handlers)
+- [ ] **15.3.5.5** Extract leadership/lease handlers (4 handlers)
+- [ ] **15.3.5.6** Extract discovery/query handlers (6 handlers)
+
+**AD Compliance Check Required**: Must preserve all gate coordination protocols
+
+#### 15.3.6 Gate Core Modules ⏳ PENDING
+
+**Files**: `nodes/gate/*.py`
+
+- [ ] **15.3.6.1** Create `registry.py` - Reuse GateJobManager, ConsistentHashRing
+- [ ] **15.3.6.2** Create `routing.py` - Reuse GateJobRouter (AD-36), DatacenterHealthManager
+- [ ] **15.3.6.3** Create `dispatch.py` - Reuse ManagerDispatcher
+- [ ] **15.3.6.4** Create `sync.py` - State sync logic
+- [ ] **15.3.6.5** Create `health.py` - Reuse CircuitBreakerManager, LatencyTracker
+- [ ] **15.3.6.6** Create `leadership.py` - Reuse JobLeadershipTracker
+- [ ] **15.3.6.7** Create `stats.py` - Reuse WindowedStatsCollector
+- [ ] **15.3.6.8** Create `cancellation.py` - Cancel coordination
+- [ ] **15.3.6.9** Create `leases.py` - Reuse JobLeaseManager, DatacenterLeaseManager
+- [ ] **15.3.6.10** Create `discovery.py` - Reuse DiscoveryService
+
+**AD Compliance Check Required**: Must preserve:
+- AD-36 (Vivaldi Routing) - GateJobRouter integration
+- AD-17 (DC Health) - Health bucket semantics
+- AD-30 (Hierarchical Failure Detection) - CircuitBreakerManager
+- AD-34 (Adaptive Timeout) - GateJobTimeoutTracker
+
+#### 15.3.7 Gate Composition Root ⏳ PENDING
+
+**File**: `nodes/gate/server.py`
+
+- [ ] **15.3.7.1** Refactor GateServer to composition root (target < 500 lines from 8,093)
+- [ ] **15.3.7.2** Wire all modules with dependency injection
+- [ ] **15.3.7.3** Register all 25 handlers
+
+**AD Compliance Check Required**: Full integration - all gate workflows must work
+
+---
+
+### 15.4 Manager Refactoring (Phase 4)
+
+**Status**: ⏳ **0% COMPLETE** - Not started (12,234 lines to refactor)
+
+**Target Structure**:
+```
+nodes/manager/
+  __init__.py
+  server.py (composition root)
+  config.py
+  state.py
+  models/
+  handlers/
+  registry.py
+  dispatch.py
+  sync.py
+  health.py
+  leadership.py
+  stats.py
+  cancellation.py
+  leases.py
+  discovery.py
+  workflow_lifecycle.py
+```
+
+#### 15.4.1 Manager Module Structure ⏳ PENDING
+
+- [ ] **15.4.1.1** Create `nodes/manager/` directory tree
+- [ ] **15.4.1.2** Create `models/`, `handlers/` subdirectories
+
+#### 15.4.2 Manager Models ⏳ PENDING
+
+**Files**: `nodes/manager/models/*.py`
+
+- [ ] **15.4.2.1** Create PeerState (slots=True)
+- [ ] **15.4.2.2** Create WorkerSyncState (slots=True)
+- [ ] **15.4.2.3** Create JobSyncState (slots=True)
+- [ ] **15.4.2.4** Create WorkflowLifecycleState (slots=True)
+- [ ] **15.4.2.5** Create ProvisionState (slots=True)
+
+**AD Compliance Check Required**: No AD violations - state containers
+
+#### 15.4.3 Manager Configuration ⏳ PENDING
+
+**File**: `nodes/manager/config.py`
+
+- [ ] **15.4.3.1** Create ManagerConfig dataclass (slots=True)
+
+**AD Compliance Check Required**: No AD violations - configuration
+
+#### 15.4.4 Manager State ⏳ PENDING
+
+**File**: `nodes/manager/state.py`
+
+- [ ] **15.4.4.1** Create ManagerState class with all mutable structures
+
+**AD Compliance Check Required**: No AD violations - state management
+
+#### 15.4.5 Manager TCP/UDP Handlers ⏳ PENDING
+
+**Files**: `nodes/manager/handlers/*.py` (27 handlers)
+
+- [ ] **15.4.5.1** Extract handlers systematically (27 total)
+
+**AD Compliance Check Required**: Must preserve all manager protocols
+
+#### 15.4.6 Manager Core Modules ⏳ PENDING
+
+**Files**: `nodes/manager/*.py`
+
+- [ ] **15.4.6.1** Create `workflow_lifecycle.py` - AD-33 transitions, dependency resolution
+- [ ] **15.4.6.2** Create `dispatch.py` - Worker allocation, quorum coordination
+- [ ] **15.4.6.3** Create `registry.py` - Worker/gate/peer management
+- [ ] **15.4.6.4** Create `sync.py` - Complex worker and peer sync
+- [ ] **15.4.6.5** Create `health.py` - Worker health monitoring
+- [ ] **15.4.6.6** Create `leadership.py` - Manager election, split-brain
+- [ ] **15.4.6.7** Create `stats.py` - Stats aggregation, backpressure
+- [ ] **15.4.6.8** Create `cancellation.py` - Workflow cancellation propagation
+- [ ] **15.4.6.9** Create `leases.py` - Fencing tokens, ownership
+- [ ] **15.4.6.10** Create `discovery.py` - Discovery service
+
+**AD Compliance Check Required**: Must preserve:
+- AD-33 (Workflow State Machine) - All transitions intact
+- AD-34 (Adaptive Timeout) - Timeout strategies preserved
+- AD-20 (Cancellation) - Cancellation flows intact
+
+#### 15.4.7 Manager Composition Root ⏳ PENDING
+
+**File**: `nodes/manager/server.py`
+
+- [ ] **15.4.7.1** Refactor ManagerServer to composition root (target < 500 lines from 12,234)
+- [ ] **15.4.7.2** Wire all modules with dependency injection
+- [ ] **15.4.7.3** Register all 27 handlers
+
+**AD Compliance Check Required**: Full integration - all manager workflows must work
+
+---
+
+### 15.5 Refactoring Verification
+
+**Status**: ⏳ **PENDING** - After all servers complete
+
+- [ ] **15.5.1** Run LSP diagnostics on all touched files
+- [ ] **15.5.2** Verify all imports resolve
+- [ ] **15.5.3** Check cyclomatic complexity (max 5 for classes, 4 for functions)
+- [ ] **15.5.4** Verify all dataclasses use slots=True
+- [ ] **15.5.5** Verify no duplicate state across modules
+- [ ] **15.5.6** Verify all server files < 500 lines (composition roots)
+- [ ] **15.5.7** **Run integration tests** (user will execute)
+- [ ] **15.5.8** **Verify AD-10 through AD-37 compliance** (comprehensive review)
+
+---
+
+### 15.6 Refactoring Progress Tracking
+
+**Overall Progress**: 15% Complete
+
+**Completed Phases**:
+- ✅ Client Phase 1.1: TCP Handlers (10 handlers extracted)
+- ✅ Client Phase 1.2: Core Modules (1/8 complete - targets.py done)
+
+**Current Phase**: Client Phase 1.2 - Extracting remaining 7 core modules
+
+**Remaining Phases**:
+- Client Phase 1.2: 7 modules (protocol, leadership, tracking, submission, cancellation, reporting, discovery)
+- Client Phase 1.3: Composition root refactor
+- Worker Phases 2.1-2.7: Complete worker refactoring
+- Gate Phases 3.1-3.7: Complete gate refactoring
+- Manager Phases 4.1-4.7: Complete manager refactoring
+- Verification Phase 15.5: Final validation
+
+**Time Estimates**:
+- Client remaining: 6-8 hours
+- Worker: 6-8 hours
+- Gate: 12-16 hours
+- Manager: 14-18 hours
+- Verification: 2-3 hours
+- **Total remaining: 40-53 hours**
+
+---
+
