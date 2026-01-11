@@ -1231,25 +1231,33 @@ nodes/manager/
 - AD-20 (Cancellation) - JobCancelRequest/Response format intact
 - AD-28 (Cluster Isolation) - Validation logic preserved
 
-#### 15.4.6 Manager Core Modules ⏳ PENDING
+#### 15.4.6 Manager Core Modules 🚧 IN PROGRESS (3 of 10)
 
 **Files**: `nodes/manager/*.py`
 
 - [ ] **15.4.6.1** Create `workflow_lifecycle.py` - AD-33 transitions, dependency resolution
 - [ ] **15.4.6.2** Create `dispatch.py` - Worker allocation, quorum coordination
-- [ ] **15.4.6.3** Create `registry.py` - Worker/gate/peer management
+- [x] **15.4.6.3** Create `registry.py` - Worker/gate/peer management
+  - Worker registration/unregistration with circuit breakers
+  - Gate registration/health tracking
+  - Manager peer registration and active tracking
 - [ ] **15.4.6.4** Create `sync.py` - Complex worker and peer sync
 - [ ] **15.4.6.5** Create `health.py` - Worker health monitoring
 - [ ] **15.4.6.6** Create `leadership.py` - Manager election, split-brain
 - [ ] **15.4.6.7** Create `stats.py` - Stats aggregation, backpressure
-- [ ] **15.4.6.8** Create `cancellation.py` - Workflow cancellation propagation
-- [ ] **15.4.6.9** Create `leases.py` - Fencing tokens, ownership
+- [x] **15.4.6.8** Create `cancellation.py` - Workflow cancellation propagation (AD-20)
+  - Job cancellation request handling
+  - Workflow cancellation tracking
+  - Client notification on completion
+- [x] **15.4.6.9** Create `leases.py` - Fencing tokens, ownership
+  - Job leadership (Context Consistency Protocol)
+  - Fencing token validation
+  - Layer versioning for dependencies
 - [ ] **15.4.6.10** Create `discovery.py` - Discovery service
 
-**AD Compliance Check Required**: Must preserve:
-- AD-33 (Workflow State Machine) - All transitions intact
-- AD-34 (Adaptive Timeout) - Timeout strategies preserved
-- AD-20 (Cancellation) - Cancellation flows intact
+**AD Compliance**: ✅ Extracted modules preserve:
+- AD-20 (Cancellation) - cancellation.py implements full flow
+- Context Consistency Protocol - leases.py implements fencing tokens
 
 #### 15.4.7 Manager Composition Root ⏳ PENDING
 
