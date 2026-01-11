@@ -937,11 +937,11 @@ class TestClientDiscovery:
         """Test datacenter discovery with many datacenters."""
         datacenters = [
             DatacenterInfo(
-                datacenter_id=f"dc-{i}",
-                manager_leader_addr=(f"manager{i}", 7000 + i),
-                status="healthy",
+                dc_id=f"dc-{i}",
+                health="healthy",
+                leader_addr=(f"manager{i}", 7000 + i),
                 available_cores=100,
-                total_workers=10,
+                worker_count=10,
             )
             for i in range(50)
         ]

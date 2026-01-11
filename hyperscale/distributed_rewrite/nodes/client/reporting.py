@@ -108,7 +108,7 @@ class ClientReportingManager:
         local_configs = [
             config for config in configs
             if hasattr(config, 'reporter_type')
-            and config.reporter_type in self._config.local_reporter_types
+            and config.reporter_type.name in self._config.local_reporter_types
         ]
 
         return local_configs
