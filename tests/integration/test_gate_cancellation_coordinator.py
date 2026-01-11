@@ -59,6 +59,7 @@ class TestCancelJobHappyPath:
     async def test_cancel_job_success(self):
         """Successfully cancel job across all DCs."""
         state = GateRuntimeState()
+        responses_received = [0]
 
         async def mock_send_tcp(addr, msg_type, data, timeout=None):
             # Return properly serialized CancelAck
@@ -67,6 +68,12 @@ class TestCancelJobHappyPath:
                 cancelled=True,
                 workflows_cancelled=5,
             )
+            # Track responses and set event when all DCs have responded
+            responses_received[0] += 1
+            if responses_received[0] >= 2:  # 2 DCs
+                event = state.get_cancellation_event("job-1")
+                if event:
+                    event.set()
             return (ack.dump(), None)
 
         coordinator = GateCancellationCoordinator(
