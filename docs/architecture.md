@@ -33138,3 +33138,1610 @@ The system provides at-most-once semantics through layered deduplication:
 │                                                                          │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
+
+## AD-41: Resource Guards - CPU/Memory Monitoring and Enforcement
+
+### Part 1: Problem Statement and Requirements
+
+#### The Resource Exhaustion Problem
+
+In a distributed performance testing framework, workflows executing on workers can consume unbounded resources:
+
+1. **Runaway workflows** - Bugs causing infinite loops or memory leaks
+2. **Misconfigured jobs** - Users requesting more resources than allocated
+3. **Cascading failures** - One overloaded worker destabilizing the cluster
+4. **Invisible degradation** - No visibility into actual vs expected resource usage
+
+Without resource guards, a single misbehaving workflow can:
+- Exhaust worker memory, causing OOM kills
+- Saturate worker CPU, starving other workflows
+- Propagate back-pressure through the entire system
+- Provide no signal to operators until catastrophic failure
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    THE RESOURCE EXHAUSTION PROBLEM                       │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  SCENARIO: Workflow with memory leak runs on worker                      │
+│                                                                          │
+│  WITHOUT RESOURCE GUARDS:                                                │
+│  ┌──────────┐        ┌──────────┐        ┌──────────┐                   │
+│  │  Manager │        │  Worker  │        │  Workflow │                  │
+│  └────┬─────┘        └────┬─────┘        └────┬─────┘                   │
+│       │                   │                   │                          │
+│       │──dispatch────────▶│──start───────────▶│                          │
+│       │                   │                   │                          │
+│       │                   │                   │── mem: 1GB               │
+│       │◀──heartbeat──────│                   │                          │
+│       │   (no resource   │                   │── mem: 4GB               │
+│       │    info)         │                   │                          │
+│       │                   │                   │── mem: 12GB              │
+│       │◀──heartbeat──────│                   │                          │
+│       │   (still no      │                   │── mem: 15GB              │
+│       │    resource info)│                   │                          │
+│       │                   │                   │── mem: 16GB → OOM!       │
+│       │                   │◀──SIGKILL────────│                          │
+│       │                   │                   │                          │
+│       │◀──worker crash!──│                   │                          │
+│       │                   │                   │                          │
+│  RESULT: Worker dies, all workflows on it lost, no warning               │
+│                                                                          │
+│  WITH RESOURCE GUARDS:                                                   │
+│  ┌──────────┐        ┌──────────┐        ┌──────────┐                   │
+│  │  Manager │        │  Worker  │        │  Workflow │                  │
+│  └────┬─────┘        └────┬─────┘        └────┬─────┘                   │
+│       │                   │                   │                          │
+│       │──dispatch────────▶│──start───────────▶│                          │
+│       │   budget: 8GB     │                   │                          │
+│       │                   │                   │── mem: 1GB               │
+│       │◀──heartbeat──────│                   │                          │
+│       │   mem: 1GB       │                   │── mem: 4GB               │
+│       │                   │◀──sample─────────│                          │
+│       │◀──heartbeat──────│                   │                          │
+│       │   mem: 4GB (50%) │                   │── mem: 7GB               │
+│       │                   │◀──sample─────────│                          │
+│       │◀──heartbeat──────│                   │                          │
+│       │   mem: 7GB (87%) │                   │                          │
+│       │   ⚠️ WARNING      │                   │                          │
+│       │                   │                   │── mem: 8.5GB             │
+│       │◀──heartbeat──────│                   │                          │
+│       │   mem: 8.5GB     │                   │                          │
+│       │   ❌ KILL         │                   │                          │
+│       │──ResourceKill────▶│──SIGTERM─────────▶│                          │
+│       │                   │                   │                          │
+│       │◀──killed─────────│                   │                          │
+│       │                   │                   │                          │
+│  RESULT: Workflow killed gracefully, worker survives, job notified       │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Requirements
+
+1. **Accurate Monitoring**: CPU/memory usage tracked across entire process trees (workflows may spawn subprocesses)
+2. **Low Overhead**: Monitoring must not significantly impact workflow performance
+3. **Asyncio Compatible**: All monitoring must be non-blocking and work with asyncio event loops
+4. **Hierarchical Aggregation**: Workers → Managers → Gates, with accurate cluster-wide totals
+5. **Multi-Node Topology**: Handle multiple managers per datacenter, multiple gates per datacenter
+6. **Noise Reduction**: Filter measurement noise without hiding real violations
+7. **Uncertainty Quantification**: Know confidence in measurements for smarter decisions
+8. **Graduated Enforcement**: WARN → THROTTLE → KILL progression with grace periods
+9. **Pure Python**: pip-installable, no custom C code or eBPF
+
+### Part 2: Kalman Filtering for Resource Metrics
+
+#### Why Kalman Filtering Instead of EWMA?
+
+Resource metrics from `psutil` are inherently noisy due to:
+- Context switches during sampling
+- Kernel scheduling jitter
+- GC pauses in monitored processes
+- Subprocess spawn/exit timing
+
+EWMA (Exponentially Weighted Moving Average) is commonly used but has limitations:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    EWMA vs KALMAN FILTER COMPARISON                      │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  EWMA (Exponentially Weighted Moving Average):                           │
+│  ─────────────────────────────────────────────                           │
+│  estimate(k) = α × measurement(k) + (1-α) × estimate(k-1)               │
+│                                                                          │
+│  Problems:                                                               │
+│  1. Fixed gain (α) - cannot adapt to changing noise conditions           │
+│  2. No uncertainty estimate - just a point value                         │
+│  3. Lag vs noise tradeoff - low α = smooth but laggy                    │
+│  4. Cannot model dynamics - assumes random walk                          │
+│                                                                          │
+│  KALMAN FILTER:                                                          │
+│  ─────────────────────────────────────────────                           │
+│  K(k) = P_pred(k) / (P_pred(k) + R)         ← Adaptive gain             │
+│  estimate(k) = prediction(k) + K(k) × innovation(k)                     │
+│  P(k) = (1 - K(k)) × P_pred(k)              ← Uncertainty update        │
+│                                                                          │
+│  Advantages:                                                             │
+│  1. Adaptive gain - automatically balances responsiveness vs smoothing  │
+│  2. Uncertainty estimate - know confidence in each measurement          │
+│  3. Optimal filtering - minimizes mean squared error                    │
+│  4. Can extend to model dynamics (acceleration, trends)                 │
+│                                                                          │
+│  PRACTICAL IMPACT:                                                       │
+│                                                                          │
+│  Raw samples:    [45, 120, 38, 95, 42, 180, 40, 55]  (noisy!)           │
+│  EWMA (α=0.3):   [45, 67, 58, 69, 61, 97, 80, 72]   (smooth but laggy) │
+│  Kalman:         [45, 68, 58, 68, 62, 88, 75, 70]   (smooth + adaptive)│
+│  Uncertainty:    [50, 35, 28, 24, 21, 28, 24, 22]   (EWMA can't do this)│
+│                                                                          │
+│  With uncertainty, we can make smarter enforcement decisions:            │
+│  - High uncertainty + near threshold → wait for more samples            │
+│  - Low uncertainty + over threshold → take action confidently           │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Kalman Filter Implementation
+
+```python
+from dataclasses import dataclass, field
+
+import numpy as np
+
+
+@dataclass
+class ScalarKalmanFilter:
+    """
+    1D Kalman filter for resource metric smoothing.
+    
+    State model: x(k) = x(k-1) + w, where w ~ N(0, Q)
+    Measurement model: z(k) = x(k) + v, where v ~ N(0, R)
+    
+    Q = process noise (how much true value can change between samples)
+    R = measurement noise (how noisy psutil readings are)
+    """
+    
+    process_noise: float = 10.0   # Q: variance in true value change
+    measurement_noise: float = 25.0  # R: variance in measurements
+    
+    _estimate: float = field(default=0.0, init=False)
+    _error_covariance: float = field(default=1000.0, init=False)  # Start uncertain
+    _initialized: bool = field(default=False, init=False)
+    _sample_count: int = field(default=0, init=False)
+    
+    def update(self, measurement: float) -> tuple[float, float]:
+        """
+        Update filter with new measurement.
+        Returns (estimate, uncertainty_stddev).
+        """
+        if not self._initialized:
+            self._estimate = measurement
+            self._error_covariance = self.measurement_noise
+            self._initialized = True
+            self._sample_count = 1
+            return self._estimate, np.sqrt(self._error_covariance)
+        
+        # Predict step
+        predicted_estimate = self._estimate  # Random walk: prediction = last estimate
+        predicted_covariance = self._error_covariance + self.process_noise
+        
+        # Update step
+        kalman_gain = predicted_covariance / (predicted_covariance + self.measurement_noise)
+        innovation = measurement - predicted_estimate
+        
+        self._estimate = predicted_estimate + kalman_gain * innovation
+        self._error_covariance = (1.0 - kalman_gain) * predicted_covariance
+        self._sample_count += 1
+        
+        return self._estimate, np.sqrt(self._error_covariance)
+    
+    def get_estimate(self) -> float:
+        return self._estimate
+    
+    def get_uncertainty(self) -> float:
+        return np.sqrt(self._error_covariance)
+    
+    def get_sample_count(self) -> int:
+        return self._sample_count
+
+
+@dataclass
+class AdaptiveKalmanFilter:
+    """
+    Kalman filter with adaptive noise estimation.
+    
+    Automatically tunes Q and R based on innovation sequence.
+    Better for resource monitoring where noise characteristics vary
+    based on workload patterns.
+    """
+    
+    initial_process_noise: float = 10.0
+    initial_measurement_noise: float = 25.0
+    adaptation_rate: float = 0.1
+    innovation_window: int = 20
+    
+    _estimate: float = field(default=0.0, init=False)
+    _error_covariance: float = field(default=1000.0, init=False)
+    _process_noise: float = field(default=10.0, init=False)
+    _measurement_noise: float = field(default=25.0, init=False)
+    _innovations: list[float] = field(default_factory=list, init=False)
+    _initialized: bool = field(default=False, init=False)
+    _sample_count: int = field(default=0, init=False)
+    
+    def __post_init__(self) -> None:
+        self._process_noise = self.initial_process_noise
+        self._measurement_noise = self.initial_measurement_noise
+    
+    def update(self, measurement: float) -> tuple[float, float]:
+        """Update with adaptive noise estimation."""
+        if not self._initialized:
+            self._estimate = measurement
+            self._error_covariance = self._measurement_noise
+            self._initialized = True
+            self._sample_count = 1
+            return self._estimate, np.sqrt(self._error_covariance)
+        
+        # Predict
+        predicted_estimate = self._estimate
+        predicted_covariance = self._error_covariance + self._process_noise
+        
+        # Innovation
+        innovation = measurement - predicted_estimate
+        innovation_covariance = predicted_covariance + self._measurement_noise
+        
+        # Store for adaptation
+        self._innovations.append(innovation)
+        if len(self._innovations) > self.innovation_window:
+            self._innovations.pop(0)
+        
+        # Update
+        kalman_gain = predicted_covariance / innovation_covariance
+        self._estimate = predicted_estimate + kalman_gain * innovation
+        self._error_covariance = (1.0 - kalman_gain) * predicted_covariance
+        
+        # Adapt noise estimates
+        if len(self._innovations) >= self.innovation_window // 2:
+            self._adapt_noise()
+        
+        self._sample_count += 1
+        return self._estimate, np.sqrt(self._error_covariance)
+    
+    def _adapt_noise(self) -> None:
+        """Adapt Q and R based on innovation statistics."""
+        if len(self._innovations) < 2:
+            return
+        
+        innovations_array = np.array(self._innovations)
+        empirical_variance = np.var(innovations_array)
+        expected_variance = self._error_covariance + self._process_noise + self._measurement_noise
+        
+        ratio = empirical_variance / max(expected_variance, 1e-6)
+        
+        if ratio > 1.2:
+            self._measurement_noise *= (1.0 + self.adaptation_rate)
+        elif ratio < 0.8:
+            self._measurement_noise *= (1.0 - self.adaptation_rate)
+        
+        self._measurement_noise = np.clip(
+            self._measurement_noise,
+            self.initial_measurement_noise * 0.1,
+            self.initial_measurement_noise * 10.0,
+        )
+```
+
+### Part 3: Process Tree Resource Monitoring
+
+#### Design Rationale
+
+Workflows may spawn subprocesses (e.g., browser automation, external tools). We must monitor the entire process tree, not just the root process.
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    PROCESS TREE MONITORING                               │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  WORKFLOW PROCESS TREE:                                                  │
+│                                                                          │
+│  worker_process (PID 1000)                                               │
+│  └── workflow_executor (PID 1001)        ← Root of workflow tree        │
+│      ├── http_client_pool (PID 1002)     ← Connection workers           │
+│      │   ├── conn_worker_1 (PID 1003)                                   │
+│      │   └── conn_worker_2 (PID 1004)                                   │
+│      ├── browser_automation (PID 1005)   ← Headless browser             │
+│      │   └── chrome (PID 1006)                                          │
+│      │       ├── renderer_1 (PID 1007)                                  │
+│      │       └── renderer_2 (PID 1008)                                  │
+│      └── data_processor (PID 1009)       ← Data pipeline                │
+│                                                                          │
+│  NAIVE MONITORING (just PID 1001):                                       │
+│  - Sees: 5% CPU, 100MB memory                                           │
+│  - Reality: 400% CPU, 2GB memory (across tree)                          │
+│  - DANGEROUS: Severe under-counting                                     │
+│                                                                          │
+│  CORRECT MONITORING (psutil.Process.children(recursive=True)):           │
+│  - Traverses entire tree from PID 1001                                  │
+│  - Aggregates CPU/memory across all descendants                          │
+│  - Handles subprocess spawn/exit dynamically                            │
+│                                                                          │
+│  IMPLEMENTATION:                                                         │
+│                                                                          │
+│  async def sample_process_tree(root_pid: int) -> ResourceMetrics:       │
+│      process = psutil.Process(root_pid)                                 │
+│      children = process.children(recursive=True)                         │
+│      all_processes = [process] + children                                │
+│                                                                          │
+│      total_cpu = 0.0                                                     │
+│      total_memory = 0                                                    │
+│                                                                          │
+│      for proc in all_processes:                                          │
+│          try:                                                            │
+│              total_cpu += proc.cpu_percent(interval=None)               │
+│              total_memory += proc.memory_info().rss                     │
+│          except (NoSuchProcess, AccessDenied, ZombieProcess):           │
+│              continue  # Process died between listing and sampling      │
+│                                                                          │
+│      return ResourceMetrics(cpu=total_cpu, memory=total_memory)         │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Process Resource Monitor Implementation
+
+```python
+import asyncio
+import os
+from dataclasses import dataclass, field
+from time import monotonic
+from typing import Optional
+
+import psutil
+
+from hyperscale.distributed.resources.kalman_filter import AdaptiveKalmanFilter
+
+
+@dataclass(slots=True)
+class ResourceMetrics:
+    """Point-in-time resource usage with uncertainty."""
+    cpu_percent: float
+    cpu_uncertainty: float
+    memory_bytes: int
+    memory_uncertainty: float
+    memory_percent: float
+    file_descriptor_count: int
+    timestamp_monotonic: float = field(default_factory=monotonic)
+    sample_count: int = 1
+    process_count: int = 1
+    
+    def is_stale(self, max_age_seconds: float = 30.0) -> bool:
+        return (monotonic() - self.timestamp_monotonic) > max_age_seconds
+
+
+@dataclass
+class ProcessResourceMonitor:
+    """
+    Monitors resource usage for a process tree using psutil + Kalman filtering.
+    
+    Key design decisions:
+    1. psutil for cross-platform, accurate process tree monitoring
+    2. Kalman filtering for noise reduction with uncertainty quantification
+    3. asyncio.to_thread for non-blocking psutil calls
+    4. Handles subprocess spawn/exit dynamically
+    """
+    
+    root_pid: int = field(default_factory=os.getpid)
+    
+    # Kalman tuning (CPU is noisier than memory)
+    cpu_process_noise: float = 15.0
+    cpu_measurement_noise: float = 50.0
+    memory_process_noise: float = 1e6   # ~1MB variance
+    memory_measurement_noise: float = 1e7  # ~10MB noise
+    
+    _process: Optional[psutil.Process] = field(default=None, init=False)
+    _cpu_filter: AdaptiveKalmanFilter = field(init=False)
+    _memory_filter: AdaptiveKalmanFilter = field(init=False)
+    _last_metrics: Optional[ResourceMetrics] = field(default=None, init=False)
+    _lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False)
+    _total_memory: int = field(default=0, init=False)
+    _cpu_count: int = field(default=1, init=False)
+    
+    def __post_init__(self) -> None:
+        try:
+            self._process = psutil.Process(self.root_pid)
+        except psutil.NoSuchProcess:
+            self._process = None
+        
+        self._cpu_filter = AdaptiveKalmanFilter(
+            initial_process_noise=self.cpu_process_noise,
+            initial_measurement_noise=self.cpu_measurement_noise,
+        )
+        self._memory_filter = AdaptiveKalmanFilter(
+            initial_process_noise=self.memory_process_noise,
+            initial_measurement_noise=self.memory_measurement_noise,
+        )
+        
+        self._total_memory = psutil.virtual_memory().total
+        self._cpu_count = psutil.cpu_count() or 1
+    
+    async def sample(self) -> ResourceMetrics:
+        """Sample process tree, returning Kalman-filtered metrics."""
+        async with self._lock:
+            return await asyncio.to_thread(self._sample_sync)
+    
+    def _sample_sync(self) -> ResourceMetrics:
+        """Synchronous sampling - runs in thread pool."""
+        if self._process is None:
+            return self._empty_metrics()
+        
+        try:
+            try:
+                children = self._process.children(recursive=True)
+            except psutil.NoSuchProcess:
+                children = []
+            
+            all_processes = [self._process] + children
+            
+            raw_cpu = 0.0
+            raw_memory = 0
+            total_fds = 0
+            live_count = 0
+            
+            for proc in all_processes:
+                try:
+                    cpu = proc.cpu_percent(interval=None)
+                    mem_info = proc.memory_info()
+                    
+                    raw_cpu += cpu
+                    raw_memory += mem_info.rss
+                    
+                    try:
+                        total_fds += proc.num_fds()
+                    except (psutil.AccessDenied, AttributeError):
+                        pass
+                    
+                    live_count += 1
+                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                    continue
+            
+            # Apply Kalman filtering
+            cpu_est, cpu_unc = self._cpu_filter.update(raw_cpu)
+            mem_est, mem_unc = self._memory_filter.update(float(raw_memory))
+            
+            cpu_est = max(0.0, cpu_est)
+            mem_est = max(0.0, mem_est)
+            
+            memory_percent = (mem_est / self._total_memory) * 100.0
+            
+            metrics = ResourceMetrics(
+                cpu_percent=cpu_est,
+                cpu_uncertainty=cpu_unc,
+                memory_bytes=int(mem_est),
+                memory_uncertainty=mem_unc,
+                memory_percent=memory_percent,
+                file_descriptor_count=total_fds,
+                timestamp_monotonic=monotonic(),
+                sample_count=self._cpu_filter.get_sample_count(),
+                process_count=live_count,
+            )
+            
+            self._last_metrics = metrics
+            return metrics
+            
+        except psutil.NoSuchProcess:
+            return self._last_metrics if self._last_metrics else self._empty_metrics()
+    
+    def _empty_metrics(self) -> ResourceMetrics:
+        return ResourceMetrics(
+            cpu_percent=0.0,
+            cpu_uncertainty=0.0,
+            memory_bytes=0,
+            memory_uncertainty=0.0,
+            memory_percent=0.0,
+            file_descriptor_count=0,
+        )
+    
+    def get_last_metrics(self) -> Optional[ResourceMetrics]:
+        return self._last_metrics
+    
+    def get_system_info(self) -> tuple[int, int]:
+        """Return (total_memory_bytes, cpu_count)."""
+        return self._total_memory, self._cpu_count
+```
+
+### Part 4: Hierarchical Aggregation Architecture
+
+#### Multi-Node Topology
+
+Each datacenter has multiple managers and multiple gates. This creates a hierarchical aggregation challenge:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    MULTI-NODE DATACENTER TOPOLOGY                        │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│                         DATACENTER (DC-EAST)                             │
+│                                                                          │
+│   GATE CLUSTER (3 gates):                                               │
+│   ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐        │
+│   │     Gate-1      │◄─┼─── gossip ──────┼─►│     Gate-2      │◄► Gate-3│
+│   │ GateResourceAgg │  │                 │  │ GateResourceAgg │        │
+│   └────────┬────────┘  └─────────────────┘  └────────┬────────┘        │
+│            │                                          │                  │
+│            └────────────────────┬─────────────────────┘                  │
+│                                 │                                        │
+│              ManagerClusterResourceView (from any manager)               │
+│                                 │                                        │
+│   MANAGER CLUSTER (4 managers): │                                        │
+│   ┌────────────┐  ┌────────────┼┐  ┌────────────┐  ┌────────────┐      │
+│   │ Manager-1  │◄─┼── gossip ──┼┼─►│ Manager-2  │◄►│ Manager-3  │◄► M-4│
+│   │            │  │            ││  │            │  │            │      │
+│   │ LocalView  │◄─┼────────────┼┼─►│ LocalView  │◄►│ LocalView  │      │
+│   │ + self CPU │  │            ││  │ + self CPU │  │ + self CPU │      │
+│   │ + workers  │  │            ││  │ + workers  │  │ + workers  │      │
+│   └─────┬──────┘  └────────────┘┘  └─────┬──────┘  └────────────┘      │
+│         │                                │                               │
+│         │      WorkerResourceReport      │                               │
+│         │         (in heartbeat)         │                               │
+│         ▼                                ▼                               │
+│   ┌──────────┐ ┌──────────┐       ┌──────────┐ ┌──────────┐            │
+│   │ Worker-1 │ │ Worker-2 │       │ Worker-3 │ │ Worker-4 │  ...       │
+│   │ + Kalman │ │ + Kalman │       │ + Kalman │ │ + Kalman │            │
+│   └──────────┘ └──────────┘       └──────────┘ └──────────┘            │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Manager-to-Manager Gossip
+
+Every manager must have a complete picture of the entire cluster. This requires gossip:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    MANAGER RESOURCE GOSSIP PROTOCOL                      │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  EACH MANAGER MAINTAINS:                                                 │
+│                                                                          │
+│  1. LocalView (computed locally):                                        │
+│     - self_metrics: This manager's own CPU/memory (from Kalman filter)  │
+│     - worker_count: Workers registered to THIS manager                  │
+│     - worker_aggregate_*: Sum of worker metrics for THIS manager        │
+│     - version: Monotonically increasing for change detection            │
+│                                                                          │
+│  2. Peer Views (received via gossip):                                    │
+│     - Map of manager_id → ManagerLocalView                              │
+│     - Each peer's LocalView (their self + their workers)                │
+│     - Staleness tracking for pruning                                    │
+│                                                                          │
+│  3. ClusterView (computed by aggregating):                               │
+│     - All managers' CPU/memory (self + peers)                           │
+│     - All workers' CPU/memory (own + peers')                            │
+│     - Vector clock for consistency                                       │
+│                                                                          │
+│  GOSSIP MESSAGE:                                                         │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │ ManagerResourceGossipMessage                                     │    │
+│  │   source_manager_id: "mgr-1"                                    │    │
+│  │   local_view: ManagerLocalView (this manager's view)            │    │
+│  │   known_peer_views: [ManagerLocalView, ...]  (subset of peers)  │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+│                                                                          │
+│  CONVERGENCE:                                                            │
+│  - Gossip runs every 2-5 seconds                                        │
+│  - Include 2-3 random peer views for faster propagation                 │
+│  - Vector clock ensures consistency                                      │
+│  - Staleness threshold (30s) prunes dead managers                       │
+│                                                                          │
+│  EXAMPLE STATE ON MANAGER-1:                                             │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │ LocalView (computed):                                            │    │
+│  │   manager_node_id: "mgr-1"                                       │    │
+│  │   self_metrics: {cpu: 25%, mem: 2GB, uncertainty: 5%}           │    │
+│  │   worker_count: 2                                                │    │
+│  │   worker_aggregate_cpu: 150%                                     │    │
+│  │   worker_aggregate_mem: 8GB                                      │    │
+│  │   version: 42                                                    │    │
+│  ├─────────────────────────────────────────────────────────────────┤    │
+│  │ Peer Views (from gossip):                                        │    │
+│  │   mgr-2: {self: 30%, workers: 2, cpu: 200%, version: 38}        │    │
+│  │   mgr-3: {self: 20%, workers: 2, cpu: 180%, version: 41}        │    │
+│  │   mgr-4: {self: 22%, workers: 1, cpu: 90%, version: 35}         │    │
+│  ├─────────────────────────────────────────────────────────────────┤    │
+│  │ ClusterView (aggregated):                                        │    │
+│  │   manager_count: 4                                               │    │
+│  │   manager_aggregate_cpu: 97% (25+30+20+22)                      │    │
+│  │   worker_count: 7 (2+2+2+1)                                     │    │
+│  │   worker_aggregate_cpu: 620% (150+200+180+90)                   │    │
+│  │   vector_clock: {mgr-1:42, mgr-2:38, mgr-3:41, mgr-4:35}        │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+│                                                                          │
+│  This ClusterView is sent to ALL gates in ManagerHeartbeat              │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Manager Resource Gossip Implementation
+
+```python
+import asyncio
+from dataclasses import dataclass, field
+from time import monotonic
+from typing import Optional
+
+from hyperscale.distributed.resources.process_resource_monitor import (
+    ProcessResourceMonitor,
+    ResourceMetrics,
+)
+from hyperscale.logging.logger import Logger
+
+
+@dataclass(slots=True)
+class ManagerLocalView:
+    """What a single manager knows locally."""
+    manager_node_id: str
+    datacenter: str
+    self_metrics: ResourceMetrics
+    worker_count: int = 0
+    worker_aggregate_cpu_percent: float = 0.0
+    worker_aggregate_memory_bytes: int = 0
+    worker_reports: dict[str, "WorkerResourceReport"] = field(default_factory=dict)
+    version: int = 0
+    timestamp_monotonic: float = field(default_factory=monotonic)
+    
+    def is_stale(self, max_age_seconds: float = 30.0) -> bool:
+        return (monotonic() - self.timestamp_monotonic) > max_age_seconds
+
+
+@dataclass(slots=True)
+class ManagerClusterResourceView:
+    """Complete cluster view computed by aggregating all managers."""
+    datacenter: str
+    computing_manager_id: str
+    manager_count: int = 0
+    manager_aggregate_cpu_percent: float = 0.0
+    manager_aggregate_memory_bytes: int = 0
+    manager_views: dict[str, ManagerLocalView] = field(default_factory=dict)
+    worker_count: int = 0
+    worker_aggregate_cpu_percent: float = 0.0
+    worker_aggregate_memory_bytes: int = 0
+    total_cores_available: int = 0
+    total_cores_allocated: int = 0
+    cpu_pressure: float = 0.0
+    memory_pressure: float = 0.0
+    vector_clock: dict[str, int] = field(default_factory=dict)
+    timestamp_monotonic: float = field(default_factory=monotonic)
+
+
+@dataclass(slots=True)
+class VersionedLocalView:
+    view: ManagerLocalView
+    received_at: float = field(default_factory=monotonic)
+    
+    def is_stale(self, max_age: float) -> bool:
+        return (monotonic() - self.received_at) > max_age
+
+
+@dataclass
+class ManagerResourceGossip:
+    """
+    Manages resource collection, gossip, and aggregation for a manager.
+    
+    Every manager must:
+    1. Monitor its OWN CPU/memory
+    2. Aggregate worker reports from workers registered to it
+    3. Gossip LocalView to peer managers
+    4. Receive peer LocalViews via gossip
+    5. Compute ClusterView aggregating ALL managers + ALL workers
+    6. Send ClusterView to ALL gates
+    """
+    
+    node_id: str
+    datacenter: str
+    logger: Optional[Logger] = None
+    staleness_threshold_seconds: float = 30.0
+    
+    _self_monitor: ProcessResourceMonitor = field(init=False)
+    _self_metrics: Optional[ResourceMetrics] = field(default=None, init=False)
+    
+    _worker_reports: dict[str, "WorkerResourceReport"] = field(
+        default_factory=dict, init=False
+    )
+    _worker_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False)
+    
+    _peer_views: dict[str, VersionedLocalView] = field(
+        default_factory=dict, init=False
+    )
+    _peer_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False)
+    
+    _version: int = field(default=0, init=False)
+    _cached_local_view: Optional[ManagerLocalView] = field(default=None, init=False)
+    _cached_cluster_view: Optional[ManagerClusterResourceView] = field(
+        default=None, init=False
+    )
+    
+    def __post_init__(self) -> None:
+        self._self_monitor = ProcessResourceMonitor()
+    
+    async def sample_self(self) -> ResourceMetrics:
+        """Sample this manager's own resource usage."""
+        self._self_metrics = await self._self_monitor.sample()
+        self._cached_local_view = None
+        return self._self_metrics
+    
+    async def update_worker_report(self, report: "WorkerResourceReport") -> bool:
+        """Update worker report from heartbeat."""
+        async with self._worker_lock:
+            existing = self._worker_reports.get(report.node_id)
+            if existing is None or report.version > existing.version:
+                self._worker_reports[report.node_id] = report
+                self._cached_local_view = None
+                self._cached_cluster_view = None
+                return True
+            return False
+    
+    async def receive_peer_view(self, view: ManagerLocalView) -> bool:
+        """Receive LocalView from peer manager via gossip."""
+        if view.manager_node_id == self.node_id:
+            return False
+        
+        async with self._peer_lock:
+            existing = self._peer_views.get(view.manager_node_id)
+            if existing is None or view.version > existing.view.version:
+                self._peer_views[view.manager_node_id] = VersionedLocalView(view=view)
+                self._cached_cluster_view = None
+                return True
+            return False
+    
+    async def compute_local_view(self) -> ManagerLocalView:
+        """Compute this manager's local view for gossiping."""
+        if self._cached_local_view is not None:
+            return self._cached_local_view
+        
+        async with self._worker_lock:
+            if self._self_metrics is None:
+                await self.sample_self()
+            
+            worker_count = 0
+            worker_cpu = 0.0
+            worker_mem = 0
+            live_reports: dict[str, "WorkerResourceReport"] = {}
+            
+            for worker_id, report in self._worker_reports.items():
+                if not report.aggregate_metrics.is_stale(self.staleness_threshold_seconds):
+                    worker_count += 1
+                    worker_cpu += report.aggregate_metrics.cpu_percent
+                    worker_mem += report.aggregate_metrics.memory_bytes
+                    live_reports[worker_id] = report
+            
+            self._version += 1
+            
+            local_view = ManagerLocalView(
+                manager_node_id=self.node_id,
+                datacenter=self.datacenter,
+                self_metrics=self._self_metrics,
+                worker_count=worker_count,
+                worker_aggregate_cpu_percent=worker_cpu,
+                worker_aggregate_memory_bytes=worker_mem,
+                worker_reports=live_reports,
+                version=self._version,
+            )
+            
+            self._cached_local_view = local_view
+            return local_view
+    
+    async def compute_cluster_view(
+        self,
+        total_cores_available: int = 0,
+        total_cores_allocated: int = 0,
+    ) -> ManagerClusterResourceView:
+        """
+        Compute complete cluster view for sending to gates.
+        
+        Aggregates this manager + all peer managers + all workers.
+        """
+        if self._cached_cluster_view is not None:
+            return self._cached_cluster_view
+        
+        local_view = await self.compute_local_view()
+        all_views: dict[str, ManagerLocalView] = {self.node_id: local_view}
+        
+        async with self._peer_lock:
+            for mgr_id, versioned in self._peer_views.items():
+                if not versioned.is_stale(self.staleness_threshold_seconds):
+                    all_views[mgr_id] = versioned.view
+        
+        # Aggregate
+        manager_cpu = 0.0
+        manager_mem = 0
+        worker_count = 0
+        worker_cpu = 0.0
+        worker_mem = 0
+        vector_clock: dict[str, int] = {}
+        
+        for mgr_id, view in all_views.items():
+            manager_cpu += view.self_metrics.cpu_percent
+            manager_mem += view.self_metrics.memory_bytes
+            worker_count += view.worker_count
+            worker_cpu += view.worker_aggregate_cpu_percent
+            worker_mem += view.worker_aggregate_memory_bytes
+            vector_clock[mgr_id] = view.version
+        
+        max_expected_cpu = max(1, worker_count * 400)
+        cpu_pressure = min(1.0, worker_cpu / max_expected_cpu)
+        
+        cluster_view = ManagerClusterResourceView(
+            datacenter=self.datacenter,
+            computing_manager_id=self.node_id,
+            manager_count=len(all_views),
+            manager_aggregate_cpu_percent=manager_cpu,
+            manager_aggregate_memory_bytes=manager_mem,
+            manager_views=all_views,
+            worker_count=worker_count,
+            worker_aggregate_cpu_percent=worker_cpu,
+            worker_aggregate_memory_bytes=worker_mem,
+            total_cores_available=total_cores_available,
+            total_cores_allocated=total_cores_allocated,
+            cpu_pressure=cpu_pressure,
+            vector_clock=vector_clock,
+        )
+        
+        self._cached_cluster_view = cluster_view
+        return cluster_view
+```
+
+### Part 5: Gate Aggregation with Multi-Manager Reconciliation
+
+Gates receive cluster views from multiple managers. They must reconcile these using vector clocks:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    GATE MULTI-MANAGER RECONCILIATION                     │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  PROBLEM: Multiple managers send ClusterView, possibly with different   │
+│  information due to gossip propagation delays.                          │
+│                                                                          │
+│  EXAMPLE:                                                                │
+│                                                                          │
+│  Manager-1 sends ClusterView:                                           │
+│    vector_clock: {mgr-1: 42, mgr-2: 38, mgr-3: 40}                     │
+│    (hasn't received mgr-3's latest update yet)                          │
+│                                                                          │
+│  Manager-2 sends ClusterView:                                           │
+│    vector_clock: {mgr-1: 41, mgr-2: 39, mgr-3: 41}                     │
+│    (has mgr-3's update, but not mgr-1's latest)                        │
+│                                                                          │
+│  SOLUTION: Take the view with the highest vector clock sum (most info)  │
+│                                                                          │
+│  Manager-1 sum: 42 + 38 + 40 = 120                                      │
+│  Manager-2 sum: 41 + 39 + 41 = 121 ← Use this one                      │
+│                                                                          │
+│  ALTERNATIVE: Merge component-wise (take max per manager)               │
+│  This is more complex but provides the most complete view.              │
+│                                                                          │
+│  GATE IMPLEMENTATION:                                                    │
+│                                                                          │
+│  async def receive_manager_cluster_view(                                 │
+│      self, view: ManagerClusterResourceView                             │
+│  ) -> bool:                                                             │
+│      existing = self._manager_views.get(view.computing_manager_id)      │
+│                                                                          │
+│      if existing is None:                                                │
+│          self._manager_views[...] = view                                │
+│          return True                                                     │
+│                                                                          │
+│      # Vector clock comparison                                           │
+│      existing_vc = existing.view.vector_clock                           │
+│      new_vc = view.vector_clock                                         │
+│      all_keys = set(existing_vc) | set(new_vc)                          │
+│                                                                          │
+│      is_newer = any(                                                     │
+│          new_vc.get(k, 0) > existing_vc.get(k, 0)                       │
+│          for k in all_keys                                               │
+│      )                                                                   │
+│                                                                          │
+│      if is_newer:                                                        │
+│          self._manager_views[...] = view                                │
+│          return True                                                     │
+│                                                                          │
+│      return False                                                        │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Part 6: Resource Enforcement with Uncertainty-Aware Decisions
+
+#### Graduated Response with Kalman Uncertainty
+
+The Kalman filter provides uncertainty estimates. We use these for smarter enforcement:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    UNCERTAINTY-AWARE ENFORCEMENT                         │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  TRADITIONAL ENFORCEMENT (no uncertainty):                               │
+│                                                                          │
+│  Budget: 400% CPU                                                        │
+│  Measurement: 410%  →  KILL immediately                                 │
+│                                                                          │
+│  Problem: What if measurement is noisy? Maybe actual is 380%.           │
+│           We killed a workflow that wasn't actually over budget.        │
+│                                                                          │
+│  UNCERTAINTY-AWARE ENFORCEMENT:                                          │
+│                                                                          │
+│  Budget: 400% CPU                                                        │
+│  Measurement: 410%                                                       │
+│  Uncertainty: σ = 30%                                                    │
+│                                                                          │
+│  95% confidence interval: [410 - 2×30, 410 + 2×30] = [350, 470]        │
+│                                                                          │
+│  Decision matrix:                                                        │
+│  ┌────────────────────────────────────────────────────────────────┐     │
+│  │ Estimate  Uncertainty  Lower Bound  Budget  Action             │     │
+│  ├────────────────────────────────────────────────────────────────┤     │
+│  │  350%       σ=50        250%         400%   NONE (clearly ok)  │     │
+│  │  380%       σ=30        320%         400%   NONE (likely ok)   │     │
+│  │  410%       σ=30        350%         400%   WARN (uncertain)   │     │
+│  │  410%       σ=5         400%         400%   KILL (confident)   │     │
+│  │  500%       σ=30        440%         400%   KILL (even lower   │     │
+│  │                                              bound exceeds)     │     │
+│  └────────────────────────────────────────────────────────────────┘     │
+│                                                                          │
+│  IMPLEMENTATION:                                                         │
+│                                                                          │
+│  def should_enforce(                                                     │
+│      estimate: float,                                                    │
+│      uncertainty: float,                                                 │
+│      budget: float,                                                      │
+│      sigma: float = 2.0  # 95% confidence                               │
+│  ) -> EnforcementAction:                                                │
+│                                                                          │
+│      lower_bound = estimate - sigma * uncertainty                       │
+│      upper_bound = estimate + sigma * uncertainty                       │
+│                                                                          │
+│      if lower_bound > budget:                                           │
+│          # Even conservative estimate exceeds budget                     │
+│          return EnforcementAction.KILL                                  │
+│                                                                          │
+│      if upper_bound > budget * 1.1:                                     │
+│          # Upper bound significantly exceeds budget                      │
+│          return EnforcementAction.WARN                                  │
+│                                                                          │
+│      if estimate > budget:                                              │
+│          # Point estimate exceeds, but uncertain                        │
+│          return EnforcementAction.WARN                                  │
+│                                                                          │
+│      return EnforcementAction.NONE                                      │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Resource Enforcer Implementation
+
+```python
+import asyncio
+from dataclasses import dataclass, field
+from enum import Enum, auto
+from time import monotonic
+from typing import Awaitable, Callable, Optional
+
+
+class EnforcementAction(Enum):
+    NONE = auto()
+    WARN = auto()
+    THROTTLE = auto()
+    KILL_WORKFLOW = auto()
+    KILL_JOB = auto()
+    EVICT_WORKER = auto()
+
+
+class ResourceViolationType(Enum):
+    CPU_EXCEEDED = auto()
+    MEMORY_EXCEEDED = auto()
+    FD_EXCEEDED = auto()
+
+
+@dataclass(frozen=True, slots=True)
+class ResourceBudget:
+    """Resource limits for a job or worker."""
+    max_cpu_percent: float
+    max_memory_bytes: int
+    max_file_descriptors: int
+    warning_threshold: float = 0.8
+    critical_threshold: float = 0.95
+    kill_threshold: float = 1.0
+    warning_grace_seconds: float = 10.0
+    critical_grace_seconds: float = 5.0
+    kill_grace_seconds: float = 2.0
+
+
+@dataclass(slots=True)
+class ViolationState:
+    """Tracks an ongoing violation."""
+    workflow_id: Optional[str]
+    worker_id: str
+    job_id: Optional[str]
+    violation_type: ResourceViolationType
+    started_at: float
+    last_seen: float
+    peak_value: float
+    peak_uncertainty: float
+    budget_value: float
+    warning_sent: bool = False
+    
+    def duration_seconds(self) -> float:
+        return self.last_seen - self.started_at
+
+
+@dataclass
+class ResourceEnforcer:
+    """
+    Enforces resource budgets with graduated, uncertainty-aware response.
+    
+    Key features:
+    1. Uses Kalman uncertainty for smarter decisions
+    2. Grace periods before escalation (avoids killing for spikes)
+    3. Graduated response: WARN → THROTTLE → KILL
+    4. Per-workflow attribution for surgical enforcement
+    """
+    
+    logger: Optional["Logger"] = None
+    
+    default_budget: ResourceBudget = field(
+        default_factory=lambda: ResourceBudget(
+            max_cpu_percent=800.0,
+            max_memory_bytes=16 * 1024 * 1024 * 1024,
+            max_file_descriptors=10000,
+        )
+    )
+    
+    on_kill_workflow: Optional[
+        Callable[[str, str, ResourceViolationType], Awaitable[bool]]
+    ] = None
+    on_evict_worker: Optional[
+        Callable[[str, ResourceViolationType], Awaitable[bool]]
+    ] = None
+    on_warn: Optional[
+        Callable[[str, str, ResourceViolationType, float], Awaitable[None]]
+    ] = None
+    
+    _violations: dict[str, ViolationState] = field(default_factory=dict, init=False)
+    _job_budgets: dict[str, ResourceBudget] = field(default_factory=dict, init=False)
+    _lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False)
+    
+    async def check_workflow_metrics(
+        self,
+        workflow_id: str,
+        worker_id: str,
+        job_id: Optional[str],
+        cpu_percent: float,
+        cpu_uncertainty: float,
+        memory_bytes: int,
+        memory_uncertainty: float,
+    ) -> EnforcementAction:
+        """Check workflow metrics against budget."""
+        async with self._lock:
+            budget = self._job_budgets.get(job_id, self.default_budget) if job_id else self.default_budget
+            now = monotonic()
+            
+            # Check CPU with uncertainty
+            action = await self._check_metric_with_uncertainty(
+                key=f"workflow:{workflow_id}:cpu",
+                workflow_id=workflow_id,
+                worker_id=worker_id,
+                job_id=job_id,
+                value=cpu_percent,
+                uncertainty=cpu_uncertainty,
+                budget_value=budget.max_cpu_percent,
+                violation_type=ResourceViolationType.CPU_EXCEEDED,
+                budget=budget,
+                now=now,
+            )
+            
+            if action != EnforcementAction.NONE:
+                return action
+            
+            # Check memory with uncertainty
+            action = await self._check_metric_with_uncertainty(
+                key=f"workflow:{workflow_id}:mem",
+                workflow_id=workflow_id,
+                worker_id=worker_id,
+                job_id=job_id,
+                value=float(memory_bytes),
+                uncertainty=memory_uncertainty,
+                budget_value=float(budget.max_memory_bytes),
+                violation_type=ResourceViolationType.MEMORY_EXCEEDED,
+                budget=budget,
+                now=now,
+            )
+            
+            return action
+    
+    async def _check_metric_with_uncertainty(
+        self,
+        key: str,
+        workflow_id: str,
+        worker_id: str,
+        job_id: Optional[str],
+        value: float,
+        uncertainty: float,
+        budget_value: float,
+        violation_type: ResourceViolationType,
+        budget: ResourceBudget,
+        now: float,
+    ) -> EnforcementAction:
+        """Check a single metric with uncertainty-aware logic."""
+        
+        # Calculate confidence bounds
+        sigma = 2.0  # 95% confidence
+        lower_bound = value - sigma * uncertainty
+        upper_bound = value + sigma * uncertainty
+        
+        # Determine violation severity
+        if lower_bound > budget_value * budget.kill_threshold:
+            # Even conservative estimate exceeds kill threshold
+            certain_violation = True
+        elif value > budget_value * budget.kill_threshold:
+            # Point estimate exceeds, but uncertainty exists
+            certain_violation = False
+        else:
+            # Clear violation state if exists
+            self._violations.pop(key, None)
+            return EnforcementAction.NONE
+        
+        # Get or create violation state
+        state = self._violations.get(key)
+        if state is None:
+            state = ViolationState(
+                workflow_id=workflow_id,
+                worker_id=worker_id,
+                job_id=job_id,
+                violation_type=violation_type,
+                started_at=now,
+                last_seen=now,
+                peak_value=value,
+                peak_uncertainty=uncertainty,
+                budget_value=budget_value,
+            )
+            self._violations[key] = state
+        else:
+            state.last_seen = now
+            state.peak_value = max(state.peak_value, value)
+        
+        duration = state.duration_seconds()
+        
+        # Adjust grace periods based on uncertainty
+        uncertainty_factor = 1.0 + (uncertainty / max(value, 1.0))
+        effective_warning_grace = budget.warning_grace_seconds * uncertainty_factor
+        effective_kill_grace = budget.kill_grace_seconds * uncertainty_factor
+        
+        # Graduated response
+        if duration < effective_warning_grace:
+            return EnforcementAction.NONE
+        
+        if not state.warning_sent:
+            state.warning_sent = True
+            if self.on_warn is not None:
+                await self.on_warn(workflow_id, worker_id, violation_type, value)
+            return EnforcementAction.WARN
+        
+        if certain_violation and duration >= effective_kill_grace:
+            if self.on_kill_workflow is not None:
+                killed = await self.on_kill_workflow(workflow_id, worker_id, violation_type)
+                if killed:
+                    self._violations.pop(key, None)
+                    return EnforcementAction.KILL_WORKFLOW
+        
+        return EnforcementAction.NONE
+```
+
+### Part 7: Wire Protocol Messages
+
+Add these message types to `hyperscale/distributed/models/distributed.py`:
+
+```python
+from dataclasses import dataclass
+from typing import Optional
+
+
+@dataclass(frozen=True, slots=True)
+class ResourceMetricsWire:
+    """Wire format for ResourceMetrics."""
+    cpu_percent: float
+    cpu_uncertainty: float
+    memory_bytes: int
+    memory_uncertainty: float
+    memory_percent: float
+    file_descriptor_count: int
+    timestamp_ms: int
+    sample_count: int
+    process_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerResourceReportWire:
+    """Wire format for WorkerResourceReport in heartbeats."""
+    node_id: str
+    aggregate_metrics: ResourceMetricsWire
+    workflow_metrics: dict[str, ResourceMetricsWire]
+    total_system_memory_bytes: int
+    total_system_cpu_count: int
+    version: int
+
+
+@dataclass(frozen=True, slots=True)
+class ManagerLocalViewWire:
+    """Wire format for ManagerLocalView gossip."""
+    manager_node_id: str
+    datacenter: str
+    self_metrics: ResourceMetricsWire
+    worker_count: int
+    worker_aggregate_cpu_percent: float
+    worker_aggregate_memory_bytes: int
+    version: int
+    timestamp_ms: int
+
+
+@dataclass(frozen=True, slots=True)
+class ManagerResourceGossipMessage:
+    """Gossip message between managers."""
+    source_manager_id: str
+    local_view: ManagerLocalViewWire
+    known_peer_views: list[ManagerLocalViewWire]
+
+
+@dataclass(frozen=True, slots=True)
+class ManagerClusterResourceViewWire:
+    """Wire format for ManagerClusterResourceView sent to gates."""
+    datacenter: str
+    computing_manager_id: str
+    manager_count: int
+    manager_aggregate_cpu_percent: float
+    manager_aggregate_memory_bytes: int
+    worker_count: int
+    worker_aggregate_cpu_percent: float
+    worker_aggregate_memory_bytes: int
+    total_cores_available: int
+    total_cores_allocated: int
+    cpu_pressure: float
+    memory_pressure: float
+    vector_clock: dict[str, int]
+    timestamp_ms: int
+
+
+@dataclass(frozen=True, slots=True)
+class DatacenterResourceViewWire:
+    """Wire format for DatacenterResourceView."""
+    datacenter: str
+    manager_count: int
+    manager_aggregate_cpu_percent: float
+    manager_aggregate_memory_bytes: int
+    worker_count: int
+    worker_aggregate_cpu_percent: float
+    worker_aggregate_memory_bytes: int
+    total_cores_available: int
+    total_cores_allocated: int
+    cpu_pressure: float
+    memory_pressure: float
+    timestamp_ms: int
+
+
+@dataclass(frozen=True, slots=True)
+class GateResourceGossipMessage:
+    """Gossip message between gates."""
+    source_gate_id: str
+    source_datacenter: str
+    version: int
+    local_dc_view: DatacenterResourceViewWire
+    known_dc_views: list[DatacenterResourceViewWire]
+
+
+@dataclass(frozen=True, slots=True)
+class ResourceKillRequest:
+    """Manager → Worker: Kill workflow due to resource violation."""
+    workflow_id: str
+    job_id: str
+    violation_type: str
+    message: str
+    force: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class ResourceKillResponse:
+    """Worker → Manager: Response to kill request."""
+    workflow_id: str
+    success: bool
+    error_message: Optional[str] = None
+    processes_killed: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class ResourceBudgetAssignment:
+    """Gate → Manager: Assign budget to job."""
+    job_id: str
+    max_cpu_percent: float
+    max_memory_bytes: int
+    max_file_descriptors: int
+    warning_threshold: float = 0.8
+    critical_threshold: float = 0.95
+```
+
+### Part 8: Implementation Guide
+
+#### File Structure
+
+```
+hyperscale/distributed/resources/
+├── __init__.py
+├── resource_metrics.py          # ResourceMetrics, ResourceBudget, views
+├── kalman_filter.py             # ScalarKalmanFilter, AdaptiveKalmanFilter
+├── process_resource_monitor.py  # ProcessResourceMonitor (psutil + Kalman)
+├── worker_resource_monitor.py   # WorkerResourceMonitor (per-workflow)
+├── manager_resource_gossip.py   # ManagerResourceGossip (aggregation)
+├── gate_resource_aggregator.py  # GateResourceAggregator (multi-DC)
+└── resource_enforcer.py         # ResourceEnforcer (budget enforcement)
+```
+
+#### Integration Steps
+
+##### Step 1: Worker Integration
+
+```python
+# In hyperscale/distributed/nodes/worker/state.py
+
+@dataclass
+class WorkerState:
+    # ... existing fields ...
+    resource_monitor: WorkerResourceMonitor = field(init=False)
+    
+    def __post_init__(self) -> None:
+        # ... existing init ...
+        self.resource_monitor = WorkerResourceMonitor(
+            node_id=self.node_id,
+            logger=self.logger,
+        )
+
+# In worker startup
+async def start(self) -> None:
+    # ... existing startup ...
+    self._task_runner.run(
+        self.state.resource_monitor.start,
+        timeout=None,
+    )
+
+# In worker heartbeat handler
+async def send_heartbeat(self) -> None:
+    report = self.state.resource_monitor.get_last_report()
+    
+    heartbeat = WorkerHeartbeat(
+        node_id=self.state.node_id,
+        # ... existing fields ...
+        resource_report=self._convert_to_wire(report),
+    )
+    
+    await self._send_to_manager(heartbeat)
+
+# When dispatching workflow
+async def handle_dispatch(self, dispatch: WorkflowDispatch) -> None:
+    # ... existing dispatch logic ...
+    
+    # Register workflow process for monitoring
+    await self.state.resource_monitor.register_workflow_process(
+        workflow_id=dispatch.workflow_id,
+        root_pid=execution.root_pid,
+    )
+```
+
+##### Step 2: Manager Integration
+
+```python
+# In hyperscale/distributed/nodes/manager/state.py
+
+@dataclass
+class ManagerState:
+    # ... existing fields ...
+    resource_gossip: ManagerResourceGossip = field(init=False)
+    resource_enforcer: ResourceEnforcer = field(init=False)
+    
+    def __post_init__(self) -> None:
+        # ... existing init ...
+        self.resource_gossip = ManagerResourceGossip(
+            node_id=self.node_id,
+            datacenter=self.datacenter,
+            logger=self.logger,
+        )
+        self.resource_enforcer = ResourceEnforcer(
+            logger=self.logger,
+            on_kill_workflow=self._kill_workflow,
+            on_warn=self._warn_workflow,
+        )
+
+# In manager startup
+async def start(self) -> None:
+    # ... existing startup ...
+    self._task_runner.run(
+        self.state.resource_gossip.start_background_tasks,
+        timeout=None,
+    )
+
+# In worker heartbeat handler
+async def handle_worker_heartbeat(self, heartbeat: WorkerHeartbeat) -> None:
+    # ... existing handling ...
+    
+    if heartbeat.resource_report is not None:
+        report = self._convert_from_wire(heartbeat.resource_report)
+        await self.state.resource_gossip.update_worker_report(report)
+        
+        # Check for violations
+        workflow_to_job = self._build_workflow_job_mapping()
+        for workflow_id, metrics in report.workflow_metrics.items():
+            job_id = workflow_to_job.get(workflow_id)
+            action = await self.state.resource_enforcer.check_workflow_metrics(
+                workflow_id=workflow_id,
+                worker_id=heartbeat.node_id,
+                job_id=job_id,
+                cpu_percent=metrics.cpu_percent,
+                cpu_uncertainty=metrics.cpu_uncertainty,
+                memory_bytes=metrics.memory_bytes,
+                memory_uncertainty=metrics.memory_uncertainty,
+            )
+            
+            if action == EnforcementAction.KILL_WORKFLOW:
+                await self.logger.log(
+                    "ResourceEnforcer",
+                    "warning",
+                    f"Killing workflow {workflow_id} due to resource violation",
+                )
+
+# In peer gossip handler
+async def handle_peer_gossip(self, message: ManagerResourceGossipMessage) -> None:
+    view = self._convert_wire_to_local_view(message.local_view)
+    await self.state.resource_gossip.receive_peer_view(view)
+    
+    for peer_view_wire in message.known_peer_views:
+        peer_view = self._convert_wire_to_local_view(peer_view_wire)
+        await self.state.resource_gossip.receive_peer_view(peer_view)
+
+# In manager-to-gate heartbeat
+async def send_heartbeat_to_gate(self, gate_address: tuple[str, int]) -> None:
+    cluster_view = await self.state.resource_gossip.compute_cluster_view(
+        total_cores_available=self._get_available_cores(),
+        total_cores_allocated=self._get_allocated_cores(),
+    )
+    
+    heartbeat = ManagerHeartbeat(
+        node_id=self.state.node_id,
+        datacenter=self.config.datacenter,
+        # ... existing fields ...
+        cluster_resource_view=self._convert_to_wire(cluster_view),
+    )
+    
+    await self._send_to_gate(gate_address, heartbeat)
+```
+
+##### Step 3: Gate Integration
+
+```python
+# In hyperscale/distributed/nodes/gate/state.py
+
+@dataclass
+class GateRuntimeState:
+    # ... existing fields ...
+    resource_aggregator: GateResourceAggregator = field(init=False)
+    
+    def __post_init__(self) -> None:
+        # ... existing init ...
+        self.resource_aggregator = GateResourceAggregator(
+            node_id=self.node_id,
+            datacenter=self.datacenter,
+            logger=self.logger,
+        )
+
+# In manager heartbeat handler
+async def handle_manager_heartbeat(self, heartbeat: ManagerHeartbeat) -> None:
+    # ... existing handling ...
+    
+    if heartbeat.cluster_resource_view is not None:
+        view = self._convert_from_wire(heartbeat.cluster_resource_view)
+        await self.state.resource_aggregator.receive_manager_cluster_view(view)
+
+# Enhanced datacenter selection for job routing
+async def select_datacenter_for_job(
+    self,
+    job: JobSubmission,
+    preferred_dcs: list[str],
+) -> Optional[str]:
+    global_view = await self.state.resource_aggregator.compute_global_view()
+    
+    candidates: list[tuple[str, float]] = []
+    
+    for dc in preferred_dcs:
+        dc_view = global_view.datacenter_views.get(dc)
+        if dc_view is None:
+            continue
+        
+        # Skip overloaded DCs
+        if dc_view.cpu_pressure > 0.95:
+            continue
+        
+        # Score based on available capacity
+        score = (1.0 - dc_view.cpu_pressure) * 0.5 + \
+                (dc_view.total_cores_available / max(1, job.required_cores)) * 0.5
+        
+        candidates.append((dc, score))
+    
+    if not candidates:
+        return None
+    
+    candidates.sort(key=lambda x: x[1], reverse=True)
+    return candidates[0][0]
+```
+
+### Part 9: Failure Mode Analysis
+
+| Failure | Impact | Mitigation |
+|---------|--------|------------|
+| Worker psutil sampling fails | No resource data for worker | Last-known metrics used; staleness detection triggers warning |
+| Manager gossip delayed | Incomplete cluster view | Vector clock detects staleness; use best available data |
+| Manager dies during gossip | Peer views become stale | 30s staleness threshold prunes dead managers |
+| Gate receives conflicting views | Inconsistent aggregation | Vector clock comparison selects most complete view |
+| Network partition (same DC) | Managers have partial views | Each manager reports what it knows; gates reconcile |
+| Network partition (cross-DC) | Gates have stale DC views | Staleness detection; route to known-healthy DCs |
+| Kalman filter diverges | Inaccurate estimates | Adaptive noise estimation; can reset filters |
+| Kill request lost | Workflow continues over-budget | Retry on next heartbeat; escalate to worker eviction |
+| Worker ignores kill | Resource exhaustion continues | Worker eviction; SWIM marks as DEAD |
+
+### Summary: AD-41 Design Decisions
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    AD-41 DESIGN DECISION SUMMARY                         │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  DECISION                  CHOICE                 RATIONALE              │
+│  ────────────────────────────────────────────────────────────────────── │
+│                                                                          │
+│  Monitoring library        psutil                 Cross-platform,        │
+│                                                   process tree support,  │
+│                                                   pip-installable        │
+│                                                                          │
+│  Noise filtering           Adaptive Kalman        Optimal smoothing,     │
+│                            filter                 uncertainty estimates, │
+│                                                   adaptive to workload   │
+│                                                                          │
+│  Asyncio integration       asyncio.to_thread      Non-blocking psutil    │
+│                                                   calls, no executor     │
+│                                                   management needed      │
+│                                                                          │
+│  Manager aggregation       Gossip + vector        Every manager has      │
+│                            clocks                 complete view,         │
+│                                                   consistency via VC     │
+│                                                                          │
+│  Gate reconciliation       Vector clock sum       Select most complete   │
+│                            comparison             view from any manager  │
+│                                                                          │
+│  Enforcement strategy      Uncertainty-aware      Avoid false positives  │
+│                            graduated response     from noisy measurements│
+│                                                                          │
+│  Process tree tracking     psutil.children        Captures subprocesses  │
+│                            (recursive=True)       spawned by workflows   │
+│                                                                          │
+│  Per-workflow attribution  Register root PID      Surgical kill without  │
+│                            on dispatch            collateral damage      │
+│                                                                          │
+│  Staleness handling        30s threshold +        Prune dead nodes,      │
+│                            timestamp tracking     use fresh data only    │
+│                                                                          │
+│  WHY THIS IS MAXIMALLY CORRECT:                                          │
+│                                                                          │
+│  1. Kalman filtering is mathematically optimal for noisy measurements   │
+│  2. Uncertainty quantification enables smarter enforcement decisions    │
+│  3. Vector clocks provide consistency without coordination overhead     │
+│  4. Process tree monitoring captures all subprocess resource usage      │
+│  5. Graduated response avoids killing workflows for transient spikes    │
+│  6. Pure Python + pip-installable (psutil, numpy already deps)          │
+│  7. Asyncio-native throughout (no blocking, no thread pool bloat)       │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
