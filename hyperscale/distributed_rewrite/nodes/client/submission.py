@@ -5,6 +5,7 @@ Handles job submission with retry logic, leader redirection, and protocol negoti
 """
 
 import asyncio
+import random
 import secrets
 from typing import Callable
 
@@ -18,6 +19,7 @@ from hyperscale.distributed_rewrite.models import (
     JobStatusPush,
     WorkflowResultPush,
     ReporterResultPush,
+    RateLimitResponse,
 )
 from hyperscale.distributed_rewrite.protocol.version import CURRENT_PROTOCOL_VERSION
 from hyperscale.distributed_rewrite.nodes.client.state import ClientState
@@ -288,9 +290,10 @@ class ClientJobSubmitter:
                 # Transient error - retry
                 last_error = redirect_result
 
-            # Exponential backoff before retry
+            # Exponential backoff before retry with jitter (AD-21)
             if retry < max_retries and last_error:
-                delay = retry_base_delay * (2**retry)
+                base_delay = retry_base_delay * (2**retry)
+                delay = base_delay * (0.5 + random.random())  # Add 0-100% jitter
                 await asyncio.sleep(delay)
 
         # All retries exhausted
