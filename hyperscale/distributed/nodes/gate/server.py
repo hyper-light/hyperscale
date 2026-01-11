@@ -1,30 +1,41 @@
 """
 Gate Server composition root.
 
-This module provides the GateServer class as a thin orchestration layer
-that wires together all gate modules following the REFACTOR.md pattern.
+This module provides the GateServer class that wires together all modular
+gate components following the one-class-per-file pattern.
 
-Note: During the transition period, this delegates to the monolithic
-gate.py implementation. Full extraction is tracked in TODO.md 15.3.7.
+The GateServer extends the base implementation and adds modular coordinators
+and handlers for clean, testable business logic separation.
+
+Module Structure:
+- Coordinators: Business logic (leadership, dispatch, stats, cancellation, peer, health)
+- Handlers: TCP message processing (job, manager, cancellation, state sync, ping)
+- State: GateRuntimeState for mutable runtime state
+- Config: GateConfig for immutable configuration
 """
 
 from typing import TYPE_CHECKING
 
-# Import the existing monolithic implementation for delegation
 from hyperscale.distributed.nodes.gate_impl import GateServer as GateServerImpl
+from hyperscale.distributed.reliability import BackpressureLevel, BackpressureSignal
 
-# Import coordinators (new modular implementations)
-from hyperscale.distributed.nodes.gate.stats_coordinator import GateStatsCoordinator
-from hyperscale.distributed.nodes.gate.cancellation_coordinator import GateCancellationCoordinator
-from hyperscale.distributed.nodes.gate.dispatch_coordinator import GateDispatchCoordinator
-from hyperscale.distributed.nodes.gate.leadership_coordinator import GateLeadershipCoordinator
+from .stats_coordinator import GateStatsCoordinator
+from .cancellation_coordinator import GateCancellationCoordinator
+from .dispatch_coordinator import GateDispatchCoordinator
+from .leadership_coordinator import GateLeadershipCoordinator
+from .peer_coordinator import GatePeerCoordinator
+from .health_coordinator import GateHealthCoordinator
 
-# Import configuration and state
-from hyperscale.distributed.nodes.gate.config import GateConfig, create_gate_config
-from hyperscale.distributed.nodes.gate.state import GateRuntimeState
+from .config import GateConfig, create_gate_config
+from .state import GateRuntimeState
 
-# Import handlers
-from hyperscale.distributed.nodes.gate.handlers.tcp_ping import GatePingHandler
+from .handlers import (
+    GatePingHandler,
+    GateJobHandler,
+    GateManagerHandler,
+    GateCancellationHandler,
+    GateStateSyncHandler,
+)
 
 if TYPE_CHECKING:
     from hyperscale.distributed.env import Env
@@ -37,18 +48,16 @@ class GateServer(GateServerImpl):
     This is the composition root that wires together all gate modules:
     - Configuration (GateConfig)
     - Runtime state (GateRuntimeState)
-    - Coordinators (stats, cancellation, dispatch, leadership)
+    - Coordinators (leadership, dispatch, stats, cancellation, peer, health)
     - Handlers (TCP/UDP message handlers)
 
-    During the transition period, this inherits from the monolithic
-    GateServerImpl to preserve behavior. Full extraction is tracked
-    in TODO.md Phase 15.3.7.
+    The class extends GateServerImpl for backward compatibility while
+    progressively delegating to modular components.
 
     Gates:
     - Form a gossip cluster for leader election (UDP SWIM)
     - Accept job submissions from clients (TCP)
     - Dispatch jobs to managers in target datacenters (TCP)
-    - Probe managers via UDP to detect DC failures (SWIM)
     - Aggregate global job status across DCs (TCP)
     - Manage leases for at-most-once semantics
     """
@@ -81,7 +90,6 @@ class GateServer(GateServerImpl):
             gate_udp_peers: Peer gate UDP addresses
             lease_timeout: Lease timeout in seconds
         """
-        # Initialize the base implementation
         super().__init__(
             host=host,
             tcp_port=tcp_port,
@@ -95,17 +103,23 @@ class GateServer(GateServerImpl):
             lease_timeout=lease_timeout,
         )
 
-        # Create modular runtime state (mirrors base state for now)
+        # Create modular runtime state
         self._modular_state = GateRuntimeState()
 
-        # Initialize coordinators (these can be used in parallel with base methods)
+        # Coordinators (initialized in _init_coordinators)
         self._stats_coordinator: GateStatsCoordinator | None = None
         self._cancellation_coordinator: GateCancellationCoordinator | None = None
         self._dispatch_coordinator: GateDispatchCoordinator | None = None
         self._leadership_coordinator: GateLeadershipCoordinator | None = None
+        self._peer_coordinator: GatePeerCoordinator | None = None
+        self._health_coordinator: GateHealthCoordinator | None = None
 
-        # Handler instances (wired during start())
+        # Handlers (initialized in _init_handlers)
         self._ping_handler: GatePingHandler | None = None
+        self._job_handler: GateJobHandler | None = None
+        self._manager_handler: GateManagerHandler | None = None
+        self._cancellation_handler: GateCancellationHandler | None = None
+        self._state_sync_handler: GateStateSyncHandler | None = None
 
     async def start(self) -> None:
         """
@@ -113,13 +127,9 @@ class GateServer(GateServerImpl):
 
         Initializes coordinators, wires handlers, and starts background tasks.
         """
-        # Call base start first
         await super().start()
 
-        # Initialize coordinators with dependencies from base implementation
         self._init_coordinators()
-
-        # Initialize handlers
         self._init_handlers()
 
     def _init_coordinators(self) -> None:
@@ -177,6 +187,46 @@ class GateServer(GateServerImpl):
             dispatch_to_dcs=self._dispatch_job_to_datacenters,
         )
 
+        # Peer coordinator
+        self._peer_coordinator = GatePeerCoordinator(
+            state=self._modular_state,
+            logger=self._udp_logger,
+            task_runner=self._task_runner,
+            peer_discovery=self._peer_discovery,
+            job_hash_ring=self._job_hash_ring,
+            job_forwarding_tracker=self._job_forwarding_tracker,
+            job_leadership_tracker=self._job_leadership_tracker,
+            versioned_clock=self._versioned_clock,
+            gate_health_config=vars(self._gate_health_config),
+            recovery_semaphore=self._recovery_semaphore,
+            recovery_jitter_min=0.0,
+            recovery_jitter_max=getattr(self.env, 'GATE_RECOVERY_JITTER_MAX', 1.0),
+            get_node_id=lambda: self._node_id,
+            get_host=lambda: self._host,
+            get_tcp_port=lambda: self._tcp_port,
+            get_udp_port=lambda: self._udp_port,
+            confirm_peer=self._confirm_peer,
+            handle_job_leader_failure=self._handle_job_leader_failure,
+        )
+
+        # Health coordinator
+        self._health_coordinator = GateHealthCoordinator(
+            state=self._modular_state,
+            logger=self._udp_logger,
+            task_runner=self._task_runner,
+            dc_health_manager=self._dc_health_manager,
+            dc_health_monitor=self._dc_health_monitor,
+            cross_dc_correlation=self._cross_dc_correlation,
+            dc_manager_discovery=self._dc_manager_discovery,
+            versioned_clock=self._versioned_clock,
+            manager_dispatcher=self._manager_dispatcher,
+            manager_health_config=vars(self._manager_health_config),
+            get_node_id=lambda: self._node_id,
+            get_host=lambda: self._host,
+            get_tcp_port=lambda: self._tcp_port,
+            confirm_manager_for_dc=self._confirm_manager_for_dc,
+        )
+
     def _init_handlers(self) -> None:
         """Initialize handler instances with dependencies."""
         # Ping handler
@@ -194,7 +244,87 @@ class GateServer(GateServerImpl):
             get_datacenter_managers=lambda: self._datacenter_managers,
         )
 
-    # Coordinator accessors for external use
+        # Job handler
+        self._job_handler = GateJobHandler(
+            state=self._modular_state,
+            logger=self._udp_logger,
+            task_runner=self._task_runner,
+            job_manager=self._job_manager,
+            job_router=self._job_router,
+            job_leadership_tracker=self._job_leadership_tracker,
+            quorum_circuit=self._quorum_circuit,
+            load_shedder=self._load_shedder,
+            job_lease_manager=self._job_lease_manager,
+            get_node_id=lambda: self._node_id,
+            get_host=lambda: self._host,
+            get_tcp_port=lambda: self._tcp_port,
+            is_leader=self.is_leader,
+            check_rate_limit=self._check_rate_limit_for_operation,
+            should_shed_request=self._should_shed_request,
+            has_quorum_available=self._has_quorum_available,
+            quorum_size=self._quorum_size,
+            select_datacenters_with_fallback=self._select_datacenters_with_fallback,
+            get_healthy_gates=self._get_healthy_gates,
+            broadcast_job_leadership=self._broadcast_job_leadership,
+            dispatch_job_to_datacenters=self._dispatch_job_to_datacenters,
+            forward_job_progress_to_peers=self._forward_job_progress_to_peers,
+            record_request_latency=self._record_request_latency,
+            record_dc_job_stats=self._record_dc_job_stats,
+            handle_update_by_tier=self._handle_update_by_tier,
+        )
+
+        # Manager handler
+        self._manager_handler = GateManagerHandler(
+            state=self._modular_state,
+            logger=self._udp_logger,
+            task_runner=self._task_runner,
+            env=self.env,
+            datacenter_managers=self._datacenter_managers,
+            role_validator=self._role_validator,
+            node_capabilities=self._node_capabilities,
+            get_node_id=lambda: self._node_id,
+            get_host=lambda: self._host,
+            get_tcp_port=lambda: self._tcp_port,
+            get_healthy_gates=self._get_healthy_gates,
+            record_manager_heartbeat=self._record_manager_heartbeat,
+            handle_manager_backpressure_signal=self._handle_manager_backpressure_signal,
+            update_dc_backpressure=self._update_dc_backpressure,
+            broadcast_manager_discovery=self._broadcast_manager_discovery,
+        )
+
+        # Cancellation handler
+        self._cancellation_handler = GateCancellationHandler(
+            state=self._modular_state,
+            logger=self._udp_logger,
+            task_runner=self._task_runner,
+            job_manager=self._job_manager,
+            datacenter_managers=self._datacenter_managers,
+            get_node_id=lambda: self._node_id,
+            get_host=lambda: self._host,
+            get_tcp_port=lambda: self._tcp_port,
+            check_rate_limit=self._check_rate_limit_for_operation,
+            send_tcp=self._send_tcp,
+            get_available_datacenters=self._get_available_datacenters,
+        )
+
+        # State sync handler
+        self._state_sync_handler = GateStateSyncHandler(
+            state=self._modular_state,
+            logger=self._udp_logger,
+            task_runner=self._task_runner,
+            job_manager=self._job_manager,
+            job_leadership_tracker=self._job_leadership_tracker,
+            versioned_clock=self._versioned_clock,
+            get_node_id=lambda: self._node_id,
+            get_host=lambda: self._host,
+            get_tcp_port=lambda: self._tcp_port,
+            is_leader=self.is_leader,
+            get_term=lambda: self._leader_election.state.current_term,
+            get_state_snapshot=self._get_state_snapshot,
+            apply_state_snapshot=self._apply_gate_state_snapshot,
+        )
+
+    # Coordinator accessors
     @property
     def stats_coordinator(self) -> GateStatsCoordinator | None:
         """Get the stats coordinator."""
@@ -215,6 +345,16 @@ class GateServer(GateServerImpl):
         """Get the leadership coordinator."""
         return self._leadership_coordinator
 
+    @property
+    def peer_coordinator(self) -> GatePeerCoordinator | None:
+        """Get the peer coordinator."""
+        return self._peer_coordinator
+
+    @property
+    def health_coordinator(self) -> GateHealthCoordinator | None:
+        """Get the health coordinator."""
+        return self._health_coordinator
+
 
 __all__ = [
     "GateServer",
@@ -225,5 +365,11 @@ __all__ = [
     "GateCancellationCoordinator",
     "GateDispatchCoordinator",
     "GateLeadershipCoordinator",
+    "GatePeerCoordinator",
+    "GateHealthCoordinator",
     "GatePingHandler",
+    "GateJobHandler",
+    "GateManagerHandler",
+    "GateCancellationHandler",
+    "GateStateSyncHandler",
 ]
