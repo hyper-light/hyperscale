@@ -761,37 +761,40 @@ class JobAck(Message):
 class WorkflowDispatch(Message):
     """
     Dispatch a single workflow to a worker.
-    
+
     Sent from manager to worker for execution.
-    
+
     Resource Model:
     - vus: Virtual users (can be large, e.g., 50,000)
     - cores: CPU cores to allocate (determined by workflow priority)
-    
+
     VUs are distributed across the allocated cores. For example:
     - 50,000 VUs / 4 cores = 12,500 VUs per core
-    
+
     Context Consistency Protocol:
     - context_version: The layer version this dispatch is for
     - dependency_context: Context from dependencies (subset of full context)
-    
+
     Workers can verify they have the correct context version before execution.
     """
     job_id: str                  # Parent job identifier
     workflow_id: str             # Unique workflow instance ID
-    workflow: bytes              # Cloudpickled Workflow class
-    context: bytes               # Cloudpickled context dict (legacy, may be empty)
-    vus: int                     # Virtual users (can be 50k+)
-    cores: int                   # CPU cores to allocate (from priority)
-    timeout_seconds: float       # Execution timeout
-    fence_token: int             # Fencing token for at-most-once
+    workflow: bytes = b''        # Cloudpickled Workflow class
+    context: bytes = b''         # Cloudpickled context dict (legacy, may be empty)
+    vus: int = 0                 # Virtual users (can be 50k+)
+    cores: int = 0               # CPU cores to allocate (from priority)
+    timeout_seconds: float = 0.0 # Execution timeout
+    fence_token: int = 0         # Fencing token for at-most-once
     # Context Consistency Protocol fields
     context_version: int = 0     # Layer version for staleness detection
     dependency_context: bytes = b''  # Context from dependencies only
+    # Additional fields for dispatch handling
+    workflow_name: str = ""      # Name of the workflow
+    job_leader_addr: tuple[str, int] | None = None  # Address of job leader
 
     def load_workflow(self) -> Workflow:
         return Message.load(self.workflow)
-    
+
     def load_context(self) -> Context:
         return Message.load(self.context)
 
