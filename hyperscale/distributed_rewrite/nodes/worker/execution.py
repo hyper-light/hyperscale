@@ -17,6 +17,7 @@ from hyperscale.distributed_rewrite.models import (
 if TYPE_CHECKING:
     from hyperscale.logging import Logger
     from hyperscale.distributed_rewrite.jobs import CoreAllocator
+    from .backpressure import WorkerBackpressureManager
 
 
 class WorkerExecutor:
@@ -33,6 +34,7 @@ class WorkerExecutor:
         logger: "Logger",
         progress_update_interval: float = 1.0,
         progress_flush_interval: float = 0.5,
+        backpressure_manager: "WorkerBackpressureManager | None" = None,
     ) -> None:
         """
         Initialize worker executor.
@@ -42,11 +44,13 @@ class WorkerExecutor:
             logger: Logger instance for logging
             progress_update_interval: Interval between progress updates
             progress_flush_interval: Interval for progress buffer flush
+            backpressure_manager: Backpressure manager for AD-37 compliance
         """
         self._core_allocator = core_allocator
         self._logger = logger
         self._progress_update_interval = progress_update_interval
         self._progress_flush_interval = progress_flush_interval
+        self._backpressure_manager = backpressure_manager
         self._running = False
 
         # Throughput tracking (AD-19)
@@ -173,16 +177,51 @@ class WorkerExecutor:
         send_progress: callable,
     ) -> None:
         """
-        Background loop for flushing progress updates.
+        Background loop for flushing progress updates (AD-37 compliant).
+
+        Respects backpressure levels from manager:
+        - NONE: Flush at normal interval
+        - THROTTLE: Add delay between flushes
+        - BATCH: Aggregate and flush less frequently
+        - REJECT: Drop non-critical updates entirely
 
         Args:
             send_progress: Function to send progress to manager
         """
         self._running = True
+        batch_accumulation_cycles = 0
+
         while self._running:
             try:
+                # Base sleep interval
                 await asyncio.sleep(self._progress_flush_interval)
+
+                # Check backpressure state (AD-37)
+                if self._backpressure_manager is not None:
+                    # REJECT level: drop non-critical updates entirely
+                    if self._backpressure_manager.should_reject_updates():
+                        async with self._progress_buffer_lock:
+                            self._progress_buffer.clear()
+                        batch_accumulation_cycles = 0
+                        continue
+
+                    # BATCH level: accumulate updates, flush less often
+                    if self._backpressure_manager.should_batch_only():
+                        batch_accumulation_cycles += 1
+                        # Flush every 4 cycles in batch mode
+                        if batch_accumulation_cycles < 4:
+                            continue
+                        batch_accumulation_cycles = 0
+
+                    # THROTTLE level: add extra delay
+                    elif self._backpressure_manager.should_throttle():
+                        throttle_delay = self._backpressure_manager.get_throttle_delay_seconds()
+                        if throttle_delay > 0:
+                            await asyncio.sleep(throttle_delay)
+
+                # Flush the buffer
                 await self.flush_progress_buffer(send_progress)
+
             except asyncio.CancelledError:
                 break
             except Exception:

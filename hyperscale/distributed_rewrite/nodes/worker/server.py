@@ -90,19 +90,20 @@ class WorkerServer(HealthAwareServer):
             recovery_semaphore_size=env.RECOVERY_SEMAPHORE_SIZE,
         )
 
+        self._backpressure_manager = WorkerBackpressureManager(
+            logger=None,
+            registry=self._registry,
+        )
+
         self._executor = WorkerExecutor(
             core_allocator=self._core_allocator,
             logger=None,
             progress_update_interval=self._config.progress_update_interval,
             progress_flush_interval=self._config.progress_flush_interval,
+            backpressure_manager=self._backpressure_manager,
         )
 
         self._state_sync = WorkerStateSync()
-
-        self._backpressure_manager = WorkerBackpressureManager(
-            logger=None,
-            registry=self._registry,
-        )
 
         self._health_integration = WorkerHealthIntegration(
             registry=self._registry,

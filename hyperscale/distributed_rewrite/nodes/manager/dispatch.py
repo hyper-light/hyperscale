@@ -11,6 +11,7 @@ from hyperscale.distributed_rewrite.models import (
     WorkflowDispatch,
     WorkflowDispatchAck,
     ProvisionRequest,
+    ProvisionConfirm,
 )
 from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerDebug, ServerWarning
 
