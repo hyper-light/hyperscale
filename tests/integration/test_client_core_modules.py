@@ -593,7 +593,7 @@ class TestClientJobTracker:
         error = "Worker timeout"
         tracker.mark_job_failed(job_id, error)
 
-        assert state._jobs[job_id].status == "FAILED"
+        assert state._jobs[job_id].status == "failed"
         # Should signal completion
         assert state._job_events[job_id].is_set()
 
@@ -682,8 +682,7 @@ class TestClientJobTracker:
         tracker.initialize_job_tracking(job_id)
 
         async def waiter():
-            await tracker.wait_for_job(job_id)
-            return "done"
+            return await tracker.wait_for_job(job_id)
 
         async def completer():
             await asyncio.sleep(0.02)
