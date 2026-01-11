@@ -562,7 +562,7 @@ class TestWorkflowCancelHandler:
 
     @pytest.mark.asyncio
     async def test_cancel_unknown_workflow(self, mock_server):
-        """Test cancellation of unknown workflow."""
+        """Test cancellation of unknown workflow (idempotent - treated as already completed)."""
         from hyperscale.distributed_rewrite.nodes.worker.handlers.tcp_cancel import (
             WorkflowCancelHandler,
         )
@@ -584,8 +584,9 @@ class TestWorkflowCancelHandler:
         )
 
         ack = WorkflowCancelResponse.load(result)
-        assert ack.success is False
-        assert "not found" in ack.error.lower() or ack.error != ""
+        # Idempotent cancellation: unknown workflow = already completed
+        assert ack.success is True
+        assert ack.already_completed is True
 
 
 class TestHandlersConcurrency:
