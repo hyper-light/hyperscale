@@ -7,6 +7,8 @@ from hyperscale.logging.config.durability_mode import DurabilityMode
 from hyperscale.logging.models import Entry, LogLevel
 from hyperscale.logging.streams.logger_stream import LoggerStream
 
+from .conftest import create_mock_stream_writer
+
 
 class TestConcurrentWrites:
     @pytest.mark.asyncio
@@ -101,7 +103,10 @@ class TestConcurrentReadsAndWrites:
             enable_lsn=True,
             instance_id=1,
         )
-        await stream.initialize()
+        await stream.initialize(
+            stdout_writer=create_mock_stream_writer(),
+            stderr_writer=create_mock_stream_writer(),
+        )
 
         for idx in range(10):
             entry = sample_entry_factory(message=f"initial {idx}")
@@ -146,7 +151,10 @@ class TestConcurrentBatchFsync:
             instance_id=1,
         )
         stream._batch_max_size = 20
-        await stream.initialize()
+        await stream.initialize(
+            stdout_writer=create_mock_stream_writer(),
+            stderr_writer=create_mock_stream_writer(),
+        )
 
         async def write_batch(prefix: str, count: int):
             for idx in range(count):
@@ -188,7 +196,10 @@ class TestMultipleStreams:
                 enable_lsn=True,
                 instance_id=idx,
             )
-            await stream.initialize()
+            await stream.initialize(
+                stdout_writer=create_mock_stream_writer(),
+                stderr_writer=create_mock_stream_writer(),
+            )
             streams.append(stream)
 
         async def write_to_stream(stream: LoggerStream, stream_idx: int, count: int):
@@ -227,7 +238,10 @@ class TestHighConcurrencyLoad:
             enable_lsn=True,
             instance_id=1,
         )
-        await stream.initialize()
+        await stream.initialize(
+            stdout_writer=create_mock_stream_writer(),
+            stderr_writer=create_mock_stream_writer(),
+        )
 
         async def write_entries(task_id: int, count: int):
             for idx in range(count):
@@ -244,7 +258,7 @@ class TestHighConcurrencyLoad:
 
         assert len(entries) == 200
 
-        lsns = [lsn for _, _, lsn in []]
+        lsns = []
         async for offset, log, lsn in stream.read_entries(log_path):
             lsns.append(lsn)
 
