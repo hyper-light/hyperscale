@@ -1261,6 +1261,9 @@ class MercurySyncBaseServer(Generic[T]):
 
             self._tcp_client_data[address_bytes][handler_name].put_nowait((payload, clock_time))
 
+        except asyncio.QueueFull:
+            self._tcp_drop_counter.increment_load_shed()
+
         except Exception as err:
             self._tcp_client_data[address_bytes][handler_name].put_nowait((err, clock_time))
         
