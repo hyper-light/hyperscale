@@ -6,7 +6,7 @@ import asyncio
 
 import pytest
 
-from tests.integration.test_message_handling.mocks import (
+from tests.integration.messaging.mocks import (
     MockServerInterface,
     MockLeaderState,
 )

@@ -13,7 +13,7 @@ import pytest
 from hyperscale.distributed_rewrite.swim.message_handling.core import MessageParser
 from hyperscale.distributed_rewrite.swim.message_handling.models import MessageContext
 
-from tests.integration.test_message_handling.mocks import MockServerInterface
+from tests.integration.messaging.mocks import MockServerInterface
 
 
 class TestMessageParserHappyPath:

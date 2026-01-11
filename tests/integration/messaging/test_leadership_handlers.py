@@ -32,7 +32,7 @@ from hyperscale.distributed_rewrite.swim.message_handling.leadership import (
 )
 from hyperscale.distributed_rewrite.swim.message_handling.models import MessageContext
 
-from tests.integration.test_message_handling.mocks import MockServerInterface, MockLeaderState
+from tests.integration.messaging.mocks import MockServerInterface, MockLeaderState
 
 
 class TestLeaderClaimHandlerHappyPath:

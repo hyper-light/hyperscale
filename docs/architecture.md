@@ -31374,3 +31374,1767 @@ class IndexedReader:
 │  └── No coordination bugs (independent instances)                   │
 └─────────────────────────────────────────────────────────────────────┘
 ```
+
+---
+
+## AD-40: Idempotent Job Submissions
+
+### Part 1: Problem Statement and Requirements
+
+#### The Duplicate Submission Problem
+
+In distributed systems, clients cannot distinguish between:
+1. **Request lost** - Network dropped the request before gate received it
+2. **Response lost** - Gate processed it but response didn't reach client
+3. **Timeout** - Request is still being processed, just slow
+
+Without idempotency, client retries cause duplicate job executions:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    THE DUPLICATE SUBMISSION PROBLEM                      │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  SCENARIO: Client submits job, response lost, client retries             │
+│                                                                          │
+│  WITHOUT IDEMPOTENCY:                                                    │
+│  ┌──────────┐        ┌──────────┐        ┌──────────┐                   │
+│  │  Client  │        │   Gate   │        │  Manager │                   │
+│  └────┬─────┘        └────┬─────┘        └────┬─────┘                   │
+│       │                   │                   │                          │
+│       │──JobSubmission───▶│                   │                          │
+│       │   job_id=abc      │──JobSubmission───▶│                          │
+│       │                   │                   │──creates job abc         │
+│       │                   │◀──JobAck─────────│                          │
+│       │    ╳ response     │                   │                          │
+│       │      lost         │                   │                          │
+│       │                   │                   │                          │
+│       │──(timeout)────────│                   │                          │
+│       │                   │                   │                          │
+│       │──JobSubmission───▶│                   │  ← Client retries        │
+│       │   job_id=def      │──JobSubmission───▶│    with NEW job_id       │
+│       │   (new id!)       │                   │──creates job def         │
+│       │                   │                   │                          │
+│       │◀──JobAck─────────│◀──JobAck─────────│                          │
+│       │                   │                   │                          │
+│       │                   │                   │                          │
+│  RESULT: TWO JOBS CREATED (abc AND def) FOR SAME LOGICAL REQUEST        │
+│                                                                          │
+│  WITH IDEMPOTENCY:                                                       │
+│  ┌──────────┐        ┌──────────┐        ┌──────────┐                   │
+│  │  Client  │        │   Gate   │        │  Manager │                   │
+│  └────┬─────┘        └────┬─────┘        └────┬─────┘                   │
+│       │                   │                   │                          │
+│       │──JobSubmission───▶│                   │                          │
+│       │   idem_key=xyz    │──JobSubmission───▶│                          │
+│       │   job_id=abc      │   idem_key=xyz    │──creates job abc         │
+│       │                   │                   │  stores idem_key→abc     │
+│       │                   │◀──JobAck─────────│                          │
+│       │    ╳ response     │                   │                          │
+│       │      lost         │                   │                          │
+│       │                   │                   │                          │
+│       │──(timeout)────────│                   │                          │
+│       │                   │                   │                          │
+│       │──JobSubmission───▶│                   │  ← Client retries        │
+│       │   idem_key=xyz    │──check cache──────│    with SAME idem_key    │
+│       │   job_id=def      │   idem_key=xyz?   │                          │
+│       │                   │◀──found: abc─────│                          │
+│       │◀──JobAck─────────│                   │                          │
+│       │   job_id=abc      │   returns abc,    │                          │
+│       │                   │   ignores def     │                          │
+│       │                   │                   │                          │
+│  RESULT: ONE JOB (abc), DUPLICATE DETECTED AND DEDUPLICATED             │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Requirements
+
+1. **At-Most-Once Semantics**: A job submission with a given idempotency key executes at most once
+2. **Bounded Memory**: Idempotency state must not grow unboundedly
+3. **Crash Recovery**: Idempotency guarantees survive gate/manager restarts
+4. **Cross-DC Consistency**: Same idempotency key handled consistently across DCs
+5. **Low Latency**: Dedup check must be O(1) and not add significant latency
+6. **Configurable Window**: TTL for idempotency keys should be configurable
+
+### Part 2: Idempotency Key Design
+
+#### Key Structure
+
+The idempotency key uniquely identifies a logical submission attempt:
+
+```python
+from dataclasses import dataclass
+from enum import Enum, auto
+from typing import Generic, TypeVar
+import secrets
+import time
+
+
+@dataclass(slots=True, frozen=True)
+class IdempotencyKey:
+    """
+    Client-generated idempotency key for job submissions.
+
+    Structure: {client_id}:{sequence}:{nonce}
+
+    - client_id: Stable identifier for the client (survives restarts)
+    - sequence: Monotonically increasing counter per client
+    - nonce: Random component to prevent collision across client restarts
+
+    The combination ensures:
+    - Same client retry uses same key (client_id + sequence)
+    - Different clients cannot collide (different client_id)
+    - Client restart doesn't reuse old sequences (nonce changes)
+    """
+    client_id: str      # Stable client identifier (e.g., hostname:pid or UUID)
+    sequence: int       # Monotonically increasing per-client
+    nonce: str          # Random component (8 bytes hex)
+
+    def __str__(self) -> str:
+        return f"{self.client_id}:{self.sequence}:{self.nonce}"
+
+    def __hash__(self) -> int:
+        return hash((self.client_id, self.sequence, self.nonce))
+
+    @classmethod
+    def parse(cls, key_str: str) -> "IdempotencyKey":
+        """Parse idempotency key from string representation."""
+        parts = key_str.split(":", 2)
+        if len(parts) != 3:
+            raise ValueError(f"Invalid idempotency key format: {key_str}")
+        return cls(
+            client_id=parts[0],
+            sequence=int(parts[1]),
+            nonce=parts[2],
+        )
+
+
+class IdempotencyKeyGenerator:
+    """
+    Generates idempotency keys for a client.
+
+    Thread-safe through atomic counter operations.
+    """
+
+    def __init__(self, client_id: str):
+        self._client_id = client_id
+        self._sequence = 0
+        self._nonce = secrets.token_hex(8)  # New nonce per generator instance
+
+    def generate(self) -> IdempotencyKey:
+        """Generate next idempotency key."""
+        seq = self._sequence
+        self._sequence += 1
+        return IdempotencyKey(
+            client_id=self._client_id,
+            sequence=seq,
+            nonce=self._nonce,
+        )
+```
+
+#### Why This Structure?
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    IDEMPOTENCY KEY STRUCTURE RATIONALE                   │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  KEY: {client_id}:{sequence}:{nonce}                                     │
+│                                                                          │
+│  COMPONENT        PURPOSE                    EXAMPLE                     │
+│  ─────────────────────────────────────────────────────────────────────  │
+│  client_id        Namespace isolation        "host1.dc1:12345"           │
+│                   - Different clients        (hostname:pid)              │
+│                     never collide                                        │
+│                                                                          │
+│  sequence         Retry detection            42                          │
+│                   - Same seq = retry         (monotonic counter)         │
+│                   - New seq = new request                                │
+│                                                                          │
+│  nonce            Restart protection         "a1b2c3d4e5f6g7h8"          │
+│                   - Prevents reuse of        (random per process)        │
+│                     old sequence numbers                                 │
+│                     after client restart                                 │
+│                                                                          │
+│  COLLISION ANALYSIS:                                                     │
+│                                                                          │
+│  Same client, same request (retry):                                      │
+│    key1 = "host1:42:abc123" ← original                                   │
+│    key2 = "host1:42:abc123" ← retry (same key, deduped)                 │
+│                                                                          │
+│  Same client, different request:                                         │
+│    key1 = "host1:42:abc123"                                              │
+│    key2 = "host1:43:abc123" ← different sequence                        │
+│                                                                          │
+│  Same client after restart:                                              │
+│    key1 = "host1:42:abc123" ← before restart                            │
+│    key2 = "host1:42:def456" ← after restart (new nonce)                 │
+│                                                                          │
+│  Different clients:                                                      │
+│    key1 = "host1:42:abc123"                                              │
+│    key2 = "host2:42:abc123" ← different client_id                       │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Part 3: Entry States and Lifecycle
+
+#### Idempotency Entry State Machine
+
+```python
+class IdempotencyStatus(Enum):
+    """
+    Status of an idempotency entry.
+
+    State transitions:
+        PENDING → COMMITTED (successful processing)
+        PENDING → REJECTED (validation/capacity rejection)
+        PENDING → EXPIRED (TTL exceeded while pending)
+
+    Terminal states (COMMITTED, REJECTED) are immutable.
+    """
+    PENDING = auto()    # Request received, processing in progress
+    COMMITTED = auto()  # Request processed successfully
+    REJECTED = auto()   # Request rejected (validation, capacity, etc.)
+
+
+T = TypeVar("T")
+
+
+@dataclass(slots=True)
+class IdempotencyEntry(Generic[T]):
+    """
+    Tracks the state and outcome of an idempotent request.
+
+    Generic over T to support different result types (JobAck, etc.)
+    """
+    idempotency_key: IdempotencyKey
+    status: IdempotencyStatus
+    job_id: str | None          # Set when job is created
+    result: T | None            # Cached result to return on duplicates
+    created_at: float           # Unix timestamp of first receipt
+    committed_at: float | None  # Unix timestamp of commit (if committed)
+    source_gate_id: str | None  # Gate that first received this request
+
+    def is_terminal(self) -> bool:
+        """Check if entry is in a terminal state."""
+        return self.status in (IdempotencyStatus.COMMITTED, IdempotencyStatus.REJECTED)
+
+    def age_seconds(self) -> float:
+        """Get age of entry in seconds."""
+        return time.time() - self.created_at
+
+
+@dataclass(slots=True, frozen=True)
+class IdempotencyConfig:
+    """Configuration for idempotency caches."""
+
+    # TTL for entries in different states
+    pending_ttl_seconds: float = 60.0       # How long to wait for pending requests
+    committed_ttl_seconds: float = 300.0    # How long to cache committed results (5 min)
+    rejected_ttl_seconds: float = 60.0      # How long to cache rejections
+
+    # Cache size limits
+    max_entries: int = 100_000              # Maximum entries in cache
+
+    # Cleanup interval
+    cleanup_interval_seconds: float = 10.0  # How often to run cleanup
+
+    # Behavior settings
+    wait_for_pending: bool = True           # Wait for PENDING entries vs immediate reject
+    pending_wait_timeout: float = 30.0      # Max wait time for pending entries
+```
+
+#### State Transition Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                   IDEMPOTENCY ENTRY STATE MACHINE                        │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│                        ┌─────────────────┐                               │
+│                        │                 │                               │
+│    new request         │   (not found)   │                               │
+│         │              │                 │                               │
+│         ▼              └────────┬────────┘                               │
+│  ┌──────────────┐               │                                        │
+│  │              │◀──────────────┘                                        │
+│  │   PENDING    │                                                        │
+│  │              │──────┬───────────────┬───────────────┐                │
+│  └──────────────┘      │               │               │                │
+│                        │               │               │                │
+│              success   │     reject    │     timeout   │                │
+│                        │               │               │                │
+│                        ▼               ▼               ▼                │
+│              ┌──────────────┐ ┌──────────────┐ ┌──────────────┐         │
+│              │              │ │              │ │              │         │
+│              │  COMMITTED   │ │   REJECTED   │ │   EXPIRED    │         │
+│              │              │ │              │ │   (removed)  │         │
+│              └──────┬───────┘ └──────┬───────┘ └──────────────┘         │
+│                     │                │                                   │
+│                     │   TTL          │   TTL                            │
+│                     │   expires      │   expires                        │
+│                     ▼                ▼                                   │
+│              ┌──────────────────────────────┐                           │
+│              │                              │                           │
+│              │     EVICTED (removed)        │                           │
+│              │                              │                           │
+│              └──────────────────────────────┘                           │
+│                                                                          │
+│  DUPLICATE HANDLING BY STATE:                                            │
+│                                                                          │
+│  ┌─────────────┬────────────────────────────────────────────────────┐   │
+│  │ State       │ Action on duplicate                                │   │
+│  ├─────────────┼────────────────────────────────────────────────────┤   │
+│  │ PENDING     │ Wait for original to complete (or timeout)         │   │
+│  │ COMMITTED   │ Return cached result immediately                   │   │
+│  │ REJECTED    │ Return cached rejection immediately                │   │
+│  │ (not found) │ Insert PENDING, process as new request            │   │
+│  └─────────────┴────────────────────────────────────────────────────┘   │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Part 4: Gate-Level Idempotency Cache
+
+The gate provides fast-path deduplication for client retries:
+
+```python
+import asyncio
+from collections import OrderedDict
+from dataclasses import dataclass, field
+from typing import Generic, TypeVar
+
+
+T = TypeVar("T")
+
+
+class GateIdempotencyCache(Generic[T]):
+    """
+    Gate-level idempotency cache for fast-path duplicate detection.
+
+    Design principles:
+    - O(1) lookup and insertion
+    - LRU eviction when at capacity
+    - TTL-based expiration for all entries
+    - Waiters for PENDING entries (coalesce duplicate requests)
+
+    This is the first line of defense against duplicates. The manager
+    provides authoritative deduplication for cross-gate scenarios.
+    """
+
+    def __init__(self, config: IdempotencyConfig):
+        self._config = config
+
+        # Main cache: idempotency_key -> entry
+        # OrderedDict for LRU ordering
+        self._cache: OrderedDict[IdempotencyKey, IdempotencyEntry[T]] = OrderedDict()
+
+        # Waiters for pending entries: idempotency_key -> list of futures
+        self._pending_waiters: dict[IdempotencyKey, list[asyncio.Future[T]]] = {}
+
+        # Background cleanup task
+        self._cleanup_task: asyncio.Task | None = None
+        self._closed = False
+
+    async def start(self) -> None:
+        """Start background cleanup task."""
+        self._cleanup_task = asyncio.create_task(self._cleanup_loop())
+
+    async def close(self) -> None:
+        """Stop cleanup and clear cache."""
+        self._closed = True
+        if self._cleanup_task:
+            self._cleanup_task.cancel()
+            try:
+                await self._cleanup_task
+            except asyncio.CancelledError:
+                pass
+
+        # Cancel all waiters
+        for waiters in self._pending_waiters.values():
+            for waiter in waiters:
+                if not waiter.done():
+                    waiter.cancel()
+
+        self._cache.clear()
+        self._pending_waiters.clear()
+
+    async def check_or_insert(
+        self,
+        key: IdempotencyKey,
+        job_id: str,
+        source_gate_id: str,
+    ) -> tuple[bool, IdempotencyEntry[T] | None]:
+        """
+        Check if key exists; if not, insert as PENDING.
+
+        Returns:
+            (is_duplicate, entry)
+            - (False, None): New request, inserted as PENDING
+            - (True, entry): Duplicate found, entry contains status
+
+        If entry is PENDING and config.wait_for_pending is True,
+        this will wait for the entry to become terminal.
+        """
+        # Check cache
+        if key in self._cache:
+            entry = self._cache[key]
+
+            # Move to end for LRU
+            self._cache.move_to_end(key)
+
+            # If terminal, return immediately
+            if entry.is_terminal():
+                return (True, entry)
+
+            # PENDING - optionally wait
+            if self._config.wait_for_pending:
+                result = await self._wait_for_pending(key)
+                # Re-fetch entry (may have been updated)
+                entry = self._cache.get(key)
+                return (True, entry)
+            else:
+                return (True, entry)
+
+        # Not found - insert as PENDING
+        entry = IdempotencyEntry(
+            idempotency_key=key,
+            status=IdempotencyStatus.PENDING,
+            job_id=job_id,
+            result=None,
+            created_at=time.time(),
+            committed_at=None,
+            source_gate_id=source_gate_id,
+        )
+
+        # Evict if at capacity
+        while len(self._cache) >= self._config.max_entries:
+            # Remove oldest (first item)
+            oldest_key, oldest_entry = next(iter(self._cache.items()))
+            self._cache.pop(oldest_key)
+            # Cancel any waiters for evicted entry
+            if oldest_key in self._pending_waiters:
+                for waiter in self._pending_waiters.pop(oldest_key):
+                    if not waiter.done():
+                        waiter.set_exception(
+                            TimeoutError("Idempotency entry evicted")
+                        )
+
+        self._cache[key] = entry
+        return (False, None)
+
+    async def commit(
+        self,
+        key: IdempotencyKey,
+        result: T,
+    ) -> None:
+        """
+        Transition entry from PENDING to COMMITTED with result.
+
+        Notifies any waiters of the result.
+        """
+        if key not in self._cache:
+            return
+
+        entry = self._cache[key]
+        if entry.status != IdempotencyStatus.PENDING:
+            return  # Already terminal
+
+        # Update entry
+        entry.status = IdempotencyStatus.COMMITTED
+        entry.result = result
+        entry.committed_at = time.time()
+
+        # Notify waiters
+        self._notify_waiters(key, result)
+
+    async def reject(
+        self,
+        key: IdempotencyKey,
+        result: T,
+    ) -> None:
+        """
+        Transition entry from PENDING to REJECTED with result.
+
+        Notifies any waiters of the rejection.
+        """
+        if key not in self._cache:
+            return
+
+        entry = self._cache[key]
+        if entry.status != IdempotencyStatus.PENDING:
+            return  # Already terminal
+
+        # Update entry
+        entry.status = IdempotencyStatus.REJECTED
+        entry.result = result
+        entry.committed_at = time.time()
+
+        # Notify waiters
+        self._notify_waiters(key, result)
+
+    def get(self, key: IdempotencyKey) -> IdempotencyEntry[T] | None:
+        """Get entry by key without modifying LRU order."""
+        return self._cache.get(key)
+
+    async def _wait_for_pending(self, key: IdempotencyKey) -> T | None:
+        """Wait for a PENDING entry to become terminal."""
+        # Create future for this waiter
+        future: asyncio.Future[T] = asyncio.Future()
+
+        if key not in self._pending_waiters:
+            self._pending_waiters[key] = []
+        self._pending_waiters[key].append(future)
+
+        try:
+            return await asyncio.wait_for(
+                future,
+                timeout=self._config.pending_wait_timeout,
+            )
+        except asyncio.TimeoutError:
+            return None
+        finally:
+            # Clean up waiter list
+            if key in self._pending_waiters:
+                try:
+                    self._pending_waiters[key].remove(future)
+                except ValueError:
+                    pass
+                if not self._pending_waiters[key]:
+                    del self._pending_waiters[key]
+
+    def _notify_waiters(self, key: IdempotencyKey, result: T) -> None:
+        """Notify all waiters for a key."""
+        if key not in self._pending_waiters:
+            return
+
+        for waiter in self._pending_waiters.pop(key):
+            if not waiter.done():
+                waiter.set_result(result)
+
+    async def _cleanup_loop(self) -> None:
+        """Background task to clean up expired entries."""
+        while not self._closed:
+            try:
+                await asyncio.sleep(self._config.cleanup_interval_seconds)
+                await self._cleanup_expired()
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                # Log but continue
+                pass
+
+    async def _cleanup_expired(self) -> None:
+        """Remove expired entries from cache."""
+        now = time.time()
+        expired_keys: list[IdempotencyKey] = []
+
+        for key, entry in self._cache.items():
+            ttl = self._get_ttl_for_status(entry.status)
+            reference_time = entry.committed_at or entry.created_at
+
+            if now - reference_time > ttl:
+                expired_keys.append(key)
+
+        for key in expired_keys:
+            self._cache.pop(key, None)
+            # Cancel any waiters
+            if key in self._pending_waiters:
+                for waiter in self._pending_waiters.pop(key):
+                    if not waiter.done():
+                        waiter.set_exception(
+                            TimeoutError("Idempotency entry expired")
+                        )
+
+    def _get_ttl_for_status(self, status: IdempotencyStatus) -> float:
+        """Get TTL for a given status."""
+        if status == IdempotencyStatus.PENDING:
+            return self._config.pending_ttl_seconds
+        elif status == IdempotencyStatus.COMMITTED:
+            return self._config.committed_ttl_seconds
+        else:  # REJECTED
+            return self._config.rejected_ttl_seconds
+
+    def stats(self) -> dict:
+        """Get cache statistics."""
+        status_counts = {status: 0 for status in IdempotencyStatus}
+        for entry in self._cache.values():
+            status_counts[entry.status] += 1
+
+        return {
+            "total_entries": len(self._cache),
+            "pending_count": status_counts[IdempotencyStatus.PENDING],
+            "committed_count": status_counts[IdempotencyStatus.COMMITTED],
+            "rejected_count": status_counts[IdempotencyStatus.REJECTED],
+            "pending_waiters": sum(len(w) for w in self._pending_waiters.values()),
+            "max_entries": self._config.max_entries,
+        }
+```
+
+### Part 5: Manager-Level Idempotency Ledger
+
+The manager provides authoritative deduplication that survives restarts:
+
+```python
+from dataclasses import dataclass
+from typing import Generic, TypeVar
+import asyncio
+
+
+T = TypeVar("T")
+
+
+@dataclass(slots=True)
+class IdempotencyLedgerEntry(Generic[T]):
+    """
+    Persistent idempotency entry stored in manager's WAL.
+
+    This is the authoritative record of whether a request was processed.
+    """
+    idempotency_key: IdempotencyKey
+    job_id: str
+    status: IdempotencyStatus
+    result_serialized: bytes | None  # Serialized result for response
+    created_at: float
+    committed_at: float | None
+
+    def to_bytes(self) -> bytes:
+        """Serialize for WAL storage."""
+        import struct
+
+        key_bytes = str(self.idempotency_key).encode("utf-8")
+        job_id_bytes = self.job_id.encode("utf-8")
+        result_bytes = self.result_serialized or b""
+
+        # Format: key_len(4) + key + job_id_len(4) + job_id +
+        #         status(1) + created_at(8) + committed_at(8) +
+        #         result_len(4) + result
+        return struct.pack(
+            f">I{len(key_bytes)}sI{len(job_id_bytes)}sBddI{len(result_bytes)}s",
+            len(key_bytes), key_bytes,
+            len(job_id_bytes), job_id_bytes,
+            self.status.value,
+            self.created_at,
+            self.committed_at or 0.0,
+            len(result_bytes), result_bytes,
+        )
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "IdempotencyLedgerEntry":
+        """Deserialize from WAL storage."""
+        import struct
+
+        offset = 0
+
+        key_len = struct.unpack_from(">I", data, offset)[0]
+        offset += 4
+        key_str = data[offset:offset + key_len].decode("utf-8")
+        offset += key_len
+
+        job_id_len = struct.unpack_from(">I", data, offset)[0]
+        offset += 4
+        job_id = data[offset:offset + job_id_len].decode("utf-8")
+        offset += job_id_len
+
+        status_val = struct.unpack_from(">B", data, offset)[0]
+        offset += 1
+
+        created_at, committed_at = struct.unpack_from(">dd", data, offset)
+        offset += 16
+
+        result_len = struct.unpack_from(">I", data, offset)[0]
+        offset += 4
+        result_bytes = data[offset:offset + result_len] if result_len > 0 else None
+
+        return cls(
+            idempotency_key=IdempotencyKey.parse(key_str),
+            job_id=job_id,
+            status=IdempotencyStatus(status_val),
+            result_serialized=result_bytes,
+            created_at=created_at,
+            committed_at=committed_at if committed_at > 0 else None,
+        )
+
+
+class ManagerIdempotencyLedger(Generic[T]):
+    """
+    Manager-level idempotency ledger with WAL persistence.
+
+    This is the authoritative source for idempotency decisions.
+    Entries are persisted to WAL before acknowledging to ensure
+    crash recovery maintains idempotency guarantees.
+
+    Design:
+    - In-memory index for O(1) lookups
+    - WAL persistence for crash recovery
+    - TTL-based cleanup to bound memory
+    - Integration with per-job VSR for cross-DC consistency
+    """
+
+    def __init__(
+        self,
+        config: IdempotencyConfig,
+        wal_path: str,
+    ):
+        self._config = config
+        self._wal_path = wal_path
+
+        # In-memory index: idempotency_key -> entry
+        self._index: dict[IdempotencyKey, IdempotencyLedgerEntry[T]] = {}
+
+        # Secondary index: job_id -> idempotency_key (for reverse lookup)
+        self._job_to_key: dict[str, IdempotencyKey] = {}
+
+        # WAL writer (uses SingleWriterBuffer from AD-39)
+        self._wal_writer = None  # Initialized in start()
+
+        # Background cleanup
+        self._cleanup_task: asyncio.Task | None = None
+        self._closed = False
+
+    async def start(self) -> None:
+        """Start ledger and recover from WAL."""
+        # Initialize WAL writer
+        # self._wal_writer = SingleWriterBuffer(...)
+        # await self._wal_writer.open(self._wal_path)
+
+        # Replay WAL to rebuild index
+        await self._replay_wal()
+
+        # Start cleanup task
+        self._cleanup_task = asyncio.create_task(self._cleanup_loop())
+
+    async def close(self) -> None:
+        """Close ledger and flush WAL."""
+        self._closed = True
+
+        if self._cleanup_task:
+            self._cleanup_task.cancel()
+            try:
+                await self._cleanup_task
+            except asyncio.CancelledError:
+                pass
+
+        if self._wal_writer:
+            await self._wal_writer.close()
+
+    async def check_or_reserve(
+        self,
+        key: IdempotencyKey,
+        job_id: str,
+    ) -> tuple[bool, IdempotencyLedgerEntry[T] | None]:
+        """
+        Check if key exists; if not, reserve it as PENDING.
+
+        IMPORTANT: Reservation is persisted to WAL before returning
+        to ensure crash recovery maintains idempotency.
+
+        Returns:
+            (is_duplicate, entry)
+            - (False, None): New request, reserved as PENDING
+            - (True, entry): Duplicate found
+        """
+        # Check in-memory index
+        if key in self._index:
+            return (True, self._index[key])
+
+        # Not found - create and persist PENDING entry
+        entry = IdempotencyLedgerEntry(
+            idempotency_key=key,
+            job_id=job_id,
+            status=IdempotencyStatus.PENDING,
+            result_serialized=None,
+            created_at=time.time(),
+            committed_at=None,
+        )
+
+        # Persist to WAL BEFORE updating index
+        await self._persist_entry(entry)
+
+        # Update indices
+        self._index[key] = entry
+        self._job_to_key[job_id] = key
+
+        return (False, None)
+
+    async def commit(
+        self,
+        key: IdempotencyKey,
+        result_serialized: bytes,
+    ) -> None:
+        """
+        Commit entry with result.
+
+        Persists to WAL before updating in-memory state.
+        """
+        if key not in self._index:
+            return
+
+        entry = self._index[key]
+        if entry.status != IdempotencyStatus.PENDING:
+            return  # Already terminal
+
+        # Update entry
+        entry.status = IdempotencyStatus.COMMITTED
+        entry.result_serialized = result_serialized
+        entry.committed_at = time.time()
+
+        # Persist to WAL
+        await self._persist_entry(entry)
+
+    async def reject(
+        self,
+        key: IdempotencyKey,
+        result_serialized: bytes,
+    ) -> None:
+        """
+        Reject entry with result.
+
+        Persists to WAL before updating in-memory state.
+        """
+        if key not in self._index:
+            return
+
+        entry = self._index[key]
+        if entry.status != IdempotencyStatus.PENDING:
+            return  # Already terminal
+
+        # Update entry
+        entry.status = IdempotencyStatus.REJECTED
+        entry.result_serialized = result_serialized
+        entry.committed_at = time.time()
+
+        # Persist to WAL
+        await self._persist_entry(entry)
+
+    def get_by_key(self, key: IdempotencyKey) -> IdempotencyLedgerEntry[T] | None:
+        """Get entry by idempotency key."""
+        return self._index.get(key)
+
+    def get_by_job_id(self, job_id: str) -> IdempotencyLedgerEntry[T] | None:
+        """Get entry by job ID (reverse lookup)."""
+        key = self._job_to_key.get(job_id)
+        if key is None:
+            return None
+        return self._index.get(key)
+
+    async def _persist_entry(self, entry: IdempotencyLedgerEntry[T]) -> None:
+        """Persist entry to WAL."""
+        if self._wal_writer:
+            entry_bytes = entry.to_bytes()
+            await self._wal_writer.write(entry_bytes)
+            await self._wal_writer.flush()  # Ensure durability
+
+    async def _replay_wal(self) -> None:
+        """Replay WAL to rebuild in-memory index."""
+        # Use SingleReaderBuffer from AD-39
+        # reader = SingleReaderBuffer(...)
+        # await reader.open(self._wal_path)
+        #
+        # async for entry_bytes in reader.read_entries():
+        #     entry = IdempotencyLedgerEntry.from_bytes(entry_bytes.data)
+        #     self._index[entry.idempotency_key] = entry
+        #     self._job_to_key[entry.job_id] = entry.idempotency_key
+        #
+        # await reader.close()
+        pass
+
+    async def _cleanup_loop(self) -> None:
+        """Background cleanup of expired entries."""
+        while not self._closed:
+            try:
+                await asyncio.sleep(self._config.cleanup_interval_seconds)
+                await self._cleanup_expired()
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                pass
+
+    async def _cleanup_expired(self) -> None:
+        """Remove expired entries from index."""
+        now = time.time()
+        expired_keys: list[IdempotencyKey] = []
+
+        for key, entry in self._index.items():
+            ttl = self._get_ttl_for_status(entry.status)
+            reference_time = entry.committed_at or entry.created_at
+
+            if now - reference_time > ttl:
+                expired_keys.append(key)
+
+        for key in expired_keys:
+            entry = self._index.pop(key, None)
+            if entry:
+                self._job_to_key.pop(entry.job_id, None)
+
+        # Note: WAL cleanup is separate (compaction) to avoid
+        # corrupting crash recovery
+
+    def _get_ttl_for_status(self, status: IdempotencyStatus) -> float:
+        """Get TTL for a given status."""
+        if status == IdempotencyStatus.PENDING:
+            return self._config.pending_ttl_seconds
+        elif status == IdempotencyStatus.COMMITTED:
+            return self._config.committed_ttl_seconds
+        else:  # REJECTED
+            return self._config.rejected_ttl_seconds
+```
+
+### Part 6: Protocol Extensions
+
+#### Extended JobSubmission Message
+
+```python
+@dataclass
+class JobSubmission(Message):
+    """
+    Job submission from client to gate or manager.
+
+    Extended with idempotency_key for at-most-once semantics.
+    """
+    job_id: str                  # Unique job identifier
+    workflows: bytes             # Cloudpickled workflows
+    vus: int                     # Virtual users per workflow
+    timeout_seconds: float       # Maximum execution time
+    target_dcs: list[str]        # Target datacenters
+    callback_addr: tuple[str, int] | None = None
+    reporting_configs: bytes | None = None
+
+    # Protocol version fields (AD-25)
+    protocol_version_major: int = 1
+    protocol_version_minor: int = 0
+    capabilities: str = ""
+
+    # Idempotency fields (AD-40)
+    idempotency_key: str = ""    # Client-generated idempotency key
+                                 # Format: "{client_id}:{sequence}:{nonce}"
+                                 # Empty string = no idempotency (legacy clients)
+
+
+@dataclass
+class JobAck(Message):
+    """
+    Acknowledgment of job submission.
+
+    Extended with idempotency information.
+    """
+    job_id: str                  # Job identifier
+    accepted: bool               # Whether job was accepted
+    error: str | None = None     # Error message if rejected
+    queued_position: int = 0     # Position in queue
+    leader_addr: tuple[str, int] | None = None
+
+    # Protocol version fields (AD-25)
+    protocol_version_major: int = 1
+    protocol_version_minor: int = 0
+    capabilities: str = ""
+
+    # Idempotency fields (AD-40)
+    idempotency_key: str = ""    # Echoed from request
+    was_duplicate: bool = False  # True if this was a duplicate submission
+    original_job_id: str = ""    # If duplicate, the original job_id
+```
+
+### Part 7: End-to-End Flow
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                     END-TO-END IDEMPOTENT SUBMISSION                     │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  ┌──────────┐     ┌──────────┐     ┌──────────┐     ┌──────────┐        │
+│  │  Client  │     │   Gate   │     │  Manager │     │  Worker  │        │
+│  └────┬─────┘     └────┬─────┘     └────┬─────┘     └────┬─────┘        │
+│       │                │                │                │               │
+│       │ JobSubmission  │                │                │               │
+│       │ idem_key=xyz   │                │                │               │
+│       │ job_id=abc     │                │                │               │
+│       │───────────────▶│                │                │               │
+│       │                │                │                │               │
+│       │                │ check cache    │                │               │
+│       │                │ idem_key=xyz   │                │               │
+│       │                │ NOT FOUND      │                │               │
+│       │                │                │                │               │
+│       │                │ insert PENDING │                │               │
+│       │                │ idem_key=xyz   │                │               │
+│       │                │                │                │               │
+│       │                │ JobSubmission  │                │               │
+│       │                │ idem_key=xyz   │                │               │
+│       │                │───────────────▶│                │               │
+│       │                │                │                │               │
+│       │                │                │ check ledger   │               │
+│       │                │                │ idem_key=xyz   │               │
+│       │                │                │ NOT FOUND      │               │
+│       │                │                │                │               │
+│       │                │                │ reserve PENDING│               │
+│       │                │                │ persist to WAL │               │
+│       │                │                │                │               │
+│       │                │                │ process job    │               │
+│       │                │                │───────────────▶│               │
+│       │                │                │                │ execute       │
+│       │                │                │                │               │
+│       │                │                │◀───────────────│               │
+│       │                │                │                │               │
+│       │                │                │ commit ledger  │               │
+│       │                │                │ idem_key=xyz   │               │
+│       │                │                │ persist to WAL │               │
+│       │                │                │                │               │
+│       │                │◀───────────────│                │               │
+│       │                │ JobAck         │                │               │
+│       │                │ job_id=abc     │                │               │
+│       │                │                │                │               │
+│       │                │ commit cache   │                │               │
+│       │                │ idem_key=xyz   │                │               │
+│       │                │                │                │               │
+│       │◀───────────────│                │                │               │
+│       │ JobAck         │                │                │               │
+│       │ job_id=abc     │                │                │               │
+│       │                │                │                │               │
+│       │                │                │                │               │
+│  ════════════════════════════════════════════════════════════════════   │
+│  CLIENT RETRIES (response was lost):                                     │
+│  ════════════════════════════════════════════════════════════════════   │
+│       │                │                │                │               │
+│       │ JobSubmission  │                │                │               │
+│       │ idem_key=xyz   │ ← SAME KEY     │                │               │
+│       │ job_id=def     │ ← NEW JOB ID   │                │               │
+│       │───────────────▶│                │                │               │
+│       │                │                │                │               │
+│       │                │ check cache    │                │               │
+│       │                │ idem_key=xyz   │                │               │
+│       │                │ FOUND:COMMITTED│                │               │
+│       │                │                │                │               │
+│       │◀───────────────│                │                │               │
+│       │ JobAck         │ ← Returns      │                │               │
+│       │ job_id=abc     │   cached       │                │               │
+│       │ was_dup=true   │   result       │                │               │
+│       │                │                │                │               │
+│  JOB def IS NEVER CREATED - DUPLICATE DETECTED                          │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Part 8: Cross-DC Consistency
+
+#### Integration with Per-Job VSR (AD-38)
+
+Idempotency entries are replicated as part of the job's VSR log:
+
+```python
+from dataclasses import dataclass
+from enum import Enum, auto
+
+
+class JobEventType(Enum):
+    """Types of job events in the VSR log."""
+    JOB_CREATED = auto()
+    JOB_CANCELLED = auto()
+    JOB_COMPLETED = auto()
+    IDEMPOTENCY_RESERVED = auto()   # AD-40: Idempotency reservation
+    IDEMPOTENCY_COMMITTED = auto()  # AD-40: Idempotency commit
+
+
+@dataclass(slots=True)
+class IdempotencyReservedEvent:
+    """
+    Event logged when idempotency key is reserved.
+
+    This event is replicated via VSR to all replicas in the job's
+    replica set, ensuring cross-DC consistency.
+    """
+    idempotency_key: str
+    job_id: str
+    reserved_at: float
+    source_dc: str
+
+
+@dataclass(slots=True)
+class IdempotencyCommittedEvent:
+    """
+    Event logged when idempotency key is committed.
+
+    Includes serialized result so replicas can respond to
+    duplicate requests without contacting the primary.
+    """
+    idempotency_key: str
+    job_id: str
+    committed_at: float
+    result_serialized: bytes
+
+
+class JobVSRCoordinatorWithIdempotency(Generic[T]):
+    """
+    Extended VSR coordinator with idempotency support.
+
+    Idempotency events are logged in the same VSR stream as job
+    events, ensuring atomic commitment and consistent ordering.
+    """
+
+    async def reserve_idempotency(
+        self,
+        job_id: str,
+        idempotency_key: IdempotencyKey,
+        source_dc: str,
+    ) -> bool:
+        """
+        Reserve idempotency key via VSR.
+
+        Returns True if reservation succeeded, False if duplicate.
+        """
+        # Create reservation event
+        event = IdempotencyReservedEvent(
+            idempotency_key=str(idempotency_key),
+            job_id=job_id,
+            reserved_at=time.time(),
+            source_dc=source_dc,
+        )
+
+        # Write via VSR (prepare + commit)
+        # This replicates to all job replicas
+        try:
+            await self.write(job_id, event)
+            return True
+        except DuplicateIdempotencyKeyError:
+            return False
+
+    async def commit_idempotency(
+        self,
+        job_id: str,
+        idempotency_key: IdempotencyKey,
+        result_serialized: bytes,
+    ) -> None:
+        """
+        Commit idempotency key with result via VSR.
+        """
+        event = IdempotencyCommittedEvent(
+            idempotency_key=str(idempotency_key),
+            job_id=job_id,
+            committed_at=time.time(),
+            result_serialized=result_serialized,
+        )
+
+        await self.write(job_id, event)
+```
+
+#### Cross-DC Deduplication Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                     CROSS-DC IDEMPOTENCY VIA VSR                         │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  Client submits to DC1, network partition, client retries to DC2         │
+│                                                                          │
+│  ┌─────────────────────────────┐   ┌─────────────────────────────┐      │
+│  │           DC1               │   │           DC2               │      │
+│  │  ┌───────┐    ┌─────────┐  │   │  ┌───────┐    ┌─────────┐  │      │
+│  │  │ Gate1 │    │ Manager1│  │   │  │ Gate2 │    │ Manager2│  │      │
+│  │  │       │    │ (Leader)│  │   │  │       │    │(Replica)│  │      │
+│  │  └───┬───┘    └────┬────┘  │   │  └───┬───┘    └────┬────┘  │      │
+│  │      │             │       │   │      │             │       │      │
+│  └──────┼─────────────┼───────┘   └──────┼─────────────┼───────┘      │
+│         │             │                  │             │               │
+│         │             │                  │             │               │
+│  1. JobSubmission     │                  │             │               │
+│     idem_key=xyz      │                  │             │               │
+│     ─────────────────▶│                  │             │               │
+│                       │                  │             │               │
+│  2. Reserve via VSR   │                  │             │               │
+│     (Prepare)         │══════════════════╪════════════▶│               │
+│                       │                  │             │ 3. Prepare    │
+│                       │                  │             │    received   │
+│                       │◀═════════════════╪═════════════│    ack sent   │
+│  4. Quorum ack        │                  │             │               │
+│     → Commit          │══════════════════╪════════════▶│               │
+│                       │                  │             │ 5. Commit     │
+│                       │                  │             │    applied    │
+│                       │                  │             │               │
+│  ════════════════════════════════════════════════════════════════════  │
+│  NETWORK PARTITION - Client retries to DC2                              │
+│  ════════════════════════════════════════════════════════════════════  │
+│                       │                  │             │               │
+│                       │    6. JobSubmission            │               │
+│                       │       idem_key=xyz (SAME)      │               │
+│                       │       ──────────────────────▶  │               │
+│                       │                  │             │               │
+│                       │                  │  7. Check   │               │
+│                       │                  │     ledger  │               │
+│                       │                  │     FOUND!  │               │
+│                       │                  │             │               │
+│                       │    8. Return cached result     │               │
+│                       │       job_id=abc               │               │
+│                       │       was_duplicate=true       │               │
+│                       │       ◀────────────────────────│               │
+│                       │                  │             │               │
+│  DUPLICATE DETECTED AT DC2 VIA REPLICATED LEDGER                        │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Part 9: Failure Scenarios
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         FAILURE SCENARIOS                                │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  SCENARIO 1: Gate crashes after receiving request, before forwarding     │
+│  ────────────────────────────────────────────────────────────────────── │
+│                                                                          │
+│  Client        Gate (crashes)      Manager                               │
+│     │              │                  │                                  │
+│     │──JobSub─────▶│                  │                                  │
+│     │  idem=xyz    │ ╳ CRASH          │                                  │
+│     │              │                  │                                  │
+│     │──(timeout)───│                  │                                  │
+│     │              │                  │                                  │
+│     │──JobSub─────▶│ (new gate)       │                                  │
+│     │  idem=xyz    │──JobSub─────────▶│  → NEW REQUEST                  │
+│     │              │                  │    (gate cache lost)             │
+│     │              │◀──JobAck────────│                                  │
+│     │◀──JobAck────│                  │                                  │
+│                                                                          │
+│  OUTCOME: Job created once (manager is authoritative)                    │
+│                                                                          │
+│  ──────────────────────────────────────────────────────────────────────  │
+│                                                                          │
+│  SCENARIO 2: Manager crashes after WAL persist, before response          │
+│  ────────────────────────────────────────────────────────────────────── │
+│                                                                          │
+│  Client        Gate            Manager (crashes)                         │
+│     │            │                  │                                    │
+│     │──JobSub───▶│──JobSub─────────▶│                                   │
+│     │  idem=xyz  │                  │──reserve PENDING                  │
+│     │            │                  │──persist to WAL                   │
+│     │            │                  │  ╳ CRASH                          │
+│     │            │                  │                                    │
+│     │──(timeout)─│                  │ (manager restarts)                │
+│     │            │                  │──replay WAL                       │
+│     │            │                  │  xyz=PENDING                      │
+│     │──JobSub───▶│──JobSub─────────▶│                                   │
+│     │  idem=xyz  │                  │──check ledger                     │
+│     │            │                  │  xyz=PENDING                      │
+│     │            │                  │──resume processing                │
+│     │            │◀──JobAck────────│                                   │
+│     │◀──JobAck──│                  │                                    │
+│                                                                          │
+│  OUTCOME: Job created once (WAL recovery)                                │
+│                                                                          │
+│  ──────────────────────────────────────────────────────────────────────  │
+│                                                                          │
+│  SCENARIO 3: Client retries before original completes                    │
+│  ────────────────────────────────────────────────────────────────────── │
+│                                                                          │
+│  Client        Gate                Manager                               │
+│     │            │                     │                                 │
+│     │──JobSub───▶│──JobSub────────────▶│ t=0                            │
+│     │  idem=xyz  │  insert PENDING     │──reserve PENDING               │
+│     │            │                     │──start processing              │
+│     │            │                     │  (slow...)                     │
+│     │            │                     │                                 │
+│     │──(timeout, │                     │ t=5s                           │
+│     │  retry)────▶│                     │                                │
+│     │  idem=xyz  │  check cache        │                                 │
+│     │            │  xyz=PENDING        │                                 │
+│     │            │  wait...            │                                 │
+│     │            │                     │                                 │
+│     │            │                     │──complete processing           │
+│     │            │◀──JobAck───────────│ t=10s                          │
+│     │            │  commit cache       │                                 │
+│     │            │  xyz=COMMITTED      │                                 │
+│     │            │  notify waiters     │                                 │
+│     │◀──JobAck──│                     │                                 │
+│                                                                          │
+│  OUTCOME: Single response to both requests (waiter pattern)              │
+│                                                                          │
+│  ──────────────────────────────────────────────────────────────────────  │
+│                                                                          │
+│  SCENARIO 4: Idempotency key expires, client retries                     │
+│  ────────────────────────────────────────────────────────────────────── │
+│                                                                          │
+│  Client        Gate            Manager                                   │
+│     │            │                │                                      │
+│     │──JobSub───▶│──JobSub───────▶│ t=0                                 │
+│     │  idem=xyz  │                │──create job abc                     │
+│     │◀──JobAck──│◀──JobAck──────│                                      │
+│     │  job=abc   │                │                                      │
+│     │            │                │                                      │
+│     │            │  (TTL passes)  │  (TTL passes)                        │
+│     │            │  xyz evicted   │  xyz evicted                         │
+│     │            │                │                                      │
+│     │──JobSub───▶│──JobSub───────▶│ t=TTL+1                             │
+│     │  idem=xyz  │  NOT FOUND     │  NOT FOUND                          │
+│     │            │                │──create job def (!)                 │
+│     │◀──JobAck──│◀──JobAck──────│                                      │
+│     │  job=def   │                │                                      │
+│                                                                          │
+│  OUTCOME: DUPLICATE JOB CREATED (TTL violation)                          │
+│                                                                          │
+│  MITIGATION: TTL must be > client's maximum retry window                 │
+│              Recommend: TTL = 5min, max retry window = 2min              │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Part 10: Integration Guide
+
+#### Client-Side Integration
+
+```python
+import secrets
+from dataclasses import dataclass
+from hyperscale.distributed_rewrite.nodes.client import DistributedClient
+
+
+class IdempotentJobClient:
+    """
+    Client wrapper that provides idempotent job submissions.
+
+    Usage:
+        client = IdempotentJobClient(distributed_client, client_id="myapp-host1")
+
+        # First attempt
+        result = await client.submit_job(workflows, ...)
+
+        # If timeout/failure, safe to retry with same params
+        # (internally uses same idempotency key for retries)
+        result = await client.submit_job_with_retry(workflows, ..., max_retries=3)
+    """
+
+    def __init__(self, inner_client: DistributedClient, client_id: str):
+        self._client = inner_client
+        self._key_generator = IdempotencyKeyGenerator(client_id)
+
+        # Track pending submissions for retry
+        self._pending: dict[int, IdempotencyKey] = {}  # seq -> key
+
+    async def submit_job(
+        self,
+        workflows: list,
+        vus: int,
+        timeout_seconds: float,
+        target_dcs: list[str],
+        idempotency_key: IdempotencyKey | None = None,
+    ) -> JobAck:
+        """
+        Submit job with idempotency.
+
+        If idempotency_key is None, generates a new one (new logical request).
+        Pass the same key to retry a failed submission.
+        """
+        if idempotency_key is None:
+            idempotency_key = self._key_generator.generate()
+
+        # Submit with idempotency key
+        return await self._client.submit_job(
+            workflows=workflows,
+            vus=vus,
+            timeout_seconds=timeout_seconds,
+            target_dcs=target_dcs,
+            idempotency_key=str(idempotency_key),
+        )
+
+    async def submit_job_with_retry(
+        self,
+        workflows: list,
+        vus: int,
+        timeout_seconds: float,
+        target_dcs: list[str],
+        max_retries: int = 3,
+        retry_delay_seconds: float = 1.0,
+    ) -> JobAck:
+        """
+        Submit job with automatic retry on failure.
+
+        Uses same idempotency key across retries to ensure at-most-once.
+        """
+        idempotency_key = self._key_generator.generate()
+
+        last_error: Exception | None = None
+
+        for attempt in range(max_retries + 1):
+            try:
+                result = await self.submit_job(
+                    workflows=workflows,
+                    vus=vus,
+                    timeout_seconds=timeout_seconds,
+                    target_dcs=target_dcs,
+                    idempotency_key=idempotency_key,
+                )
+
+                if result.was_duplicate:
+                    # Our previous attempt succeeded, use that result
+                    pass
+
+                return result
+
+            except Exception as e:
+                last_error = e
+                if attempt < max_retries:
+                    await asyncio.sleep(retry_delay_seconds * (2 ** attempt))
+
+        raise last_error
+```
+
+#### Gate-Side Integration
+
+```python
+class GateJobHandler:
+    """
+    Gate handler for job submissions with idempotency.
+    """
+
+    def __init__(
+        self,
+        idempotency_cache: GateIdempotencyCache[JobAck],
+        manager_client: ManagerClient,
+        gate_id: str,
+    ):
+        self._cache = idempotency_cache
+        self._manager = manager_client
+        self._gate_id = gate_id
+
+    async def handle_job_submission(
+        self,
+        submission: JobSubmission,
+        client_addr: tuple[str, int],
+    ) -> JobAck:
+        """
+        Handle job submission with idempotency check.
+        """
+        # Parse idempotency key (empty = legacy client, no idempotency)
+        if not submission.idempotency_key:
+            # Legacy path - no idempotency
+            return await self._forward_to_manager(submission)
+
+        try:
+            idem_key = IdempotencyKey.parse(submission.idempotency_key)
+        except ValueError:
+            # Invalid key format - reject
+            return JobAck(
+                job_id=submission.job_id,
+                accepted=False,
+                error="Invalid idempotency key format",
+            )
+
+        # Check cache
+        is_duplicate, entry = await self._cache.check_or_insert(
+            key=idem_key,
+            job_id=submission.job_id,
+            source_gate_id=self._gate_id,
+        )
+
+        if is_duplicate and entry is not None:
+            # Return cached result
+            if entry.result is not None:
+                result = entry.result
+                # Mark as duplicate for client awareness
+                return JobAck(
+                    job_id=result.job_id,
+                    accepted=result.accepted,
+                    error=result.error,
+                    queued_position=result.queued_position,
+                    idempotency_key=submission.idempotency_key,
+                    was_duplicate=True,
+                    original_job_id=entry.job_id or "",
+                )
+            else:
+                # PENDING with no result - shouldn't happen if wait_for_pending=True
+                return JobAck(
+                    job_id=submission.job_id,
+                    accepted=False,
+                    error="Request pending, please retry",
+                )
+
+        # New request - forward to manager
+        try:
+            result = await self._forward_to_manager(submission)
+
+            # Commit to cache
+            if result.accepted:
+                await self._cache.commit(idem_key, result)
+            else:
+                await self._cache.reject(idem_key, result)
+
+            return result
+
+        except Exception as e:
+            # Manager error - don't commit, allow retry
+            # Remove PENDING entry so retry can try again
+            # (This is safe because manager hasn't committed)
+            raise
+
+    async def _forward_to_manager(self, submission: JobSubmission) -> JobAck:
+        """Forward submission to manager."""
+        return await self._manager.submit_job(submission)
+```
+
+#### Manager-Side Integration
+
+```python
+class ManagerJobHandler:
+    """
+    Manager handler for job submissions with idempotency.
+    """
+
+    def __init__(
+        self,
+        idempotency_ledger: ManagerIdempotencyLedger[JobAck],
+        job_store: JobStore,
+        vsr_coordinator: JobVSRCoordinatorWithIdempotency,
+    ):
+        self._ledger = idempotency_ledger
+        self._jobs = job_store
+        self._vsr = vsr_coordinator
+
+    async def handle_job_submission(
+        self,
+        submission: JobSubmission,
+    ) -> JobAck:
+        """
+        Handle job submission with idempotency check.
+        """
+        # Parse idempotency key
+        if not submission.idempotency_key:
+            # Legacy path
+            return await self._process_submission(submission)
+
+        try:
+            idem_key = IdempotencyKey.parse(submission.idempotency_key)
+        except ValueError:
+            return JobAck(
+                job_id=submission.job_id,
+                accepted=False,
+                error="Invalid idempotency key format",
+            )
+
+        # Check ledger
+        is_duplicate, entry = await self._ledger.check_or_reserve(
+            key=idem_key,
+            job_id=submission.job_id,
+        )
+
+        if is_duplicate and entry is not None:
+            # Return cached result
+            if entry.result_serialized:
+                # Deserialize and return
+                result = self._deserialize_result(entry.result_serialized)
+                return JobAck(
+                    job_id=result.job_id,
+                    accepted=result.accepted,
+                    error=result.error,
+                    idempotency_key=submission.idempotency_key,
+                    was_duplicate=True,
+                    original_job_id=entry.job_id,
+                )
+            else:
+                # Still PENDING - race condition, return pending response
+                return JobAck(
+                    job_id=submission.job_id,
+                    accepted=False,
+                    error="Request pending",
+                )
+
+        # Process submission
+        result = await self._process_submission(submission)
+
+        # Commit to ledger
+        result_bytes = self._serialize_result(result)
+        if result.accepted:
+            await self._ledger.commit(idem_key, result_bytes)
+        else:
+            await self._ledger.reject(idem_key, result_bytes)
+
+        return result
+
+    async def _process_submission(self, submission: JobSubmission) -> JobAck:
+        """Process job submission (create job, dispatch, etc.)."""
+        # ... existing job processing logic ...
+        pass
+
+    def _serialize_result(self, result: JobAck) -> bytes:
+        """Serialize JobAck for storage."""
+        import cloudpickle
+        return cloudpickle.dumps(result)
+
+    def _deserialize_result(self, data: bytes) -> JobAck:
+        """Deserialize JobAck from storage."""
+        import cloudpickle
+        return cloudpickle.loads(data)
+```
+
+### Part 11: Configuration Recommendations
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    CONFIGURATION RECOMMENDATIONS                         │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  DEPLOYMENT PROFILE         GATE CACHE         MANAGER LEDGER            │
+│  ────────────────────────────────────────────────────────────────────── │
+│                                                                          │
+│  Development/Testing                                                     │
+│    pending_ttl:              30s                60s                      │
+│    committed_ttl:            60s                120s                     │
+│    max_entries:              1,000              10,000                   │
+│    cleanup_interval:         5s                 10s                      │
+│                                                                          │
+│  Production (Single DC)                                                  │
+│    pending_ttl:              60s                120s                     │
+│    committed_ttl:            300s (5min)        600s (10min)             │
+│    max_entries:              100,000            500,000                  │
+│    cleanup_interval:         10s                30s                      │
+│                                                                          │
+│  Production (Multi-DC)                                                   │
+│    pending_ttl:              120s               300s                     │
+│    committed_ttl:            600s (10min)       1800s (30min)            │
+│    max_entries:              100,000            1,000,000                │
+│    cleanup_interval:         30s                60s                      │
+│                                                                          │
+│  RATIONALE:                                                              │
+│                                                                          │
+│  - pending_ttl: Must exceed slowest expected processing time             │
+│  - committed_ttl: Must exceed client's maximum retry window              │
+│  - Multi-DC needs longer TTLs due to cross-DC latency                   │
+│  - Manager TTLs > Gate TTLs for authoritative dedup                     │
+│                                                                          │
+│  MEMORY ESTIMATION:                                                      │
+│                                                                          │
+│  Entry size ≈ 200 bytes (key + metadata + small result)                 │
+│                                                                          │
+│  100,000 entries × 200 bytes = 20 MB per gate                           │
+│  500,000 entries × 200 bytes = 100 MB per manager                       │
+│                                                                          │
+│  TUNING GUIDELINES:                                                      │
+│                                                                          │
+│  1. Monitor cache hit rates:                                             │
+│     - High hit rate (>5%) suggests aggressive client retries            │
+│     - Increase committed_ttl if clients retry after TTL                 │
+│                                                                          │
+│  2. Monitor eviction rates:                                              │
+│     - High eviction suggests max_entries too low                        │
+│     - Increase or add more gate/manager capacity                        │
+│                                                                          │
+│  3. Monitor pending timeouts:                                            │
+│     - Frequent timeouts suggest pending_ttl too short                   │
+│     - Or indicates manager processing delays                            │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Part 12: Correctness Argument
+
+#### At-Most-Once Guarantee
+
+The system provides at-most-once semantics through layered deduplication:
+
+**Layer 1: Gate Cache (Fast Path)**
+- Catches retries to the same gate within TTL
+- Not authoritative (can lose state on restart)
+- Provides latency optimization, not correctness guarantee
+
+**Layer 2: Manager Ledger (Authoritative)**
+- WAL-persisted, survives restarts
+- Checked on every new request
+- Provides the correctness guarantee
+
+**Layer 3: VSR Replication (Cross-DC)**
+- Idempotency entries replicated with job events
+- Ensures any replica can detect duplicates
+- Survives DC-level failures
+
+#### Proof Sketch
+
+**Claim**: A job submission with idempotency key K executes at most once.
+
+**Proof**:
+
+1. **First arrival at any manager**:
+   - Manager checks ledger, K not found
+   - Manager reserves K (PENDING) in WAL
+   - WAL flush ensures reservation survives crash
+   - Job processing begins
+
+2. **Duplicate arrival before commit**:
+   - If same manager: ledger check finds K=PENDING, waits
+   - If different manager (via different gate): VSR replication ensures K seen
+   - No duplicate processing starts
+
+3. **Duplicate arrival after commit**:
+   - Manager commits K with result in WAL
+   - VSR replicates commit to all replicas
+   - Any subsequent lookup finds K=COMMITTED, returns cached result
+
+4. **Manager crash during processing**:
+   - K=PENDING persisted in WAL
+   - On recovery, replay reconstructs PENDING state
+   - Client retry finds K=PENDING, waits for completion
+   - Processing resumes (not restarted)
+
+5. **TTL expiration**:
+   - If K evicted before client retry: duplicate may occur
+   - **Mitigation**: TTL must exceed maximum client retry window
+   - This is a deployment configuration requirement, not a protocol flaw
+
+**QED**: Under correct configuration (TTL > retry window), at-most-once holds.
+
+#### Failure Mode Analysis
+
+| Failure | Idempotency Preserved? | Notes |
+|---------|------------------------|-------|
+| Gate crash before forward | Yes | Manager never saw request |
+| Gate crash after forward | Yes | Manager has authoritative state |
+| Manager crash before WAL | Yes | No state = retry allowed |
+| Manager crash after WAL | Yes | WAL recovery restores state |
+| Network partition (same DC) | Yes | Manager is single authority |
+| Network partition (cross-DC) | Yes | VSR ensures consistency |
+| TTL expiration + late retry | **No** | Config issue, not protocol |
+| Clock skew affecting TTL | Degraded | Use HLC for TTL if critical |
+
+### Summary: AD-40 Design Decisions
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    AD-40 DESIGN DECISION SUMMARY                         │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  DECISION                  CHOICE                 RATIONALE              │
+│  ────────────────────────────────────────────────────────────────────── │
+│                                                                          │
+│  Key structure             client:seq:nonce       Collision-resistant,   │
+│                                                   restart-safe           │
+│                                                                          │
+│  Gate cache                LRU + TTL              Fast path, bounded     │
+│                                                   memory                 │
+│                                                                          │
+│  Manager persistence       WAL                    Crash recovery,        │
+│                                                   integrates with VSR    │
+│                                                                          │
+│  Cross-DC consistency      Per-job VSR            Same log as job        │
+│                            replication            events = atomic        │
+│                                                                          │
+│  Pending request handling  Wait + notify          Coalesce duplicates,   │
+│                                                   single response        │
+│                                                                          │
+│  Result caching            Full result            Enables response       │
+│                            serialized             without re-processing  │
+│                                                                          │
+│  TTL strategy              Status-dependent       PENDING short,         │
+│                                                   COMMITTED longer       │
+│                                                                          │
+│  Legacy compatibility      Empty key = no         Gradual migration      │
+│                            idempotency            supported              │
+│                                                                          │
+│  WHY THIS IS MAXIMALLY CORRECT:                                          │
+│                                                                          │
+│  1. Two-tier dedup (gate + manager) provides defense in depth           │
+│  2. WAL persistence survives crashes without re-execution               │
+│  3. VSR integration ensures cross-DC consistency atomically             │
+│  4. Waiter pattern handles concurrent duplicates elegantly              │
+│  5. Bounded memory through LRU + TTL (no unbounded growth)              │
+│  6. Explicit failure modes with clear configuration requirements        │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
