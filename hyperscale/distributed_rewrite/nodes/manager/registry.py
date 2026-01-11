@@ -117,6 +117,93 @@ class ManagerRegistry:
         unhealthy = set(self._state._worker_unhealthy_since.keys())
         return set(self._state._workers.keys()) - unhealthy
 
+    def update_worker_health_state(
+        self,
+        worker_id: str,
+        health_state: str,
+    ) -> None:
+        """
+        Update worker health state from heartbeat (AD-17).
+
+        Args:
+            worker_id: Worker node ID
+            health_state: Health state: "healthy", "busy", "stressed", "overloaded"
+        """
+        if worker_id in self._state._workers:
+            self._state._worker_health_states[worker_id] = health_state
+
+    def get_worker_health_state(self, worker_id: str) -> str:
+        """
+        Get worker health state.
+
+        Args:
+            worker_id: Worker node ID
+
+        Returns:
+            Health state string, defaults to "healthy" if unknown
+        """
+        return self._state._worker_health_states.get(worker_id, "healthy")
+
+    def get_workers_by_health_bucket(
+        self,
+        cores_required: int = 1,
+    ) -> dict[str, list[WorkerRegistration]]:
+        """
+        Bucket workers by health state for AD-17 smart dispatch.
+
+        Returns workers grouped by health: healthy > busy > degraded.
+        Workers marked as unhealthy or with open circuit breakers are excluded.
+        Workers within each bucket are sorted by available capacity (descending).
+
+        Args:
+            cores_required: Minimum cores required
+
+        Returns:
+            Dict with keys "healthy", "busy", "degraded" containing lists of workers
+        """
+        buckets: dict[str, list[WorkerRegistration]] = {
+            "healthy": [],
+            "busy": [],
+            "degraded": [],
+        }
+
+        # Get workers not marked as dead/unhealthy
+        unhealthy_ids = set(self._state._worker_unhealthy_since.keys())
+
+        for worker_id, worker in self._state._workers.items():
+            # Skip unhealthy workers
+            if worker_id in unhealthy_ids:
+                continue
+
+            # Skip workers with open circuit breakers
+            if circuit := self._state._worker_circuits.get(worker_id):
+                if circuit.is_open():
+                    continue
+
+            # Skip workers without capacity
+            if worker.node.total_cores < cores_required:
+                continue
+
+            # Get health state and bucket
+            health_state = self._state._worker_health_states.get(worker_id, "healthy")
+
+            if health_state == "healthy":
+                buckets["healthy"].append(worker)
+            elif health_state == "busy":
+                buckets["busy"].append(worker)
+            elif health_state in ("stressed", "degraded"):
+                buckets["degraded"].append(worker)
+            # "overloaded" workers are excluded (treated like unhealthy)
+
+        # Sort each bucket by capacity (total_cores descending)
+        for bucket_name in buckets:
+            buckets[bucket_name].sort(
+                key=lambda w: w.node.total_cores,
+                reverse=True,
+            )
+
+        return buckets
+
     def register_gate(self, gate_info: GateInfo) -> None:
         """
         Register a gate with this manager.
