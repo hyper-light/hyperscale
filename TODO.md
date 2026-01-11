@@ -1093,11 +1093,11 @@ nodes/gate/
 
 **Commit**: See git log
 
-#### 15.3.6 Gate Core Modules ⏳ PENDING
+#### 15.3.6 Gate Core Modules ✅ COMPLETE
 
 **Files**: `nodes/gate/*.py`
 
-- [ ] **15.3.6.1** Create `registry.py` - Reuse GateJobManager, ConsistentHashRing
+- [x] **15.3.6.1** Create `registry.py` - Re-exports GateJobManager, ConsistentHashRing
 - [ ] **15.3.6.2** Create `routing.py` - Reuse GateJobRouter (AD-36), DatacenterHealthManager
 - [ ] **15.3.6.3** Create `dispatch.py` - Reuse ManagerDispatcher
 - [ ] **15.3.6.4** Create `sync.py` - State sync logic
