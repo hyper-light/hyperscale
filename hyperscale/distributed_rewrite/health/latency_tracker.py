@@ -61,7 +61,7 @@ class LatencyTracker:
         cutoff = now - self._config.sample_max_age
         self._samples[peer_id] = [
             (ts, lat) for ts, lat in samples
-            if ts > cutoff
+            if ts >= cutoff
         ][-self._config.sample_max_count:]
 
     def get_average_latency(self) -> float | None:
