@@ -694,6 +694,56 @@ class WorkerServer(HealthAwareServer):
             return (False, f"Unknown manager: {new_manager_id} not in known managers")
         return (True, "")
 
+    async def _check_pending_transfer_for_job(
+        self, job_id: str, workflow_id: str
+    ) -> None:
+        """
+        Check if there's a pending transfer for a job when a new workflow arrives (Section 8.3).
+
+        Called after a workflow is dispatched to see if a leadership transfer
+        arrived before the workflow did.
+        """
+        import time as time_module
+        pending = self._pending_transfers.get(job_id)
+        if pending is None:
+            return
+
+        # Check if the transfer has expired
+        current_time = time_module.monotonic()
+        pending_transfer_ttl = self._config.pending_transfer_ttl_seconds
+        if current_time - pending.received_at > pending_transfer_ttl:
+            # Transfer expired, remove it
+            del self._pending_transfers[job_id]
+            return
+
+        # Check if this workflow is in the pending transfer
+        if workflow_id in pending.workflow_ids:
+            # Apply the pending transfer
+            job_lock = self._get_job_transfer_lock(job_id)
+            async with job_lock:
+                # Update job leader for this workflow
+                self._workflow_job_leader[workflow_id] = pending.new_manager_addr
+                # Update fence token
+                self._job_fence_tokens[job_id] = pending.fence_token
+
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerInfo(
+                        message=f"Applied pending transfer for workflow {workflow_id[:8]}... to job {job_id[:8]}...",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+
+            # Check if all workflows in the transfer have been seen
+            remaining_workflows = [
+                wf_id for wf_id in pending.workflow_ids
+                if wf_id not in self._active_workflows and wf_id != workflow_id
+            ]
+            if not remaining_workflows:
+                del self._pending_transfers[job_id]
+
     # =========================================================================
     # Registration Methods
     # =========================================================================
@@ -905,7 +955,7 @@ class WorkerServer(HealthAwareServer):
         self, dispatch, addr: tuple[str, int], allocation_result
     ) -> bytes:
         """Handle the execution phase of a workflow dispatch."""
-        return await self._workflow_executor.handle_dispatch_execution(
+        result = await self._workflow_executor.handle_dispatch_execution(
             dispatch=dispatch,
             dispatching_addr=addr,
             allocated_cores=allocation_result.allocated_cores,
@@ -915,6 +965,11 @@ class WorkerServer(HealthAwareServer):
             node_host=self._host,
             node_port=self._tcp_port,
         )
+
+        # Section 8.3: Check for pending transfers that arrived before this dispatch
+        await self._check_pending_transfer_for_job(dispatch.job_id, dispatch.workflow_id)
+
+        return result
 
     def _cleanup_workflow_state(self, workflow_id: str) -> None:
         """Cleanup workflow state on failure."""
