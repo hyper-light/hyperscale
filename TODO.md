@@ -743,11 +743,11 @@ nodes/client/
 
 **AD Compliance**: ✅ AD-25 (Protocol Version Negotiation) preserved - no message serialization changes
 
-#### 15.1.7 Client Leadership Tracking ⏳ PENDING
+#### 15.1.7 Client Leadership Tracking ✅ COMPLETE
 
 **File**: `nodes/client/leadership.py`
 
-- [ ] **15.1.7.1** Create ClientLeadershipTracker class
+- [x] **15.1.7.1** Create ClientLeadershipTracker class
   - validate_gate_fence_token() - Fence token monotonicity check
   - validate_manager_fence_token() - Fence token check for job+DC
   - update_gate_leader() - Store GateLeaderInfo with timestamp
@@ -757,9 +757,10 @@ nodes/client/
   - is_job_orphaned() - Check orphan state
   - get_current_gate_leader() - Retrieve gate leader address
   - get_current_manager_leader() - Retrieve manager leader address
-  - orphan_check_loop() - Background task for orphan detection
+  - get_leadership_metrics() - Transfer and orphan metrics
+  - orphan_check_loop() - Background task placeholder for orphan detection
 
-**AD Compliance Check Required**: Must preserve AD-16 (Leadership Transfer) fence token semantics
+**AD Compliance**: ✅ AD-16 (Leadership Transfer) fence token semantics preserved - monotonicity validation intact
 
 #### 15.1.8 Client Job Tracking ⏳ PENDING
 
