@@ -77,15 +77,12 @@ class WorkflowDispatchHandler:
                     error=f"Queue depth limit reached: {current_pending}/{max_pending} pending",
                 ).dump()
 
-            # Validate fence token for at-most-once dispatch
-            current_fence_token = self._server._workflow_fence_tokens.get(
-                dispatch.workflow_id, -1
-            )
-            if dispatch.fence_token <= current_fence_token:
+            # Validate fence token for at-most-once dispatch (walrus for single lookup)
+            if dispatch.fence_token <= (current := self._server._workflow_fence_tokens.get(dispatch.workflow_id, -1)):
                 return WorkflowDispatchAck(
                     workflow_id=dispatch.workflow_id,
                     accepted=False,
-                    error=f"Stale fence token: {dispatch.fence_token} <= {current_fence_token}",
+                    error=f"Stale fence token: {dispatch.fence_token} <= {current}",
                 ).dump()
 
             # Update fence token tracking

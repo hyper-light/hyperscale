@@ -213,31 +213,26 @@ class JobLeaderTransferHandler:
         self, transfer: JobLeaderWorkerTransfer
     ) -> tuple[int, int, list[str], dict[str, str]]:
         """Apply routing updates for workflows in the transfer."""
-        workflows_updated = 0
+        active = self._server._active_workflows
+        orphaned = self._server._orphaned_workflows
+        job_leader = self._server._workflow_job_leader
+
+        # Partition workflows into found vs not found (comprehension)
+        workflows_not_found = [wf_id for wf_id in transfer.workflow_ids if wf_id not in active]
+        found_workflows = [wf_id for wf_id in transfer.workflow_ids if wf_id in active]
+
+        # Update job leader and collect states (comprehension with side effects via walrus)
+        workflow_states = {}
         workflows_rescued = 0
-        workflows_not_found: list[str] = []
-        workflow_states: dict[str, str] = {}
-
-        for workflow_id in transfer.workflow_ids:
-            if workflow_id not in self._server._active_workflows:
-                workflows_not_found.append(workflow_id)
-                continue
-
-            # Update job leader for this workflow
-            self._server._workflow_job_leader[workflow_id] = transfer.new_manager_addr
-            workflows_updated += 1
-
+        for workflow_id in found_workflows:
+            job_leader[workflow_id] = transfer.new_manager_addr
+            workflow_states[workflow_id] = active[workflow_id].status
             # Clear orphan status if present (Section 2.7)
-            if workflow_id in self._server._orphaned_workflows:
-                del self._server._orphaned_workflows[workflow_id]
+            if workflow_id in orphaned:
+                del orphaned[workflow_id]
                 workflows_rescued += 1
 
-            # Record workflow state for ack
-            workflow_states[workflow_id] = self._server._active_workflows[
-                workflow_id
-            ].status
-
-        return (workflows_updated, workflows_rescued, workflows_not_found, workflow_states)
+        return (len(found_workflows), workflows_rescued, workflows_not_found, workflow_states)
 
     async def _log_transfer_result(
         self,
