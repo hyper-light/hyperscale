@@ -152,3 +152,69 @@ class WorkerBackpressureManager:
         """Check if worker is currently overloaded."""
         state_str = self.get_overload_state_str()
         return state_str in ("overloaded", "critical")
+
+    # =========================================================================
+    # AD-37: Explicit Backpressure Policy Methods
+    # =========================================================================
+
+    def should_throttle(self) -> bool:
+        """
+        Check if progress updates should be throttled (AD-37).
+
+        Returns True when backpressure level is THROTTLE or higher.
+        """
+        level = self.get_max_backpressure_level()
+        return level.value >= BackpressureLevel.THROTTLE.value
+
+    def should_batch_only(self) -> bool:
+        """
+        Check if only batched progress updates should be sent (AD-37).
+
+        Returns True when backpressure level is BATCH or higher.
+        """
+        level = self.get_max_backpressure_level()
+        return level.value >= BackpressureLevel.BATCH.value
+
+    def should_reject_updates(self) -> bool:
+        """
+        Check if non-critical progress updates should be dropped (AD-37).
+
+        Returns True when backpressure level is REJECT.
+        """
+        level = self.get_max_backpressure_level()
+        return level.value >= BackpressureLevel.REJECT.value
+
+    def get_throttle_delay_seconds(self) -> float:
+        """
+        Get additional delay for throttled updates (AD-37).
+
+        Returns delay in seconds based on backpressure state.
+        """
+        level = self.get_max_backpressure_level()
+        delay_ms = self._backpressure_delay_ms
+
+        if level == BackpressureLevel.NONE:
+            return 0.0
+        elif level == BackpressureLevel.THROTTLE:
+            # Use suggested delay or default 500ms
+            return max(delay_ms, 500) / 1000.0
+        elif level == BackpressureLevel.BATCH:
+            # Double the delay for batch mode
+            return max(delay_ms * 2, 1000) / 1000.0
+        else:
+            # REJECT: maximum delay
+            return max(delay_ms * 4, 2000) / 1000.0
+
+    def get_backpressure_state_name(self) -> str:
+        """
+        Get human-readable backpressure state name (AD-37).
+
+        Returns state name for logging/metrics.
+        """
+        level = self.get_max_backpressure_level()
+        return {
+            BackpressureLevel.NONE: "NO_BACKPRESSURE",
+            BackpressureLevel.THROTTLE: "THROTTLED",
+            BackpressureLevel.BATCH: "BATCH_ONLY",
+            BackpressureLevel.REJECT: "REJECT",
+        }.get(level, "UNKNOWN")
