@@ -161,23 +161,26 @@ class TestWorkerBackpressureManagerOverloadDetection:
 
     def test_get_overload_state_str(self):
         """Test getting overload state string."""
-        manager = WorkerBackpressureManager()
+        state = _create_mock_state()
+        manager = WorkerBackpressureManager(state)
         manager.set_resource_getters(lambda: 50.0, lambda: 40.0)
 
-        state = manager.get_overload_state_str()
+        overload_state = manager.get_overload_state_str()
 
-        assert isinstance(state, str)
+        assert isinstance(overload_state, str)
 
     def test_is_overloaded_normal(self):
         """Test overload check under normal conditions."""
-        manager = WorkerBackpressureManager()
+        state = _create_mock_state()
+        manager = WorkerBackpressureManager(state)
         manager.set_resource_getters(lambda: 30.0, lambda: 40.0)
 
         assert manager.is_overloaded() is False
 
     def test_record_workflow_latency(self):
         """Test recording workflow latency."""
-        manager = WorkerBackpressureManager()
+        state = _create_mock_state()
+        manager = WorkerBackpressureManager(state)
 
         # Should not raise
         manager.record_workflow_latency(100.0)
@@ -188,60 +191,69 @@ class TestWorkerBackpressureManagerAD37Policy:
 
     def test_should_throttle_none(self):
         """Test should_throttle with NONE level."""
-        manager = WorkerBackpressureManager()
+        state = _create_mock_state()
+        manager = WorkerBackpressureManager(state)
 
         assert manager.should_throttle() is False
 
     def test_should_throttle_throttle(self):
         """Test should_throttle with THROTTLE level."""
-        manager = WorkerBackpressureManager()
+        state = _create_mock_state()
+        manager = WorkerBackpressureManager(state)
         manager.set_manager_backpressure("mgr-1", BackpressureLevel.THROTTLE)
 
         assert manager.should_throttle() is True
 
     def test_should_throttle_higher(self):
         """Test should_throttle with higher level."""
-        manager = WorkerBackpressureManager()
+        state = _create_mock_state()
+        manager = WorkerBackpressureManager(state)
         manager.set_manager_backpressure("mgr-1", BackpressureLevel.BATCH)
 
         assert manager.should_throttle() is True
 
     def test_should_batch_only_none(self):
         """Test should_batch_only with NONE level."""
-        manager = WorkerBackpressureManager()
+        state = _create_mock_state()
+        manager = WorkerBackpressureManager(state)
 
         assert manager.should_batch_only() is False
 
     def test_should_batch_only_throttle(self):
         """Test should_batch_only with THROTTLE level."""
-        manager = WorkerBackpressureManager()
+        state = _create_mock_state()
+        manager = WorkerBackpressureManager(state)
         manager.set_manager_backpressure("mgr-1", BackpressureLevel.THROTTLE)
 
         assert manager.should_batch_only() is False
 
     def test_should_batch_only_batch(self):
         """Test should_batch_only with BATCH level."""
-        manager = WorkerBackpressureManager()
+        state = _create_mock_state()
+        manager = WorkerBackpressureManager(state)
         manager.set_manager_backpressure("mgr-1", BackpressureLevel.BATCH)
 
         assert manager.should_batch_only() is True
 
     def test_should_reject_updates_none(self):
         """Test should_reject_updates with NONE level."""
-        manager = WorkerBackpressureManager()
+        state = _create_mock_state()
+        manager = WorkerBackpressureManager(state)
 
         assert manager.should_reject_updates() is False
 
     def test_should_reject_updates_batch(self):
         """Test should_reject_updates with BATCH level."""
-        manager = WorkerBackpressureManager()
+        state = _create_mock_state()
+        manager = WorkerBackpressureManager(state)
         manager.set_manager_backpressure("mgr-1", BackpressureLevel.BATCH)
 
         assert manager.should_reject_updates() is False
 
     def test_should_reject_updates_reject(self):
         """Test should_reject_updates with REJECT level."""
-        manager = WorkerBackpressureManager()
+        state = _create_mock_state()
+        manager = WorkerBackpressureManager(state)
         manager.set_manager_backpressure("mgr-1", BackpressureLevel.REJECT)
 
         assert manager.should_reject_updates() is True
@@ -252,14 +264,16 @@ class TestWorkerBackpressureManagerThrottleDelay:
 
     def test_get_throttle_delay_none(self):
         """Test throttle delay with NONE level."""
-        manager = WorkerBackpressureManager()
+        state = _create_mock_state()
+        manager = WorkerBackpressureManager(state)
 
         delay = manager.get_throttle_delay_seconds()
         assert delay == 0.0
 
     def test_get_throttle_delay_throttle(self):
         """Test throttle delay with THROTTLE level."""
-        manager = WorkerBackpressureManager()
+        state = _create_mock_state()
+        manager = WorkerBackpressureManager(state)
         manager.set_manager_backpressure("mgr-1", BackpressureLevel.THROTTLE)
         manager.set_backpressure_delay_ms(0)
 
@@ -268,7 +282,8 @@ class TestWorkerBackpressureManagerThrottleDelay:
 
     def test_get_throttle_delay_throttle_with_delay(self):
         """Test throttle delay with THROTTLE level and suggested delay."""
-        manager = WorkerBackpressureManager()
+        state = _create_mock_state()
+        manager = WorkerBackpressureManager(state)
         manager.set_manager_backpressure("mgr-1", BackpressureLevel.THROTTLE)
         manager.set_backpressure_delay_ms(1000)
 
@@ -277,7 +292,8 @@ class TestWorkerBackpressureManagerThrottleDelay:
 
     def test_get_throttle_delay_batch(self):
         """Test throttle delay with BATCH level."""
-        manager = WorkerBackpressureManager()
+        state = _create_mock_state()
+        manager = WorkerBackpressureManager(state)
         manager.set_manager_backpressure("mgr-1", BackpressureLevel.BATCH)
         manager.set_backpressure_delay_ms(500)
 
@@ -286,7 +302,8 @@ class TestWorkerBackpressureManagerThrottleDelay:
 
     def test_get_throttle_delay_reject(self):
         """Test throttle delay with REJECT level."""
-        manager = WorkerBackpressureManager()
+        state = _create_mock_state()
+        manager = WorkerBackpressureManager(state)
         manager.set_manager_backpressure("mgr-1", BackpressureLevel.REJECT)
         manager.set_backpressure_delay_ms(500)
 
@@ -299,14 +316,16 @@ class TestWorkerBackpressureManagerStateName:
 
     def test_get_backpressure_state_name_none(self):
         """Test state name for NONE level."""
-        manager = WorkerBackpressureManager()
+        state = _create_mock_state()
+        manager = WorkerBackpressureManager(state)
 
         name = manager.get_backpressure_state_name()
         assert name == "NO_BACKPRESSURE"
 
     def test_get_backpressure_state_name_throttle(self):
         """Test state name for THROTTLE level."""
-        manager = WorkerBackpressureManager()
+        state = _create_mock_state()
+        manager = WorkerBackpressureManager(state)
         manager.set_manager_backpressure("mgr-1", BackpressureLevel.THROTTLE)
 
         name = manager.get_backpressure_state_name()
@@ -314,7 +333,8 @@ class TestWorkerBackpressureManagerStateName:
 
     def test_get_backpressure_state_name_batch(self):
         """Test state name for BATCH level."""
-        manager = WorkerBackpressureManager()
+        state = _create_mock_state()
+        manager = WorkerBackpressureManager(state)
         manager.set_manager_backpressure("mgr-1", BackpressureLevel.BATCH)
 
         name = manager.get_backpressure_state_name()
@@ -322,7 +342,8 @@ class TestWorkerBackpressureManagerStateName:
 
     def test_get_backpressure_state_name_reject(self):
         """Test state name for REJECT level."""
-        manager = WorkerBackpressureManager()
+        state = _create_mock_state()
+        manager = WorkerBackpressureManager(state)
         manager.set_manager_backpressure("mgr-1", BackpressureLevel.REJECT)
 
         name = manager.get_backpressure_state_name()
@@ -335,7 +356,8 @@ class TestWorkerBackpressureManagerPolling:
     @pytest.mark.asyncio
     async def test_run_overload_poll_loop_starts_running(self):
         """Test that poll loop starts running."""
-        manager = WorkerBackpressureManager(poll_interval=0.01)
+        state = _create_mock_state()
+        manager = WorkerBackpressureManager(state, poll_interval=0.01)
 
         task = asyncio.create_task(manager.run_overload_poll_loop())
 
@@ -355,7 +377,8 @@ class TestWorkerBackpressureManagerPolling:
     @pytest.mark.asyncio
     async def test_stop_stops_loop(self):
         """Test that stop() stops the loop."""
-        manager = WorkerBackpressureManager(poll_interval=0.01)
+        state = _create_mock_state()
+        manager = WorkerBackpressureManager(state, poll_interval=0.01)
 
         task = asyncio.create_task(manager.run_overload_poll_loop())
 
@@ -373,7 +396,8 @@ class TestWorkerBackpressureManagerPolling:
     @pytest.mark.asyncio
     async def test_poll_loop_handles_exceptions(self):
         """Test that poll loop handles exceptions gracefully."""
-        manager = WorkerBackpressureManager(poll_interval=0.01)
+        state = _create_mock_state()
+        manager = WorkerBackpressureManager(state, poll_interval=0.01)
 
         call_count = [0]
 
