@@ -600,7 +600,7 @@ class LoggerStream:
         path: str | None = None,
         retention_policy: RetentionPolicyConfig | None = None,
         filter: Callable[[T], bool] | None = None,
-    ):
+    ) -> int | None:
         filename: str | None = None
         directory: str | None = None
 
@@ -628,7 +628,7 @@ class LoggerStream:
             retention_policy = self._default_retention_policy
 
         if filename or directory:
-            await self._log_to_file(
+            return await self._log_to_file(
                 entry,
                 filename=filename,
                 directory=directory,
@@ -642,6 +642,7 @@ class LoggerStream:
                 template=template,
                 filter=filter,
             )
+            return None
 
     def _to_entry(
         self,
