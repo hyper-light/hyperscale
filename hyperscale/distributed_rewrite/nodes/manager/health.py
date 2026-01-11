@@ -122,6 +122,9 @@ class ManagerHealthMonitor:
         self._latency_max_age = 60.0
         self._latency_max_count = 30
 
+        # AD-18: Hybrid overload detector for manager self-health
+        self._overload_detector = HybridOverloadDetector()
+
         # AD-30: Job-level suspicion tracking
         # Key: (job_id, worker_id) -> JobSuspicion
         self._job_suspicions: dict[tuple[str, str], JobSuspicion] = {}
@@ -151,10 +154,14 @@ class ManagerHealthMonitor:
         if hasattr(heartbeat, 'deadline') and heartbeat.deadline:
             self._state._worker_deadlines[worker_id] = heartbeat.deadline
 
+        # AD-17/AD-18: Update worker health state from heartbeat for smart dispatch
+        worker_health_state = getattr(heartbeat, 'health_overload_state', 'healthy')
+        self._registry.update_worker_health_state(worker_id, worker_health_state)
+
         self._task_runner.run(
             self._logger.log,
             ServerDebug(
-                message=f"Worker heartbeat from {worker_id[:8]}... cores={heartbeat.available_cores}/{heartbeat.total_cores}",
+                message=f"Worker heartbeat from {worker_id[:8]}... cores={heartbeat.available_cores}/{heartbeat.total_cores} state={worker_health_state}",
                 node_host=self._config.host,
                 node_port=self._config.tcp_port,
                 node_id=self._node_id,
@@ -209,6 +216,8 @@ class ManagerHealthMonitor:
         """
         Record a latency sample for health tracking.
 
+        Also feeds the AD-18 hybrid overload detector for self-health monitoring.
+
         Args:
             target_type: Type of target (worker, peer, gate)
             target_id: Target identifier
@@ -228,6 +237,9 @@ class ManagerHealthMonitor:
 
         samples.append(sample)
         self._prune_latency_samples(samples)
+
+        # AD-18: Feed latency to hybrid overload detector for manager self-health
+        self._overload_detector.record_latency(latency_ms)
 
     def _prune_latency_samples(self, samples: list[tuple[float, float]]) -> None:
         """Prune old latency samples."""
@@ -527,8 +539,35 @@ class ManagerHealthMonitor:
 
         self._job_dead_workers.pop(job_id, None)
 
+    def get_manager_overload_state(
+        self,
+        cpu_percent: float = 0.0,
+        memory_percent: float = 0.0,
+    ) -> str:
+        """
+        Get manager's own overload state (AD-18).
+
+        Args:
+            cpu_percent: Current CPU utilization (0-100)
+            memory_percent: Current memory utilization (0-100)
+
+        Returns:
+            Overload state: "healthy", "busy", "stressed", or "overloaded"
+        """
+        return self._overload_detector.get_state(cpu_percent, memory_percent).value
+
+    def get_overload_diagnostics(self) -> dict:
+        """
+        Get hybrid overload detector diagnostics (AD-18).
+
+        Returns:
+            Dict with baseline, drift, state, and other diagnostic info
+        """
+        return self._overload_detector.get_diagnostics()
+
     def get_health_metrics(self) -> dict:
         """Get health-related metrics."""
+        overload_diag = self._overload_detector.get_diagnostics()
         return {
             "healthy_workers": self.get_healthy_worker_count(),
             "unhealthy_workers": self.get_unhealthy_worker_count(),
@@ -537,6 +576,10 @@ class ManagerHealthMonitor:
                 len(self._state._worker_latency_samples) +
                 len(self._state._peer_manager_latency_samples)
             ),
+            # AD-18 metrics
+            "manager_overload_state": overload_diag.get("current_state", "healthy"),
+            "manager_baseline_latency": overload_diag.get("baseline", 0.0),
+            "manager_baseline_drift": overload_diag.get("baseline_drift", 0.0),
             # AD-30 metrics
             "job_suspicions": len(self._job_suspicions),
             "global_dead_workers": len(self._global_dead_workers),
