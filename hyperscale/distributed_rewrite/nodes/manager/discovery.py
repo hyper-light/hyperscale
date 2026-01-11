@@ -8,7 +8,7 @@ per AD-28 specifications.
 import asyncio
 from typing import TYPE_CHECKING
 
-from hyperscale.logging.hyperscale_logging_models import ServerDebug
+from hyperscale.logging.hyperscale_logging_models import ServerDebug, ServerWarning
 
 if TYPE_CHECKING:
     from hyperscale.distributed_rewrite.nodes.manager.state import ManagerState
@@ -222,8 +222,16 @@ class ManagerDiscoveryCoordinator:
 
             except asyncio.CancelledError:
                 break
-            except Exception:
-                pass  # Continue on errors
+            except Exception as maintenance_error:
+                self._task_runner.run(
+                    self._logger.log,
+                    ServerWarning(
+                        message=f"Discovery maintenance error: {maintenance_error}",
+                        node_host=self._config.host,
+                        node_port=self._config.tcp_port,
+                        node_id=self._node_id,
+                    )
+                )
 
     def get_discovery_metrics(self) -> dict:
         """Get discovery-related metrics."""

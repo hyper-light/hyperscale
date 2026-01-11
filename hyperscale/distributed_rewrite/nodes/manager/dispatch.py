@@ -226,11 +226,31 @@ class ManagerDispatchCoordinator:
                 )
 
                 if response and not isinstance(response, Exception):
-                    # Parse confirmation and track
-                    pass  # Full impl parses ProvisionConfirm
+                    confirmation = ProvisionConfirm.load(response)
+                    if confirmation.confirmed and confirmation.workflow_id == workflow_id:
+                        self._state._provision_confirmations[workflow_id].add(
+                            confirmation.confirming_node
+                        )
+                        self._task_runner.run(
+                            self._logger.log,
+                            ServerDebug(
+                                message=f"Provision confirmed by {confirmation.confirming_node[:8]}... for workflow {workflow_id[:8]}...",
+                                node_host=self._config.host,
+                                node_port=self._config.tcp_port,
+                                node_id=self._node_id,
+                            )
+                        )
 
-            except Exception:
-                pass  # Continue with other peers
+            except Exception as provision_error:
+                self._task_runner.run(
+                    self._logger.log,
+                    ServerWarning(
+                        message=f"Provision request to peer {peer_addr} failed: {provision_error}",
+                        node_host=self._config.host,
+                        node_port=self._config.tcp_port,
+                        node_id=self._node_id,
+                    )
+                )
 
         # Check quorum
         confirmed = self._state._provision_confirmations.get(workflow_id, set())

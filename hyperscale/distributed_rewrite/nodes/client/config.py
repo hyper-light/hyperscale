@@ -9,13 +9,18 @@ import os
 from dataclasses import dataclass
 
 
-# Transient errors that should trigger retry logic
+# Transient errors that should trigger retry logic (AD-21, AD-32)
+# Includes cluster state errors and load shedding/rate limiting patterns
 TRANSIENT_ERRORS = frozenset({
     "syncing",
     "not ready",
     "election in progress",
     "no leader",
     "split brain",
+    "rate limit",
+    "overload",
+    "too many",
+    "server busy",
 })
 
 
