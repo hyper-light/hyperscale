@@ -117,12 +117,18 @@ class ManagerConfig:
 
     # Heartbeat settings (from env)
     heartbeat_interval_seconds: float = 5.0
+    gate_heartbeat_interval_seconds: float = 10.0
 
     # Peer sync settings (from env)
     peer_sync_interval_seconds: float = 30.0
+    peer_job_sync_interval_seconds: float = 15.0
 
     # Throughput tracking (from env)
     throughput_interval_seconds: float = 10.0
+
+    # Job timeout settings (AD-34)
+    job_timeout_check_interval_seconds: float = 30.0
+    job_retention_seconds: float = 3600.0
 
 
 def create_manager_config_from_env(
@@ -212,6 +218,10 @@ def create_manager_config_from_env(
         cluster_stabilization_timeout_seconds=env.CLUSTER_STABILIZATION_TIMEOUT,
         cluster_stabilization_poll_interval_seconds=env.CLUSTER_STABILIZATION_POLL_INTERVAL,
         heartbeat_interval_seconds=env.MANAGER_HEARTBEAT_INTERVAL,
+        gate_heartbeat_interval_seconds=getattr(env, 'MANAGER_GATE_HEARTBEAT_INTERVAL', 10.0),
         peer_sync_interval_seconds=env.MANAGER_PEER_SYNC_INTERVAL,
+        peer_job_sync_interval_seconds=getattr(env, 'MANAGER_PEER_JOB_SYNC_INTERVAL', 15.0),
         throughput_interval_seconds=getattr(env, 'MANAGER_THROUGHPUT_INTERVAL_SECONDS', 10.0),
+        job_timeout_check_interval_seconds=getattr(env, 'JOB_TIMEOUT_CHECK_INTERVAL', 30.0),
+        job_retention_seconds=getattr(env, 'JOB_RETENTION_SECONDS', 3600.0),
     )

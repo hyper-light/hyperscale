@@ -475,6 +475,12 @@ class ManagerServer(HealthAwareServer):
         self._discovery_maintenance_task: asyncio.Task | None = None
         self._job_responsiveness_task: asyncio.Task | None = None
         self._stats_push_task: asyncio.Task | None = None
+        self._gate_heartbeat_task: asyncio.Task | None = None
+        self._rate_limit_cleanup_task: asyncio.Task | None = None
+        self._job_cleanup_task: asyncio.Task | None = None
+        self._unified_timeout_task: asyncio.Task | None = None
+        self._deadline_enforcement_task: asyncio.Task | None = None
+        self._peer_job_state_sync_task: asyncio.Task | None = None
 
     def _init_address_mappings(self) -> None:
         """Initialize UDP to TCP address mappings."""
@@ -673,6 +679,12 @@ class ManagerServer(HealthAwareServer):
             self._discovery_maintenance_task,
             self._job_responsiveness_task,
             self._stats_push_task,
+            self._gate_heartbeat_task,
+            self._rate_limit_cleanup_task,
+            self._job_cleanup_task,
+            self._unified_timeout_task,
+            self._deadline_enforcement_task,
+            self._peer_job_state_sync_task,
         ]
 
     def _start_background_tasks(self) -> None:
@@ -686,6 +698,12 @@ class ManagerServer(HealthAwareServer):
             self._job_responsiveness_loop()
         )
         self._stats_push_task = asyncio.create_task(self._stats_push_loop())
+        self._gate_heartbeat_task = asyncio.create_task(self._gate_heartbeat_loop())
+        self._rate_limit_cleanup_task = asyncio.create_task(self._rate_limit_cleanup_loop())
+        self._job_cleanup_task = asyncio.create_task(self._job_cleanup_loop())
+        self._unified_timeout_task = asyncio.create_task(self._unified_timeout_loop())
+        self._deadline_enforcement_task = asyncio.create_task(self._deadline_enforcement_loop())
+        self._peer_job_state_sync_task = asyncio.create_task(self._peer_job_state_sync_loop())
 
     async def _cancel_background_tasks(self) -> None:
         """Cancel all background tasks."""

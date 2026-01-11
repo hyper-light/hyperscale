@@ -1366,6 +1366,21 @@ class JobLeadershipAck(Message):
     job_id: str                  # Job being acknowledged
     accepted: bool               # Whether announcement was accepted
     responder_id: str            # Node ID of responder
+    error: str | None = None     # Error message if not accepted
+
+
+@dataclass(slots=True)
+class JobLeadershipNotification(Message):
+    """
+    Notification of job leadership to peer gates.
+
+    When a gate takes ownership of a job, it notifies peers so they
+    can route results and requests correctly.
+    """
+    job_id: str                  # Job identifier
+    leader_gate_id: str          # Node ID of the gate that owns the job
+    leader_addr: tuple[str, int] # TCP address of the leader gate
+    fence_token: int = 0         # Fencing token for consistency
 
 
 @dataclass(slots=True)
