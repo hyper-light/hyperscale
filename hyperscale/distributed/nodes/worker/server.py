@@ -438,6 +438,10 @@ class WorkerServer(HealthAwareServer):
         if self._background_loops:
             self._background_loops.stop()
 
+        # Cancel all active workflows via TaskRunner
+        for workflow_id in list(self._workflow_tokens.keys()):
+            await self._cancel_workflow(workflow_id, "server_shutdown")
+
         # Shutdown remote manager and workers
         await self._lifecycle_manager.shutdown_remote_manager()
 
@@ -845,12 +849,24 @@ class WorkerServer(HealthAwareServer):
         task_runner_run: callable,
     ) -> None:
         """Handle job leadership claims from heartbeat."""
-        for workflow_id, leader_addr in list(self._workflow_job_leader.items()):
-            progress = self._active_workflows.get(workflow_id)
-            if progress and progress.job_id in job_leaderships:
-                if leader_addr != manager_addr:
+        # Check each active workflow to see if this manager leads its job
+        for workflow_id, progress in list(self._active_workflows.items()):
+            job_id = progress.job_id
+            if job_id in job_leaderships:
+                current_leader = self._workflow_job_leader.get(workflow_id)
+                if current_leader != manager_addr:
                     self._workflow_job_leader[workflow_id] = manager_addr
                     self._worker_state.clear_workflow_orphaned(workflow_id)
+                    task_runner_run(
+                        self._udp_logger.log,
+                        ServerInfo(
+                            message=f"Job leader update via SWIM: workflow {workflow_id[:8]}... "
+                                    f"job {job_id[:8]}... -> {manager_addr}",
+                            node_host=node_host,
+                            node_port=node_port,
+                            node_id=node_id_short,
+                        )
+                    )
 
     def _on_cores_available(self, available_cores: int) -> None:
         """Handle cores becoming available - notify manager."""
