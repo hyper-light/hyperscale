@@ -5,12 +5,14 @@ Handles job cancellation with retry logic, leader redirection, and completion tr
 """
 
 import asyncio
+import random
 import time
 
 from hyperscale.core.jobs.models import JobStatus
 from hyperscale.distributed_rewrite.models import (
     JobCancelRequest,
     JobCancelResponse,
+    RateLimitResponse,
 )
 from hyperscale.distributed_rewrite.nodes.client.state import ClientState
 from hyperscale.distributed_rewrite.nodes.client.config import ClientConfig, TRANSIENT_ERRORS
@@ -111,19 +113,33 @@ class ClientCancellationManager:
 
             if isinstance(response_data, Exception):
                 last_error = str(response_data)
-                # Wait before retry with exponential backoff
+                # Wait before retry with exponential backoff and jitter (AD-21)
                 if retry < max_retries:
-                    delay = retry_base_delay * (2 ** retry)
+                    base_delay = retry_base_delay * (2 ** retry)
+                    delay = base_delay * (0.5 + random.random())  # Add 0-100% jitter
                     await asyncio.sleep(delay)
                 continue
 
             if response_data == b'error':
                 last_error = "Server returned error"
-                # Wait before retry with exponential backoff
+                # Wait before retry with exponential backoff and jitter (AD-21)
                 if retry < max_retries:
-                    delay = retry_base_delay * (2 ** retry)
+                    base_delay = retry_base_delay * (2 ** retry)
+                    delay = base_delay * (0.5 + random.random())  # Add 0-100% jitter
                     await asyncio.sleep(delay)
                 continue
+
+            # Check for rate limiting response (AD-32)
+            try:
+                rate_limit_response = RateLimitResponse.load(response_data)
+                # Server is rate limiting - honor retry_after and treat as transient
+                last_error = rate_limit_response.error
+                if retry < max_retries:
+                    await asyncio.sleep(rate_limit_response.retry_after_seconds)
+                continue
+            except Exception:
+                # Not a RateLimitResponse, continue to parse as JobCancelResponse
+                pass
 
             response = JobCancelResponse.load(response_data)
 
@@ -142,9 +158,10 @@ class ClientCancellationManager:
             # Check for transient error
             if response.error and self._is_transient_error(response.error):
                 last_error = response.error
-                # Wait before retry with exponential backoff
+                # Wait before retry with exponential backoff and jitter (AD-21)
                 if retry < max_retries:
-                    delay = retry_base_delay * (2 ** retry)
+                    base_delay = retry_base_delay * (2 ** retry)
+                    delay = base_delay * (0.5 + random.random())  # Add 0-100% jitter
                     await asyncio.sleep(delay)
                 continue
 

@@ -330,6 +330,16 @@ class ClientJobSubmitter:
             if isinstance(response, Exception):
                 return str(response)  # Transient error
 
+            # Check for rate limiting response (AD-32)
+            try:
+                rate_limit_response = RateLimitResponse.load(response)
+                # Server is rate limiting - honor retry_after and treat as transient
+                await asyncio.sleep(rate_limit_response.retry_after_seconds)
+                return rate_limit_response.error  # Transient error
+            except Exception:
+                # Not a RateLimitResponse, continue to parse as JobAck
+                pass
+
             ack = JobAck.load(response)
 
             if ack.accepted:
