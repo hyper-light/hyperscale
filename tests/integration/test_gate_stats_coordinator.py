@@ -36,7 +36,12 @@ class MockTaskRunner:
     tasks: list = field(default_factory=list)
 
     def run(self, coro, *args, **kwargs):
-        task = asyncio.create_task(coro(*args, **kwargs) if args else coro)
+        # If coro is callable (coroutine function), call it to get the coroutine object
+        if callable(coro) and not asyncio.iscoroutine(coro):
+            actual_coro = coro(*args, **kwargs)
+        else:
+            actual_coro = coro
+        task = asyncio.create_task(actual_coro)
         self.tasks.append(task)
         return task
 
