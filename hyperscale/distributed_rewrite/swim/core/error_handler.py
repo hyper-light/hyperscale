@@ -98,10 +98,18 @@ class ErrorStats:
             if len(self._timestamps) >= self.max_errors:
                 self._circuit_state = CircuitState.OPEN
                 self._circuit_opened_at = now
+        elif self._circuit_state == CircuitState.HALF_OPEN:
+            # Error during half-open state means recovery failed - reopen circuit
+            self._circuit_state = CircuitState.OPEN
+            self._circuit_opened_at = now
 
     def record_failure(self) -> None:
         """Record a failure occurrence (alias for record_error)."""
         self.record_error()
+
+    def is_open(self) -> bool:
+        """Check if circuit is open (rejecting requests). Method form for compatibility."""
+        return self.circuit_state == CircuitState.OPEN
     
     def record_success(self) -> None:
         """
