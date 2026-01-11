@@ -8,8 +8,6 @@ Tests:
 - Metrics tracking
 """
 
-import pytest
-
 from hyperscale.distributed.reliability import (
     HybridOverloadDetector,
     LoadShedder,

@@ -9,12 +9,8 @@ Tests:
 - Edge cases: boundary conditions, cleanup operations
 """
 
-import asyncio
 import time
 from concurrent.futures import ThreadPoolExecutor
-from unittest.mock import MagicMock
-
-import pytest
 
 from hyperscale.distributed.health.circuit_breaker_manager import (
     CircuitBreakerManager,

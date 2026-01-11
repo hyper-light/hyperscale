@@ -12,7 +12,6 @@ These tests verify that:
 
 import asyncio
 import pytest
-import time
 
 from hyperscale.distributed.reliability import (
     JitterStrategy,

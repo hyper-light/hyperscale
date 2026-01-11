@@ -9,12 +9,8 @@ Tests:
 - Edge cases: boundary conditions, precision
 """
 
-import asyncio
 import time
 from concurrent.futures import ThreadPoolExecutor
-from unittest.mock import patch
-
-import pytest
 
 from hyperscale.distributed.health.latency_tracker import (
     LatencyTracker,

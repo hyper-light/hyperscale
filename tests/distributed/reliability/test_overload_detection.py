@@ -10,9 +10,6 @@ These tests verify that:
 6. Final state is max of all detection methods
 """
 
-import pytest
-import time
-
 from hyperscale.distributed.reliability import (
     OverloadState,
     OverloadConfig,

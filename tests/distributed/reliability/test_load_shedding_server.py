@@ -12,10 +12,7 @@ Tests load shedding in realistic server scenarios with:
 
 import asyncio
 import pytest
-import random
-import time
 from dataclasses import dataclass
-from typing import Any
 
 from hyperscale.distributed.reliability import (
     HybridOverloadDetector,
