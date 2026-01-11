@@ -2295,6 +2295,220 @@ class GateServer(HealthAwareServer):
             )
         )
 
+    async def _forward_workflow_result_to_peers(self, push: WorkflowResultPush) -> bool:
+        """Forward workflow result to the job owner gate using consistent hashing."""
+        candidates = self._job_hash_ring.get_nodes(push.job_id, count=3)
+
+        for candidate in candidates:
+            if candidate.node_id == self._node_id.full:
+                continue
+
+            try:
+                gate_addr = (candidate.tcp_host, candidate.tcp_port)
+                await self.send_tcp(
+                    gate_addr,
+                    "workflow_result_push",
+                    push.dump(),
+                    timeout=3.0,
+                )
+                return True
+            except Exception:
+                continue
+
+        for gate_id, gate_info in list(self._known_gates.items()):
+            if gate_id == self._node_id.full:
+                continue
+            try:
+                gate_addr = (gate_info.tcp_host, gate_info.tcp_port)
+                await self.send_tcp(
+                    gate_addr,
+                    "workflow_result_push",
+                    push.dump(),
+                    timeout=3.0,
+                )
+                return True
+            except Exception:
+                continue
+
+        return False
+
+    async def _aggregate_and_forward_workflow_result(
+        self,
+        job_id: str,
+        workflow_id: str,
+    ) -> None:
+        """Aggregate workflow results from all DCs and forward to client."""
+        workflow_results = self._workflow_dc_results.get(job_id, {}).get(workflow_id, {})
+        if not workflow_results:
+            return
+
+        first_dc_push = next(iter(workflow_results.values()))
+        is_test_workflow = first_dc_push.is_test
+
+        all_workflow_stats: list[WorkflowStats] = []
+        per_dc_results: list[WorkflowDCResult] = []
+        workflow_name = ""
+        has_failure = False
+        error_messages: list[str] = []
+        max_elapsed = 0.0
+
+        for datacenter, dc_push in workflow_results.items():
+            workflow_name = dc_push.workflow_name
+            all_workflow_stats.extend(dc_push.results)
+
+            if is_test_workflow:
+                dc_aggregated_stats: WorkflowStats | None = None
+                if dc_push.results:
+                    if len(dc_push.results) > 1:
+                        aggregator = Results()
+                        dc_aggregated_stats = aggregator.merge_results(dc_push.results)
+                    else:
+                        dc_aggregated_stats = dc_push.results[0]
+
+                per_dc_results.append(WorkflowDCResult(
+                    datacenter=datacenter,
+                    status=dc_push.status,
+                    stats=dc_aggregated_stats,
+                    error=dc_push.error,
+                    elapsed_seconds=dc_push.elapsed_seconds,
+                ))
+            else:
+                per_dc_results.append(WorkflowDCResult(
+                    datacenter=datacenter,
+                    status=dc_push.status,
+                    stats=None,
+                    error=dc_push.error,
+                    elapsed_seconds=dc_push.elapsed_seconds,
+                    raw_results=dc_push.results,
+                ))
+
+            if dc_push.status == "FAILED":
+                has_failure = True
+                if dc_push.error:
+                    error_messages.append(f"{datacenter}: {dc_push.error}")
+
+            if dc_push.elapsed_seconds > max_elapsed:
+                max_elapsed = dc_push.elapsed_seconds
+
+        if not all_workflow_stats:
+            return
+
+        status = "FAILED" if has_failure else "COMPLETED"
+        error = "; ".join(error_messages) if error_messages else None
+
+        if is_test_workflow:
+            aggregator = Results()
+            if len(all_workflow_stats) > 1:
+                aggregated = aggregator.merge_results(all_workflow_stats)
+            else:
+                aggregated = all_workflow_stats[0]
+            results_to_send = [aggregated]
+        else:
+            results_to_send = all_workflow_stats
+
+        client_push = WorkflowResultPush(
+            job_id=job_id,
+            workflow_id=workflow_id,
+            workflow_name=workflow_name,
+            datacenter="aggregated",
+            status=status,
+            results=results_to_send,
+            error=error,
+            elapsed_seconds=max_elapsed,
+            per_dc_results=per_dc_results,
+            completed_at=time.time(),
+            is_test=is_test_workflow,
+        )
+
+        callback = self._job_manager.get_callback(job_id)
+        if callback:
+            try:
+                await self.send_tcp(
+                    callback,
+                    "workflow_result_push",
+                    client_push.dump(),
+                    timeout=5.0,
+                )
+            except Exception as error:
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerWarning(
+                        message=f"Failed to send workflow result to client {callback}: {error}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+
+        if job_id in self._workflow_dc_results:
+            self._workflow_dc_results[job_id].pop(workflow_id, None)
+
+    async def _query_all_datacenters(
+        self,
+        request: WorkflowQueryRequest,
+    ) -> dict[str, list[WorkflowStatusInfo]]:
+        """Query all datacenter managers for workflow status."""
+        dc_results: dict[str, list[WorkflowStatusInfo]] = {}
+
+        async def query_dc(dc_id: str, manager_addr: tuple[str, int]) -> None:
+            try:
+                response_data, _ = await self.send_tcp(
+                    manager_addr,
+                    "workflow_query",
+                    request.dump(),
+                    timeout=5.0,
+                )
+                if isinstance(response_data, Exception) or response_data == b'error':
+                    return
+
+                manager_response = WorkflowQueryResponse.load(response_data)
+                dc_results[dc_id] = manager_response.workflows
+
+            except Exception:
+                pass
+
+        job_dc_managers = self._job_dc_managers.get(request.job_id, {}) if request.job_id else {}
+
+        query_tasks = []
+        for dc_id in self._datacenter_managers.keys():
+            target_addr = self._get_dc_query_target(dc_id, job_dc_managers)
+            if target_addr:
+                query_tasks.append(query_dc(dc_id, target_addr))
+
+        if query_tasks:
+            await asyncio.gather(*query_tasks, return_exceptions=True)
+
+        return dc_results
+
+    def _get_dc_query_target(
+        self,
+        dc_id: str,
+        job_dc_managers: dict[str, tuple[str, int]],
+    ) -> tuple[str, int] | None:
+        """Get the best manager address to query for a datacenter."""
+        if dc_id in job_dc_managers:
+            return job_dc_managers[dc_id]
+
+        manager_statuses = self._datacenter_manager_status.get(dc_id, {})
+        fallback_addr: tuple[str, int] | None = None
+
+        for manager_addr, heartbeat in manager_statuses.items():
+            if fallback_addr is None:
+                fallback_addr = (heartbeat.tcp_host, heartbeat.tcp_port)
+
+            if heartbeat.is_leader:
+                return (heartbeat.tcp_host, heartbeat.tcp_port)
+
+        return fallback_addr
+
+    def _clear_orphaned_job(
+        self,
+        job_id: str,
+        new_manager_addr: tuple[str, int],
+    ) -> None:
+        """Clear orphaned status when a new manager takes over a job."""
+        self._orphaned_jobs.pop(job_id, None)
+
     async def _wait_for_cluster_stabilization(self) -> None:
         """Wait for SWIM cluster to stabilize."""
         expected_peers = len(self._gate_udp_peers)

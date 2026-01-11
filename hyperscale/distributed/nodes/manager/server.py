@@ -2082,11 +2082,70 @@ class ManagerServer(HealthAwareServer):
         data: bytes,
         clock_time: int,
     ) -> bytes:
-        """Handle workflow cancellation complete notification."""
+        """
+        Handle workflow cancellation completion push from worker (AD-20).
+
+        Workers push this notification after successfully (or unsuccessfully)
+        cancelling a workflow. The manager:
+        1. Tracks completion of all workflows in a job cancellation
+        2. Aggregates any errors from failed cancellations
+        3. When all workflows report, fires the completion event
+        4. Pushes aggregated result to origin gate/client
+        """
         try:
-            notification = WorkflowCancellationComplete.load(data)
-            await self._cancellation.handle_workflow_cancelled(notification)
-            return b"ok"
+            completion = WorkflowCancellationComplete.load(data)
+            job_id = completion.job_id
+            workflow_id = completion.workflow_id
+
+            await self._udp_logger.log(
+                ServerInfo(
+                    message=f"Received workflow cancellation complete for {workflow_id[:8]}... "
+                    f"(job {job_id[:8]}..., success={completion.success})",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+
+            # Track this workflow as complete
+            pending = self._manager_state._cancellation_pending_workflows.get(job_id, set())
+            if workflow_id in pending:
+                pending.discard(workflow_id)
+
+                # Collect any errors
+                if not completion.success and completion.errors:
+                    for error in completion.errors:
+                        self._manager_state._cancellation_errors[job_id].append(
+                            f"Workflow {workflow_id[:8]}...: {error}"
+                        )
+
+                # Check if all workflows for this job have reported
+                if not pending:
+                    # All workflows cancelled - fire completion event and push to origin
+                    event = self._manager_state._cancellation_completion_events.get(job_id)
+                    if event:
+                        event.set()
+
+                    errors = self._manager_state._cancellation_errors.get(job_id, [])
+                    success = len(errors) == 0
+
+                    # Push completion notification to origin gate/client
+                    self._task_runner.run(
+                        self._push_cancellation_complete_to_origin,
+                        job_id,
+                        success,
+                        errors,
+                    )
+
+                    # Cleanup tracking structures
+                    self._manager_state._cancellation_pending_workflows.pop(job_id, None)
+                    self._manager_state._cancellation_completion_events.pop(job_id, None)
+                    self._manager_state._cancellation_initiated_at.pop(job_id, None)
+
+            # Also delegate to cancellation coordinator for additional handling
+            await self._cancellation.handle_workflow_cancelled(completion)
+
+            return b"OK"
 
         except Exception as error:
             await self._udp_logger.log(
@@ -2097,7 +2156,7 @@ class ManagerServer(HealthAwareServer):
                     node_id=self._node_id.short,
                 )
             )
-            return b"error"
+            return b"ERROR"
 
     @tcp.receive()
     async def state_sync_request(
@@ -2139,37 +2198,147 @@ class ManagerServer(HealthAwareServer):
         data: bytes,
         clock_time: int,
     ) -> bytes:
-        """Handle healthcheck extension request (AD-26)."""
+        """
+        Handle deadline extension request from worker (AD-26).
+
+        Workers can request deadline extensions when:
+        - Executing long-running workflows
+        - System is under heavy load but making progress
+        - Approaching timeout but not stuck
+
+        Extensions use logarithmic decay and require progress to be granted.
+        """
         try:
             request = HealthcheckExtensionRequest.load(data)
 
-            worker_id = self._manager_state._worker_addr_to_id.get(addr)
+            # Rate limit check (AD-24)
+            client_id = f"{addr[0]}:{addr[1]}"
+            allowed, retry_after = self._check_rate_limit_for_operation(client_id, "extension")
+            if not allowed:
+                return HealthcheckExtensionResponse(
+                    granted=False,
+                    extension_seconds=0.0,
+                    new_deadline=0.0,
+                    remaining_extensions=0,
+                    denial_reason=f"Rate limited, retry after {retry_after:.1f}s",
+                ).dump()
+
+            # Check if worker is registered
+            worker_id = request.worker_id
+            if not worker_id:
+                worker_id = self._manager_state._worker_addr_to_id.get(addr)
+
             if not worker_id:
                 return HealthcheckExtensionResponse(
                     granted=False,
-                    denial_reason="Unknown worker",
+                    extension_seconds=0.0,
+                    new_deadline=0.0,
+                    remaining_extensions=0,
+                    denial_reason="Worker not registered",
                 ).dump()
 
-            granted, extension_seconds, new_deadline, remaining, denial_reason = (
-                self._extension_manager.handle_extension_request(
-                    worker_id=worker_id,
-                    reason=request.reason,
-                    current_progress=request.current_progress,
-                    estimated_completion=request.estimated_completion,
-                )
+            worker = self._manager_state._workers.get(worker_id)
+            if not worker:
+                return HealthcheckExtensionResponse(
+                    granted=False,
+                    extension_seconds=0.0,
+                    new_deadline=0.0,
+                    remaining_extensions=0,
+                    denial_reason="Worker not found",
+                ).dump()
+
+            # Get current deadline (or set default)
+            current_deadline = self._manager_state._worker_deadlines.get(
+                worker_id,
+                time.monotonic() + 30.0,
             )
 
-            return HealthcheckExtensionResponse(
-                granted=granted,
-                extension_seconds=extension_seconds,
-                new_deadline=new_deadline,
-                remaining_extensions=remaining,
-                denial_reason=denial_reason,
-            ).dump()
+            # Handle extension request via worker health manager
+            response = self._worker_health_manager.handle_extension_request(
+                request=request,
+                current_deadline=current_deadline,
+            )
+
+            # Update stored deadline if granted
+            if response.granted:
+                self._manager_state._worker_deadlines[worker_id] = response.new_deadline
+
+                # AD-26 Issue 3: Integrate with SWIM timing wheels (SWIM as authority)
+                hierarchical_detector = self.get_hierarchical_detector()
+                if hierarchical_detector:
+                    worker_addr = (worker.node.host, worker.node.udp_port)
+                    swim_granted, swim_extension, swim_denial, is_warning = (
+                        await hierarchical_detector.request_extension(
+                            node=worker_addr,
+                            reason=request.reason,
+                            current_progress=request.current_progress,
+                        )
+                    )
+                    if not swim_granted:
+                        await self._udp_logger.log(
+                            ServerWarning(
+                                message=f"SWIM denied extension for {worker_id[:8]}... despite WorkerHealthManager grant: {swim_denial}",
+                                node_host=self._host,
+                                node_port=self._tcp_port,
+                                node_id=self._node_id.short,
+                            )
+                        )
+
+                # Notify timeout strategies of extension (AD-34 Part 10.4.7)
+                await self._notify_timeout_strategies_of_extension(
+                    worker_id=worker_id,
+                    extension_seconds=response.extension_seconds,
+                    worker_progress=request.current_progress,
+                )
+
+                await self._udp_logger.log(
+                    ServerInfo(
+                        message=f"Granted {response.extension_seconds:.1f}s extension to worker {worker_id[:8]}... (reason: {request.reason})",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+            else:
+                await self._udp_logger.log(
+                    ServerWarning(
+                        message=f"Denied extension to worker {worker_id[:8]}...: {response.denial_reason}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+
+                # Check if worker should be evicted
+                should_evict, eviction_reason = self._worker_health_manager.should_evict_worker(
+                    worker_id
+                )
+                if should_evict:
+                    await self._udp_logger.log(
+                        ServerWarning(
+                            message=f"Worker {worker_id[:8]}... should be evicted: {eviction_reason}",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
+
+            return response.dump()
 
         except Exception as error:
+            await self._udp_logger.log(
+                ServerError(
+                    message=f"Extension request error: {error}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
             return HealthcheckExtensionResponse(
                 granted=False,
+                extension_seconds=0.0,
+                new_deadline=0.0,
+                remaining_extensions=0,
                 denial_reason=str(error),
             ).dump()
 
