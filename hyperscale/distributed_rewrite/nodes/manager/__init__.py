@@ -14,10 +14,18 @@ from .leases import ManagerLeaseCoordinator
 from .workflow_lifecycle import ManagerWorkflowLifecycle
 from .dispatch import ManagerDispatchCoordinator
 from .sync import ManagerStateSync
-from .health import ManagerHealthMonitor, NodeStatus, JobSuspicion
+from .health import (
+    ManagerHealthMonitor,
+    NodeStatus,
+    JobSuspicion,
+    ExtensionTracker,
+    HealthcheckExtensionManager,
+)
 from .leadership import ManagerLeadershipCoordinator
 from .stats import ManagerStatsCoordinator, ProgressState, BackpressureLevel
 from .discovery import ManagerDiscoveryCoordinator
+from .load_shedding import ManagerLoadShedder, RequestPriority, OverloadState
+from .in_flight import InFlightTracker, BoundedRequestExecutor
 
 __all__ = [
     # Configuration and State
@@ -37,9 +45,19 @@ __all__ = [
     "ManagerDiscoveryCoordinator",
     # AD-19 Progress State (Three-Signal Health)
     "ProgressState",
+    # AD-22 Load Shedding with Priority Queues
+    "ManagerLoadShedder",
+    "RequestPriority",
+    "OverloadState",
     # AD-23 Backpressure
     "BackpressureLevel",
+    # AD-26 Adaptive Healthcheck Extensions
+    "ExtensionTracker",
+    "HealthcheckExtensionManager",
     # AD-30 Hierarchical Failure Detection
     "NodeStatus",
     "JobSuspicion",
+    # AD-32 Bounded Execution
+    "InFlightTracker",
+    "BoundedRequestExecutor",
 ]

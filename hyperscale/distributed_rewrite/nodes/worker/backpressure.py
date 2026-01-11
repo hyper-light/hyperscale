@@ -1,8 +1,9 @@
 """
-Worker backpressure manager (AD-18, AD-23).
+Worker backpressure manager (AD-18, AD-23, AD-37).
 
 Handles overload detection, circuit breakers, and load shedding
-signals for worker health reporting.
+signals for worker health reporting. Implements explicit backpressure
+policy for progress updates per AD-37.
 """
 
 import asyncio
