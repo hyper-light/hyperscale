@@ -24,15 +24,12 @@ from hyperscale.distributed.nodes.client.state import ClientState
 from hyperscale.distributed.nodes.client.config import ClientConfig
 from hyperscale.distributed.nodes.client.targets import ClientTargetSelector
 from hyperscale.distributed.models import (
-    PingRequest,
     ManagerPingResponse,
     GatePingResponse,
-    WorkflowQueryRequest,
     WorkflowQueryResponse,
     WorkflowStatusInfo,
     GateWorkflowQueryResponse,
     DatacenterWorkflowStatus,
-    DatacenterListRequest,
     DatacenterListResponse,
     DatacenterInfo,
 )

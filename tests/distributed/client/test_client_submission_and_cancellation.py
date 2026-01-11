@@ -13,11 +13,9 @@ Covers:
 """
 
 import asyncio
-import secrets
-from unittest.mock import Mock, AsyncMock, patch
+from unittest.mock import Mock, AsyncMock
 
 import pytest
-import cloudpickle
 
 from hyperscale.distributed.nodes.client.submission import ClientJobSubmitter
 from hyperscale.distributed.nodes.client.cancellation import ClientCancellationManager

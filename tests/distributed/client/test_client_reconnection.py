@@ -14,18 +14,13 @@ The Client Reconnection pattern ensures:
 - Current state is immediately available on reconnect
 """
 
-import asyncio
-import pytest
 import time
 
 from hyperscale.distributed.models import (
     RegisterCallback,
     RegisterCallbackResponse,
-    JobSubmission,
     JobProgress,
-    JobFinalResult,
     JobStatus,
-    JobStatusPush,
 )
 
 
