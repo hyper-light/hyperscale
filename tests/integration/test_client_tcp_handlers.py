@@ -33,6 +33,7 @@ from hyperscale.distributed_rewrite.nodes.client.handlers import (
     ManagerLeaderTransferHandler,
 )
 from hyperscale.distributed_rewrite.nodes.client.state import ClientState
+from hyperscale.distributed_rewrite.nodes.client.leadership import ClientLeadershipTracker
 from hyperscale.distributed_rewrite.models import (
     JobStatusPush,
     JobBatchPush,
@@ -358,9 +359,10 @@ class TestGateLeaderTransferHandler:
         job_id = "fence-job"
 
         # Establish current leader with token 10
-        state.update_gate_leader(job_id, ("gate-1", 9000), fence_token=10)
+        leadership = ClientLeadershipTracker(state, logger)
+        leadership.update_gate_leader(job_id, ("gate-1", 9000), fence_token=10)
 
-        handler = GateLeaderTransferHandler(state, logger, Mock())
+        handler = GateLeaderTransferHandler(state, logger, leadership)
 
         # Try transfer with older token
         transfer = GateJobLeaderTransfer(
@@ -441,14 +443,15 @@ class TestManagerLeaderTransferHandler:
         datacenter_id = "dc-west"
 
         # Establish current leader
-        state.update_manager_leader(
+        leadership = ClientLeadershipTracker(state, logger)
+        leadership.update_manager_leader(
             job_id,
             datacenter_id,
             ("manager-1", 7000),
             fence_token=10
         )
 
-        handler = ManagerLeaderTransferHandler(state, logger, Mock())
+        handler = ManagerLeaderTransferHandler(state, logger, leadership)
 
         # Try older token
         transfer = ManagerJobLeaderTransfer(
