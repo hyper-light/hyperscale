@@ -4,6 +4,7 @@ import tempfile
 from typing import AsyncGenerator
 
 import pytest
+from typing import Generator
 
 from hyperscale.logging.config.durability_mode import DurabilityMode
 from hyperscale.logging.models import Entry, LogLevel
@@ -18,7 +19,7 @@ def event_loop():
 
 
 @pytest.fixture
-def temp_log_directory() -> str:
+def temp_log_directory() -> Generator[str, None]:
     with tempfile.TemporaryDirectory() as temp_directory:
         yield temp_directory
 
