@@ -149,11 +149,12 @@ class GateLeadershipCoordinator:
         """
         # Check if we already have leadership with higher fence token
         current_token = self._leadership_tracker.get_fence_token(job_id)
+        node_id = self._get_node_id()
         if current_token and current_token >= fence_token:
             return JobLeadershipAck(
                 job_id=job_id,
                 accepted=False,
-                error="Higher fence token exists",
+                responder_id=node_id.full,
             )
 
         # Accept the leadership announcement
@@ -168,6 +169,7 @@ class GateLeadershipCoordinator:
         return JobLeadershipAck(
             job_id=job_id,
             accepted=True,
+            responder_id=node_id.full,
         )
 
     async def transfer_leadership(

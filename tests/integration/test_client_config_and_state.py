@@ -296,21 +296,33 @@ class TestClientState:
         """Test marking job as orphaned."""
         state = ClientState()
         job_id = "orphan-job"
-        orphan_info = {"reason": "Leader disappeared"}
+        orphan_info = OrphanedJobInfo(
+            job_id=job_id,
+            orphan_timestamp=time.time(),
+            last_known_gate=("gate-1", 9000),
+            last_known_manager=None,
+        )
 
         state.mark_job_orphaned(job_id, orphan_info)
 
         assert job_id in state._orphaned_jobs
         orphaned = state._orphaned_jobs[job_id]
-        assert orphaned.orphan_info == orphan_info
-        assert orphaned.orphaned_at > 0
+        assert orphaned.job_id == job_id
+        assert orphaned.orphan_timestamp > 0
+        assert orphaned.last_known_gate == ("gate-1", 9000)
 
     def test_clear_job_orphaned(self):
         """Test clearing orphan status."""
         state = ClientState()
         job_id = "orphan-clear-job"
 
-        state.mark_job_orphaned(job_id, {"reason": "test"})
+        orphan_info = OrphanedJobInfo(
+            job_id=job_id,
+            orphan_timestamp=time.time(),
+            last_known_gate=None,
+            last_known_manager=None,
+        )
+        state.mark_job_orphaned(job_id, orphan_info)
         assert job_id in state._orphaned_jobs
 
         state.clear_job_orphaned(job_id)
@@ -323,7 +335,13 @@ class TestClientState:
 
         assert state.is_job_orphaned(job_id) is False
 
-        state.mark_job_orphaned(job_id, {"reason": "test"})
+        orphan_info = OrphanedJobInfo(
+            job_id=job_id,
+            orphan_timestamp=time.time(),
+            last_known_gate=None,
+            last_known_manager=None,
+        )
+        state.mark_job_orphaned(job_id, orphan_info)
         assert state.is_job_orphaned(job_id) is True
 
     def test_increment_gate_transfers(self):
