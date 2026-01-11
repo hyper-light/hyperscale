@@ -81,8 +81,8 @@ class JobSuspicion:
             Seconds until expiration
         """
         # Timeout shrinks with confirmations (Lifeguard formula)
-        log_n = max(1, cluster_size).bit_length()
-        shrink_factor = max(1, log_n - self.confirmation_count)
+        # More confirmations = shorter timeout = faster failure declaration
+        shrink_factor = max(1, 1 + self.confirmation_count)
         effective_timeout = self.timeout_seconds / shrink_factor
 
         elapsed = time.monotonic() - self.started_at

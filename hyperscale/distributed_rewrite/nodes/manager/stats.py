@@ -115,13 +115,13 @@ class ManagerStatsCoordinator:
         Get expected dispatch throughput based on worker capacity.
 
         Returns:
-            Expected dispatches per second
+            Expected dispatches per second (0.0 if no workers)
         """
         # Simple calculation based on healthy worker count
         # Full implementation would consider actual capacity
         healthy_count = len(self._state._workers) - len(self._state._worker_unhealthy_since)
-        # Assume ~1 dispatch/sec per healthy worker as baseline
-        return float(max(healthy_count, 1))
+        # Return 0.0 if no workers (system is idle, not stuck)
+        return float(healthy_count)
 
     def get_progress_state(self) -> ProgressState:
         """
