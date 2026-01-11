@@ -1806,6 +1806,1171 @@ class ManagerServer(HealthAwareServer):
                 error=str(error),
             ).dump()
 
+    @tcp.receive()
+    async def gate_register(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ) -> bytes:
+        """Handle gate registration via TCP."""
+        try:
+            registration = GateRegistrationRequest.load(data)
+
+            # Cluster isolation validation (AD-28)
+            if registration.cluster_id != self._env.CLUSTER_ID:
+                return GateRegistrationResponse(
+                    accepted=False,
+                    manager_id=self._node_id.full,
+                    datacenter=self._node_id.datacenter,
+                    healthy_managers=[],
+                    error=f"Cluster isolation violation: gate cluster_id '{registration.cluster_id}' does not match",
+                    protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+                    protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+                ).dump()
+
+            if registration.environment_id != self._env.ENVIRONMENT_ID:
+                return GateRegistrationResponse(
+                    accepted=False,
+                    manager_id=self._node_id.full,
+                    datacenter=self._node_id.datacenter,
+                    healthy_managers=[],
+                    error="Environment isolation violation: gate environment_id mismatch",
+                    protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+                    protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+                ).dump()
+
+            # Protocol version validation (AD-25)
+            gate_version = ProtocolVersion(
+                registration.protocol_version_major,
+                registration.protocol_version_minor,
+            )
+            gate_caps_set = (
+                set(registration.capabilities.split(","))
+                if registration.capabilities
+                else set()
+            )
+            gate_caps = NodeCapabilities(
+                protocol_version=gate_version,
+                capabilities=gate_caps_set,
+            )
+            local_caps = NodeCapabilities.current()
+            negotiated = negotiate_capabilities(local_caps, gate_caps)
+
+            if not negotiated.compatible:
+                return GateRegistrationResponse(
+                    accepted=False,
+                    manager_id=self._node_id.full,
+                    datacenter=self._node_id.datacenter,
+                    healthy_managers=[],
+                    error=f"Incompatible protocol version: {gate_version}",
+                    protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+                    protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+                ).dump()
+
+            # Store gate info
+            gate_info = GateInfo(
+                node_id=registration.node_id,
+                tcp_host=registration.tcp_host,
+                tcp_port=registration.tcp_port,
+                udp_host=registration.udp_host,
+                udp_port=registration.udp_port,
+            )
+
+            self._registry.register_gate(gate_info)
+
+            # Track gate addresses
+            gate_tcp_addr = (registration.tcp_host, registration.tcp_port)
+            gate_udp_addr = (registration.udp_host, registration.udp_port)
+            self._manager_state._gate_udp_to_tcp[gate_udp_addr] = gate_tcp_addr
+
+            # Add to SWIM probing
+            self.add_unconfirmed_peer(gate_udp_addr)
+            self._probe_scheduler.add_member(gate_udp_addr)
+
+            # Store negotiated capabilities
+            self._manager_state._gate_negotiated_caps[registration.node_id] = negotiated
+
+            negotiated_caps_str = ",".join(sorted(negotiated.common_features))
+            return GateRegistrationResponse(
+                accepted=True,
+                manager_id=self._node_id.full,
+                datacenter=self._node_id.datacenter,
+                healthy_managers=self._get_healthy_managers(),
+                protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+                protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+                capabilities=negotiated_caps_str,
+            ).dump()
+
+        except Exception as error:
+            return GateRegistrationResponse(
+                accepted=False,
+                manager_id=self._node_id.full,
+                datacenter=self._node_id.datacenter,
+                healthy_managers=[],
+                error=str(error),
+                protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+                protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+            ).dump()
+
+    @tcp.receive()
+    async def worker_discovery(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ) -> bytes:
+        """Handle worker discovery broadcast from peer manager."""
+        try:
+            broadcast = WorkerDiscoveryBroadcast.load(data)
+
+            worker_id = broadcast.worker_id
+
+            # Skip if already registered
+            if worker_id in self._manager_state._workers:
+                return b'ok'
+
+            # Schedule direct registration with the worker
+            worker_tcp_addr = tuple(broadcast.worker_tcp_addr)
+            worker_udp_addr = tuple(broadcast.worker_udp_addr)
+
+            worker_snapshot = WorkerStateSnapshot(
+                node_id=worker_id,
+                host=worker_tcp_addr[0],
+                tcp_port=worker_tcp_addr[1],
+                udp_port=worker_udp_addr[1],
+                state=WorkerState.HEALTHY.value,
+                total_cores=broadcast.available_cores,
+                available_cores=broadcast.available_cores,
+                version=0,
+            )
+
+            self._task_runner.run(
+                self._register_with_discovered_worker,
+                worker_snapshot,
+            )
+
+            return b'ok'
+
+        except Exception as error:
+            await self._udp_logger.log(
+                ServerError(
+                    message=f"Worker discovery error: {error}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            return b'error'
+
+    @tcp.receive()
+    async def receive_worker_status_update(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ) -> bytes:
+        """Handle worker status update via TCP."""
+        try:
+            heartbeat = WorkerHeartbeat.load(data)
+
+            # Process heartbeat via WorkerPool
+            await self._worker_pool.process_heartbeat(heartbeat.node_id, heartbeat)
+
+            return b'ok'
+
+        except Exception as error:
+            await self._udp_logger.log(
+                ServerError(
+                    message=f"Worker status update error: {error}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            return b'error'
+
+    @tcp.receive()
+    async def worker_heartbeat(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ) -> bytes:
+        """Handle worker heartbeat via TCP."""
+        try:
+            heartbeat = WorkerHeartbeat.load(data)
+
+            # Process heartbeat via WorkerPool
+            await self._worker_pool.process_heartbeat(heartbeat.node_id, heartbeat)
+
+            # Trigger dispatch for active jobs
+            if self._workflow_dispatcher:
+                for job_id, submission in list(self._manager_state._job_submissions.items()):
+                    await self._workflow_dispatcher.try_dispatch(job_id, submission)
+
+            return b'ok'
+
+        except Exception as error:
+            await self._udp_logger.log(
+                ServerError(
+                    message=f"Worker heartbeat error: {error}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            return b'error'
+
+    @tcp.receive()
+    async def context_forward(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ) -> bytes:
+        """Handle context forwarded from non-leader manager."""
+        try:
+            forward = ContextForward.load(data)
+
+            # Verify we are the job leader
+            if not self._is_job_leader(forward.job_id):
+                return b'not_leader'
+
+            # Apply context updates
+            await self._apply_context_updates(
+                forward.job_id,
+                forward.workflow_id,
+                forward.context_updates,
+                forward.context_timestamps,
+            )
+
+            return b'ok'
+
+        except Exception as error:
+            await self._udp_logger.log(
+                ServerError(
+                    message=f"Context forward error: {error}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            return b'error'
+
+    @tcp.receive()
+    async def context_layer_sync(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ) -> bytes:
+        """Handle context layer sync from job leader."""
+        try:
+            sync = ContextLayerSync.load(data)
+
+            # Check if this is a newer layer version
+            current_version = self._manager_state._job_layer_version.get(sync.job_id, -1)
+            if sync.layer_version <= current_version:
+                return ContextLayerSyncAck(
+                    job_id=sync.job_id,
+                    layer_version=sync.layer_version,
+                    applied=False,
+                    responder_id=self._node_id.full,
+                ).dump()
+
+            # Apply context snapshot
+            context_dict = cloudpickle.loads(sync.context_snapshot)
+
+            if sync.job_id not in self._manager_state._job_contexts:
+                self._manager_state._job_contexts[sync.job_id] = Context()
+
+            context = self._manager_state._job_contexts[sync.job_id]
+            for workflow_name, values in context_dict.items():
+                await context.from_dict(workflow_name, values)
+
+            # Update layer version
+            self._manager_state._job_layer_version[sync.job_id] = sync.layer_version
+
+            # Update job leader if not set
+            if sync.job_id not in self._manager_state._job_leaders:
+                self._manager_state._job_leaders[sync.job_id] = sync.source_node_id
+
+            return ContextLayerSyncAck(
+                job_id=sync.job_id,
+                layer_version=sync.layer_version,
+                applied=True,
+                responder_id=self._node_id.full,
+            ).dump()
+
+        except Exception:
+            return ContextLayerSyncAck(
+                job_id="unknown",
+                layer_version=-1,
+                applied=False,
+                responder_id=self._node_id.full,
+            ).dump()
+
+    @tcp.receive()
+    async def job_submission(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ) -> bytes:
+        """Handle job submission from gate or client."""
+        try:
+            # Rate limit check (AD-24)
+            client_id = f"{addr[0]}:{addr[1]}"
+            allowed, retry_after = self._rate_limiter.check_rate_limit(client_id, "job_submit")
+            if not allowed:
+                return RateLimitResponse(
+                    operation="job_submit",
+                    retry_after_seconds=retry_after,
+                ).dump()
+
+            # Load shedding check (AD-22)
+            if self._load_shedder.should_shed("JobSubmission"):
+                overload_state = self._load_shedder.get_current_state()
+                return JobAck(
+                    job_id="",
+                    accepted=False,
+                    error=f"System under load ({overload_state.value}), please retry later",
+                    protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+                    protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+                ).dump()
+
+            submission = JobSubmission.load(data)
+
+            # Protocol version negotiation (AD-25)
+            client_version = ProtocolVersion(
+                major=getattr(submission, 'protocol_version_major', 1),
+                minor=getattr(submission, 'protocol_version_minor', 0),
+            )
+
+            if client_version.major != CURRENT_PROTOCOL_VERSION.major:
+                return JobAck(
+                    job_id=submission.job_id,
+                    accepted=False,
+                    error=f"Incompatible protocol version: {client_version}",
+                    protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+                    protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+                ).dump()
+
+            # Negotiate capabilities
+            client_caps_str = getattr(submission, 'capabilities', '')
+            client_features = set(client_caps_str.split(',')) if client_caps_str else set()
+            our_features = get_features_for_version(CURRENT_PROTOCOL_VERSION)
+            negotiated_features = client_features & our_features
+            negotiated_caps_str = ','.join(sorted(negotiated_features))
+
+            # Unpickle workflows
+            workflows: list[tuple[str, list[str], Workflow]] = restricted_loads(submission.workflows)
+
+            # Only active managers accept jobs
+            if self._manager_state._manager_state != ManagerStateEnum.ACTIVE:
+                return JobAck(
+                    job_id=submission.job_id,
+                    accepted=False,
+                    error=f"Manager is {self._manager_state._manager_state.value}, not accepting jobs",
+                ).dump()
+
+            # Create job using JobManager
+            callback_addr = None
+            if submission.callback_addr:
+                callback_addr = tuple(submission.callback_addr) if isinstance(submission.callback_addr, list) else submission.callback_addr
+
+            job_info = await self._job_manager.create_job(
+                submission=submission,
+                callback_addr=callback_addr,
+            )
+
+            job_info.leader_node_id = self._node_id.full
+            job_info.leader_addr = (self._host, self._tcp_port)
+            job_info.fencing_token = 1
+
+            # Store submission for dispatch
+            self._manager_state._job_submissions[submission.job_id] = submission
+
+            # Start timeout tracking (AD-34)
+            timeout_strategy = self._select_timeout_strategy(submission)
+            await timeout_strategy.start_tracking(
+                job_id=submission.job_id,
+                timeout_seconds=submission.timeout_seconds,
+                gate_addr=tuple(submission.gate_addr) if submission.gate_addr else None,
+            )
+            self._manager_state._job_timeout_strategies[submission.job_id] = timeout_strategy
+
+            # Set job leadership
+            self._manager_state._job_leaders[submission.job_id] = self._node_id.full
+            self._manager_state._job_leader_addrs[submission.job_id] = (self._host, self._tcp_port)
+            self._manager_state._job_fencing_tokens[submission.job_id] = 1
+            self._manager_state._job_layer_version[submission.job_id] = 0
+            self._manager_state._job_contexts[submission.job_id] = Context()
+
+            # Store callbacks
+            if submission.callback_addr:
+                self._manager_state._job_callbacks[submission.job_id] = submission.callback_addr
+                self._manager_state._progress_callbacks[submission.job_id] = submission.callback_addr
+
+            if submission.origin_gate_addr:
+                self._manager_state._job_origin_gates[submission.job_id] = submission.origin_gate_addr
+
+            self._manager_state.increment_state_version()
+
+            # Broadcast job leadership to peers
+            workflow_names = [wf.name for _, _, wf in workflows]
+            await self._broadcast_job_leadership(
+                submission.job_id,
+                len(workflows),
+                workflow_names,
+            )
+
+            # Dispatch workflows
+            await self._dispatch_job_workflows(submission, workflows)
+
+            return JobAck(
+                job_id=submission.job_id,
+                accepted=True,
+                queued_position=self._job_manager.job_count,
+                protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+                protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+                capabilities=negotiated_caps_str,
+            ).dump()
+
+        except Exception as error:
+            await self._udp_logger.log(
+                ServerError(
+                    message=f"Job submission error: {error}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            return JobAck(
+                job_id="unknown",
+                accepted=False,
+                error=str(error),
+            ).dump()
+
+    @tcp.receive()
+    async def job_global_timeout(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ) -> bytes:
+        """Handle global timeout decision from gate (AD-34)."""
+        try:
+            timeout_msg = JobGlobalTimeout.load(data)
+
+            strategy = self._manager_state._job_timeout_strategies.get(timeout_msg.job_id)
+            if not strategy:
+                return b''
+
+            accepted = await strategy.handle_global_timeout(
+                timeout_msg.job_id,
+                timeout_msg.reason,
+                timeout_msg.fence_token,
+            )
+
+            if accepted:
+                self._manager_state._job_timeout_strategies.pop(timeout_msg.job_id, None)
+                await self._udp_logger.log(
+                    ServerInfo(
+                        message=f"Job {timeout_msg.job_id} globally timed out: {timeout_msg.reason}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+
+            return b''
+
+        except Exception as error:
+            await self._udp_logger.log(
+                ServerError(
+                    message=f"Job global timeout error: {error}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            return b''
+
+    @tcp.receive()
+    async def provision_request(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ) -> bytes:
+        """Handle provision request from leader for quorum."""
+        try:
+            request = ProvisionRequest.load(data)
+
+            # Check if we can confirm
+            worker = self._worker_pool.get_worker(request.target_worker)
+            can_confirm = (
+                worker is not None and
+                self._worker_pool.is_worker_healthy(request.target_worker) and
+                (worker.available_cores - worker.reserved_cores) >= request.cores_required
+            )
+
+            return ProvisionConfirm(
+                job_id=request.job_id,
+                workflow_id=request.workflow_id,
+                confirming_node=self._node_id.full,
+                confirmed=can_confirm,
+                version=self._manager_state._state_version,
+                error=None if can_confirm else "Worker not available",
+            ).dump()
+
+        except Exception as error:
+            return ProvisionConfirm(
+                job_id="unknown",
+                workflow_id="unknown",
+                confirming_node=self._node_id.full,
+                confirmed=False,
+                version=self._manager_state._state_version,
+                error=str(error),
+            ).dump()
+
+    @tcp.receive()
+    async def provision_commit(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ) -> bytes:
+        """Handle provision commit from leader."""
+        try:
+            ProvisionCommit.load(data)  # Validate message format
+            self._manager_state.increment_state_version()
+            return b'ok'
+
+        except Exception as error:
+            await self._udp_logger.log(
+                ServerError(
+                    message=f"Provision commit error: {error}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            return b'error'
+
+    @tcp.receive()
+    async def workflow_cancellation_query(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ) -> bytes:
+        """Handle workflow cancellation query from worker."""
+        try:
+            query = WorkflowCancellationQuery.load(data)
+
+            job = self._job_manager.get_job(query.job_id)
+            if not job:
+                return WorkflowCancellationResponse(
+                    job_id=query.job_id,
+                    workflow_id=query.workflow_id,
+                    workflow_name="",
+                    status="UNKNOWN",
+                    error="Job not found",
+                ).dump()
+
+            # Check job-level cancellation
+            if job.status == JobStatus.CANCELLED.value:
+                return WorkflowCancellationResponse(
+                    job_id=query.job_id,
+                    workflow_id=query.workflow_id,
+                    workflow_name="",
+                    status="CANCELLED",
+                ).dump()
+
+            # Check specific workflow status
+            for sub_wf in job.sub_workflows.values():
+                if str(sub_wf.token) == query.workflow_id:
+                    workflow_name = ""
+                    status = WorkflowStatus.RUNNING.value
+                    if sub_wf.progress is not None:
+                        workflow_name = sub_wf.progress.workflow_name
+                        status = sub_wf.progress.status
+                    return WorkflowCancellationResponse(
+                        job_id=query.job_id,
+                        workflow_id=query.workflow_id,
+                        workflow_name=workflow_name,
+                        status=status,
+                    ).dump()
+
+            return WorkflowCancellationResponse(
+                job_id=query.job_id,
+                workflow_id=query.workflow_id,
+                workflow_name="",
+                status="UNKNOWN",
+                error="Workflow not found",
+            ).dump()
+
+        except Exception as error:
+            return WorkflowCancellationResponse(
+                job_id="unknown",
+                workflow_id="unknown",
+                workflow_name="",
+                status="ERROR",
+                error=str(error),
+            ).dump()
+
+    @tcp.receive()
+    async def receive_cancel_single_workflow(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ) -> bytes:
+        """Handle single workflow cancellation request."""
+        try:
+            request = SingleWorkflowCancelRequest.load(data)
+
+            # Rate limit check
+            client_id = f"{addr[0]}:{addr[1]}"
+            allowed, retry_after = self._rate_limiter.check_rate_limit(client_id, "cancel_workflow")
+            if not allowed:
+                return RateLimitResponse(
+                    operation="cancel_workflow",
+                    retry_after_seconds=retry_after,
+                ).dump()
+
+            # Check if already cancelled
+            if request.workflow_id in self._manager_state._cancelled_workflows:
+                existing = self._manager_state._cancelled_workflows[request.workflow_id]
+                return SingleWorkflowCancelResponse(
+                    job_id=request.job_id,
+                    workflow_id=request.workflow_id,
+                    request_id=request.request_id,
+                    status=WorkflowCancellationStatus.ALREADY_CANCELLED.value,
+                    cancelled_dependents=existing.dependents,
+                    datacenter=self._node_id.datacenter,
+                ).dump()
+
+            job = self._job_manager.get_job(request.job_id)
+            if not job:
+                return SingleWorkflowCancelResponse(
+                    job_id=request.job_id,
+                    workflow_id=request.workflow_id,
+                    request_id=request.request_id,
+                    status=WorkflowCancellationStatus.NOT_FOUND.value,
+                    errors=["Job not found"],
+                    datacenter=self._node_id.datacenter,
+                ).dump()
+
+            # Add to cancelled workflows
+            self._manager_state._cancelled_workflows[request.workflow_id] = CancelledWorkflowInfo(
+                job_id=request.job_id,
+                workflow_id=request.workflow_id,
+                cancelled_at=time.monotonic(),
+                request_id=request.request_id,
+                dependents=[],
+            )
+
+            return SingleWorkflowCancelResponse(
+                job_id=request.job_id,
+                workflow_id=request.workflow_id,
+                request_id=request.request_id,
+                status=WorkflowCancellationStatus.CANCELLED.value,
+                datacenter=self._node_id.datacenter,
+            ).dump()
+
+        except Exception as error:
+            return SingleWorkflowCancelResponse(
+                job_id="unknown",
+                workflow_id="unknown",
+                request_id="unknown",
+                status=WorkflowCancellationStatus.NOT_FOUND.value,
+                errors=[str(error)],
+                datacenter=self._node_id.datacenter,
+            ).dump()
+
+    @tcp.receive()
+    async def receive_workflow_cancellation_peer_notification(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ) -> bytes:
+        """Handle workflow cancellation peer notification."""
+        try:
+            notification = WorkflowCancellationPeerNotification.load(data)
+
+            # Add all cancelled workflows to our bucket
+            for wf_id in notification.cancelled_workflows:
+                if wf_id not in self._manager_state._cancelled_workflows:
+                    self._manager_state._cancelled_workflows[wf_id] = CancelledWorkflowInfo(
+                        job_id=notification.job_id,
+                        workflow_id=wf_id,
+                        cancelled_at=notification.timestamp or time.monotonic(),
+                        request_id=notification.request_id,
+                        dependents=[],
+                    )
+
+            return b"OK"
+
+        except Exception as error:
+            await self._udp_logger.log(
+                ServerError(
+                    message=f"Workflow cancellation peer notification error: {error}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            return b"ERROR"
+
+    @tcp.receive()
+    async def job_leadership_announcement(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ) -> bytes:
+        """Handle job leadership announcement from another manager."""
+        try:
+            announcement = JobLeadershipAnnouncement.load(data)
+
+            # Don't accept if we're already the leader
+            if self._is_job_leader(announcement.job_id):
+                return JobLeadershipAck(
+                    job_id=announcement.job_id,
+                    accepted=False,
+                    responder_id=self._node_id.full,
+                ).dump()
+
+            # Record job leadership
+            self._manager_state._job_leaders[announcement.job_id] = announcement.leader_id
+            self._manager_state._job_leader_addrs[announcement.job_id] = (
+                announcement.leader_host,
+                announcement.leader_tcp_port,
+            )
+
+            # Initialize context for this job
+            if announcement.job_id not in self._manager_state._job_contexts:
+                self._manager_state._job_contexts[announcement.job_id] = Context()
+
+            if announcement.job_id not in self._manager_state._job_layer_version:
+                self._manager_state._job_layer_version[announcement.job_id] = 0
+
+            # Track remote job
+            await self._job_manager.track_remote_job(
+                job_id=announcement.job_id,
+                leader_node_id=announcement.leader_id,
+                leader_addr=(announcement.leader_host, announcement.leader_tcp_port),
+            )
+
+            return JobLeadershipAck(
+                job_id=announcement.job_id,
+                accepted=True,
+                responder_id=self._node_id.full,
+            ).dump()
+
+        except Exception as error:
+            await self._udp_logger.log(
+                ServerError(
+                    message=f"Job leadership announcement error: {error}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            return b'error'
+
+    @tcp.receive()
+    async def job_state_sync(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ) -> bytes:
+        """Handle job state sync from job leader."""
+        try:
+            sync_msg = JobStateSyncMessage.load(data)
+
+            # Only accept from actual job leader
+            current_leader = self._manager_state._job_leaders.get(sync_msg.job_id)
+            if current_leader and current_leader != sync_msg.leader_id:
+                return JobStateSyncAck(
+                    job_id=sync_msg.job_id,
+                    responder_id=self._node_id.full,
+                    accepted=False,
+                ).dump()
+
+            # Update job state tracking
+            job = self._job_manager.get_job(sync_msg.job_id)
+            if job:
+                job.status = sync_msg.status
+                job.workflows_total = sync_msg.workflows_total
+                job.workflows_completed = sync_msg.workflows_completed
+                job.workflows_failed = sync_msg.workflows_failed
+                job.timestamp = time.monotonic()
+
+            # Update fencing token
+            current_token = self._manager_state._job_fencing_tokens.get(sync_msg.job_id, 0)
+            if sync_msg.fencing_token > current_token:
+                self._manager_state._job_fencing_tokens[sync_msg.job_id] = sync_msg.fencing_token
+
+            # Update origin gate
+            if sync_msg.origin_gate_addr:
+                self._manager_state._job_origin_gates[sync_msg.job_id] = sync_msg.origin_gate_addr
+
+            return JobStateSyncAck(
+                job_id=sync_msg.job_id,
+                responder_id=self._node_id.full,
+                accepted=True,
+            ).dump()
+
+        except Exception as error:
+            await self._udp_logger.log(
+                ServerError(
+                    message=f"Job state sync error: {error}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            return b'error'
+
+    @tcp.receive()
+    async def job_leader_gate_transfer(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ) -> bytes:
+        """Handle job leader gate transfer notification from gate."""
+        try:
+            transfer = JobLeaderGateTransfer.load(data)
+
+            # Use fence token for consistency
+            current_fence = self._manager_state._job_fencing_tokens.get(transfer.job_id, 0)
+            if transfer.fence_token < current_fence:
+                return JobLeaderGateTransferAck(
+                    job_id=transfer.job_id,
+                    manager_id=self._node_id.full,
+                    accepted=False,
+                ).dump()
+
+            # Update origin gate
+            self._manager_state._job_origin_gates[transfer.job_id] = transfer.new_gate_addr
+
+            if transfer.fence_token > current_fence:
+                self._manager_state._job_fencing_tokens[transfer.job_id] = transfer.fence_token
+
+            await self._udp_logger.log(
+                ServerInfo(
+                    message=f"Job {transfer.job_id} leader gate transferred: {transfer.old_gate_id} -> {transfer.new_gate_id}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+
+            return JobLeaderGateTransferAck(
+                job_id=transfer.job_id,
+                manager_id=self._node_id.full,
+                accepted=True,
+            ).dump()
+
+        except Exception as error:
+            await self._udp_logger.log(
+                ServerError(
+                    message=f"Job leader gate transfer error: {error}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            return b'error'
+
+    @tcp.receive()
+    async def register_callback(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ) -> bytes:
+        """Handle client callback registration for job reconnection."""
+        try:
+            # Rate limit check
+            client_id = f"{addr[0]}:{addr[1]}"
+            allowed, retry_after = self._rate_limiter.check_rate_limit(client_id, "reconnect")
+            if not allowed:
+                return RateLimitResponse(
+                    operation="reconnect",
+                    retry_after_seconds=retry_after,
+                ).dump()
+
+            request = RegisterCallback.load(data)
+            job_id = request.job_id
+
+            job = self._job_manager.get_job(job_id)
+            if not job:
+                return RegisterCallbackResponse(
+                    job_id=job_id,
+                    success=False,
+                    error="Job not found",
+                ).dump()
+
+            # Register callback
+            self._manager_state._job_callbacks[job_id] = request.callback_addr
+            self._manager_state._progress_callbacks[job_id] = request.callback_addr
+
+            # Calculate elapsed time
+            elapsed = time.monotonic() - job.timestamp if job.timestamp > 0 else 0.0
+
+            # Count completed/failed
+            total_completed = 0
+            total_failed = 0
+            for wf in job.workflows.values():
+                total_completed += wf.completed_count
+                total_failed += wf.failed_count
+
+            return RegisterCallbackResponse(
+                job_id=job_id,
+                success=True,
+                status=job.status.value,
+                total_completed=total_completed,
+                total_failed=total_failed,
+                elapsed_seconds=elapsed,
+            ).dump()
+
+        except Exception as error:
+            await self._udp_logger.log(
+                ServerError(
+                    message=f"Register callback error: {error}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            return b'error'
+
+    @tcp.receive()
+    async def workflow_query(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ) -> bytes:
+        """Handle workflow status query from client."""
+        try:
+            # Rate limit check
+            client_id = f"{addr[0]}:{addr[1]}"
+            allowed, retry_after = self._rate_limiter.check_rate_limit(client_id, "workflow_query")
+            if not allowed:
+                return RateLimitResponse(
+                    operation="workflow_query",
+                    retry_after_seconds=retry_after,
+                ).dump()
+
+            request = WorkflowQueryRequest.load(data)
+            workflows: list[WorkflowStatusInfo] = []
+
+            job = self._job_manager.get_job(request.job_id)
+            if job is None:
+                return WorkflowQueryResponse(
+                    request_id=request.request_id,
+                    manager_id=self._node_id.full,
+                    datacenter=self._node_id.datacenter,
+                    workflows=workflows,
+                ).dump()
+
+            # Find matching workflows
+            for wf_info in job.workflows.values():
+                if wf_info.name in request.workflow_names:
+                    workflow_id = wf_info.token.workflow_id or ""
+                    status = wf_info.status.value
+                    is_enqueued = wf_info.status == WorkflowStatus.PENDING
+
+                    # Aggregate from sub-workflows
+                    assigned_workers: list[str] = []
+                    provisioned_cores = 0
+                    completed_count = 0
+                    failed_count = 0
+                    rate_per_second = 0.0
+
+                    for sub_token_str in wf_info.sub_workflow_tokens:
+                        sub_info = job.sub_workflows.get(sub_token_str)
+                        if sub_info:
+                            if sub_info.worker_id:
+                                assigned_workers.append(sub_info.worker_id)
+                            provisioned_cores += sub_info.cores_allocated
+                            if sub_info.progress:
+                                completed_count += sub_info.progress.completed_count
+                                failed_count += sub_info.progress.failed_count
+                                rate_per_second += sub_info.progress.rate_per_second
+
+                    workflows.append(WorkflowStatusInfo(
+                        workflow_id=workflow_id,
+                        workflow_name=wf_info.name,
+                        status=status,
+                        is_enqueued=is_enqueued,
+                        queue_position=0,
+                        provisioned_cores=provisioned_cores,
+                        completed_count=completed_count,
+                        failed_count=failed_count,
+                        rate_per_second=rate_per_second,
+                        assigned_workers=assigned_workers,
+                    ))
+
+            return WorkflowQueryResponse(
+                request_id=request.request_id,
+                manager_id=self._node_id.full,
+                datacenter=self._node_id.datacenter,
+                workflows=workflows,
+            ).dump()
+
+        except Exception as error:
+            await self._udp_logger.log(
+                ServerError(
+                    message=f"Workflow query error: {error}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            return b'error'
+
+    # =========================================================================
+    # Helper Methods - Job Submission
+    # =========================================================================
+
+    def _select_timeout_strategy(self, submission: JobSubmission) -> TimeoutStrategy:
+        """Select appropriate timeout strategy based on submission."""
+        if submission.gate_addr:
+            return GateCoordinatedTimeout(
+                send_tcp=self._send_to_peer,
+                logger=self._udp_logger,
+                node_id=self._node_id.short,
+                task_runner=self._task_runner,
+            )
+        return LocalAuthorityTimeout(
+            cancel_job=self._cancellation.cancel_job,
+            logger=self._udp_logger,
+            node_id=self._node_id.short,
+            task_runner=self._task_runner,
+        )
+
+    async def _broadcast_job_leadership(
+        self,
+        job_id: str,
+        workflow_count: int,
+        workflow_names: list[str],
+    ) -> None:
+        """Broadcast job leadership to peer managers."""
+        announcement = JobLeadershipAnnouncement(
+            job_id=job_id,
+            leader_id=self._node_id.full,
+            leader_host=self._host,
+            leader_tcp_port=self._tcp_port,
+            workflow_count=workflow_count,
+            workflow_names=workflow_names,
+        )
+
+        for peer_addr in self._manager_state._active_manager_peers:
+            try:
+                await self.send_tcp(
+                    peer_addr,
+                    "job_leadership_announcement",
+                    announcement.dump(),
+                    timeout=2.0,
+                )
+            except Exception:
+                pass
+
+    async def _dispatch_job_workflows(
+        self,
+        submission: JobSubmission,
+        workflows: list[tuple[str, list[str], Workflow]],
+    ) -> None:
+        """Dispatch workflows respecting dependencies."""
+        if self._workflow_dispatcher:
+            registered = await self._workflow_dispatcher.register_workflows(
+                submission,
+                workflows,
+            )
+            if registered:
+                await self._workflow_dispatcher.start_job_dispatch(
+                    submission.job_id, submission
+                )
+                await self._workflow_dispatcher.try_dispatch(
+                    submission.job_id, submission
+                )
+
+        job = self._job_manager.get_job(submission.job_id)
+        if job:
+            job.status = JobStatus.RUNNING.value
+            self._manager_state.increment_state_version()
+
+    async def _register_with_discovered_worker(
+        self,
+        worker_snapshot: WorkerStateSnapshot,
+    ) -> None:
+        """Register with a discovered worker."""
+        # Implementation: Contact worker directly to complete registration
+        pass
+
+    def _is_job_leader(self, job_id: str) -> bool:
+        """Check if this manager is the leader for a job."""
+        leader_id = self._manager_state._job_leaders.get(job_id)
+        return leader_id == self._node_id.full
+
+    async def _apply_context_updates(
+        self,
+        job_id: str,
+        workflow_id: str,
+        updates_bytes: bytes,
+        timestamps_bytes: bytes,
+    ) -> None:
+        """Apply context updates from workflow completion."""
+        context = self._manager_state._job_contexts.get(job_id)
+        if not context:
+            context = Context()
+            self._manager_state._job_contexts[job_id] = context
+
+        updates = cloudpickle.loads(updates_bytes)
+        timestamps = cloudpickle.loads(timestamps_bytes) if timestamps_bytes else {}
+
+        for key, value in updates.items():
+            timestamp = timestamps.get(key, self._manager_state.increment_context_lamport_clock())
+            await context.update(
+                workflow_id,
+                key,
+                value,
+                timestamp=timestamp,
+                source_node=self._node_id.full,
+            )
+
+    def _get_healthy_managers(self) -> list[ManagerInfo]:
+        """Get list of healthy managers including self."""
+        managers = [
+            ManagerInfo(
+                node_id=self._node_id.full,
+                tcp_host=self._host,
+                tcp_port=self._tcp_port,
+                udp_host=self._host,
+                udp_port=self._udp_port,
+                datacenter=self._node_id.datacenter,
+                is_leader=self.is_leader(),
+            )
+        ]
+
+        for peer_id in self._manager_state._active_manager_peer_ids:
+            peer_info = self._manager_state._known_manager_peers.get(peer_id)
+            if peer_info:
+                managers.append(peer_info)
+
+        return managers
+
     # =========================================================================
     # Job Completion
     # =========================================================================

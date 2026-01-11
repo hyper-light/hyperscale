@@ -1059,11 +1059,17 @@ class WorkerServer(HealthAwareServer):
         active_ids = list(self._active_workflows.keys())
         return ",".join(active_ids).encode("utf-8")
 
-    @tcp.receive()
-    async def manager_to_worker_registration(
+    @tcp.handle('manager_register')
+    async def handle_manager_register(
         self, addr: tuple[str, int], data: bytes, clock_time: int
     ) -> bytes:
-        """Handle bidirectional registration from manager."""
+        """
+        Handle registration request from a manager.
+
+        This enables bidirectional registration: managers can proactively
+        register with workers they discover via state sync from peer managers.
+        This speeds up cluster formation.
+        """
         return self._registration_handler.process_manager_registration(
             data=data,
             node_id_full=self._node_id.full,
@@ -1072,6 +1078,38 @@ class WorkerServer(HealthAwareServer):
             add_unconfirmed_peer=self.add_unconfirmed_peer,
             add_to_probe_scheduler=self.add_to_probe_scheduler,
         )
+
+    @tcp.handle('worker_register')
+    async def handle_worker_register(
+        self, addr: tuple[str, int], data: bytes, clock_time: int
+    ) -> bytes:
+        """
+        Handle registration response from manager - populate known managers.
+
+        This handler processes RegistrationResponse when managers push registration
+        acknowledgments to workers.
+        """
+        accepted, primary_manager_id = self._registration_handler.process_registration_response(
+            data=data,
+            node_host=self._host,
+            node_port=self._tcp_port,
+            node_id_short=self._node_id.short,
+            add_unconfirmed_peer=self.add_unconfirmed_peer,
+            add_to_probe_scheduler=self.add_to_probe_scheduler,
+        )
+
+        if accepted and primary_manager_id:
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerInfo(
+                    message=f"Registration accepted, primary manager: {primary_manager_id[:8]}...",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+
+        return data
 
 
 __all__ = ["WorkerServer"]
