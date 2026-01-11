@@ -26,6 +26,19 @@ from hyperscale.distributed_rewrite.nodes.client.tracking import ClientJobTracke
 from hyperscale.distributed_rewrite.nodes.client.config import ClientConfig
 from hyperscale.distributed_rewrite.nodes.client.state import ClientState
 from hyperscale.distributed_rewrite.protocol.version import ProtocolVersion
+from hyperscale.distributed_rewrite.models import (
+    ClientJobResult,
+    GateLeaderInfo,
+    ManagerLeaderInfo,
+    JobStatus,
+)
+
+
+def make_mock_logger():
+    """Create a mock logger for testing."""
+    logger = Mock()
+    logger.log = AsyncMock()
+    return logger
 
 
 class TestClientTargetSelector:
@@ -163,7 +176,7 @@ class TestClientTargetSelector:
         assert len(targets) == 2
 
     def test_edge_case_no_managers(self):
-        """Test with no managers configured."""
+        """Test with no managers configured - returns None."""
         config = ClientConfig(
             host="localhost",
             tcp_port=8000,
@@ -174,11 +187,12 @@ class TestClientTargetSelector:
         state = ClientState()
         selector = ClientTargetSelector(config, state)
 
-        with pytest.raises(RuntimeError, match="No managers configured"):
-            selector.get_next_manager()
+        # Should return None, not raise
+        result = selector.get_next_manager()
+        assert result is None
 
     def test_edge_case_no_gates(self):
-        """Test with no gates configured."""
+        """Test with no gates configured - returns None."""
         config = ClientConfig(
             host="localhost",
             tcp_port=8000,
@@ -189,8 +203,9 @@ class TestClientTargetSelector:
         state = ClientState()
         selector = ClientTargetSelector(config, state)
 
-        with pytest.raises(RuntimeError, match="No gates configured"):
-            selector.get_next_gate()
+        # Should return None, not raise
+        result = selector.get_next_gate()
+        assert result is None
 
     def test_edge_case_single_manager(self):
         """Test with single manager (always returns same)."""
@@ -237,14 +252,17 @@ class TestClientProtocol:
     def test_happy_path_instantiation(self):
         """Test normal protocol initialization."""
         state = ClientState()
-        protocol = ClientProtocol(state)
+        logger = make_mock_logger()
+        protocol = ClientProtocol(state, logger)
 
         assert protocol._state == state
+        assert protocol._logger == logger
 
     def test_get_client_capabilities_string(self):
         """Test client capabilities string generation."""
         state = ClientState()
-        protocol = ClientProtocol(state)
+        logger = make_mock_logger()
+        protocol = ClientProtocol(state, logger)
 
         capabilities = protocol.get_client_capabilities_string()
 
@@ -255,7 +273,8 @@ class TestClientProtocol:
     def test_negotiate_capabilities_compatible(self):
         """Test capability negotiation with compatible server."""
         state = ClientState()
-        protocol = ClientProtocol(state)
+        logger = make_mock_logger()
+        protocol = ClientProtocol(state, logger)
 
         server_addr = ("server1", 8000)
         result = protocol.negotiate_capabilities(
@@ -268,13 +287,15 @@ class TestClientProtocol:
         # Should store negotiated capabilities
         assert server_addr in state._server_negotiated_caps
         caps = state._server_negotiated_caps[server_addr]
-        assert caps.server_version_major == 1
-        assert caps.server_version_minor == 0
+        # NegotiatedCapabilities stores ProtocolVersion objects
+        assert caps.remote_version.major == 1
+        assert caps.remote_version.minor == 0
 
     def test_negotiate_capabilities_multiple_servers(self):
         """Test negotiating with multiple servers."""
         state = ClientState()
-        protocol = ClientProtocol(state)
+        logger = make_mock_logger()
+        protocol = ClientProtocol(state, logger)
 
         server1 = ("server1", 8000)
         server2 = ("server2", 8001)
@@ -289,7 +310,8 @@ class TestClientProtocol:
     def test_edge_case_empty_capabilities(self):
         """Test with empty capabilities string."""
         state = ClientState()
-        protocol = ClientProtocol(state)
+        logger = make_mock_logger()
+        protocol = ClientProtocol(state, logger)
 
         server_addr = ("server", 8000)
         protocol.negotiate_capabilities(
@@ -304,7 +326,8 @@ class TestClientProtocol:
     def test_edge_case_version_mismatch(self):
         """Test with server version mismatch."""
         state = ClientState()
-        protocol = ClientProtocol(state)
+        logger = make_mock_logger()
+        protocol = ClientProtocol(state, logger)
 
         server_addr = ("old-server", 8000)
         # Old server version
@@ -325,14 +348,17 @@ class TestClientLeadershipTracker:
     def test_happy_path_instantiation(self):
         """Test normal leadership tracker creation."""
         state = ClientState()
-        tracker = ClientLeadershipTracker(state)
+        logger = make_mock_logger()
+        tracker = ClientLeadershipTracker(state, logger)
 
         assert tracker._state == state
+        assert tracker._logger == logger
 
     def test_validate_gate_fence_token_valid(self):
         """Test valid gate fence token."""
         state = ClientState()
-        tracker = ClientLeadershipTracker(state)
+        logger = make_mock_logger()
+        tracker = ClientLeadershipTracker(state, logger)
 
         job_id = "job-123"
         # First update
@@ -347,7 +373,8 @@ class TestClientLeadershipTracker:
     def test_validate_gate_fence_token_stale(self):
         """Test stale gate fence token."""
         state = ClientState()
-        tracker = ClientLeadershipTracker(state)
+        logger = make_mock_logger()
+        tracker = ClientLeadershipTracker(state, logger)
 
         job_id = "job-456"
         tracker.update_gate_leader(job_id, ("gate1", 9000), fence_token=5)
@@ -361,7 +388,8 @@ class TestClientLeadershipTracker:
     def test_validate_gate_fence_token_no_current_leader(self):
         """Test fence token validation with no current leader."""
         state = ClientState()
-        tracker = ClientLeadershipTracker(state)
+        logger = make_mock_logger()
+        tracker = ClientLeadershipTracker(state, logger)
 
         # No leader yet
         valid, msg = tracker.validate_gate_fence_token("new-job", new_fence_token=1)
@@ -372,28 +400,30 @@ class TestClientLeadershipTracker:
     def test_update_gate_leader(self):
         """Test updating gate leader."""
         state = ClientState()
-        tracker = ClientLeadershipTracker(state)
+        logger = make_mock_logger()
+        tracker = ClientLeadershipTracker(state, logger)
 
         job_id = "gate-leader-job"
-        leader_info = ("gate1", 9000)
+        gate_addr = ("gate1", 9000)
 
-        tracker.update_gate_leader(job_id, leader_info, fence_token=1)
+        tracker.update_gate_leader(job_id, gate_addr, fence_token=1)
 
         assert job_id in state._gate_job_leaders
         tracking = state._gate_job_leaders[job_id]
-        assert tracking.leader_info == leader_info
+        assert tracking.gate_addr == gate_addr
 
     def test_update_manager_leader(self):
         """Test updating manager leader."""
         state = ClientState()
-        tracker = ClientLeadershipTracker(state)
+        logger = make_mock_logger()
+        tracker = ClientLeadershipTracker(state, logger)
 
         job_id = "mgr-leader-job"
         datacenter_id = "dc-east"
-        leader_info = ("manager1", 7000)
+        manager_addr = ("manager1", 7000)
 
         tracker.update_manager_leader(
-            job_id, datacenter_id, leader_info, fence_token=1
+            job_id, datacenter_id, manager_addr, fence_token=1
         )
 
         key = (job_id, datacenter_id)
@@ -402,23 +432,32 @@ class TestClientLeadershipTracker:
     def test_mark_job_orphaned(self):
         """Test marking job as orphaned."""
         state = ClientState()
-        tracker = ClientLeadershipTracker(state)
+        logger = make_mock_logger()
+        tracker = ClientLeadershipTracker(state, logger)
 
         job_id = "orphan-job"
-        orphan_info = {"reason": "Leader disappeared"}
 
-        tracker.mark_job_orphaned(job_id, orphan_info)
+        tracker.mark_job_orphaned(
+            job_id,
+            last_known_gate=("gate1", 9000),
+            last_known_manager=None,
+        )
 
         assert state.is_job_orphaned(job_id) is True
 
     def test_clear_job_orphaned(self):
         """Test clearing orphan status."""
         state = ClientState()
-        tracker = ClientLeadershipTracker(state)
+        logger = make_mock_logger()
+        tracker = ClientLeadershipTracker(state, logger)
 
         job_id = "clear-orphan-job"
 
-        tracker.mark_job_orphaned(job_id, {"reason": "test"})
+        tracker.mark_job_orphaned(
+            job_id,
+            last_known_gate=None,
+            last_known_manager=None,
+        )
         assert state.is_job_orphaned(job_id) is True
 
         tracker.clear_job_orphaned(job_id)
@@ -427,21 +466,23 @@ class TestClientLeadershipTracker:
     def test_get_current_gate_leader(self):
         """Test getting current gate leader."""
         state = ClientState()
-        tracker = ClientLeadershipTracker(state)
+        logger = make_mock_logger()
+        tracker = ClientLeadershipTracker(state, logger)
 
         job_id = "get-gate-leader"
-        leader_info = ("gate2", 9001)
+        gate_addr = ("gate2", 9001)
 
-        tracker.update_gate_leader(job_id, leader_info, fence_token=1)
+        tracker.update_gate_leader(job_id, gate_addr, fence_token=1)
 
         result = tracker.get_current_gate_leader(job_id)
 
-        assert result == leader_info
+        assert result == gate_addr
 
     def test_get_current_gate_leader_no_leader(self):
         """Test getting gate leader when none exists."""
         state = ClientState()
-        tracker = ClientLeadershipTracker(state)
+        logger = make_mock_logger()
+        tracker = ClientLeadershipTracker(state, logger)
 
         result = tracker.get_current_gate_leader("nonexistent-job")
 
@@ -450,22 +491,28 @@ class TestClientLeadershipTracker:
     def test_get_leadership_metrics(self):
         """Test leadership metrics retrieval."""
         state = ClientState()
-        tracker = ClientLeadershipTracker(state)
+        logger = make_mock_logger()
+        tracker = ClientLeadershipTracker(state, logger)
 
         state.increment_gate_transfers()
         state.increment_manager_transfers()
-        tracker.mark_job_orphaned("job1", {"reason": "test"})
+        tracker.mark_job_orphaned(
+            "job1",
+            last_known_gate=None,
+            last_known_manager=None,
+        )
 
         metrics = tracker.get_leadership_metrics()
 
         assert metrics["gate_transfers_received"] == 1
         assert metrics["manager_transfers_received"] == 1
-        assert metrics["orphaned_jobs_count"] == 1
+        assert metrics["orphaned_jobs"] == 1
 
     def test_edge_case_multiple_leader_updates(self):
         """Test multiple leader updates for same job."""
         state = ClientState()
-        tracker = ClientLeadershipTracker(state)
+        logger = make_mock_logger()
+        tracker = ClientLeadershipTracker(state, logger)
 
         job_id = "multi-update-job"
 
@@ -484,14 +531,17 @@ class TestClientJobTracker:
     def test_happy_path_instantiation(self):
         """Test normal job tracker creation."""
         state = ClientState()
-        tracker = ClientJobTracker(state)
+        logger = make_mock_logger()
+        tracker = ClientJobTracker(state, logger)
 
         assert tracker._state == state
+        assert tracker._logger == logger
 
     def test_initialize_job_tracking(self):
         """Test job tracking initialization."""
         state = ClientState()
-        tracker = ClientJobTracker(state)
+        logger = make_mock_logger()
+        tracker = ClientJobTracker(state, logger)
 
         job_id = "track-job-123"
         status_callback = Mock()
@@ -507,19 +557,21 @@ class TestClientJobTracker:
     def test_update_job_status(self):
         """Test job status update."""
         state = ClientState()
-        tracker = ClientJobTracker(state)
+        logger = make_mock_logger()
+        tracker = ClientJobTracker(state, logger)
 
         job_id = "status-job"
         tracker.initialize_job_tracking(job_id)
 
         tracker.update_job_status(job_id, "RUNNING")
 
-        assert state._jobs[job_id] == "RUNNING"
+        assert state._jobs[job_id].status == "RUNNING"
 
     def test_update_job_status_completion(self):
         """Test job status update with completion event."""
         state = ClientState()
-        tracker = ClientJobTracker(state)
+        logger = make_mock_logger()
+        tracker = ClientJobTracker(state, logger)
 
         job_id = "complete-job"
         tracker.initialize_job_tracking(job_id)
@@ -532,7 +584,8 @@ class TestClientJobTracker:
     def test_mark_job_failed(self):
         """Test marking job as failed."""
         state = ClientState()
-        tracker = ClientJobTracker(state)
+        logger = make_mock_logger()
+        tracker = ClientJobTracker(state, logger)
 
         job_id = "failed-job"
         tracker.initialize_job_tracking(job_id)
@@ -540,7 +593,7 @@ class TestClientJobTracker:
         error = "Worker timeout"
         tracker.mark_job_failed(job_id, error)
 
-        assert state._jobs[job_id] == "FAILED"
+        assert state._jobs[job_id].status == "FAILED"
         # Should signal completion
         assert state._job_events[job_id].is_set()
 
@@ -548,7 +601,8 @@ class TestClientJobTracker:
     async def test_wait_for_job_success(self):
         """Test waiting for job completion."""
         state = ClientState()
-        tracker = ClientJobTracker(state)
+        logger = make_mock_logger()
+        tracker = ClientJobTracker(state, logger)
 
         job_id = "wait-job"
         tracker.initialize_job_tracking(job_id)
@@ -562,13 +616,14 @@ class TestClientJobTracker:
             complete_job(),
         )
 
-        assert state._jobs[job_id] == "COMPLETED"
+        assert state._jobs[job_id].status == "COMPLETED"
 
     @pytest.mark.asyncio
     async def test_wait_for_job_timeout(self):
         """Test waiting for job with timeout."""
         state = ClientState()
-        tracker = ClientJobTracker(state)
+        logger = make_mock_logger()
+        tracker = ClientJobTracker(state, logger)
 
         job_id = "timeout-job"
         tracker.initialize_job_tracking(job_id)
@@ -579,20 +634,22 @@ class TestClientJobTracker:
     def test_get_job_status(self):
         """Test getting job status."""
         state = ClientState()
-        tracker = ClientJobTracker(state)
+        logger = make_mock_logger()
+        tracker = ClientJobTracker(state, logger)
 
         job_id = "get-status-job"
         tracker.initialize_job_tracking(job_id)
         tracker.update_job_status(job_id, "RUNNING")
 
-        status = tracker.get_job_status(job_id)
+        result = tracker.get_job_status(job_id)
 
-        assert status == "RUNNING"
+        assert result.status == "RUNNING"
 
     def test_get_job_status_nonexistent(self):
         """Test getting status of nonexistent job."""
         state = ClientState()
-        tracker = ClientJobTracker(state)
+        logger = make_mock_logger()
+        tracker = ClientJobTracker(state, logger)
 
         status = tracker.get_job_status("nonexistent-job")
 
@@ -601,7 +658,8 @@ class TestClientJobTracker:
     def test_edge_case_multiple_status_updates(self):
         """Test multiple status updates for same job."""
         state = ClientState()
-        tracker = ClientJobTracker(state)
+        logger = make_mock_logger()
+        tracker = ClientJobTracker(state, logger)
 
         job_id = "multi-status-job"
         tracker.initialize_job_tracking(job_id)
@@ -611,13 +669,14 @@ class TestClientJobTracker:
         tracker.update_job_status(job_id, "COMPLETED")
 
         # Should have final status
-        assert state._jobs[job_id] == "COMPLETED"
+        assert state._jobs[job_id].status == "COMPLETED"
 
     @pytest.mark.asyncio
     async def test_concurrency_multiple_waiters(self):
         """Test multiple waiters for same job."""
         state = ClientState()
-        tracker = ClientJobTracker(state)
+        logger = make_mock_logger()
+        tracker = ClientJobTracker(state, logger)
 
         job_id = "multi-waiter-job"
         tracker.initialize_job_tracking(job_id)
@@ -637,5 +696,6 @@ class TestClientJobTracker:
             completer(),
         )
 
-        # All waiters should complete
-        assert results[:3] == ["done", "done", "done"]
+        # All waiters should complete and return ClientJobResult
+        for result in results[:3]:
+            assert isinstance(result, ClientJobResult)
