@@ -694,7 +694,7 @@ class ExtensionTracker:
         if self.extension_count >= self.max_extensions:
             return f"Maximum extensions ({self.max_extensions}) exceeded"
         if current_progress <= self.last_progress:
-            return f"No progress since last extension (was {self.last_progress:.2f}, now {current_progress:.2f})"
+            return f"No progress since last extension (current={current_progress}, last={self.last_progress})"
         return "Extension denied"
 
 

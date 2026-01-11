@@ -133,7 +133,7 @@ class ExtensionTracker:
                 return (
                     False,
                     0.0,
-                    f"No progress since last extension (current_progress={current_progress}, last={self.last_progress})",
+                    f"No progress since last extension (current={current_progress}, last={self.last_progress})",
                     False,
                 )
 

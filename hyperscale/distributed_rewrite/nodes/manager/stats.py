@@ -238,6 +238,8 @@ class ManagerStatsCoordinator:
 
     def get_stats_metrics(self) -> dict:
         """Get stats-related metrics."""
+        # Capture count before get_dispatch_throughput() which may reset it
+        throughput_count = self._state._dispatch_throughput_count
         return {
             "dispatch_throughput": self.get_dispatch_throughput(),
             "expected_throughput": self.get_expected_throughput(),
@@ -245,5 +247,5 @@ class ManagerStatsCoordinator:
             "progress_state_duration": self.get_progress_state_duration(),
             "backpressure_level": self.get_backpressure_level().value,
             "stats_buffer_count": self._stats_buffer_count,
-            "throughput_count": self._state._dispatch_throughput_count,
+            "throughput_count": throughput_count,
         }
