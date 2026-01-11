@@ -51,7 +51,7 @@ class TestClientJobSubmitter:
         self.logger = Mock(spec=Logger)
         self.logger.log = AsyncMock()
         self.targets = ClientTargetSelector(self.config, self.state)
-        self.tracker = ClientJobTracker(self.state)
+        self.tracker = ClientJobTracker(self.state, self.logger)
         self.protocol = ClientProtocol(self.state)
 
     @pytest.mark.asyncio

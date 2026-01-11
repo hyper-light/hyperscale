@@ -314,9 +314,9 @@ class TestClientDiscovery:
         return mock_logger
 
     @pytest.fixture
-    def targets(self, config):
+    def targets(self, config, state):
         """Create ClientTargetSelector instance."""
-        return ClientTargetSelector(config)
+        return ClientTargetSelector(config, state)
 
     @pytest.fixture
     def send_tcp(self):
