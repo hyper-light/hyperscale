@@ -29581,3 +29581,264 @@ Both architectures share:
 - Bounded queues (backpressure)
 - Executor isolation (non-blocking)
 - Explicit status handling (no silent failures)
+
+### High-Concurrency Read Pattern: One Reader Per Consumer
+
+For maximum concurrency with multiple independent queries, create **one `SingleReaderBuffer` instance per consumer**:
+
+```python
+class ReaderPool:
+    """
+    Pool of independent readers for concurrent queries.
+
+    Each consumer gets its own reader instance with:
+    - Independent file descriptor
+    - Independent prefetch state
+    - Independent sequence tracking
+    - No coordination overhead
+    """
+
+    __slots__ = ('_path', '_readers', '_config')
+
+    def __init__(
+        self,
+        path: str,
+        queue_size: int = 1000,
+        prefetch_capacity: int = 262144,
+        chunk_size: int = 65536,
+    ):
+        self._path = path
+        self._readers: list[SingleReaderBuffer] = []
+        self._config = {
+            'queue_size': queue_size,
+            'prefetch_capacity': prefetch_capacity,
+            'chunk_size': chunk_size,
+        }
+
+    async def create_reader(
+        self,
+        from_sequence: int = 0,
+    ) -> SingleReaderBuffer:
+        """Create a new independent reader instance."""
+        reader = SingleReaderBuffer(**self._config)
+        await reader.open(self._path, from_sequence=from_sequence)
+        self._readers.append(reader)
+        return reader
+
+    async def close_all(self) -> None:
+        """Close all reader instances."""
+        await asyncio.gather(*[
+            reader.close() for reader in self._readers
+        ])
+        self._readers.clear()
+
+
+# Usage: Concurrent independent queries
+async def concurrent_queries(path: str) -> None:
+    pool = ReaderPool(path)
+
+    async def query_range(start_seq: int, end_seq: int) -> list[bytes]:
+        """Independent query - gets its own reader."""
+        reader = await pool.create_reader(from_sequence=start_seq)
+        results = []
+
+        async for entry in reader.read_entries():
+            if entry.sequence >= end_seq:
+                break
+            results.append(entry.data)
+
+        return results
+
+    # Run queries concurrently - each has independent reader
+    results = await asyncio.gather(
+        query_range(0, 1000),
+        query_range(500, 1500),
+        query_range(2000, 3000),
+    )
+
+    await pool.close_all()
+```
+
+### Why Not Parallel Chunk Readers?
+
+One might consider parallelizing reads by splitting the file into chunks:
+
+```
+File: [Chunk 0][Chunk 1][Chunk 2][Chunk 3]
+         ↓        ↓        ↓        ↓
+      Reader 0  Reader 1  Reader 2  Reader 3
+         ↓        ↓        ↓        ↓
+      [Merge in sequence order]
+         ↓
+      Consumer
+```
+
+**This is NOT more correct** for these reasons:
+
+| Problem | Impact |
+|---------|--------|
+| **Chunk boundary detection** | Segments may span chunks - need to scan to find boundaries |
+| **Merge complexity** | Must reassemble in sequence order - coordination overhead |
+| **Partial failure handling** | One chunk failure affects entire read |
+| **Sequential I/O faster** | OS read-ahead optimizes sequential access |
+| **SSD marginal gains** | Parallel reads help but don't justify complexity |
+
+**The correct pattern is:**
+- Single-Reader for sequential scans (recovery, replay)
+- Multiple independent Single-Readers for concurrent queries
+- Index + Single-Reader for random access
+
+### Indexed Random Access
+
+For frequent random access by sequence number, build an index during sequential scan:
+
+```python
+class IndexedReader:
+    """
+    Single-Reader with sequence index for O(1) access.
+
+    Index is built lazily during first sequential scan,
+    then persisted for subsequent access.
+    """
+
+    __slots__ = (
+        '_reader', '_index', '_index_path',
+        '_path', '_config',
+    )
+
+    def __init__(
+        self,
+        path: str,
+        index_path: str | None = None,
+    ):
+        self._path = path
+        self._index_path = index_path or f"{path}.idx"
+        self._index: dict[int, int] = {}  # sequence → file_offset
+        self._reader: SingleReaderBuffer | None = None
+        self._config = {
+            'queue_size': 1000,
+            'prefetch_capacity': 262144,
+            'chunk_size': 65536,
+        }
+
+    async def build_index(self) -> None:
+        """Build index by scanning file sequentially."""
+        reader = SingleReaderBuffer(**self._config)
+        await reader.open(self._path)
+
+        file_offset = 0
+        async for entry in reader.read_entries():
+            self._index[entry.sequence] = file_offset
+            # Track offset: header + data
+            file_offset += SegmentHeader.HEADER_SIZE + len(entry.data)
+
+        await reader.close()
+
+        # Persist index
+        await self._save_index()
+
+    async def _save_index(self) -> None:
+        """Save index to disk."""
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            None,
+            self._save_index_sync,
+        )
+
+    def _save_index_sync(self) -> None:
+        """Synchronous index save."""
+        import json
+        with open(self._index_path, 'w') as f:
+            json.dump(self._index, f)
+
+    async def load_index(self) -> bool:
+        """Load index from disk. Returns False if not found."""
+        loop = asyncio.get_running_loop()
+        try:
+            self._index = await loop.run_in_executor(
+                None,
+                self._load_index_sync,
+            )
+            return True
+        except FileNotFoundError:
+            return False
+
+    def _load_index_sync(self) -> dict[int, int]:
+        """Synchronous index load."""
+        import json
+        with open(self._index_path, 'r') as f:
+            return {int(k): v for k, v in json.load(f).items()}
+
+    async def get_by_sequence(self, sequence: int) -> ReadEntry | None:
+        """O(1) access to entry by sequence number."""
+        if sequence not in self._index:
+            return None
+
+        file_offset = self._index[sequence]
+
+        # Create reader positioned at offset
+        reader = SingleReaderBuffer(**self._config)
+        await reader.open(self._path, from_sequence=sequence)
+
+        # Read single entry
+        result = await reader.read()
+        await reader.close()
+
+        if result.status == ReadStatus.SUCCESS:
+            return result.entry
+        return None
+
+    async def get_range(
+        self,
+        start_seq: int,
+        end_seq: int,
+    ) -> AsyncIterator[ReadEntry]:
+        """Get entries in sequence range."""
+        if start_seq not in self._index:
+            return
+
+        reader = SingleReaderBuffer(**self._config)
+        await reader.open(self._path, from_sequence=start_seq)
+
+        async for entry in reader.read_entries():
+            if entry.sequence >= end_seq:
+                break
+            yield entry
+
+        await reader.close()
+```
+
+### Summary: Read Architecture Decision Tree
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    READ ACCESS PATTERN DECISION                     │
+│                                                                     │
+│  Q: What is the access pattern?                                     │
+│                                                                     │
+│  ├── Sequential scan (recovery, replay, export)                     │
+│  │   └── Use: SingleReaderBuffer                                   │
+│  │       - One instance                                             │
+│  │       - Prefetch enables throughput                              │
+│  │       - CRC/sequence verification                                │
+│  │                                                                  │
+│  ├── Concurrent independent queries                                 │
+│  │   └── Use: ReaderPool (multiple SingleReaderBuffer)             │
+│  │       - One reader per query                                     │
+│  │       - Independent state, no coordination                       │
+│  │       - Maximum parallelism                                      │
+│  │                                                                  │
+│  └── Random access by sequence                                      │
+│      └── Use: IndexedReader                                        │
+│          - Build index once (sequential scan)                       │
+│          - O(1) lookup by sequence                                  │
+│          - SingleReaderBuffer for actual read                       │
+│                                                                     │
+│  WHY SINGLE-READER IS MOST CORRECT:                                │
+│  ├── Hardware alignment (sequential I/O)                            │
+│  ├── Single validation point (no duplicate CRC checks)              │
+│  ├── Simple state (one prefetch task, one queue)                    │
+│  ├── Bounded memory (fixed prefetch + queue)                        │
+│  └── No coordination bugs (independent instances)                   │
+└─────────────────────────────────────────────────────────────────────┘
+```
