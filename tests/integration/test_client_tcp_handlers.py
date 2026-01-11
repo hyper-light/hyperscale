@@ -44,6 +44,8 @@ from hyperscale.distributed_rewrite.models import (
     JobCancellationComplete,
     GateJobLeaderTransfer,
     ManagerJobLeaderTransfer,
+    GateJobLeaderTransferAck,
+    ManagerJobLeaderTransferAck,
 )
 from hyperscale.distributed_rewrite.models.client import ClientJobResult
 from hyperscale.distributed_rewrite.jobs import WindowedStatsPush
