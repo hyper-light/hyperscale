@@ -10,6 +10,7 @@ import time
 
 from hyperscale.distributed.swim import HealthAwareServer, WorkerStateEmbedder
 from hyperscale.distributed.env import Env
+from hyperscale.distributed.discovery import DiscoveryService
 from hyperscale.distributed.models import (
     NodeInfo,
     NodeRole,
@@ -121,9 +122,16 @@ class WorkerServer(HealthAwareServer):
             logger=None,
         )
 
+        # AD-28: Enhanced DNS Discovery
+        static_seeds = [f"{host}:{port}" for host, port in self._seed_managers]
+        discovery_config = env.get_discovery_config(
+            node_role="worker",
+            static_seeds=static_seeds,
+        )
+        self._discovery_service = DiscoveryService(discovery_config)
+
         self._discovery_manager = WorkerDiscoveryManager(
-            env=env,
-            seed_managers=self._seed_managers,
+            discovery_service=self._discovery_service,
             logger=None,
         )
 
