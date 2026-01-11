@@ -326,7 +326,8 @@ class TestGateLeaderTransferHandler:
 
         job_id = "transfer-job-123"
 
-        handler = GateLeaderTransferHandler(state, logger, None)
+        leadership = ClientLeadershipTracker(state, logger)
+        handler = GateLeaderTransferHandler(state, logger, leadership)
 
         transfer = GateJobLeaderTransfer(
             job_id=job_id,
