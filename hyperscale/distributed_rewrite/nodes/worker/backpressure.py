@@ -4,6 +4,9 @@ Worker backpressure manager (AD-18, AD-23, AD-37).
 Handles overload detection, circuit breakers, and load shedding
 signals for worker health reporting. Implements explicit backpressure
 policy for progress updates per AD-37.
+
+Note: Backpressure state is delegated to WorkerState to maintain
+single source of truth (no duplicate state).
 """
 
 import asyncio
@@ -17,6 +20,7 @@ from hyperscale.distributed_rewrite.reliability import (
 if TYPE_CHECKING:
     from hyperscale.logging import Logger
     from .registry import WorkerRegistry
+    from .state import WorkerState
 
 
 class WorkerBackpressureManager:
@@ -26,10 +30,13 @@ class WorkerBackpressureManager:
     Combines CPU, memory, and latency signals to determine worker
     health state for gossip reporting (AD-18). Also tracks manager
     backpressure signals (AD-23) to adjust update frequency.
+
+    Delegates backpressure state to WorkerState (single source of truth).
     """
 
     def __init__(
         self,
+        state: "WorkerState",
         logger: "Logger | None" = None,
         registry: "WorkerRegistry | None" = None,
         poll_interval: float = 0.25,
@@ -38,19 +45,17 @@ class WorkerBackpressureManager:
         Initialize backpressure manager.
 
         Args:
+            state: WorkerState for backpressure tracking (single source of truth)
             logger: Logger instance for logging
             registry: WorkerRegistry for manager tracking
             poll_interval: Polling interval for resource sampling (default 250ms)
         """
+        self._state = state
         self._logger = logger
         self._registry = registry
         self._overload_detector = HybridOverloadDetector()
         self._poll_interval = poll_interval
         self._running = False
-
-        # Manager backpressure tracking (AD-23)
-        self._manager_backpressure: dict[str, BackpressureLevel] = {}
-        self._backpressure_delay_ms: int = 0
 
         # Resource getters (set by server)
         self._get_cpu_percent: callable = lambda: 0.0
@@ -128,25 +133,37 @@ class WorkerBackpressureManager:
         """
         Update backpressure level for a manager (AD-23).
 
+        Delegates to WorkerState (single source of truth).
+
         Args:
             manager_id: Manager node identifier
             level: Backpressure level from manager
         """
-        self._manager_backpressure[manager_id] = level
+        self._state.set_manager_backpressure(manager_id, level)
 
     def get_max_backpressure_level(self) -> BackpressureLevel:
-        """Get maximum backpressure level across all managers."""
-        if not self._manager_backpressure:
-            return BackpressureLevel.NONE
-        return max(self._manager_backpressure.values(), key=lambda x: x.value)
+        """
+        Get maximum backpressure level across all managers.
+
+        Delegates to WorkerState (single source of truth).
+        """
+        return self._state.get_max_backpressure_level()
 
     def set_backpressure_delay_ms(self, delay_ms: int) -> None:
-        """Set backpressure delay from manager."""
-        self._backpressure_delay_ms = delay_ms
+        """
+        Set backpressure delay from manager.
+
+        Delegates to WorkerState (single source of truth).
+        """
+        self._state.set_backpressure_delay_ms(delay_ms)
 
     def get_backpressure_delay_ms(self) -> int:
-        """Get current backpressure delay."""
-        return self._backpressure_delay_ms
+        """
+        Get current backpressure delay.
+
+        Delegates to WorkerState (single source of truth).
+        """
+        return self._state.get_backpressure_delay_ms()
 
     def is_overloaded(self) -> bool:
         """Check if worker is currently overloaded."""

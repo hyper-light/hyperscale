@@ -144,8 +144,7 @@ class WorkerExecutor:
             workflow_id: Workflow identifier
             progress: Progress update to buffer
         """
-        async with self._state._progress_buffer_lock:
-            self._state._progress_buffer[workflow_id] = progress
+        await self._state.buffer_progress_update(workflow_id, progress)
 
     async def flush_progress_buffer(
         self,
@@ -157,9 +156,7 @@ class WorkerExecutor:
         Args:
             send_progress: Function to send progress to manager
         """
-        async with self._state._progress_buffer_lock:
-            updates = dict(self._state._progress_buffer)
-            self._state._progress_buffer.clear()
+        updates = await self._state.flush_progress_buffer()
 
         for workflow_id, progress in updates.items():
             try:
@@ -195,8 +192,7 @@ class WorkerExecutor:
                 if self._backpressure_manager is not None:
                     # REJECT level: drop non-critical updates entirely
                     if self._backpressure_manager.should_reject_updates():
-                        async with self._state._progress_buffer_lock:
-                            self._state._progress_buffer.clear()
+                        await self._state.clear_progress_buffer()
                         batch_accumulation_cycles = 0
                         continue
 
@@ -238,8 +234,8 @@ class WorkerExecutor:
             "total_cores": self.total_cores,
             "throughput": self.get_throughput(),
             "expected_throughput": self.get_expected_throughput(),
-            "completion_samples": len(self._completion_times),
-            "buffered_updates": len(self._progress_buffer),
+            "completion_samples": self._state.get_completion_sample_count(),
+            "buffered_updates": self._state.get_buffered_update_count(),
         }
 
     @staticmethod
