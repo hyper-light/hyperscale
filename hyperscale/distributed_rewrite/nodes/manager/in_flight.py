@@ -80,12 +80,17 @@ class InFlightTracker:
         # Metrics
         self._acquired_total: int = 0
         self._rejected_total: int = 0
-        self._rejected_by_priority: dict[int, int] = {0: 0, 1: 0, 2: 0, 3: 0}
+        self._rejected_by_priority: dict[RequestPriority, int] = {
+            RequestPriority.CRITICAL: 0,
+            RequestPriority.HIGH: 0,
+            RequestPriority.NORMAL: 0,
+            RequestPriority.LOW: 0,
+        }
 
         # Lock for thread-safe operations
         self._lock = asyncio.Lock()
 
-    async def try_acquire(self, priority: "RequestPriority") -> bool:
+    async def try_acquire(self, priority: RequestPriority) -> bool:
         """
         Try to acquire a slot for the given priority.
 
@@ -96,37 +101,54 @@ class InFlightTracker:
             True if slot acquired, False if at limit
         """
         async with self._lock:
-            priority_val = priority.value
-
-            # CRITICAL always allowed
-            if priority_val == 0:
-                self._counts[priority_val] += 1
+            # CRITICAL always allowed (AD-37: CONTROL messages never shed)
+            if priority == RequestPriority.CRITICAL:
+                self._counts[priority] += 1
                 self._global_count += 1
                 self._acquired_total += 1
                 return True
 
             # Check priority-specific limit
-            if self._counts[priority_val] >= self._limits[priority_val]:
+            if self._counts[priority] >= self._limits[priority]:
                 self._rejected_total += 1
-                self._rejected_by_priority[priority_val] += 1
+                self._rejected_by_priority[priority] += 1
                 return False
 
             # Check global limit (excluding CRITICAL)
             non_critical_count = sum(
-                self._counts[p] for p in range(1, 4)
+                self._counts[p] for p in [
+                    RequestPriority.HIGH,
+                    RequestPriority.NORMAL,
+                    RequestPriority.LOW,
+                ]
             )
             if non_critical_count >= self._global_limit:
                 self._rejected_total += 1
-                self._rejected_by_priority[priority_val] += 1
+                self._rejected_by_priority[priority] += 1
                 return False
 
             # Acquire slot
-            self._counts[priority_val] += 1
+            self._counts[priority] += 1
             self._global_count += 1
             self._acquired_total += 1
             return True
 
-    async def release(self, priority: "RequestPriority") -> None:
+    async def try_acquire_for_handler(self, handler_name: str) -> bool:
+        """
+        Try to acquire a slot using AD-37 MessageClass classification.
+
+        This is the preferred method for AD-37 compliant bounded execution.
+
+        Args:
+            handler_name: Name of the handler (e.g., "receive_workflow_progress")
+
+        Returns:
+            True if slot acquired, False if at limit
+        """
+        priority = classify_handler_to_priority(handler_name)
+        return await self.try_acquire(priority)
+
+    async def release(self, priority: RequestPriority) -> None:
         """
         Release a slot for the given priority.
 
@@ -134,11 +156,20 @@ class InFlightTracker:
             priority: Request priority
         """
         async with self._lock:
-            priority_val = priority.value
-            self._counts[priority_val] = max(0, self._counts[priority_val] - 1)
+            self._counts[priority] = max(0, self._counts[priority] - 1)
             self._global_count = max(0, self._global_count - 1)
 
-    def try_acquire_sync(self, priority: "RequestPriority") -> bool:
+    async def release_for_handler(self, handler_name: str) -> None:
+        """
+        Release a slot using AD-37 MessageClass classification.
+
+        Args:
+            handler_name: Name of the handler
+        """
+        priority = classify_handler_to_priority(handler_name)
+        await self.release(priority)
+
+    def try_acquire_sync(self, priority: RequestPriority) -> bool:
         """
         Synchronous version of try_acquire for use in sync callbacks.
 
@@ -148,44 +179,70 @@ class InFlightTracker:
         Returns:
             True if slot acquired, False if at limit
         """
-        priority_val = priority.value
-
-        # CRITICAL always allowed
-        if priority_val == 0:
-            self._counts[priority_val] += 1
+        # CRITICAL always allowed (AD-37: CONTROL messages never shed)
+        if priority == RequestPriority.CRITICAL:
+            self._counts[priority] += 1
             self._global_count += 1
             self._acquired_total += 1
             return True
 
         # Check priority-specific limit
-        if self._counts[priority_val] >= self._limits[priority_val]:
+        if self._counts[priority] >= self._limits[priority]:
             self._rejected_total += 1
-            self._rejected_by_priority[priority_val] += 1
+            self._rejected_by_priority[priority] += 1
             return False
 
         # Check global limit
-        non_critical_count = sum(self._counts[p] for p in range(1, 4))
+        non_critical_count = sum(
+            self._counts[p] for p in [
+                RequestPriority.HIGH,
+                RequestPriority.NORMAL,
+                RequestPriority.LOW,
+            ]
+        )
         if non_critical_count >= self._global_limit:
             self._rejected_total += 1
-            self._rejected_by_priority[priority_val] += 1
+            self._rejected_by_priority[priority] += 1
             return False
 
         # Acquire slot
-        self._counts[priority_val] += 1
+        self._counts[priority] += 1
         self._global_count += 1
         self._acquired_total += 1
         return True
 
-    def release_sync(self, priority: "RequestPriority") -> None:
+    def try_acquire_sync_for_handler(self, handler_name: str) -> bool:
+        """
+        Synchronous try_acquire using AD-37 MessageClass classification.
+
+        Args:
+            handler_name: Name of the handler
+
+        Returns:
+            True if slot acquired, False if at limit
+        """
+        priority = classify_handler_to_priority(handler_name)
+        return self.try_acquire_sync(priority)
+
+    def release_sync(self, priority: RequestPriority) -> None:
         """
         Synchronous version of release.
 
         Args:
             priority: Request priority
         """
-        priority_val = priority.value
-        self._counts[priority_val] = max(0, self._counts[priority_val] - 1)
+        self._counts[priority] = max(0, self._counts[priority] - 1)
         self._global_count = max(0, self._global_count - 1)
+
+    def release_sync_for_handler(self, handler_name: str) -> None:
+        """
+        Synchronous release using AD-37 MessageClass classification.
+
+        Args:
+            handler_name: Name of the handler
+        """
+        priority = classify_handler_to_priority(handler_name)
+        self.release_sync(priority)
 
     def track_task(self, task: asyncio.Task, priority: "RequestPriority") -> None:
         """
