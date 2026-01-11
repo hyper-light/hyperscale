@@ -89,7 +89,7 @@ class WorkflowFatal(Entry, kw_only=True):
     level: LogLevel = LogLevel.FATAL
     
 class RunTrace(Entry, kw_only=True):
-    node_id: int
+    node_id: str | int
     workflow: str
     duration: str
     run_id: int
@@ -97,7 +97,7 @@ class RunTrace(Entry, kw_only=True):
     level: LogLevel = LogLevel.TRACE
 
 class RunDebug(Entry, kw_only=True):
-    node_id: int
+    node_id: str | int
     workflow: str
     duration: str
     run_id: int
@@ -105,7 +105,7 @@ class RunDebug(Entry, kw_only=True):
     level: LogLevel = LogLevel.DEBUG
 
 class RunInfo(Entry, kw_only=True):
-    node_id: int
+    node_id: str | int
     workflow: str
     duration: str
     run_id: int
@@ -113,7 +113,7 @@ class RunInfo(Entry, kw_only=True):
     level: LogLevel = LogLevel.INFO
 
 class RunError(Entry, kw_only=True):
-    node_id: int
+    node_id: str | int
     workflow: str
     duration: str
     run_id: int
@@ -121,7 +121,7 @@ class RunError(Entry, kw_only=True):
     level: LogLevel = LogLevel.ERROR
 
 class RunFatal(Entry, kw_only=True):
-    node_id: int
+    node_id: str | int
     workflow: str
     duration: str
     run_id: int
@@ -129,7 +129,7 @@ class RunFatal(Entry, kw_only=True):
     level: LogLevel = LogLevel.FATAL
 
 class ServerTrace(Entry, kw_only=True):
-    node_id: int
+    node_id: str | int
     node_host: str
     node_port: int
     level: LogLevel = LogLevel.TRACE
