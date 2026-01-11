@@ -164,7 +164,7 @@ class TestCancelJobHandlerNegativePath:
 
         # Should return error response
         response = JobCancelResponse.load(result)
-        assert response.accepted is False
+        assert response.success is False
         assert response.error is not None
 
 
@@ -214,7 +214,7 @@ class TestCancelJobHandlerEdgeCases:
         result = await handler.handle(("10.0.0.1", 9000), request.dump(), 1)
 
         response = JobCancelResponse.load(result)
-        assert response.accepted is False
+        assert response.success is False
 
 
 # =============================================================================
@@ -314,7 +314,7 @@ class TestJobCancelRequestHandlerNegativePath:
         )
 
         response = JobCancelResponse.load(result)
-        assert response.accepted is False
+        assert response.success is False
         assert response.job_id == "unknown"
 
     @pytest.mark.asyncio
@@ -342,7 +342,7 @@ class TestJobCancelRequestHandlerNegativePath:
         result = await handler.handle(("10.0.0.1", 9000), request.dump(), 1)
 
         response = JobCancelResponse.load(result)
-        assert response.accepted is False
+        assert response.success is False
         assert "Bad request" in response.error
 
 
@@ -402,10 +402,10 @@ class TestWorkflowCancellationCompleteHandlerHappyPath:
         )
 
         notification = WorkflowCancellationComplete(
-            workflow_id="wf-789",
             job_id="job-abc",
+            workflow_id="wf-789",
             success=False,
-            error="Worker timeout",
+            errors=["Worker timeout"],
         )
 
         await handler.handle(("10.0.0.50", 6000), notification.dump(), 1)
@@ -458,8 +458,8 @@ class TestWorkflowCancellationCompleteHandlerNegativePath:
         )
 
         notification = WorkflowCancellationComplete(
-            workflow_id="wf-123",
             job_id="job-456",
+            workflow_id="wf-123",
             success=True,
         )
 
@@ -492,10 +492,10 @@ class TestWorkflowCancellationCompleteHandlerEdgeCases:
         long_error = "Error: " + "x" * 10000
 
         notification = WorkflowCancellationComplete(
-            workflow_id="wf-123",
             job_id="job-456",
+            workflow_id="wf-123",
             success=False,
-            error=long_error,
+            errors=[long_error],
         )
 
         result = await handler.handle(("10.0.0.50", 6000), notification.dump(), 1)
@@ -580,8 +580,8 @@ class TestHandlersConcurrency:
 
         notifications = [
             WorkflowCancellationComplete(
-                workflow_id=f"wf-{i}",
                 job_id="job-concurrent",
+                workflow_id=f"wf-{i}",
                 success=True,
             )
             for i in range(20)
@@ -617,7 +617,7 @@ class TestHandlerIntegration:
             return JobCancelResponse(
                 job_id=request.job_id,
                 success=True,
-                workflow_count=len(pending_workflows),
+                cancelled_workflow_count=len(pending_workflows),
             ).dump()
 
         async def completion_impl(notification):
@@ -657,13 +657,13 @@ class TestHandlerIntegration:
         )
 
         response = JobCancelResponse.load(cancel_result)
-        assert response.accepted is True
+        assert response.success is True
 
         # Send completion notifications
         for wf_id in ["wf-1", "wf-2", "wf-3"]:
             notification = WorkflowCancellationComplete(
-                workflow_id=wf_id,
                 job_id="job-123",
+                workflow_id=wf_id,
                 success=True,
             )
             await completion_handler.handle(
