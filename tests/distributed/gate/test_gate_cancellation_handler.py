@@ -469,7 +469,7 @@ class TestHandleJobCancellationComplete:
             handle_exception=mock_handle_exception,
         )
 
-        assert result == b'ok'
+        assert result == b'OK'
 
     @pytest.mark.asyncio
     async def test_handles_invalid_data(self):
