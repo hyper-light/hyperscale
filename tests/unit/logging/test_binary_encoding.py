@@ -66,7 +66,7 @@ class TestBinaryEncode:
         crc_stored = struct.unpack("<I", encoded[:4])[0]
 
         length = struct.unpack("<I", encoded[4:8])[0]
-        crc_computed = hashlib.crc32(encoded[4 : 16 + length]) & 0xFFFFFFFF
+        crc_computed = zlib.crc32(encoded[4 : 16 + length]) & 0xFFFFFFFF
 
         assert crc_stored == crc_computed
 
@@ -162,7 +162,7 @@ class TestBinaryRoundtrip:
     ):
         messages = [
             ("message 1", LogLevel.INFO, 1),
-            ("message 2", LogLevel.WARNING, 2),
+            ("message 2", LogLevel.WARN, 2),
             ("message 3", LogLevel.ERROR, 3),
         ]
 

@@ -1,6 +1,6 @@
-import hashlib
 import os
 import struct
+import zlib
 
 import pytest
 
