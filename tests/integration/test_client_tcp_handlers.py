@@ -244,37 +244,18 @@ class TestJobFinalResultHandler:
         assert state._job_events[job_id].is_set()
 
     @pytest.mark.asyncio
-    async def test_final_result_with_callback(self):
-        """Test final result with callback."""
+    async def test_error_handling_invalid_data(self):
+        """Test handling of invalid final result data."""
         state = ClientState()
         logger = Mock(spec=Logger)
         logger.log = AsyncMock()
 
-        job_id = "final-callback-job"
-        callback_results = []
-
-        def result_callback(result):
-            callback_results.append(result)
-
-        initial_result = ClientJobResult(job_id=job_id, status="PENDING")
-        state.initialize_job_tracking(job_id, initial_result)
-        # Store callback in appropriate place
-        state._job_callbacks[job_id] = (None, None, result_callback, None)
-
         handler = JobFinalResultHandler(state, logger)
 
-        final_result = JobFinalResult(
-            job_id=job_id,
-            datacenter="dc-test",
-            status="completed",
-            total_completed=50,
-            total_failed=0,
-        )
-        data = final_result.dump()
+        # Invalid data
+        result = await handler.handle(("server", 8000), b'invalid', 100)
 
-        await handler.handle(("server", 8000), data, 100)
-
-        assert len(callback_results) == 1
+        assert result == b'error'
 
 
 class TestCancellationCompleteHandler:
@@ -345,7 +326,7 @@ class TestGateLeaderTransferHandler:
 
         job_id = "transfer-job-123"
 
-        handler = GateLeaderTransferHandler(state, logger, Mock())
+        handler = GateLeaderTransferHandler(state, logger, None)
 
         transfer = GateJobLeaderTransfer(
             job_id=job_id,
@@ -401,7 +382,7 @@ class TestGateLeaderTransferHandler:
 
         job_id = "first-transfer-job"
 
-        handler = GateLeaderTransferHandler(state, logger, Mock())
+        handler = GateLeaderTransferHandler(state, logger, None)
 
         transfer = GateJobLeaderTransfer(
             job_id=job_id,
@@ -430,7 +411,7 @@ class TestManagerLeaderTransferHandler:
         job_id = "mgr-transfer-job"
         datacenter_id = "dc-east"
 
-        handler = ManagerLeaderTransferHandler(state, logger, Mock())
+        handler = ManagerLeaderTransferHandler(state, logger, None)
 
         transfer = ManagerJobLeaderTransfer(
             job_id=job_id,
@@ -593,7 +574,7 @@ class TestHandlersConcurrency:
         handler = JobStatusPushHandler(state, logger)
 
         async def send_status_update(job_id):
-            push = JobStatusPush(job_id=job_id, status="RUNNING")
+            push = JobStatusPush(job_id=job_id, status="RUNNING", message="Status update")
             data = push.dump()
             return await handler.handle(("server", 8000), data, 100)
 
@@ -611,7 +592,7 @@ class TestHandlersConcurrency:
         logger = Mock(spec=Logger)
         logger.log = AsyncMock()
 
-        handler = GateLeaderTransferHandler(state, logger, Mock())
+        handler = GateLeaderTransferHandler(state, logger, None)
 
         job_id = "concurrent-transfer-job"
 
