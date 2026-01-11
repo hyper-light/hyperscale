@@ -151,6 +151,7 @@ class LoggerStream:
         self._batch_max_size: int = 100
         self._batch_timer_handle: asyncio.TimerHandle | None = None
         self._batch_flush_task: asyncio.Task[None] | None = None
+        self._closing: bool = False
 
         self._read_files: Dict[str, io.FileIO] = {}
         self._read_locks: Dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
@@ -385,6 +386,8 @@ class LoggerStream:
         self._update_logfile_metadata(logfile_path, logfile_metadata)
 
     async def close(self, shutdown_subscribed: bool = False):
+        self._closing = True
+
         was_running = self._consumer.status == ConsumerStatus.RUNNING
 
         self._consumer.stop()
@@ -413,9 +416,12 @@ class LoggerStream:
                 except asyncio.CancelledError:
                     pass
 
-        for logfile_path in list(self._files.keys()):
-            if self._pending_batch:
-                await self._flush_batch(logfile_path)
+        if self._pending_batch and self._batch_lock:
+            async with self._batch_lock:
+                for _, future in self._pending_batch:
+                    if not future.done():
+                        future.set_result(None)
+                self._pending_batch.clear()
 
         await asyncio.gather(
             *[self._close_file(logfile_path) for logfile_path in self._files]
@@ -455,17 +461,14 @@ class LoggerStream:
 
     async def _close_file(self, logfile_path: str):
         if file_lock := self._file_locks.get(logfile_path):
-            if file_lock.locked():
-                file_lock.release()
-
             await file_lock.acquire()
-            await self._loop.run_in_executor(
-                None,
-                self._close_file_at_path,
-                logfile_path,
-            )
-
-            if file_lock.locked():
+            try:
+                await self._loop.run_in_executor(
+                    None,
+                    self._close_file_at_path,
+                    logfile_path,
+                )
+            finally:
                 file_lock.release()
 
     def _close_file_at_path(self, logfile_path: str):
@@ -1122,6 +1125,9 @@ class LoggerStream:
         return future
 
     def _trigger_batch_flush(self, logfile_path: str) -> None:
+        if self._closing:
+            return
+
         if self._batch_flush_task is None or self._batch_flush_task.done():
             self._batch_flush_task = asyncio.create_task(
                 self._flush_batch(logfile_path)
