@@ -360,6 +360,46 @@ class WorkerState:
         return self._backpressure_delay_ms
 
     # =========================================================================
+    # Progress Buffer (AD-37)
+    # =========================================================================
+
+    async def buffer_progress_update(
+        self,
+        workflow_id: str,
+        progress: WorkflowProgress,
+    ) -> None:
+        """
+        Buffer a progress update for later flush.
+
+        Args:
+            workflow_id: Workflow identifier
+            progress: Progress update to buffer
+        """
+        async with self._progress_buffer_lock:
+            self._progress_buffer[workflow_id] = progress
+
+    async def flush_progress_buffer(self) -> dict[str, WorkflowProgress]:
+        """
+        Flush and return all buffered progress updates.
+
+        Returns:
+            Dictionary of workflow_id to progress updates
+        """
+        async with self._progress_buffer_lock:
+            updates = dict(self._progress_buffer)
+            self._progress_buffer.clear()
+        return updates
+
+    async def clear_progress_buffer(self) -> None:
+        """Clear all buffered progress updates without returning them."""
+        async with self._progress_buffer_lock:
+            self._progress_buffer.clear()
+
+    def get_buffered_update_count(self) -> int:
+        """Get count of buffered progress updates."""
+        return len(self._progress_buffer)
+
+    # =========================================================================
     # Throughput Tracking (AD-19)
     # =========================================================================
 
@@ -388,3 +428,7 @@ class WorkerState:
         if avg_completion_time <= 0:
             return 0.0
         return 1.0 / avg_completion_time
+
+    def get_completion_sample_count(self) -> int:
+        """Get count of completion time samples."""
+        return len(self._completion_times)
