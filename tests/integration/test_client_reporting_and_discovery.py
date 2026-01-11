@@ -557,6 +557,7 @@ class TestClientDiscovery:
         )
         query_response = WorkflowQueryResponse(
             request_id="req-query-1",
+            manager_id="mgr-1",
             datacenter="dc-east",
             workflows=[workflow_info],
         )
@@ -599,6 +600,7 @@ class TestClientDiscovery:
         )
         query_response = WorkflowQueryResponse(
             request_id="req-query",
+            manager_id="mgr-1",
             datacenter="dc-east",
             workflows=[workflow_info],
         )
@@ -923,6 +925,7 @@ class TestClientDiscovery:
         """Test workflow query with empty workflow list."""
         query_response = WorkflowQueryResponse(
             request_id="req-empty",
+            manager_id="mgr-1",
             datacenter="dc-east",
             workflows=[],  # Empty workflow list
         )
@@ -971,6 +974,7 @@ class TestClientDiscovery:
         )
         query_response = WorkflowQueryResponse(
             request_id="req-special",
+            manager_id="mgr-1",
             datacenter="dc-east-🌍",
             workflows=[workflow_info],
         )
