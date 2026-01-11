@@ -485,7 +485,7 @@ class TestWindowedStatsPushHandler:
 
         handler = WindowedStatsPushHandler(state, logger, None)
 
-        push = WindowedStatsPush(job_id=job_id, window_stats={})
+        push = WindowedStatsPush(job_id=job_id, workflow_id="workflow-1")
         data = cloudpickle.dumps(push)
 
         result = await handler.handle(("server", 8000), data, 100)
@@ -506,7 +506,7 @@ class TestWindowedStatsPushHandler:
 
         handler = WindowedStatsPushHandler(state, logger, rate_limiter)
 
-        push = WindowedStatsPush(job_id="rate-job", window_stats={})
+        push = WindowedStatsPush(job_id="rate-job", workflow_id="workflow-1")
         data = cloudpickle.dumps(push)
 
         result = await handler.handle(("server", 8000), data, 100)
@@ -529,7 +529,7 @@ class TestWindowedStatsPushHandler:
 
         handler = WindowedStatsPushHandler(state, logger, None)
 
-        push = WindowedStatsPush(job_id=job_id, window_stats={})
+        push = WindowedStatsPush(job_id=job_id, workflow_id="workflow-1")
         data = cloudpickle.dumps(push)
 
         # Should not raise, handles gracefully
@@ -546,7 +546,7 @@ class TestWindowedStatsPushHandler:
 
         handler = WindowedStatsPushHandler(state, logger, None)
 
-        push = WindowedStatsPush(job_id="no-callback-job", window_stats={})
+        push = WindowedStatsPush(job_id="no-callback-job", workflow_id="workflow-1")
         data = cloudpickle.dumps(push)
 
         result = await handler.handle(("server", 8000), data, 100)
@@ -567,7 +567,8 @@ class TestHandlersConcurrency:
 
         job_ids = [f"concurrent-job-{i}" for i in range(10)]
         for jid in job_ids:
-            state.initialize_job_tracking(jid)
+            initial_result = ClientJobResult(job_id=jid, status="PENDING")
+            state.initialize_job_tracking(jid, initial_result)
 
         handler = JobStatusPushHandler(state, logger)
 
@@ -597,8 +598,8 @@ class TestHandlersConcurrency:
         async def send_transfer(fence_token):
             transfer = GateJobLeaderTransfer(
                 job_id=job_id,
-                new_leader_host=f"gate-{fence_token}",
-                new_leader_tcp_port=9000 + fence_token,
+                new_gate_id=f"gate-{fence_token}",
+                new_gate_addr=(f"gate-{fence_token}", 9000 + fence_token),
                 fence_token=fence_token,
             )
             data = transfer.dump()
