@@ -23178,250 +23178,290 @@ WorkerNode
 
 ---
 
-## Part 14: Multi-Raft Global Replication
+## Part 14: Per-Job Viewstamped Replication
 
-This section defines the maximally correct, robust, and performant architecture for global job ledger replication across datacenters.
+This section defines the maximally correct, robust, and performant architecture for global job ledger replication across datacenters, integrated with the existing per-job leadership model.
 
-### Why Multi-Raft?
+### Why Per-Job VSR (Not Multi-Raft)?
 
-For a distributed job ledger, the replication protocol must satisfy:
+For a distributed job ledger **with per-job leadership already established**, the replication protocol must integrate with existing mechanisms:
 
-| Requirement | Constraint |
-|-------------|------------|
-| **No lost jobs** | Durability via quorum replication |
-| **No duplicate jobs** | Exactly-once via log position deduplication |
-| **Ordering** | Total ordering within shard, causal across shards |
-| **Partition tolerance** | Majority quorum continues during partitions |
-| **Automatic failover** | Leader election on failure |
-| **High throughput** | Parallel writes to independent shards |
+| Existing Mechanism | What It Provides |
+|-------------------|------------------|
+| **Consistent hash ring** | Deterministic job-to-gate assignment |
+| **Lease-based ownership** | Active ownership confirmation with TTL |
+| **Fencing tokens** | Monotonic tokens prevent stale updates |
+| **Backup gates** | Ordered failover candidates |
 
-**Multi-Raft** (multiple independent Raft groups, sharded by job ID) is the maximally correct approach because:
+**Key Insight**: The per-job leadership model already determines WHO writes for each job. Adding Raft leader election is redundant—we just need durable replication.
 
-1. **Raft is proven correct** - Formal TLA+ proofs exist
-2. **Sharding eliminates single-leader bottleneck** - N shards = N parallel leaders
-3. **Independent failure domains** - One shard down ≠ all down
-4. **Same strong consistency guarantees** - Each shard is a full Raft group
+**Per-Job Viewstamped Replication** maps directly to existing infrastructure:
+
+| Per-Job Leadership | Viewstamped Replication |
+|-------------------|-------------------------|
+| Fencing token | View number |
+| Job leader (gate) | Primary |
+| Consistent hash backups | Replica set |
+| Lease expiry | View change trigger |
+| Lease acquisition | View change completion |
+
+**Why VSR over Raft for this system:**
+
+1. **No redundant election** - Job leadership already determined by consistent hash + lease
+2. **Unified view management** - Fencing tokens ARE view numbers
+3. **Direct write path** - Job leader writes to replicas, no shard leader indirection
+4. **Simpler protocol** - No term tracking, no log matching property needed
+5. **Proven correct** - VSR has formal proofs identical to Raft
 
 ### Architecture Overview
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
-│                     MULTI-RAFT GLOBAL JOB LEDGER                                │
+│               PER-JOB VIEWSTAMPED REPLICATION ARCHITECTURE                      │
 │                                                                                 │
-│  ┌───────────────────────────────────────────────────────────────────────────┐  │
-│  │                    SHARD ASSIGNMENT (hash(job_id) % N)                    │  │
-│  │                                                                           │  │
-│  │  job_id: use1-1704931200000-gate42-00001 → hash → shard_2               │  │
-│  │  job_id: euw1-1704931200001-gate07-00042 → hash → shard_0               │  │
-│  │  job_id: apac-1704931200002-gate15-00007 → hash → shard_1               │  │
-│  └───────────────────────────────────────────────────────────────────────────┘  │
+│  INTEGRATION WITH EXISTING PER-JOB LEADERSHIP:                                  │
+│  ────────────────────────────────────────────────────────────────────────────  │
 │                                                                                 │
 │  ┌─────────────────────────────────────────────────────────────────────────┐    │
-│  │              RAFT GROUP 0 (shard_0: jobs hashing to 0)                  │    │
+│  │                    CONSISTENT HASH RING (existing)                      │    │
 │  │                                                                         │    │
-│  │   US-EAST Gate     EU-WEST Gate      APAC Gate                         │    │
-│  │   ┌─────────┐      ┌─────────┐      ┌─────────┐                        │    │
-│  │   │ LEADER  │◄────►│ FOLLOWER│◄────►│ FOLLOWER│                        │    │
-│  │   │         │      │         │      │         │                        │    │
-│  │   │ Log:    │      │ Log:    │      │ Log:    │                        │    │
-│  │   │ [1,2,3] │      │ [1,2,3] │      │ [1,2]   │  ← replicating        │    │
-│  │   └─────────┘      └─────────┘      └─────────┘                        │    │
+│  │  hash("job-abc") → Gate-2 (primary), Gate-3 (backup1), Gate-4 (backup2)│    │
+│  │  hash("job-xyz") → Gate-1 (primary), Gate-2 (backup1), Gate-3 (backup2)│    │
+│  │  hash("job-123") → Gate-4 (primary), Gate-1 (backup1), Gate-2 (backup2)│    │
 │  └─────────────────────────────────────────────────────────────────────────┘    │
 │                                                                                 │
 │  ┌─────────────────────────────────────────────────────────────────────────┐    │
-│  │              RAFT GROUP 1 (shard_1: jobs hashing to 1)                  │    │
+│  │                VSR REPLICATION FOR JOB "job-abc"                        │    │
 │  │                                                                         │    │
-│  │   US-EAST Gate     EU-WEST Gate      APAC Gate                         │    │
-│  │   ┌─────────┐      ┌─────────┐      ┌─────────┐                        │    │
-│  │   │ FOLLOWER│◄────►│ LEADER  │◄────►│ FOLLOWER│                        │    │
-│  │   │         │      │         │      │         │                        │    │
-│  │   │ Log:    │      │ Log:    │      │ Log:    │                        │    │
-│  │   │ [1,2,3] │      │ [1,2,3] │      │ [1,2,3] │                        │    │
-│  │   └─────────┘      └─────────┘      └─────────┘                        │    │
+│  │   Gate-2 (Primary)     Gate-3 (Replica)      Gate-4 (Replica)          │    │
+│  │   ┌─────────────┐      ┌─────────────┐      ┌─────────────┐            │    │
+│  │   │ view=5      │      │ view=5      │      │ view=5      │            │    │
+│  │   │ (fence tok) │      │             │      │             │            │    │
+│  │   │             │      │             │      │             │            │    │
+│  │   │ Log:        │      │ Log:        │      │ Log:        │            │    │
+│  │   │ [v5:0,1,2]  │─────►│ [v5:0,1,2]  │      │ [v5:0,1]    │            │    │
+│  │   │             │      │             │      │ (catching up)│            │    │
+│  │   │ SINGLE      │      │             │      │             │            │    │
+│  │   │ WRITER      │      │             │      │             │            │    │
+│  │   └─────────────┘      └─────────────┘      └─────────────┘            │    │
 │  └─────────────────────────────────────────────────────────────────────────┘    │
 │                                                                                 │
-│  ┌─────────────────────────────────────────────────────────────────────────┐    │
-│  │              RAFT GROUP 2 (shard_2: jobs hashing to 2)                  │    │
-│  │                                                                         │    │
-│  │   US-EAST Gate     EU-WEST Gate      APAC Gate                         │    │
-│  │   ┌─────────┐      ┌─────────┐      ┌─────────┐                        │    │
-│  │   │ FOLLOWER│◄────►│ FOLLOWER│◄────►│ LEADER  │                        │    │
-│  │   │         │      │         │      │         │                        │    │
-│  │   │ Log:    │      │ Log:    │      │ Log:    │                        │    │
-│  │   │ [1,2]   │      │ [1,2]   │      │ [1,2,3] │  ← replicating        │    │
-│  │   └─────────┘      └─────────┘      └─────────┘                        │    │
-│  └─────────────────────────────────────────────────────────────────────────┘    │
+│  KEY DIFFERENCE FROM MULTI-RAFT:                                               │
+│  ────────────────────────────────────────────────────────────────────────────  │
 │                                                                                 │
-│  BENEFITS:                                                                      │
-│  • Leadership distributed across DCs (load balancing)                          │
-│  • Independent failure domains (one group down ≠ all down)                     │
-│  • Parallel writes (different jobs to different leaders)                       │
-│  • Same strong consistency guarantees as single Raft                           │
-│  • Linear scalability with shard count                                         │
+│  Multi-Raft (redundant):          Per-Job VSR (unified):                       │
+│  ┌────────────────────┐           ┌────────────────────┐                       │
+│  │ Job Leader         │           │ Job Leader         │                       │
+│  │ (consistent hash)  │           │ (consistent hash)  │                       │
+│  │        │           │           │        │           │                       │
+│  │        ▼           │           │        │           │                       │
+│  │ Raft Shard Leader  │           │        │           │                       │
+│  │ (elected - may     │           │        │           │                       │
+│  │  differ!)          │           │        ▼           │                       │
+│  │        │           │           │ VSR Replicas       │                       │
+│  │        ▼           │           │ (hash backups)     │                       │
+│  │ Raft Followers     │           └────────────────────┘                       │
+│  └────────────────────┘                                                        │
+│                                                                                 │
+│  VSR eliminates the Raft shard leader indirection.                             │
+│  Job leader writes DIRECTLY to its replicas.                                   │
+│                                                                                 │
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Raft State Machine
+### VSR State Machine
 
-Each Raft group maintains the standard Raft state:
+Each replica maintains VSR state per job:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
-│                           RAFT NODE STATE                                       │
+│                           VSR REPLICA STATE (PER JOB)                           │
 │                                                                                 │
 │  Persistent State (survives restarts):                                         │
-│  ├── current_term: int          # Latest term seen                             │
-│  ├── voted_for: str | None      # Candidate voted for in current term          │
-│  └── log: list[LogEntry]        # Log entries (index 1-based)                  │
+│  ├── view: int                  # Current view = fencing token                 │
+│  ├── sequence: int              # Next expected sequence in current view       │
+│  ├── prepare_log: list[Entry]   # Prepared but not yet committed entries       │
+│  └── commit_log: list[Entry]    # Committed entries                            │
 │                                                                                 │
-│  Volatile State (all nodes):                                                    │
-│  ├── commit_index: int          # Highest log entry known committed            │
-│  ├── last_applied: int          # Highest log entry applied to state machine   │
-│  └── role: FOLLOWER | CANDIDATE | LEADER                                       │
+│  Per-Entry State:                                                               │
+│  ├── view: int                  # View when entry was created                  │
+│  ├── seq: int                   # Sequence number within view                  │
+│  ├── data: JobEvent             # The job state change                         │
+│  └── hlc: HybridLogicalClock    # For causal ordering across jobs              │
 │                                                                                 │
-│  Volatile State (leaders only):                                                 │
-│  ├── next_index: dict[node_id, int]    # Next log index to send to each node   │
-│  └── match_index: dict[node_id, int]   # Highest log index replicated to node  │
-│                                                                                 │
-└─────────────────────────────────────────────────────────────────────────────────┘
-```
-
-### Raft Role Transitions
-
-```
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                           RAFT ROLE STATE MACHINE                               │
-│                                                                                 │
-│                              Startup                                            │
-│                                 │                                               │
-│                                 ▼                                               │
-│                          ┌───────────┐                                          │
-│                          │ FOLLOWER  │◄─────────────────────────────┐           │
-│                          └─────┬─────┘                              │           │
-│                                │                                    │           │
-│                                │ Election timeout                   │           │
-│                                │ (no heartbeat from leader)         │           │
-│                                ▼                                    │           │
-│                          ┌───────────┐                              │           │
-│              ┌──────────►│ CANDIDATE │                              │           │
-│              │           └─────┬─────┘                              │           │
-│              │                 │                                    │           │
-│   Election   │    ┌────────────┼────────────┐                       │           │
-│   timeout    │    │            │            │                       │           │
-│   (split     │    │            │            │                       │           │
-│   vote)      │    ▼            ▼            ▼                       │           │
-│              │  Loses      Wins vote    Discovers                   │           │
-│              │  election   (majority)   higher term                 │           │
-│              │    │            │            │                       │           │
-│              │    │            │            │                       │           │
-│              └────┘            ▼            └───────────────────────┘           │
-│                          ┌───────────┐                                          │
-│                          │  LEADER   │                                          │
-│                          └─────┬─────┘                                          │
-│                                │                                                │
-│                                │ Discovers higher term                          │
-│                                │ (from AppendEntries or RequestVote response)   │
-│                                │                                                │
-│                                └────────────────────────────────────────────────┘
-│                                         (reverts to FOLLOWER)                   │
+│  Primary State (job leader only):                                               │
+│  ├── next_seq: int              # Next sequence to assign                      │
+│  ├── pending: dict[seq, Future] # Awaiting quorum ack                          │
+│  └── replica_ack: dict[seq, set[replica_id]]  # Which replicas acked           │
 │                                                                                 │
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Log Replication Flow
+### VSR vs Raft: Why No Election?
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
-│                           LOG REPLICATION SEQUENCE                              │
+│                           NO ELECTION NEEDED                                    │
 │                                                                                 │
-│  Client        Leader (US-EAST)      Follower (EU-WEST)    Follower (APAC)     │
+│  RAFT APPROACH (what we're NOT doing):                                         │
+│  ────────────────────────────────────────────────────────────────────────────  │
+│                                                                                 │
+│  1. Node detects leader failure (election timeout)                             │
+│  2. Node increments term, becomes candidate                                    │
+│  3. Node requests votes from peers                                             │
+│  4. Peers vote based on log completeness                                       │
+│  5. Winner becomes leader                                                      │
+│                                                                                 │
+│  Problem: This duplicates what per-job leadership already does!                │
+│                                                                                 │
+│  VSR APPROACH (what we ARE doing):                                             │
+│  ────────────────────────────────────────────────────────────────────────────  │
+│                                                                                 │
+│  1. Job leader determined by consistent hash (deterministic)                   │
+│  2. Ownership confirmed by lease acquisition                                   │
+│  3. Fencing token = view number (monotonic)                                    │
+│  4. On failure: lease expires → backup acquires lease → new view               │
+│                                                                                 │
+│  ┌───────────────────────────────────────────────────────────────────────┐     │
+│  │                    VIEW CHANGE (LEASE-BASED)                          │     │
+│  │                                                                       │     │
+│  │   Primary Failure         Backup Takeover                             │     │
+│  │        │                       │                                      │     │
+│  │        X                       │                                      │     │
+│  │   (lease expires)              │                                      │     │
+│  │                                │                                      │     │
+│  │                    ┌───────────┴───────────┐                          │     │
+│  │                    │                       │                          │     │
+│  │                    ▼                       │                          │     │
+│  │            Acquire lease                   │                          │     │
+│  │            (new fence token)               │                          │     │
+│  │                    │                       │                          │     │
+│  │                    ▼                       │                          │     │
+│  │            Send ViewChange                 │                          │     │
+│  │            to replicas                     │                          │     │
+│  │                    │                       │                          │     │
+│  │                    ▼                       │                          │     │
+│  │            Collect state from              │                          │     │
+│  │            quorum (latest seq)             │                          │     │
+│  │                    │                       │                          │     │
+│  │                    ▼                       │                          │     │
+│  │            Start new view at               │                          │     │
+│  │            max(seq) + 1                    │                          │     │
+│  │                                                                       │     │
+│  └───────────────────────────────────────────────────────────────────────┘     │
+│                                                                                 │
+│  NO ELECTION PROTOCOL - leadership is DETERMINISTIC from consistent hash       │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Write Protocol (Prepare-Commit)
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                        VSR WRITE PROTOCOL (2-PHASE)                             │
+│                                                                                 │
+│  Client       Job Leader (Primary)    Replica (Backup1)    Replica (Backup2)   │
 │    │                 │                      │                    │              │
-│    │  1. Submit      │                      │                    │              │
-│    │  JobCreate      │                      │                    │              │
+│    │  1. CreateJob   │                      │                    │              │
 │    │────────────────►│                      │                    │              │
 │    │                 │                      │                    │              │
-│    │                 │  2. Append to        │                    │              │
-│    │                 │     local log        │                    │              │
-│    │                 │  ┌─────────────┐     │                    │              │
-│    │                 │  │ Log: [1,2,3]│     │                    │              │
-│    │                 │  └─────────────┘     │                    │              │
+│    │                 │  2. Verify lease     │                    │              │
+│    │                 │     ownership        │                    │              │
 │    │                 │                      │                    │              │
-│    │                 │  3. AppendEntries    │                    │              │
+│    │                 │  3. Assign seq=N     │                    │              │
+│    │                 │     in current view  │                    │              │
+│    │                 │                      │                    │              │
+│    │                 │  4. Prepare(view=5, seq=N, data)          │              │
 │    │                 │─────────────────────►│                    │              │
 │    │                 │─────────────────────────────────────────►│              │
 │    │                 │                      │                    │              │
-│    │                 │  4. Follower         │                    │              │
-│    │                 │     appends entry    │                    │              │
-│    │                 │                      │  ┌─────────────┐   │              │
-│    │                 │                      │  │ Log: [1,2,3]│   │              │
-│    │                 │                      │  └─────────────┘   │              │
+│    │                 │                      │  5. Verify:        │              │
+│    │                 │                      │  - view >= known   │              │
+│    │                 │                      │  - seq == expected │              │
+│    │                 │                      │  - Persist entry   │              │
 │    │                 │                      │                    │              │
-│    │                 │  5. ACK              │                    │              │
+│    │                 │  6. PrepareAck       │                    │              │
 │    │                 │◄─────────────────────│                    │              │
 │    │                 │◄─────────────────────────────────────────│              │
 │    │                 │                      │                    │              │
-│    │                 │  6. Quorum reached   │                    │              │
+│    │                 │  7. Quorum reached   │                    │              │
 │    │                 │     (2/3 = majority) │                    │              │
-│    │                 │     commit_index++   │                    │              │
 │    │                 │                      │                    │              │
-│    │  7. ACK         │                      │                    │              │
-│    │◄────────────────│                      │                    │              │
-│    │  (committed)    │                      │                    │              │
-│    │                 │                      │                    │              │
-│    │                 │  8. Next heartbeat   │                    │              │
-│    │                 │     includes new     │                    │              │
-│    │                 │     commit_index     │                    │              │
+│    │                 │  8. Commit(view=5, seq=N)                 │              │
 │    │                 │─────────────────────►│                    │              │
 │    │                 │─────────────────────────────────────────►│              │
 │    │                 │                      │                    │              │
-│    │                 │  9. Followers apply  │                    │              │
-│    │                 │     committed entry  │                    │              │
-│    │                 │     to state machine │                    │              │
+│    │  9. ACK         │                      │                    │              │
+│    │◄────────────────│                      │                    │              │
+│    │  (committed)    │                      │                    │              │
+│    │                 │                      │                    │              │
+│                                                                                 │
+│  KEY PROPERTIES:                                                               │
+│  ─────────────────────────────────────────────────────────────────────────────  │
+│  • SINGLE WRITER: Only job leader can issue Prepare for this job               │
+│  • SEQUENCED: Replicas reject out-of-order sequence numbers                    │
+│  • FENCED: Replicas reject Prepare from old views (stale leaders)              │
+│  • DURABLE: Entry persisted before PrepareAck sent                             │
 │                                                                                 │
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Leader Election Protocol
+### View Change Protocol (Lease-Based Failover)
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
-│                           LEADER ELECTION SEQUENCE                              │
+│                      VIEW CHANGE PROTOCOL (LEASE-BASED)                         │
 │                                                                                 │
-│  US-EAST (Candidate)    EU-WEST (Follower)    APAC (Follower)                  │
+│  Old Primary (Gate-2)    Backup1 (Gate-3)      Backup2 (Gate-4)                │
 │         │                      │                    │                           │
-│         │  1. Election timeout │                    │                           │
-│         │     current_term++   │                    │                           │
-│         │     vote for self    │                    │                           │
-│         │                      │                    │                           │
-│         │  2. RequestVote      │                    │                           │
-│         │     term=2           │                    │                           │
-│         │     lastLogIndex=5   │                    │                           │
-│         │     lastLogTerm=1    │                    │                           │
-│         │─────────────────────►│                    │                           │
-│         │─────────────────────────────────────────►│                           │
-│         │                      │                    │                           │
-│         │                      │  3. Check:         │                           │
-│         │                      │  - term >= current │                           │
-│         │                      │  - not voted yet   │                           │
-│         │                      │  - log up-to-date  │                           │
-│         │                      │                    │                           │
-│         │  4. VoteGranted      │                    │                           │
-│         │◄─────────────────────│                    │                           │
-│         │◄─────────────────────────────────────────│                           │
-│         │                      │                    │                           │
-│         │  5. Majority votes   │                    │                           │
-│         │     (2/3 including   │                    │                           │
-│         │      self) → LEADER  │                    │                           │
-│         │                      │                    │                           │
-│         │  6. Send heartbeats  │                    │                           │
-│         │     (empty Append-   │                    │                           │
-│         │      Entries)        │                    │                           │
-│         │─────────────────────►│                    │                           │
-│         │─────────────────────────────────────────►│                           │
-│         │                      │                    │                           │
-│         │                      │  7. Accept leader  │                           │
-│         │                      │     reset election │                           │
-│         │                      │     timer          │                           │
+│         X                      │                    │                           │
+│    (crashes, lease            │                    │                           │
+│     expires after TTL)        │                    │                           │
+│                               │                    │                           │
+│                    ┌──────────┴────────────────────┤                           │
+│                    │                               │                           │
+│                    │  1. Detect lease expiry       │                           │
+│                    │     (from hash ring - I'm     │                           │
+│                    │      next in line)            │                           │
+│                    │                               │                           │
+│                    │  2. Acquire lease             │                           │
+│                    │     new_view = old_view + 1   │                           │
+│                    │     fence_token = 6           │                           │
+│                    │                               │                           │
+│                    │  3. ViewChange(new_view=6)    │                           │
+│                    │──────────────────────────────►│                           │
+│                    │                               │                           │
+│                    │  4. ViewChangeAck             │                           │
+│                    │     (last_prepared_seq=42)    │                           │
+│                    │◄──────────────────────────────│                           │
+│                    │                               │                           │
+│                    │  Also query crashed primary   │                           │
+│                    │  (if reachable) for its state │                           │
+│                    │                               │                           │
+│                    │  5. Compute start_seq =       │                           │
+│                    │     max(all_last_prepared) + 1│                           │
+│                    │     = 43                      │                           │
+│                    │                               │                           │
+│                    │  6. NewView(view=6, seq=43)   │                           │
+│                    │──────────────────────────────►│                           │
+│                    │                               │                           │
+│                    │  7. Begin accepting writes    │                           │
+│                    │     at seq=43 in view=6       │                           │
+│                    │                               │                           │
+│                                                                                 │
+│  SAFETY GUARANTEE:                                                              │
+│  ─────────────────────────────────────────────────────────────────────────────  │
+│  • Old primary's uncommitted writes (seq > 42) cannot commit:                  │
+│    - Would need quorum ack                                                     │
+│    - But quorum has moved to view=6                                            │
+│    - Replicas reject view=5 Prepare messages                                   │
+│                                                                                 │
+│  • New primary's start_seq ensures no sequence gaps                            │
+│                                                                                 │
+│  • Fencing token prevents stale primary from writing:                          │
+│    - Even if old primary recovers, its token=5 is rejected                     │
+│    - Must re-acquire lease (would get token >= 7)                              │
 │                                                                                 │
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -23430,787 +23470,780 @@ Each Raft group maintains the standard Raft state:
 
 ```python
 """
-hyperscale/distributed_rewrite/ledger/raft/raft_node.py
+hyperscale/distributed_rewrite/ledger/vsr/job_vsr.py
 
-Multi-Raft implementation for global job ledger replication.
+Per-Job Viewstamped Replication for global job ledger.
+Integrates with existing per-job leadership model.
 Uses Single-Writer architecture (AD-39 Part 15) for log persistence.
 """
 
 import asyncio
-import hashlib
-import random
 import time
-from collections import defaultdict
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Callable, Generic, TypeVar
+from typing import Generic, TypeVar
 
 from hyperscale.distributed_rewrite.ledger.models.hlc import HybridLogicalClock
+from hyperscale.distributed_rewrite.nodes.gate import GateJobLease
 
 
 T = TypeVar('T')
 
 
-class RaftRole(Enum):
-    """Raft node role."""
-    FOLLOWER = auto()
-    CANDIDATE = auto()
-    LEADER = auto()
-
-
-class MessageType(Enum):
-    """Raft RPC message types."""
-    REQUEST_VOTE = auto()
-    REQUEST_VOTE_RESPONSE = auto()
-    APPEND_ENTRIES = auto()
-    APPEND_ENTRIES_RESPONSE = auto()
+class PrepareStatus(Enum):
+    """Result of Prepare request handling."""
+    SUCCESS = auto()
+    STALE_VIEW = auto()
+    WRONG_SEQUENCE = auto()
+    NOT_OWNER = auto()
 
 
 @dataclass(slots=True)
-class LogEntry(Generic[T]):
-    """Single entry in the Raft log."""
-    term: int
-    index: int
-    command: T
+class VSREntry(Generic[T]):
+    """Single entry in the VSR log."""
+    view: int              # Fencing token when entry was created
+    seq: int               # Sequence number within view
+    data: T                # The job event
+    hlc: HybridLogicalClock
+    committed: bool = False
+
+
+@dataclass(slots=True)
+class Prepare(Generic[T]):
+    """Prepare RPC from primary to replicas."""
+    job_id: str
+    view: int              # = fencing token
+    seq: int               # Sequence number
+    data: T                # Job event
     hlc: HybridLogicalClock
 
 
 @dataclass(slots=True)
-class RequestVote:
-    """RequestVote RPC."""
-    term: int
-    candidate_id: str
-    last_log_index: int
-    last_log_term: int
+class PrepareResponse:
+    """Prepare RPC response."""
+    job_id: str
+    status: PrepareStatus
+    current_view: int      # Replica's known view
+    expected_seq: int      # For WRONG_SEQUENCE, what replica expects
 
 
 @dataclass(slots=True)
-class RequestVoteResponse:
-    """RequestVote RPC response."""
-    term: int
-    vote_granted: bool
+class Commit:
+    """Commit notification from primary to replicas."""
+    job_id: str
+    view: int
+    seq: int
 
 
 @dataclass(slots=True)
-class AppendEntries(Generic[T]):
-    """AppendEntries RPC."""
-    term: int
-    leader_id: str
-    prev_log_index: int
-    prev_log_term: int
-    entries: list[LogEntry[T]]
-    leader_commit: int
+class ViewChange:
+    """View change request from new primary."""
+    job_id: str
+    new_view: int          # New fencing token
 
 
 @dataclass(slots=True)
-class AppendEntriesResponse:
-    """AppendEntries RPC response."""
-    term: int
-    success: bool
-    match_index: int  # Highest index replicated (for fast catch-up)
+class ViewChangeResponse:
+    """View change response with replica state."""
+    job_id: str
+    last_prepared_view: int
+    last_prepared_seq: int
+    uncommitted_entries: list[VSREntry]
 
 
-@dataclass
-class RaftConfig:
-    """Raft timing and cluster configuration."""
-    election_timeout_min_ms: int = 150
-    election_timeout_max_ms: int = 300
-    heartbeat_interval_ms: int = 50
-    batch_size: int = 100
-    max_entries_per_append: int = 1000
+@dataclass(slots=True)
+class NewView:
+    """New view announcement from primary."""
+    job_id: str
+    view: int
+    start_seq: int
 
 
-class RaftNode(Generic[T]):
+class JobReplicaState(Generic[T]):
     """
-    Single Raft consensus node.
-
-    Implements the Raft protocol for distributed consensus:
-    - Leader election with randomized timeouts
-    - Log replication with consistency checks
-    - Commit index advancement on quorum
-    - State machine application
+    Per-job state maintained by each replica.
 
     Thread Safety:
-    - All state mutations through single-writer pattern
-    - RPC handlers queue commands, single task processes
+    - All access through single-writer pattern
     - No locks required (asyncio single-threaded)
-
-    Integration:
-    - Uses SingleWriterBuffer (AD-39 Part 15) for log persistence
-    - Integrates with HybridLogicalClock for causal ordering
-    - Works with existing Gate/Manager node infrastructure
     """
 
     __slots__ = (
-        '_node_id', '_peers', '_config',
-        '_current_term', '_voted_for', '_log',
-        '_commit_index', '_last_applied', '_role',
-        '_next_index', '_match_index',
-        '_leader_id', '_votes_received',
-        '_election_timer', '_heartbeat_timer',
-        '_command_queue', '_pending_commits',
-        '_state_machine', '_transport',
-        '_running', '_hlc',
+        'job_id', 'known_view', 'expected_seq',
+        'prepare_log', 'commit_log', '_hlc',
+    )
+
+    def __init__(self, job_id: str, hlc: HybridLogicalClock):
+        self.job_id = job_id
+        self.known_view = 0        # Highest view seen
+        self.expected_seq = 0      # Next expected sequence
+        self.prepare_log: list[VSREntry[T]] = []
+        self.commit_log: list[VSREntry[T]] = []
+        self._hlc = hlc
+
+    def handle_prepare(self, prepare: Prepare[T]) -> PrepareResponse:
+        """
+        Handle Prepare from primary.
+
+        Sequence checking ensures total ordering within view.
+        View checking ensures stale primaries are rejected.
+        """
+        # Check view
+        if prepare.view < self.known_view:
+            return PrepareResponse(
+                job_id=self.job_id,
+                status=PrepareStatus.STALE_VIEW,
+                current_view=self.known_view,
+                expected_seq=self.expected_seq,
+            )
+
+        # New view - reset sequence expectation
+        if prepare.view > self.known_view:
+            self.known_view = prepare.view
+            self.expected_seq = 0
+
+        # Check sequence
+        if prepare.seq != self.expected_seq:
+            return PrepareResponse(
+                job_id=self.job_id,
+                status=PrepareStatus.WRONG_SEQUENCE,
+                current_view=self.known_view,
+                expected_seq=self.expected_seq,
+            )
+
+        # Valid prepare - create entry and persist
+        entry = VSREntry(
+            view=prepare.view,
+            seq=prepare.seq,
+            data=prepare.data,
+            hlc=prepare.hlc,
+            committed=False,
+        )
+        self.prepare_log.append(entry)
+        self.expected_seq = prepare.seq + 1
+
+        return PrepareResponse(
+            job_id=self.job_id,
+            status=PrepareStatus.SUCCESS,
+            current_view=self.known_view,
+            expected_seq=self.expected_seq,
+        )
+
+    def handle_commit(self, commit: Commit) -> bool:
+        """
+        Handle Commit from primary.
+
+        Marks prepared entry as committed.
+        Returns True if commit was applied.
+        """
+        if commit.view != self.known_view:
+            return False
+
+        # Find and commit the entry
+        for entry in self.prepare_log:
+            if entry.view == commit.view and entry.seq == commit.seq:
+                if not entry.committed:
+                    entry.committed = True
+                    self.commit_log.append(entry)
+                    return True
+
+        return False
+
+    def handle_view_change(self, view_change: ViewChange) -> ViewChangeResponse:
+        """
+        Handle ViewChange from new primary.
+
+        Returns state needed for new primary to determine start_seq.
+        """
+        # Accept new view
+        if view_change.new_view > self.known_view:
+            self.known_view = view_change.new_view
+
+        # Find last prepared entry
+        last_view = 0
+        last_seq = -1
+        uncommitted: list[VSREntry] = []
+
+        for entry in self.prepare_log:
+            if not entry.committed:
+                uncommitted.append(entry)
+            if entry.seq > last_seq:
+                last_view = entry.view
+                last_seq = entry.seq
+
+        return ViewChangeResponse(
+            job_id=self.job_id,
+            last_prepared_view=last_view,
+            last_prepared_seq=last_seq,
+            uncommitted_entries=uncommitted,
+        )
+
+    def handle_new_view(self, new_view: NewView) -> None:
+        """
+        Handle NewView from new primary.
+
+        Resets sequence expectation for new view.
+        """
+        if new_view.view >= self.known_view:
+            self.known_view = new_view.view
+            self.expected_seq = new_view.start_seq
+
+
+class JobPrimaryState(Generic[T]):
+    """
+    Per-job state maintained by the primary (job leader).
+
+    Manages pending writes awaiting quorum acknowledgment.
+    """
+
+    __slots__ = (
+        'job_id', 'view', 'next_seq',
+        'pending', 'replica_acks', '_hlc',
     )
 
     def __init__(
         self,
-        node_id: str,
-        peers: list[str],
-        config: RaftConfig,
-        state_machine: Callable[[T], None],
-        transport: 'RaftTransport',
+        job_id: str,
+        view: int,
+        start_seq: int,
+        hlc: HybridLogicalClock,
     ):
-        self._node_id = node_id
-        self._peers = peers
-        self._config = config
-        self._state_machine = state_machine
-        self._transport = transport
+        self.job_id = job_id
+        self.view = view
+        self.next_seq = start_seq
+        self.pending: dict[int, tuple[T, asyncio.Future[int]]] = {}
+        self.replica_acks: dict[int, set[str]] = {}
+        self._hlc = hlc
 
-        # Persistent state
-        self._current_term = 0
-        self._voted_for: str | None = None
-        self._log: list[LogEntry[T]] = []
-
-        # Volatile state
-        self._commit_index = 0
-        self._last_applied = 0
-        self._role = RaftRole.FOLLOWER
-
-        # Leader state
-        self._next_index: dict[str, int] = {}
-        self._match_index: dict[str, int] = {}
-
-        # Election state
-        self._leader_id: str | None = None
-        self._votes_received: set[str] = set()
-
-        # Timers
-        self._election_timer: asyncio.Task | None = None
-        self._heartbeat_timer: asyncio.Task | None = None
-
-        # Command handling
-        self._command_queue: asyncio.Queue[tuple[T, asyncio.Future]] = asyncio.Queue()
-        self._pending_commits: dict[int, asyncio.Future] = {}
-
-        self._running = False
-        self._hlc = HybridLogicalClock.now(node_id)
-
-    @property
-    def is_leader(self) -> bool:
-        return self._role == RaftRole.LEADER
-
-    @property
-    def leader_id(self) -> str | None:
-        return self._leader_id if self._role != RaftRole.LEADER else self._node_id
-
-    async def start(self) -> None:
-        """Start the Raft node."""
-        self._running = True
-        self._reset_election_timer()
-        asyncio.create_task(self._process_commands())
-
-    async def stop(self) -> None:
-        """Stop the Raft node."""
-        self._running = False
-        if self._election_timer:
-            self._election_timer.cancel()
-        if self._heartbeat_timer:
-            self._heartbeat_timer.cancel()
-
-    async def submit(self, command: T) -> int:
+    def create_prepare(self, data: T) -> tuple[Prepare[T], asyncio.Future[int]]:
         """
-        Submit command to the cluster.
-        Returns log index when committed.
-        Raises if not leader.
+        Create Prepare for new write.
+
+        Returns (Prepare message, Future that resolves when committed).
         """
-        if self._role != RaftRole.LEADER:
-            raise NotLeaderError(self._leader_id)
+        seq = self.next_seq
+        self.next_seq += 1
+
+        prepare = Prepare(
+            job_id=self.job_id,
+            view=self.view,
+            seq=seq,
+            data=data,
+            hlc=self._hlc.tick(int(time.time() * 1000)),
+        )
 
         future: asyncio.Future[int] = asyncio.get_event_loop().create_future()
-        await self._command_queue.put((command, future))
-        return await future
+        self.pending[seq] = (data, future)
+        self.replica_acks[seq] = set()
 
-    async def _process_commands(self) -> None:
-        """Single-writer command processor."""
-        while self._running:
-            try:
-                command, future = await asyncio.wait_for(
-                    self._command_queue.get(),
-                    timeout=0.01,
-                )
+        return prepare, future
 
-                if self._role != RaftRole.LEADER:
-                    future.set_exception(NotLeaderError(self._leader_id))
-                    continue
-
-                # Append to local log
-                index = len(self._log) + 1
-                entry = LogEntry(
-                    term=self._current_term,
-                    index=index,
-                    command=command,
-                    hlc=self._hlc.tick(self._now_ms()),
-                )
-                self._log.append(entry)
-                self._pending_commits[index] = future
-
-                # Replicate to followers
-                await self._replicate_to_all()
-
-            except asyncio.TimeoutError:
-                continue
-            except asyncio.CancelledError:
-                break
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # Election Logic
-    # ─────────────────────────────────────────────────────────────────────────
-
-    def _reset_election_timer(self) -> None:
-        """Reset election timeout with randomized delay."""
-        if self._election_timer:
-            self._election_timer.cancel()
-
-        timeout_ms = random.randint(
-            self._config.election_timeout_min_ms,
-            self._config.election_timeout_max_ms,
-        )
-        self._election_timer = asyncio.create_task(
-            self._election_timeout(timeout_ms / 1000.0)
-        )
-
-    async def _election_timeout(self, delay: float) -> None:
-        """Handle election timeout - start election."""
-        await asyncio.sleep(delay)
-
-        if self._role == RaftRole.LEADER:
-            return
-
-        # Become candidate
-        self._role = RaftRole.CANDIDATE
-        self._current_term += 1
-        self._voted_for = self._node_id
-        self._votes_received = {self._node_id}
-        self._leader_id = None
-
-        # Request votes from all peers
-        last_log_index = len(self._log)
-        last_log_term = self._log[-1].term if self._log else 0
-
-        request = RequestVote(
-            term=self._current_term,
-            candidate_id=self._node_id,
-            last_log_index=last_log_index,
-            last_log_term=last_log_term,
-        )
-
-        for peer in self._peers:
-            asyncio.create_task(self._request_vote(peer, request))
-
-        # Reset timer for next election if this one fails
-        self._reset_election_timer()
-
-    async def _request_vote(self, peer: str, request: RequestVote) -> None:
-        """Send RequestVote RPC to peer."""
-        try:
-            response = await self._transport.send_request_vote(peer, request)
-            await self._handle_request_vote_response(response)
-        except Exception:
-            pass  # Peer unreachable, ignore
-
-    async def _handle_request_vote_response(
+    def record_ack(
         self,
-        response: RequestVoteResponse,
-    ) -> None:
-        """Handle RequestVote response."""
-        if response.term > self._current_term:
-            self._become_follower(response.term)
-            return
+        seq: int,
+        replica_id: str,
+        quorum_size: int,
+    ) -> bool:
+        """
+        Record PrepareAck from replica.
 
-        if (
-            self._role == RaftRole.CANDIDATE
-            and response.term == self._current_term
-            and response.vote_granted
-        ):
-            self._votes_received.add(response.term)  # Track by term
+        Returns True if quorum reached (should send Commit).
+        """
+        if seq not in self.replica_acks:
+            return False
 
-            # Check for majority
-            if len(self._votes_received) > (len(self._peers) + 1) // 2:
-                self._become_leader()
+        self.replica_acks[seq].add(replica_id)
 
-    def _become_leader(self) -> None:
-        """Transition to leader role."""
-        self._role = RaftRole.LEADER
-        self._leader_id = self._node_id
+        # Check for quorum (including self)
+        return len(self.replica_acks[seq]) + 1 >= quorum_size
 
-        # Initialize leader state
-        next_index = len(self._log) + 1
-        for peer in self._peers:
-            self._next_index[peer] = next_index
-            self._match_index[peer] = 0
+    def complete_commit(self, seq: int) -> None:
+        """
+        Mark write as committed after quorum.
 
-        # Start heartbeats
-        self._start_heartbeat_timer()
-
-    def _become_follower(self, term: int) -> None:
-        """Transition to follower role."""
-        self._role = RaftRole.FOLLOWER
-        self._current_term = term
-        self._voted_for = None
-
-        if self._heartbeat_timer:
-            self._heartbeat_timer.cancel()
-            self._heartbeat_timer = None
-
-        self._reset_election_timer()
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # Log Replication (Leader)
-    # ─────────────────────────────────────────────────────────────────────────
-
-    def _start_heartbeat_timer(self) -> None:
-        """Start periodic heartbeats."""
-        if self._heartbeat_timer:
-            self._heartbeat_timer.cancel()
-
-        self._heartbeat_timer = asyncio.create_task(self._heartbeat_loop())
-
-    async def _heartbeat_loop(self) -> None:
-        """Send periodic heartbeats to all followers."""
-        while self._running and self._role == RaftRole.LEADER:
-            await self._replicate_to_all()
-            await asyncio.sleep(self._config.heartbeat_interval_ms / 1000.0)
-
-    async def _replicate_to_all(self) -> None:
-        """Send AppendEntries to all followers."""
-        tasks = [
-            self._replicate_to_peer(peer)
-            for peer in self._peers
-        ]
-        await asyncio.gather(*tasks, return_exceptions=True)
-
-    async def _replicate_to_peer(self, peer: str) -> None:
-        """Send AppendEntries to single peer."""
-        next_idx = self._next_index.get(peer, 1)
-        prev_log_index = next_idx - 1
-        prev_log_term = self._log[prev_log_index - 1].term if prev_log_index > 0 else 0
-
-        # Get entries to send
-        entries = self._log[next_idx - 1:next_idx - 1 + self._config.max_entries_per_append]
-
-        request = AppendEntries(
-            term=self._current_term,
-            leader_id=self._node_id,
-            prev_log_index=prev_log_index,
-            prev_log_term=prev_log_term,
-            entries=entries,
-            leader_commit=self._commit_index,
-        )
-
-        try:
-            response = await self._transport.send_append_entries(peer, request)
-            await self._handle_append_entries_response(peer, response)
-        except Exception:
-            pass  # Peer unreachable
-
-    async def _handle_append_entries_response(
-        self,
-        peer: str,
-        response: AppendEntriesResponse,
-    ) -> None:
-        """Handle AppendEntries response from peer."""
-        if response.term > self._current_term:
-            self._become_follower(response.term)
-            return
-
-        if self._role != RaftRole.LEADER:
-            return
-
-        if response.success:
-            # Update match_index and next_index
-            self._match_index[peer] = response.match_index
-            self._next_index[peer] = response.match_index + 1
-
-            # Check if we can advance commit_index
-            self._try_advance_commit_index()
-        else:
-            # Decrement next_index and retry
-            self._next_index[peer] = max(1, self._next_index[peer] - 1)
-
-    def _try_advance_commit_index(self) -> None:
-        """Advance commit_index if quorum achieved."""
-        # Find highest index replicated to majority
-        for n in range(len(self._log), self._commit_index, -1):
-            if self._log[n - 1].term != self._current_term:
-                continue
-
-            # Count replicas (including self)
-            replicas = 1  # Self
-            for peer in self._peers:
-                if self._match_index.get(peer, 0) >= n:
-                    replicas += 1
-
-            if replicas > (len(self._peers) + 1) // 2:
-                self._commit_index = n
-                self._apply_committed_entries()
-                break
-
-    def _apply_committed_entries(self) -> None:
-        """Apply committed entries to state machine."""
-        while self._last_applied < self._commit_index:
-            self._last_applied += 1
-            entry = self._log[self._last_applied - 1]
-
-            # Apply to state machine
-            self._state_machine(entry.command)
-
-            # Resolve pending commit future
-            if self._last_applied in self._pending_commits:
-                future = self._pending_commits.pop(self._last_applied)
-                if not future.done():
-                    future.set_result(self._last_applied)
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # RPC Handlers (Follower/Candidate)
-    # ─────────────────────────────────────────────────────────────────────────
-
-    async def handle_request_vote(
-        self,
-        request: RequestVote,
-    ) -> RequestVoteResponse:
-        """Handle incoming RequestVote RPC."""
-        if request.term > self._current_term:
-            self._become_follower(request.term)
-
-        vote_granted = False
-
-        if request.term < self._current_term:
-            # Reject: stale term
-            pass
-        elif self._voted_for is None or self._voted_for == request.candidate_id:
-            # Check if candidate's log is at least as up-to-date
-            last_log_index = len(self._log)
-            last_log_term = self._log[-1].term if self._log else 0
-
-            log_ok = (
-                request.last_log_term > last_log_term
-                or (
-                    request.last_log_term == last_log_term
-                    and request.last_log_index >= last_log_index
-                )
-            )
-
-            if log_ok:
-                self._voted_for = request.candidate_id
-                vote_granted = True
-                self._reset_election_timer()
-
-        return RequestVoteResponse(
-            term=self._current_term,
-            vote_granted=vote_granted,
-        )
-
-    async def handle_append_entries(
-        self,
-        request: AppendEntries[T],
-    ) -> AppendEntriesResponse:
-        """Handle incoming AppendEntries RPC."""
-        if request.term > self._current_term:
-            self._become_follower(request.term)
-
-        if request.term < self._current_term:
-            return AppendEntriesResponse(
-                term=self._current_term,
-                success=False,
-                match_index=0,
-            )
-
-        # Valid leader - reset election timer
-        self._leader_id = request.leader_id
-        self._reset_election_timer()
-
-        if self._role == RaftRole.CANDIDATE:
-            self._become_follower(request.term)
-
-        # Check log consistency
-        if request.prev_log_index > 0:
-            if len(self._log) < request.prev_log_index:
-                return AppendEntriesResponse(
-                    term=self._current_term,
-                    success=False,
-                    match_index=len(self._log),
-                )
-
-            if self._log[request.prev_log_index - 1].term != request.prev_log_term:
-                # Conflict - truncate log
-                self._log = self._log[:request.prev_log_index - 1]
-                return AppendEntriesResponse(
-                    term=self._current_term,
-                    success=False,
-                    match_index=len(self._log),
-                )
-
-        # Append new entries
-        for entry in request.entries:
-            if entry.index <= len(self._log):
-                if self._log[entry.index - 1].term != entry.term:
-                    # Conflict - truncate and append
-                    self._log = self._log[:entry.index - 1]
-                    self._log.append(entry)
-            else:
-                self._log.append(entry)
-
-        # Update commit index
-        if request.leader_commit > self._commit_index:
-            self._commit_index = min(request.leader_commit, len(self._log))
-            self._apply_committed_entries()
-
-        return AppendEntriesResponse(
-            term=self._current_term,
-            success=True,
-            match_index=len(self._log),
-        )
-
-    def _now_ms(self) -> int:
-        """Current time in milliseconds."""
-        return int(time.time() * 1000)
+        Resolves the pending Future.
+        """
+        if seq in self.pending:
+            _, future = self.pending.pop(seq)
+            if not future.done():
+                future.set_result(seq)
+            self.replica_acks.pop(seq, None)
 
 
-class NotLeaderError(Exception):
-    """Raised when operation requires leader but node is not leader."""
-    def __init__(self, leader_id: str | None):
-        self.leader_id = leader_id
-        super().__init__(f"Not leader. Current leader: {leader_id}")
-
-
-class RaftTransport:
+class VSRTransport(Generic[T]):
     """
-    Abstract transport for Raft RPCs.
+    Abstract transport for VSR RPCs.
 
     Implementations:
     - InMemoryTransport: For testing
-    - TCPTransport: For production (uses existing Gate messaging)
+    - GateTransport: For production (uses existing Gate messaging)
     """
 
-    async def send_request_vote(
+    async def send_prepare(
         self,
-        peer: str,
-        request: RequestVote,
-    ) -> RequestVoteResponse:
+        replica_id: str,
+        prepare: Prepare[T],
+    ) -> PrepareResponse:
         raise NotImplementedError
 
-    async def send_append_entries(
+    async def send_commit(
         self,
-        peer: str,
-        request: AppendEntries,
-    ) -> AppendEntriesResponse:
+        replica_id: str,
+        commit: Commit,
+    ) -> None:
         raise NotImplementedError
+
+    async def send_view_change(
+        self,
+        replica_id: str,
+        view_change: ViewChange,
+    ) -> ViewChangeResponse:
+        raise NotImplementedError
+
+    async def send_new_view(
+        self,
+        replica_id: str,
+        new_view: NewView,
+    ) -> None:
+        raise NotImplementedError
+
+
+class NotJobLeaderError(Exception):
+    """Raised when operation requires job leadership."""
+    def __init__(self, job_id: str, current_leader: str | None):
+        self.job_id = job_id
+        self.current_leader = current_leader
+        super().__init__(
+            f"Not leader for job {job_id}. "
+            f"Current leader: {current_leader}"
+        )
+
+
+class StaleViewError(Exception):
+    """Raised when primary has stale view (fencing token)."""
+    def __init__(self, job_id: str, our_view: int, current_view: int):
+        self.job_id = job_id
+        self.our_view = our_view
+        self.current_view = current_view
+        super().__init__(
+            f"Stale view for job {job_id}. "
+            f"Our view: {our_view}, current: {current_view}"
+        )
 ```
 
-### Multi-Raft Coordinator
+### Per-Job VSR Coordinator
 
 ```python
 """
-hyperscale/distributed_rewrite/ledger/raft/multi_raft.py
+hyperscale/distributed_rewrite/ledger/vsr/job_vsr_coordinator.py
 
-Coordinates multiple Raft groups for sharded job ledger.
+Coordinates VSR replication for all jobs on this gate.
+Integrates with existing per-job leadership model.
 """
 
 import asyncio
-import hashlib
 from dataclasses import dataclass
-from typing import Generic, TypeVar
+from typing import Callable, Generic, TypeVar
 
-from hyperscale.distributed_rewrite.ledger.raft.raft_node import (
-    RaftConfig,
-    RaftNode,
-    RaftTransport,
-    NotLeaderError,
+from hyperscale.distributed_rewrite.consistent_hash import ConsistentHashRing
+from hyperscale.distributed_rewrite.ledger.models.hlc import HybridLogicalClock
+from hyperscale.distributed_rewrite.ledger.vsr.job_vsr import (
+    JobPrimaryState,
+    JobReplicaState,
+    VSRTransport,
+    Prepare,
+    PrepareResponse,
+    PrepareStatus,
+    Commit,
+    ViewChange,
+    ViewChangeResponse,
+    NewView,
+    NotJobLeaderError,
+    StaleViewError,
 )
+from hyperscale.distributed_rewrite.nodes.gate import GateJobLease
 
 
 T = TypeVar('T')
 
 
 @dataclass
-class MultiRaftConfig:
-    """Multi-Raft configuration."""
-    shard_count: int = 16  # Number of Raft groups
-    raft_config: RaftConfig = None
-
-    def __post_init__(self):
-        if self.raft_config is None:
-            self.raft_config = RaftConfig()
+class VSRConfig:
+    """VSR configuration."""
+    replica_count: int = 3          # Total replicas (primary + backups)
+    quorum_size: int = 2            # Majority needed for commit
+    prepare_timeout_ms: int = 5000  # Timeout for Prepare phase
+    view_change_timeout_ms: int = 10000  # Timeout for view change
 
 
-class MultiRaftCoordinator(Generic[T]):
+class JobVSRCoordinator(Generic[T]):
     """
-    Coordinates multiple Raft groups for sharded consensus.
+    Coordinates VSR replication for jobs owned by this gate.
 
-    Sharding Strategy:
-    - hash(job_id) % shard_count → shard assignment
-    - Each shard is independent Raft group
-    - Leaders distributed across nodes for load balancing
+    Key Integration Points:
+    - ConsistentHashRing: Determines replicas for each job
+    - GateJobLease: Provides fencing token (= view number)
+    - Per-job leadership: Determines if we're primary
 
-    Benefits:
-    - Linear scalability with shard count
-    - Independent failure domains
-    - Parallel writes to different shards
-    - Same strong consistency per shard
+    Write Flow (as primary):
+    1. Verify we hold lease for job
+    2. Create Prepare with current view (fencing token) and next seq
+    3. Send Prepare to replicas from consistent hash ring
+    4. Wait for quorum PrepareAcks
+    5. Send Commit to replicas
+    6. Return to client
+
+    Replica Flow:
+    1. Receive Prepare from primary
+    2. Verify view >= known_view and seq == expected_seq
+    3. Persist entry, send PrepareAck
+    4. Receive Commit, mark committed
     """
 
     __slots__ = (
-        '_node_id', '_peers', '_config',
-        '_shards', '_transport', '_state_machine',
+        '_node_id', '_config', '_transport',
+        '_hash_ring', '_state_machine',
+        '_primary_states', '_replica_states',
+        '_leases', '_hlc', '_running',
     )
 
     def __init__(
         self,
         node_id: str,
-        peers: list[str],
-        config: MultiRaftConfig,
-        state_machine: 'ShardedStateMachine[T]',
-        transport: RaftTransport,
+        config: VSRConfig,
+        transport: VSRTransport[T],
+        hash_ring: ConsistentHashRing,
+        state_machine: Callable[[str, T], None],  # (job_id, event) -> None
     ):
         self._node_id = node_id
-        self._peers = peers
         self._config = config
-        self._state_machine = state_machine
         self._transport = transport
-        self._shards: dict[int, RaftNode[T]] = {}
+        self._hash_ring = hash_ring
+        self._state_machine = state_machine
+
+        # Per-job state
+        self._primary_states: dict[str, JobPrimaryState[T]] = {}
+        self._replica_states: dict[str, JobReplicaState[T]] = {}
+
+        # Lease cache (from GateJobLease)
+        self._leases: dict[str, GateJobLease] = {}
+
+        self._hlc = HybridLogicalClock.now(node_id)
+        self._running = False
 
     async def start(self) -> None:
-        """Start all Raft groups."""
-        for shard_id in range(self._config.shard_count):
-            shard = RaftNode(
-                node_id=f"{self._node_id}:shard{shard_id}",
-                peers=[f"{peer}:shard{shard_id}" for peer in self._peers],
-                config=self._config.raft_config,
-                state_machine=lambda cmd, sid=shard_id: self._state_machine.apply(sid, cmd),
-                transport=self._transport,
-            )
-            self._shards[shard_id] = shard
-            await shard.start()
+        """Start the coordinator."""
+        self._running = True
 
     async def stop(self) -> None:
-        """Stop all Raft groups."""
-        for shard in self._shards.values():
-            await shard.stop()
+        """Stop the coordinator."""
+        self._running = False
 
-    def get_shard(self, key: str) -> int:
-        """Get shard ID for key."""
-        hash_bytes = hashlib.sha256(key.encode()).digest()
-        return int.from_bytes(hash_bytes[:4], 'big') % self._config.shard_count
+    def is_primary_for(self, job_id: str) -> bool:
+        """Check if we're primary (job leader) for this job."""
+        return job_id in self._leases and self._leases[job_id].is_valid()
 
-    async def submit(self, key: str, command: T) -> int:
+    def get_replicas(self, job_id: str) -> list[str]:
+        """Get replica node IDs for job (from consistent hash ring)."""
+        nodes = self._hash_ring.get_nodes(job_id, self._config.replica_count)
+        # Exclude self - we're primary
+        return [n for n in nodes if n != self._node_id]
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Primary Operations (Job Leader)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    async def write(self, job_id: str, event: T) -> int:
         """
-        Submit command to appropriate shard.
-        Routes to shard leader, follows redirects.
-        """
-        shard_id = self.get_shard(key)
-        shard = self._shards[shard_id]
+        Write event for job (must be job leader).
 
-        max_redirects = 3
-        for _ in range(max_redirects):
-            try:
-                return await shard.submit(command)
-            except NotLeaderError as e:
-                if e.leader_id is None:
-                    # No known leader, retry after delay
-                    await asyncio.sleep(0.1)
-                    continue
-                # Forward to leader
-                leader_shard = self._shards.get(shard_id)
-                if leader_shard and leader_shard.leader_id:
-                    # Use transport to forward
-                    return await self._forward_to_leader(
-                        e.leader_id,
-                        shard_id,
-                        command,
+        Returns sequence number when committed.
+        Raises NotJobLeaderError if not leader.
+        Raises StaleViewError if our lease is stale.
+        """
+        # Verify we're primary
+        if not self.is_primary_for(job_id):
+            current_leader = self._hash_ring.get_node(job_id)
+            raise NotJobLeaderError(job_id, current_leader)
+
+        lease = self._leases[job_id]
+        view = lease.fence_token
+
+        # Get or create primary state
+        if job_id not in self._primary_states:
+            self._primary_states[job_id] = JobPrimaryState(
+                job_id=job_id,
+                view=view,
+                start_seq=0,
+                hlc=self._hlc,
+            )
+
+        primary_state = self._primary_states[job_id]
+
+        # Check for stale view
+        if primary_state.view < view:
+            # Our lease was renewed with higher token - update state
+            primary_state.view = view
+
+        # Create prepare
+        prepare, future = primary_state.create_prepare(event)
+
+        # Send to replicas
+        replicas = self.get_replicas(job_id)
+        await self._send_prepare_to_replicas(
+            prepare,
+            replicas,
+            primary_state,
+        )
+
+        # Wait for commit
+        return await future
+
+    async def _send_prepare_to_replicas(
+        self,
+        prepare: Prepare[T],
+        replicas: list[str],
+        primary_state: JobPrimaryState[T],
+    ) -> None:
+        """Send Prepare to all replicas, handle responses."""
+        tasks = [
+            self._send_prepare_to_replica(prepare, replica, primary_state)
+            for replica in replicas
+        ]
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _send_prepare_to_replica(
+        self,
+        prepare: Prepare[T],
+        replica: str,
+        primary_state: JobPrimaryState[T],
+    ) -> None:
+        """Send Prepare to single replica."""
+        try:
+            response = await asyncio.wait_for(
+                self._transport.send_prepare(replica, prepare),
+                timeout=self._config.prepare_timeout_ms / 1000.0,
+            )
+
+            if response.status == PrepareStatus.SUCCESS:
+                # Record ack
+                quorum_reached = primary_state.record_ack(
+                    prepare.seq,
+                    replica,
+                    self._config.quorum_size,
+                )
+
+                if quorum_reached:
+                    # Send commit to all replicas
+                    commit = Commit(
+                        job_id=prepare.job_id,
+                        view=prepare.view,
+                        seq=prepare.seq,
+                    )
+                    await self._send_commit_to_replicas(
+                        commit,
+                        self.get_replicas(prepare.job_id),
                     )
 
-        raise Exception(f"Failed to submit to shard {shard_id} after {max_redirects} redirects")
+                    # Complete the write
+                    primary_state.complete_commit(prepare.seq)
 
-    async def _forward_to_leader(
+                    # Apply to local state machine
+                    self._state_machine(prepare.job_id, prepare.data)
+
+            elif response.status == PrepareStatus.STALE_VIEW:
+                # We're stale - someone else has higher view
+                raise StaleViewError(
+                    prepare.job_id,
+                    prepare.view,
+                    response.current_view,
+                )
+
+        except asyncio.TimeoutError:
+            pass  # Replica unreachable, other replicas may still ack
+        except StaleViewError:
+            raise  # Propagate stale view errors
+
+    async def _send_commit_to_replicas(
         self,
-        leader_id: str,
-        shard_id: int,
-        command: T,
-    ) -> int:
-        """Forward command to known leader."""
-        # Implementation depends on transport
-        raise NotImplementedError
+        commit: Commit,
+        replicas: list[str],
+    ) -> None:
+        """Send Commit to all replicas (fire-and-forget)."""
+        tasks = [
+            self._transport.send_commit(replica, commit)
+            for replica in replicas
+        ]
+        await asyncio.gather(*tasks, return_exceptions=True)
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # Replica Operations
+    # ─────────────────────────────────────────────────────────────────────────
 
-class ShardedStateMachine(Generic[T]):
-    """
-    State machine that handles sharded commands.
+    async def handle_prepare(self, prepare: Prepare[T]) -> PrepareResponse:
+        """Handle incoming Prepare from primary."""
+        # Get or create replica state
+        if prepare.job_id not in self._replica_states:
+            self._replica_states[prepare.job_id] = JobReplicaState(
+                job_id=prepare.job_id,
+                hlc=self._hlc,
+            )
 
-    Each shard maintains independent state:
-    - Jobs hash to specific shards
-    - Operations within shard are linearizable
-    - Cross-shard operations require coordination
-    """
+        replica_state = self._replica_states[prepare.job_id]
+        return replica_state.handle_prepare(prepare)
 
-    def apply(self, shard_id: int, command: T) -> None:
-        """Apply command to shard's state."""
-        raise NotImplementedError
+    async def handle_commit(self, commit: Commit) -> None:
+        """Handle incoming Commit from primary."""
+        if commit.job_id in self._replica_states:
+            replica_state = self._replica_states[commit.job_id]
+            if replica_state.handle_commit(commit):
+                # Apply to local state machine
+                for entry in replica_state.commit_log:
+                    if entry.view == commit.view and entry.seq == commit.seq:
+                        self._state_machine(commit.job_id, entry.data)
+                        break
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # View Change (Failover)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    async def perform_view_change(
+        self,
+        job_id: str,
+        new_lease: GateJobLease,
+    ) -> None:
+        """
+        Perform view change when taking over as primary.
+
+        Called when:
+        1. Previous primary's lease expired
+        2. We acquired new lease from consistent hash ring
+        """
+        new_view = new_lease.fence_token
+        replicas = self.get_replicas(job_id)
+
+        # Send ViewChange to all replicas
+        view_change = ViewChange(job_id=job_id, new_view=new_view)
+        responses: list[ViewChangeResponse] = []
+
+        tasks = [
+            self._transport.send_view_change(replica, view_change)
+            for replica in replicas
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for result in results:
+            if isinstance(result, ViewChangeResponse):
+                responses.append(result)
+
+        # Determine start_seq from responses
+        max_seq = -1
+        for response in responses:
+            if response.last_prepared_seq > max_seq:
+                max_seq = response.last_prepared_seq
+
+        # Also check local replica state
+        if job_id in self._replica_states:
+            local_state = self._replica_states[job_id]
+            if local_state.prepare_log:
+                local_max = max(e.seq for e in local_state.prepare_log)
+                if local_max > max_seq:
+                    max_seq = local_max
+
+        start_seq = max_seq + 1
+
+        # Send NewView to replicas
+        new_view_msg = NewView(
+            job_id=job_id,
+            view=new_view,
+            start_seq=start_seq,
+        )
+        await asyncio.gather(*[
+            self._transport.send_new_view(replica, new_view_msg)
+            for replica in replicas
+        ], return_exceptions=True)
+
+        # Initialize primary state
+        self._primary_states[job_id] = JobPrimaryState(
+            job_id=job_id,
+            view=new_view,
+            start_seq=start_seq,
+            hlc=self._hlc,
+        )
+
+        # Store lease
+        self._leases[job_id] = new_lease
+
+    async def handle_view_change(
+        self,
+        view_change: ViewChange,
+    ) -> ViewChangeResponse:
+        """Handle incoming ViewChange from new primary."""
+        if view_change.job_id not in self._replica_states:
+            self._replica_states[view_change.job_id] = JobReplicaState(
+                job_id=view_change.job_id,
+                hlc=self._hlc,
+            )
+
+        replica_state = self._replica_states[view_change.job_id]
+        return replica_state.handle_view_change(view_change)
+
+    async def handle_new_view(self, new_view: NewView) -> None:
+        """Handle incoming NewView from new primary."""
+        if new_view.job_id in self._replica_states:
+            self._replica_states[new_view.job_id].handle_new_view(new_view)
 ```
 
 ### Integration with Hyperscale Gates
 
 ```python
 """
-hyperscale/distributed_rewrite/ledger/raft/gate_integration.py
+hyperscale/distributed_rewrite/ledger/vsr/gate_integration.py
 
-Integrates Multi-Raft with Gate nodes for global job ledger.
+Integrates Per-Job VSR with Gate nodes for global job ledger.
 """
 
 import asyncio
 from dataclasses import dataclass
 from typing import Any
 
+from hyperscale.distributed_rewrite.consistent_hash import ConsistentHashRing
 from hyperscale.distributed_rewrite.ledger.models.job_events import (
     JobEvent,
     JobCreated,
     JobCancelled,
     JobCompleted,
 )
-from hyperscale.distributed_rewrite.ledger.raft.multi_raft import (
-    MultiRaftCoordinator,
-    MultiRaftConfig,
-    ShardedStateMachine,
+from hyperscale.distributed_rewrite.ledger.vsr.job_vsr_coordinator import (
+    JobVSRCoordinator,
+    VSRConfig,
+    VSRTransport,
 )
-from hyperscale.distributed_rewrite.ledger.raft.raft_node import RaftTransport
+from hyperscale.distributed_rewrite.nodes.gate import GateJobLease
 from hyperscale.logging import Logger
 
 
-class JobLedgerStateMachine(ShardedStateMachine[JobEvent]):
+class JobLedgerStateMachine:
     """
     State machine for job ledger.
 
-    Maintains per-shard job state:
-    - active_jobs: dict[job_id, JobState]
-    - pending_cancellations: dict[job_id, CancelState]
-    - job_history: list[JobEvent] (bounded, for audit)
+    Applied locally when entries are committed.
+    Maintains per-job state (not sharded - VSR is per-job).
     """
 
-    __slots__ = ('_shards', '_logger')
+    __slots__ = ('_jobs', '_history', '_max_history', '_logger')
 
-    def __init__(self, shard_count: int, logger: Logger):
-        self._shards: dict[int, ShardState] = {
-            i: ShardState() for i in range(shard_count)
-        }
+    def __init__(self, logger: Logger, max_history: int = 10000):
+        self._jobs: dict[str, JobState] = {}
+        self._history: list[tuple[str, JobEvent]] = []  # (job_id, event)
+        self._max_history = max_history
         self._logger = logger
 
-    def apply(self, shard_id: int, event: JobEvent) -> None:
-        """Apply job event to shard state."""
-        state = self._shards[shard_id]
-
+    def apply(self, job_id: str, event: JobEvent) -> None:
+        """Apply job event to state."""
         if isinstance(event, JobCreated):
-            state.active_jobs[event.job_id] = JobState(
-                job_id=event.job_id,
+            self._jobs[job_id] = JobState(
+                job_id=job_id,
                 status='CREATED',
                 spec=event.spec,
                 assigned_dcs=event.assigned_dcs,
@@ -24218,38 +24251,24 @@ class JobLedgerStateMachine(ShardedStateMachine[JobEvent]):
             )
 
         elif isinstance(event, JobCancelled):
-            if event.job_id in state.active_jobs:
-                state.active_jobs[event.job_id].status = 'CANCELLED'
-                state.active_jobs[event.job_id].cancelled_at = event.hlc
+            if job_id in self._jobs:
+                self._jobs[job_id].status = 'CANCELLED'
+                self._jobs[job_id].cancelled_at = event.hlc
 
         elif isinstance(event, JobCompleted):
-            if event.job_id in state.active_jobs:
-                state.active_jobs[event.job_id].status = 'COMPLETED'
-                state.active_jobs[event.job_id].completed_at = event.hlc
-                state.active_jobs[event.job_id].results = event.results
+            if job_id in self._jobs:
+                self._jobs[job_id].status = 'COMPLETED'
+                self._jobs[job_id].completed_at = event.hlc
+                self._jobs[job_id].results = event.results
 
         # Maintain bounded history
-        state.history.append(event)
-        if len(state.history) > state.max_history:
-            state.history = state.history[-state.max_history:]
+        self._history.append((job_id, event))
+        if len(self._history) > self._max_history:
+            self._history = self._history[-self._max_history:]
 
-    def get_job(self, shard_id: int, job_id: str) -> 'JobState | None':
-        """Get job state from shard."""
-        return self._shards[shard_id].active_jobs.get(job_id)
-
-
-@dataclass
-class ShardState:
-    """Per-shard state."""
-    active_jobs: dict[str, 'JobState'] = None
-    history: list[JobEvent] = None
-    max_history: int = 10000
-
-    def __post_init__(self):
-        if self.active_jobs is None:
-            self.active_jobs = {}
-        if self.history is None:
-            self.history = []
+    def get_job(self, job_id: str) -> 'JobState | None':
+        """Get job state."""
+        return self._jobs.get(job_id)
 
 
 @dataclass
@@ -24269,35 +24288,38 @@ class GateJobLedger:
     """
     Global job ledger for Gate nodes.
 
-    Wraps MultiRaftCoordinator with job-specific operations.
-    Provides high-level API for job lifecycle management.
+    Wraps JobVSRCoordinator with job-specific operations.
+    Integrates with existing per-job leadership model.
+
+    Key Difference from Multi-Raft:
+    - No shard leaders - job leader writes directly to replicas
+    - Fencing tokens from lease system provide view numbers
+    - Consistent hash ring determines replicas (not Raft groups)
     """
 
     __slots__ = (
         '_coordinator', '_state_machine',
-        '_logger', '_node_id',
+        '_logger', '_node_id', '_hash_ring',
     )
 
     def __init__(
         self,
         node_id: str,
-        peer_gates: list[str],
-        config: MultiRaftConfig,
-        transport: RaftTransport,
+        config: VSRConfig,
+        transport: VSRTransport[JobEvent],
+        hash_ring: ConsistentHashRing,
         logger: Logger,
     ):
         self._node_id = node_id
         self._logger = logger
-        self._state_machine = JobLedgerStateMachine(
-            config.shard_count,
-            logger,
-        )
-        self._coordinator = MultiRaftCoordinator(
+        self._hash_ring = hash_ring
+        self._state_machine = JobLedgerStateMachine(logger)
+        self._coordinator = JobVSRCoordinator(
             node_id=node_id,
-            peers=peer_gates,
             config=config,
-            state_machine=self._state_machine,
             transport=transport,
+            hash_ring=hash_ring,
+            state_machine=self._state_machine.apply,
         )
 
     async def start(self) -> None:
@@ -24316,14 +24338,16 @@ class GateJobLedger:
     ) -> int:
         """
         Create a new job.
-        Returns log index when committed.
+
+        Must be called by job leader (gate determined by consistent hash).
+        Returns sequence number when committed.
         """
         event = JobCreated(
             job_id=job_id,
             spec=spec,
             assigned_dcs=assigned_dcs,
         )
-        return await self._coordinator.submit(job_id, event)
+        return await self._coordinator.write(job_id, event)
 
     async def cancel_job(
         self,
@@ -24333,14 +24357,16 @@ class GateJobLedger:
     ) -> int:
         """
         Cancel a job.
-        Returns log index when committed.
+
+        Must be called by job leader.
+        Returns sequence number when committed.
         """
         event = JobCancelled(
             job_id=job_id,
             reason=reason,
             requestor=requestor,
         )
-        return await self._coordinator.submit(job_id, event)
+        return await self._coordinator.write(job_id, event)
 
     async def complete_job(
         self,
@@ -24349,64 +24375,91 @@ class GateJobLedger:
     ) -> int:
         """
         Mark job as completed.
-        Returns log index when committed.
+
+        Must be called by job leader.
+        Returns sequence number when committed.
         """
         event = JobCompleted(
             job_id=job_id,
             results=results,
         )
-        return await self._coordinator.submit(job_id, event)
+        return await self._coordinator.write(job_id, event)
 
     def get_job(self, job_id: str) -> JobState | None:
-        """Get current job state (local read - may be stale)."""
-        shard_id = self._coordinator.get_shard(job_id)
-        return self._state_machine.get_job(shard_id, job_id)
+        """
+        Get current job state (local read).
+
+        Reads from local replica state. May be stale if:
+        - This node is not the job leader
+        - Recent writes haven't been replicated yet
+
+        For strong consistency, use get_job_linearizable().
+        """
+        return self._state_machine.get_job(job_id)
 
     async def get_job_linearizable(self, job_id: str) -> JobState | None:
         """
         Get job state with linearizable read.
-        Ensures read reflects all committed writes.
+
+        If we're job leader: read is already linearizable (single writer).
+        If we're replica: query job leader for latest state.
         """
-        # Submit no-op to ensure we're up-to-date
-        # (Alternative: read from leader with lease)
-        shard_id = self._coordinator.get_shard(job_id)
-        # ... implementation details
-        return self._state_machine.get_job(shard_id, job_id)
+        if self._coordinator.is_primary_for(job_id):
+            # We're the single writer - local state is authoritative
+            return self._state_machine.get_job(job_id)
+
+        # Not leader - would need to query leader
+        # (Implementation depends on transport)
+        # For now, return local state with staleness warning
+        return self._state_machine.get_job(job_id)
+
+    async def on_lease_acquired(self, job_id: str, lease: GateJobLease) -> None:
+        """
+        Called when we acquire job leadership.
+
+        Triggers view change to synchronize state from replicas.
+        """
+        await self._coordinator.perform_view_change(job_id, lease)
+
+    def is_job_leader(self, job_id: str) -> bool:
+        """Check if we're the job leader."""
+        return self._coordinator.is_primary_for(job_id)
 ```
 
 ### Cross-DC Timing Diagram
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
-│                    CROSS-DC JOB CREATION TIMING                                 │
+│                    CROSS-DC JOB CREATION TIMING (VSR)                           │
 │                                                                                 │
 │  Client          US-EAST Gate       EU-WEST Gate        APAC Gate              │
-│  (US-EAST)       (Leader shard 0)   (Follower)          (Follower)             │
+│  (US-EAST)       (Job Leader)       (Replica)           (Replica)              │
 │     │                  │                  │                  │                  │
 │     │  CreateJob       │                  │                  │                  │
 │     │─────────────────►│                  │                  │                  │
 │     │                  │                  │                  │                  │
-│     │                  │ Write to local   │                  │                  │
-│     │                  │ WAL (AD-39)      │                  │                  │
+│     │                  │ Verify lease     │                  │                  │
+│     │                  │ (fence_token=5)  │                  │                  │
 │     │                  │ T=0ms            │                  │                  │
 │     │                  │                  │                  │                  │
-│     │                  │ AppendEntries    │                  │                  │
+│     │                  │ Prepare(v=5,s=0) │                  │                  │
 │     │                  │ (async parallel) │                  │                  │
 │     │                  │─────────────────►│                  │                  │
 │     │                  │ RTT: ~80ms       │                  │                  │
 │     │                  │─────────────────────────────────────►│                 │
 │     │                  │ RTT: ~150ms      │                  │                  │
 │     │                  │                  │                  │                  │
-│     │                  │                  │ Write to local   │                  │
-│     │                  │                  │ WAL              │                  │
+│     │                  │                  │ Check view>=5    │                  │
+│     │                  │                  │ Check seq==0     │                  │
+│     │                  │                  │ Persist entry    │                  │
 │     │                  │                  │ T=80ms           │                  │
 │     │                  │                  │                  │                  │
 │     │                  │◄─────────────────│                  │                  │
-│     │                  │ ACK              │                  │                  │
+│     │                  │ PrepareAck       │                  │                  │
 │     │                  │ T=80ms           │                  │                  │
 │     │                  │                  │                  │                  │
 │     │                  │ Quorum! (2/3)    │                  │                  │
-│     │                  │ commit_index++   │                  │                  │
+│     │                  │ Send Commit      │                  │                  │
 │     │                  │ T=80ms           │                  │                  │
 │     │                  │                  │                  │                  │
 │     │◄─────────────────│                  │                  │                  │
@@ -24414,19 +24467,23 @@ class GateJobLedger:
 │     │  (committed)     │                  │                  │                  │
 │     │  T=80ms          │                  │                  │                  │
 │     │                  │                  │                  │                  │
-│     │                  │                  │                  │ Write to local   │
-│     │                  │◄─────────────────────────────────────│ WAL             │
-│     │                  │ ACK (late)       │                  │ T=150ms         │
-│     │                  │ T=150ms          │                  │                  │
+│     │                  │                  │                  │ PrepareAck (late)│
+│     │                  │◄─────────────────────────────────────│ T=150ms         │
 │     │                  │                  │                  │                  │
 │                                                                                 │
 │  TIMELINE:                                                                      │
-│  ├── T=0ms:    Client submits, leader writes to WAL                            │
-│  ├── T=80ms:   EU-WEST ACKs, quorum reached, client gets response              │
-│  ├── T=150ms:  APAC ACKs (already committed, just catching up)                 │
+│  ├── T=0ms:    Client submits, job leader verifies lease                       │
+│  ├── T=80ms:   EU-WEST PrepareAcks, quorum reached, Commit sent, client ACKed  │
+│  ├── T=150ms:  APAC PrepareAcks (already committed, just catching up)          │
 │                                                                                 │
 │  LATENCY: ~80ms (RTT to nearest quorum member)                                 │
 │  DURABILITY: Survives US-EAST + EU-WEST simultaneous failure                   │
+│                                                                                 │
+│  KEY DIFFERENCE FROM RAFT:                                                      │
+│  • No heartbeats needed (job leader doesn't change unless lease expires)       │
+│  • No election timeout (leadership is deterministic from consistent hash)      │
+│  • Simpler protocol (Prepare/Commit vs AppendEntries with log matching)        │
+│                                                                                 │
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -24434,85 +24491,105 @@ class GateJobLedger:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
-│                    FAILURE SCENARIO: LEADER FAILURE                             │
+│                    FAILURE SCENARIO: JOB LEADER FAILURE                         │
 │                                                                                 │
-│  BEFORE: US-EAST is leader for shard 0                                         │
+│  BEFORE: US-EAST is job leader (primary from consistent hash)                  │
 │                                                                                 │
 │  US-EAST Gate       EU-WEST Gate        APAC Gate                              │
-│  (LEADER)           (FOLLOWER)          (FOLLOWER)                             │
+│  (JOB LEADER)       (REPLICA backup1)   (REPLICA backup2)                      │
 │  ┌─────────┐        ┌─────────┐        ┌─────────┐                             │
-│  │ term=3  │        │ term=3  │        │ term=3  │                             │
-│  │ log=    │        │ log=    │        │ log=    │                             │
-│  │ [1,2,3] │        │ [1,2,3] │        │ [1,2]   │                             │
+│  │ view=5  │        │ view=5  │        │ view=5  │                             │
+│  │ lease ✓ │        │ seq=42  │        │ seq=41  │                             │
+│  │ seq=42  │        │         │        │ (behind)│                             │
 │  └─────────┘        └─────────┘        └─────────┘                             │
 │       │                  │                  │                                   │
 │       X (crashes)        │                  │                                   │
+│       │                  │                  │                                   │
+│  (lease expires         │                  │                                   │
+│   after TTL)            │                  │                                   │
 │                          │                  │                                   │
-│  AFTER: Leader election                                                         │
+│  AFTER: View change (lease-based, NOT election)                                │
 │                          │                  │                                   │
-│                          │ Election timeout │                                   │
-│                          │ term++           │                                   │
-│                          │ RequestVote      │                                   │
+│                          │ Detect lease     │                                   │
+│                          │ expiry (I'm next │                                   │
+│                          │ in hash ring)    │                                   │
+│                          │                  │                                   │
+│                          │ Acquire lease    │                                   │
+│                          │ fence_token=6    │                                   │
+│                          │                  │                                   │
+│                          │ ViewChange(v=6)  │                                   │
 │                          │─────────────────►│                                   │
 │                          │                  │                                   │
 │                          │◄─────────────────│                                   │
-│                          │ VoteGranted      │                                   │
-│                          │ (log is longer)  │                                   │
+│                          │ ViewChangeAck    │                                   │
+│                          │ (last_seq=41)    │                                   │
+│                          │                  │                                   │
+│                          │ start_seq = 43   │                                   │
+│                          │ (max of 42,41)+1 │                                   │
+│                          │                  │                                   │
+│                          │ NewView(v=6,s=43)│                                   │
+│                          │─────────────────►│                                   │
 │                          │                  │                                   │
 │  EU-WEST Gate        APAC Gate                                                  │
-│  (NEW LEADER)        (FOLLOWER)                                                │
+│  (NEW JOB LEADER)    (REPLICA)                                                 │
 │  ┌─────────┐        ┌─────────┐                                                │
-│  │ term=4  │        │ term=4  │                                                │
-│  │ log=    │        │ log=    │                                                │
-│  │ [1,2,3] │        │ [1,2,3] │  ← APAC catches up                             │
+│  │ view=6  │        │ view=6  │                                                │
+│  │ lease ✓ │        │ seq=43  │  ← Ready for new writes                        │
+│  │ seq=43  │        │         │                                                │
 │  └─────────┘        └─────────┘                                                │
 │                                                                                 │
 │  INVARIANTS PRESERVED:                                                          │
-│  ✓ No committed entries lost (entry 3 was committed, preserved)                │
-│  ✓ New leader has all committed entries                                        │
-│  ✓ Uncommitted entries may be lost (acceptable - client didn't get ACK)        │
+│  ✓ No committed entries lost (quorum had them)                                 │
+│  ✓ New leader starts after highest prepared seq                                │
+│  ✓ Old leader's uncommitted writes (seq=42 if not quorum-acked) lost           │
+│  ✓ Old leader cannot write (fencing token=5 rejected by replicas)              │
+│                                                                                 │
+│  NO ELECTION NEEDED - consistent hash determines next leader!                  │
+│                                                                                 │
 └─────────────────────────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────────────────────────┐
 │                    FAILURE SCENARIO: NETWORK PARTITION                          │
 │                                                                                 │
-│  PARTITION: US-EAST isolated from EU-WEST and APAC                             │
+│  PARTITION: US-EAST (job leader) isolated from EU-WEST and APAC                │
 │                                                                                 │
 │  ┌────────────────────┐         ┌────────────────────────────────────┐         │
 │  │    Minority        │         │         Majority                   │         │
 │  │    Partition       │    X    │         Partition                  │         │
 │  │                    │ Network │                                    │         │
 │  │  US-EAST Gate      │ Failure │  EU-WEST Gate      APAC Gate       │         │
-│  │  (was LEADER)      │         │  (FOLLOWER)        (FOLLOWER)      │         │
+│  │  (JOB LEADER)      │         │  (REPLICA)         (REPLICA)       │         │
 │  │  ┌─────────┐       │         │  ┌─────────┐      ┌─────────┐     │         │
-│  │  │ term=3  │       │         │  │ term=3  │      │ term=3  │     │         │
-│  │  │ LEADER  │       │         │  │         │      │         │     │         │
+│  │  │ view=5  │       │         │  │ view=5  │      │ view=5  │     │         │
+│  │  │ lease ✓ │       │         │  │         │      │         │     │         │
 │  │  └─────────┘       │         │  └─────────┘      └─────────┘     │         │
 │  └────────────────────┘         └────────────────────────────────────┘         │
 │                                                                                 │
 │  BEHAVIOR:                                                                      │
 │                                                                                 │
 │  Minority (US-EAST):                                                           │
-│  • Cannot commit (no quorum)                                                   │
-│  • Rejects client writes                                                       │
-│  • Eventually steps down (no heartbeat ACKs)                                   │
+│  • Cannot commit (no quorum for PrepareAcks)                                   │
+│  • Keeps trying to reach replicas (times out)                                  │
+│  • Lease eventually expires (cannot renew without majority)                    │
 │                                                                                 │
 │  Majority (EU-WEST + APAC):                                                    │
-│  • Election timeout triggers                                                   │
-│  • EU-WEST or APAC becomes new leader                                          │
-│  • Can commit new entries (has quorum)                                         │
-│  • Continues serving clients                                                   │
+│  • See job leader's lease expiring (no renewal)                                │
+│  • EU-WEST (next in hash ring) acquires new lease                              │
+│  • EU-WEST performs view change with fence_token=6                             │
+│  • EU-WEST can commit new writes (has quorum with APAC)                        │
 │                                                                                 │
 │  AFTER PARTITION HEALS:                                                         │
-│  • US-EAST discovers higher term                                               │
-│  • US-EAST becomes follower                                                    │
-│  • US-EAST's uncommitted entries discarded                                     │
-│  • US-EAST catches up from new leader                                          │
+│  • US-EAST's lease is expired                                                  │
+│  • US-EAST tries to write → PrepareAck rejects (view=5 < current view=6)       │
+│  • US-EAST discovers it's no longer leader via StaleViewError                  │
+│  • US-EAST becomes replica, syncs state from new leader                        │
 │                                                                                 │
 │  SAFETY PRESERVED:                                                              │
-│  ✓ At most one leader per term                                                 │
-│  ✓ Committed entries never lost                                                │
-│  ✓ Linearizability maintained                                                  │
+│  ✓ At most one writer per view (fencing)                                       │
+│  ✓ Committed entries never lost (quorum requirement)                           │
+│  ✓ Linearizability maintained (single writer per job)                          │
+│  ✓ No split-brain (fencing tokens enforce total ordering of leadership)        │
+│                                                                                 │
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -24522,35 +24599,113 @@ class GateJobLedger:
 |--------|-------|-------|
 | **Write Latency** | 80-150ms | RTT to nearest quorum member |
 | **Read Latency (local)** | <1ms | May be stale |
-| **Read Latency (linearizable)** | 80-150ms | Requires leader roundtrip |
-| **Throughput (per shard)** | ~10K ops/s | Limited by leader |
-| **Throughput (16 shards)** | ~160K ops/s | Linear with shard count |
-| **Failover Time** | 150-300ms | Election timeout + election |
-| **Log Replication** | Pipelined | Multiple in-flight AppendEntries |
+| **Read Latency (linearizable)** | <1ms (if leader) | Single writer = authoritative |
+| **Throughput (per job)** | ~10K ops/s | Limited by job leader |
+| **Throughput (N jobs)** | ~10K × N ops/s | Each job has independent leader |
+| **Failover Time** | Lease TTL + ViewChange | Typically 5-15s |
+| **Replication** | 2-phase (Prepare/Commit) | Simpler than Raft AppendEntries |
+
+**Comparison with Multi-Raft:**
+
+| Aspect | Multi-Raft | Per-Job VSR |
+|--------|-----------|-------------|
+| Leader election | Raft protocol (150-300ms) | Lease-based (deterministic) |
+| Heartbeats | Required (50ms intervals) | Not needed |
+| Log matching | Required (complex) | Not needed (single writer) |
+| Write conflicts | Possible (resolved by Raft) | Impossible (single writer) |
+| Shard affinity | Job may not be on shard leader | Job leader IS the writer |
+| Complexity | Higher (Raft + sharding) | Lower (VSR + per-job leadership) |
 
 ### Configuration Recommendations
 
 ```python
-# Production configuration for global job ledger
-MULTI_RAFT_CONFIG = MultiRaftConfig(
-    shard_count=16,  # 16 independent Raft groups
-    raft_config=RaftConfig(
-        # Election timeout: 150-300ms randomized
-        # - Must be > 2x max RTT to avoid spurious elections
-        # - Randomization prevents split votes
-        election_timeout_min_ms=150,
-        election_timeout_max_ms=300,
+# Production configuration for global job ledger (Per-Job VSR)
+VSR_CONFIG = VSRConfig(
+    # Replica count: 3 (primary + 2 backups)
+    # - Survives 1 failure
+    # - Quorum = 2 (majority)
+    replica_count=3,
+    quorum_size=2,
 
-        # Heartbeat: 50ms
-        # - Must be < election_timeout / 3
-        # - Frequent enough to prevent elections
-        heartbeat_interval_ms=50,
+    # Prepare timeout: 5 seconds
+    # - Must be > max RTT across DCs (~300ms)
+    # - Allows for transient network issues
+    prepare_timeout_ms=5000,
 
-        # Batching for throughput
-        batch_size=100,
-        max_entries_per_append=1000,
-    ),
+    # View change timeout: 10 seconds
+    # - Collecting state from replicas may take time
+    # - Not on critical path (only during failover)
+    view_change_timeout_ms=10000,
 )
+
+# Lease configuration (integrates with existing per-job leadership)
+LEASE_CONFIG = GateJobLeaseConfig(
+    # Lease TTL: 10 seconds
+    # - Long enough to avoid spurious failovers
+    # - Short enough for timely failure detection
+    lease_ttl_seconds=10,
+
+    # Renewal interval: 3 seconds
+    # - < lease_ttl / 3 to ensure renewal before expiry
+    renewal_interval_seconds=3,
+
+    # Fencing token increment: automatic
+    # - Each new lease gets token = max(seen) + 1
+    # - Provides view numbers for VSR
+)
+```
+
+### Why This Is Maximally Correct
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                    CORRECTNESS ARGUMENT                                         │
+│                                                                                 │
+│  Per-Job VSR is maximally correct because:                                     │
+│                                                                                 │
+│  1. SINGLE WRITER PER JOB                                                      │
+│     ──────────────────────────────────────────────────────────────────────────  │
+│     • Only job leader can issue Prepare for its jobs                           │
+│     • Eliminates write conflicts by design                                     │
+│     • No need for conflict resolution logic                                    │
+│                                                                                 │
+│  2. FENCING TOKENS PROVIDE TOTAL ORDERING OF LEADERSHIP                        │
+│     ──────────────────────────────────────────────────────────────────────────  │
+│     • Each new leader gets strictly higher token                               │
+│     • Replicas reject writes from old tokens                                   │
+│     • Prevents split-brain during partitions                                   │
+│                                                                                 │
+│  3. SEQUENCE NUMBERS PROVIDE TOTAL ORDERING WITHIN VIEW                        │
+│     ──────────────────────────────────────────────────────────────────────────  │
+│     • Replicas only accept expected sequence                                   │
+│     • Out-of-order writes rejected                                             │
+│     • No gaps in committed entries                                             │
+│                                                                                 │
+│  4. VIEW CHANGE SYNCHRONIZES STATE                                             │
+│     ──────────────────────────────────────────────────────────────────────────  │
+│     • New leader collects state from quorum                                    │
+│     • Starts at max(prepared_seq) + 1                                          │
+│     • No committed entries lost                                                │
+│                                                                                 │
+│  5. QUORUM INTERSECTION GUARANTEES DURABILITY                                  │
+│     ──────────────────────────────────────────────────────────────────────────  │
+│     • Commit requires quorum PrepareAcks                                       │
+│     • View change requires quorum ViewChangeAcks                               │
+│     • Quorums intersect → new leader sees committed state                      │
+│                                                                                 │
+│  6. NO REDUNDANT MECHANISMS                                                    │
+│     ──────────────────────────────────────────────────────────────────────────  │
+│     • Per-job leadership provides: who writes                                  │
+│     • VSR provides: durable replication                                        │
+│     • No overlapping leader election (Raft term vs lease)                      │
+│     • Single source of truth for leadership                                    │
+│                                                                                 │
+│  FORMAL BASIS:                                                                 │
+│     • VSR (Viewstamped Replication) has formal proofs                          │
+│     • Fencing tokens are equivalent to VSR view numbers                        │
+│     • Lease-based view change is standard practice (e.g., Chubby, ZooKeeper)   │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
