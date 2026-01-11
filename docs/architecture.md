@@ -36917,3 +36917,806 @@ Reason: Wait time acceptable, prefer lower latency
 │                                                                          │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
+
+---
+
+## AD-44: Retry Budgets and Best-Effort Completion
+
+### Part 1: Problem Statement
+
+**Current Limitations**:
+
+1. **Retry Storms**: Each workflow retries independently up to `max_dispatch_attempts` (default 5). A job with 100 workflows can generate 500 retries, overwhelming the cluster during failures.
+
+2. **No Partial Completion Control**: When a datacenter is lost, jobs wait indefinitely for results that will never arrive. Tests cannot explicitly opt into "best-effort" semantics where partial results are acceptable.
+
+3. **No Job-Level Retry Control**: Jobs cannot specify their retry tolerance. A critical job and a best-effort job both get the same retry behavior.
+
+**Example Problems**:
+
+```
+Problem 1: Retry Storm
+─────────────────────
+Job with 50 workflows, cluster experiencing transient failures
+Each workflow retries 5 times → 250 retry attempts
+All retries happen simultaneously → cluster overwhelmed
+Other jobs starved of resources
+
+Problem 2: DC Loss
+──────────────────
+Job targets 3 DCs: dc-east, dc-west, dc-central
+dc-central experiences network partition
+Job waits indefinitely for dc-central results
+Test never completes, user frustrated
+```
+
+### Part 2: Design Overview
+
+**Two complementary features**:
+
+1. **Retry Budgets**: Job-level retry limit shared across all workflows, with per-workflow caps
+2. **Best-Effort Mode**: Explicit partial completion when minimum DC threshold is met
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         AD-44 DESIGN OVERVIEW                           │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │                      RETRY BUDGETS                               │    │
+│  │                                                                  │    │
+│  │  Job-Specified:                                                  │    │
+│  │    retry_budget: 15         (total retries for entire job)      │    │
+│  │    retry_budget_per_workflow: 3  (max per single workflow)      │    │
+│  │                                                                  │    │
+│  │  Env-Enforced Limits:                                           │    │
+│  │    RETRY_BUDGET_MAX: 50     (hard ceiling)                      │    │
+│  │    RETRY_BUDGET_PER_WORKFLOW_MAX: 5  (hard ceiling)             │    │
+│  │                                                                  │    │
+│  │  Effective = min(job_requested, env_max)                        │    │
+│  │                                                                  │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+│                                                                          │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │                    BEST-EFFORT MODE                              │    │
+│  │                                                                  │    │
+│  │  Job-Specified:                                                  │    │
+│  │    best_effort: true                                            │    │
+│  │    best_effort_min_dcs: 2   (minimum DCs for success)           │    │
+│  │    best_effort_deadline_seconds: 300  (max wait time)           │    │
+│  │                                                                  │    │
+│  │  Completion triggers:                                           │    │
+│  │    1. min_dcs reached → complete with partial results           │    │
+│  │    2. deadline expired → complete with available results        │    │
+│  │    3. all DCs reported → complete normally                      │    │
+│  │                                                                  │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Part 3: Retry Budget Architecture
+
+#### Budget Model
+
+```python
+# Extension to distributed/models/jobs.py
+@dataclass(slots=True)
+class RetryBudgetState:
+    """
+    Tracks retry budget consumption for a job.
+
+    Enforced at manager level since managers handle dispatch.
+    """
+    job_id: str
+    total_budget: int                           # Effective budget (clamped to max)
+    per_workflow_max: int                       # Per-workflow limit (clamped)
+    consumed: int = 0                           # Total retries consumed
+    per_workflow_consumed: dict[str, int] = field(default_factory=dict)
+
+    def can_retry(self, workflow_id: str) -> tuple[bool, str]:
+        """
+        Check if workflow can retry.
+
+        Returns:
+            (allowed, reason) - reason explains denial if not allowed
+        """
+        # Check job-level budget
+        if self.consumed >= self.total_budget:
+            return False, f"job_budget_exhausted ({self.consumed}/{self.total_budget})"
+
+        # Check per-workflow limit
+        wf_consumed = self.per_workflow_consumed.get(workflow_id, 0)
+        if wf_consumed >= self.per_workflow_max:
+            return False, f"workflow_budget_exhausted ({wf_consumed}/{self.per_workflow_max})"
+
+        return True, "allowed"
+
+    def consume_retry(self, workflow_id: str) -> None:
+        """Record a retry attempt."""
+        self.consumed += 1
+        self.per_workflow_consumed[workflow_id] = (
+            self.per_workflow_consumed.get(workflow_id, 0) + 1
+        )
+
+    def get_remaining(self) -> int:
+        """Get remaining job-level retries."""
+        return max(0, self.total_budget - self.consumed)
+
+    def get_workflow_remaining(self, workflow_id: str) -> int:
+        """Get remaining retries for specific workflow."""
+        wf_consumed = self.per_workflow_consumed.get(workflow_id, 0)
+        return max(0, self.per_workflow_max - wf_consumed)
+```
+
+#### Enforcement Flow
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    RETRY BUDGET ENFORCEMENT FLOW                        │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  1. JOB SUBMISSION (Gate → Manager)                                     │
+│  ──────────────────────────────────                                     │
+│                                                                          │
+│  JobSubmission arrives at manager:                                       │
+│    retry_budget: 20                                                      │
+│    retry_budget_per_workflow: 4                                         │
+│                                                                          │
+│  Manager clamps to Env limits:                                           │
+│    effective_budget = min(20, RETRY_BUDGET_MAX=50) → 20                 │
+│    effective_per_wf = min(4, RETRY_BUDGET_PER_WORKFLOW_MAX=5) → 4       │
+│                                                                          │
+│  Create RetryBudgetState:                                                │
+│    _retry_budgets[job_id] = RetryBudgetState(                           │
+│        job_id=job_id,                                                    │
+│        total_budget=20,                                                  │
+│        per_workflow_max=4,                                               │
+│    )                                                                     │
+│                                                                          │
+│  2. WORKFLOW DISPATCH FAILS                                              │
+│  ──────────────────────────                                             │
+│                                                                          │
+│  WorkflowDispatcher._dispatch_workflow() fails                           │
+│       │                                                                  │
+│       ▼                                                                  │
+│  Before applying backoff, check budget:                                  │
+│    budget = self._retry_budgets.get(job_id)                             │
+│    can_retry, reason = budget.can_retry(workflow_id)                    │
+│       │                                                                  │
+│       ├─── can_retry=True ───────────────────────────────┐              │
+│       │                                                   │              │
+│       │    budget.consume_retry(workflow_id)             │              │
+│       │    self._apply_backoff(pending)                  │              │
+│       │    → Workflow will retry after backoff           │              │
+│       │                                                   │              │
+│       └─── can_retry=False ──────────────────────────────┤              │
+│                                                           │              │
+│            Log: "Retry denied: {reason}"                 │              │
+│            pending.dispatch_attempts = pending.max       │              │
+│            → Workflow marked as permanently failed       │              │
+│                                                           │              │
+│  3. BUDGET EXHAUSTION LOGGING                                           │
+│  ────────────────────────────                                           │
+│                                                                          │
+│  When budget exhausted, log for visibility:                              │
+│    ServerWarning(                                                        │
+│        message=f"Job {job_id} retry budget exhausted "                  │
+│                f"({consumed}/{total}), failing workflow {wf_id}",       │
+│    )                                                                     │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Integration with Existing Retry Logic
+
+```python
+# In WorkflowDispatcher._dispatch_workflow()
+async def _dispatch_workflow(self, pending: PendingWorkflow) -> bool:
+    """Dispatch workflow with retry budget enforcement."""
+
+    # ... existing allocation logic ...
+
+    if not allocations:
+        # No cores available - check retry budget before backoff
+        budget = self._retry_budgets.get(pending.job_id)
+        if budget:
+            can_retry, reason = budget.can_retry(pending.workflow_id)
+            if not can_retry:
+                # Budget exhausted - fail without retry
+                await self._logger.log(ServerWarning(
+                    message=f"Workflow {pending.workflow_id[:8]}... retry denied: {reason}",
+                    node_id=self._manager_id,
+                ))
+                pending.dispatch_attempts = pending.max_dispatch_attempts
+                return False
+
+            # Budget allows retry - consume and apply backoff
+            budget.consume_retry(pending.workflow_id)
+
+        self._apply_backoff(pending)
+        return False
+
+    # ... rest of existing dispatch logic ...
+```
+
+### Part 4: Best-Effort Mode Architecture
+
+#### Best-Effort State Model
+
+```python
+# Extension to distributed/models/jobs.py
+@dataclass(slots=True)
+class BestEffortState:
+    """
+    Tracks best-effort completion state for a job.
+
+    Enforced at gate level since gates handle DC routing.
+    """
+    job_id: str
+    enabled: bool
+    min_dcs: int                                # Minimum DCs for success
+    deadline: float                             # Absolute monotonic time
+    target_dcs: set[str]                        # All target DCs
+    dcs_completed: set[str] = field(default_factory=set)
+    dcs_failed: set[str] = field(default_factory=set)
+
+    def record_dc_result(self, dc_id: str, success: bool) -> None:
+        """Record result from a datacenter."""
+        if success:
+            self.dcs_completed.add(dc_id)
+        else:
+            self.dcs_failed.add(dc_id)
+
+    def check_completion(self, now: float) -> tuple[bool, str, bool]:
+        """
+        Check if job should complete.
+
+        Returns:
+            (should_complete, reason, is_success)
+        """
+        # All DCs reported - normal completion
+        all_reported = (self.dcs_completed | self.dcs_failed) == self.target_dcs
+        if all_reported:
+            success = len(self.dcs_completed) > 0
+            return True, "all_dcs_reported", success
+
+        if not self.enabled:
+            # Best-effort disabled - wait for all DCs
+            return False, "waiting_for_all_dcs", False
+
+        # Check minimum DCs threshold
+        if len(self.dcs_completed) >= self.min_dcs:
+            return True, f"min_dcs_reached ({len(self.dcs_completed)}/{self.min_dcs})", True
+
+        # Check deadline
+        if now >= self.deadline:
+            success = len(self.dcs_completed) > 0
+            reason = f"deadline_expired (completed: {len(self.dcs_completed)})"
+            return True, reason, success
+
+        return False, "waiting", False
+
+    def get_completion_ratio(self) -> float:
+        """Get ratio of completed DCs."""
+        if not self.target_dcs:
+            return 0.0
+        return len(self.dcs_completed) / len(self.target_dcs)
+```
+
+#### Completion Flow
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                   BEST-EFFORT COMPLETION FLOW                           │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  1. JOB SUBMISSION (Client → Gate)                                      │
+│  ─────────────────────────────────                                      │
+│                                                                          │
+│  JobSubmission:                                                          │
+│    best_effort: true                                                    │
+│    best_effort_min_dcs: 2                                               │
+│    best_effort_deadline_seconds: 300                                    │
+│    target_datacenters: [dc-east, dc-west, dc-central]                   │
+│                                                                          │
+│  Gate creates BestEffortState:                                           │
+│    _best_effort_states[job_id] = BestEffortState(                       │
+│        job_id=job_id,                                                    │
+│        enabled=True,                                                     │
+│        min_dcs=2,                                                        │
+│        deadline=now + 300,                                               │
+│        target_dcs={"dc-east", "dc-west", "dc-central"},                 │
+│    )                                                                     │
+│                                                                          │
+│  2. DC RESULTS ARRIVE                                                    │
+│  ────────────────────                                                   │
+│                                                                          │
+│  dc-east reports: COMPLETED (50 workflows done)                         │
+│    state.record_dc_result("dc-east", success=True)                      │
+│    check_completion() → (False, "waiting", False)                       │
+│                                                                          │
+│  dc-west reports: COMPLETED (50 workflows done)                         │
+│    state.record_dc_result("dc-west", success=True)                      │
+│    check_completion() → (True, "min_dcs_reached (2/2)", True)           │
+│                                                                          │
+│  3. JOB COMPLETES (partial success)                                      │
+│  ──────────────────────────────────                                     │
+│                                                                          │
+│  Gate marks job COMPLETED:                                               │
+│    - Returns results from dc-east + dc-west                             │
+│    - dc-central results NOT included (not yet reported)                 │
+│    - Job status: COMPLETED                                               │
+│    - Completion reason: "min_dcs_reached"                               │
+│    - Completion ratio: 0.67 (2/3 DCs)                                   │
+│                                                                          │
+│  4. LATE DC RESULT (optional handling)                                   │
+│  ─────────────────────────────────────                                  │
+│                                                                          │
+│  dc-central reports: COMPLETED (50 workflows done)                      │
+│    → Job already completed, result logged but not aggregated            │
+│    → OR: Job result updated with late DC data (configurable)            │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Deadline Enforcement
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    BEST-EFFORT DEADLINE FLOW                            │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  Scenario: DC-central is partitioned, will never respond                 │
+│                                                                          │
+│  T=0s:    Job submitted, deadline = T+300s                              │
+│  T=30s:   dc-east reports COMPLETED                                     │
+│  T=45s:   dc-west reports COMPLETED                                     │
+│           (min_dcs=2 reached, but let's say min_dcs=3)                  │
+│  T=60s:   ...waiting for dc-central...                                  │
+│  T=120s:  ...still waiting...                                           │
+│  T=300s:  DEADLINE EXPIRED                                              │
+│                                                                          │
+│  Gate deadline check (runs periodically):                                │
+│       │                                                                  │
+│       ▼                                                                  │
+│  for job_id, state in _best_effort_states.items():                      │
+│      should_complete, reason, success = state.check_completion(now)     │
+│      if should_complete:                                                 │
+│          complete_job(job_id, reason, success)                          │
+│       │                                                                  │
+│       ▼                                                                  │
+│  Job completes with:                                                     │
+│    status: COMPLETED (2/3 DCs succeeded)                                │
+│    reason: "deadline_expired (completed: 2)"                            │
+│    results: dc-east + dc-west data                                      │
+│    missing: dc-central                                                   │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Part 5: Extended JobSubmission Model
+
+```python
+# Extension to distributed/models/distributed.py
+@dataclass(slots=True)
+class JobSubmission(Message):
+    """
+    Job submission from client to gate.
+
+    Extended with retry budget and best-effort fields (AD-44).
+    """
+    job_id: str
+    workflows: bytes                            # Cloudpickled workflows
+    vus: int
+    timeout_seconds: float
+    datacenter_count: int = 1
+    preferred_datacenters: list[str] = field(default_factory=list)
+
+    # ... existing fields ...
+
+    # AD-44: Retry Budget
+    retry_budget: int = 0                       # 0 = use default
+    # Total retries allowed across all workflows in job.
+    # Clamped to RETRY_BUDGET_MAX at manager.
+
+    retry_budget_per_workflow: int = 0          # 0 = use default
+    # Maximum retries per individual workflow.
+    # Clamped to RETRY_BUDGET_PER_WORKFLOW_MAX at manager.
+
+    # AD-44: Best-Effort Mode
+    best_effort: bool = False
+    # Enable best-effort completion mode.
+    # When true, job completes when min_dcs threshold reached or deadline expires.
+
+    best_effort_min_dcs: int = 1
+    # Minimum datacenters that must complete for job success.
+    # Only used when best_effort=True.
+
+    best_effort_deadline_seconds: float = 0.0   # 0 = use default
+    # Maximum seconds to wait for all DCs before completing with available results.
+    # Only used when best_effort=True. Clamped to BEST_EFFORT_DEADLINE_MAX.
+```
+
+### Part 6: Environment Configuration
+
+```python
+# Extension to distributed/env/env.py
+class Env(BaseModel):
+    # ... existing fields ...
+
+    # AD-44: Retry Budget Configuration
+    RETRY_BUDGET_MAX: StrictInt = 50
+    # Hard ceiling on job-level retry budget.
+    # Jobs requesting higher values are clamped to this.
+
+    RETRY_BUDGET_PER_WORKFLOW_MAX: StrictInt = 5
+    # Hard ceiling on per-workflow retry limit.
+    # Prevents single workflow from consuming entire budget.
+
+    RETRY_BUDGET_DEFAULT: StrictInt = 10
+    # Default retry budget when job doesn't specify.
+    # Used when retry_budget=0 in JobSubmission.
+
+    RETRY_BUDGET_PER_WORKFLOW_DEFAULT: StrictInt = 3
+    # Default per-workflow limit when not specified.
+    # Used when retry_budget_per_workflow=0 in JobSubmission.
+
+    # AD-44: Best-Effort Configuration
+    BEST_EFFORT_DEADLINE_MAX: StrictFloat = 3600.0
+    # Maximum best-effort deadline (1 hour).
+    # Jobs requesting higher values are clamped.
+
+    BEST_EFFORT_DEADLINE_DEFAULT: StrictFloat = 300.0
+    # Default deadline when job specifies best_effort=True but no deadline.
+    # 5 minutes is reasonable for most test scenarios.
+
+    BEST_EFFORT_MIN_DCS_DEFAULT: StrictInt = 1
+    # Default minimum DCs when not specified.
+    # 1 means job completes when ANY DC succeeds.
+
+    BEST_EFFORT_DEADLINE_CHECK_INTERVAL: StrictFloat = 5.0
+    # How often gates check for deadline expiration.
+    # Lower = more responsive, higher = less overhead.
+```
+
+### Part 7: SWIM Hierarchy Integration
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    AD-44 SWIM HIERARCHY INTEGRATION                     │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  GATE CLUSTER (SWIM)                                                     │
+│  ───────────────────                                                    │
+│  Responsibilities:                                                       │
+│    • Receive JobSubmission with retry/best-effort config                │
+│    • Track BestEffortState per job                                      │
+│    • Run deadline check loop                                            │
+│    • Aggregate DC results and determine completion                      │
+│    • Broadcast job completion to peer gates                             │
+│                                                                          │
+│  State:                                                                  │
+│    _best_effort_states: dict[job_id, BestEffortState]                   │
+│                                                                          │
+│       │                                                                  │
+│       │ JobSubmission (with retry_budget, best_effort)                  │
+│       ▼                                                                  │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │                                                                  │    │
+│  │  MANAGER CLUSTER (SWIM)                                         │    │
+│  │  ──────────────────────                                         │    │
+│  │  Responsibilities:                                               │    │
+│  │    • Receive JobSubmission, extract retry budget                │    │
+│  │    • Clamp budget to Env maximums                               │    │
+│  │    • Create RetryBudgetState per job                            │    │
+│  │    • Enforce budget on each workflow retry                      │    │
+│  │    • Report job results back to gate                            │    │
+│  │                                                                  │    │
+│  │  State:                                                          │    │
+│  │    _retry_budgets: dict[job_id, RetryBudgetState]               │    │
+│  │                                                                  │    │
+│  │       │                                                          │    │
+│  │       │ WorkflowDispatch                                        │    │
+│  │       ▼                                                          │    │
+│  │  ┌───────────────────────────────────────────────────────┐      │    │
+│  │  │                                                        │      │    │
+│  │  │  WORKERS (report to Manager via SWIM)                 │      │    │
+│  │  │  ────────────────────────────────────                 │      │    │
+│  │  │  Responsibilities:                                     │      │    │
+│  │  │    • Execute workflows (unchanged)                    │      │    │
+│  │  │    • Report completion/failure to manager             │      │    │
+│  │  │                                                        │      │    │
+│  │  │  Note: Workers are UNAWARE of retry budgets or        │      │    │
+│  │  │  best-effort mode. They just execute and report.      │      │    │
+│  │  │                                                        │      │    │
+│  │  └───────────────────────────────────────────────────────┘      │    │
+│  │                                                                  │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Part 8: Data Flow Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                       AD-44 COMPLETE DATA FLOW                          │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  CLIENT                                                                  │
+│    │                                                                     │
+│    │ JobSubmission:                                                      │
+│    │   job_id: "test-123"                                               │
+│    │   retry_budget: 15                                                  │
+│    │   retry_budget_per_workflow: 3                                     │
+│    │   best_effort: true                                                │
+│    │   best_effort_min_dcs: 2                                           │
+│    │   best_effort_deadline_seconds: 300                                │
+│    │   target: [dc-east, dc-west, dc-central]                           │
+│    ▼                                                                     │
+│  GATE                                                                    │
+│    │                                                                     │
+│    │ 1. Create BestEffortState:                                         │
+│    │    enabled=true, min_dcs=2, deadline=now+300                       │
+│    │                                                                     │
+│    │ 2. Route to target DCs                                             │
+│    │                                                                     │
+│    ├─────────────────┬─────────────────┬─────────────────┐              │
+│    ▼                 ▼                 ▼                 │              │
+│  dc-east          dc-west         dc-central            │              │
+│  MANAGER          MANAGER          MANAGER               │              │
+│    │                │                 │                  │              │
+│    │ Create RetryBudgetState:        │                  │              │
+│    │   total=15, per_wf=3            │                  │              │
+│    │                │                 │                  │              │
+│    │ Dispatch workflows...           │                  │              │
+│    │                │                 │                  │              │
+│    │ Workflow fails:                 │                  │              │
+│    │   budget.can_retry(wf_id)?      │                  │              │
+│    │   → YES: consume, retry         │                  │              │
+│    │   → NO: fail workflow           │                  │              │
+│    │                │                 │                  │              │
+│    │ Complete!      │ Complete!       │ (partitioned)   │              │
+│    │                │                 │                  │              │
+│    ▼                ▼                 ▼                  │              │
+│  GATE receives results:                                  │              │
+│    │                                                     │              │
+│    │ dc-east: COMPLETED                                 │              │
+│    │   state.record_dc_result("dc-east", True)          │              │
+│    │   check_completion() → waiting (1/2 min_dcs)       │              │
+│    │                                                     │              │
+│    │ dc-west: COMPLETED                                 │              │
+│    │   state.record_dc_result("dc-west", True)          │              │
+│    │   check_completion() → COMPLETE (2/2 min_dcs)      │              │
+│    │                                                     │              │
+│    ▼                                                     │              │
+│  JOB COMPLETED (partial success)                         │              │
+│    status: COMPLETED                                     │              │
+│    reason: "min_dcs_reached (2/2)"                      │              │
+│    completion_ratio: 0.67                               │              │
+│    results: dc-east + dc-west data                      │              │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Part 9: Example Scenarios
+
+#### Scenario 1: Normal Completion (No Retries Needed)
+
+```
+Job: 10 workflows, retry_budget=15, best_effort=false
+Target: dc-east
+
+All 10 workflows complete successfully on first attempt
+→ Budget consumed: 0/15
+→ Job status: COMPLETED
+→ Completion: normal (all workflows succeeded)
+```
+
+#### Scenario 2: Retries Within Budget
+
+```
+Job: 10 workflows, retry_budget=15, retry_budget_per_workflow=3
+Target: dc-east
+
+Workflows 1-8: Complete on first attempt
+Workflow 9: Fails 2 times, succeeds on 3rd attempt
+Workflow 10: Fails 3 times, succeeds on 4th attempt
+
+Budget tracking:
+  After WF9 retries: consumed=2, wf9_consumed=2
+  After WF10 retries: consumed=5, wf10_consumed=3
+
+→ Budget consumed: 5/15
+→ Job status: COMPLETED
+→ All workflows eventually succeeded
+```
+
+#### Scenario 3: Per-Workflow Budget Exhausted
+
+```
+Job: 10 workflows, retry_budget=15, retry_budget_per_workflow=3
+Target: dc-east
+
+Workflow 1: Fails 3 times (per_workflow_max reached)
+  Retry 1: budget.consume_retry("wf1") → consumed=1, wf1=1
+  Retry 2: budget.consume_retry("wf1") → consumed=2, wf1=2
+  Retry 3: budget.consume_retry("wf1") → consumed=3, wf1=3
+  Retry 4: budget.can_retry("wf1") → FALSE ("workflow_budget_exhausted")
+  → WF1 marked FAILED
+
+Workflows 2-10: Complete successfully
+
+→ Budget consumed: 3/15
+→ Job status: COMPLETED (partial - 9/10 workflows)
+→ WF1 failed after exhausting per-workflow budget
+```
+
+#### Scenario 4: Job-Level Budget Exhausted
+
+```
+Job: 10 workflows, retry_budget=5, retry_budget_per_workflow=3
+Target: dc-east (experiencing issues)
+
+WF1: Fails, retry 1 → consumed=1
+WF2: Fails, retry 1 → consumed=2
+WF3: Fails, retry 1 → consumed=3
+WF4: Fails, retry 1 → consumed=4
+WF5: Fails, retry 1 → consumed=5
+WF6: Fails, retry 1 → budget.can_retry() → FALSE ("job_budget_exhausted")
+WF7-10: Also fail, all denied retries
+
+→ Budget consumed: 5/5 (exhausted)
+→ Remaining workflows fail without retry
+→ Prevents retry storm
+```
+
+#### Scenario 5: Best-Effort with DC Loss
+
+```
+Job: 30 workflows, best_effort=true, min_dcs=2, deadline=300s
+Target: dc-east, dc-west, dc-central
+
+T=0s:    Job submitted
+T=30s:   dc-east completes (10 workflows)
+         check_completion() → waiting (1/2 min_dcs)
+T=45s:   dc-west completes (10 workflows)
+         check_completion() → COMPLETE (2/2 min_dcs)
+
+→ Job status: COMPLETED
+→ Reason: "min_dcs_reached (2/2)"
+→ Results: 20 workflows from dc-east + dc-west
+→ dc-central: not waited for (min_dcs satisfied)
+```
+
+#### Scenario 6: Best-Effort Deadline Expiration
+
+```
+Job: 30 workflows, best_effort=true, min_dcs=3, deadline=60s
+Target: dc-east, dc-west, dc-central
+
+T=0s:    Job submitted, deadline=T+60s
+T=30s:   dc-east completes (10 workflows)
+T=45s:   dc-west completes (10 workflows)
+         check_completion() → waiting (2/3 min_dcs not met)
+T=60s:   DEADLINE EXPIRED
+         check_completion() → COMPLETE (deadline, 2 DCs)
+
+→ Job status: COMPLETED
+→ Reason: "deadline_expired (completed: 2)"
+→ Results: 20 workflows (partial)
+→ dc-central: timed out
+```
+
+### Part 10: Implementation Guide
+
+#### File Structure
+
+```
+hyperscale/distributed/
+├── models/
+│   ├── jobs.py                     # Add RetryBudgetState, BestEffortState
+│   └── distributed.py              # Extend JobSubmission
+├── jobs/
+│   ├── workflow_dispatcher.py      # Integrate retry budget enforcement
+│   ├── retry_budget.py             # RetryBudgetManager (new)
+│   └── best_effort.py              # BestEffortManager (new)
+├── nodes/
+│   ├── manager/
+│   │   ├── server.py               # Extract and track retry budgets
+│   │   └── state.py                # Add _retry_budgets tracking
+│   └── gate/
+│       ├── server.py               # Integrate best-effort completion
+│       ├── state.py                # Add _best_effort_states tracking
+│       └── handlers/
+│           └── tcp_job.py          # Extract best-effort config
+└── env/
+    └── env.py                      # Add AD-44 configuration
+```
+
+#### Integration Points
+
+1. **JobSubmission** (distributed/models/distributed.py):
+   - Add `retry_budget`, `retry_budget_per_workflow`
+   - Add `best_effort`, `best_effort_min_dcs`, `best_effort_deadline_seconds`
+
+2. **Manager Server** (distributed/nodes/manager/server.py):
+   - On job reception: Create RetryBudgetState with clamped values
+   - Store in `_state._retry_budgets[job_id]`
+   - Clean up on job completion
+
+3. **WorkflowDispatcher** (distributed/jobs/workflow_dispatcher.py):
+   - Before retry: Check `budget.can_retry(workflow_id)`
+   - If allowed: `budget.consume_retry(workflow_id)`, apply backoff
+   - If denied: Fail workflow immediately
+
+4. **Gate Server** (distributed/nodes/gate/server.py):
+   - On job submission: Create BestEffortState
+   - Run deadline check loop (periodic task)
+   - On DC result: Update state, check completion
+
+5. **GateJobManager** (distributed/jobs/gates/gate_job_manager.py):
+   - Integrate `check_completion()` into result aggregation
+   - Support partial completion with available results
+
+6. **Env** (distributed/env/env.py):
+   - Add all `RETRY_BUDGET_*` variables
+   - Add all `BEST_EFFORT_*` variables
+
+### Part 11: Failure Mode Analysis
+
+| Failure | Impact | Mitigation |
+|---------|--------|------------|
+| Manager crash during job | Retry budget state lost | Rebuild from pending workflows; conservative (assume some consumed) |
+| Gate crash during job | Best-effort state lost | Peer gates can reconstruct from job metadata |
+| Budget exhausted early | Many workflows fail | Log prominently; allow job-level override in submission |
+| Deadline too short | Job completes with few results | Minimum deadline enforced via Env |
+| All DCs fail before min | Job fails with no results | Return partial results if any; clear failure reason |
+| Late DC result after completion | Results not included | Optionally log/store; don't re-aggregate |
+| Clock skew affects deadline | Premature/late completion | Use monotonic time; deadline relative to submission |
+
+### Part 12: Design Decision Summary
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    AD-44 DESIGN DECISION SUMMARY                        │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  DECISION                  CHOICE                 RATIONALE              │
+│  ──────────────────────────────────────────────────────────────────────│
+│                                                                          │
+│  Retry budget scope        Job-level with         Prevents retry storms  │
+│                            per-workflow cap       while allowing recovery│
+│                                                                          │
+│  Budget enforcement        Manager-side           Managers handle dispatch│
+│  location                                         and retry logic        │
+│                                                                          │
+│  Env limits                Hard ceiling on        Operators control      │
+│                            job requests           cluster-wide behavior  │
+│                                                                          │
+│  Best-effort scope         Gate-level             Gates handle DC routing│
+│                                                   and result aggregation │
+│                                                                          │
+│  Completion triggers       min_dcs OR deadline    Flexible: fast complete│
+│                            OR all reported        or guaranteed wait     │
+│                                                                          │
+│  Late results              Logged, not            Simplifies completion  │
+│                            re-aggregated          logic; predictable     │
+│                                                                          │
+│  Default behavior          best_effort=false      Backwards compatible;  │
+│                                                   explicit opt-in        │
+│                                                                          │
+│  WHY THIS IS CORRECT:                                                    │
+│                                                                          │
+│  1. Job-level budget prevents retry storms during cluster issues        │
+│  2. Per-workflow cap prevents one bad workflow from consuming budget    │
+│  3. Env limits give operators control over cluster behavior             │
+│  4. Best-effort mode is explicit opt-in (safe default)                 │
+│  5. min_dcs + deadline provides flexible completion semantics          │
+│  6. Manager handles retries (existing pattern), Gate handles DCs        │
+│  7. All config via Env (consistent with AD-42, AD-43)                  │
+│  8. Workers remain simple (unaware of budgets/best-effort)             │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
