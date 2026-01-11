@@ -10,7 +10,6 @@ These tests verify that:
 6. DC health classification based on manager health signals
 """
 
-import pytest
 import time
 
 from hyperscale.distributed.health import (

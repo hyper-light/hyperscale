@@ -21,8 +21,7 @@ Each test class validates:
 import asyncio
 import pytest
 import time
-from unittest.mock import MagicMock, AsyncMock, patch
-from dataclasses import dataclass
+from unittest.mock import MagicMock, AsyncMock
 
 from hyperscale.distributed.nodes.manager.state import ManagerState
 from hyperscale.distributed.nodes.manager.config import ManagerConfig

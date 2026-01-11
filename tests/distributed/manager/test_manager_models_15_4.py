@@ -19,7 +19,6 @@ Each test class validates:
 import asyncio
 import pytest
 import time
-from dataclasses import FrozenInstanceError
 
 from hyperscale.distributed.nodes.manager.models import (
     PeerState,
