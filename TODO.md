@@ -849,7 +849,7 @@ nodes/client/
 
 ### 15.2 Worker Refactoring (Phase 2)
 
-**Status**: 🚧 **60% COMPLETE** - Module structure, models, config, state, handlers done
+**Status**: 🚧 **90% COMPLETE** - Module structure, models, config, state, handlers, core modules done
 
 **Target Structure**:
 ```
@@ -958,26 +958,37 @@ nodes/worker/
 
 **AD Compliance**: ✅ Verified - preserves AD-20, AD-31, AD-33, Section 8 compliance
 
-#### 15.2.6 Worker Core Modules ⏳ PENDING
+#### 15.2.6 Worker Core Modules ✅ COMPLETE
 
 **Files**: `nodes/worker/*.py`
 
-- [ ] **15.2.6.1** Create `execution.py` - WorkerExecutor
-  - handle_dispatch(), allocate_cores(), report_progress(), cleanup()
-- [ ] **15.2.6.2** Create `registry.py` - WorkerRegistry
-  - register_manager(), track_health(), peer_discovery()
-- [ ] **15.2.6.3** Create `sync.py` - WorkerStateSync
-  - generate_snapshot(), handle_sync_request()
-- [ ] **15.2.6.4** Create `cancellation.py` - WorkerCancellationHandler
-  - handle_cancel(), notify_completion()
-- [ ] **15.2.6.5** Create `health.py` - WorkerHealthIntegration
-  - swim_callbacks(), health_embedding(), overload_detection()
-- [ ] **15.2.6.6** Create `backpressure.py` - WorkerBackpressureManager
-  - overload_signals(), circuit_breakers(), load_shedding()
-- [ ] **15.2.6.7** Create `discovery.py` - WorkerDiscoveryManager
-  - discovery_integration(), maintenance_loop()
+- [x] **15.2.6.1** Create `execution.py` - WorkerExecutor
+  - allocate_cores(), free_cores(), record_throughput_event()
+  - get_throughput(), get_expected_throughput() (AD-19)
+  - buffer_progress_update(), run_progress_flush_loop()
+  - create_initial_progress() factory method
+- [x] **15.2.6.2** Create `registry.py` - WorkerRegistry
+  - add_manager(), get_manager(), mark_manager_healthy/unhealthy()
+  - get_healthy_manager_tcp_addrs(), get_primary_manager_tcp_addr()
+  - Circuit breaker management: get_or_create_circuit(), is_circuit_open()
+  - select_new_primary_manager(), find_manager_by_udp_addr()
+- [x] **15.2.6.3** Create `sync.py` - WorkerStateSync
+  - increment_version(), generate_snapshot(), apply_snapshot()
+- [x] **15.2.6.4** Create `cancellation.py` - WorkerCancellationHandler
+  - create_cancel_event(), signal_cancellation(), is_cancelled()
+  - cancel_workflow(), run_cancellation_poll_loop()
+- [x] **15.2.6.5** Create `health.py` - WorkerHealthIntegration
+  - on_node_dead(), on_node_join() SWIM callbacks
+  - get_health_embedding(), is_healthy(), get_health_status()
+- [x] **15.2.6.6** Create `backpressure.py` - WorkerBackpressureManager
+  - run_overload_poll_loop() (AD-18)
+  - get_overload_state_str(), record_workflow_latency()
+  - Manager backpressure tracking (AD-23)
+- [x] **15.2.6.7** Create `discovery.py` - WorkerDiscoveryManager
+  - run_maintenance_loop() (AD-28)
+  - select_best_manager(), record_success/failure()
 
-**AD Compliance Check Required**: Must preserve AD-33 (Workflow State Machine) transitions
+**AD Compliance**: ✅ Verified - preserves AD-18, AD-19, AD-23, AD-28, AD-33
 
 #### 15.2.7 Worker Composition Root ⏳ PENDING
 
@@ -993,7 +1004,7 @@ nodes/worker/
 
 ### 15.3 Gate Refactoring (Phase 3)
 
-**Status**: 🚧 **90% COMPLETE** - Module foundation done, composition root in progress (8,093 lines to refactor)
+**Status**: ✅ **100% COMPLETE** - Modular foundation with coordinators and composition root
 
 **Target Structure**:
 ```
