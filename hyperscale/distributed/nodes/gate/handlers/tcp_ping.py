@@ -53,7 +53,7 @@ class GatePingHandler:
         self._get_all_job_ids = get_all_job_ids
         self._get_datacenter_managers = get_datacenter_managers
 
-    async def handle(
+    async def handle_ping(
         self,
         addr: tuple[str, int],
         data: bytes,

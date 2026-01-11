@@ -102,7 +102,7 @@ class GateManagerHandler:
         self._update_dc_backpressure = update_dc_backpressure
         self._broadcast_manager_discovery = broadcast_manager_discovery
 
-    async def handle_manager_status_update(
+    async def handle_status_update(
         self,
         addr: tuple[str, int],
         data: bytes,
@@ -151,7 +151,7 @@ class GateManagerHandler:
             await handle_exception(error, "manager_status_update")
             return b'error'
 
-    async def handle_manager_register(
+    async def handle_register(
         self,
         addr: tuple[str, int],
         data: bytes,
@@ -391,7 +391,7 @@ class GateManagerHandler:
                 error=str(error),
             ).dump()
 
-    async def handle_manager_discovery(
+    async def handle_discovery(
         self,
         addr: tuple[str, int],
         data: bytes,

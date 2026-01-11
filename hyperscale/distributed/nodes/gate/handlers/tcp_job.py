@@ -141,7 +141,7 @@ class GateJobHandler:
         self._record_dc_job_stats = record_dc_job_stats
         self._handle_update_by_tier = handle_update_by_tier
 
-    async def handle_job_submission(
+    async def handle_submission(
         self,
         addr: tuple[str, int],
         data: bytes,
@@ -328,7 +328,7 @@ class GateJobHandler:
                 error=str(error),
             ).dump()
 
-    async def handle_job_status_request(
+    async def handle_status_request(
         self,
         addr: tuple[str, int],
         data: bytes,
@@ -376,7 +376,7 @@ class GateJobHandler:
             latency_ms = (time.monotonic() - start_time) * 1000
             self._record_request_latency(latency_ms)
 
-    async def handle_job_progress(
+    async def handle_progress(
         self,
         addr: tuple[str, int],
         data: bytes,
