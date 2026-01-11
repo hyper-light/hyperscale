@@ -13,6 +13,7 @@ from hyperscale.distributed_rewrite.nodes.gate.cancellation_coordinator import (
     GateCancellationCoordinator,
 )
 from hyperscale.distributed_rewrite.nodes.gate.state import GateRuntimeState
+from hyperscale.distributed_rewrite.models import CancelAck
 
 
 # =============================================================================
@@ -40,17 +41,10 @@ class MockTaskRunner:
         return task
 
 
-@dataclass
-class MockCancelAck:
-    """Mock cancel acknowledgment."""
-    accepted: bool = True
-    error: str | None = None
-
-    @classmethod
-    def load(cls, data: bytes) -> "MockCancelAck":
-        if b"rejected" in data:
-            return cls(accepted=False, error="Rejected by manager")
-        return cls(accepted=True)
+def make_success_ack(job_id: str = "job-1") -> bytes:
+    """Create a successful CancelAck response."""
+    ack = CancelAck(job_id=job_id, cancelled=True, workflows_cancelled=5)
+    return ack.dump()
 
 
 # =============================================================================
@@ -67,7 +61,13 @@ class TestCancelJobHappyPath:
         state = GateRuntimeState()
 
         async def mock_send_tcp(addr, msg_type, data, timeout=None):
-            return (b"ok", None)
+            # Return properly serialized CancelAck
+            ack = CancelAck(
+                job_id="job-1",
+                cancelled=True,
+                workflows_cancelled=5,
+            )
+            return (ack.dump(), None)
 
         coordinator = GateCancellationCoordinator(
             state=state,
@@ -211,7 +211,8 @@ class TestCancelJobFailureMode:
             nonlocal call_count
             call_count += 1
             if call_count == 1:
-                return (b"ok", None)
+                ack = CancelAck(job_id="job-1", cancelled=True, workflows_cancelled=5)
+                return (ack.dump(), None)
             raise Exception("DC 2 failed")
 
         coordinator = GateCancellationCoordinator(
@@ -244,7 +245,8 @@ class TestCancelJobInDC:
         state = GateRuntimeState()
 
         async def mock_send(addr, msg_type, data, timeout=None):
-            return (b"ok", None)
+            ack = CancelAck(job_id="job-1", cancelled=True, workflows_cancelled=5)
+            return (ack.dump(), None)
 
         coordinator = GateCancellationCoordinator(
             state=state,
@@ -261,9 +263,9 @@ class TestCancelJobInDC:
 
         await coordinator._cancel_job_in_dc("job-1", "dc-east", "user_requested")
 
-        # Should not have added errors
+        # Should not have added errors since ack.cancelled is True
         errors = state.get_cancellation_errors("job-1")
-        # Errors depend on response parsing
+        assert len(errors) == 0
 
     @pytest.mark.asyncio
     async def test_cancel_in_dc_no_manager(self):
