@@ -3,18 +3,23 @@ Manager in-flight tracking module.
 
 Implements AD-32 bounded execution with priority-aware in-flight tracking
 to prevent unbounded task accumulation and memory exhaustion.
+
+Uses the centralized AD-37 message classification from the reliability module
+for consistent priority handling across all node types.
 """
 
 import asyncio
-import time
 from typing import TYPE_CHECKING
 
+from hyperscale.distributed_rewrite.reliability import (
+    RequestPriority,
+    classify_handler_to_priority,
+)
 from hyperscale.logging.hyperscale_logging_models import ServerDebug, ServerWarning
 
 if TYPE_CHECKING:
     from hyperscale.distributed_rewrite.nodes.manager.config import ManagerConfig
     from hyperscale.logging import Logger
-    from hyperscale.distributed_rewrite.nodes.manager.load_shedding import RequestPriority
 
 
 class InFlightTracker:
@@ -49,15 +54,21 @@ class InFlightTracker:
         self._task_runner = task_runner
 
         # Per-priority limits (CRITICAL has no limit)
-        self._limits = {
-            0: float("inf"),  # CRITICAL
-            1: high_limit,  # HIGH
-            2: normal_limit,  # NORMAL
-            3: low_limit,  # LOW
+        # Uses RequestPriority enum for AD-37 compliant indexing
+        self._limits: dict[RequestPriority, float] = {
+            RequestPriority.CRITICAL: float("inf"),
+            RequestPriority.HIGH: high_limit,
+            RequestPriority.NORMAL: normal_limit,
+            RequestPriority.LOW: low_limit,
         }
 
         # Current counts per priority
-        self._counts: dict[int, int] = {0: 0, 1: 0, 2: 0, 3: 0}
+        self._counts: dict[RequestPriority, int] = {
+            RequestPriority.CRITICAL: 0,
+            RequestPriority.HIGH: 0,
+            RequestPriority.NORMAL: 0,
+            RequestPriority.LOW: 0,
+        }
 
         # Global limit
         self._global_limit = global_limit
