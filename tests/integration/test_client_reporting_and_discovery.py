@@ -547,8 +547,19 @@ class TestClientDiscovery:
     # =========================================================================
 
     @pytest.mark.asyncio
-    async def test_happy_path_query_workflows(self, discovery, send_tcp):
+    async def test_happy_path_query_workflows(self, state, logger, send_tcp):
         """Test workflow query from managers."""
+        # Use single-manager config to avoid duplicate results from parallel queries
+        config = ClientConfig(
+            host="localhost",
+            tcp_port=8000,
+            env="test",
+            managers=[("manager1", 7000)],
+            gates=[],
+        )
+        targets = ClientTargetSelector(config, state)
+        discovery = ClientDiscovery(state, config, logger, targets, send_tcp)
+
         workflow_info = WorkflowStatusInfo(
             workflow_name="TestWorkflow",
             workflow_id="TestWorkflow-wf-1",
