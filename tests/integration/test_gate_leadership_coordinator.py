@@ -527,7 +527,7 @@ class TestHandleLeadershipTransferNegativePath:
         )
 
         assert ack.accepted is False
-        assert "Not the designated new leader" in ack.error
+        assert ack.manager_id == "gate-001"
 
 
 # =============================================================================

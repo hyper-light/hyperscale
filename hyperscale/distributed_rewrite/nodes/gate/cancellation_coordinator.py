@@ -151,7 +151,7 @@ class GateCancellationCoordinator:
 
             if response and not isinstance(response, Exception):
                 ack = CancelAck.load(response)
-                if not ack.accepted:
+                if not ack.cancelled:
                     self._state.add_cancellation_error(
                         job_id, f"DC {dc_id} rejected: {ack.error}"
                     )

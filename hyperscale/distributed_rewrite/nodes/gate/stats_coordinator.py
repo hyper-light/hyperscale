@@ -110,18 +110,24 @@ class GateStatsCoordinator:
             return
 
         # Build status push message
+        is_final = job.status in (
+            JobStatus.COMPLETED.value,
+            JobStatus.FAILED.value,
+            JobStatus.CANCELLED.value,
+        )
+        message = f"Job {job_id}: {job.status}"
+        if is_final:
+            message = f"Job {job_id} {job.status.lower()}"
+
         push = JobStatusPush(
             job_id=job_id,
             status=job.status,
+            message=message,
             total_completed=getattr(job, 'total_completed', 0),
             total_failed=getattr(job, 'total_failed', 0),
             overall_rate=getattr(job, 'overall_rate', 0.0),
             elapsed_seconds=getattr(job, 'elapsed_seconds', 0.0),
-            is_final=job.status in (
-                JobStatus.COMPLETED.value,
-                JobStatus.FAILED.value,
-                JobStatus.CANCELLED.value,
-            ),
+            is_final=is_final,
         )
 
         try:
