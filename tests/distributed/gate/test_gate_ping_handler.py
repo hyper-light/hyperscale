@@ -98,7 +98,7 @@ class TestGatePingHandlerHappyPath:
 
         try:
             # We need to patch PingRequest.load
-            result = await handler.handle(
+            result = await handler.handle_ping(
                 addr=("10.0.0.1", 8000),
                 data=b"ping_request_data",
                 clock_time=12345,
