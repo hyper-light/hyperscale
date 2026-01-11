@@ -399,6 +399,24 @@ class LoggerStream:
             task = self._queue.get_nowait()
             await task
 
+        if self._batch_timer_handle:
+            self._batch_timer_handle.cancel()
+            self._batch_timer_handle = None
+
+        if self._batch_flush_task and not self._batch_flush_task.done():
+            try:
+                await asyncio.wait_for(self._batch_flush_task, timeout=1.0)
+            except asyncio.TimeoutError:
+                self._batch_flush_task.cancel()
+                try:
+                    await self._batch_flush_task
+                except asyncio.CancelledError:
+                    pass
+
+        for logfile_path in list(self._files.keys()):
+            if self._pending_batch:
+                await self._flush_batch(logfile_path)
+
         await asyncio.gather(
             *[self._close_file(logfile_path) for logfile_path in self._files]
         )
