@@ -10,9 +10,6 @@ handlers/, models/) provides the foundation for the eventual composition
 root refactoring in Phase 15.2.7.
 """
 
-# Import from original worker.py file (parent directory)
-# This preserves backward compatibility during incremental refactoring
-from hyperscale.distributed.nodes.worker_impl import WorkerServer
 
 # Also export the new modular components
 from .config import WorkerConfig, create_worker_config_from_env
@@ -43,6 +40,7 @@ from .cancellation import WorkerCancellationHandler
 from .health import WorkerHealthIntegration
 from .backpressure import WorkerBackpressureManager
 from .discovery import WorkerDiscoveryManager
+from .server import WorkerServer
 
 __all__ = [
     # Main server class

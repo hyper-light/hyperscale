@@ -10,15 +10,12 @@ These tests verify that the DiscoveryService correctly:
 """
 
 import pytest
-import time
 
 from hyperscale.distributed.discovery import (
     DiscoveryConfig,
     DiscoveryService,
     PeerInfo,
     PeerHealth,
-    LocalityInfo,
-    LocalityTier,
     SelectionResult,
 )
 

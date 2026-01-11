@@ -29,7 +29,6 @@ from hyperscale.distributed.discovery.dns.security import (
 )
 from hyperscale.distributed.discovery.dns.resolver import (
     AsyncDNSResolver,
-    DNSResult,
     DNSError,
 )
 
