@@ -1122,13 +1122,25 @@ nodes/manager/
 
 **AD Compliance**: ✅ No AD violations - state containers only, no protocol changes
 
-#### 15.4.3 Manager Configuration ⏳ PENDING
+#### 15.4.3 Manager Configuration ✅ COMPLETE
 
 **File**: `nodes/manager/config.py`
 
-- [ ] **15.4.3.1** Create ManagerConfig dataclass (slots=True)
+- [x] **15.4.3.1** Create ManagerConfig dataclass (slots=True)
+  - Network: host, tcp_port, udp_port, datacenter_id
+  - Gates: seed_gates, gate_udp_addrs
+  - Peers: seed_managers, manager_udp_peers
+  - Quorum/workflow: timeout, retries, workflow_timeout
+  - Dead node reaping intervals
+  - Orphan scan and cancelled workflow settings
+  - Recovery, dispatch, job cleanup settings
+  - TCP timeouts, batch push, stats windows
+  - AD-23 stats buffer configuration
+  - AD-30 job responsiveness settings
+  - Cluster identity and mTLS
+- [x] **15.4.3.2** Create create_manager_config_from_env() factory function
 
-**AD Compliance Check Required**: No AD violations - configuration
+**AD Compliance**: ✅ No AD violations - configuration only, no protocol changes
 
 #### 15.4.4 Manager State ⏳ PENDING
 
