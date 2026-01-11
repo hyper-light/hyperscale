@@ -591,6 +591,88 @@ class WorkerServer(HealthAwareServer):
             active_workflows=dict(self._active_workflows),
         )
 
+    def _get_heartbeat(self) -> WorkerHeartbeat:
+        """
+        Build a WorkerHeartbeat with current state.
+
+        This is the same data that gets embedded in SWIM messages via
+        WorkerStateEmbedder, but available for other uses like diagnostics
+        or explicit TCP status updates if needed.
+        """
+        return WorkerHeartbeat(
+            node_id=self._node_id.full,
+            state=self._get_worker_state().value,
+            available_cores=self._core_allocator.available_cores,
+            queue_depth=len(self._pending_workflows),
+            cpu_percent=self._get_cpu_percent(),
+            memory_percent=self._get_memory_percent(),
+            version=self._state_sync.state_version,
+            active_workflows={
+                wf_id: wf.status for wf_id, wf in self._active_workflows.items()
+            },
+            extension_requested=self._worker_state._extension_requested,
+            extension_reason=self._worker_state._extension_reason,
+            extension_current_progress=self._worker_state._extension_current_progress,
+            extension_completed_items=self._worker_state._extension_completed_items,
+            extension_total_items=self._worker_state._extension_total_items,
+            extension_estimated_completion=self._worker_state._extension_estimated_completion,
+            extension_active_workflow_count=len(self._active_workflows),
+        )
+
+    def request_extension(
+        self,
+        reason: str,
+        progress: float = 0.0,
+        completed_items: int = 0,
+        total_items: int = 0,
+        estimated_completion: float = 0.0,
+    ) -> None:
+        """
+        Request a deadline extension via heartbeat piggyback (AD-26).
+
+        This sets the extension request fields in the worker's heartbeat,
+        which will be processed by the manager when the next heartbeat is
+        received. This is more efficient than a separate TCP call for
+        extension requests.
+
+        AD-26 Issue 4: Supports absolute metrics (completed_items, total_items)
+        which are preferred over relative progress for robustness.
+
+        Args:
+            reason: Human-readable reason for the extension request.
+            progress: Monotonic progress value (not clamped to 0-1). Must strictly
+                increase between extension requests for approval. Prefer completed_items.
+            completed_items: Absolute count of completed items (preferred metric).
+            total_items: Total items to complete.
+            estimated_completion: Estimated seconds until workflow completion.
+        """
+        self._worker_state._extension_requested = True
+        self._worker_state._extension_reason = reason
+        self._worker_state._extension_current_progress = max(0.0, progress)
+        self._worker_state._extension_completed_items = completed_items
+        self._worker_state._extension_total_items = total_items
+        self._worker_state._extension_estimated_completion = estimated_completion
+        self._worker_state._extension_active_workflow_count = len(self._active_workflows)
+
+    def clear_extension_request(self) -> None:
+        """
+        Clear the extension request after it's been processed.
+
+        Called when the worker completes its task or the manager has
+        processed the extension request.
+        """
+        self._worker_state._extension_requested = False
+        self._worker_state._extension_reason = ""
+        self._worker_state._extension_current_progress = 0.0
+        self._worker_state._extension_completed_items = 0
+        self._worker_state._extension_total_items = 0
+        self._worker_state._extension_estimated_completion = 0.0
+        self._worker_state._extension_active_workflow_count = 0
+
+    async def get_core_assignments(self) -> dict[int, str | None]:
+        """Get a copy of the current core assignments."""
+        return await self._core_allocator.get_core_assignments()
+
     # =========================================================================
     # Lock Helpers (Section 8)
     # =========================================================================
@@ -717,6 +799,31 @@ class WorkerServer(HealthAwareServer):
                 node_id=self._node_id.short,
             )
         )
+
+    def _on_peer_confirmed(self, peer: tuple[str, int]) -> None:
+        """
+        Add confirmed peer to active peer sets (AD-29).
+
+        Called when a peer is confirmed via successful SWIM communication.
+        This is the ONLY place where managers should be added to _healthy_manager_ids,
+        ensuring failure detection only applies to managers we've communicated with.
+
+        Args:
+            peer: The UDP address of the confirmed peer (manager).
+        """
+        for manager_id, manager_info in self._registry._known_managers.items():
+            if (manager_info.udp_host, manager_info.udp_port) == peer:
+                self._registry._healthy_manager_ids.add(manager_id)
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerInfo(
+                        message=f"AD-29: Manager {manager_id[:8]}... confirmed via SWIM, added to healthy set",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+                break
 
     def _handle_manager_heartbeat(self, heartbeat, source_addr: tuple[str, int]) -> None:
         """Handle manager heartbeat from SWIM."""
