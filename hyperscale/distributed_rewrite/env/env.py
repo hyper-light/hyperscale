@@ -148,6 +148,9 @@ class Env(BaseModel):
     JOB_RESPONSIVENESS_THRESHOLD: StrictFloat = 60.0  # Seconds without progress before suspicion
     JOB_RESPONSIVENESS_CHECK_INTERVAL: StrictFloat = 15.0  # Seconds between responsiveness checks
 
+    # AD-34: Job Timeout Settings
+    JOB_TIMEOUT_CHECK_INTERVAL: StrictFloat = 30.0  # Seconds between job timeout checks
+
     # Manager TCP Timeout Settings
     MANAGER_TCP_TIMEOUT_SHORT: StrictFloat = 2.0  # Short timeout for quick operations (peer sync, worker queries)
     MANAGER_TCP_TIMEOUT_STANDARD: StrictFloat = 5.0  # Standard timeout for job dispatch, result forwarding

@@ -9365,7 +9365,7 @@ class ManagerServer(HealthAwareServer):
         """
         Background task that checks for job timeouts (AD-34 Part 10.4.3).
 
-        Runs every 30 seconds (configurable). Only leader checks timeouts.
+        Runs at JOB_TIMEOUT_CHECK_INTERVAL (default 30s). Only leader checks timeouts.
         Delegates to strategy.check_timeout() which handles both:
         - Extension-aware timeout (base_timeout + extensions)
         - Stuck detection (no progress for 2+ minutes)
@@ -9374,7 +9374,7 @@ class ManagerServer(HealthAwareServer):
         - LocalAuthorityTimeout: Immediately marks job as timed out
         - GateCoordinatedTimeout: Reports to gate and waits for decision
         """
-        check_interval = 30.0  # TODO: Move to env.py config
+        check_interval = self._env.JOB_TIMEOUT_CHECK_INTERVAL
 
         while self._running:
             try:
