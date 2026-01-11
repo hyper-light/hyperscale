@@ -1098,6 +1098,7 @@ class LoggerStream:
             self._loop = asyncio.get_event_loop()
 
         future: asyncio.Future[None] = self._loop.create_future()
+        should_flush = False
 
         async with self._batch_lock:
             self._pending_batch.append((logfile_path, future))
@@ -1113,7 +1114,10 @@ class LoggerStream:
                 if self._batch_timer_handle:
                     self._batch_timer_handle.cancel()
                     self._batch_timer_handle = None
-                await self._flush_batch(logfile_path)
+                should_flush = True
+
+        if should_flush:
+            await self._flush_batch(logfile_path)
 
         return future
 
