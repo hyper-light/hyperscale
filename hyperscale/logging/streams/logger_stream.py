@@ -159,7 +159,11 @@ class LoggerStream:
     def has_active_subscriptions(self):
         return self._provider.subscriptions_count > 0
 
-    async def initialize(self) -> asyncio.StreamWriter:
+    async def initialize(
+        self,
+        stdout_writer: asyncio.StreamWriter | None = None,
+        stderr_writer: asyncio.StreamWriter | None = None,
+    ) -> asyncio.StreamWriter:
         async with self._init_lock:
             if self._initialized:
                 return
@@ -180,13 +184,13 @@ class LoggerStream:
             if self._provider is None:
                 self._provider = LogProvider()
 
-            if self._stdout is None or self._stdout.closed:
-                self._stdout = await self._dup_stdout()
+            if stdout_writer is not None:
+                self._stream_writers[StreamType.STDOUT] = stdout_writer
 
-            if self._stderr is None or self._stderr.closed:
-                self._stderr = await self._dup_stderr()
+            elif self._stream_writers.get(StreamType.STDOUT) is None:
+                if self._stdout is None or self._stdout.closed:
+                    self._stdout = await self._dup_stdout()
 
-            if self._stream_writers.get(StreamType.STDOUT) is None:
                 transport, protocol = await self._loop.connect_write_pipe(
                     lambda: LoggerProtocol(), self._stdout
                 )
@@ -205,7 +209,13 @@ class LoggerStream:
                     self._loop,
                 )
 
-            if self._stream_writers.get(StreamType.STDERR) is None:
+            if stderr_writer is not None:
+                self._stream_writers[StreamType.STDERR] = stderr_writer
+
+            elif self._stream_writers.get(StreamType.STDERR) is None:
+                if self._stderr is None or self._stderr.closed:
+                    self._stderr = await self._dup_stderr()
+
                 transport, protocol = await self._loop.connect_write_pipe(
                     lambda: LoggerProtocol(), self._stderr
                 )
