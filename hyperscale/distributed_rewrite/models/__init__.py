@@ -16,6 +16,11 @@ from .coordinates import (
     NetworkCoordinate as NetworkCoordinate,
 )
 
+# Protocol version negotiation (AD-25)
+from hyperscale.distributed_rewrite.protocol.version import (
+    NegotiatedCapabilities as NegotiatedCapabilities,
+)
+
 # Distributed system types
 from .distributed import (
     # Enums

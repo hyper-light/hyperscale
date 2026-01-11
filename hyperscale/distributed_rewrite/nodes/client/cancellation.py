@@ -8,10 +8,10 @@ import asyncio
 import random
 import time
 
-from hyperscale.core.jobs.models import JobStatus
 from hyperscale.distributed_rewrite.models import (
     JobCancelRequest,
     JobCancelResponse,
+    JobStatus,
     RateLimitResponse,
 )
 from hyperscale.distributed_rewrite.nodes.client.state import ClientState

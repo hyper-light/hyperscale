@@ -14,6 +14,7 @@ from hyperscale.distributed_rewrite.reliability.retry import (
     JitterStrategy as JitterStrategy,
     RetryConfig as RetryConfig,
     RetryExecutor as RetryExecutor,
+    calculate_jittered_delay as calculate_jittered_delay,
 )
 from hyperscale.distributed_rewrite.reliability.overload import (
     OverloadState as OverloadState,
