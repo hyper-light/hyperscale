@@ -463,7 +463,7 @@ class TestGetOsCpus:
         assert isinstance(result, int)
         assert result >= 1
 
-    @patch("hyperscale.distributed_rewrite.nodes.worker.config.os.cpu_count")
+    @patch("hyperscale.distributed.nodes.worker.config.os.cpu_count")
     def test_fallback_to_os_cpu_count(self, mock_cpu_count):
         """Test fallback when psutil is not available."""
         # Simulate psutil import failure
