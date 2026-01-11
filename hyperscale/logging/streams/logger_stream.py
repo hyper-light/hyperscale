@@ -873,6 +873,8 @@ class LoggerStream:
                     ),
                 )
 
+        return lsn
+
     def _write_to_file(
         self,
         log: Log[T],

@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from hyperscale.logging.config.durability_mode import DurabilityMode
+from hyperscale.logging.config.logging_config import LoggingConfig
 from hyperscale.logging.models import Entry, LogLevel
 from hyperscale.logging.streams.logger_stream import LoggerStream
 
@@ -14,6 +15,14 @@ def event_loop():
     loop = asyncio.new_event_loop()
     yield loop
     loop.close()
+
+
+@pytest.fixture(autouse=True)
+def configure_log_level():
+    config = LoggingConfig()
+    config.update(log_level="debug")
+    yield
+    config.update(log_level="error")
 
 
 @pytest.fixture
