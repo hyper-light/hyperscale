@@ -195,8 +195,8 @@ class WorkerExecutor:
                 if self._backpressure_manager is not None:
                     # REJECT level: drop non-critical updates entirely
                     if self._backpressure_manager.should_reject_updates():
-                        async with self._progress_buffer_lock:
-                            self._progress_buffer.clear()
+                        async with self._state._progress_buffer_lock:
+                            self._state._progress_buffer.clear()
                         batch_accumulation_cycles = 0
                         continue
 
