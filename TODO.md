@@ -1203,13 +1203,26 @@ nodes/manager/
 
 **AD Compliance**: ✅ No AD violations - state management only, preserves AD-19/20/33 tracking
 
-#### 15.4.5 Manager TCP/UDP Handlers ⏳ PENDING
+#### 15.4.5 Manager TCP/UDP Handlers 🚧 IN PROGRESS (5 of 27)
 
-**Files**: `nodes/manager/handlers/*.py` (27 handlers)
+**Files**: `nodes/manager/handlers/*.py` (27 handlers total)
 
-- [ ] **15.4.5.1** Extract handlers systematically (27 total)
+- [x] **15.4.5.1** Create `tcp_worker_registration.py` - WorkerRegistrationHandler
+  - AD-28 cluster/environment isolation validation
+  - mTLS certificate claim validation
+  - Worker storage and address mapping
+- [x] **15.4.5.2** Create `tcp_state_sync.py` - StateSyncRequestHandler
+  - State synchronization with peer managers
+  - Snapshot generation delegation
+- [x] **15.4.5.3** Create `tcp_cancellation.py` - Cancellation handlers (AD-20)
+  - CancelJobHandler (legacy format support)
+  - JobCancelRequestHandler (AD-20 format)
+  - WorkflowCancellationCompleteHandler
+- [ ] **15.4.5.4** Remaining 22 handlers (job submission, progress, provision, etc.)
 
-**AD Compliance Check Required**: Must preserve all manager protocols
+**AD Compliance**: ✅ Extracted handlers preserve:
+- AD-20 (Cancellation) - JobCancelRequest/Response format intact
+- AD-28 (Cluster Isolation) - Validation logic preserved
 
 #### 15.4.6 Manager Core Modules ⏳ PENDING
 

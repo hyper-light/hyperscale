@@ -26,7 +26,6 @@ class ClientCancellationManager:
     2. Get targets prioritizing the server that accepted the job
     3. Retry loop with exponential backoff:
        - Cycle through all targets (gates/managers)
-       - Follow leader redirects (up to max_redirects)
        - Detect transient errors and retry
        - Permanent rejection fails immediately
     4. On success: update job status to CANCELLED
@@ -156,71 +155,6 @@ class ClientCancellationManager:
         raise RuntimeError(
             f"Job cancellation failed after {max_retries} retries: {last_error}"
         )
-
-    async def _cancel_with_redirects(
-        self,
-        job_id: str,
-        target: tuple[str, int],
-        request: JobCancelRequest,
-        max_redirects: int,
-        timeout: float,
-    ) -> str | JobCancelResponse:
-        """
-        Cancel with leader redirect handling.
-
-        Args:
-            job_id: Job identifier
-            target: Initial target (host, port)
-            request: JobCancelRequest message
-            max_redirects: Maximum redirects to follow
-            timeout: Request timeout
-
-        Returns:
-            "success", JobCancelResponse, or error message (transient)
-        """
-        redirects = 0
-        while redirects <= max_redirects:
-            response_data, _ = await self._send_tcp(
-                target,
-                "cancel_job",
-                request.dump(),
-                timeout=timeout,
-            )
-
-            if isinstance(response_data, Exception):
-                return str(response_data)  # Transient error
-
-            if response_data == b'error':
-                return "Server returned error"  # Transient error
-
-            response = JobCancelResponse.load(response_data)
-
-            if response.success:
-                self._tracker.update_job_status(job_id, JobStatus.CANCELLED.value)
-                return "success"
-
-            # Check for already completed/cancelled (not an error)
-            if response.already_cancelled:
-                self._tracker.update_job_status(job_id, JobStatus.CANCELLED.value)
-                return response
-            if response.already_completed:
-                self._tracker.update_job_status(job_id, JobStatus.COMPLETED.value)
-                return response
-
-            # Check for leader redirect
-            if response.leader_addr and redirects < max_redirects:
-                target = tuple(response.leader_addr)
-                redirects += 1
-                continue
-
-            # Check for transient error
-            if response.error and self._is_transient_error(response.error):
-                return response.error  # Transient error
-
-            # Permanent error
-            raise RuntimeError(f"Job cancellation failed: {response.error}")
-
-        return "max_redirects_exceeded"
 
     async def await_job_cancellation(
         self,
