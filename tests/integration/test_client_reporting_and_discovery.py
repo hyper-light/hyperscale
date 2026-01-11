@@ -380,7 +380,7 @@ class TestClientDiscovery:
             managers=[],  # No managers
             gates=[],
         )
-        targets = ClientTargetSelector(config)
+        targets = ClientTargetSelector(config, state)
         discovery = ClientDiscovery(state, config, logger, targets, send_tcp)
 
         with pytest.raises(RuntimeError, match="No managers configured"):
@@ -396,7 +396,7 @@ class TestClientDiscovery:
             managers=[],
             gates=[],  # No gates
         )
-        targets = ClientTargetSelector(config)
+        targets = ClientTargetSelector(config, state)
         discovery = ClientDiscovery(state, config, logger, targets, send_tcp)
 
         with pytest.raises(RuntimeError, match="No gates configured"):

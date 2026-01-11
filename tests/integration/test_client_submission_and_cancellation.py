@@ -412,7 +412,7 @@ class TestClientCancellationManager:
         self.logger = Mock(spec=Logger)
         self.logger.log = AsyncMock()
         self.targets = ClientTargetSelector(self.config, self.state)
-        self.tracker = ClientJobTracker(self.state)
+        self.tracker = ClientJobTracker(self.state, self.logger)
 
     @pytest.mark.asyncio
     async def test_happy_path_successful_cancellation(self):
