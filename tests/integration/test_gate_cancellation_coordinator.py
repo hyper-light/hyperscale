@@ -412,7 +412,7 @@ class TestConcurrency:
 
         async def mock_send(addr, msg_type, data, timeout=None):
             await asyncio.sleep(0.01)  # Small delay
-            return (b"ok", None)
+            return (make_success_ack(), None)
 
         coordinator = GateCancellationCoordinator(
             state=state,
@@ -478,7 +478,7 @@ class TestEdgeCases:
         state = GateRuntimeState()
 
         async def mock_send(addr, msg_type, data, timeout=None):
-            return (b"ok", None)
+            return (make_success_ack(), None)
 
         coordinator = GateCancellationCoordinator(
             state=state,
@@ -501,7 +501,7 @@ class TestEdgeCases:
         state = GateRuntimeState()
 
         async def mock_send(addr, msg_type, data, timeout=None):
-            return (b"ok", None)
+            return (make_success_ack(), None)
 
         coordinator = GateCancellationCoordinator(
             state=state,
@@ -524,7 +524,7 @@ class TestEdgeCases:
         state = GateRuntimeState()
 
         async def mock_send(addr, msg_type, data, timeout=None):
-            return (b"ok", None)
+            return (make_success_ack(), None)
 
         coordinator = GateCancellationCoordinator(
             state=state,

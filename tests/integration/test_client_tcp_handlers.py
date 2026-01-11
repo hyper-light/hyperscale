@@ -61,7 +61,7 @@ class TestJobStatusPushHandler:
         job_id = "job-123"
         state.initialize_job_tracking(job_id)
 
-        handler = JobStatusPushHandler(state, logger, Mock())
+        handler = JobStatusPushHandler(state, logger)
 
         push = JobStatusPush(job_id=job_id, status="RUNNING")
         data = push.dump()
@@ -86,7 +86,7 @@ class TestJobStatusPushHandler:
 
         state.initialize_job_tracking(job_id, on_status_update=status_callback)
 
-        handler = JobStatusPushHandler(state, logger, Mock())
+        handler = JobStatusPushHandler(state, logger)
 
         push = JobStatusPush(job_id=job_id, status="COMPLETED")
         data = push.dump()
@@ -102,7 +102,7 @@ class TestJobStatusPushHandler:
         logger = Mock(spec=Logger)
         logger.log = AsyncMock()
 
-        handler = JobStatusPushHandler(state, logger, Mock())
+        handler = JobStatusPushHandler(state, logger)
 
         # Invalid data
         result = await handler.handle(("server", 8000), b'invalid', 100)
@@ -123,7 +123,7 @@ class TestJobStatusPushHandler:
 
         state.initialize_job_tracking(job_id, on_status_update=bad_callback)
 
-        handler = JobStatusPushHandler(state, logger, Mock())
+        handler = JobStatusPushHandler(state, logger)
 
         push = JobStatusPush(job_id=job_id, status="RUNNING")
         data = push.dump()
@@ -148,7 +148,7 @@ class TestJobBatchPushHandler:
         for jid in job_ids:
             state.initialize_job_tracking(jid)
 
-        handler = JobBatchPushHandler(state, logger, Mock())
+        handler = JobBatchPushHandler(state, logger)
 
         batch = JobBatchPush(
             job_ids=job_ids,
@@ -170,7 +170,7 @@ class TestJobBatchPushHandler:
         logger = Mock(spec=Logger)
         logger.log = AsyncMock()
 
-        handler = JobBatchPushHandler(state, logger, Mock())
+        handler = JobBatchPushHandler(state, logger)
 
         batch = JobBatchPush(job_ids=[], statuses=[])
         data = batch.dump()
@@ -193,7 +193,7 @@ class TestJobBatchPushHandler:
         for jid in job_ids:
             state.initialize_job_tracking(jid)
 
-        handler = JobBatchPushHandler(state, logger, Mock())
+        handler = JobBatchPushHandler(state, logger)
 
         batch = JobBatchPush(job_ids=job_ids, statuses=statuses)
         data = batch.dump()
@@ -562,7 +562,7 @@ class TestHandlersConcurrency:
         for jid in job_ids:
             state.initialize_job_tracking(jid)
 
-        handler = JobStatusPushHandler(state, logger, Mock())
+        handler = JobStatusPushHandler(state, logger)
 
         async def send_status_update(job_id):
             push = JobStatusPush(job_id=job_id, status="RUNNING")
