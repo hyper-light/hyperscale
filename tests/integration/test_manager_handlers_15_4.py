@@ -413,7 +413,7 @@ class TestWorkflowCancellationCompleteHandlerHappyPath:
         assert captured_notification.workflow_id == "wf-789"
         assert captured_notification.job_id == "job-abc"
         assert captured_notification.success is False
-        assert captured_notification.error == "Worker timeout"
+        assert captured_notification.errors[0] == "Worker timeout"
 
 
 class TestWorkflowCancellationCompleteHandlerNegativePath:
@@ -501,7 +501,7 @@ class TestWorkflowCancellationCompleteHandlerEdgeCases:
         result = await handler.handle(("10.0.0.50", 6000), notification.dump(), 1)
 
         assert result == b'ok'
-        assert captured_notification.error == long_error
+        assert captured_notification.errors[0] == long_error
 
 
 # =============================================================================
