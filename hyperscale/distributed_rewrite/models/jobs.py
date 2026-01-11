@@ -336,13 +336,22 @@ class JobInfo:
         workflow_progresses = []
         current_time = time.time()
         for wf_token_str, wf_info in self.workflows.items():
+            # Aggregate completed_count and failed_count from sub-workflows
+            aggregated_completed_count = 0
+            aggregated_failed_count = 0
+            for sub_wf_token_str in wf_info.sub_workflow_tokens:
+                if sub_wf_info := self.sub_workflows.get(sub_wf_token_str):
+                    if sub_wf_info.progress:
+                        aggregated_completed_count += sub_wf_info.progress.completed_count
+                        aggregated_failed_count += sub_wf_info.progress.failed_count
+
             wf_progress = WorkflowProgress(
                 job_id=self.job_id,
                 workflow_id=wf_info.token.workflow_id or "",
                 workflow_name=wf_info.name,
                 status=wf_info.status.value,
-                completed_count=0,  # TODO: aggregate from sub-workflows
-                failed_count=0,
+                completed_count=aggregated_completed_count,
+                failed_count=aggregated_failed_count,
                 rate_per_second=0.0,
                 elapsed_seconds=self.elapsed_seconds(),
                 timestamp=self.timestamp,
