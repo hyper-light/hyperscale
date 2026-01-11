@@ -1,7 +1,6 @@
 import asyncio
 import datetime
 import functools
-import hashlib
 import io
 import os
 import pathlib
@@ -9,6 +8,7 @@ import struct
 import sys
 import threading
 import time
+import zlib
 from collections import defaultdict
 from typing import (
     Any,
@@ -920,7 +920,7 @@ class LoggerStream:
         lsn_value = lsn if lsn is not None else 0
 
         header = struct.pack("<IQ", len(payload), lsn_value)
-        crc = hashlib.crc32(header + payload) & 0xFFFFFFFF
+        crc = zlib.crc32(header + payload) & 0xFFFFFFFF
 
         return struct.pack("<I", crc) + header + payload
 
@@ -936,7 +936,7 @@ class LoggerStream:
                 f"Truncated entry: have {len(data)}, need {BINARY_HEADER_SIZE + length}"
             )
 
-        crc_computed = hashlib.crc32(data[4 : 16 + length]) & 0xFFFFFFFF
+        crc_computed = zlib.crc32(data[4 : 16 + length]) & 0xFFFFFFFF
         if crc_stored != crc_computed:
             raise ValueError(
                 f"CRC mismatch: stored={crc_stored:#x}, computed={crc_computed:#x}"

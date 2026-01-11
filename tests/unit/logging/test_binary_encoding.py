@@ -1,5 +1,5 @@
-import hashlib
 import struct
+import zlib
 
 import pytest
 
