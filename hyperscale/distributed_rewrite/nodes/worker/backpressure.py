@@ -8,10 +8,14 @@ signals for worker health reporting.
 import asyncio
 from typing import TYPE_CHECKING
 
-from hyperscale.distributed_rewrite.reliability import BackpressureLevel
+from hyperscale.distributed_rewrite.reliability import (
+    BackpressureLevel,
+    HybridOverloadDetector,
+)
 
 if TYPE_CHECKING:
-    from hyperscale.distributed_rewrite.reliability import HybridOverloadDetector
+    from hyperscale.logging import Logger
+    from .registry import WorkerRegistry
 
 
 class WorkerBackpressureManager:
@@ -25,17 +29,21 @@ class WorkerBackpressureManager:
 
     def __init__(
         self,
-        overload_detector: "HybridOverloadDetector",
+        logger: "Logger | None" = None,
+        registry: "WorkerRegistry | None" = None,
         poll_interval: float = 0.25,
     ) -> None:
         """
         Initialize backpressure manager.
 
         Args:
-            overload_detector: HybridOverloadDetector for resource monitoring
+            logger: Logger instance for logging
+            registry: WorkerRegistry for manager tracking
             poll_interval: Polling interval for resource sampling (default 250ms)
         """
-        self._overload_detector = overload_detector
+        self._logger = logger
+        self._registry = registry
+        self._overload_detector = HybridOverloadDetector()
         self._poll_interval = poll_interval
         self._running = False
 

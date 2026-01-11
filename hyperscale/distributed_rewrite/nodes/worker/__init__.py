@@ -32,6 +32,7 @@ from .handlers import (
     StateSyncHandler,
     JobLeaderTransferHandler,
     WorkflowStatusQueryHandler,
+    WorkflowProgressHandler,
 )
 
 # Core modules (Phase 15.2.6)
@@ -65,6 +66,7 @@ __all__ = [
     "StateSyncHandler",
     "JobLeaderTransferHandler",
     "WorkflowStatusQueryHandler",
+    "WorkflowProgressHandler",
     # Core modules
     "WorkerExecutor",
     "WorkerRegistry",

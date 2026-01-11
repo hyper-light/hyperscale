@@ -6,7 +6,16 @@ for timeouts, intervals, retry policies, and health monitoring.
 """
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+
+def _get_os_cpus() -> int:
+    """Get OS CPU count."""
+    try:
+        import psutil
+        return psutil.cpu_count(logical=False) or os.cpu_count() or 1
+    except ImportError:
+        return os.cpu_count() or 1
 
 
 @dataclass(slots=True)
@@ -25,7 +34,7 @@ class WorkerConfig:
     datacenter_id: str = "default"
 
     # Core allocation
-    total_cores: int | None = None
+    total_cores: int = field(default_factory=_get_os_cpus)
     max_workflow_cores: int | None = None
 
     # Manager communication timeouts
@@ -70,8 +79,64 @@ class WorkerConfig:
     registration_max_retries: int = 3
     registration_base_delay_seconds: float = 0.5
 
-    # Seed managers (TCP addresses)
-    seed_managers: list[tuple[str, int]] | None = None
+    @property
+    def progress_update_interval(self) -> float:
+        """Alias for progress_update_interval_seconds."""
+        return self.progress_update_interval_seconds
+
+    @property
+    def progress_flush_interval(self) -> float:
+        """Alias for progress_flush_interval_seconds."""
+        return self.progress_flush_interval_seconds
+
+    @classmethod
+    def from_env(
+        cls,
+        env,
+        host: str,
+        tcp_port: int,
+        udp_port: int,
+        datacenter_id: str = "default",
+    ) -> "WorkerConfig":
+        """
+        Create worker configuration from Env object.
+
+        Args:
+            env: Env configuration object
+            host: Worker host address
+            tcp_port: Worker TCP port
+            udp_port: Worker UDP port
+            datacenter_id: Datacenter identifier
+
+        Returns:
+            WorkerConfig instance
+        """
+        total_cores = getattr(env, 'WORKER_MAX_CORES', None)
+        if not total_cores:
+            total_cores = _get_os_cpus()
+
+        return cls(
+            host=host,
+            tcp_port=tcp_port,
+            udp_port=udp_port,
+            datacenter_id=datacenter_id,
+            total_cores=total_cores,
+            tcp_timeout_short_seconds=getattr(env, 'WORKER_TCP_TIMEOUT_SHORT', 2.0),
+            tcp_timeout_standard_seconds=getattr(env, 'WORKER_TCP_TIMEOUT_STANDARD', 5.0),
+            dead_manager_reap_interval_seconds=getattr(env, 'WORKER_DEAD_MANAGER_REAP_INTERVAL', 60.0),
+            dead_manager_check_interval_seconds=getattr(env, 'WORKER_DEAD_MANAGER_CHECK_INTERVAL', 10.0),
+            progress_update_interval_seconds=getattr(env, 'WORKER_PROGRESS_UPDATE_INTERVAL', 1.0),
+            progress_flush_interval_seconds=getattr(env, 'WORKER_PROGRESS_FLUSH_INTERVAL', 0.5),
+            cancellation_poll_interval_seconds=getattr(env, 'WORKER_CANCELLATION_POLL_INTERVAL', 5.0),
+            orphan_grace_period_seconds=getattr(env, 'WORKER_ORPHAN_GRACE_PERIOD', 120.0),
+            orphan_check_interval_seconds=getattr(env, 'WORKER_ORPHAN_CHECK_INTERVAL', 10.0),
+            pending_transfer_ttl_seconds=getattr(env, 'WORKER_PENDING_TRANSFER_TTL', 60.0),
+            overload_poll_interval_seconds=getattr(env, 'WORKER_OVERLOAD_POLL_INTERVAL', 0.25),
+            throughput_interval_seconds=getattr(env, 'WORKER_THROUGHPUT_INTERVAL_SECONDS', 10.0),
+            recovery_jitter_min_seconds=getattr(env, 'RECOVERY_JITTER_MIN', 0.0),
+            recovery_jitter_max_seconds=getattr(env, 'RECOVERY_JITTER_MAX', 1.0),
+            recovery_semaphore_size=getattr(env, 'RECOVERY_SEMAPHORE_SIZE', 5),
+        )
 
 
 def create_worker_config_from_env(
@@ -96,12 +161,16 @@ def create_worker_config_from_env(
     Returns:
         WorkerConfig instance
     """
+    total_cores = int(os.getenv("WORKER_MAX_CORES", "0"))
+    if not total_cores:
+        total_cores = _get_os_cpus()
+
     return WorkerConfig(
         host=host,
         tcp_port=tcp_port,
         udp_port=udp_port,
         datacenter_id=datacenter_id,
-        total_cores=int(os.getenv("WORKER_MAX_CORES", "0")) or None,
+        total_cores=total_cores,
         tcp_timeout_short_seconds=float(os.getenv("WORKER_TCP_TIMEOUT_SHORT", "2.0")),
         tcp_timeout_standard_seconds=float(os.getenv("WORKER_TCP_TIMEOUT_STANDARD", "5.0")),
         dead_manager_reap_interval_seconds=float(
@@ -134,5 +203,4 @@ def create_worker_config_from_env(
         throughput_interval_seconds=float(
             os.getenv("WORKER_THROUGHPUT_INTERVAL_SECONDS", "10.0")
         ),
-        seed_managers=seed_managers,
     )
