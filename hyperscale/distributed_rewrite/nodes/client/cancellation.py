@@ -69,7 +69,7 @@ class ClientCancellationManager:
         Args:
             job_id: Job identifier to cancel.
             reason: Optional reason for cancellation.
-            max_redirects: Maximum leader redirects to follow.
+            max_redirects: Maximum leader redirects to follow (unused - for API compatibility).
             max_retries: Maximum retries for transient errors.
             retry_base_delay: Base delay for exponential backoff (seconds).
             timeout: Request timeout in seconds.
@@ -102,24 +102,55 @@ class ClientCancellationManager:
             target_idx = retry % len(all_targets)
             target = all_targets[target_idx]
 
-            # Try with leader redirect handling
-            result = await self._cancel_with_redirects(
-                job_id, target, request, max_redirects, timeout
+            # Send cancellation request
+            response_data, _ = await self._send_tcp(
+                target,
+                "cancel_job",
+                request.dump(),
+                timeout=timeout,
             )
 
-            if result == "success":
-                return self._state._jobs[job_id]  # Return updated job result
-            elif isinstance(result, JobCancelResponse):
-                # Success (already cancelled/completed) or permanent error handled
-                return result
-            else:
-                # Transient error - retry
-                last_error = result
+            if isinstance(response_data, Exception):
+                last_error = str(response_data)
+                # Wait before retry with exponential backoff
+                if retry < max_retries:
+                    delay = retry_base_delay * (2 ** retry)
+                    await asyncio.sleep(delay)
+                continue
 
-            # Wait before retry with exponential backoff
-            if retry < max_retries:
-                delay = retry_base_delay * (2 ** retry)
-                await asyncio.sleep(delay)
+            if response_data == b'error':
+                last_error = "Server returned error"
+                # Wait before retry with exponential backoff
+                if retry < max_retries:
+                    delay = retry_base_delay * (2 ** retry)
+                    await asyncio.sleep(delay)
+                continue
+
+            response = JobCancelResponse.load(response_data)
+
+            if response.success:
+                self._tracker.update_job_status(job_id, JobStatus.CANCELLED.value)
+                return response
+
+            # Check for already completed/cancelled (not an error)
+            if response.already_cancelled:
+                self._tracker.update_job_status(job_id, JobStatus.CANCELLED.value)
+                return response
+            if response.already_completed:
+                self._tracker.update_job_status(job_id, JobStatus.COMPLETED.value)
+                return response
+
+            # Check for transient error
+            if response.error and self._is_transient_error(response.error):
+                last_error = response.error
+                # Wait before retry with exponential backoff
+                if retry < max_retries:
+                    delay = retry_base_delay * (2 ** retry)
+                    await asyncio.sleep(delay)
+                continue
+
+            # Permanent error
+            raise RuntimeError(f"Job cancellation failed: {response.error}")
 
         # All retries exhausted
         raise RuntimeError(

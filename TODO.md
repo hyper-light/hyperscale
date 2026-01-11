@@ -849,7 +849,7 @@ nodes/client/
 
 ### 15.2 Worker Refactoring (Phase 2)
 
-**Status**: ⏳ **0% COMPLETE** - Not started
+**Status**: 🚧 **60% COMPLETE** - Module structure, models, config, state, handlers done
 
 **Target Structure**:
 ```
@@ -869,63 +869,94 @@ nodes/worker/
   backpressure.py
 ```
 
-#### 15.2.1 Worker Module Structure ⏳ PENDING
+#### 15.2.1 Worker Module Structure ✅ COMPLETE
 
-- [ ] **15.2.1.1** Create `nodes/worker/` directory tree
-- [ ] **15.2.1.2** Create `models/`, `handlers/` subdirectories
-- [ ] **15.2.1.3** Create `__init__.py` with WorkerServer export
+- [x] **15.2.1.1** Create `nodes/worker/` directory tree
+- [x] **15.2.1.2** Create `models/`, `handlers/` subdirectories
+- [x] **15.2.1.3** Create `__init__.py` with WorkerServer export
+- [x] **15.2.1.4** Rename `worker.py` to `worker_impl.py` for module compatibility
 
-#### 15.2.2 Worker Models ⏳ PENDING
+**Commit**: Pending
+
+#### 15.2.2 Worker Models ✅ COMPLETE
 
 **Files**: `nodes/worker/models/*.py`
 
-- [ ] **15.2.2.1** Create ManagerPeerState dataclass (slots=True)
-  - Fields: manager_addr, udp_addr, last_seen, health_status
-- [ ] **15.2.2.2** Create WorkflowRuntimeState dataclass (slots=True)
-  - Fields: workflow_id, status, allocated_cores, start_time
-- [ ] **15.2.2.3** Create CancelState dataclass (slots=True)
-  - Fields: workflow_id, cancel_requested_at, cancel_completed
-- [ ] **15.2.2.4** Create ExecutionMetrics dataclass (slots=True)
-  - Fields: workflows_executed, cores_allocated, avg_duration
+- [x] **15.2.2.1** Create ManagerPeerState dataclass (slots=True)
+  - Fields: manager_id, tcp_host, tcp_port, udp_host, udp_port, datacenter, is_leader, is_healthy, unhealthy_since, state_epoch
+- [x] **15.2.2.2** Create WorkflowRuntimeState dataclass (slots=True)
+  - Fields: workflow_id, job_id, status, allocated_cores, fence_token, start_time, job_leader_addr, is_orphaned, orphaned_since, cores_completed, vus
+- [x] **15.2.2.3** Create CancelState dataclass (slots=True)
+  - Fields: workflow_id, job_id, cancel_requested_at, cancel_reason, cancel_completed, cancel_success, cancel_error
+- [x] **15.2.2.4** Create ExecutionMetrics dataclass (slots=True)
+  - Fields: workflows_executed, workflows_completed, workflows_failed, workflows_cancelled, total_cores_allocated, total_execution_time_seconds, throughput metrics
+- [x] **15.2.2.5** Create CompletionTimeTracker dataclass (slots=True)
+  - Sliding window of completion times for expected throughput calculation
+- [x] **15.2.2.6** Create TransferMetrics dataclass (slots=True)
+  - Section 8.6 transfer acceptance/rejection statistics
+- [x] **15.2.2.7** Create PendingTransferState dataclass (slots=True)
+  - Section 8.3 pending transfer storage
 
-**AD Compliance Check Required**: No AD violations expected - state containers
+**AD Compliance**: ✅ No AD violations - state containers only
 
-#### 15.2.3 Worker Configuration ⏳ PENDING
+#### 15.2.3 Worker Configuration ✅ COMPLETE
 
 **File**: `nodes/worker/config.py`
 
-- [ ] **15.2.3.1** Create WorkerConfig dataclass (slots=True)
+- [x] **15.2.3.1** Create WorkerConfig dataclass (slots=True)
   - Core allocation: total_cores, max_workflow_cores
-  - Timeouts: workflow_timeout, cancel_timeout
-  - Health: heartbeat_interval, health_check_interval
-  - Discovery: discovery_interval
-  - Backpressure: overload_threshold, shed_load_threshold
+  - Timeouts: tcp_timeout_short_seconds, tcp_timeout_standard_seconds
+  - Manager tracking: dead_manager_reap_interval_seconds, dead_manager_check_interval_seconds
+  - Discovery: discovery_probe_interval_seconds, discovery_failure_decay_interval_seconds (AD-28)
+  - Progress: progress_update_interval_seconds, progress_flush_interval_seconds
+  - Cancellation: cancellation_poll_interval_seconds
+  - Orphan handling: orphan_grace_period_seconds, orphan_check_interval_seconds (Section 2.7)
+  - Pending transfers: pending_transfer_ttl_seconds (Section 8.3)
+  - Overload: overload_poll_interval_seconds (AD-18)
+  - Throughput: throughput_interval_seconds (AD-19)
+  - Recovery: recovery_jitter_min_seconds, recovery_jitter_max_seconds, recovery_semaphore_size
+  - Registration: registration_max_retries, registration_base_delay_seconds
+- [x] **15.2.3.2** Create create_worker_config_from_env() factory function
 
-**AD Compliance Check Required**: No AD violations - configuration
+**AD Compliance**: ✅ No AD violations - configuration only
 
-#### 15.2.4 Worker State ⏳ PENDING
+#### 15.2.4 Worker State ✅ COMPLETE
 
 **File**: `nodes/worker/state.py`
 
-- [ ] **15.2.4.1** Create WorkerState class with mutable structures
-  - Active workflows: _workflows, _workflow_fence_tokens
-  - Core allocation: _allocated_cores, _core_allocator
-  - Manager tracking: _manager_peers, _circuits
-  - Execution: _workflow_results, _cancel_requests
+- [x] **15.2.4.1** Create WorkerState class with mutable structures
+  - Manager tracking: _known_managers, _healthy_manager_ids, _primary_manager_id, _manager_unhealthy_since, _manager_circuits, _manager_addr_circuits, _manager_state_locks, _manager_state_epoch
+  - Workflow tracking: _active_workflows, _workflow_tokens, _workflow_cancel_events, _workflow_id_to_name, _workflow_job_leader, _workflow_fence_tokens, _workflow_cores_completed, _pending_workflows
+  - Progress buffering: _progress_buffer, _progress_buffer_lock
+  - Backpressure (AD-23): _manager_backpressure, _backpressure_delay_ms
+  - Orphan handling (Section 2.7): _orphaned_workflows
+  - Job leadership transfer (Section 8): _job_leader_transfer_locks, _job_fence_tokens, _pending_transfers, transfer metrics
+  - State versioning: _state_version
+  - Extension requests (AD-26): _extension_requested, _extension_reason, _extension_current_progress, etc.
+  - Throughput tracking (AD-19): _throughput_completions, _throughput_interval_start, _throughput_last_value, _completion_times
+- [x] **15.2.4.2** Helper methods for manager tracking, workflow tracking, orphan handling, backpressure, throughput
 
-**AD Compliance Check Required**: No AD violations - state management
+**AD Compliance**: ✅ No AD violations - state management only
 
-#### 15.2.5 Worker TCP Handlers ⏳ PENDING
+#### 15.2.5 Worker TCP Handlers ✅ COMPLETE
 
 **Files**: `nodes/worker/handlers/*.py`
 
-- [ ] **15.2.5.1** Create `tcp_dispatch.py` - WorkflowDispatchHandler
-- [ ] **15.2.5.2** Create `tcp_cancel.py` - WorkflowCancelHandler
-- [ ] **15.2.5.3** Create `tcp_state_sync.py` - StateSyncHandler
-- [ ] **15.2.5.4** Create `tcp_leader_transfer.py` - LeaderTransferHandler
-- [ ] **15.2.5.5** Create `tcp_manager_registration.py` - ManagerRegistrationHandler
+- [x] **15.2.5.1** Create `tcp_dispatch.py` - WorkflowDispatchHandler
+  - Validates fence tokens, allocates cores, starts execution
+  - Preserves AD-33 workflow state machine compliance
+- [x] **15.2.5.2** Create `tcp_cancel.py` - WorkflowCancelHandler
+  - Handles workflow cancellation (AD-20)
+  - Checks terminal states, returns detailed response
+- [x] **15.2.5.3** Create `tcp_state_sync.py` - StateSyncHandler
+  - Returns worker state snapshot for manager synchronization
+- [x] **15.2.5.4** Create `tcp_leader_transfer.py` - JobLeaderTransferHandler
+  - Section 8 robustness: per-job locks, fence validation, pending transfers
+  - Clears orphan status on transfer (Section 2.7)
+- [x] **15.2.5.5** Create `tcp_status_query.py` - WorkflowStatusQueryHandler
+  - Returns active workflow IDs for orphan scanning
 
-**AD Compliance Check Required**: Must preserve workflow dispatch protocol (AD-33)
+**AD Compliance**: ✅ Verified - preserves AD-20, AD-31, AD-33, Section 8 compliance
 
 #### 15.2.6 Worker Core Modules ⏳ PENDING
 
@@ -1229,18 +1260,24 @@ nodes/manager/
 
 ### 15.6 Refactoring Progress Tracking
 
-**Overall Progress**: 15% Complete
+**Overall Progress**: 25% Complete
 
 **Completed Phases**:
 - ✅ Client Phase 1.1: TCP Handlers (10 handlers extracted)
 - ✅ Client Phase 1.2: Core Modules (1/8 complete - targets.py done)
+- ✅ Worker Phase 2.1: Module Structure (directory, __init__, worker_impl.py rename)
+- ✅ Worker Phase 2.2: Models (7 dataclasses with slots=True)
+- ✅ Worker Phase 2.3: Configuration (WorkerConfig dataclass)
+- ✅ Worker Phase 2.4: State (WorkerState class with all tracking)
+- ✅ Worker Phase 2.5: TCP Handlers (5 handlers extracted)
 
-**Current Phase**: Client Phase 1.2 - Extracting remaining 7 core modules
+**Current Phase**: Worker Phase 2.6 - Core modules (pending)
 
 **Remaining Phases**:
 - Client Phase 1.2: 7 modules (protocol, leadership, tracking, submission, cancellation, reporting, discovery)
 - Client Phase 1.3: Composition root refactor
-- Worker Phases 2.1-2.7: Complete worker refactoring
+- Worker Phase 2.6: Core modules (execution, registry, sync, cancellation, health, backpressure, discovery)
+- Worker Phase 2.7: Composition root refactor
 - Gate Phases 3.1-3.7: Complete gate refactoring
 - Manager Phases 4.1-4.7: Complete manager refactoring
 - Verification Phase 15.5: Final validation
