@@ -10,6 +10,7 @@ import time
 from typing import TYPE_CHECKING
 
 from hyperscale.distributed_rewrite.swim import HealthAwareServer, WorkerStateEmbedder
+from hyperscale.distributed_rewrite.env import Env
 from hyperscale.distributed_rewrite.models import (
     NodeInfo,
     NodeRole,
@@ -18,7 +19,6 @@ from hyperscale.distributed_rewrite.models import (
     WorkerStateSnapshot,
     WorkflowProgress,
 )
-from hyperscale.distributed_rewrite.env import Env
 from hyperscale.distributed_rewrite.jobs import CoreAllocator
 from hyperscale.distributed_rewrite.protocol.version import (
     NodeCapabilities,
@@ -351,6 +351,56 @@ class WorkerServer(HealthAwareServer):
         """Handle manager heartbeat from SWIM."""
         from hyperscale.distributed_rewrite.nodes.worker_impl import WorkerServer as ImplServer
         ImplServer._handle_manager_heartbeat(self, heartbeat, source_addr)
+
+    # =========================================================================
+    # Dispatch Execution Delegation (for tcp_dispatch.py)
+    # =========================================================================
+
+    async def _handle_dispatch_execution(
+        self, dispatch, addr: tuple[str, int], allocation_result
+    ) -> bytes:
+        """Delegate dispatch execution to worker_impl."""
+        from hyperscale.distributed_rewrite.nodes.worker_impl import WorkerServer as ImplServer
+        return await ImplServer._handle_dispatch_execution(self, dispatch, addr, allocation_result)
+
+    def _cleanup_workflow_state(self, workflow_id: str) -> None:
+        """Cleanup workflow state on failure."""
+        # Clear from tracking dicts
+        self._active_workflows.pop(workflow_id, None)
+        self._workflow_tokens.pop(workflow_id, None)
+        self._workflow_cancel_events.pop(workflow_id, None)
+        self._workflow_job_leader.pop(workflow_id, None)
+        self._workflow_fence_tokens.pop(workflow_id, None)
+        self._orphaned_workflows.pop(workflow_id, None)
+
+    # =========================================================================
+    # Cancellation Delegation (for tcp_cancel.py - AD-20)
+    # =========================================================================
+
+    async def _cancel_workflow(
+        self, workflow_id: str, reason: str
+    ) -> tuple[bool, str | None]:
+        """Delegate workflow cancellation to worker_impl."""
+        from hyperscale.distributed_rewrite.nodes.worker_impl import WorkerServer as ImplServer
+        return await ImplServer._cancel_workflow(self, workflow_id, reason)
+
+    # =========================================================================
+    # Environment Property (for tcp_dispatch.py)
+    # =========================================================================
+
+    @property
+    def env(self) -> Env:
+        """Get the environment configuration."""
+        return self._env
+
+    # =========================================================================
+    # State Version Property (for tcp_state_sync.py)
+    # =========================================================================
+
+    @property
+    def _state_version(self) -> int:
+        """Get current state version - delegate to state sync."""
+        return self._state_sync.state_version
 
     # =========================================================================
     # Resource Helpers

@@ -144,12 +144,39 @@ class GateStatsCoordinator:
                 pass
 
     async def _batch_stats_loop(self) -> None:
-        """Background loop for periodic stats aggregation and push."""
-        interval_seconds = self._stats_push_interval_ms / 1000.0
+        """
+        Background loop for periodic stats aggregation and push.
+
+        Implements AD-37 explicit backpressure handling by adjusting
+        flush interval based on system backpressure level:
+        - NONE: Normal interval
+        - THROTTLE: 2x interval (reduce update frequency)
+        - BATCH: 4x interval (accept only batched updates)
+        - REJECT: 8x interval (aggressive slowdown, drop non-critical)
+        """
+        from hyperscale.distributed_rewrite.reliability import BackpressureLevel
+
+        base_interval_seconds = self._stats_push_interval_ms / 1000.0
 
         while True:
             try:
+                # AD-37: Check backpressure level and adjust interval
+                backpressure_level = self._state.get_max_backpressure_level()
+
+                if backpressure_level == BackpressureLevel.THROTTLE:
+                    interval_seconds = base_interval_seconds * 2.0
+                elif backpressure_level == BackpressureLevel.BATCH:
+                    interval_seconds = base_interval_seconds * 4.0
+                elif backpressure_level == BackpressureLevel.REJECT:
+                    interval_seconds = base_interval_seconds * 8.0
+                else:
+                    interval_seconds = base_interval_seconds
+
                 await asyncio.sleep(interval_seconds)
+
+                # Skip push entirely under REJECT backpressure (non-critical updates)
+                if backpressure_level == BackpressureLevel.REJECT:
+                    continue
 
                 # Get jobs with pending stats
                 pending_jobs = self._windowed_stats.get_jobs_with_pending_stats()
