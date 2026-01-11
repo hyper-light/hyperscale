@@ -23220,3 +23220,1167 @@ The architecture balances latency, throughput, and durability through configurab
 *Coordination and Reliability*:
 - `hyperscale/distributed_rewrite/ledger/coordination/ack_window_manager.py` (AckWindowManager)
 - `hyperscale/distributed_rewrite/ledger/reliability/circuit_breaker.py` (CircuitBreaker)
+
+---
+
+### AD-39: Logger Extension for AD-38 WAL Compliance
+
+**Decision**: Extend the existing `hyperscale/logging` Logger with optional WAL-compliant features (durability modes, binary format, sequence numbers, read-back) while maintaining full backward compatibility with existing usage patterns.
+
+**Related**: AD-38 (Global Job Ledger), AD-20 (Cancellation)
+
+**Rationale**:
+- AD-38 identified that Logger is unsuitable for Control Plane WAL due to missing fsync, sequence numbers, and read-back capability.
+- However, creating a completely separate NodeWAL class duplicates async I/O patterns already proven in Logger.
+- By extending Logger with **optional** WAL features, we achieve code reuse, consistent API patterns, and progressive enhancement.
+- All existing Logger usage (Data Plane stats) continues unchanged with default parameters.
+- New WAL use cases opt-in to durability features via new parameters.
+
+---
+
+## Part 1: Current Logger Architecture Analysis
+
+### 1.1 File Structure
+
+```
+hyperscale/logging/
+├── __init__.py
+├── config/
+│   ├── __init__.py
+│   ├── log_level_map.py
+│   ├── logging_config.py
+│   └── stream_type.py
+├── models/
+│   ├── __init__.py
+│   ├── entry.py
+│   ├── log.py
+│   └── log_level.py
+├── queue/
+│   ├── __init__.py
+│   ├── consumer_status.py
+│   ├── log_consumer.py
+│   ├── log_provider.py
+│   └── provider_status.py
+├── rotation/
+│   ├── __init__.py
+│   ├── file_size_parser.py
+│   └── time_parser.py
+├── snowflake/
+│   ├── __init__.py
+│   ├── constants.py
+│   ├── snowflake.py
+│   └── snowflake_generator.py         # Already exists - useful for LSN
+├── streams/
+│   ├── __init__.py
+│   ├── logger.py                       # Main Logger class
+│   ├── logger_context.py               # Context manager
+│   ├── logger_stream.py                # Core implementation
+│   ├── protocol.py
+│   └── retention_policy.py
+└── hyperscale_logging_models.py
+```
+
+### 1.2 Current Usage Patterns
+
+All Logger file usage follows a consistent pattern across the codebase:
+
+```python
+# Pattern 1: Configure then use context
+self._logger.configure(
+    name="context_name",
+    path="hyperscale.leader.log.json",
+    template="{timestamp} - {level} - {thread_id} - {filename}:{function_name}.{line_number} - {message}",
+    models={
+        "trace": (TraceModel, default_config),
+        "debug": (DebugModel, default_config),
+    },
+)
+
+async with self._logger.context(name="context_name") as ctx:
+    await ctx.log(Entry(message="...", level=LogLevel.INFO))
+    await ctx.log_prepared("message text", name="debug")
+
+# Pattern 2: Inline context with path
+async with self._logger.context(
+    name="remote_graph_manager",
+    path="hyperscale.leader.log.json",
+    template="...",
+    nested=True,  # Reuse existing context
+) as ctx:
+    await ctx.log(Entry(...))
+```
+
+### 1.3 Usage by Component
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         LOGGER USAGE MAP                                 │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  RemoteGraphManager                                                      │
+│  ├── Context: "remote_graph_manager", "{graph_slug}_logger",            │
+│  │            "{workflow_slug}_logger"                                   │
+│  ├── Path: "hyperscale.leader.log.json"                                 │
+│  ├── Models: GraphDebug, WorkflowTrace, RemoteManagerInfo              │
+│  └── Methods: ctx.log(), ctx.log_prepared()                            │
+│                                                                          │
+│  RemoteGraphController                                                   │
+│  ├── Context: "graph_server_{id}", "workflow_run_{id}",                 │
+│  │            "graph_client_{id}", "controller"                         │
+│  ├── Path: None (console only)                                          │
+│  ├── Models: StatusUpdate, RunInfo, ServerDebug/Info/Error             │
+│  └── Methods: ctx.log_prepared()                                        │
+│                                                                          │
+│  WorkflowRunner                                                          │
+│  ├── Context: "{workflow_slug}_{run_id}_logger", "workflow_manager"     │
+│  ├── Path: self._logfile (configurable)                                 │
+│  ├── Models: Entry                                                      │
+│  └── Methods: ctx.log(), ctx.log_prepared()                            │
+│                                                                          │
+│  LocalRunner                                                             │
+│  ├── Context: "local_runner"                                            │
+│  ├── Path: "hyperscale.leader.log.json"                                 │
+│  ├── Models: TestTrace, TestInfo, TestError                            │
+│  └── Methods: ctx.log_prepared()                                        │
+│                                                                          │
+│  LocalServerPool                                                         │
+│  ├── Context: "local_server_pool"                                       │
+│  ├── Path: "hyperscale.leader.log.json"                                 │
+│  ├── Models: Entry                                                      │
+│  └── Methods: ctx.log()                                                 │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 1.4 Current LoggerStream Core Methods
+
+```python
+# File: hyperscale/logging/streams/logger_stream.py
+
+class LoggerStream:
+    def __init__(self, name, template, filename, directory, retention_policy, models): ...
+
+    # File operations
+    async def open_file(self, filename, directory, is_default, retention_policy): ...
+    def _open_file(self, logfile_path): ...                    # Sync, runs in executor
+    async def close_file(self, filename, directory): ...
+    async def _close_file(self, logfile_path): ...
+
+    # Rotation
+    async def _rotate(self, logfile_path, retention_policy): ...
+    def _rotate_logfile(self, retention_policy, logfile_path): ...  # Sync
+
+    # Logging
+    async def log(self, entry, template, path, retention_policy, filter): ...
+    async def _log(self, entry_or_log, template, filter): ...           # Console
+    async def _log_to_file(self, entry_or_log, filename, directory, ...): ...  # File
+
+    # THE CRITICAL METHOD - Line 857-873
+    def _write_to_file(self, log, logfile_path): ...  # Sync, runs in executor
+
+    # Pub/Sub
+    async def get(self, filter): ...   # Async iterator from consumer
+    async def put(self, entry): ...    # Send to provider
+```
+
+### 1.5 Critical Gap: `_write_to_file` Implementation
+
+```python
+# CURRENT IMPLEMENTATION (logger_stream.py:857-873)
+def _write_to_file(
+    self,
+    log: Log,
+    logfile_path: str,
+):
+    try:
+        if (
+            logfile := self._files.get(logfile_path)
+        ) and (
+            logfile.closed is False
+        ):
+
+            logfile.write(msgspec.json.encode(log) + b"\n")  # JSON only
+            logfile.flush()  # NO fsync - data can be lost!
+
+    except Exception:
+        pass  # Errors swallowed
+```
+
+**Problems for WAL**:
+1. **No fsync** - `flush()` only pushes to OS buffer, not disk
+2. **JSON only** - No binary format with CRC checksums
+3. **No LSN** - No sequence number generation
+4. **Write-only** - No read-back for recovery
+5. **Errors swallowed** - Silent failures unacceptable for WAL
+
+---
+
+## Part 2: Extension Design
+
+### 2.1 Design Principles
+
+1. **Additive Only** - New optional parameters with backward-compatible defaults
+2. **Zero Breaking Changes** - All existing code works unchanged
+3. **Progressive Enhancement** - Enable WAL features per-context as needed
+4. **Single Responsibility** - Each new feature independently toggleable
+5. **Consistent Patterns** - Same `context()` API already familiar to codebase
+
+### 2.2 New Configuration Enum
+
+```python
+"""
+hyperscale/logging/config/durability_mode.py
+"""
+from enum import IntEnum
+
+
+class DurabilityMode(IntEnum):
+    """
+    Durability levels for log writes.
+
+    Controls when writes are considered durable:
+    - NONE: No sync (testing only, data loss on any failure)
+    - FLUSH: Buffer flush only (current behavior, data loss on OS crash)
+    - FSYNC: Per-write fsync (safest, highest latency)
+    - FSYNC_BATCH: Batched fsync (recommended for WAL - balance of safety/perf)
+    """
+    NONE = 0         # No sync (testing only)
+    FLUSH = 1        # Current behavior - flush() to OS buffer
+    FSYNC = 2        # fsync per write (safest, ~1-10ms latency)
+    FSYNC_BATCH = 3  # Batched fsync every N writes or T ms
+```
+
+### 2.3 API Extension
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    LOGGER API EXTENSION                                  │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  Logger.context() - EXTENDED                                             │
+│  ──────────────────────────────────                                     │
+│                                                                          │
+│  EXISTING PARAMETERS (unchanged):                                        │
+│  ├── name: str | None = None                                            │
+│  ├── template: str | None = None                                        │
+│  ├── path: str | None = None                                            │
+│  ├── retention_policy: RetentionPolicyConfig | None = None              │
+│  ├── nested: bool = False                                               │
+│  └── models: dict[...] | None = None                                    │
+│                                                                          │
+│  NEW PARAMETERS (all optional, defaults = current behavior):            │
+│  ├── durability: DurabilityMode = DurabilityMode.FLUSH    # NEW         │
+│  ├── format: Literal['json', 'binary'] = 'json'           # NEW         │
+│  ├── enable_lsn: bool = False                             # NEW         │
+│  └── instance_id: int = 0                                 # NEW         │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 2.4 Usage Comparison
+
+```python
+# ═══════════════════════════════════════════════════════════════════════
+# EXISTING CODE - COMPLETELY UNCHANGED (Data Plane - stats)
+# ═══════════════════════════════════════════════════════════════════════
+
+async with self._logger.context(
+    name="remote_graph_manager",
+    path="hyperscale.leader.log.json",
+    template="{timestamp} - {level} - {...} - {message}",
+) as ctx:
+    await ctx.log(Entry(message="Stats update", level=LogLevel.INFO))
+    # Uses: JSON format, flush() only, no LSN
+    # Behavior: IDENTICAL to current implementation
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# NEW CODE - WAL MODE (Control Plane - job/workflow commands)
+# ═══════════════════════════════════════════════════════════════════════
+
+async with self._logger.context(
+    name="node_wal",
+    path="hyperscale.wal.log",               # Can use .wal extension
+    durability=DurabilityMode.FSYNC_BATCH,   # NEW: Batched fsync
+    format='binary',                          # NEW: Binary with CRC
+    enable_lsn=True,                          # NEW: Sequence numbers
+    instance_id=self._node_id,                # NEW: For snowflake LSN
+) as ctx:
+    lsn = await ctx.log(WALEntry(...))
+    # Uses: Binary format, CRC32 checksum, fsync, LSN tracking
+    # Returns: LSN for replication tracking
+```
+
+---
+
+## Part 3: LoggerStream Modifications
+
+### 3.1 `__init__` Extension
+
+```python
+# CURRENT (lines 65-136)
+def __init__(
+    self,
+    name: str | None = None,
+    template: str | None = None,
+    filename: str | None = None,
+    directory: str | None = None,
+    retention_policy: RetentionPolicyConfig | None = None,
+    models: dict[str, tuple[type[T], dict[str, Any]]] | None = None,
+) -> None:
+    # ... existing initialization ...
+
+# EXTENDED
+def __init__(
+    self,
+    name: str | None = None,
+    template: str | None = None,
+    filename: str | None = None,
+    directory: str | None = None,
+    retention_policy: RetentionPolicyConfig | None = None,
+    models: dict[str, tuple[type[T], dict[str, Any]]] | None = None,
+    # NEW AD-39 parameters
+    durability: DurabilityMode = DurabilityMode.FLUSH,
+    format: Literal['json', 'binary'] = 'json',
+    enable_lsn: bool = False,
+    instance_id: int = 0,
+) -> None:
+    # ... existing initialization ...
+
+    # NEW: AD-39 WAL support
+    self._durability = durability
+    self._format = format
+    self._enable_lsn = enable_lsn
+    self._instance_id = instance_id
+
+    # LSN generator (reuses existing snowflake module)
+    self._sequence_generator: SnowflakeGenerator | None = None
+    if enable_lsn:
+        self._sequence_generator = SnowflakeGenerator(instance_id)
+
+    # Batch fsync state
+    self._pending_batch: list[tuple[bytes, str, asyncio.Future[int | None]]] = []
+    self._batch_lock: asyncio.Lock | None = None  # Lazy init
+    self._batch_timeout_ms: int = 10
+    self._batch_max_size: int = 100
+    self._last_batch_time: float = 0.0
+```
+
+### 3.2 `_write_to_file` Rewrite
+
+```python
+def _write_to_file(
+    self,
+    log: Log,
+    logfile_path: str,
+    durability: DurabilityMode | None = None,
+) -> int | None:
+    """
+    Write log entry to file with configurable durability.
+
+    Args:
+        log: Log entry to write
+        logfile_path: Target file path
+        durability: Override durability mode (uses default if None)
+
+    Returns:
+        LSN if enable_lsn is True, else None
+
+    Raises:
+        IOError: On write failure (not swallowed in WAL mode)
+    """
+    if durability is None:
+        durability = self._durability
+
+    logfile = self._files.get(logfile_path)
+    if logfile is None or logfile.closed:
+        return None
+
+    # Generate LSN if enabled
+    lsn: int | None = None
+    if self._enable_lsn and self._sequence_generator:
+        lsn = self._sequence_generator.generate()
+        if lsn is not None:
+            log.lsn = lsn
+
+    # Encode based on format
+    if self._format == 'binary':
+        data = self._encode_binary(log, lsn)
+    else:
+        data = msgspec.json.encode(log) + b"\n"
+
+    # Write data
+    logfile.write(data)
+
+    # Apply durability
+    match durability:
+        case DurabilityMode.NONE:
+            pass  # No sync (testing only)
+
+        case DurabilityMode.FLUSH:
+            logfile.flush()  # Current behavior
+
+        case DurabilityMode.FSYNC:
+            logfile.flush()
+            os.fsync(logfile.fileno())  # Guaranteed on-disk
+
+        case DurabilityMode.FSYNC_BATCH:
+            logfile.flush()
+            # Batch fsync handled by caller
+
+    return lsn
+```
+
+### 3.3 Binary Encoding with CRC
+
+```python
+def _encode_binary(self, log: Log, lsn: int | None) -> bytes:
+    """
+    Encode log entry in binary format with CRC32 checksum.
+
+    Binary Format:
+    ┌──────────┬──────────┬──────────┬─────────────────────┐
+    │ CRC32    │ Length   │ LSN      │ Payload (JSON)      │
+    │ (4 bytes)│ (4 bytes)│ (8 bytes)│ (variable)          │
+    └──────────┴──────────┴──────────┴─────────────────────┘
+
+    Total header: 16 bytes
+    CRC32 covers: length + LSN + payload
+    """
+    import struct
+    import hashlib
+
+    payload = msgspec.json.encode(log)
+    lsn_value = lsn if lsn is not None else 0
+
+    # Header: length (4) + LSN (8)
+    header = struct.pack("<IQ", len(payload), lsn_value)
+
+    # CRC32 over header + payload
+    crc = hashlib.crc32(header + payload)
+
+    # Final: CRC32 (4) + header (12) + payload
+    return struct.pack("<I", crc) + header + payload
+
+
+def _decode_binary(self, data: bytes) -> tuple[Log, int]:
+    """
+    Decode binary log entry with CRC verification.
+
+    Args:
+        data: Raw bytes from file
+
+    Returns:
+        Tuple of (Log, LSN)
+
+    Raises:
+        ValueError: On CRC mismatch or malformed data
+    """
+    import struct
+    import hashlib
+
+    HEADER_SIZE = 16  # CRC(4) + length(4) + LSN(8)
+
+    if len(data) < HEADER_SIZE:
+        raise ValueError(f"Entry too short: {len(data)} < {HEADER_SIZE}")
+
+    crc_stored = struct.unpack("<I", data[:4])[0]
+    length, lsn = struct.unpack("<IQ", data[4:16])
+
+    if len(data) < HEADER_SIZE + length:
+        raise ValueError(f"Truncated entry: have {len(data)}, need {HEADER_SIZE + length}")
+
+    # Verify CRC over header (after CRC field) + payload
+    crc_computed = hashlib.crc32(data[4:16 + length])
+    if crc_stored != crc_computed:
+        raise ValueError(f"CRC mismatch: stored={crc_stored:#x}, computed={crc_computed:#x}")
+
+    payload = data[16:16 + length]
+    log = msgspec.json.decode(payload, type=Log)
+
+    return log, lsn
+```
+
+### 3.4 Read-Back for Recovery
+
+```python
+async def read_entries(
+    self,
+    logfile_path: str,
+    from_offset: int = 0,
+) -> AsyncIterator[tuple[int, Log, int | None]]:
+    """
+    Read entries from file for WAL recovery.
+
+    Yields tuples of (file_offset, log_entry, lsn).
+    Handles both JSON and binary formats based on self._format.
+
+    Args:
+        logfile_path: Path to log file
+        from_offset: Starting byte offset (0 = beginning)
+
+    Yields:
+        (offset, log, lsn) for each entry
+
+    Raises:
+        ValueError: On corrupted entries (CRC mismatch, malformed data)
+    """
+    import struct
+
+    BINARY_HEADER_SIZE = 16
+
+    file_lock = self._file_locks[logfile_path]
+    await file_lock.acquire()
+
+    try:
+        # Open file for reading (separate from write handle)
+        read_file = await self._loop.run_in_executor(
+            None,
+            functools.partial(open, logfile_path, 'rb'),
+        )
+
+        try:
+            await self._loop.run_in_executor(None, read_file.seek, from_offset)
+            offset = from_offset
+
+            while True:
+                if self._format == 'binary':
+                    # Read header first
+                    header = await self._loop.run_in_executor(
+                        None, read_file.read, BINARY_HEADER_SIZE
+                    )
+
+                    if len(header) == 0:
+                        break  # EOF
+
+                    if len(header) < BINARY_HEADER_SIZE:
+                        raise ValueError(f"Truncated header at offset {offset}")
+
+                    length = struct.unpack("<I", header[4:8])[0]
+                    payload = await self._loop.run_in_executor(
+                        None, read_file.read, length
+                    )
+
+                    if len(payload) < length:
+                        raise ValueError(f"Truncated payload at offset {offset}")
+
+                    log, lsn = self._decode_binary(header + payload)
+                    entry_size = BINARY_HEADER_SIZE + length
+                    yield offset, log, lsn
+                    offset += entry_size
+
+                else:
+                    # JSON format: line-delimited
+                    line = await self._loop.run_in_executor(
+                        None, read_file.readline
+                    )
+
+                    if not line:
+                        break  # EOF
+
+                    log = msgspec.json.decode(line.rstrip(b'\n'), type=Log)
+                    lsn = getattr(log, 'lsn', None)
+                    yield offset, log, lsn
+                    offset = read_file.tell()
+
+        finally:
+            read_file.close()
+
+    finally:
+        if file_lock.locked():
+            file_lock.release()
+
+
+async def get_last_lsn(self, logfile_path: str) -> int | None:
+    """
+    Get the last LSN in a log file (for recovery).
+
+    Scans from end of file for efficiency with binary format.
+    """
+    last_lsn: int | None = None
+
+    async for offset, log, lsn in self.read_entries(logfile_path):
+        if lsn is not None:
+            last_lsn = lsn
+
+    return last_lsn
+```
+
+### 3.5 Batched Fsync
+
+```python
+async def _schedule_batch_fsync(self, logfile_path: str) -> None:
+    """
+    Schedule entry for batch fsync.
+
+    Batches are flushed when:
+    - batch_max_size entries accumulated, OR
+    - batch_timeout_ms elapsed since first entry
+
+    This provides ~10x throughput improvement over per-write fsync
+    while maintaining bounded latency.
+    """
+    if self._batch_lock is None:
+        self._batch_lock = asyncio.Lock()
+
+    current_time = time.monotonic()
+
+    async with self._batch_lock:
+        should_flush = (
+            len(self._pending_batch) >= self._batch_max_size or
+            (
+                self._last_batch_time > 0 and
+                (current_time - self._last_batch_time) * 1000 >= self._batch_timeout_ms
+            )
+        )
+
+        if should_flush:
+            await self._flush_batch(logfile_path)
+            self._last_batch_time = current_time
+        elif self._last_batch_time == 0:
+            self._last_batch_time = current_time
+
+
+async def _flush_batch(self, logfile_path: str) -> None:
+    """
+    Flush pending batch with single fsync.
+
+    One fsync for multiple writes provides significant throughput
+    improvement while maintaining durability guarantees.
+    """
+    if not self._pending_batch:
+        return
+
+    logfile = self._files.get(logfile_path)
+    if logfile and not logfile.closed:
+        await self._loop.run_in_executor(
+            None,
+            os.fsync,
+            logfile.fileno(),
+        )
+
+    # Signal all waiting futures
+    for _, _, future in self._pending_batch:
+        if not future.done():
+            future.set_result(None)
+
+    self._pending_batch.clear()
+    self._last_batch_time = 0.0
+```
+
+---
+
+## Part 4: Log Model Extension
+
+### 4.1 Add Optional LSN Field
+
+```python
+"""
+hyperscale/logging/models/log.py - EXTENDED
+"""
+from dataclasses import dataclass, field
+from typing import Generic, TypeVar
+
+T = TypeVar('T')
+
+
+@dataclass
+class Log(Generic[T]):
+    """
+    Wrapper around log entries with metadata.
+
+    Extended with optional LSN for WAL use cases.
+    """
+    entry: T
+    filename: str | None = None
+    function_name: str | None = None
+    line_number: int | None = None
+    thread_id: int | None = None
+    timestamp: str | None = None
+
+    # NEW: Optional LSN for WAL entries
+    lsn: int | None = field(default=None)
+```
+
+---
+
+## Part 5: Flow Diagrams
+
+### 5.1 Write Flow Comparison
+
+```
+═══════════════════════════════════════════════════════════════════════════
+                    CURRENT FLOW (Data Plane - No Change)
+═══════════════════════════════════════════════════════════════════════════
+
+    ctx.log(entry)
+         │
+         ▼
+    ┌─────────────┐
+    │ _log_to_file│
+    └──────┬──────┘
+           │
+           ▼
+    ┌─────────────────────┐
+    │ run_in_executor     │
+    │ (_write_to_file)    │
+    └──────┬──────────────┘
+           │
+           ▼
+    ┌─────────────────────┐
+    │ msgspec.json.encode │
+    │ + logfile.write()   │
+    │ + logfile.flush()   │ ◄── Data in OS buffer only
+    └─────────────────────┘
+           │
+           ▼
+       [Return]
+
+
+═══════════════════════════════════════════════════════════════════════════
+                    NEW FLOW (Control Plane - WAL Mode)
+═══════════════════════════════════════════════════════════════════════════
+
+    ctx.log(entry)
+         │
+         ▼
+    ┌─────────────┐
+    │ _log_to_file│
+    └──────┬──────┘
+           │
+           ▼
+    ┌─────────────────────┐
+    │ run_in_executor     │
+    │ (_write_to_file)    │
+    └──────┬──────────────┘
+           │
+           ▼
+    ┌─────────────────────────────────────────────────┐
+    │  if enable_lsn:                                  │
+    │      lsn = snowflake_generator.generate()        │
+    │      log.lsn = lsn                               │
+    └──────────────────────┬──────────────────────────┘
+                           │
+                           ▼
+    ┌─────────────────────────────────────────────────┐
+    │  if format == 'binary':                          │
+    │      data = _encode_binary(log, lsn)             │
+    │          ├── payload = msgspec.json.encode(log)  │
+    │          ├── header = struct.pack(len, lsn)      │
+    │          └── crc = hashlib.crc32(header+payload) │
+    │  else:                                           │
+    │      data = msgspec.json.encode(log) + b"\n"    │
+    └──────────────────────┬──────────────────────────┘
+                           │
+                           ▼
+                   logfile.write(data)
+                           │
+                           ▼
+    ┌─────────────────────────────────────────────────┐
+    │  match durability:                               │
+    │      NONE  → (no sync)                          │
+    │      FLUSH → logfile.flush()                    │
+    │      FSYNC → logfile.flush() + os.fsync()       │
+    │      FSYNC_BATCH → flush + schedule_batch()     │
+    └──────────────────────┬──────────────────────────┘
+                           │
+                           ▼
+                    [Return LSN]
+```
+
+### 5.2 Batch Fsync Flow
+
+```
+═══════════════════════════════════════════════════════════════════════════
+                    BATCH FSYNC TIMING (DurabilityMode.FSYNC_BATCH)
+═══════════════════════════════════════════════════════════════════════════
+
+Time →  T0      T1      T2      T3      T4      T5      T6      T7      T8
+        │       │       │       │       │       │       │       │       │
+        │       │       │       │       │       │       │       │       │
+Write 1 ●───────────────────────────────────────●
+        ↑ write+flush                           ↑ fsync (batched)
+        │                                       │
+Write 2 ────────●──────────────────────────────●
+                ↑ write+flush                  ↑ same fsync
+                │                              │
+Write 3 ────────────────●─────────────────────●
+                        ↑ write+flush         ↑ same fsync
+                        │                     │
+        ├───────────────┼─────────────────────┤
+        │   10ms batch timeout                │
+        │   OR 100 entries                    │
+        └─────────────────────────────────────┘
+                                              │
+                                              ▼
+                                    ┌─────────────────┐
+                                    │ Single fsync()  │
+                                    │ for all 3       │
+                                    │ writes          │
+                                    └─────────────────┘
+
+Benefits:
+- 3 writes with 1 fsync instead of 3 fsyncs
+- ~3x throughput improvement
+- Max latency bounded to 10ms
+- All writes durable after batch fsync
+```
+
+### 5.3 Recovery Flow
+
+```
+═══════════════════════════════════════════════════════════════════════════
+                    WAL RECOVERY FLOW (read_entries)
+═══════════════════════════════════════════════════════════════════════════
+
+                            STARTUP
+                               │
+                               ▼
+                    ┌──────────────────┐
+                    │  Check for WAL   │
+                    │  files exist     │
+                    └────────┬─────────┘
+                             │
+              ┌──────────────┴──────────────┐
+              │ Yes                         │ No
+              ▼                             ▼
+    ┌──────────────────┐          ┌──────────────────┐
+    │  Open WAL file   │          │  Fresh start     │
+    │  for reading     │          │  (no recovery)   │
+    └────────┬─────────┘          └──────────────────┘
+             │
+             ▼
+    ┌──────────────────────────────────────────────┐
+    │  async for offset, log, lsn in read_entries: │
+    └────────┬─────────────────────────────────────┘
+             │
+             ▼
+    ┌──────────────────────────────────────────────┐
+    │  Binary format?                              │
+    │  ├── Read 16-byte header                     │
+    │  ├── Extract length, LSN                     │
+    │  ├── Read payload                            │
+    │  ├── Verify CRC32                            │
+    │  └── Decode JSON payload                     │
+    │                                              │
+    │  JSON format?                                │
+    │  ├── Read line                               │
+    │  └── Decode JSON                             │
+    └────────┬─────────────────────────────────────┘
+             │
+             ▼
+    ┌──────────────────────────────────────────────┐
+    │  For each recovered entry:                    │
+    │  ├── Check entry.state                        │
+    │  ├── If PENDING: replay to consensus          │
+    │  ├── If REGIONAL: verify with DC             │
+    │  ├── If GLOBAL: mark as recovered            │
+    │  └── Track max_lsn for new writes            │
+    └────────┬─────────────────────────────────────┘
+             │
+             ▼
+    ┌──────────────────────────────────────────────┐
+    │  Update sequence_generator with max_lsn      │
+    │  Resume normal operations                     │
+    └──────────────────────────────────────────────┘
+```
+
+---
+
+## Part 6: Timing Diagrams
+
+### 6.1 Durability Mode Latencies
+
+```
+═══════════════════════════════════════════════════════════════════════════
+                    LATENCY COMPARISON BY DURABILITY MODE
+═══════════════════════════════════════════════════════════════════════════
+
+DurabilityMode.NONE (testing only):
+├── write()      ──┤ ~1μs
+│                  │
+└── Total: ~1μs    │
+                   │
+DurabilityMode.FLUSH (current default):
+├── write()      ──┤ ~1μs
+├── flush()      ──┤ ~10μs
+│                  │
+└── Total: ~11μs   │
+                   │
+DurabilityMode.FSYNC (per-write):
+├── write()      ──┤ ~1μs
+├── flush()      ──┤ ~10μs
+├── fsync()      ──────────────────────────────┤ ~1-10ms (SSD)
+│                                               │
+└── Total: ~1-10ms                              │
+                                                │
+DurabilityMode.FSYNC_BATCH (recommended for WAL):
+├── write()      ──┤ ~1μs
+├── flush()      ──┤ ~10μs
+├── (wait for batch)  ──────────────────┤ ≤10ms
+├── fsync() [shared] ──────────────────────────┤ ~1-10ms / N writes
+│                                               │
+└── Per-write latency: ~10ms + 1ms/N           │
+    (with 100 writes/batch: ~100μs/write)      │
+
+
+Throughput Comparison (64-byte entries, NVMe SSD):
+┌─────────────────┬───────────────┬─────────────────────────────────┐
+│ Mode            │ Writes/sec    │ Notes                           │
+├─────────────────┼───────────────┼─────────────────────────────────┤
+│ NONE            │ ~1,000,000    │ No durability (testing only)    │
+│ FLUSH           │ ~500,000      │ Current behavior, OS buffer     │
+│ FSYNC           │ ~500          │ Per-write fsync, very slow      │
+│ FSYNC_BATCH     │ ~50,000       │ 100 writes/fsync, recommended   │
+└─────────────────┴───────────────┴─────────────────────────────────┘
+```
+
+### 6.2 End-to-End Job Commit Timeline
+
+```
+═══════════════════════════════════════════════════════════════════════════
+                    JOB CREATION WITH WAL (FSYNC_BATCH)
+═══════════════════════════════════════════════════════════════════════════
+
+Time →   0ms        1ms        5ms       10ms       15ms      110ms
+         │          │          │          │          │          │
+Gate     ├── Write to WAL ─────┤          │          │          │
+         │  (enable_lsn=True)  │          │          │          │
+         │  (format='binary')  │          │          │          │
+         │                     │          │          │          │
+         │          ├── Batch fsync ──────┤          │          │
+         │          │  (10ms timeout)     │          │          │
+         │          │                     │          │          │
+         │          │          │          ├── LOCAL committed   │
+         │          │          │          │  (process crash     │
+         │          │          │          │   survivable)       │
+         │          │          │          │          │          │
+         │          │          │          │          ├── REGIONAL
+         │          │          │          │          │  consensus
+         │          │          │          │          │  (DC peers)
+         │          │          │          │          │          │
+         │          │          │          │          │          ├── GLOBAL
+         │          │          │          │          │          │  consensus
+         │          │          │          │          │          │  (cross-DC)
+         │          │          │          │          │          │
+         ├──────────┼──────────┼──────────┼──────────┼──────────┤
+         │   <1ms   │   10ms   │          │  ~5ms    │  ~100ms  │
+         │  write   │  fsync   │          │ regional │  global  │
+         │          │  batch   │          │          │          │
+
+
+Latency Breakdown:
+┌────────────────────┬─────────┬────────────────────────────────────────┐
+│ Stage              │ Latency │ What Survives                          │
+├────────────────────┼─────────┼────────────────────────────────────────┤
+│ Write to WAL       │ <1ms    │ Nothing (in memory)                    │
+│ Batch fsync        │ ≤10ms   │ Process crash                          │
+│ REGIONAL consensus │ ~5ms    │ Node crash, rack failure               │
+│ GLOBAL consensus   │ ~100ms  │ DC failure, region failure             │
+└────────────────────┴─────────┴────────────────────────────────────────┘
+```
+
+---
+
+## Part 7: File Changes Summary
+
+### 7.1 Modified Files
+
+```
+hyperscale/logging/
+├── config/
+│   ├── __init__.py                 # MODIFY: Export DurabilityMode
+│   └── durability_mode.py          # NEW: DurabilityMode enum
+│
+├── models/
+│   └── log.py                      # MODIFY: Add lsn: int | None = None
+│
+└── streams/
+    ├── logger.py                   # MODIFY: Pass new params to context()
+    ├── logger_context.py           # MODIFY: Accept new params, pass to stream
+    └── logger_stream.py            # MODIFY: Core implementation changes
+```
+
+### 7.2 LoggerStream Change Summary
+
+| Method | Change Type | Lines | Description |
+|--------|-------------|-------|-------------|
+| `__init__` | MODIFY | 65-136 | Add 4 new params, 7 new instance vars |
+| `_to_logfile_path` | MODIFY | 444-463 | Relax `.json` extension constraint |
+| `_write_to_file` | REWRITE | 857-873 | Add durability, binary format, LSN |
+| `_encode_binary` | NEW | - | Binary format with CRC32 |
+| `_decode_binary` | NEW | - | Binary decode with CRC verify |
+| `read_entries` | NEW | - | Async iterator for recovery |
+| `get_last_lsn` | NEW | - | Find last LSN for recovery |
+| `_schedule_batch_fsync` | NEW | - | Batch fsync scheduling |
+| `_flush_batch` | NEW | - | Execute batch fsync |
+| `_log_to_file` | MODIFY | 739-855 | Thread durability param |
+
+### 7.3 New File: `durability_mode.py`
+
+```python
+"""
+hyperscale/logging/config/durability_mode.py
+
+Durability configuration for Logger writes.
+"""
+from enum import IntEnum
+
+
+class DurabilityMode(IntEnum):
+    """
+    Durability levels for log writes.
+
+    NONE:        No sync - testing only, data loss on any failure
+    FLUSH:       Buffer flush - current behavior, data loss on OS crash
+    FSYNC:       Per-write fsync - safest, highest latency (~1-10ms/write)
+    FSYNC_BATCH: Batched fsync - recommended for WAL (~10ms max latency)
+
+    Recommended:
+    - Data Plane (stats): FLUSH (default, current behavior)
+    - Control Plane (WAL): FSYNC_BATCH (durability + throughput)
+    - Testing: NONE (maximum speed, no durability)
+    """
+    NONE = 0
+    FLUSH = 1
+    FSYNC = 2
+    FSYNC_BATCH = 3
+```
+
+---
+
+## Part 8: Integration with AD-38
+
+### 8.1 Architecture Mapping
+
+```
+═══════════════════════════════════════════════════════════════════════════
+                    AD-38 + AD-39 INTEGRATION
+═══════════════════════════════════════════════════════════════════════════
+
+AD-38 Architecture              │  AD-39 Logger Extension
+────────────────────────────────┼────────────────────────────────────────
+                                │
+CONTROL PLANE                   │
+┌───────────────────────────────┼───────────────────────────────────────┐
+│ NodeWAL (job/workflow cmds)   │  Logger with WAL mode:                │
+│                               │  ├── durability=FSYNC_BATCH           │
+│ • Binary format with CRC      │  ├── format='binary'                  │
+│ • Sequence numbers (LSN)      │  ├── enable_lsn=True                  │
+│ • fsync guarantee             │  └── instance_id=node_id              │
+│ • Read-back for recovery      │                                       │
+└───────────────────────────────┼───────────────────────────────────────┘
+                                │
+DATA PLANE                      │
+┌───────────────────────────────┼───────────────────────────────────────┐
+│ Logger (stats streaming)      │  Logger with default mode:            │
+│                               │  ├── durability=FLUSH (default)       │
+│ • JSON format                 │  ├── format='json' (default)          │
+│ • Eventual consistency OK     │  ├── enable_lsn=False (default)       │
+│ • High throughput             │  └── (no changes needed)              │
+└───────────────────────────────┼───────────────────────────────────────┘
+```
+
+### 8.2 Usage Example: Gate Node
+
+```python
+class GateNode:
+    def __init__(self):
+        self._logger = Logger()
+
+        # Configure WAL context for job operations (Control Plane)
+        self._logger.configure(
+            name="gate_wal",
+            path="hyperscale.gate.wal",
+            durability=DurabilityMode.FSYNC_BATCH,
+            format='binary',
+            enable_lsn=True,
+            instance_id=self._node_id,
+        )
+
+        # Configure stats context (Data Plane - unchanged)
+        self._logger.configure(
+            name="gate_stats",
+            path="hyperscale.gate.stats.json",
+            # All defaults: FLUSH, json, no LSN
+        )
+
+    async def create_job(self, job: Job):
+        # WAL mode - durable, with LSN
+        async with self._logger.context(name="gate_wal") as ctx:
+            lsn = await ctx.log(JobCreatedEvent(job_id=job.id, ...))
+            # lsn returned for replication tracking
+
+            # Replicate to DC peers
+            await self._replicate_to_regional(lsn)
+
+            # Replicate to other DCs
+            await self._replicate_to_global(lsn)
+
+    async def record_stats(self, stats: Stats):
+        # Stats mode - fire-and-forget, eventual consistency
+        async with self._logger.context(name="gate_stats") as ctx:
+            await ctx.log(StatsEntry(stats=stats))
+            # No LSN, no fsync, just best-effort logging
+```
+
+---
+
+## Part 9: Success Criteria
+
+**Backward Compatibility**:
+1. All existing Logger usage works unchanged with zero code modifications
+2. Default parameters produce identical behavior to current implementation
+3. No new dependencies or breaking API changes
+
+**WAL Compliance (when enabled)**:
+4. `FSYNC_BATCH` mode survives process crash with ≤10ms data loss window
+5. `FSYNC` mode survives process crash with zero data loss
+6. Binary format with CRC32 detects all single-bit errors
+7. LSN generation is monotonic and unique per instance
+8. `read_entries()` successfully recovers all non-corrupted entries
+
+**Performance**:
+9. Default mode (FLUSH) has identical performance to current implementation
+10. FSYNC_BATCH mode achieves ≥50,000 writes/second on NVMe SSD
+11. Batch timeout bounded to 10ms maximum latency
+12. Binary encoding adds <10μs overhead per entry
+
+**Integration**:
+13. Logger WAL mode integrates seamlessly with AD-38 NodeWAL patterns
+14. SnowflakeGenerator correctly reused for LSN generation
+15. File rotation works correctly with both JSON and binary formats
+
+---
+
+## Part 10: Conclusion
+
+AD-39 extends the existing Logger with optional WAL-compliant features while maintaining full backward compatibility. This approach:
+
+**Advantages**:
+- **Code Reuse**: Leverages proven async I/O patterns from Logger
+- **Consistent API**: Same `context()` pattern used throughout codebase
+- **Progressive Enhancement**: Enable WAL features incrementally per-context
+- **Zero Breaking Changes**: All existing code works unchanged
+- **Unified Codebase**: Single Logger class for both Control and Data Plane
+
+**Key Extensions**:
+- `DurabilityMode` enum: NONE, FLUSH, FSYNC, FSYNC_BATCH
+- Binary format with CRC32 checksums for integrity
+- LSN generation via existing SnowflakeGenerator
+- Read-back capability for crash recovery
+- Batched fsync for throughput/latency balance
+
+**Relationship to AD-38**:
+- AD-38 defines the architecture (Control Plane vs Data Plane)
+- AD-39 implements the Logger extensions to support both planes
+- Data Plane continues using Logger defaults (no changes)
+- Control Plane uses Logger with WAL mode enabled
+
+**References**:
+- `hyperscale/logging/streams/logger_stream.py` (core modifications)
+- `hyperscale/logging/streams/logger_context.py` (parameter passthrough)
+- `hyperscale/logging/streams/logger.py` (API extension)
+- `hyperscale/logging/models/log.py` (LSN field addition)
+- `hyperscale/logging/config/durability_mode.py` (new enum)
+- `hyperscale/logging/snowflake/snowflake_generator.py` (LSN generation)
