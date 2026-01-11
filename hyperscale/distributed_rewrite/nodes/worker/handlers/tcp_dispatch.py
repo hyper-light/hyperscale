@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 from hyperscale.distributed_rewrite.models import (
     WorkflowDispatch,
     WorkflowDispatchAck,
-    WorkflowStatus,
+    WorkerState,
 )
 
 if TYPE_CHECKING:
@@ -60,7 +60,7 @@ class WorkflowDispatchHandler:
             dispatch = WorkflowDispatch.load(data)
 
             # Check backpressure first (fast path rejection)
-            if self._server._get_worker_state() == WorkflowStatus.DRAINING:
+            if self._server._get_worker_state() == WorkerState.DRAINING:
                 return WorkflowDispatchAck(
                     workflow_id=dispatch.workflow_id,
                     accepted=False,
