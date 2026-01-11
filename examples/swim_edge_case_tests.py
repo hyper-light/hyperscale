@@ -11,6 +11,7 @@ These tests validate:
 
 import asyncio
 import gc
+import inspect
 import random
 import sys
 import time

@@ -17,6 +17,7 @@ Tests cover:
 import asyncio
 import sys
 import time
+import inspect
 import random
 from collections import deque
 from dataclasses import dataclass, field
