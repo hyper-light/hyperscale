@@ -191,7 +191,7 @@ class TestGatePingHandlerNegativePath:
             get_datacenter_managers=lambda: {},
         )
 
-        result = await handler.handle(
+        result = await handler.handle_ping(
             addr=("10.0.0.1", 8000),
             data=b"invalid_data",
             clock_time=12345,
@@ -226,7 +226,7 @@ class TestGatePingHandlerFailureMode:
             get_datacenter_managers=lambda: {},
         )
 
-        result = await handler.handle(
+        result = await handler.handle_ping(
             addr=("10.0.0.1", 8000),
             data=b"request_data",
             clock_time=12345,
@@ -439,7 +439,7 @@ class TestGatePingHandlerConcurrency:
 
         # Send many concurrent pings
         results = await asyncio.gather(*[
-            handler.handle(
+            handler.handle_ping(
                 addr=(f"10.0.0.{i}", 8000),
                 data=b"ping_data",
                 clock_time=12345 + i,
@@ -486,7 +486,7 @@ class TestGatePingHandlerStateConsistency:
             state.remove_active_peer(("10.0.0.1", 9000))
 
         async def handle_ping():
-            return await handler.handle(
+            return await handler.handle_ping(
                 addr=("10.0.0.1", 8000),
                 data=b"ping_data",
                 clock_time=12345,
