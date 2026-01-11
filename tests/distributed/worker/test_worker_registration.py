@@ -218,7 +218,7 @@ class TestWorkerRegistrationHandlerRegisterWithManager:
         async def failing_send(*args, **kwargs):
             call_count[0] += 1
             if call_count[0] < 3:
-                raise RuntimeError("Connection failed")
+                raise ConnectionError("Connection failed")
             return b"OK"
 
         result = await handler.register_with_manager(

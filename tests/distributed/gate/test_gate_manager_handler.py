@@ -251,7 +251,7 @@ class TestHandleStatusUpdateBackpressure:
         state = GateRuntimeState()
         # Pre-register manager with backpressure so that the heartbeat clears it
         manager_addr = ("10.0.0.1", 8000)
-        state._manager_backpressure[manager_addr] = BackpressureLevel.MEDIUM
+        state._manager_backpressure[manager_addr] = BackpressureLevel.THROTTLE
 
         updated_dcs = []
 

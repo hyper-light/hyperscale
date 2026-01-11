@@ -89,6 +89,8 @@ class WorkerLifecycleManager:
 
     def get_worker_ips(self) -> list[tuple[str, int]]:
         """Get list of worker IP/port tuples for local processes."""
+        if self._total_cores == 0:
+            return []
         base_worker_port = self._local_udp_port + (self._total_cores ** 2)
         return [
             (self._host, port)

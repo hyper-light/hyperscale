@@ -66,12 +66,16 @@ class MockNodeId:
 class MockGateJobManager:
     """Mock gate job manager."""
     jobs: dict = field(default_factory=dict)
+    callbacks: dict = field(default_factory=dict)
 
     def get_job(self, job_id: str):
         return self.jobs.get(job_id)
 
     def has_job(self, job_id: str) -> bool:
         return job_id in self.jobs
+
+    def get_callback(self, job_id: str):
+        return self.callbacks.get(job_id)
 
 
 def create_mock_handler(
