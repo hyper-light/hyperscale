@@ -863,8 +863,9 @@ class WorkflowCancelRequest(Message):
     """
     job_id: str                  # Parent job ID
     workflow_id: str             # Specific workflow to cancel
-    requester_id: str            # Who requested cancellation
-    timestamp: float             # When cancellation was requested
+    requester_id: str = ""       # Who requested cancellation
+    timestamp: float = 0.0       # When cancellation was requested
+    reason: str = ""             # Optional cancellation reason
 
 
 @dataclass(slots=True)
