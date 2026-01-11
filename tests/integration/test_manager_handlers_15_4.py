@@ -242,6 +242,7 @@ class TestJobCancelRequestHandlerHappyPath:
         request = JobCancelRequest(
             job_id="job-123",
             requester_id="client-456",
+            timestamp=0.0,
             reason="User requested cancellation",
         )
 
@@ -279,6 +280,7 @@ class TestJobCancelRequestHandlerHappyPath:
         request = JobCancelRequest(
             job_id="job-789",
             requester_id="gate-abc",
+            timestamp=0.0,
             reason="Timeout exceeded",
         )
         await handler.handle(("10.0.0.1", 9000), request.dump(), 1)
@@ -333,6 +335,7 @@ class TestJobCancelRequestHandlerNegativePath:
         request = JobCancelRequest(
             job_id="job-123",
             requester_id="client-456",
+            timestamp=0.0,
             reason="Test",
         )
 
@@ -366,10 +369,9 @@ class TestWorkflowCancellationCompleteHandlerHappyPath:
         )
 
         notification = WorkflowCancellationComplete(
-            workflow_id="wf-123",
             job_id="job-456",
+            workflow_id="wf-123",
             success=True,
-            error=None,
         )
 
         result = await handler.handle(
@@ -523,7 +525,7 @@ class TestHandlersConcurrency:
             await asyncio.sleep(0.01)  # Simulate processing
             return JobCancelResponse(
                 job_id=request.job_id,
-                accepted=True,
+                success=True,
             ).dump()
 
         handler = JobCancelRequestHandler(
@@ -540,6 +542,7 @@ class TestHandlersConcurrency:
             JobCancelRequest(
                 job_id=f"job-{i}",
                 requester_id=f"client-{i}",
+                timestamp=0.0,
                 reason="Concurrent test",
             )
             for i in range(10)
@@ -613,7 +616,7 @@ class TestHandlerIntegration:
             # Simulate initiating cancellation
             return JobCancelResponse(
                 job_id=request.job_id,
-                accepted=True,
+                success=True,
                 workflow_count=len(pending_workflows),
             ).dump()
 
@@ -644,6 +647,7 @@ class TestHandlerIntegration:
         cancel_request = JobCancelRequest(
             job_id="job-123",
             requester_id="client-1",
+            timestamp=0.0,
             reason="Test flow",
         )
         cancel_result = await cancel_handler.handle(
