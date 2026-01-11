@@ -22,9 +22,7 @@ from hyperscale.distributed_rewrite.reliability.overload import (
     OverloadConfig,
     OverloadState,
 )
-from hyperscale.distributed_rewrite.reliability.load_shedding import (
-    RequestPriority,
-)
+from hyperscale.distributed_rewrite.reliability.priority import RequestPriority
 
 
 @dataclass(slots=True)

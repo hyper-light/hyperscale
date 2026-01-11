@@ -18,29 +18,16 @@ Shedding Behavior by State:
 """
 
 from dataclasses import dataclass, field
-from enum import IntEnum
 
 from hyperscale.distributed_rewrite.reliability.overload import (
     HybridOverloadDetector,
     OverloadState,
 )
+from hyperscale.distributed_rewrite.reliability.priority import RequestPriority
 from hyperscale.distributed_rewrite.reliability.message_class import (
     MessageClass,
     classify_handler,
 )
-
-
-class RequestPriority(IntEnum):
-    """Priority levels for request classification.
-
-    Lower values indicate higher priority.
-    Maps directly to AD-37 MessageClass via MESSAGE_CLASS_TO_PRIORITY.
-    """
-
-    CRITICAL = 0  # CONTROL: SWIM probes/acks, cancellation, leadership - never shed
-    HIGH = 1  # DISPATCH: Job submissions, workflow dispatch, state sync
-    NORMAL = 2  # DATA: Progress updates, stats queries
-    LOW = 3  # TELEMETRY: Debug stats, detailed metrics
 
 
 # Mapping from MessageClass to RequestPriority (AD-37 compliance)
