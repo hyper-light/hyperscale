@@ -471,6 +471,7 @@ class TestWorkerRegistrationHandlerProcessManagerRegistration:
         registration = ManagerToWorkerRegistration(
             manager=manager,
             is_leader=False,
+            term=1,
             known_managers=[],
         )
 
@@ -521,6 +522,7 @@ class TestWorkerRegistrationHandlerProcessManagerRegistration:
         registration = ManagerToWorkerRegistration(
             manager=manager,
             is_leader=True,
+            term=1,
             known_managers=[],
         )
 
@@ -575,6 +577,7 @@ class TestWorkerRegistrationHandlerProcessManagerRegistration:
         registration = ManagerToWorkerRegistration(
             manager=registering_manager,
             is_leader=False,
+            term=1,
             known_managers=[known_manager],
         )
 
@@ -720,6 +723,7 @@ class TestWorkerRegistrationHandlerEdgeCases:
         registration = ManagerToWorkerRegistration(
             manager=manager,
             is_leader=False,
+            term=1,
             known_managers=[],
         )
 
