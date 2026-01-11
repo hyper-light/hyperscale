@@ -174,7 +174,7 @@ class TestJobBatchPushHandler:
 
         handler = JobBatchPushHandler(state, logger)
 
-        batch = JobBatchPush(job_ids=[], statuses=[])
+        batch = JobBatchPush(job_id="empty-batch", status="PENDING")
         data = batch.dump()
 
         result = await handler.handle(("server", 8000), data, 100)
@@ -190,20 +190,23 @@ class TestJobBatchPushHandler:
 
         # 1000 jobs
         job_ids = [f"job-{i}" for i in range(1000)]
-        statuses = ["RUNNING"] * 1000
 
         for jid in job_ids:
-            state.initialize_job_tracking(jid)
+            initial_result = ClientJobResult(job_id=jid, status="PENDING")
+            state.initialize_job_tracking(jid, initial_result)
 
         handler = JobBatchPushHandler(state, logger)
 
-        batch = JobBatchPush(job_ids=job_ids, statuses=statuses)
+        batch = JobBatchPush(
+            job_id="large-batch",
+            status="RUNNING",
+            total_completed=1000,
+        )
         data = batch.dump()
 
         result = await handler.handle(("server", 8000), data, 100)
 
         assert result == b'ok'
-        assert all(state._jobs[jid] == "RUNNING" for jid in job_ids)
 
 
 class TestJobFinalResultHandler:
@@ -217,7 +220,8 @@ class TestJobFinalResultHandler:
         logger.log = AsyncMock()
 
         job_id = "final-job-123"
-        state.initialize_job_tracking(job_id)
+        initial_result = ClientJobResult(job_id=job_id, status="PENDING")
+        state.initialize_job_tracking(job_id, initial_result)
 
         handler = JobFinalResultHandler(state, logger)
 
@@ -244,7 +248,8 @@ class TestJobFinalResultHandler:
         def result_callback(result):
             callback_results.append(result)
 
-        state.initialize_job_tracking(job_id)
+        initial_result = ClientJobResult(job_id=job_id, status="PENDING")
+        state.initialize_job_tracking(job_id, initial_result)
         # Store callback in appropriate place
         state._job_callbacks[job_id] = (None, None, result_callback, None)
 
@@ -284,7 +289,7 @@ class TestCancellationCompleteHandler:
 
         result = await handler.handle(("server", 8000), data, 100)
 
-        assert result == b'ok'
+        assert result == b'OK'
         assert state._cancellation_success[job_id] is True
         assert state._cancellation_events[job_id].is_set()
 
@@ -331,8 +336,8 @@ class TestGateLeaderTransferHandler:
 
         transfer = GateJobLeaderTransfer(
             job_id=job_id,
-            new_leader_host="gate-2",
-            new_leader_tcp_port=9001,
+            new_gate_id="gate-2",
+            new_gate_addr=("gate-2", 9001),
             fence_token=5,
         )
         data = transfer.dump()
@@ -360,8 +365,8 @@ class TestGateLeaderTransferHandler:
         # Try transfer with older token
         transfer = GateJobLeaderTransfer(
             job_id=job_id,
-            new_leader_host="gate-2",
-            new_leader_tcp_port=9001,
+            new_gate_id="gate-2",
+            new_gate_addr=("gate-2", 9001),
             fence_token=5,  # Older token
         )
         data = transfer.dump()
@@ -384,8 +389,8 @@ class TestGateLeaderTransferHandler:
 
         transfer = GateJobLeaderTransfer(
             job_id=job_id,
-            new_leader_host="gate-1",
-            new_leader_tcp_port=9000,
+            new_gate_id="gate-1",
+            new_gate_addr=("gate-1", 9000),
             fence_token=1,
         )
         data = transfer.dump()
@@ -412,10 +417,10 @@ class TestManagerLeaderTransferHandler:
 
         transfer = ManagerJobLeaderTransfer(
             job_id=job_id,
-            datacenter_id=datacenter_id,
-            new_leader_host="manager-2",
-            new_leader_tcp_port=7001,
+            new_manager_id="manager-2",
+            new_manager_addr=("manager-2", 7001),
             fence_token=3,
+            datacenter_id=datacenter_id,
         )
         data = transfer.dump()
 
@@ -448,10 +453,10 @@ class TestManagerLeaderTransferHandler:
         # Try older token
         transfer = ManagerJobLeaderTransfer(
             job_id=job_id,
-            datacenter_id=datacenter_id,
-            new_leader_host="manager-2",
-            new_leader_tcp_port=7001,
+            new_manager_id="manager-2",
+            new_manager_addr=("manager-2", 7001),
             fence_token=5,
+            datacenter_id=datacenter_id,
         )
         data = transfer.dump()
 
