@@ -25,11 +25,9 @@ from hyperscale.distributed.protocol.version import (
     ProtocolVersion,
     get_features_for_version,
 )
-from hyperscale.distributed.reliability import (
-    CircuitState,
-    RateLimitResponse,
-)
-from hyperscale.distributed.reliability.errors import (
+from hyperscale.distributed.models import RateLimitResponse
+from hyperscale.distributed.swim.core.error_handler import CircuitState
+from hyperscale.distributed.swim.core.errors import (
     QuorumCircuitOpenError,
     QuorumError,
     QuorumUnavailableError,
