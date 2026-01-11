@@ -19,7 +19,6 @@ All components from TODO.md phases 1-4 are covered:
 
 import asyncio
 import time
-from collections import Counter
 
 import pytest
 

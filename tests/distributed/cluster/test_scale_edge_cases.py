@@ -17,12 +17,8 @@ conditions and degrades gracefully rather than catastrophically.
 
 import asyncio
 import gc
-import sys
 import time
 import weakref
-from collections import deque
-from dataclasses import dataclass, field
-from typing import Any
 
 import pytest
 
