@@ -10,7 +10,8 @@ from hyperscale.core.jobs.protocols.replay_guard import (
     ReplayError as ReplayError,
 )
 
-from hyperscale.distributed_rewrite.reliability import (
+# Import directly to avoid circular import through reliability/__init__.py
+from hyperscale.distributed_rewrite.reliability.rate_limiting import (
     ServerRateLimiter as ServerRateLimiter,
 )
 from hyperscale.core.jobs.protocols.constants import (
