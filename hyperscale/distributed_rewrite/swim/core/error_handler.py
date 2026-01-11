@@ -45,33 +45,44 @@ from .protocols import LoggerProtocol
 class ErrorStats:
     """
     Track error rates for circuit breaker decisions.
-    
+
     Uses a sliding window to calculate recent error rate and
     determine if the circuit should open.
-    
+
     Memory safety:
     - Timestamps deque is bounded to prevent unbounded growth
     - Prunes old entries on each operation
     """
-    
+
     window_seconds: float = 60.0
     """Time window for error rate calculation."""
-    
+
     max_errors: int = 10
     """Circuit opens after this many errors in window."""
-    
+
     half_open_after: float = 30.0
     """Seconds to wait before attempting recovery."""
-    
+
     max_timestamps: int = 1000
     """Maximum timestamps to store (prevents memory growth under sustained errors)."""
-    
+
+    # Alias parameters for compatibility
+    error_threshold: int | None = None
+    """Alias for max_errors (for backwards compatibility)."""
+
+    error_rate_threshold: float = 0.5
+    """Error rate threshold (errors per second) for circuit opening."""
+
     _timestamps: deque[float] = field(default_factory=deque)
     _circuit_state: CircuitState = CircuitState.CLOSED
     _circuit_opened_at: float | None = None
-    
+
     def __post_init__(self):
-        """Initialize bounded deque."""
+        """Initialize bounded deque and handle parameter aliases."""
+        # Handle error_threshold alias for max_errors
+        if self.error_threshold is not None:
+            object.__setattr__(self, 'max_errors', self.error_threshold)
+
         # Create bounded deque if not already bounded
         if not hasattr(self._timestamps, 'maxlen') or self._timestamps.maxlen != self.max_timestamps:
             self._timestamps = deque(self._timestamps, maxlen=self.max_timestamps)
