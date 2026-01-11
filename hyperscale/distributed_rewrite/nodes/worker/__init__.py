@@ -34,6 +34,15 @@ from .handlers import (
     WorkflowStatusQueryHandler,
 )
 
+# Core modules (Phase 15.2.6)
+from .execution import WorkerExecutor
+from .registry import WorkerRegistry
+from .sync import WorkerStateSync
+from .cancellation import WorkerCancellationHandler
+from .health import WorkerHealthIntegration
+from .backpressure import WorkerBackpressureManager
+from .discovery import WorkerDiscoveryManager
+
 __all__ = [
     # Main server class
     "WorkerServer",
@@ -56,4 +65,12 @@ __all__ = [
     "StateSyncHandler",
     "JobLeaderTransferHandler",
     "WorkflowStatusQueryHandler",
+    # Core modules
+    "WorkerExecutor",
+    "WorkerRegistry",
+    "WorkerStateSync",
+    "WorkerCancellationHandler",
+    "WorkerHealthIntegration",
+    "WorkerBackpressureManager",
+    "WorkerDiscoveryManager",
 ]
