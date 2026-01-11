@@ -745,11 +745,11 @@ class LoggerStream:
         directory: str | None = None,
         retention_policy: RetentionPolicyConfig | None = None,
         filter: Callable[[T], bool] | None = None,
-    ):
+    ) -> int | None:
         if self._config.disabled:
-            return
+            return None
 
-        entry: Entry = None
+        entry: Entry | None = None
         if isinstance(entry_or_log, Log):
             entry = entry_or_log.entry
 
@@ -757,10 +757,10 @@ class LoggerStream:
             entry = entry_or_log
 
         if self._config.enabled(self._name, entry.level) is False:
-            return
+            return None
 
         if filter and filter(entry) is False:
-            return
+            return None
 
         if self._cwd is None:
             self._cwd = await self._loop.run_in_executor(
@@ -779,7 +779,7 @@ class LoggerStream:
 
         else:
             filename = "logs.json"
-            directory = os.path.join(self._cwd, "logs")
+            directory = os.path.join(str(self._cwd), "logs")
             logfile_path = os.path.join(directory, filename)
 
         if self._files.get(logfile_path) is None or self._files[logfile_path].closed:
@@ -791,10 +791,10 @@ class LoggerStream:
         if retention_policy:
             self._retention_policies[logfile_path] = retention_policy
 
-        if retention_policy := self._retention_policies.get(logfile_path):
+        if rotation_policy := self._retention_policies.get(logfile_path):
             await self._rotate(
                 logfile_path,
-                retention_policy,
+                rotation_policy,
             )
 
         if isinstance(entry_or_log, Log):
@@ -814,19 +814,24 @@ class LoggerStream:
                 line_number=line_number,
             )
 
+        lsn: int | None = None
         try:
             file_lock = self._file_locks[logfile_path]
             await file_lock.acquire()
 
-            await self._loop.run_in_executor(
+            lsn = await self._loop.run_in_executor(
                 None,
                 self._write_to_file,
                 log,
                 logfile_path,
+                self._durability,
             )
 
             if file_lock.locked():
                 file_lock.release()
+
+            if self._durability == DurabilityMode.FSYNC_BATCH:
+                await self._schedule_batch_fsync(logfile_path)
 
             await asyncio.sleep(0)
 
@@ -966,3 +971,154 @@ class LoggerStream:
             )
 
         await self._provider.put(entry)
+
+    async def read_entries(
+        self,
+        logfile_path: str,
+        from_offset: int = 0,
+    ) -> AsyncIterator[tuple[int, Log[T], int | None]]:
+        read_lock = self._read_locks[logfile_path]
+        await read_lock.acquire()
+
+        try:
+            read_file = await self._loop.run_in_executor(
+                None,
+                functools.partial(open, logfile_path, "rb"),
+            )
+
+            try:
+                await self._loop.run_in_executor(None, read_file.seek, from_offset)
+                offset = from_offset
+                entries_yielded = 0
+
+                while True:
+                    if self._log_format == "binary":
+                        header = await self._loop.run_in_executor(
+                            None,
+                            read_file.read,
+                            BINARY_HEADER_SIZE,
+                        )
+
+                        if len(header) == 0:
+                            break
+
+                        if len(header) < BINARY_HEADER_SIZE:
+                            raise ValueError(f"Truncated header at offset {offset}")
+
+                        length = struct.unpack("<I", header[4:8])[0]
+
+                        payload = await self._loop.run_in_executor(
+                            None,
+                            read_file.read,
+                            length,
+                        )
+
+                        if len(payload) < length:
+                            raise ValueError(f"Truncated payload at offset {offset}")
+
+                        log, lsn = self._decode_binary(header + payload)
+                        entry_size = BINARY_HEADER_SIZE + length
+
+                        yield offset, log, lsn
+                        offset += entry_size
+
+                    else:
+                        line = await self._loop.run_in_executor(
+                            None,
+                            read_file.readline,
+                        )
+
+                        if not line:
+                            break
+
+                        log = msgspec.json.decode(line.rstrip(b"\n"), type=Log)
+                        lsn = log.lsn
+
+                        yield offset, log, lsn
+
+                        offset = await self._loop.run_in_executor(
+                            None,
+                            read_file.tell,
+                        )
+
+                    entries_yielded += 1
+                    if entries_yielded % 100 == 0:
+                        await asyncio.sleep(0)
+
+            finally:
+                await self._loop.run_in_executor(None, read_file.close)
+
+        finally:
+            if read_lock.locked():
+                read_lock.release()
+
+    async def get_last_lsn(self, logfile_path: str) -> int | None:
+        last_lsn: int | None = None
+
+        try:
+            async for _offset, _log, lsn in self.read_entries(logfile_path):
+                if lsn is not None:
+                    last_lsn = lsn
+        except (FileNotFoundError, ValueError):
+            pass
+
+        return last_lsn
+
+    async def _schedule_batch_fsync(self, logfile_path: str) -> asyncio.Future[None]:
+        if self._batch_lock is None:
+            self._batch_lock = asyncio.Lock()
+
+        if self._loop is None:
+            self._loop = asyncio.get_event_loop()
+
+        future: asyncio.Future[None] = self._loop.create_future()
+
+        async with self._batch_lock:
+            self._pending_batch.append((logfile_path, future))
+
+            if len(self._pending_batch) == 1:
+                self._batch_timer_handle = self._loop.call_later(
+                    self._batch_timeout_ms / 1000.0,
+                    self._trigger_batch_flush,
+                    logfile_path,
+                )
+
+            if len(self._pending_batch) >= self._batch_max_size:
+                if self._batch_timer_handle:
+                    self._batch_timer_handle.cancel()
+                    self._batch_timer_handle = None
+                await self._flush_batch(logfile_path)
+
+        return future
+
+    def _trigger_batch_flush(self, logfile_path: str) -> None:
+        if self._batch_flush_task is None or self._batch_flush_task.done():
+            self._batch_flush_task = asyncio.create_task(
+                self._flush_batch(logfile_path)
+            )
+
+    async def _flush_batch(self, logfile_path: str) -> None:
+        if self._batch_lock is None:
+            return
+
+        async with self._batch_lock:
+            if not self._pending_batch:
+                return
+
+            if self._batch_timer_handle:
+                self._batch_timer_handle.cancel()
+                self._batch_timer_handle = None
+
+            logfile = self._files.get(logfile_path)
+            if logfile and not logfile.closed:
+                await self._loop.run_in_executor(
+                    None,
+                    os.fsync,
+                    logfile.fileno(),
+                )
+
+            for _, future in self._pending_batch:
+                if not future.done():
+                    future.set_result(None)
+
+            self._pending_batch.clear()
