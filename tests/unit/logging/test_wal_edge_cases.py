@@ -7,6 +7,8 @@ from hyperscale.logging.config.durability_mode import DurabilityMode
 from hyperscale.logging.models import Entry, Log, LogLevel
 from hyperscale.logging.streams.logger_stream import BINARY_HEADER_SIZE, LoggerStream
 
+from .conftest import create_mock_stream_writer
+
 
 class TestEmptyFiles:
     @pytest.mark.asyncio
@@ -125,7 +127,10 @@ class TestFilenameExtensions:
             filename="test.txt",
             directory=temp_log_directory,
         )
-        await stream.initialize()
+        await stream.initialize(
+            stdout_writer=create_mock_stream_writer(),
+            stderr_writer=create_mock_stream_writer(),
+        )
 
         with pytest.raises(ValueError, match="Invalid log file extension"):
             stream._to_logfile_path("test.txt")

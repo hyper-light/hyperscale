@@ -8,6 +8,8 @@ from hyperscale.logging.models import Entry, LogLevel
 from hyperscale.logging.snowflake import SnowflakeGenerator
 from hyperscale.logging.streams.logger_stream import LoggerStream
 
+from .conftest import create_mock_stream_writer
+
 
 class TestSnowflakeGeneratorIntegration:
     def test_snowflake_generator_created_when_lsn_enabled(
@@ -49,7 +51,9 @@ class TestSnowflakeGeneratorIntegration:
             instance_id=instance_id,
         )
 
+        assert stream._sequence_generator is not None
         lsn = stream._sequence_generator.generate()
+        assert lsn is not None
 
         extracted_instance = (lsn >> 12) & 0x3FF
         assert extracted_instance == instance_id
@@ -86,7 +90,10 @@ class TestLSNGeneration:
             enable_lsn=True,
             instance_id=1,
         )
-        await stream.initialize()
+        await stream.initialize(
+            stdout_writer=create_mock_stream_writer(),
+            stderr_writer=create_mock_stream_writer(),
+        )
 
         entry = Entry(message="stdout test", level=LogLevel.INFO)
         lsn = await stream.log(entry)
@@ -164,14 +171,22 @@ class TestLSNWithDifferentInstanceIds:
             instance_id=2,
         )
 
-        await stream1.initialize()
-        await stream2.initialize()
+        await stream1.initialize(
+            stdout_writer=create_mock_stream_writer(),
+            stderr_writer=create_mock_stream_writer(),
+        )
+        await stream2.initialize(
+            stdout_writer=create_mock_stream_writer(),
+            stderr_writer=create_mock_stream_writer(),
+        )
 
         entry = Entry(message="test", level=LogLevel.INFO)
 
         lsn1 = await stream1.log(entry)
         lsn2 = await stream2.log(entry)
 
+        assert lsn1 is not None
+        assert lsn2 is not None
         assert lsn1 != lsn2
 
         instance1_from_lsn = (lsn1 >> 12) & 0x3FF
