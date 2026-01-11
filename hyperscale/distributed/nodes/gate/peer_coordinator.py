@@ -18,7 +18,7 @@ from hyperscale.distributed.models import (
     GateInfo,
 )
 from hyperscale.distributed.health import GateHealthState
-from hyperscale.distributed.reliability import DiscoveryService
+from hyperscale.distributed.discovery import DiscoveryService
 from hyperscale.logging import Logger
 from hyperscale.logging.hyperscale_logging_models import (
     ServerDebug,
