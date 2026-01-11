@@ -107,6 +107,7 @@ class ManagerStateSync:
         """
         max_retries = self._config.state_sync_retries
         base_delay = 0.5
+        max_delay = 30.0
 
         for attempt in range(max_retries):
             try:
@@ -122,11 +123,11 @@ class ManagerStateSync:
                     if sync_response.worker_state:
                         return sync_response.worker_state
 
-            except Exception as e:
+            except Exception as sync_error:
                 self._task_runner.run(
                     self._logger.log,
                     ServerWarning(
-                        message=f"Worker state sync attempt {attempt + 1} failed: {e}",
+                        message=f"Worker state sync attempt {attempt + 1} failed: {sync_error}",
                         node_host=self._config.host,
                         node_port=self._config.tcp_port,
                         node_id=self._node_id,
@@ -134,7 +135,13 @@ class ManagerStateSync:
                 )
 
             if attempt < max_retries - 1:
-                await asyncio.sleep(base_delay * (2 ** attempt))
+                delay = calculate_jittered_delay(
+                    attempt=attempt,
+                    base_delay=base_delay,
+                    max_delay=max_delay,
+                    jitter=JitterStrategy.FULL,
+                )
+                await asyncio.sleep(delay)
 
         return None
 
@@ -208,6 +215,7 @@ class ManagerStateSync:
         """
         max_retries = self._config.state_sync_retries
         base_delay = 0.5
+        max_delay = 30.0
 
         for attempt in range(max_retries):
             try:
@@ -223,11 +231,11 @@ class ManagerStateSync:
                     if sync_response.manager_state:
                         return sync_response.manager_state
 
-            except Exception as e:
+            except Exception as sync_error:
                 self._task_runner.run(
                     self._logger.log,
                     ServerWarning(
-                        message=f"Peer state sync attempt {attempt + 1} failed: {e}",
+                        message=f"Peer state sync attempt {attempt + 1} failed: {sync_error}",
                         node_host=self._config.host,
                         node_port=self._config.tcp_port,
                         node_id=self._node_id,
@@ -235,7 +243,13 @@ class ManagerStateSync:
                 )
 
             if attempt < max_retries - 1:
-                await asyncio.sleep(base_delay * (2 ** attempt))
+                delay = calculate_jittered_delay(
+                    attempt=attempt,
+                    base_delay=base_delay,
+                    max_delay=max_delay,
+                    jitter=JitterStrategy.FULL,
+                )
+                await asyncio.sleep(delay)
 
         return None
 
