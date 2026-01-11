@@ -28,8 +28,10 @@ Core Modules (re-exports from infrastructure packages):
 
 from .config import GateConfig, create_gate_config
 from .state import GateRuntimeState
+from .server import GateServer
 
 __all__ = [
+    "GateServer",
     "GateConfig",
     "create_gate_config",
     "GateRuntimeState",

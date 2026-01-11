@@ -21,8 +21,8 @@ import pytest
 from hyperscale.distributed_rewrite.models import (
     WorkflowDispatch,
     WorkflowDispatchAck,
-    WorkflowCancel,
-    WorkflowCancelAck,
+    WorkflowCancelRequest,
+    WorkflowCancelResponse,
     JobLeaderWorkerTransfer,
     JobLeaderWorkerTransferAck,
     WorkflowProgressAck,
@@ -543,7 +543,7 @@ class TestWorkflowCancelHandler:
             ),
         }
 
-        cancel = WorkflowCancel(
+        cancel = WorkflowCancelRequest(
             job_id="job-123",
             workflow_id="wf-456",
             reason="user requested",
@@ -555,7 +555,7 @@ class TestWorkflowCancelHandler:
             clock_time=1000,
         )
 
-        ack = WorkflowCancelAck.load(result)
+        ack = WorkflowCancelResponse.load(result)
         assert ack.workflow_id == "wf-456"
         assert ack.success is True
 
@@ -570,7 +570,7 @@ class TestWorkflowCancelHandler:
 
         mock_server._active_workflows = {}
 
-        cancel = WorkflowCancel(
+        cancel = WorkflowCancelRequest(
             job_id="job-123",
             workflow_id="wf-unknown",
             reason="user requested",
@@ -582,7 +582,7 @@ class TestWorkflowCancelHandler:
             clock_time=1000,
         )
 
-        ack = WorkflowCancelAck.load(result)
+        ack = WorkflowCancelResponse.load(result)
         assert ack.success is False
         assert "not found" in ack.error.lower() or ack.error != ""
 
