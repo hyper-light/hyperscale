@@ -82,7 +82,7 @@ class TestClientReportingManager:
         workflow_stats = {"total": 100, "success": 95}
 
         # Mock Reporter
-        with patch("hyperscale.distributed_rewrite.nodes.client.reporting.Reporter") as mock_reporter_class:
+        with patch("hyperscale.distributed.nodes.client.reporting.Reporter") as mock_reporter_class:
             mock_reporter = AsyncMock()
             mock_reporter_class.return_value = mock_reporter
 
@@ -121,7 +121,7 @@ class TestClientReportingManager:
         )
         state._job_reporting_configs[job_id] = [json_config, csv_config]
 
-        with patch("hyperscale.distributed_rewrite.nodes.client.reporting.Reporter") as mock_reporter_class:
+        with patch("hyperscale.distributed.nodes.client.reporting.Reporter") as mock_reporter_class:
             mock_reporter = AsyncMock()
             mock_reporter_class.return_value = mock_reporter
 
@@ -141,7 +141,7 @@ class TestClientReportingManager:
         workflow_name = "FailWorkflow"
         workflow_stats = {"total": 10}
 
-        with patch("hyperscale.distributed_rewrite.nodes.client.reporting.Reporter") as mock_reporter_class:
+        with patch("hyperscale.distributed.nodes.client.reporting.Reporter") as mock_reporter_class:
             # Make reporter raise exception on connect
             mock_reporter = AsyncMock()
             mock_reporter.connect.side_effect = Exception("Connection failed")
@@ -162,7 +162,7 @@ class TestClientReportingManager:
         workflow_name = "SubmitFailWorkflow"
         workflow_stats = {"total": 5}
 
-        with patch("hyperscale.distributed_rewrite.nodes.client.reporting.Reporter") as mock_reporter_class:
+        with patch("hyperscale.distributed.nodes.client.reporting.Reporter") as mock_reporter_class:
             mock_reporter = AsyncMock()
             mock_reporter.submit_workflow_results.side_effect = Exception("Submit failed")
             mock_reporter_class.return_value = mock_reporter
@@ -233,7 +233,7 @@ class TestClientReportingManager:
                 job_id, "ConcurrentWorkflow", workflow_stats
             )
 
-        with patch("hyperscale.distributed_rewrite.nodes.client.reporting.Reporter") as mock_reporter_class:
+        with patch("hyperscale.distributed.nodes.client.reporting.Reporter") as mock_reporter_class:
             mock_reporter = AsyncMock()
             mock_reporter_class.return_value = mock_reporter
 
@@ -268,7 +268,7 @@ class TestClientReportingManager:
         workflow_name = "EmptyStatsWorkflow"
         workflow_stats = {}
 
-        with patch("hyperscale.distributed_rewrite.nodes.client.reporting.Reporter") as mock_reporter_class:
+        with patch("hyperscale.distributed.nodes.client.reporting.Reporter") as mock_reporter_class:
             mock_reporter = AsyncMock()
             mock_reporter_class.return_value = mock_reporter
 

@@ -17,6 +17,7 @@ conditions and degrades gracefully rather than catastrophically.
 
 import asyncio
 import gc
+import sys
 import time
 import weakref
 

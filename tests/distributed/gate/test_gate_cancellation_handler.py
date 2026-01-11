@@ -454,9 +454,9 @@ class TestHandleJobCancellationComplete:
 
         complete = JobCancellationComplete(
             job_id="job-123",
-            datacenter="dc-east",
             success=True,
-            workflows_cancelled=10,
+            cancelled_workflow_count=10,
+            total_workflow_count=10,
             errors=[],
         )
 
@@ -487,7 +487,7 @@ class TestHandleJobCancellationComplete:
             handle_exception=mock_handle_exception,
         )
 
-        assert result == b'error'
+        assert result == b'ERROR'
 
 
 # =============================================================================
