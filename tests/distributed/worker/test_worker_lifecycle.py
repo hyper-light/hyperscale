@@ -225,28 +225,25 @@ class TestWorkerLifecycleManagerBackgroundTasks:
             env=env,
         )
 
-        # Create mock tasks
-        task1 = MagicMock()
-        task1.done.return_value = False
-        task1.cancel = MagicMock()
+        # Create real async tasks that we can cancel
+        async def long_running_task():
+            await asyncio.sleep(100)
 
-        task2 = MagicMock()
-        task2.done.return_value = True  # Already done
-        task2.cancel = MagicMock()
+        task1 = asyncio.create_task(long_running_task())
 
-        # Use real async function for awaiting cancelled task
-        async def cancelled_coro():
-            raise asyncio.CancelledError()
+        # Create an already-completed task
+        async def instant_task():
+            return "done"
 
-        task1.__await__ = cancelled_coro().__await__
+        task2 = asyncio.create_task(instant_task())
+        await asyncio.sleep(0)  # Let task2 complete
 
         manager.add_background_task(task1)
         manager.add_background_task(task2)
 
         await manager.cancel_background_tasks()
 
-        task1.cancel.assert_called_once()
-        task2.cancel.assert_not_called()  # Already done, shouldn't cancel
+        assert task1.cancelled()
         assert len(manager._background_tasks) == 0
 
     def test_cancel_background_tasks_sync(self) -> None:
