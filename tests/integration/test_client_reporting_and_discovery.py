@@ -369,7 +369,7 @@ class TestClientDiscovery:
                 is_leader=True,
                 state="healthy",
                 term=1,
-                datacenter_count=3,
+                active_datacenter_count=3,
                 active_job_count=50,
             )
         send_tcp.return_value = (ping_response.dump(), None)
@@ -516,7 +516,7 @@ class TestClientDiscovery:
                 is_leader=True,
                 state="healthy",
                 term=1,
-                datacenter_count=2,
+                active_datacenter_count=2,
                 active_job_count=20,
             )
             else:
@@ -529,7 +529,7 @@ class TestClientDiscovery:
                 is_leader=True,
                 state="healthy",
                 term=1,
-                datacenter_count=2,
+                active_datacenter_count=2,
                 active_job_count=25,
             )
             return (response.dump(), None)

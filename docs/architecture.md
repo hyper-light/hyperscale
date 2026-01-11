@@ -20042,3 +20042,1971 @@ T0+interval: Flush loop checks max signal
 - `hyperscale/distributed_rewrite/nodes/manager.py:6066`
 - `hyperscale/distributed_rewrite/nodes/worker.py:3320`
 - `hyperscale/distributed_rewrite/server/protocol/in_flight_tracker.py:1`
+
+---
+
+### AD-38: Global Job Ledger with Per-Node Write-Ahead Logging
+
+**Decision**: Implement a tiered durability architecture combining per-node Write-Ahead Logs (WAL) with a globally replicated Job Ledger for cross-datacenter job coordination.
+
+**Related**: AD-20 (Cancellation), AD-33 (Federated Health Monitoring), AD-35 (Vivaldi Coordinates), AD-36 (Cross-DC Routing), AD-37 (Backpressure)
+
+**Rationale**:
+- Gates assign jobs to datacenters worldwide; job state must survive node, rack, and region failures.
+- Per-node WAL provides sub-millisecond local durability for immediate crash recovery.
+- Global ledger provides cross-region consistency and authoritative job state.
+- Event sourcing enables audit trail, conflict detection, and temporal queries.
+- Hybrid Logical Clocks provide causal ordering without requiring synchronized clocks.
+
+**Architecture Overview**:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         Global Job Ledger                                │
+│                    (Cross-Region Consensus Layer)                        │
+│                                                                          │
+│   Provides: Global ordering, cross-region consistency, authoritative     │
+│             state, conflict resolution, audit trail                      │
+└─────────────────────────────────────────────────────────────────────────┘
+                                    ▲
+                                    │ Async replication
+                                    │ with causal ordering
+                                    │
+┌─────────────────────────────────────────────────────────────────────────┐
+│                      Regional Consensus Group                            │
+│                   (Raft/Multi-Paxos within region)                       │
+│                                                                          │
+│   Provides: Regional durability, fast local commits, leader election     │
+└─────────────────────────────────────────────────────────────────────────┘
+                                    ▲
+                                    │ Sync replication
+                                    │ within region
+                                    │
+┌───────────────┐  ┌───────────────┐  ┌───────────────┐
+│   Node WAL    │  │   Node WAL    │  │   Node WAL    │
+│   (Gate-1)    │  │   (Gate-2)    │  │   (Gate-3)    │
+│               │  │               │  │               │
+│ Local durability│ │ Local durability│ │ Local durability│
+│ Crash recovery │  │ Crash recovery │  │ Crash recovery │
+└───────────────┘  └───────────────┘  └───────────────┘
+```
+
+---
+
+## Part 1: Event Sourcing Model
+
+All job state changes are stored as immutable events rather than mutable state:
+
+**Event Types**:
+
+| Event | Fields | Semantics |
+|-------|--------|-----------|
+| `JobCreated` | job_id, spec, assigned_dcs, fence_token, hlc | New job submitted |
+| `JobAccepted` | job_id, dc_id, worker_count, fence_token, hlc | DC accepted job |
+| `JobProgressReported` | job_id, dc_id, completed, failed, hlc | Progress update |
+| `JobCancellationRequested` | job_id, reason, requestor, fence_token, hlc | Cancel initiated |
+| `JobCancellationAcked` | job_id, dc_id, workflows_cancelled, hlc | DC confirmed cancel |
+| `JobCompleted` | job_id, final_status, aggregate_metrics, hlc | Job finished |
+| `JobFailed` | job_id, error, failed_dc, hlc | Job failed |
+| `JobTimedOut` | job_id, timeout_type, last_progress_hlc, hlc | Job exceeded timeout |
+
+**Event State Diagram**:
+
+```
+                              JobCreated
+                                  │
+                    ┌─────────────┼─────────────┐
+                    │             │             │
+                    ▼             ▼             ▼
+              JobAccepted   JobAccepted   JobAccepted
+                (DC-1)        (DC-2)        (DC-3)
+                    │             │             │
+                    └──────┬──────┴──────┬──────┘
+                           │             │
+              ┌────────────┼─────────────┼────────────┐
+              │            │             │            │
+              ▼            ▼             ▼            ▼
+    JobProgressReported  JobCancellation  JobTimedOut  JobFailed
+              │          Requested            │            │
+              │             │                 │            │
+              ▼             ▼                 │            │
+    JobProgressReported  JobCancellation     │            │
+              │            Acked              │            │
+              │             │                 │            │
+              └──────┬──────┴─────────────────┴────────────┘
+                     │
+                     ▼
+              JobCompleted
+```
+
+---
+
+## Part 2: Hybrid Logical Clocks (HLC)
+
+HLC combines physical time with logical counters for causal ordering without clock synchronization:
+
+**HLC Invariants**:
+1. If event A causally precedes B, then HLC(A) < HLC(B)
+2. HLC is always within bounded drift of physical time
+3. Total ordering achieved via (wall_time, logical_counter, node_id)
+
+**HLC State Diagram**:
+
+```
+                    ┌─────────────────────────┐
+                    │       Local Event       │
+                    │  wall' = max(wall, now) │
+                    │  if wall' == wall:      │
+                    │    logical++            │
+                    │  else:                  │
+                    │    logical = 0          │
+                    └───────────┬─────────────┘
+                                │
+                                ▼
+┌───────────────────────────────────────────────────────────────┐
+│                         HLC State                              │
+│  (wall_time_ms: int, logical_counter: int, node_id: str)      │
+└───────────────────────────────────────────────────────────────┘
+                                ▲
+                                │
+                    ┌───────────┴─────────────┐
+                    │     Receive Event       │
+                    │  wall' = max(wall,      │
+                    │           remote.wall,  │
+                    │           now)          │
+                    │  logical' = derived     │
+                    │    from max sources     │
+                    └─────────────────────────┘
+```
+
+**HLC Timing Diagram**:
+
+```
+Node A                              Node B
+  │                                    │
+  │ T=100, L=0                         │
+  │ ────────────── msg ──────────────► │
+  │                                    │ T=95 (behind)
+  │                                    │ receive: wall'=max(95,100)=100
+  │                                    │          logical'=0+1=1
+  │                                    │ HLC=(100, 1, B)
+  │                                    │
+  │                       ◄─── ack ─── │ T=100, L=1
+  │ T=100 (same)                       │
+  │ receive: wall'=100                 │
+  │          logical'=max(0,1)+1=2     │
+  │ HLC=(100, 2, A)                    │
+  │                                    │
+  │ T=101 (advanced)                   │
+  │ local event: wall'=101, L=0        │
+  │ HLC=(101, 0, A)                    │
+```
+
+---
+
+## Part 3: Per-Node Write-Ahead Log
+
+Each node maintains a local WAL for immediate crash recovery:
+
+**WAL Entry Binary Format**:
+
+```
+┌──────────┬──────────┬──────────┬──────────┬──────────┬──────────┐
+│ CRC32    │ Length   │ LSN      │ HLC      │ State    │ Type     │
+│ (4 bytes)│ (4 bytes)│ (8 bytes)│ (16 bytes)│ (1 byte) │ (1 byte) │
+├──────────┴──────────┴──────────┴──────────┴──────────┴──────────┤
+│                        Payload (variable)                        │
+└─────────────────────────────────────────────────────────────────┘
+
+Total header: 34 bytes
+CRC32: Covers all fields except CRC32 itself
+```
+
+**WAL Entry State Machine**:
+
+```
+┌─────────┐
+│ PENDING │ ─── Written to local WAL
+└────┬────┘
+     │ Regional consensus achieved
+     ▼
+┌──────────┐
+│ REGIONAL │ ─── Replicated within datacenter
+└────┬─────┘
+     │ Global ledger confirmed
+     ▼
+┌────────┐
+│ GLOBAL │ ─── Committed to global ledger
+└────┬───┘
+     │ Applied to state machine
+     ▼
+┌─────────┐
+│ APPLIED │ ─── State machine updated
+└────┬────┘
+     │ Checkpoint created
+     ▼
+┌───────────┐
+│ COMPACTED │ ─── Safe to garbage collect
+└───────────┘
+```
+
+**WAL Segment Structure**:
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│                     WAL Segment File (64MB)                     │
+├────────────────────────────────────────────────────────────────┤
+│ Entry 1: LSN=1, HLC=(T1,L1,N), State=GLOBAL, payload=...       │
+├────────────────────────────────────────────────────────────────┤
+│ Entry 2: LSN=2, HLC=(T2,L2,N), State=REGIONAL, payload=...     │
+├────────────────────────────────────────────────────────────────┤
+│ Entry 3: LSN=3, HLC=(T3,L3,N), State=PENDING, payload=...      │
+├────────────────────────────────────────────────────────────────┤
+│ ... more entries ...                                            │
+├────────────────────────────────────────────────────────────────┤
+│ [Zero-filled space for future entries]                          │
+└────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Part 4: Commit Pipeline
+
+Three-stage commit with progressive durability guarantees:
+
+**Commit Flow Diagram**:
+
+```
+  Client Request
+        │
+        ▼
+┌───────────────┐     ┌─────────────────────────────────────────────────┐
+│  Gate Node    │     │                 Commit Pipeline                  │
+│               │     │                                                  │
+│  ┌─────────┐  │     │  Stage 1: LOCAL WAL                             │
+│  │ Submit  │──┼────►│  ─────────────────                              │
+│  │  Job    │  │     │  • Write to memory-mapped segment               │
+│  └─────────┘  │     │  • Batch fsync (10ms or 100 entries)            │
+│               │     │  • Latency: <1ms                                │
+│               │     │  • Survives: process crash                      │
+│               │     │                                                  │
+│               │     │  Stage 2: REGIONAL CONSENSUS                    │
+│               │     │  ────────────────────────                       │
+│               │     │  • Raft/Paxos within datacenter                 │
+│               │     │  • Quorum: 2/3 nodes                            │
+│               │     │  • Latency: 2-10ms                              │
+│               │     │  • Survives: node failure                       │
+│               │     │                                                  │
+│               │     │  Stage 3: GLOBAL LEDGER                         │
+│               │     │  ─────────────────────                          │
+│               │     │  • Cross-region replication                     │
+│               │     │  • Quorum: 3/5 regions                          │
+│               │     │  • Latency: 50-300ms                            │
+│               │     │  • Survives: region failure                     │
+└───────────────┘     └─────────────────────────────────────────────────┘
+```
+
+**Durability Levels**:
+
+| Level | Latency | Survives | Use Case |
+|-------|---------|----------|----------|
+| LOCAL | <1ms | Process crash | High-throughput updates |
+| REGIONAL | 2-10ms | Node failure | Normal job operations |
+| GLOBAL | 50-300ms | Region failure | Critical operations (cancel) |
+
+**Commit Timing Diagram**:
+
+```
+T0          T1          T2          T3          T4
+│           │           │           │           │
+│ Write to  │ Batch     │ Regional  │ Global    │
+│ WAL       │ fsync     │ commit    │ commit    │
+│           │           │           │           │
+├───────────┼───────────┼───────────┼───────────┤
+│   <1ms    │   10ms    │   5ms     │  100ms    │
+│           │           │           │           │
+│◄─ LOCAL ─►│           │           │           │
+│◄────── REGIONAL ─────►│           │           │
+│◄─────────────── GLOBAL ──────────►│           │
+│                                               │
+│  Client sees ack after chosen durability      │
+│  level is achieved                            │
+```
+
+---
+
+## Part 5: Global Job Ledger
+
+Cross-region consensus for authoritative job state:
+
+**Regional Authority Model**:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     Global Job Ledger                            │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│   ┌──────────────┐    ┌──────────────┐    ┌──────────────┐     │
+│   │  US-EAST     │    │  EU-WEST     │    │  APAC        │     │
+│   │  Authority   │    │  Authority   │    │  Authority   │     │
+│   │              │    │              │    │              │     │
+│   │ Jobs: 1M     │    │ Jobs: 800K   │    │ Jobs: 600K   │     │
+│   │ (home here)  │    │ (home here)  │    │ (home here)  │     │
+│   └──────┬───────┘    └──────┬───────┘    └──────┬───────┘     │
+│          │                   │                   │              │
+│          └───────────────────┼───────────────────┘              │
+│                              │                                   │
+│                    Cross-Region Replication                      │
+│                    (Async with Causal Ordering)                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Job ID Format** (encodes home region):
+
+```
+Format: {region_code}-{timestamp_ms}-{gate_id}-{sequence}
+Example: use1-1704931200000-gate42-00001
+
+Benefits:
+├── Lexicographically sortable by time
+├── Instant routing to authoritative region
+├── No coordination needed for ID generation
+└── Region encoded for fast authority lookup
+```
+
+**Conflict Resolution**:
+
+```
+Conflict detected when: same job_id, same fence_token, different events
+
+Resolution priority (deterministic):
+1. Cancellation always wins (fail-safe)
+2. Higher fence token wins (later operation)
+3. HLC ordering (causal precedence)
+4. Lexicographic node_id (deterministic tie-breaker)
+
+                    ┌─────────────────────────┐
+                    │   Conflicting Events    │
+                    │   A: JobAccepted        │
+                    │   B: JobCancellation    │
+                    └───────────┬─────────────┘
+                                │
+                    ┌───────────▼───────────┐
+                    │ Is either Cancellation?│
+                    └───────────┬───────────┘
+                           Yes  │
+                    ┌───────────▼───────────┐
+                    │  Cancellation Wins    │
+                    │  (fail-safe)          │
+                    └───────────────────────┘
+```
+
+---
+
+## Part 6: Anti-Entropy and Repair
+
+Merkle tree-based consistency verification:
+
+**Merkle Tree Structure**:
+
+```
+                         Root Hash
+                        /         \
+                   Hash(L)       Hash(R)
+                  /      \      /      \
+              Hash(A)  Hash(B) Hash(C)  Hash(D)
+                │        │       │        │
+            ┌───┴───┐ ┌──┴──┐ ┌──┴──┐ ┌───┴───┐
+            │Jobs   │ │Jobs │ │Jobs │ │Jobs   │
+            │A-E    │ │F-J  │ │K-O  │ │P-Z    │
+            └───────┘ └─────┘ └─────┘ └───────┘
+```
+
+**Anti-Entropy Flow**:
+
+```
+Region A                                    Region B
+    │                                           │
+    │ ─────── Root Hash Exchange ────────────► │
+    │                                           │
+    │ ◄─────── Hash Mismatch ───────────────── │
+    │                                           │
+    │ ─────── Request Subtree L ─────────────► │
+    │                                           │
+    │ ◄─────── Subtree L Hashes ───────────── │
+    │                                           │
+    │ Compare: Hash(A) matches, Hash(B) differs │
+    │                                           │
+    │ ─────── Request Jobs F-J ──────────────► │
+    │                                           │
+    │ ◄─────── Events for Jobs F-J ─────────── │
+    │                                           │
+    │ Merge events using conflict resolution    │
+    │                                           │
+```
+
+**Repair State Machine**:
+
+```
+┌──────────┐
+│ CONSISTENT│◄─────────────────────────────────┐
+└─────┬────┘                                   │
+      │ Hash mismatch detected                 │
+      ▼                                        │
+┌───────────┐                                  │
+│ COMPARING │ ◄── Drill down Merkle tree       │
+└─────┬─────┘                                  │
+      │ Divergent range found                  │
+      ▼                                        │
+┌───────────┐                                  │
+│ FETCHING  │ ── Request events from authority │
+└─────┬─────┘                                  │
+      │ Events received                        │
+      ▼                                        │
+┌───────────┐                                  │
+│ MERGING   │ ── Apply conflict resolution     │
+└─────┬─────┘                                  │
+      │ State merged                           │
+      ▼                                        │
+┌──────────���┐                                  │
+│ VERIFYING │ ── Recompute hashes              │
+└─────┬─────┘                                  │
+      │ Hashes match                           │
+      └────────────────────────────────────────┘
+```
+
+---
+
+## Part 7: Checkpoint and Compaction
+
+Efficient recovery through periodic snapshots:
+
+**Checkpoint Contents**:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      Checkpoint File                             │
+├─────────────────────────────────────────────────────────────────┤
+│ Header:                                                          │
+│   checkpoint_id: uuid                                            │
+│   created_at: timestamp                                          │
+│   local_lsn: 12345                                              │
+│   regional_lsn: 12340                                           │
+│   global_lsn: 12300                                             │
+├─────────────────────────────────────────────────────────────────┤
+│ State Snapshot:                                                  │
+│   active_jobs: {job_id -> JobState}                             │
+│   pending_cancellations: {job_id -> CancelState}                │
+│   dc_assignments: {job_id -> [dc_ids]}                          │
+│   fence_tokens: {job_id -> token}                               │
+├─────────────────────────────────────────────────────────────────┤
+│ Indexes:                                                         │
+│   job_by_status: {status -> [job_ids]}                          │
+│   job_by_dc: {dc_id -> [job_ids]}                               │
+│   job_by_gate: {gate_id -> [job_ids]}                           │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Compaction Flow**:
+
+```
+                    ┌─────────────────┐
+                    │ Checkpoint      │
+                    │ Created at      │
+                    │ LSN=1000        │
+                    └────────┬────────┘
+                             │
+        ┌────────────────────┼────────────────────┐
+        │                    │                    │
+        ▼                    ▼                    ▼
+┌───────────────┐  ┌───────────────┐  ┌───────────────┐
+│ Segment 0     │  │ Segment 1     │  │ Segment 2     │
+│ LSN 1-500     │  │ LSN 501-1000  │  │ LSN 1001-1200 │
+│ [COMPACTED]   │  │ [COMPACTED]   │  │ [ACTIVE]      │
+└───────┬───────┘  └───────┬───────┘  └───────────────┘
+        │                  │
+        ▼                  ▼
+   ┌─────────┐        ┌─────────┐
+   │ DELETE  │        │ DELETE  │
+   └─────────┘        └─────────┘
+```
+
+**Recovery Flow**:
+
+```
+┌──────────────────┐
+│   Node Startup   │
+└────────┬─────────┘
+         │
+         ▼
+┌────────────────────────┐
+│ Find Latest Checkpoint │
+└────────┬───────────────┘
+         │
+    ┌────┴────┐
+    │ Found?  │
+    └────┬────┘
+    No   │   Yes
+    │    └────────────────┐
+    ▼                     ▼
+┌─────────────┐  ┌────────────────────┐
+│ Full WAL    │  │ Restore Checkpoint │
+│ Replay      │  │ State Snapshot     │
+└──────┬──────┘  └────────┬───────────┘
+       │                  │
+       │                  ▼
+       │         ┌────────────────────┐
+       │         │ Replay WAL from    │
+       │         │ checkpoint LSN     │
+       │         └────────┬───────────┘
+       │                  │
+       └────────┬─────────┘
+                │
+                ▼
+       ┌────────────────────┐
+       │ Reconcile with     │
+       │ Regional/Global    │
+       └────────┬───────────┘
+                │
+                ▼
+       ┌────────────────────┐
+       │ Node Ready         │
+       └────────────────────┘
+```
+
+---
+
+## Part 8: Session Consistency Guarantees
+
+Read consistency levels for different use cases:
+
+**Consistency Levels**:
+
+| Level | Guarantee | Latency | Use Case |
+|-------|-----------|---------|----------|
+| EVENTUAL | May read stale | Fastest | Dashboards, monitoring |
+| SESSION | Read-your-writes | Low | Normal operations |
+| BOUNDED_STALENESS | Max lag = X ms | Medium | Cross-region queries |
+| STRONG | Authoritative | Highest | Status verification |
+
+**Session State Diagram**:
+
+```
+                         ┌──────────────────┐
+                         │  Session Start   │
+                         └────────┬─────────┘
+                                  │
+                                  ▼
+                         ┌──────────────────┐
+                         │ last_read_hlc=0  │
+                         │ written_jobs={}  │
+                         └────────┬─────────┘
+                                  │
+              ┌───────────────────┼───────────────────┐
+              │                   │                   │
+              ▼                   ▼                   ▼
+      ┌───────────────┐  ┌───────────────┐  ┌───────────────┐
+      │ Write Job A   │  │ Read Job A    │  │ Read Job B    │
+      │               │  │ (after write) │  │ (no write)    │
+      │ written_jobs  │  │               │  │               │
+      │ += {A}        │  │ Must read     │  │ May read      │
+      └───────────────┘  │ authoritative │  │ local replica │
+                         └───────────────┘  └───────────────┘
+```
+
+---
+
+## Part 9: Implementation
+
+### WAL Entry Model
+
+```python
+"""
+hyperscale/distributed_rewrite/ledger/models/wal_entry.py
+"""
+
+from dataclasses import dataclass, field
+from enum import IntEnum
+import struct
+import hashlib
+
+from hyperscale.distributed_rewrite.ledger.models.hlc import HybridLogicalClock
+
+
+class WALEntryState(IntEnum):
+    """State of a WAL entry in the commit pipeline."""
+    PENDING = 0       # Written to local WAL, not yet replicated
+    REGIONAL = 1      # Committed to regional consensus group
+    GLOBAL = 2        # Committed to global ledger
+    APPLIED = 3       # Applied to local state machine
+    COMPACTED = 4     # Safe to garbage collect
+
+
+@dataclass(slots=True)
+class WALEntry:
+    """
+    Single entry in the Write-Ahead Log.
+    
+    Binary format (fixed header + variable payload):
+    ┌──────────┬──────────┬──────────┬──────────┬──────────┬──────────┐
+    │ CRC32    │ Length   │ LSN      │ HLC      │ State    │ Type     │
+    │ (4 bytes)│ (4 bytes)│ (8 bytes)│ (16 bytes)│ (1 byte) │ (1 byte) │
+    ├──────────┴──────────┴──────────┴──────────┴──────────┴──────────┤
+    │                        Payload (variable)                        │
+    └─────────────────────────────────────────────────────────────────┘
+    """
+    lsn: int                          # Log Sequence Number (monotonic)
+    hlc: HybridLogicalClock           # Hybrid Logical Clock timestamp
+    state: WALEntryState              # Current commit state
+    entry_type: int                   # Type discriminator
+    payload: bytes                    # Serialized operation
+    crc32: int = 0                    # Checksum for integrity
+    
+    HEADER_SIZE = 34  # 4 + 4 + 8 + 16 + 1 + 1
+    
+    def serialize(self) -> bytes:
+        """Serialize entry to bytes with CRC."""
+        header = struct.pack(
+            "<IIQQQBB",
+            0,  # CRC placeholder
+            len(self.payload),
+            self.lsn,
+            self.hlc.wall_time_ms,
+            self.hlc.logical_counter,
+            self.state.value,
+            self.entry_type,
+        )
+        data = header + self.payload
+        crc = hashlib.crc32(data[4:])  # CRC over everything except CRC field
+        return struct.pack("<I", crc) + data[4:]
+    
+    @classmethod
+    def deserialize(cls, data: bytes) -> "WALEntry":
+        """Deserialize entry from bytes with CRC verification."""
+        if len(data) < cls.HEADER_SIZE:
+            raise ValueError(f"Entry too short: {len(data)} < {cls.HEADER_SIZE}")
+        
+        crc_stored, length, lsn, wall_time, logical, state, entry_type = struct.unpack(
+            "<IIQQQBB", data[:cls.HEADER_SIZE]
+        )
+        
+        # Verify CRC
+        crc_computed = hashlib.crc32(data[4:cls.HEADER_SIZE + length])
+        if crc_stored != crc_computed:
+            raise ValueError(f"CRC mismatch: stored={crc_stored}, computed={crc_computed}")
+        
+        payload = data[cls.HEADER_SIZE:cls.HEADER_SIZE + length]
+        
+        return cls(
+            lsn=lsn,
+            hlc=HybridLogicalClock(wall_time, logical, ""),
+            state=WALEntryState(state),
+            entry_type=entry_type,
+            payload=payload,
+            crc32=crc_stored,
+        )
+```
+
+### Hybrid Logical Clock
+
+```python
+"""
+hyperscale/distributed_rewrite/ledger/models/hlc.py
+"""
+
+from dataclasses import dataclass
+import time
+
+
+@dataclass(slots=True)
+class HybridLogicalClock:
+    """
+    Hybrid Logical Clock for causal ordering.
+    
+    Combines physical time with logical counter:
+    - Provides causal ordering without synchronized clocks
+    - Bounded drift from physical time
+    - Total ordering via (wall_time, logical_counter, node_id)
+    
+    Invariants:
+    1. If A → B (A causally precedes B), then HLC(A) < HLC(B)
+    2. HLC.wall_time >= physical_time - max_drift
+    3. Comparison: (wall_time, logical_counter, node_id)
+    """
+    wall_time_ms: int      # Physical timestamp (milliseconds)
+    logical_counter: int   # Logical component for same-millisecond ordering
+    node_id: str           # Tie-breaker for concurrent events
+    
+    def tick(self, local_wall_time_ms: int) -> "HybridLogicalClock":
+        """
+        Generate next timestamp for local event.
+        
+        Algorithm:
+        1. new_wall = max(current_wall, physical_time)
+        2. if new_wall == current_wall: logical++
+        3. else: logical = 0
+        """
+        new_wall = max(self.wall_time_ms, local_wall_time_ms)
+        if new_wall == self.wall_time_ms:
+            return HybridLogicalClock(new_wall, self.logical_counter + 1, self.node_id)
+        return HybridLogicalClock(new_wall, 0, self.node_id)
+    
+    def receive(
+        self,
+        remote: "HybridLogicalClock",
+        local_wall_time_ms: int,
+    ) -> "HybridLogicalClock":
+        """
+        Update clock on receiving message from remote node.
+        
+        Algorithm:
+        1. new_wall = max(local_wall, remote_wall, physical_time)
+        2. Compute logical based on which wall times matched
+        """
+        new_wall = max(self.wall_time_ms, remote.wall_time_ms, local_wall_time_ms)
+        
+        if new_wall == self.wall_time_ms == remote.wall_time_ms:
+            # All three equal: take max logical + 1
+            new_logical = max(self.logical_counter, remote.logical_counter) + 1
+        elif new_wall == self.wall_time_ms:
+            # Local wall is max: increment local logical
+            new_logical = self.logical_counter + 1
+        elif new_wall == remote.wall_time_ms:
+            # Remote wall is max: increment remote logical
+            new_logical = remote.logical_counter + 1
+        else:
+            # Physical time is max: reset logical
+            new_logical = 0
+        
+        return HybridLogicalClock(new_wall, new_logical, self.node_id)
+    
+    def __lt__(self, other: "HybridLogicalClock") -> bool:
+        if self.wall_time_ms != other.wall_time_ms:
+            return self.wall_time_ms < other.wall_time_ms
+        if self.logical_counter != other.logical_counter:
+            return self.logical_counter < other.logical_counter
+        return self.node_id < other.node_id
+    
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, HybridLogicalClock):
+            return False
+        return (
+            self.wall_time_ms == other.wall_time_ms
+            and self.logical_counter == other.logical_counter
+            and self.node_id == other.node_id
+        )
+    
+    def __hash__(self) -> int:
+        return hash((self.wall_time_ms, self.logical_counter, self.node_id))
+    
+    @classmethod
+    def now(cls, node_id: str) -> "HybridLogicalClock":
+        """Create HLC at current physical time."""
+        return cls(
+            wall_time_ms=int(time.time() * 1000),
+            logical_counter=0,
+            node_id=node_id,
+        )
+```
+
+### WAL Segment
+
+```python
+"""
+hyperscale/distributed_rewrite/ledger/storage/wal_segment.py
+"""
+
+import mmap
+import os
+import struct
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Iterator
+
+from hyperscale.distributed_rewrite.ledger.models.wal_entry import WALEntry
+
+
+class SegmentFullError(Exception):
+    """Raised when WAL segment cannot accept more entries."""
+    pass
+
+
+@dataclass
+class WALSegment:
+    """
+    Single segment file of the WAL.
+    
+    Segments are:
+    - Pre-allocated for performance (no fragmentation)
+    - Memory-mapped for efficient I/O
+    - Sealed when full (immutable after seal)
+    - Garbage collected when all entries COMPACTED
+    
+    File format:
+    ┌────────────────────────────────────────────────────────────────┐
+    │                     WAL Segment File (64MB)                     │
+    ├────────────────────────────────────────────────────────────────┤
+    │ Entry 1 │ Entry 2 │ ... │ Entry N │ [Zero-filled space]        │
+    └────────────────────────────────────────────────────────────────┘
+    """
+    segment_id: int
+    path: Path
+    max_size: int = 64 * 1024 * 1024  # 64MB default
+    
+    _mmap: mmap.mmap | None = field(default=None, repr=False)
+    _write_offset: int = field(default=0, repr=False)
+    _sealed: bool = field(default=False, repr=False)
+    
+    def open(self, create: bool = False) -> None:
+        """Open segment file with memory mapping."""
+        if create and not self.path.exists():
+            # Pre-allocate file with zeros
+            with open(self.path, "wb") as file_handle:
+                file_handle.write(b"\x00" * self.max_size)
+        
+        file_descriptor = os.open(str(self.path), os.O_RDWR)
+        self._mmap = mmap.mmap(file_descriptor, self.max_size)
+        os.close(file_descriptor)
+        
+        # Find write offset by scanning for end of data
+        self._write_offset = self._find_write_offset()
+    
+    def _find_write_offset(self) -> int:
+        """Find the end of valid data in segment."""
+        offset = 0
+        while offset < self.max_size - WALEntry.HEADER_SIZE:
+            # Read length field (bytes 4-8 of entry header)
+            length_bytes = self._mmap[offset + 4:offset + 8]
+            if length_bytes == b"\x00\x00\x00\x00":
+                break
+            length = struct.unpack("<I", length_bytes)[0]
+            offset += WALEntry.HEADER_SIZE + length
+        return offset
+    
+    def append(self, entry: WALEntry) -> int:
+        """
+        Append entry to segment.
+        
+        Returns: Offset where entry was written
+        Raises: SegmentFullError if segment is full or sealed
+        """
+        if self._sealed:
+            raise SegmentFullError("Segment is sealed")
+        
+        data = entry.serialize()
+        if self._write_offset + len(data) > self.max_size:
+            raise SegmentFullError("Segment is full")
+        
+        offset = self._write_offset
+        self._mmap[offset:offset + len(data)] = data
+        self._write_offset += len(data)
+        
+        return offset
+    
+    def sync(self) -> None:
+        """Flush changes to disk (fsync)."""
+        if self._mmap:
+            self._mmap.flush()
+    
+    def read_entry(self, offset: int) -> WALEntry:
+        """Read entry at given offset."""
+        # Read header to get length
+        header = self._mmap[offset:offset + WALEntry.HEADER_SIZE]
+        length = struct.unpack("<I", header[4:8])[0]
+        
+        # Read full entry
+        data = self._mmap[offset:offset + WALEntry.HEADER_SIZE + length]
+        return WALEntry.deserialize(bytes(data))
+    
+    def iterate_entries(self) -> Iterator[tuple[int, WALEntry]]:
+        """Iterate all entries in segment with their offsets."""
+        offset = 0
+        while offset < self._write_offset:
+            entry = self.read_entry(offset)
+            yield offset, entry
+            offset += WALEntry.HEADER_SIZE + len(entry.payload)
+    
+    def seal(self) -> None:
+        """Seal segment - no more writes allowed."""
+        self._sealed = True
+    
+    def close(self) -> None:
+        """Close segment and release resources."""
+        if self._mmap:
+            self._mmap.close()
+            self._mmap = None
+    
+    @property
+    def is_sealed(self) -> bool:
+        """Check if segment is sealed."""
+        return self._sealed
+    
+    @property
+    def bytes_used(self) -> int:
+        """Get number of bytes used in segment."""
+        return self._write_offset
+    
+    @property
+    def bytes_available(self) -> int:
+        """Get number of bytes available in segment."""
+        return self.max_size - self._write_offset
+```
+
+### Node WAL Manager
+
+```python
+"""
+hyperscale/distributed_rewrite/ledger/storage/node_wal.py
+"""
+
+import asyncio
+import time
+from dataclasses import dataclass, field
+from enum import IntEnum
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+from hyperscale.logging import Logger
+from hyperscale.distributed_rewrite.ledger.models.wal_entry import WALEntry, WALEntryState
+from hyperscale.distributed_rewrite.ledger.models.hlc import HybridLogicalClock
+from hyperscale.distributed_rewrite.ledger.storage.wal_segment import WALSegment, SegmentFullError
+
+if TYPE_CHECKING:
+    from hyperscale.distributed_rewrite.ledger.models.recovery_result import RecoveryResult
+
+
+class WALDurability(IntEnum):
+    """Durability levels for WAL writes."""
+    MEMORY = 0        # No sync (unsafe, testing only)
+    WRITE = 1         # After write() syscall
+    FSYNC = 2         # After fsync (per entry)
+    FSYNC_BATCH = 3   # After batched fsync (default)
+
+
+@dataclass
+class NodeWAL:
+    """
+    Per-node Write-Ahead Log manager.
+    
+    Provides:
+    - Append with configurable durability
+    - Batched fsync for throughput
+    - Crash recovery
+    - State transition tracking
+    - Garbage collection of compacted entries
+    
+    Usage:
+        wal = NodeWAL(
+            data_dir=Path("/data/wal"),
+            node_id="gate-1",
+        )
+        
+        recovery = await wal.open()
+        
+        lsn = await wal.append(
+            entry_type=EventType.JOB_CREATED,
+            payload=event.serialize(),
+        )
+        
+        await wal.update_state(lsn, WALEntryState.REGIONAL)
+    """
+    
+    data_dir: Path
+    node_id: str
+    segment_size: int = 64 * 1024 * 1024  # 64MB
+    sync_mode: WALDurability = WALDurability.FSYNC_BATCH
+    batch_size: int = 100
+    batch_timeout_ms: int = 10
+    
+    _logger: Logger = field(default_factory=Logger, repr=False)
+    _segments: list[WALSegment] = field(default_factory=list, repr=False)
+    _active_segment: WALSegment | None = field(default=None, repr=False)
+    _next_lsn: int = field(default=1, repr=False)
+    _hlc: HybridLogicalClock | None = field(default=None, repr=False)
+    _pending_batch: list[tuple[WALEntry, asyncio.Future]] = field(default_factory=list, repr=False)
+    _batch_lock: asyncio.Lock | None = field(default=None, repr=False)
+    _state_index: dict[int, WALEntryState] = field(default_factory=dict, repr=False)
+    _batch_task: asyncio.Task | None = field(default=None, repr=False)
+    
+    def __post_init__(self):
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        self._hlc = HybridLogicalClock.now(self.node_id)
+    
+    def _get_batch_lock(self) -> asyncio.Lock:
+        """Get or create batch lock (lazy initialization)."""
+        if self._batch_lock is None:
+            self._batch_lock = asyncio.Lock()
+        return self._batch_lock
+    
+    async def open(self) -> "RecoveryResult":
+        """
+        Open WAL and recover state from existing segments.
+        
+        Returns: RecoveryResult with recovery statistics and pending entries
+        """
+        from hyperscale.distributed_rewrite.ledger.models.recovery_result import RecoveryResult
+        
+        async with self._logger.context(
+            name="node_wal",
+            path="hyperscale.ledger.log.json",
+            template="{timestamp} - {level} - {thread_id} - {filename}:{function_name}.{line_number} - {message}",
+        ) as ctx:
+            await ctx.log(
+                Entry(
+                    message=f"Opening WAL at {self.data_dir}",
+                    level=LogLevel.INFO,
+                )
+            )
+            
+            # Discover existing segments
+            segment_files = sorted(self.data_dir.glob("segment_*.wal"))
+            
+            recovered_entries = 0
+            max_lsn = 0
+            max_hlc = self._hlc
+            pending_entries: list[WALEntry] = []
+            
+            for segment_path in segment_files:
+                segment_id = int(segment_path.stem.split("_")[1])
+                segment = WALSegment(segment_id, segment_path, self.segment_size)
+                segment.open(create=False)
+                
+                # Scan entries
+                for offset, entry in segment.iterate_entries():
+                    recovered_entries += 1
+                    max_lsn = max(max_lsn, entry.lsn)
+                    if entry.hlc > max_hlc:
+                        max_hlc = entry.hlc
+                    
+                    # Track entries not yet globally committed
+                    if entry.state < WALEntryState.GLOBAL:
+                        pending_entries.append(entry)
+                    
+                    self._state_index[entry.lsn] = entry.state
+                
+                self._segments.append(segment)
+            
+            # Set up for new writes
+            self._next_lsn = max_lsn + 1
+            self._hlc = max_hlc
+            
+            # Create new active segment if needed
+            if not self._segments or self._segments[-1].bytes_available < self.segment_size * 0.1:
+                await self._create_new_segment()
+            else:
+                self._active_segment = self._segments[-1]
+            
+            await ctx.log(
+                Entry(
+                    message=f"WAL recovery complete: {recovered_entries} entries, max_lsn={max_lsn}, {len(pending_entries)} pending",
+                    level=LogLevel.INFO,
+                )
+            )
+            
+            return RecoveryResult(
+                recovered_entries=recovered_entries,
+                max_lsn=max_lsn,
+                max_hlc=max_hlc,
+                pending_entries=pending_entries,
+            )
+    
+    async def _create_new_segment(self) -> None:
+        """Create a new segment for writing."""
+        segment_id = len(self._segments)
+        segment_path = self.data_dir / f"segment_{segment_id:08d}.wal"
+        segment = WALSegment(segment_id, segment_path, self.segment_size)
+        segment.open(create=True)
+        
+        if self._active_segment:
+            self._active_segment.seal()
+        
+        self._segments.append(segment)
+        self._active_segment = segment
+    
+    async def append(
+        self,
+        entry_type: int,
+        payload: bytes,
+        durability: WALDurability | None = None,
+    ) -> int:
+        """
+        Append entry to WAL with specified durability.
+        
+        Args:
+            entry_type: Event type discriminator
+            payload: Serialized event data
+            durability: Durability level (uses default if None)
+        
+        Returns: LSN of appended entry
+        """
+        durability = durability or self.sync_mode
+        
+        # Generate timestamps
+        self._hlc = self._hlc.tick(int(time.time() * 1000))
+        lsn = self._next_lsn
+        self._next_lsn += 1
+        
+        entry = WALEntry(
+            lsn=lsn,
+            hlc=self._hlc,
+            state=WALEntryState.PENDING,
+            entry_type=entry_type,
+            payload=payload,
+        )
+        
+        # Write to segment
+        try:
+            self._active_segment.append(entry)
+        except SegmentFullError:
+            await self._create_new_segment()
+            self._active_segment.append(entry)
+        
+        # Track state
+        self._state_index[lsn] = WALEntryState.PENDING
+        
+        # Handle durability
+        match durability:
+            case WALDurability.MEMORY:
+                pass  # No sync
+            
+            case WALDurability.WRITE:
+                pass  # OS will sync eventually
+            
+            case WALDurability.FSYNC:
+                self._active_segment.sync()
+            
+            case WALDurability.FSYNC_BATCH:
+                await self._batch_sync(entry)
+        
+        return lsn
+    
+    async def _batch_sync(self, entry: WALEntry) -> None:
+        """Batch multiple entries before fsync for throughput."""
+        future: asyncio.Future = asyncio.Future()
+        
+        async with self._get_batch_lock():
+            self._pending_batch.append((entry, future))
+            
+            if len(self._pending_batch) >= self.batch_size:
+                # Batch is full, sync now
+                await self._flush_batch()
+            elif self._batch_task is None or self._batch_task.done():
+                # Schedule timeout flush
+                self._batch_task = asyncio.create_task(self._batch_timeout_flush())
+        
+        await future
+    
+    async def _batch_timeout_flush(self) -> None:
+        """Flush batch after timeout."""
+        await asyncio.sleep(self.batch_timeout_ms / 1000)
+        async with self._get_batch_lock():
+            if self._pending_batch:
+                await self._flush_batch()
+    
+    async def _flush_batch(self) -> None:
+        """Flush pending batch and complete futures."""
+        if not self._pending_batch:
+            return
+        
+        # Perform single fsync for entire batch
+        self._active_segment.sync()
+        
+        # Complete all futures
+        for entry, future in self._pending_batch:
+            if not future.done():
+                future.set_result(entry.lsn)
+        
+        self._pending_batch.clear()
+    
+    async def update_state(self, lsn: int, new_state: WALEntryState) -> None:
+        """
+        Update the commit state of an entry.
+        
+        Called when entry progresses through commit pipeline:
+        PENDING -> REGIONAL -> GLOBAL -> APPLIED -> COMPACTED
+        """
+        if lsn not in self._state_index:
+            return
+        
+        current_state = self._state_index[lsn]
+        if new_state.value <= current_state.value:
+            return  # State can only advance
+        
+        self._state_index[lsn] = new_state
+    
+    async def read_pending(self) -> list[WALEntry]:
+        """Read all entries not yet globally committed."""
+        pending = []
+        for segment in self._segments:
+            for offset, entry in segment.iterate_entries():
+                if self._state_index.get(entry.lsn, entry.state) < WALEntryState.GLOBAL:
+                    pending.append(entry)
+        return pending
+    
+    async def read_range(self, start_lsn: int, end_lsn: int) -> list[WALEntry]:
+        """Read entries in LSN range (inclusive)."""
+        entries = []
+        for segment in self._segments:
+            for offset, entry in segment.iterate_entries():
+                if start_lsn <= entry.lsn <= end_lsn:
+                    entries.append(entry)
+        return sorted(entries, key=lambda e: e.lsn)
+    
+    async def compact(self, safe_lsn: int) -> int:
+        """
+        Compact entries up to safe_lsn.
+        
+        safe_lsn: LSN up to which all entries have been
+        globally committed and checkpointed.
+        
+        Returns: Number of segments removed
+        """
+        removed = 0
+        
+        for segment in list(self._segments):
+            if segment == self._active_segment:
+                continue
+            
+            # Check if all entries in segment are safe to remove
+            all_safe = True
+            max_segment_lsn = 0
+            
+            for offset, entry in segment.iterate_entries():
+                max_segment_lsn = max(max_segment_lsn, entry.lsn)
+                if entry.lsn > safe_lsn:
+                    all_safe = False
+                    break
+            
+            if all_safe and max_segment_lsn <= safe_lsn:
+                segment.close()
+                segment.path.unlink()
+                self._segments.remove(segment)
+                removed += 1
+        
+        return removed
+    
+    async def close(self) -> None:
+        """Close WAL and release resources."""
+        # Flush any pending writes
+        async with self._get_batch_lock():
+            await self._flush_batch()
+        
+        # Cancel batch task if running
+        if self._batch_task and not self._batch_task.done():
+            self._batch_task.cancel()
+            try:
+                await self._batch_task
+            except asyncio.CancelledError:
+                pass
+        
+        for segment in self._segments:
+            segment.close()
+    
+    @property
+    def current_lsn(self) -> int:
+        """Get the current (next to be assigned) LSN."""
+        return self._next_lsn
+    
+    @property
+    def current_hlc(self) -> HybridLogicalClock:
+        """Get the current HLC."""
+        return self._hlc
+```
+
+### Job Ledger Entry
+
+```python
+"""
+hyperscale/distributed_rewrite/ledger/models/ledger_entry.py
+"""
+
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from hyperscale.distributed_rewrite.ledger.models.hlc import HybridLogicalClock
+    from hyperscale.distributed_rewrite.ledger.events.base import JobEvent
+
+
+@dataclass(slots=True)
+class JobLedgerEntry:
+    """
+    Entry in the Global Job Ledger.
+    
+    Contains:
+    - Job identification and fence token
+    - Causal timestamp (HLC)
+    - The actual event
+    - Source tracking for provenance
+    """
+    job_id: str
+    fence_token: int
+    hlc: "HybridLogicalClock"
+    event: "JobEvent"
+    source_node: str
+    source_region: str
+    source_lsn: int
+    
+    def conflicts_with(self, other: "JobLedgerEntry") -> bool:
+        """Detect conflicting concurrent operations."""
+        if self.job_id != other.job_id:
+            return False
+        # Same fence token = concurrent writes
+        return self.fence_token == other.fence_token
+    
+    @staticmethod
+    def resolve_conflict(
+        entry_a: "JobLedgerEntry",
+        entry_b: "JobLedgerEntry",
+    ) -> "JobLedgerEntry":
+        """
+        Deterministic conflict resolution.
+        
+        Priority order:
+        1. Cancellation always wins (fail-safe)
+        2. Higher fence token wins (later operation)
+        3. HLC ordering (causal precedence)
+        4. Lexicographic node_id (deterministic tie-breaker)
+        """
+        from hyperscale.distributed_rewrite.ledger.events.cancellation import (
+            JobCancellationRequested,
+        )
+        
+        # Cancellation is highest priority (fail-safe)
+        if isinstance(entry_a.event, JobCancellationRequested):
+            return entry_a
+        if isinstance(entry_b.event, JobCancellationRequested):
+            return entry_b
+        
+        # Higher fence token wins
+        if entry_a.fence_token != entry_b.fence_token:
+            return entry_a if entry_a.fence_token > entry_b.fence_token else entry_b
+        
+        # HLC ordering
+        if entry_a.hlc != entry_b.hlc:
+            return entry_a if entry_a.hlc > entry_b.hlc else entry_b
+        
+        # Deterministic tie-breaker
+        return entry_a if entry_a.hlc.node_id < entry_b.hlc.node_id else entry_b
+```
+
+### Commit Pipeline
+
+```python
+"""
+hyperscale/distributed_rewrite/ledger/pipeline/commit_pipeline.py
+"""
+
+import asyncio
+from dataclasses import dataclass, field
+from enum import IntEnum
+from typing import TYPE_CHECKING
+
+from hyperscale.logging import Logger
+from hyperscale.distributed_rewrite.ledger.models.wal_entry import WALEntryState
+from hyperscale.distributed_rewrite.ledger.models.ledger_entry import JobLedgerEntry
+from hyperscale.distributed_rewrite.ledger.storage.node_wal import NodeWAL, WALDurability
+
+if TYPE_CHECKING:
+    from hyperscale.distributed_rewrite.ledger.consensus.regional import RegionalConsensusGroup
+    from hyperscale.distributed_rewrite.ledger.global_ledger import GlobalJobLedger
+    from hyperscale.distributed_rewrite.ledger.events.base import JobEvent
+
+
+class CommitDurability(IntEnum):
+    """Durability levels for commit pipeline."""
+    LOCAL = 1      # Local WAL only
+    REGIONAL = 2   # Regional consensus
+    GLOBAL = 3     # Global ledger
+
+
+@dataclass(slots=True)
+class CommitResult:
+    """Result of commit operation."""
+    lsn: int
+    durability_achieved: CommitDurability
+    regional_confirmed: bool
+    global_confirmed: bool
+    error: str | None = None
+
+
+@dataclass
+class CommitPipeline:
+    """
+    Three-stage commit pipeline for job operations.
+    
+    Stage 1: Local WAL (immediate durability, single node)
+    Stage 2: Regional Consensus (fast, within-DC replication)
+    Stage 3: Global Ledger (cross-region, authoritative)
+    
+    Each stage provides progressively stronger guarantees:
+    - Local: Survives process crash (<1ms)
+    - Regional: Survives node failure (2-10ms)
+    - Global: Survives region failure (50-300ms)
+    """
+    
+    node_id: str
+    region_id: str
+    wal: NodeWAL
+    regional_consensus: "RegionalConsensusGroup"
+    global_ledger: "GlobalJobLedger"
+    
+    _logger: Logger = field(default_factory=Logger, repr=False)
+    _pending_regional: dict[int, asyncio.Future] = field(default_factory=dict, repr=False)
+    _pending_global: dict[int, asyncio.Future] = field(default_factory=dict, repr=False)
+    
+    async def commit_job_event(
+        self,
+        event: "JobEvent",
+        required_durability: CommitDurability = CommitDurability.REGIONAL,
+    ) -> CommitResult:
+        """
+        Commit a job event through the pipeline.
+        
+        Args:
+            event: The job event to commit
+            required_durability: Minimum durability before returning
+        
+        Returns:
+            CommitResult with achieved durability and status
+        """
+        async with self._logger.context(
+            name="commit_pipeline",
+            path="hyperscale.ledger.log.json",
+            template="{timestamp} - {level} - {thread_id} - {filename}:{function_name}.{line_number} - {message}",
+        ) as ctx:
+            # Stage 1: Local WAL
+            payload = event.serialize()
+            lsn = await self.wal.append(
+                entry_type=event.event_type,
+                payload=payload,
+                durability=WALDurability.FSYNC_BATCH,
+            )
+            
+            await ctx.log(
+                Entry(
+                    message=f"Event {event.event_type} for job {event.job_id} written to WAL at LSN {lsn}",
+                    level=LogLevel.DEBUG,
+                )
+            )
+            
+            if required_durability == CommitDurability.LOCAL:
+                return CommitResult(
+                    lsn=lsn,
+                    durability_achieved=CommitDurability.LOCAL,
+                    regional_confirmed=False,
+                    global_confirmed=False,
+                )
+            
+            # Stage 2: Regional Consensus
+            regional_future: asyncio.Future = asyncio.Future()
+            self._pending_regional[lsn] = regional_future
+            
+            await self.regional_consensus.propose(
+                lsn=lsn,
+                hlc=self.wal.current_hlc,
+                event=event,
+            )
+            
+            try:
+                await asyncio.wait_for(regional_future, timeout=5.0)
+                await self.wal.update_state(lsn, WALEntryState.REGIONAL)
+                
+                await ctx.log(
+                    Entry(
+                        message=f"Event LSN {lsn} committed to regional consensus",
+                        level=LogLevel.DEBUG,
+                    )
+                )
+            except asyncio.TimeoutError:
+                await ctx.log(
+                    Entry(
+                        message=f"Regional consensus timeout for LSN {lsn}",
+                        level=LogLevel.WARNING,
+                    )
+                )
+                return CommitResult(
+                    lsn=lsn,
+                    durability_achieved=CommitDurability.LOCAL,
+                    regional_confirmed=False,
+                    global_confirmed=False,
+                    error="Regional consensus timeout",
+                )
+            
+            if required_durability == CommitDurability.REGIONAL:
+                # Start async global replication but don't wait
+                asyncio.create_task(self._replicate_to_global(lsn, event))
+                
+                return CommitResult(
+                    lsn=lsn,
+                    durability_achieved=CommitDurability.REGIONAL,
+                    regional_confirmed=True,
+                    global_confirmed=False,
+                )
+            
+            # Stage 3: Global Ledger
+            global_future: asyncio.Future = asyncio.Future()
+            self._pending_global[lsn] = global_future
+            
+            await self._replicate_to_global(lsn, event)
+            
+            try:
+                await asyncio.wait_for(global_future, timeout=30.0)
+                await self.wal.update_state(lsn, WALEntryState.GLOBAL)
+                
+                await ctx.log(
+                    Entry(
+                        message=f"Event LSN {lsn} committed to global ledger",
+                        level=LogLevel.INFO,
+                    )
+                )
+            except asyncio.TimeoutError:
+                await ctx.log(
+                    Entry(
+                        message=f"Global replication timeout for LSN {lsn}",
+                        level=LogLevel.WARNING,
+                    )
+                )
+                return CommitResult(
+                    lsn=lsn,
+                    durability_achieved=CommitDurability.REGIONAL,
+                    regional_confirmed=True,
+                    global_confirmed=False,
+                    error="Global replication timeout",
+                )
+            
+            return CommitResult(
+                lsn=lsn,
+                durability_achieved=CommitDurability.GLOBAL,
+                regional_confirmed=True,
+                global_confirmed=True,
+            )
+    
+    async def _replicate_to_global(self, lsn: int, event: "JobEvent") -> None:
+        """Replicate event to global ledger."""
+        entry = JobLedgerEntry(
+            job_id=event.job_id,
+            fence_token=event.fence_token,
+            hlc=self.wal.current_hlc,
+            event=event,
+            source_node=self.node_id,
+            source_region=self.region_id,
+            source_lsn=lsn,
+        )
+        
+        await self.global_ledger.append(entry)
+    
+    def on_regional_committed(self, lsn: int) -> None:
+        """Callback when regional consensus commits an entry."""
+        if lsn in self._pending_regional:
+            future = self._pending_regional.pop(lsn)
+            if not future.done():
+                future.set_result(True)
+    
+    def on_global_committed(self, lsn: int) -> None:
+        """Callback when global ledger commits an entry."""
+        if lsn in self._pending_global:
+            future = self._pending_global.pop(lsn)
+            if not future.done():
+                future.set_result(True)
+```
+
+### Checkpoint Manager
+
+```python
+"""
+hyperscale/distributed_rewrite/ledger/checkpoint/checkpoint_manager.py
+"""
+
+import asyncio
+import time
+import uuid
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+from hyperscale.logging import Logger
+from hyperscale.distributed_rewrite.ledger.models.wal_entry import WALEntry
+
+if TYPE_CHECKING:
+    from hyperscale.distributed_rewrite.ledger.storage.node_wal import NodeWAL
+    from hyperscale.distributed_rewrite.ledger.state_machine import JobStateMachine
+
+
+@dataclass(slots=True)
+class Checkpoint:
+    """Checkpoint file contents."""
+    checkpoint_id: str
+    created_at: float
+    local_lsn: int
+    regional_lsn: int
+    global_lsn: int
+    state_snapshot: bytes
+
+
+@dataclass
+class CheckpointManager:
+    """
+    Manages checkpoints for efficient recovery.
+    
+    Checkpoints capture:
+    - Local state machine snapshot
+    - LSN watermarks (local, regional, global)
+    - Active job state
+    
+    Enables:
+    - Fast recovery (skip WAL replay for old entries)
+    - WAL compaction (remove checkpointed entries)
+    - State transfer to new nodes
+    """
+    
+    wal: "NodeWAL"
+    state_machine: "JobStateMachine"
+    checkpoint_dir: Path
+    checkpoint_interval_entries: int = 100_000
+    checkpoint_interval_seconds: float = 300.0
+    max_checkpoints_to_keep: int = 3
+    
+    _logger: Logger = field(default_factory=Logger, repr=False)
+    _last_checkpoint_lsn: int = field(default=0, repr=False)
+    _last_checkpoint_time: float = field(default=0.0, repr=False)
+    _entries_since_checkpoint: int = field(default=0, repr=False)
+    
+    def __post_init__(self):
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    
+    async def maybe_checkpoint(self, current_lsn: int) -> bool:
+        """
+        Create checkpoint if thresholds exceeded.
+        
+        Returns: True if checkpoint was created
+        """
+        self._entries_since_checkpoint += 1
+        now = time.monotonic()
+        
+        should_checkpoint = (
+            self._entries_since_checkpoint >= self.checkpoint_interval_entries or
+            now - self._last_checkpoint_time >= self.checkpoint_interval_seconds
+        )
+        
+        if should_checkpoint:
+            await self.create_checkpoint(current_lsn)
+            return True
+        return False
+    
+    async def create_checkpoint(self, lsn: int) -> Checkpoint:
+        """
+        Create a consistent checkpoint.
+        
+        Steps:
+        1. Snapshot state machine (atomic)
+        2. Record LSN watermarks
+        3. Write checkpoint file
+        4. Trigger WAL compaction
+        5. Clean old checkpoints
+        """
+        async with self._logger.context(
+            name="checkpoint_manager",
+            path="hyperscale.ledger.log.json",
+            template="{timestamp} - {level} - {thread_id} - {filename}:{function_name}.{line_number} - {message}",
+        ) as ctx:
+            await ctx.log(
+                Entry(
+                    message=f"Creating checkpoint at LSN {lsn}",
+                    level=LogLevel.INFO,
+                )
+            )
+            
+            # 1. Snapshot state machine
+            state_snapshot = await self.state_machine.snapshot()
+            
+            # 2. Record watermarks
+            checkpoint = Checkpoint(
+                checkpoint_id=uuid.uuid4().hex,
+                created_at=time.time(),
+                local_lsn=lsn,
+                regional_lsn=await self._get_regional_watermark(),
+                global_lsn=await self._get_global_watermark(),
+                state_snapshot=state_snapshot,
+            )
+            
+            # 3. Write checkpoint file
+            checkpoint_path = self.checkpoint_dir / f"checkpoint_{checkpoint.checkpoint_id}.ckpt"
+            await self._write_checkpoint_file(checkpoint_path, checkpoint)
+            
+            # 4. Update tracking
+            self._last_checkpoint_lsn = lsn
+            self._last_checkpoint_time = time.monotonic()
+            self._entries_since_checkpoint = 0
+            
+            await ctx.log(
+                Entry(
+                    message=f"Checkpoint {checkpoint.checkpoint_id} created at LSN {lsn}",
+                    level=LogLevel.INFO,
+                )
+            )
+            
+            # 5. Trigger async WAL compaction and cleanup
+            asyncio.create_task(self._compact_and_cleanup(checkpoint))
+            
+            return checkpoint
+    
+    async def _compact_and_cleanup(self, checkpoint: Checkpoint) -> None:
+        """Compact WAL and clean old checkpoints."""
+        # Only compact if global ledger has confirmed
+        safe_lsn = min(checkpoint.local_lsn, checkpoint.global_lsn)
+        removed_segments = await self.wal.compact(safe_lsn)
+        
+        # Clean old checkpoints
+        await self._clean_old_checkpoints()
+    
+    async def _clean_old_checkpoints(self) -> int:
+        """Remove old checkpoints, keeping most recent N."""
+        checkpoint_files = sorted(
+            self.checkpoint_dir.glob("checkpoint_*.ckpt"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        
+        removed = 0
+        for checkpoint_file in checkpoint_files[self.max_checkpoints_to_keep:]:
+            checkpoint_file.unlink()
+            removed += 1
+        
+        return removed
+    
+    async def recover_from_checkpoint(self) -> tuple[Checkpoint | None, list[WALEntry]]:
+        """
+        Recover from latest checkpoint + WAL replay.
+        
+        Returns:
+        - Latest valid checkpoint (or None)
+        - WAL entries to replay after checkpoint
+        """
+        async with self._logger.context(
+            name="checkpoint_manager",
+            path="hyperscale.ledger.log.json",
+            template="{timestamp} - {level} - {thread_id} - {filename}:{function_name}.{line_number} - {message}",
+        ) as ctx:
+            # Find latest valid checkpoint
+            checkpoint = await self._find_latest_checkpoint()
+            
+            if checkpoint is None:
+                await ctx.log(
+                    Entry(
+                        message="No checkpoint found, full WAL replay required",
+                        level=LogLevel.WARNING,
+                    )
+                )
+                # Open WAL for full replay
+                wal_recovery = await self.wal.open()
+                return None, wal_recovery.pending_entries
+            
+            await ctx.log(
+                Entry(
+                    message=f"Recovering from checkpoint {checkpoint.checkpoint_id} at LSN {checkpoint.local_lsn}",
+                    level=LogLevel.INFO,
+                )
+            )
+            
+            # Restore state from checkpoint
+            await self.state_machine.restore(checkpoint.state_snapshot)
+            
+            # Open WAL and find entries after checkpoint
+            await self.wal.open()
+            entries_to_replay = await self.wal.read_range(
+                checkpoint.local_lsn + 1,
+                self.wal.current_lsn - 1,
+            )
+            
+            await ctx.log(
+                Entry(
+                    message=f"Recovery: replaying {len(entries_to_replay)} WAL entries after checkpoint",
+                    level=LogLevel.INFO,
+                )
+            )
+            
+            return checkpoint, entries_to_replay
+    
+    async def _find_latest_checkpoint(self) -> Checkpoint | None:
+        """Find and validate latest checkpoint."""
+        checkpoint_files = sorted(
+            self.checkpoint_dir.glob("checkpoint_*.ckpt"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        
+        for checkpoint_path in checkpoint_files:
+            try:
+                checkpoint = await self._read_checkpoint_file(checkpoint_path)
+                return checkpoint
+            except Exception:
+                # Corrupted checkpoint, try next
+                continue
+        
+        return None
+    
+    async def _write_checkpoint_file(self, path: Path, checkpoint: Checkpoint) -> None:
+        """Write checkpoint to file."""
+        import pickle
+        
+        data = pickle.dumps(checkpoint)
+        
+        # Write atomically via temp file + rename
+        temp_path = path.with_suffix(".tmp")
+        temp_path.write_bytes(data)
+        temp_path.rename(path)
+    
+    async def _read_checkpoint_file(self, path: Path) -> Checkpoint:
+        """Read checkpoint from file."""
+        import pickle
+        
+        data = path.read_bytes()
+        return pickle.loads(data)
+    
+    async def _get_regional_watermark(self) -> int:
+        """Get highest LSN confirmed by regional consensus."""
+        # Would query regional consensus group
+        return self._last_checkpoint_lsn
+    
+    async def _get_global_watermark(self) -> int:
+        """Get highest LSN confirmed by global ledger."""
+        # Would query global ledger
+        return self._last_checkpoint_lsn
+```
+
+---
+
+## Part 10: Output Examples
+
+### WAL Recovery Log Output
+
+```json
+{"timestamp": "2024-01-15T10:23:45.123Z", "level": "INFO", "thread_id": "140234567890", "filename": "node_wal.py", "function_name": "open", "line_number": 89, "message": "Opening WAL at /data/gate-1/wal"}
+{"timestamp": "2024-01-15T10:23:45.234Z", "level": "INFO", "thread_id": "140234567890", "filename": "node_wal.py", "function_name": "open", "line_number": 142, "message": "WAL recovery complete: 45623 entries, max_lsn=45623, 127 pending"}
+{"timestamp": "2024-01-15T10:23:45.345Z", "level": "INFO", "thread_id": "140234567890", "filename": "checkpoint_manager.py", "function_name": "recover_from_checkpoint", "line_number": 156, "message": "Recovering from checkpoint abc123def456 at LSN 45000"}
+{"timestamp": "2024-01-15T10:23:45.456Z", "level": "INFO", "thread_id": "140234567890", "filename": "checkpoint_manager.py", "function_name": "recover_from_checkpoint", "line_number": 178, "message": "Recovery: replaying 623 WAL entries after checkpoint"}
+```
+
+### Commit Pipeline Log Output
+
+```json
+{"timestamp": "2024-01-15T10:24:00.001Z", "level": "DEBUG", "thread_id": "140234567891", "filename": "commit_pipeline.py", "function_name": "commit_job_event", "line_number": 78, "message": "Event JOB_CREATED for job use1-1705312000000-gate1-00042 written to WAL at LSN 45624"}
+{"timestamp": "2024-01-15T10:24:00.012Z", "level": "DEBUG", "thread_id": "140234567891", "filename": "commit_pipeline.py", "function_name": "commit_job_event", "line_number": 98, "message": "Event LSN 45624 committed to regional consensus"}
+{"timestamp": "2024-01-15T10:24:00.156Z", "level": "INFO", "thread_id": "140234567891", "filename": "commit_pipeline.py", "function_name": "commit_job_event", "line_number": 142, "message": "Event LSN 45624 committed to global ledger"}
+```
+
+### Checkpoint Creation Log Output
+
+```json
+{"timestamp": "2024-01-15T10:30:00.001Z", "level": "INFO", "thread_id": "140234567892", "filename": "checkpoint_manager.py", "function_name": "create_checkpoint", "line_number": 89, "message": "Creating checkpoint at LSN 50000"}
+{"timestamp": "2024-01-15T10:30:00.234Z", "level": "INFO", "thread_id": "140234567892", "filename": "checkpoint_manager.py", "function_name": "create_checkpoint", "line_number": 112, "message": "Checkpoint def789abc012 created at LSN 50000"}
+```
+
+---
+
+## Part 11: File Organization
+
+```
+hyperscale/distributed_rewrite/ledger/
+├── __init__.py
+├── models/
+│   ├── __init__.py
+│   ├── hlc.py                    # HybridLogicalClock
+│   ├── wal_entry.py              # WALEntry, WALEntryState
+│   ├── ledger_entry.py           # JobLedgerEntry
+│   └── recovery_result.py        # RecoveryResult
+├── events/
+│   ├── __init__.py
+│   ├── base.py                   # JobEvent base class
+│   ├── creation.py               # JobCreated, JobAccepted
+│   ├── progress.py               # JobProgressReported
+│   ├── cancellation.py           # JobCancellationRequested/Acked
+│   └── completion.py             # JobCompleted, JobFailed, JobTimedOut
+├── storage/
+│   ├── __init__.py
+│   ├── wal_segment.py            # WALSegment
+│   ├── node_wal.py               # NodeWAL manager
+│   └── ledger_storage.py         # LSM-tree storage for global ledger
+├── consensus/
+│   ├── __init__.py
+│   ├── regional.py               # RegionalConsensusGroup (Raft)
+│   └── flexible_paxos.py         # FlexiblePaxos for cross-region
+├── pipeline/
+│   ├── __init__.py
+│   ├── commit_pipeline.py        # Three-stage commit
+│   └── replication.py            # Cross-region replication
+├── checkpoint/
+│   ├── __init__.py
+│   └── checkpoint_manager.py     # Checkpoint and compaction
+├── anti_entropy/
+│   ├── __init__.py
+│   ├── merkle_tree.py            # Merkle tree for verification
+│   └── repair.py                 # Anti-entropy repair
+├── session/
+│   ├── __init__.py
+│   └── read_session.py           # Session consistency guarantees
+└── global_ledger.py              # GlobalJobLedger facade
+```
+
+---
+
+## Part 12: Integration with Existing Components
+
+**Gate Integration**:
+```
+GateNode
+├── CommitPipeline (AD-38)
+│   ├── NodeWAL (local durability)
+│   ├── RegionalConsensus (DC durability)
+│   └── GlobalLedger (global durability)
+├── GateCancellationCoordinator (AD-20)
+│   └── Uses CommitPipeline with GLOBAL durability
+├── JobRouter (AD-36)
+│   └── Reads from GlobalLedger for job state
+└── BackpressureManager (AD-37)
+    └── Shapes update traffic to ledger
+```
+
+**Manager Integration**:
+```
+ManagerNode
+├── NodeWAL (local operations)
+├── WorkflowStateMachine (AD-33)
+│   └── Persists state transitions to WAL
+├── FederatedHealthMonitor (AD-33)
+│   └── Reads global ledger for cross-DC state
+└── JobLeaderManager (AD-8)
+    └── Uses ledger for leader election state
+```
+
+---
+
+## Part 13: Success Criteria
+
+1. **Durability**: Zero job loss under any single failure (node, rack, region)
+2. **Latency**: LOCAL <1ms, REGIONAL <10ms, GLOBAL <300ms (p99)
+3. **Throughput**: >100K job events/second per region
+4. **Recovery**: <30 seconds from crash to serving requests
+5. **Consistency**: Causal+ consistency for reads, linearizable for critical ops
+6. **Audit**: Complete event history queryable for any time range
+7. **Compaction**: WAL size bounded to 2x active job state
+
+---
+
+## Conclusion
+
+AD-38 provides a robust, multi-tier durability architecture that:
+- Combines per-node WAL for immediate crash recovery
+- Uses regional consensus for datacenter-level durability
+- Employs a global ledger for cross-region consistency
+- Supports event sourcing for audit, debugging, and temporal queries
+- Integrates with existing AD components (AD-20, AD-33, AD-36, AD-37)
+
+The architecture balances latency, throughput, and durability through configurable commit levels, allowing callers to choose the appropriate tradeoff for each operation type.
+
+**References**:
+- `hyperscale/distributed_rewrite/ledger/models/hlc.py` (HybridLogicalClock)
+- `hyperscale/distributed_rewrite/ledger/storage/node_wal.py` (NodeWAL)
+- `hyperscale/distributed_rewrite/ledger/pipeline/commit_pipeline.py` (CommitPipeline)
+- `hyperscale/distributed_rewrite/ledger/checkpoint/checkpoint_manager.py` (CheckpointManager)
