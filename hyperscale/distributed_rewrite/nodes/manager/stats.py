@@ -6,14 +6,41 @@ throughput tracking per AD-19 and AD-23 specifications.
 """
 
 import time
+from enum import Enum
 from typing import TYPE_CHECKING
 
-from hyperscale.logging.hyperscale_logging_models import ServerDebug
+from hyperscale.logging.hyperscale_logging_models import ServerDebug, ServerWarning
 
 if TYPE_CHECKING:
     from hyperscale.distributed_rewrite.nodes.manager.state import ManagerState
     from hyperscale.distributed_rewrite.nodes.manager.config import ManagerConfig
     from hyperscale.logging.hyperscale_logger import Logger
+
+
+class ProgressState(Enum):
+    """
+    Progress state for AD-19 Three-Signal Health Model.
+
+    Tracks dispatch throughput relative to expected capacity.
+    """
+
+    NORMAL = "normal"  # >= 80% of expected throughput
+    SLOW = "slow"  # 50-80% of expected throughput
+    DEGRADED = "degraded"  # 20-50% of expected throughput
+    STUCK = "stuck"  # < 20% of expected throughput
+
+
+class BackpressureLevel(Enum):
+    """
+    Backpressure levels for AD-23.
+
+    Determines how aggressively to shed load.
+    """
+
+    NONE = "none"  # No backpressure
+    THROTTLE = "throttle"  # Slow down incoming requests
+    BATCH = "batch"  # Batch stats updates
+    REJECT = "reject"  # Reject new stats updates
 
 
 class ManagerStatsCoordinator:
@@ -40,6 +67,16 @@ class ManagerStatsCoordinator:
         self._logger = logger
         self._node_id = node_id
         self._task_runner = task_runner
+
+        # AD-19: Progress state tracking
+        self._progress_state = ProgressState.NORMAL
+        self._progress_state_since: float = time.monotonic()
+
+        # AD-23: Stats buffer tracking for backpressure
+        self._stats_buffer_count: int = 0
+        self._stats_buffer_high_watermark: int = 1000
+        self._stats_buffer_critical_watermark: int = 5000
+        self._stats_buffer_reject_watermark: int = 10000
 
     def record_dispatch(self) -> None:
         """Record a workflow dispatch for throughput tracking."""
@@ -86,6 +123,70 @@ class ManagerStatsCoordinator:
         # Assume ~1 dispatch/sec per healthy worker as baseline
         return float(max(healthy_count, 1))
 
+    def get_progress_state(self) -> ProgressState:
+        """
+        Calculate and return current progress state (AD-19).
+
+        Based on ratio of actual throughput to expected throughput:
+        - NORMAL: >= 80%
+        - SLOW: 50-80%
+        - DEGRADED: 20-50%
+        - STUCK: < 20%
+
+        Returns:
+            Current ProgressState
+        """
+        actual = self.get_dispatch_throughput()
+        expected = self.get_expected_throughput()
+
+        if expected <= 0:
+            return ProgressState.NORMAL
+
+        ratio = actual / expected
+        now = time.monotonic()
+
+        if ratio >= 0.8:
+            new_state = ProgressState.NORMAL
+        elif ratio >= 0.5:
+            new_state = ProgressState.SLOW
+        elif ratio >= 0.2:
+            new_state = ProgressState.DEGRADED
+        else:
+            new_state = ProgressState.STUCK
+
+        # Track state changes
+        if new_state != self._progress_state:
+            self._task_runner.run(
+                self._logger.log,
+                ServerWarning(
+                    message=f"Progress state changed: {self._progress_state.value} -> {new_state.value} (ratio={ratio:.2f})",
+                    node_host=self._config.host,
+                    node_port=self._config.tcp_port,
+                    node_id=self._node_id,
+                )
+            )
+            self._progress_state = new_state
+            self._progress_state_since = now
+
+        return self._progress_state
+
+    def get_progress_state_duration(self) -> float:
+        """
+        Get how long we've been in current progress state.
+
+        Returns:
+            Duration in seconds
+        """
+        return time.monotonic() - self._progress_state_since
+
+    def record_stats_buffer_entry(self) -> None:
+        """Record a new entry in the stats buffer for AD-23 tracking."""
+        self._stats_buffer_count += 1
+
+    def record_stats_buffer_flush(self, count: int) -> None:
+        """Record flushing entries from stats buffer."""
+        self._stats_buffer_count = max(0, self._stats_buffer_count - count)
+
     def should_apply_backpressure(self) -> bool:
         """
         Check if backpressure should be applied (AD-23).
@@ -93,19 +194,28 @@ class ManagerStatsCoordinator:
         Returns:
             True if system is under load and should shed requests
         """
-        # Check stats buffer thresholds
-        # In full implementation, this would check StatsBuffer fill level
-        return False
+        return self._stats_buffer_count >= self._stats_buffer_high_watermark
 
-    def get_backpressure_level(self) -> str:
+    def get_backpressure_level(self) -> BackpressureLevel:
         """
         Get current backpressure level (AD-23).
 
+        Based on stats buffer fill level:
+        - NONE: < high watermark
+        - THROTTLE: >= high watermark
+        - BATCH: >= critical watermark
+        - REJECT: >= reject watermark
+
         Returns:
-            "none", "throttle", "batch", or "reject"
+            Current BackpressureLevel
         """
-        # In full implementation, this checks StatsBuffer thresholds
-        return "none"
+        if self._stats_buffer_count >= self._stats_buffer_reject_watermark:
+            return BackpressureLevel.REJECT
+        elif self._stats_buffer_count >= self._stats_buffer_critical_watermark:
+            return BackpressureLevel.BATCH
+        elif self._stats_buffer_count >= self._stats_buffer_high_watermark:
+            return BackpressureLevel.THROTTLE
+        return BackpressureLevel.NONE
 
     def record_progress_update(self, job_id: str, workflow_id: str) -> None:
         """
@@ -131,6 +241,9 @@ class ManagerStatsCoordinator:
         return {
             "dispatch_throughput": self.get_dispatch_throughput(),
             "expected_throughput": self.get_expected_throughput(),
-            "backpressure_level": self.get_backpressure_level(),
+            "progress_state": self._progress_state.value,
+            "progress_state_duration": self.get_progress_state_duration(),
+            "backpressure_level": self.get_backpressure_level().value,
+            "stats_buffer_count": self._stats_buffer_count,
             "throughput_count": self._state._dispatch_throughput_count,
         }
