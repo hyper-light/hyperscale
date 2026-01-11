@@ -35923,3 +35923,997 @@ hyperscale/distributed/
 │                                                                          │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
+
+---
+
+## AD-43: Capacity-Aware Spillover and Core Reservation
+
+### Part 1: Problem Statement
+
+**Current Limitation**: Gates route jobs based on datacenter health classification (HEALTHY/BUSY/DEGRADED/UNHEALTHY) but lack visibility into actual core capacity. This creates suboptimal routing:
+
+1. **No Capacity Planning**: Gates don't know "DC-A has 500 total cores, 200 available"
+2. **No Wait Time Estimation**: When a DC is BUSY, gates can't estimate when capacity will free
+3. **First-Come-First-Serve Only**: Jobs queue at the primary DC even when a nearby DC has immediate capacity
+4. **No Proactive Spillover**: Jobs wait in queue instead of spilling to DCs with available cores
+
+**Example Problem**:
+```
+Job X requires 100 cores
+DC-A (primary): 50 available, queue depth 20, ~5 min until cores free
+DC-B (nearby):  200 available, queue depth 0
+
+Current behavior: Job X queues at DC-A, waits 5+ minutes
+Desired behavior: Job X spills to DC-B, starts immediately
+```
+
+### Part 2: Execution Model
+
+Understanding the execution model is critical for this design:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         EXECUTION MODEL                                  │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  WORKER (N cores)                                                        │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │                                                                    │  │
+│  │   ┌─────┐  ┌─────┐  ┌─────┐  ┌─────┐  ┌─────┐  ┌─────┐           │  │
+│  │   │ C0  │  │ C1  │  │ C2  │  │ C3  │  │ C4  │  │ C5  │  ...      │  │
+│  │   │busy │  │free │  │busy │  │free │  │busy │  │free │           │  │
+│  │   └─────┘  └─────┘  └─────┘  └─────┘  └─────┘  └─────┘           │  │
+│  │                                                                    │  │
+│  │   • Exactly 1 workflow per core (strict 1:1 mapping)              │  │
+│  │   • NO queue at worker level                                       │  │
+│  │   • Reports available_cores to manager                             │  │
+│  │   • Rejects dispatch if no cores available                         │  │
+│  │                                                                    │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│                                                                          │
+│  MANAGER                                                                 │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │                                                                    │  │
+│  │   Active Dispatches (workflows executing on workers)               │  │
+│  │   ┌────────────────────────────────────────────────────────────┐  │  │
+│  │   │ workflow_id │ worker_id │ dispatched_at │ duration_seconds │  │  │
+│  │   │ wf-001      │ worker-A  │ 1704567890.0  │ 120.0            │  │  │
+│  │   │ wf-002      │ worker-A  │ 1704567900.0  │ 60.0             │  │  │
+│  │   │ wf-003      │ worker-B  │ 1704567880.0  │ 180.0            │  │  │
+│  │   └────────────────────────────────────────────────────────────┘  │  │
+│  │                                                                    │  │
+│  │   Pending Queue (workflows waiting for cores)                      │  │
+│  │   ┌────────────────────────────────────────────────────────────┐  │  │
+│  │   │ [W4: 60s] → [W5: 120s] → [W6: 90s] → [W7: 60s] → ...      │  │  │
+│  │   └────────────────────────────────────────────────────────────┘  │  │
+│  │                                                                    │  │
+│  │   • Dispatches workflows to workers with available cores           │  │
+│  │   • Tracks pending workflows with their declared durations         │  │
+│  │   • Calculates estimated time until cores free                     │  │
+│  │   • Reports capacity metrics to gates                              │  │
+│  │                                                                    │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│                                                                          │
+│  GATE                                                                    │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │                                                                    │  │
+│  │   Aggregated DC Capacity (from all managers in DC)                 │  │
+│  │   ┌────────────────────────────────────────────────────────────┐  │  │
+│  │   │ DC         │ total │ avail │ pending │ est_wait_sec       │  │  │
+│  │   │ dc-east    │ 1000  │ 200   │ 15      │ 180.0              │  │  │
+│  │   │ dc-west    │ 800   │ 500   │ 5       │ 45.0               │  │  │
+│  │   │ dc-central │ 1200  │ 0     │ 30      │ 420.0              │  │  │
+│  │   └────────────────────────────────────────────────────────────┘  │  │
+│  │                                                                    │  │
+│  │   • Aggregates capacity across all managers per DC                 │  │
+│  │   • Makes spillover decisions based on capacity + wait time        │  │
+│  │   • Routes jobs to DC with best capacity/latency tradeoff          │  │
+│  │                                                                    │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Part 3: Workflow Duration Source
+
+Workflows declare their expected duration as a class attribute:
+
+```python
+# From hyperscale/core/graph/workflow.py
+class Workflow:
+    vus: int = 1000
+    duration: str = "1m"   # Expected execution duration
+    timeout: str = "30s"   # Additional timeout buffer
+    # ...
+```
+
+Duration is parsed using `TimeParser`:
+
+```python
+# From hyperscale/distributed/taskex/util/time_parser.py
+class TimeParser:
+    """
+    Parses duration strings like "1m", "30s", "2h", "1m30s".
+    Returns total_seconds as float.
+    """
+    UNITS = {"s": "seconds", "m": "minutes", "h": "hours", "d": "days", "w": "weeks"}
+
+    def __init__(self, time_amount: str) -> None:
+        self.time = float(
+            timedelta(**{
+                self.UNITS.get(m.group("unit").lower(), "seconds"): float(m.group("val"))
+                for m in re.finditer(r"(?P<val>\d+(\.\d+)?)(?P<unit>[smhdw]?)", time_amount)
+            }).total_seconds()
+        )
+```
+
+**Key Insight**: Since workflows declare their duration upfront, managers can calculate:
+1. Remaining time for active dispatches: `duration - (now - dispatched_at)`
+2. Total pending queue duration: `sum(pending_workflow.duration for each pending)`
+3. Estimated time until N cores free up
+
+### Part 4: Manager Execution Time Estimation
+
+#### Active Dispatch Tracking
+
+Managers must track active dispatches with their durations:
+
+```python
+# Extension to manager state
+@dataclass(slots=True)
+class ActiveDispatch:
+    """
+    Tracks a workflow currently executing on a worker.
+    """
+    workflow_id: str
+    job_id: str
+    worker_id: str
+    cores_allocated: int
+    dispatched_at: float          # time.monotonic() when dispatched
+    duration_seconds: float       # From Workflow.duration (parsed)
+    timeout_seconds: float        # From Workflow.timeout (parsed)
+
+    def remaining_seconds(self, now: float) -> float:
+        """Estimate remaining execution time."""
+        elapsed = now - self.dispatched_at
+        remaining = self.duration_seconds - elapsed
+        return max(0.0, remaining)
+
+    def expected_completion(self) -> float:
+        """Expected completion timestamp (monotonic)."""
+        return self.dispatched_at + self.duration_seconds
+```
+
+#### Estimated Wait Time Calculation
+
+```python
+# In WorkflowDispatcher or ManagerState
+class ExecutionTimeEstimator:
+    """
+    Estimates when cores will become available.
+
+    Uses workflow duration declarations to predict completion times.
+    """
+
+    def __init__(
+        self,
+        active_dispatches: dict[str, ActiveDispatch],
+        pending_workflows: dict[str, PendingWorkflow],
+        total_cores: int,
+    ):
+        self._active = active_dispatches
+        self._pending = pending_workflows
+        self._total_cores = total_cores
+
+    def estimate_wait_for_cores(self, cores_needed: int) -> float:
+        """
+        Estimate seconds until `cores_needed` cores are available.
+
+        Algorithm:
+        1. Get completion times for all active dispatches
+        2. Sort by expected completion
+        3. Simulate cores freeing up
+        4. Return time when enough cores available
+        """
+        now = time.monotonic()
+
+        # Build list of (completion_time, cores_freeing)
+        completions: list[tuple[float, int]] = []
+        for dispatch in self._active.values():
+            completion = dispatch.expected_completion()
+            if completion > now:
+                completions.append((completion, dispatch.cores_allocated))
+
+        # Sort by completion time
+        completions.sort(key=lambda x: x[0])
+
+        # Calculate current available
+        active_cores = sum(d.cores_allocated for d in self._active.values())
+        available_cores = self._total_cores - active_cores
+
+        if available_cores >= cores_needed:
+            return 0.0  # Already have capacity
+
+        # Simulate cores freeing up
+        for completion_time, cores_freeing in completions:
+            available_cores += cores_freeing
+            if available_cores >= cores_needed:
+                return completion_time - now
+
+        # If we get here, not enough cores even after all complete
+        # This means job requires more cores than DC has
+        return float('inf')
+
+    def get_pending_duration_sum(self) -> float:
+        """Sum of all pending workflow durations."""
+        total = 0.0
+        for pending in self._pending.values():
+            if not pending.dispatched:
+                # Parse duration from workflow
+                duration = TimeParser(pending.workflow.duration).time
+                total += duration
+        return total
+
+    def get_active_remaining_sum(self) -> float:
+        """Sum of remaining time for all active dispatches."""
+        now = time.monotonic()
+        return sum(d.remaining_seconds(now) for d in self._active.values())
+```
+
+### Part 5: Extended ManagerHeartbeat
+
+Add capacity estimation fields to ManagerHeartbeat:
+
+```python
+# Extension to distributed/models/distributed.py
+@dataclass(slots=True)
+class ManagerHeartbeat(Message):
+    # ... existing fields ...
+
+    # AD-43: Capacity estimation fields
+    pending_workflow_count: int = 0           # Workflows waiting for cores
+    pending_duration_seconds: float = 0.0     # Sum of pending workflow durations
+    active_remaining_seconds: float = 0.0     # Sum of remaining time for active workflows
+    estimated_cores_free_at: float = 0.0      # Monotonic time when next cores free
+    estimated_cores_freeing: int = 0          # How many cores freeing at that time
+
+    # For more detailed capacity planning
+    cores_freeing_schedule: bytes = b""       # Serialized list[(time_offset, cores)]
+```
+
+#### Building the Extended Heartbeat
+
+```python
+# In manager/server.py or heartbeat builder
+def _build_manager_heartbeat(self) -> ManagerHeartbeat:
+    """Build heartbeat with capacity estimation."""
+    now = time.monotonic()
+
+    # Get execution time estimator
+    estimator = ExecutionTimeEstimator(
+        active_dispatches=self._state._active_dispatches,
+        pending_workflows=self._dispatcher._pending,
+        total_cores=self._get_total_cores(),
+    )
+
+    # Calculate capacity metrics
+    pending_count = len([p for p in self._dispatcher._pending.values() if not p.dispatched])
+    pending_duration = estimator.get_pending_duration_sum()
+    active_remaining = estimator.get_active_remaining_sum()
+
+    # Find next completion
+    next_completion = float('inf')
+    next_cores = 0
+    for dispatch in self._state._active_dispatches.values():
+        completion = dispatch.expected_completion()
+        if completion > now and completion < next_completion:
+            next_completion = completion
+            next_cores = dispatch.cores_allocated
+
+    return ManagerHeartbeat(
+        # ... existing fields ...
+
+        # AD-43 capacity fields
+        pending_workflow_count=pending_count,
+        pending_duration_seconds=pending_duration,
+        active_remaining_seconds=active_remaining,
+        estimated_cores_free_at=next_completion if next_completion != float('inf') else 0.0,
+        estimated_cores_freeing=next_cores,
+    )
+```
+
+### Part 6: Gate Capacity Aggregation
+
+Gates aggregate manager heartbeats into DC-wide capacity:
+
+```python
+# In datacenters/datacenter_capacity.py
+@dataclass(slots=True)
+class DatacenterCapacity:
+    """
+    Aggregated capacity for a datacenter.
+
+    Built from ManagerHeartbeats across all managers in the DC.
+    """
+    datacenter_id: str
+    total_cores: int                    # Sum across all managers
+    available_cores: int                # Sum across healthy managers
+    pending_workflow_count: int         # Sum across all managers
+    pending_duration_seconds: float     # Sum across all managers
+    active_remaining_seconds: float     # Sum across all managers
+
+    # Computed metrics
+    estimated_wait_seconds: float       # For a typical workflow
+    utilization: float                  # available / total
+
+    # Health classification (from AD-16)
+    health_bucket: str                  # HEALTHY, BUSY, DEGRADED, UNHEALTHY
+
+    # Timing
+    last_updated: float                 # time.monotonic()
+
+    @classmethod
+    def aggregate(
+        cls,
+        datacenter_id: str,
+        heartbeats: list[ManagerHeartbeat],
+        health_bucket: str,
+    ) -> "DatacenterCapacity":
+        """Aggregate capacity from manager heartbeats."""
+        if not heartbeats:
+            return cls(
+                datacenter_id=datacenter_id,
+                total_cores=0,
+                available_cores=0,
+                pending_workflow_count=0,
+                pending_duration_seconds=0.0,
+                active_remaining_seconds=0.0,
+                estimated_wait_seconds=float('inf'),
+                utilization=0.0,
+                health_bucket=health_bucket,
+                last_updated=time.monotonic(),
+            )
+
+        total_cores = sum(h.total_cores for h in heartbeats)
+        available_cores = sum(h.available_cores for h in heartbeats)
+        pending_count = sum(h.pending_workflow_count for h in heartbeats)
+        pending_duration = sum(h.pending_duration_seconds for h in heartbeats)
+        active_remaining = sum(h.active_remaining_seconds for h in heartbeats)
+
+        # Estimate wait time (simplified: pending_duration / cores if no capacity)
+        if available_cores > 0:
+            estimated_wait = 0.0
+        elif total_cores > 0:
+            # Average time per pending workflow * queue depth / parallelism
+            avg_duration = pending_duration / max(1, pending_count)
+            estimated_wait = (pending_count * avg_duration) / total_cores
+        else:
+            estimated_wait = float('inf')
+
+        utilization = 1.0 - (available_cores / total_cores) if total_cores > 0 else 1.0
+
+        return cls(
+            datacenter_id=datacenter_id,
+            total_cores=total_cores,
+            available_cores=available_cores,
+            pending_workflow_count=pending_count,
+            pending_duration_seconds=pending_duration,
+            active_remaining_seconds=active_remaining,
+            estimated_wait_seconds=estimated_wait,
+            utilization=utilization,
+            health_bucket=health_bucket,
+            last_updated=time.monotonic(),
+        )
+
+    def can_serve_immediately(self, cores_required: int) -> bool:
+        """Check if DC can serve job immediately."""
+        return self.available_cores >= cores_required
+
+    def estimated_wait_for_cores(self, cores_required: int) -> float:
+        """Estimate wait time for specific core count."""
+        if self.available_cores >= cores_required:
+            return 0.0
+
+        # Simplified estimation
+        cores_needed = cores_required - self.available_cores
+        if self.total_cores == 0:
+            return float('inf')
+
+        # Estimate based on active remaining + pending duration
+        total_work_remaining = self.active_remaining_seconds + self.pending_duration_seconds
+        throughput = self.total_cores  # cores processed per second of work
+
+        return total_work_remaining / throughput if throughput > 0 else float('inf')
+```
+
+### Part 7: Spillover Decision Logic
+
+Extend GateJobRouter with capacity-aware spillover:
+
+```python
+# In routing/spillover.py
+@dataclass(slots=True)
+class SpilloverDecision:
+    """Result of spillover evaluation."""
+    should_spillover: bool
+    reason: str
+    primary_dc: str
+    spillover_dc: str | None
+    primary_wait_seconds: float
+    spillover_wait_seconds: float
+    latency_penalty_ms: float       # Additional RTT to spillover DC
+
+
+class SpilloverEvaluator:
+    """
+    Evaluates whether to spillover a job to a different datacenter.
+
+    Spillover triggers when:
+    1. Primary DC cannot serve immediately (available_cores < required)
+    2. Primary DC wait time exceeds threshold
+    3. A nearby DC has immediate capacity
+    4. Latency penalty is acceptable
+    """
+
+    def __init__(self, env: Env):
+        self._max_wait_seconds = env.SPILLOVER_MAX_WAIT_SECONDS
+        self._max_latency_penalty_ms = env.SPILLOVER_MAX_LATENCY_PENALTY_MS
+        self._min_improvement_ratio = env.SPILLOVER_MIN_IMPROVEMENT_RATIO
+
+    def evaluate(
+        self,
+        job_cores_required: int,
+        primary_capacity: DatacenterCapacity,
+        fallback_capacities: list[tuple[DatacenterCapacity, float]],  # (capacity, rtt_ms)
+        primary_rtt_ms: float,
+    ) -> SpilloverDecision:
+        """
+        Evaluate spillover decision.
+
+        Args:
+            job_cores_required: Cores needed by the job
+            primary_capacity: Capacity of primary (preferred) DC
+            fallback_capacities: List of (capacity, rtt_ms) for fallback DCs
+            primary_rtt_ms: RTT to primary DC
+
+        Returns:
+            SpilloverDecision with recommendation
+        """
+        # Check if primary can serve immediately
+        if primary_capacity.can_serve_immediately(job_cores_required):
+            return SpilloverDecision(
+                should_spillover=False,
+                reason="primary_has_capacity",
+                primary_dc=primary_capacity.datacenter_id,
+                spillover_dc=None,
+                primary_wait_seconds=0.0,
+                spillover_wait_seconds=0.0,
+                latency_penalty_ms=0.0,
+            )
+
+        # Calculate primary wait time
+        primary_wait = primary_capacity.estimated_wait_for_cores(job_cores_required)
+
+        # If wait is acceptable, don't spillover
+        if primary_wait <= self._max_wait_seconds:
+            return SpilloverDecision(
+                should_spillover=False,
+                reason="primary_wait_acceptable",
+                primary_dc=primary_capacity.datacenter_id,
+                spillover_dc=None,
+                primary_wait_seconds=primary_wait,
+                spillover_wait_seconds=0.0,
+                latency_penalty_ms=0.0,
+            )
+
+        # Find best spillover candidate
+        best_spillover: tuple[DatacenterCapacity, float] | None = None
+        best_score = float('inf')
+
+        for capacity, rtt_ms in fallback_capacities:
+            # Skip if no immediate capacity
+            if not capacity.can_serve_immediately(job_cores_required):
+                continue
+
+            # Check latency penalty
+            latency_penalty = rtt_ms - primary_rtt_ms
+            if latency_penalty > self._max_latency_penalty_ms:
+                continue
+
+            # Score: lower is better (favor low latency)
+            score = latency_penalty
+            if score < best_score:
+                best_score = score
+                best_spillover = (capacity, rtt_ms)
+
+        if best_spillover is None:
+            # No suitable spillover target
+            return SpilloverDecision(
+                should_spillover=False,
+                reason="no_spillover_with_capacity",
+                primary_dc=primary_capacity.datacenter_id,
+                spillover_dc=None,
+                primary_wait_seconds=primary_wait,
+                spillover_wait_seconds=0.0,
+                latency_penalty_ms=0.0,
+            )
+
+        spillover_capacity, spillover_rtt = best_spillover
+        latency_penalty = spillover_rtt - primary_rtt_ms
+
+        # Check improvement ratio
+        # Spillover should significantly improve wait time
+        spillover_wait = spillover_capacity.estimated_wait_for_cores(job_cores_required)
+        if spillover_wait > primary_wait * self._min_improvement_ratio:
+            return SpilloverDecision(
+                should_spillover=False,
+                reason="improvement_insufficient",
+                primary_dc=primary_capacity.datacenter_id,
+                spillover_dc=spillover_capacity.datacenter_id,
+                primary_wait_seconds=primary_wait,
+                spillover_wait_seconds=spillover_wait,
+                latency_penalty_ms=latency_penalty,
+            )
+
+        return SpilloverDecision(
+            should_spillover=True,
+            reason="spillover_improves_wait_time",
+            primary_dc=primary_capacity.datacenter_id,
+            spillover_dc=spillover_capacity.datacenter_id,
+            primary_wait_seconds=primary_wait,
+            spillover_wait_seconds=spillover_wait,
+            latency_penalty_ms=latency_penalty,
+        )
+```
+
+### Part 8: Integration with AD-36 Routing
+
+Extend GateJobRouter to use capacity-aware spillover:
+
+```python
+# In routing/gate_job_router.py
+class GateJobRouter:
+    """
+    Routes jobs to datacenters with capacity-aware spillover.
+
+    Extends AD-36 routing with:
+    - DC-wide capacity aggregation
+    - Spillover based on wait time estimation
+    - Core requirement awareness
+    """
+
+    def __init__(
+        self,
+        env: Env,
+        capacity_aggregator: DatacenterCapacityAggregator,
+        coordinate_tracker: CoordinateTracker,
+        # ... existing dependencies ...
+    ):
+        self._env = env
+        self._capacity_aggregator = capacity_aggregator
+        self._coordinate_tracker = coordinate_tracker
+        self._spillover_evaluator = SpilloverEvaluator(env)
+        # ... existing initialization ...
+
+    async def route_job(
+        self,
+        job_id: str,
+        cores_required: int,                    # AD-43: Core requirement
+        preferred_datacenters: list[str] | None = None,
+    ) -> RoutingDecision:
+        """
+        Route job with capacity-aware spillover.
+
+        Args:
+            job_id: Job identifier
+            cores_required: Total cores needed by job
+            preferred_datacenters: User-preferred DCs (optional)
+
+        Returns:
+            RoutingDecision with primary and fallback DCs
+        """
+        # Step 1: Get DC candidates (existing AD-36 logic)
+        candidates = await self._get_datacenter_candidates(preferred_datacenters)
+
+        # Step 2: Filter by health bucket (existing AD-36 logic)
+        bucket_result = self._bucket_selector.select_bucket(candidates)
+
+        # Step 3: Get capacity for each candidate
+        capacities: dict[str, DatacenterCapacity] = {}
+        for candidate in bucket_result.primary_candidates:
+            capacity = self._capacity_aggregator.get_capacity(candidate.datacenter_id)
+            capacities[candidate.datacenter_id] = capacity
+
+        # Step 4: Score candidates (existing AD-36 logic)
+        scored = self._score_candidates(bucket_result.primary_candidates)
+
+        if not scored:
+            return RoutingDecision.no_capacity(job_id)
+
+        # Step 5: Select primary DC
+        primary = scored[0]
+        primary_capacity = capacities[primary.datacenter_id]
+        primary_rtt = primary.rtt_ucb_ms
+
+        # Step 6: Evaluate spillover (AD-43)
+        fallback_with_rtt = [
+            (capacities[c.datacenter_id], c.rtt_ucb_ms)
+            for c in scored[1:]
+            if c.datacenter_id in capacities
+        ]
+
+        spillover = self._spillover_evaluator.evaluate(
+            job_cores_required=cores_required,
+            primary_capacity=primary_capacity,
+            fallback_capacities=fallback_with_rtt,
+            primary_rtt_ms=primary_rtt,
+        )
+
+        # Step 7: Build routing decision
+        if spillover.should_spillover and spillover.spillover_dc:
+            # Route to spillover DC
+            return RoutingDecision(
+                job_id=job_id,
+                primary_datacenter=spillover.spillover_dc,
+                fallback_datacenters=[primary.datacenter_id] + [
+                    c.datacenter_id for c in scored[1:]
+                    if c.datacenter_id != spillover.spillover_dc
+                ],
+                reason=f"spillover: {spillover.reason}",
+                wait_estimate_seconds=spillover.spillover_wait_seconds,
+                latency_penalty_ms=spillover.latency_penalty_ms,
+            )
+        else:
+            # Route to primary DC
+            return RoutingDecision(
+                job_id=job_id,
+                primary_datacenter=primary.datacenter_id,
+                fallback_datacenters=[c.datacenter_id for c in scored[1:]],
+                reason=f"primary: {spillover.reason}",
+                wait_estimate_seconds=spillover.primary_wait_seconds,
+                latency_penalty_ms=0.0,
+            )
+```
+
+### Part 9: Environment Configuration
+
+Add spillover configuration to Env:
+
+```python
+# In distributed/env/env.py
+class Env(BaseModel):
+    # ... existing fields ...
+
+    # AD-43: Capacity-Aware Spillover Configuration
+    SPILLOVER_MAX_WAIT_SECONDS: StrictFloat = 60.0
+    # Maximum acceptable wait time before considering spillover.
+    # If primary DC wait exceeds this, evaluate spillover to nearby DCs.
+
+    SPILLOVER_MAX_LATENCY_PENALTY_MS: StrictFloat = 100.0
+    # Maximum additional RTT penalty for spillover DC.
+    # Won't spillover to DC with RTT > primary_rtt + this value.
+
+    SPILLOVER_MIN_IMPROVEMENT_RATIO: StrictFloat = 0.5
+    # Minimum improvement required to justify spillover.
+    # Spillover wait must be < primary_wait * this ratio.
+
+    SPILLOVER_ENABLED: StrictBool = True
+    # Enable/disable capacity-aware spillover.
+    # When disabled, falls back to AD-36 health-bucket routing only.
+
+    CAPACITY_STALENESS_THRESHOLD_SECONDS: StrictFloat = 30.0
+    # Maximum age of capacity data before considering it stale.
+    # Stale capacity data falls back to health-bucket routing.
+
+    CAPACITY_AGGREGATION_INTERVAL_SECONDS: StrictFloat = 5.0
+    # How often gates aggregate capacity from manager heartbeats.
+```
+
+### Part 10: Data Flow Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    AD-43 CAPACITY-AWARE SPILLOVER DATA FLOW             │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  1. WORKFLOW DURATION TRACKING (Manager)                                │
+│  ───────────────────────────────────────                                │
+│                                                                          │
+│  On workflow dispatch:                                                   │
+│    duration = TimeParser(workflow.duration).time  # e.g., "1m" → 60.0   │
+│    active_dispatch = ActiveDispatch(                                     │
+│        workflow_id=workflow_id,                                          │
+│        dispatched_at=time.monotonic(),                                  │
+│        duration_seconds=duration,                                        │
+│    )                                                                     │
+│    _active_dispatches[workflow_id] = active_dispatch                    │
+│                                                                          │
+│  2. CAPACITY ESTIMATION (Manager)                                       │
+│  ────────────────────────────────                                       │
+│                                                                          │
+│  On heartbeat build:                                                     │
+│    pending_count = len(pending_workflows)                               │
+│    pending_duration = sum(TimeParser(w.duration).time for w in pending) │
+│    active_remaining = sum(d.remaining_seconds() for d in active)        │
+│                                                                          │
+│    heartbeat.pending_workflow_count = pending_count                     │
+│    heartbeat.pending_duration_seconds = pending_duration                │
+│    heartbeat.active_remaining_seconds = active_remaining                │
+│                                                                          │
+│  3. HEARTBEAT TRANSMISSION (Manager → Gate)                             │
+│  ──────────────────────────────────────────                             │
+│                                                                          │
+│  ManagerHeartbeat (TCP to gate, every 10s):                             │
+│    {                                                                     │
+│      "available_cores": 150,                                            │
+│      "total_cores": 500,                                                │
+│      "pending_workflow_count": 12,                                      │
+│      "pending_duration_seconds": 720.0,  # 12 workflows × 60s avg      │
+│      "active_remaining_seconds": 180.0,  # 3 workflows × 60s remaining │
+│    }                                                                     │
+│                                                                          │
+│  4. CAPACITY AGGREGATION (Gate)                                         │
+│  ──────────────────────────────                                         │
+│                                                                          │
+│  On heartbeat received:                                                  │
+│    _manager_heartbeats[manager_id] = heartbeat                          │
+│                                                                          │
+│  On aggregation tick (every 5s):                                        │
+│    for dc_id in datacenters:                                            │
+│      heartbeats = [h for m, h in _manager_heartbeats if h.dc == dc_id]  │
+│      capacity = DatacenterCapacity.aggregate(dc_id, heartbeats)         │
+│      _dc_capacities[dc_id] = capacity                                   │
+│                                                                          │
+│  5. SPILLOVER DECISION (Gate)                                           │
+│  ────────────────────────────                                           │
+│                                                                          │
+│  Job arrives: job_id="job-123", cores_required=100                      │
+│                                                                          │
+│  Primary DC (dc-east):                                                   │
+│    capacity.available_cores = 50  (< 100 required)                      │
+│    capacity.estimated_wait = 120s                                       │
+│    rtt = 45ms                                                           │
+│                                                                          │
+│  Evaluate spillover:                                                     │
+│    - Wait 120s > max_wait 60s → consider spillover                      │
+│                                                                          │
+│  Check dc-west:                                                          │
+│    capacity.available_cores = 200 (>= 100 required) ✓                   │
+│    rtt = 80ms                                                           │
+│    latency_penalty = 80 - 45 = 35ms (< 100ms threshold) ✓              │
+│                                                                          │
+│  Decision: SPILLOVER to dc-west                                          │
+│    - Starts immediately (0s wait) vs 120s at primary                    │
+│    - 35ms additional latency (acceptable)                               │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Part 11: Spillover Decision Tree
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                      SPILLOVER DECISION TREE                            │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  Job arrives requiring N cores                                           │
+│       │                                                                  │
+│       ▼                                                                  │
+│  ┌─────────────────────────────────────┐                                │
+│  │ Primary DC has N+ available cores?  │                                │
+│  └────────────────┬────────────────────┘                                │
+│                   │                                                      │
+│          ┌───────┴───────┐                                              │
+│          │ YES           │ NO                                           │
+│          ▼               ▼                                              │
+│    Route to Primary    ┌────────────────────────────┐                   │
+│    (no spillover)      │ Primary wait > threshold?  │                   │
+│                        └─────────────┬──────────────┘                   │
+│                                      │                                   │
+│                         ┌────────────┴────────────┐                     │
+│                         │ NO                      │ YES                 │
+│                         ▼                         ▼                     │
+│                   Queue at Primary         ┌─────────────────────┐      │
+│                   (wait acceptable)        │ Any fallback DC has │      │
+│                                            │ N+ cores AND        │      │
+│                                            │ latency penalty OK? │      │
+│                                            └──────────┬──────────┘      │
+│                                                       │                  │
+│                                          ┌────────────┴────────────┐    │
+│                                          │ NO                      │ YES│
+│                                          ▼                         ▼    │
+│                                    Queue at Primary          ┌──────────┐
+│                                    (no alternative)          │Spillover │
+│                                                              │to best   │
+│                                                              │fallback  │
+│                                                              └──────────┘
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Part 12: Implementation Guide
+
+#### File Structure
+
+```
+hyperscale/distributed/
+├── capacity/
+│   ├── __init__.py
+│   ├── active_dispatch.py          # ActiveDispatch dataclass
+│   ├── execution_estimator.py      # ExecutionTimeEstimator
+│   ├── datacenter_capacity.py      # DatacenterCapacity aggregation
+│   └── capacity_aggregator.py      # Gate-side aggregation service
+├── routing/
+│   ├── spillover.py                # SpilloverEvaluator, SpilloverDecision
+│   └── gate_job_router.py          # Extended with spillover (modify)
+├── nodes/
+│   ├── manager/
+│   │   ├── server.py               # Extended heartbeat building (modify)
+│   │   └── state.py                # Add _active_dispatches tracking (modify)
+│   └── gate/
+│       └── health_coordinator.py   # Capacity aggregation integration (modify)
+├── models/
+│   └── distributed.py              # Extended ManagerHeartbeat (modify)
+└── env/
+    └── env.py                      # Spillover configuration (modify)
+```
+
+#### Integration Points
+
+1. **ManagerHeartbeat** (distributed/models/distributed.py):
+   - Add `pending_workflow_count: int`
+   - Add `pending_duration_seconds: float`
+   - Add `active_remaining_seconds: float`
+   - Add `estimated_cores_free_at: float`
+   - Add `estimated_cores_freeing: int`
+
+2. **ManagerState** (distributed/nodes/manager/state.py):
+   - Add `_active_dispatches: dict[str, ActiveDispatch]`
+   - Track dispatches with duration on dispatch
+   - Remove on completion/failure
+
+3. **WorkflowDispatcher** (distributed/jobs/workflow_dispatcher.py):
+   - On dispatch success: Create ActiveDispatch with parsed duration
+   - On completion: Remove ActiveDispatch
+   - Provide pending duration calculation
+
+4. **Manager Server** (distributed/nodes/manager/server.py):
+   - Extend `_build_manager_heartbeat()` with capacity fields
+   - Use ExecutionTimeEstimator for calculations
+
+5. **GateHealthCoordinator** (distributed/nodes/gate/health_coordinator.py):
+   - Store capacity data from ManagerHeartbeats
+   - Aggregate into DatacenterCapacity per DC
+   - Provide to GateJobRouter
+
+6. **GateJobRouter** (distributed/routing/gate_job_router.py):
+   - Accept `cores_required` parameter
+   - Use SpilloverEvaluator for spillover decisions
+   - Return extended RoutingDecision with wait estimates
+
+7. **Env** (distributed/env/env.py):
+   - Add `SPILLOVER_*` configuration variables
+   - Add `CAPACITY_*` configuration variables
+
+### Part 13: Example Scenarios
+
+#### Scenario 1: Normal Routing (No Spillover)
+
+```
+Job: cores_required=50
+DC-East: available=200, wait=0s, rtt=30ms
+DC-West: available=150, wait=0s, rtt=80ms
+
+Decision: Route to DC-East
+Reason: Primary has capacity, no spillover needed
+```
+
+#### Scenario 2: Spillover Due to Wait Time
+
+```
+Job: cores_required=100
+DC-East (primary): available=20, wait=120s, rtt=30ms
+DC-West (fallback): available=150, wait=0s, rtt=80ms
+
+Evaluation:
+- Primary wait (120s) > threshold (60s) → consider spillover
+- DC-West has capacity (150 >= 100) ✓
+- Latency penalty (50ms) < threshold (100ms) ✓
+- Improvement: 0s vs 120s → significant
+
+Decision: Spillover to DC-West
+Reason: Wait time improvement outweighs latency penalty
+```
+
+#### Scenario 3: No Spillover (Latency Too High)
+
+```
+Job: cores_required=100
+DC-East (primary): available=20, wait=90s, rtt=30ms
+DC-West (fallback): available=150, wait=0s, rtt=200ms
+
+Evaluation:
+- Primary wait (90s) > threshold (60s) → consider spillover
+- DC-West has capacity (150 >= 100) ✓
+- Latency penalty (170ms) > threshold (100ms) ✗
+
+Decision: Queue at DC-East
+Reason: Spillover latency penalty too high
+```
+
+#### Scenario 4: No Spillover (Acceptable Wait)
+
+```
+Job: cores_required=50
+DC-East (primary): available=20, wait=45s, rtt=30ms
+DC-West (fallback): available=100, wait=0s, rtt=60ms
+
+Evaluation:
+- Primary wait (45s) <= threshold (60s) → don't spillover
+
+Decision: Queue at DC-East
+Reason: Wait time acceptable, prefer lower latency
+```
+
+### Part 14: Failure Mode Analysis
+
+| Failure | Impact | Mitigation |
+|---------|--------|------------|
+| Stale capacity data | Incorrect spillover decisions | Staleness threshold; fall back to health buckets |
+| Duration estimates wrong | Wait time miscalculation | Use timeout as upper bound; track actual vs estimated |
+| Heartbeat delayed | Capacity data outdated | Multiple manager aggregation; use best available |
+| Spillover target becomes busy | Job waits at spillover DC | Include fallback chain; re-route on failure |
+| All DCs at capacity | Job queues anyway | Graceful degradation; use least-wait DC |
+| Network partition | Gates see partial capacity | Conservative (lower) capacity estimation |
+| Manager crash | Lost active dispatch data | Failover rebuilds from worker state |
+| Duration not declared | Can't estimate wait | Default duration from env; log warning |
+
+### Part 15: Design Decision Summary
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    AD-43 DESIGN DECISION SUMMARY                        │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  DECISION                  CHOICE                 RATIONALE              │
+│  ──────────────────────────────────────────────────────────────────────│
+│                                                                          │
+│  Capacity tracking         Manager-side           Workers have no queue; │
+│  location                  (pending queue)        managers own dispatch  │
+│                                                                          │
+│  Duration source           Workflow.duration      Static declaration     │
+│                            class attribute        enables prediction     │
+│                                                                          │
+│  Wait estimation           Sum of pending +       Simple, conservative,  │
+│                            active remaining       easy to compute        │
+│                                                                          │
+│  Spillover trigger         Wait > threshold       Balances responsiveness│
+│                            AND capacity exists    with stability         │
+│                                                                          │
+│  Latency constraint        Max penalty (100ms)    Prevents routing to    │
+│                                                   distant DCs            │
+│                                                                          │
+│  Aggregation level         Per-DC (all managers)  Matches routing        │
+│                                                   granularity            │
+│                                                                          │
+│  Heartbeat extension       5 new fields           Minimal overhead,      │
+│                                                   fits existing pattern  │
+│                                                                          │
+│  Configuration             Env variables          Consistent with        │
+│                                                   existing patterns      │
+│                                                                          │
+│  Fallback behavior         Health-bucket routing  Graceful degradation   │
+│                            (AD-36)                when capacity stale    │
+│                                                                          │
+│  WHY THIS IS CORRECT:                                                    │
+│                                                                          │
+│  1. Workers execute 1 workflow/core - queue is definitionally at manager│
+│  2. Static duration declaration enables wait time prediction            │
+│  3. Gates already receive ManagerHeartbeats - minimal new infrastructure│
+│  4. Spillover decisions use existing Vivaldi RTT (AD-35)               │
+│  5. Health bucket fallback (AD-36) ensures graceful degradation        │
+│  6. All parameters Env-configurable for operational tuning             │
+│  7. Extends rather than replaces existing routing                      │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
