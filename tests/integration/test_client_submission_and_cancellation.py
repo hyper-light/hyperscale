@@ -513,8 +513,8 @@ class TestClientCancellationManager:
         result = await manager.cancel_job(job_id)
 
         assert result.already_cancelled is True
-        # Should update status to CANCELLED
-        assert self.state._jobs[job_id] == "CANCELLED"
+        # Should update status to cancelled
+        assert self.state._jobs[job_id].status == "cancelled"
 
     @pytest.mark.asyncio
     async def test_cancellation_already_completed(self):
@@ -543,7 +543,7 @@ class TestClientCancellationManager:
         result = await manager.cancel_job(job_id)
 
         assert result.already_completed is True
-        assert self.state._jobs[job_id] == "COMPLETED"
+        assert self.state._jobs[job_id].status == "completed"
 
     @pytest.mark.asyncio
     async def test_cancellation_with_rate_limiting(self):
