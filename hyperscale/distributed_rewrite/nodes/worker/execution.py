@@ -3,11 +3,14 @@ Worker execution module.
 
 Handles workflow execution, progress reporting, and cleanup
 for worker dispatch operations (AD-33 compliance).
+
+Note: Throughput and progress buffer state is delegated to WorkerState
+to maintain single source of truth (no duplicate state).
 """
 
 import asyncio
 import time
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from hyperscale.distributed_rewrite.models import (
     WorkflowProgress,
@@ -18,6 +21,7 @@ if TYPE_CHECKING:
     from hyperscale.logging import Logger
     from hyperscale.distributed_rewrite.jobs import CoreAllocator
     from .backpressure import WorkerBackpressureManager
+    from .state import WorkerState
 
 
 class WorkerExecutor:
@@ -26,12 +30,16 @@ class WorkerExecutor:
 
     Manages workflow dispatch, progress monitoring, status transitions,
     and cleanup. Preserves AD-33 workflow state machine transitions.
+
+    Delegates throughput tracking and progress buffering to WorkerState
+    to avoid duplicate state.
     """
 
     def __init__(
         self,
         core_allocator: "CoreAllocator",
         logger: "Logger",
+        state: "WorkerState",
         progress_update_interval: float = 1.0,
         progress_flush_interval: float = 0.5,
         backpressure_manager: "WorkerBackpressureManager | None" = None,
@@ -42,27 +50,18 @@ class WorkerExecutor:
         Args:
             core_allocator: CoreAllocator for core management
             logger: Logger instance for logging
+            state: WorkerState for throughput/progress tracking (single source of truth)
             progress_update_interval: Interval between progress updates
             progress_flush_interval: Interval for progress buffer flush
             backpressure_manager: Backpressure manager for AD-37 compliance
         """
         self._core_allocator = core_allocator
         self._logger = logger
+        self._state = state
         self._progress_update_interval = progress_update_interval
         self._progress_flush_interval = progress_flush_interval
         self._backpressure_manager = backpressure_manager
         self._running = False
-
-        # Throughput tracking (AD-19)
-        self._throughput_completions: int = 0
-        self._throughput_interval_start: float = time.monotonic()
-        self._throughput_last_value: float = 0.0
-        self._completion_times: list[float] = []
-        self._completion_times_max_samples: int = 50
-
-        # Progress buffering
-        self._progress_buffer: dict[str, WorkflowProgress] = {}
-        self._progress_buffer_lock = asyncio.Lock()
 
     @property
     def available_cores(self) -> int:
@@ -102,40 +101,34 @@ class WorkerExecutor:
         """
         Record a workflow completion event for throughput tracking (AD-19).
 
+        Delegates to WorkerState (single source of truth).
+
         Args:
             completion_time_seconds: Time taken to complete the workflow
         """
-        self._throughput_completions += 1
-        self._completion_times.append(completion_time_seconds)
-        if len(self._completion_times) > self._completion_times_max_samples:
-            self._completion_times.pop(0)
+        self._state.record_completion(completion_time_seconds)
 
     def get_throughput(self) -> float:
         """
         Get current throughput (completions per second).
 
+        Delegates to WorkerState (single source of truth).
+
         Returns:
             Throughput value
         """
-        current_time = time.monotonic()
-        elapsed = current_time - self._throughput_interval_start
-        if elapsed >= 10.0:
-            self._throughput_last_value = self._throughput_completions / elapsed
-            self._throughput_completions = 0
-            self._throughput_interval_start = current_time
-        return self._throughput_last_value
+        return self._state.get_throughput()
 
     def get_expected_throughput(self) -> float:
         """
         Get expected throughput based on average completion time.
 
+        Delegates to WorkerState (single source of truth).
+
         Returns:
             Expected throughput value
         """
-        if not self._completion_times:
-            return 0.0
-        avg_time = sum(self._completion_times) / len(self._completion_times)
-        return 1.0 / avg_time if avg_time > 0 else 0.0
+        return self._state.get_expected_throughput()
 
     async def buffer_progress_update(
         self,
@@ -145,12 +138,14 @@ class WorkerExecutor:
         """
         Buffer a progress update for later flush.
 
+        Delegates to WorkerState (single source of truth).
+
         Args:
             workflow_id: Workflow identifier
             progress: Progress update to buffer
         """
-        async with self._progress_buffer_lock:
-            self._progress_buffer[workflow_id] = progress
+        async with self._state._progress_buffer_lock:
+            self._state._progress_buffer[workflow_id] = progress
 
     async def flush_progress_buffer(
         self,
@@ -162,9 +157,9 @@ class WorkerExecutor:
         Args:
             send_progress: Function to send progress to manager
         """
-        async with self._progress_buffer_lock:
-            updates = dict(self._progress_buffer)
-            self._progress_buffer.clear()
+        async with self._state._progress_buffer_lock:
+            updates = dict(self._state._progress_buffer)
+            self._state._progress_buffer.clear()
 
         for workflow_id, progress in updates.items():
             try:
