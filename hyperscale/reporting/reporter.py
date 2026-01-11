@@ -195,7 +195,7 @@ class Reporter(Generic[T]):
         await self.selected_reporter.connect()
 
     async def submit_workflow_results(self, results: WorkflowStats):
-        workflow_stats: CountResults = results.get("stats")
+        workflow_stats: CountResults = results.get("stats") or {}
 
         workflow_results = [
             {

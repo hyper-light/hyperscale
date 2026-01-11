@@ -1,7 +1,7 @@
 import asyncio
 from typing import List
 
-from pydantic import BaseModel, StrictStr, StrictInt
+from pydantic import BaseModel, ConfigDict, StrictStr, StrictInt
 from hyperscale.commands.cli.arg_types import KeywordArg, Context
 from hyperscale.ui.styling import stylize, get_style
 
@@ -10,14 +10,13 @@ from .line_parsing import is_arg_descriptor
 
 
 class OptionsHelpMessage(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     options: List[KeywordArg]
     help_string: StrictStr
     indentation: StrictInt = 0
     header: StrictStr = "options"
     styling: CLIStyle | None = None
-
-    class Config:
-        arbitrary_types_allowed = True
 
     def _map_doc_string_param_descriptors(self, styles: CLIStyle | None = None):
         param_lines = [

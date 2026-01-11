@@ -27,7 +27,7 @@ class RetryDecision(Enum):
     IMMEDIATE = auto()   # Retry immediately (no delay)
 
 
-@dataclass
+@dataclass(slots=True)
 class RetryPolicy:
     """
     Configuration for retry behavior.
@@ -148,7 +148,7 @@ GOSSIP_RETRY_POLICY = RetryPolicy(
 )
 
 
-@dataclass
+@dataclass(slots=True)
 class RetryResult:
     """Result of a retry operation."""
     

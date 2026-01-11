@@ -1,12 +1,13 @@
-from .dependent_workflow import DependentWorkflow
 from .workflow import Workflow
 
 
 def depends(*args: str):
+
+    dependencies = list(set(args))
+
     def wrapper(workflow: Workflow):
-        return DependentWorkflow(
-            workflow,
-            list(set(args)),
-        )
+        workflow._dependencies = dependencies
+
+        return workflow
 
     return wrapper

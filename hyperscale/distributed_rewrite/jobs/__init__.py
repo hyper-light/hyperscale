@@ -11,11 +11,17 @@ Manager-side:
 Worker-side:
 - CoreAllocator: Thread-safe core allocation for workflow execution
 
+Shared (Manager/Gate):
+- JobLeadershipTracker: Per-job leadership tracking with fencing tokens
+- WindowedStatsCollector: Time-correlated stats aggregation
+
 Supporting types:
 - TrackingToken: Globally unique workflow tracking IDs
 - JobInfo, WorkflowInfo, SubWorkflowInfo: Job state containers
 - WorkflowStateMachine: State machine for workflow transitions
 - AllocationResult: Core allocation result container
+- JobLeadership: Leadership info for a single job
+- DCManagerLeadership: Per-DC manager leadership info (for gates)
 
 Logging models:
 - WorkerPoolTrace/Debug/Info/Warning/Error/Critical
@@ -44,6 +50,17 @@ from hyperscale.distributed_rewrite.jobs.workflow_dispatcher import (
 from hyperscale.distributed_rewrite.jobs.core_allocator import (
     CoreAllocator as CoreAllocator,
     AllocationResult as AllocationResult,
+)
+from hyperscale.distributed_rewrite.jobs.windowed_stats_collector import (
+    WindowedStatsCollector as WindowedStatsCollector,
+    WindowedStatsPush as WindowedStatsPush,
+    WorkerWindowStats as WorkerWindowStats,
+    WindowBucket as WindowBucket,
+)
+from hyperscale.distributed_rewrite.jobs.job_leadership_tracker import (
+    JobLeadershipTracker as JobLeadershipTracker,
+    JobLeadership as JobLeadership,
+    DCManagerLeadership as DCManagerLeadership,
 )
 from hyperscale.distributed_rewrite.jobs.logging_models import (
     WorkerPoolTrace as WorkerPoolTrace,

@@ -17,7 +17,7 @@ V = TypeVar('V')
 from .protocols import LoggerProtocol
 
 
-@dataclass
+@dataclass(slots=True)
 class BoundedDict(Generic[K, V]):
     """
     A dictionary with bounded size and automatic eviction.
@@ -198,7 +198,7 @@ class BoundedDict(Generic[K, V]):
         )
 
 
-@dataclass
+@dataclass(slots=True)
 class CleanupConfig:
     """
     Configuration for periodic cleanup of SWIM state.

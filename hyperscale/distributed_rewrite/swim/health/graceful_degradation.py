@@ -28,7 +28,7 @@ class DegradationLevel(Enum):
     CRITICAL = 4     # Emergency mode - minimal operation
 
 
-@dataclass
+@dataclass(slots=True)
 class DegradationPolicy:
     """
     Policy for graceful degradation behavior at each level.
@@ -117,7 +117,7 @@ DEGRADATION_POLICIES: dict[DegradationLevel, DegradationPolicy] = {
 }
 
 
-@dataclass
+@dataclass(slots=True)
 class GracefulDegradation:
     """
     Manages graceful degradation based on node health metrics.

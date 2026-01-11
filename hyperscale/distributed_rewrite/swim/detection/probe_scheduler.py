@@ -12,7 +12,7 @@ import random
 from dataclasses import dataclass, field
 
 
-@dataclass
+@dataclass(slots=True)
 class ProbeScheduler:
     """
     Implements SWIM's randomized round-robin probing.

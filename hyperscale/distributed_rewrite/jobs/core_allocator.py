@@ -32,7 +32,7 @@ from hyperscale.distributed_rewrite.jobs.logging_models import (
 from hyperscale.logging import Logger
 
 
-@dataclass
+@dataclass(slots=True)
 class AllocationResult:
     """Result of a core allocation attempt."""
 

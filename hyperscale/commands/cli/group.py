@@ -134,7 +134,7 @@ class Group(Generic[T]):
         self.display_help_on_error = display_help_on_error
         self.error_exit_code = error_exit_code
 
-        self._loop = asyncio.get_event_loop()
+        self._loop: asyncio.AbstractEventLoop | None = None
 
     def update_command(
         self,

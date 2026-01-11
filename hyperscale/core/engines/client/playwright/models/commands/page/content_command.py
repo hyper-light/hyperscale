@@ -1,12 +1,12 @@
 from pydantic import (
     BaseModel,
+    ConfigDict,
     StrictFloat,
     StrictInt,
 )
 
 
 class ContentCommand(BaseModel):
-    timeout: StrictInt | StrictFloat
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
-    class Config:
-        arbitrary_types_allowed = True
+    timeout: StrictInt | StrictFloat

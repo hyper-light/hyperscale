@@ -35,7 +35,7 @@ class LeadershipChange:
             self.timestamp = time.monotonic()
 
 
-@dataclass
+@dataclass(slots=True)
 class FlappingDetector:
     """
     Detects leadership flapping (rapid leadership changes).

@@ -264,7 +264,15 @@ class IncarnationTracker:
         if incarnation > state.incarnation:
             return MessageFreshness.FRESH
         if incarnation == state.incarnation:
-            status_priority = {b'OK': 0, b'JOIN': 0, b'SUSPECT': 1, b'DEAD': 2}
+            # Status priority: UNCONFIRMED < JOIN/OK < SUSPECT < DEAD (AD-29)
+            # UNCONFIRMED has lowest priority - can be overridden by confirmation
+            status_priority = {
+                b'UNCONFIRMED': -1,
+                b'OK': 0,
+                b'JOIN': 0,
+                b'SUSPECT': 1,
+                b'DEAD': 2,
+            }
             if status_priority.get(status, 0) > status_priority.get(state.status, 0):
                 return MessageFreshness.FRESH
             return MessageFreshness.DUPLICATE
@@ -347,9 +355,16 @@ class IncarnationTracker:
             return 0
         
         to_evict_count = len(self.node_states) - self.max_nodes + 100  # Evict batch
-        
+
         # Sort by (status_priority, last_update_time)
-        status_priority = {b'DEAD': 0, b'SUSPECT': 1, b'OK': 2, b'JOIN': 2}
+        # UNCONFIRMED peers evicted first (AD-29)
+        status_priority = {
+            b'UNCONFIRMED': -1,
+            b'DEAD': 0,
+            b'SUSPECT': 1,
+            b'OK': 2,
+            b'JOIN': 2,
+        }
 
         # Snapshot to avoid dict mutation during iteration
         sorted_nodes = sorted(
@@ -394,17 +409,175 @@ class IncarnationTracker:
     
     def get_stats(self) -> dict[str, int]:
         """Get tracker statistics for monitoring."""
-        status_counts = {b'OK': 0, b'SUSPECT': 0, b'DEAD': 0, b'JOIN': 0}
+        status_counts = {
+            b'UNCONFIRMED': 0,
+            b'OK': 0,
+            b'SUSPECT': 0,
+            b'DEAD': 0,
+            b'JOIN': 0,
+        }
         # Snapshot to avoid dict mutation during iteration
         for state in list(self.node_states.values()):
             status_counts[state.status] = status_counts.get(state.status, 0) + 1
-        
+
         return {
             'total_nodes': len(self.node_states),
+            'unconfirmed_nodes': status_counts.get(b'UNCONFIRMED', 0),
             'ok_nodes': status_counts.get(b'OK', 0),
             'suspect_nodes': status_counts.get(b'SUSPECT', 0),
             'dead_nodes': status_counts.get(b'DEAD', 0),
             'total_evictions': self._eviction_count,
             'total_cleanups': self._cleanup_count,
         }
+
+    # =========================================================================
+    # AD-29: Peer Confirmation Methods
+    # =========================================================================
+
+    def add_unconfirmed_node(
+        self,
+        node: tuple[str, int],
+        timestamp: float | None = None,
+    ) -> bool:
+        """
+        Add a node as UNCONFIRMED (AD-29 Task 12.3.1).
+
+        Called when a peer is discovered via gossip or configuration but
+        hasn't been confirmed via bidirectional communication yet.
+
+        Args:
+            node: Node address tuple (host, port)
+            timestamp: Optional timestamp (defaults to now)
+
+        Returns:
+            True if node was added, False if already exists with higher status
+        """
+        if timestamp is None:
+            timestamp = time.monotonic()
+
+        # Don't demote existing confirmed nodes
+        existing = self.node_states.get(node)
+        if existing and existing.status != b'UNCONFIRMED':
+            return False
+
+        if node not in self.node_states:
+            self.node_states[node] = NodeState(
+                status=b'UNCONFIRMED',
+                incarnation=0,
+                last_update_time=timestamp,
+            )
+            return True
+
+        return False
+
+    def confirm_node(
+        self,
+        node: tuple[str, int],
+        incarnation: int = 0,
+        timestamp: float | None = None,
+    ) -> bool:
+        """
+        Transition node from UNCONFIRMED to OK (AD-29 Task 12.3.2).
+
+        Called when we receive first successful bidirectional communication
+        (probe ACK, heartbeat, valid protocol message).
+
+        Args:
+            node: Node address tuple (host, port)
+            incarnation: Node's incarnation from the confirming message
+            timestamp: Optional timestamp (defaults to now)
+
+        Returns:
+            True if node was confirmed, False if not found or already confirmed
+        """
+        if timestamp is None:
+            timestamp = time.monotonic()
+
+        existing = self.node_states.get(node)
+
+        # If not known, add as confirmed directly
+        if existing is None:
+            self.node_states[node] = NodeState(
+                status=b'OK',
+                incarnation=incarnation,
+                last_update_time=timestamp,
+            )
+            return True
+
+        # If UNCONFIRMED, transition to OK
+        if existing.status == b'UNCONFIRMED':
+            existing.status = b'OK'
+            existing.incarnation = max(existing.incarnation, incarnation)
+            existing.last_update_time = timestamp
+            return True
+
+        # Already confirmed (OK, SUSPECT, or DEAD) - update incarnation if higher
+        if incarnation > existing.incarnation:
+            existing.incarnation = incarnation
+            existing.last_update_time = timestamp
+
+        return False
+
+    def is_node_confirmed(self, node: tuple[str, int]) -> bool:
+        """
+        Check if a node is confirmed (not UNCONFIRMED) (AD-29).
+
+        Returns:
+            True if node exists and is not in UNCONFIRMED state
+        """
+        state = self.node_states.get(node)
+        return state is not None and state.status != b'UNCONFIRMED'
+
+    def is_node_unconfirmed(self, node: tuple[str, int]) -> bool:
+        """
+        Check if a node is in UNCONFIRMED state (AD-29).
+
+        Returns:
+            True if node exists and is in UNCONFIRMED state
+        """
+        state = self.node_states.get(node)
+        return state is not None and state.status == b'UNCONFIRMED'
+
+    def can_suspect_node(self, node: tuple[str, int]) -> bool:
+        """
+        Check if a node can be transitioned to SUSPECT (AD-29 Task 12.3.4).
+
+        Per AD-29: Only CONFIRMED peers can be suspected. UNCONFIRMED peers
+        cannot transition to SUSPECT - they must first be confirmed.
+
+        Returns:
+            True if node can be suspected (is confirmed and not already DEAD)
+        """
+        state = self.node_states.get(node)
+        if state is None:
+            return False
+
+        # AD-29: Cannot suspect unconfirmed peers
+        if state.status == b'UNCONFIRMED':
+            return False
+
+        # Cannot re-suspect dead nodes
+        if state.status == b'DEAD':
+            return False
+
+        return True
+
+    def get_nodes_by_state(self, status: Status) -> list[tuple[str, int]]:
+        """
+        Get all nodes in a specific state (AD-29 Task 12.3.5).
+
+        Args:
+            status: The status to filter by
+
+        Returns:
+            List of node addresses with that status
+        """
+        return [
+            node for node, state in self.node_states.items()
+            if state.status == status
+        ]
+
+    def get_unconfirmed_nodes(self) -> list[tuple[str, int]]:
+        """Get all nodes in UNCONFIRMED state."""
+        return self.get_nodes_by_state(b'UNCONFIRMED')
 

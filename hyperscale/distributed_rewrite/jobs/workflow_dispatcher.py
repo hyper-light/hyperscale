@@ -15,13 +15,13 @@ Key responsibilities:
 
 import asyncio
 import time
+import traceback
 from typing import Any, Callable, Coroutine
 
 import cloudpickle
 import networkx
 
 from hyperscale.core.graph.workflow import Workflow
-from hyperscale.core.graph.dependent_workflow import DependentWorkflow
 from hyperscale.core.jobs.workers.stage_priority import StagePriority
 from hyperscale.distributed_rewrite.models import (
     JobSubmission,
@@ -66,6 +66,7 @@ class WorkflowDispatcher:
         max_dispatch_attempts: int = 5,
         on_workflow_evicted: Callable[[str, str, str], Coroutine[Any, Any, None]] | None = None,
         on_dispatch_failed: Callable[[str, str, str], Coroutine[Any, Any, None]] | None = None,
+        get_leader_term: Callable[[], int] | None = None,
     ):
         """
         Initialize WorkflowDispatcher.
@@ -83,6 +84,8 @@ class WorkflowDispatcher:
                                Takes (job_id, workflow_id, reason) and is awaited
             on_dispatch_failed: Optional callback when dispatch permanently fails after retries
                                Takes (job_id, workflow_id, reason) and is awaited
+            get_leader_term: Callback to get current leader election term (AD-10 requirement).
+                            Returns the current term for fence token generation.
         """
         self._job_manager = job_manager
         self._worker_pool = worker_pool
@@ -93,6 +96,7 @@ class WorkflowDispatcher:
         self._max_dispatch_attempts = max_dispatch_attempts
         self._on_workflow_evicted = on_workflow_evicted
         self._on_dispatch_failed = on_dispatch_failed
+        self._get_leader_term = get_leader_term
         self._logger = Logger()
 
         # Pending workflows waiting for dependencies/cores
@@ -126,7 +130,9 @@ class WorkflowDispatcher:
     async def register_workflows(
         self,
         submission: JobSubmission,
-        workflows: list[type[Workflow] | DependentWorkflow],
+        workflows: list[
+            tuple[str, list[str], Workflow]
+        ],
     ) -> bool:
         """
         Register all workflows from a job submission.
@@ -134,6 +140,11 @@ class WorkflowDispatcher:
         Builds the dependency graph and registers workflows with
         JobManager. Workflows without dependencies are immediately
         eligible for dispatch.
+
+        Args:
+            submission: The job submission
+            workflows: List of (workflow_id, dependencies, workflow) tuples
+                       workflow_id is client-generated for cross-DC consistency
 
         Returns True if registration succeeded.
         """
@@ -145,21 +156,15 @@ class WorkflowDispatcher:
         priorities: dict[str, StagePriority] = {}
         is_test: dict[str, bool] = {}
 
-        for i, wf in enumerate(workflows):
-            try:
-                # Handle DependentWorkflow specially to preserve name and get dependencies
-                dependencies: list[str] = []
-                if isinstance(wf, DependentWorkflow):
-                    dependencies = wf.dependencies
-                    name = wf.dependent_workflow.__name__
-                    instance = wf.dependent_workflow()
-                else:
-                    name = wf.__name__
-                    instance = wf()
+        for wf_data in workflows:
 
-                # Generate workflow ID
-                workflow_id = f"wf-{i:04d}"
-                vus = getattr(instance, 'vus', submission.vus)
+            # Unpack with client-generated workflow_id
+            workflow_id, dependencies, instance = wf_data
+            try:
+
+                # Use the client-provided workflow_id (globally unique across DCs)
+                name = getattr(instance, 'name', None) or type(instance).__name__
+                vus = instance.vus if instance.vus and instance.vus > 0 else submission.vus
 
                 # Register with JobManager
                 await self._job_manager.register_workflow(
@@ -559,8 +564,9 @@ class WorkflowDispatcher:
                 # Create sub-workflow token
                 sub_token = workflow_token.to_sub_workflow_token(worker_id)
 
-                # Get fence token for at-most-once dispatch
-                fence_token = self._job_manager.get_next_fence_token(pending.job_id)
+                # Get fence token for at-most-once dispatch (AD-10: incorporate leader term)
+                leader_term = self._get_leader_term() if self._get_leader_term else 0
+                fence_token = self._job_manager.get_next_fence_token(pending.job_id, leader_term)
 
                 # Create dispatch message
                 dispatch = WorkflowDispatch(
@@ -916,6 +922,188 @@ class WorkflowDispatcher:
                 if pending:
                     # Set the ready event to unblock any waiters, then clear
                     pending.ready_event.set()
+
+    async def cancel_pending_workflows(self, job_id: str) -> list[str]:
+        """
+        Cancel all pending workflows for a job (AD-20 job cancellation).
+
+        Removes workflows from the pending queue before they can be dispatched.
+        This is critical for robust job cancellation - pending workflows must
+        be removed BEFORE cancelling running workflows to prevent race conditions
+        where a pending workflow gets dispatched during cancellation.
+
+        Args:
+            job_id: The job ID whose pending workflows should be cancelled
+
+        Returns:
+            List of workflow IDs that were cancelled from the pending queue
+        """
+        cancelled_workflow_ids: list[str] = []
+
+        async with self._pending_lock:
+            # Find all pending workflows for this job
+            keys_to_remove = [
+                key for key in self._pending
+                if key.startswith(f"{job_id}:")
+            ]
+
+            # Remove each pending workflow
+            for key in keys_to_remove:
+                pending = self._pending.pop(key, None)
+                if pending:
+                    # Extract workflow_id from key (format: "job_id:workflow_id")
+                    workflow_id = key.split(":", 1)[1]
+                    cancelled_workflow_ids.append(workflow_id)
+
+                    # Set ready event to unblock any waiters
+                    pending.ready_event.set()
+
+            if cancelled_workflow_ids:
+                await self._log_info(
+                    f"Cancelled {len(cancelled_workflow_ids)} pending workflows for job cancellation",
+                    job_id=job_id
+                )
+
+        return cancelled_workflow_ids
+
+    async def cancel_pending_workflows_by_ids(
+        self,
+        job_id: str,
+        workflow_ids: list[str]
+    ) -> list[str]:
+        """
+        Cancel specific pending workflows by their IDs (for single workflow cancellation).
+
+        Used when cancelling a workflow and its dependents - only removes
+        workflows from the pending queue if they are in the provided list.
+
+        Args:
+            job_id: The job ID
+            workflow_ids: List of specific workflow IDs to cancel
+
+        Returns:
+            List of workflow IDs that were actually cancelled from the pending queue
+        """
+        cancelled_workflow_ids: list[str] = []
+
+        async with self._pending_lock:
+            # Find pending workflows matching the provided IDs
+            for workflow_id in workflow_ids:
+                key = f"{job_id}:{workflow_id}"
+                pending = self._pending.pop(key, None)
+
+                if pending:
+                    cancelled_workflow_ids.append(workflow_id)
+
+                    # Set ready event to unblock any waiters
+                    pending.ready_event.set()
+
+            if cancelled_workflow_ids:
+                await self._log_info(
+                    f"Cancelled {len(cancelled_workflow_ids)} specific pending workflows",
+                    job_id=job_id
+                )
+
+        return cancelled_workflow_ids
+
+    async def get_job_dependency_graph(self, job_id: str) -> dict[str, set[str]]:
+        """
+        Get the dependency graph for all workflows in a job.
+
+        Returns a dict mapping workflow_id -> set of dependency workflow_ids.
+        This is needed by the Manager's failure handler to find dependents
+        when rescheduling workflows after worker failure (AD-33).
+
+        Args:
+            job_id: The job ID
+
+        Returns:
+            Dict mapping workflow_id to its set of dependencies.
+            Empty dict if job not found or no workflows.
+        """
+        dependency_graph: dict[str, set[str]] = {}
+
+        async with self._pending_lock:
+            # Extract dependencies from all pending workflows for this job
+            for key, pending in self._pending.items():
+                if pending.job_id == job_id:
+                    # Copy the set to avoid external mutation
+                    dependency_graph[pending.workflow_id] = pending.dependencies.copy()
+
+        return dependency_graph
+
+    async def add_pending_workflow(
+        self,
+        job_id: str,
+        workflow_id: str,
+        workflow_name: str,
+        workflow: Workflow,
+        vus: int,
+        priority: StagePriority,
+        is_test: bool,
+        dependencies: set[str],
+        timeout_seconds: float
+    ) -> None:
+        """
+        Add a workflow back to the pending queue (AD-33 retry mechanism).
+
+        Used during failure recovery to re-queue failed workflows in dependency order.
+        The workflow will be dispatched when its dependencies are satisfied and cores
+        are available.
+
+        Args:
+            job_id: The job ID
+            workflow_id: The workflow ID
+            workflow_name: Human-readable workflow name
+            workflow: The workflow instance to dispatch
+            vus: Virtual users for this workflow
+            priority: Dispatch priority
+            is_test: Whether this is a test workflow
+            dependencies: Set of workflow IDs this workflow depends on
+            timeout_seconds: Timeout for this workflow
+        """
+        now = time.monotonic()
+        key = f"{job_id}:{workflow_id}"
+
+        async with self._pending_lock:
+            # Check if already pending (idempotent)
+            if key in self._pending:
+                await self._log_debug(
+                    f"Workflow {workflow_id} already pending, skipping add",
+                    job_id=job_id,
+                    workflow_id=workflow_id
+                )
+                return
+
+            # Create new pending workflow entry
+            pending = PendingWorkflow(
+                job_id=job_id,
+                workflow_id=workflow_id,
+                workflow_name=workflow_name,
+                workflow=workflow,
+                vus=vus,
+                priority=priority,
+                is_test=is_test,
+                dependencies=dependencies,
+                registered_at=now,
+                timeout_seconds=timeout_seconds,
+                next_retry_delay=self.INITIAL_RETRY_DELAY,
+                max_dispatch_attempts=self._max_dispatch_attempts,
+            )
+
+            self._pending[key] = pending
+
+            # Check if ready for immediate dispatch
+            pending.check_and_signal_ready()
+
+            await self._log_info(
+                f"Added workflow {workflow_id} back to pending queue for retry",
+                job_id=job_id,
+                workflow_id=workflow_id
+            )
+
+        # Signal dispatch trigger to wake up dispatch loop
+        self.signal_dispatch()
 
     # =========================================================================
     # Logging Helpers

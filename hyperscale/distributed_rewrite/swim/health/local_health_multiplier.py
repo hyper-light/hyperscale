@@ -5,7 +5,7 @@ Lifeguard Local Health Multiplier (LHM) implementation.
 from dataclasses import dataclass
 
 
-@dataclass
+@dataclass(slots=True)
 class LocalHealthMultiplier:
     """
     Lifeguard Local Health Multiplier (LHM).
@@ -29,11 +29,12 @@ class LocalHealthMultiplier:
     max_score: int = 8  # Saturation limit 'S' from paper
     
     # Scoring weights for different events
+    # Per Lifeguard paper (Section 4.3): all events are +1 or -1
     PROBE_TIMEOUT_PENALTY: int = 1
-    REFUTATION_PENALTY: int = 2
+    REFUTATION_PENALTY: int = 1  # Paper: "Refuting a suspect message about self: +1"
     MISSED_NACK_PENALTY: int = 1
     EVENT_LOOP_LAG_PENALTY: int = 1
-    EVENT_LOOP_CRITICAL_PENALTY: int = 2
+    EVENT_LOOP_CRITICAL_PENALTY: int = 1  # Per Lifeguard paper: all penalties are +1
     SUCCESSFUL_PROBE_REWARD: int = 1
     SUCCESSFUL_NACK_REWARD: int = 1
     EVENT_LOOP_RECOVERED_REWARD: int = 1
@@ -89,13 +90,18 @@ class LocalHealthMultiplier:
     def get_multiplier(self) -> float:
         """
         Get the current LHM multiplier for timeout calculations.
-        
-        Per Lifeguard paper, the multiplier increases probe timeout
-        and suspicion timeout based on local health score.
-        
-        Returns a value from 1.0 (healthy) to 1 + max_score (unhealthy).
+
+        Per Lifeguard paper (Section 4.3, page 5):
+        "ProbeTimeout = BaseProbeTimeout × (LHM(S) + 1)"
+
+        With max_score=8 (S=8), this gives a multiplier range of 1-9.
+        The paper states: "S defaults to 8, which means the probe interval
+        and timeout will back off as high as 9 seconds and 4.5 seconds"
+        (from base values of 1 second and 500ms respectively).
+
+        Returns a value from 1.0 (healthy, score=0) to 9.0 (max unhealthy, score=8).
         """
-        return 1.0 + (self.score / self.max_score) * self.max_score
+        return 1.0 + self.score
     
     def reset(self) -> None:
         """Reset LHM to healthy state."""

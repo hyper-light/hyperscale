@@ -10,14 +10,14 @@ except Exception:
 
 from pydantic import (
     BaseModel,
+    ConfigDict,
     StrictFloat,
     StrictInt,
 )
 
 
 class ExpectResponseCommand(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     url_or_predicate: Optional[str | Pattern[str] | Callable[[Response], bool]] = None
     timeout: StrictInt | StrictFloat
-
-    class Config:
-        arbitrary_types_allowed = True

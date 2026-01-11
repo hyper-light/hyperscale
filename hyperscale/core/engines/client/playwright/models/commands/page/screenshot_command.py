@@ -14,6 +14,7 @@ except Exception:
     
 from pydantic import (
     BaseModel,
+    ConfigDict,
     StrictBool,
     StrictFloat,
     StrictInt,
@@ -22,6 +23,8 @@ from pydantic import (
 
 
 class ScreenshotCommand(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     path: StrictStr | Path
     image_type: Literal["jpeg", "png"] = "png"
     quality: Optional[StrictInt] = None
@@ -35,6 +38,3 @@ class ScreenshotCommand(BaseModel):
     mask_color: Optional[StrictStr] = None
     style: Optional[StrictStr] = None
     timeout: StrictInt | StrictFloat
-
-    class Config:
-        arbitrary_types_allowed = True

@@ -25,6 +25,7 @@ class Workflow:
     timeout: str = "30s"
     interval: str | None = None
     reporting: ReporterConfigs | CustomReporter | None = None
+    _dependencies = []
 
     def __init__(self):
         module = importlib.import_module(self.__module__)
@@ -32,11 +33,8 @@ class Workflow:
 
         self.name = self.__class__.__name__
 
-        generator = SnowflakeGenerator(
-            (uuid.uuid1().int + threading.get_native_id()) >> 64
-        )
-
-        self.id = generator.generate()
+        self.id = uuid.uuid4().int >> 64
+        self._dependencies = self._dependencies
 
 
         self.client = Client()

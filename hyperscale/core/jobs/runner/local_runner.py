@@ -96,13 +96,15 @@ class LocalRunner:
     async def run(
         self,
         test_name: str,
-        workflows: List[Workflow],
+        workflows: List[
+            tuple[list[str], Workflow]
+        ],
         cert_path: str | None = None,
         key_path: str | None = None,
         timeout: int | float | str | None = None,
         terminal_mode: TerminalMode = "full",
     ):
-        workflow_names = [workflow.name for workflow in workflows]
+        workflow_names = [workflow.name for _, workflow in workflows]
 
         default_config = {
             "runner_type": self._runner_type,
@@ -137,7 +139,7 @@ class LocalRunner:
             )
 
             self._interface.initialize(
-                workflows,
+                [workflow for _, workflow in workflows],
                 terminal_mode=terminal_mode,
             )
 
@@ -229,7 +231,12 @@ class LocalRunner:
                     name="debug",
                 )
 
+                # Send shutdown request to workers (non-blocking, workers will terminate)
                 await self._remote_manger.shutdown_workers()
+
+                # Run cleanup operations in parallel for faster shutdown
+                loop = asyncio.get_event_loop()
+
                 await self._remote_manger.close()
 
                 loop = asyncio.get_event_loop()
@@ -239,11 +246,12 @@ class LocalRunner:
                     *[loop.run_in_executor(None, child.kill) for child in children]
                 )
 
+                await self._server_pool.shutdown()
+
                 await ctx.log_prepared(
-                    f"Stopping Hyperscale Server Pool for test {test_name}",
+                    f"Stopped Hyperscale Server Pool for test {test_name}",
                     name="debug",
                 )
-                await self._server_pool.shutdown()
 
                 await ctx.log_prepared(f"Exiting test {test_name}", name="info")
 
@@ -275,7 +283,7 @@ class LocalRunner:
                             f"Aborting Hyperscale Terminal UI for test {test_name}",
                             name="debug",
                         )
-                        await self._interface.stop()
+                        await self._interface.abort()
 
                 except Exception as e:
                     await ctx.log_prepared(
@@ -370,6 +378,7 @@ class LocalRunner:
                     f"Encountered error {str(e)} aborting Hyperscale Terminal UI",
                     name="trace",
                 )
+
 
             except asyncio.CancelledError:
                 pass

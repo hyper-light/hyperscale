@@ -1,6 +1,7 @@
 import asyncio
 import pathlib
 import time
+import uuid
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from typing import (
@@ -25,7 +26,6 @@ T = TypeVar("T")
 class Task(Generic[T]):
     def __init__(
         self,
-        snowflake_generator: SnowflakeGenerator,
         name: str,
         task: Callable[[], T] | str,
         executor: ProcessPoolExecutor | ThreadPoolExecutor | None,
@@ -40,8 +40,7 @@ class Task(Generic[T]):
         keep_policy: Literal["COUNT", "AGE", "COUNT_AND_AGE"] = "COUNT",
         task_type: TaskType = TaskType.CALLABLE,
     ) -> None:
-        self._snowflake_generator = snowflake_generator
-        self.task_id = snowflake_generator.generate()
+        self.task_id = Task.generate_id()
         self.name: str = name
         self.args = args
         self.trigger: Literal["MANUAL", "ON_START"] = trigger
@@ -84,6 +83,10 @@ class Task(Generic[T]):
             return run.status
 
         return RunStatus.IDLE
+    
+    @classmethod
+    def generate_id(cls):
+        return uuid.uuid4().int >> 64
 
     async def get_run_update(self, run_id: int):
         return await self._runs[run_id].get_run_update()
@@ -208,7 +211,7 @@ class Task(Generic[T]):
             timeout = self.timeout
 
         if run_id is None:
-            run_id = self._snowflake_generator.generate()
+            run_id = Task.generate_id()
 
         run = Run(
             run_id,
@@ -243,7 +246,7 @@ class Task(Generic[T]):
             timeout = self.timeout
 
         if run_id is None:
-            run_id = self._snowflake_generator.generate()
+            run_id = Task.generate_id()
 
         run = Run(
             run_id,
@@ -274,7 +277,7 @@ class Task(Generic[T]):
         **kwargs,
     ):
         if run_id is None:
-            run_id = self._snowflake_generator.generate()
+            run_id = Task.generate_id()
 
         if timeout is None:
             timeout = self.timeout
@@ -313,7 +316,7 @@ class Task(Generic[T]):
         poll_interval: int | float = 0.5,
     ):
         if run_id is None:
-            run_id = self._snowflake_generator.generate()
+            run_id = Task.generate_id()
 
         if timeout is None:
             timeout = self.timeout
@@ -357,7 +360,7 @@ class Task(Generic[T]):
 
                 await asyncio.sleep(self.schedule)
                 run = Run(
-                    self._snowflake_generator.generate(),
+                    Task.generate_id(),
                     self.name,
                     self.call,
                     self._executor,
@@ -378,7 +381,7 @@ class Task(Generic[T]):
 
                 await asyncio.sleep(self.schedule)
                 run = Run(
-                    self._snowflake_generator.generate(),
+                    Task.generate_id(),
                     self.name,
                     self.call,
                     self._executor,
@@ -412,7 +415,7 @@ class Task(Generic[T]):
 
                 await asyncio.sleep(self.schedule)
                 run = Run(
-                    self._snowflake_generator.generate(),
+                    Task.generate_id(),
                     self.name,
                     self.call,
                     self._executor,
@@ -438,7 +441,7 @@ class Task(Generic[T]):
 
                 await asyncio.sleep(self.schedule)
                 run = Run(
-                    self._snowflake_generator.generate(),
+                    Task.generate_id(),
                     self.name,
                     self.call,
                     self._executor,

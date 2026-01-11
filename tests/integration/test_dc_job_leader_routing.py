@@ -39,7 +39,8 @@ class TestOriginGateAddressField:
         submission = JobSubmission(
             job_id="job-123",
             workflows=b"pickled_workflows",
-            total_workflows=5,
+            vus=1,
+            timeout_seconds=60.0,
         )
         assert hasattr(submission, 'origin_gate_addr')
         assert submission.origin_gate_addr is None
@@ -50,7 +51,8 @@ class TestOriginGateAddressField:
         submission = JobSubmission(
             job_id="job-123",
             workflows=b"pickled_workflows",
-            total_workflows=5,
+            vus=1,
+            timeout_seconds=60.0,
             origin_gate_addr=origin_addr,
         )
         assert submission.origin_gate_addr == origin_addr
@@ -61,7 +63,8 @@ class TestOriginGateAddressField:
         original = JobSubmission(
             job_id="job-456",
             workflows=b"test_workflows",
-            total_workflows=3,
+            vus=1,
+            timeout_seconds=60.0,
             origin_gate_addr=origin_addr,
         )
 
@@ -298,7 +301,8 @@ class TestDirectRoutingScenarios:
         submission = JobSubmission(
             job_id="job-direct-routing",
             workflows=b"test_workflows",
-            total_workflows=3,
+            vus=1,
+            timeout_seconds=60.0,
             origin_gate_addr=gate_a_addr,
         )
 

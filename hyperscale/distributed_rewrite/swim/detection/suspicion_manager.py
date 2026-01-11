@@ -165,11 +165,11 @@ class SuspicionManager:
                     # Same suspicion, add confirmation
                     existing.add_confirmation(from_node)
                     # Recalculate timeout with new confirmation
-                    self._reschedule_timer(existing)
+                    await self._reschedule_timer(existing)
                     return existing
                 else:
                     # Higher incarnation suspicion, replace
-                    self._cancel_timer(existing)
+                    await self._cancel_timer(existing)
             else:
                 # New suspicion - check limits
                 if len(self.suspicions) >= self.max_suspicions:
@@ -204,10 +204,13 @@ class SuspicionManager:
     def _schedule_timer(self, state: SuspicionState) -> None:
         """Schedule the expiration timer for a suspicion."""
         timeout = state.calculate_timeout()
-        
+
         async def expire_suspicion():
-            await asyncio.sleep(timeout)
-            await self._handle_expiration(state)
+            try:
+                await asyncio.sleep(timeout)
+                await self._handle_expiration(state)
+            except asyncio.CancelledError:
+                raise
         
         if self._task_runner:
             # Use TaskRunner for automatic cleanup
@@ -224,14 +227,17 @@ class SuspicionManager:
             # Fallback to raw asyncio task
             state._timer_task = asyncio.create_task(expire_suspicion())
     
-    def _reschedule_timer(self, state: SuspicionState) -> None:
+    async def _reschedule_timer(self, state: SuspicionState) -> None:
         """Reschedule timer with updated timeout (after new confirmation)."""
-        self._cancel_timer(state)
+        await self._cancel_timer(state)
         remaining = state.time_remaining()
         if remaining > 0:
             async def expire_suspicion():
-                await asyncio.sleep(remaining)
-                await self._handle_expiration(state)
+                try:
+                    await asyncio.sleep(remaining)
+                    await self._handle_expiration(state)
+                except asyncio.CancelledError:
+                    raise
             
             if self._task_runner:
                 run = self._task_runner.run(
@@ -262,25 +268,25 @@ class SuspicionManager:
                 self._pending_fallback_tasks.add(task)
                 self._unmanaged_tasks_created += 1
     
-    def _cancel_timer(self, state: SuspicionState) -> None:
+    async def _cancel_timer(self, state: SuspicionState) -> None:
         """Cancel the timer for a suspicion."""
         # Cancel via TaskRunner if available
         if state.node in self._timer_tokens and self._task_runner:
             token = self._timer_tokens.pop(state.node, None)
             if token:
                 try:
-                    # Use task runner's run method instead of raw create_task
-                    self._task_runner.run(self._task_runner.cancel, token)
+                    # Await the cancellation directly
+                    await self._task_runner.cancel(token)
                 except Exception as e:
                     self._log_warning(f"Failed to cancel timer via TaskRunner: {e}")
-        
+
         # Also cancel the raw task if present
         state.cancel_timer()
     
     async def _handle_expiration(self, state: SuspicionState) -> None:
         """
         Handle suspicion expiration - declare node as DEAD.
-        
+
         Uses lock + double-check pattern to prevent race conditions.
         This is async to properly coordinate with other async methods.
         """
@@ -289,17 +295,17 @@ class SuspicionManager:
             if state.node not in self.suspicions:
                 self._race_avoided_count += 1
                 return
-            
+
             # Verify this is the same suspicion (not a new one with same node)
             current = self.suspicions.get(state.node)
             if current is not state:
                 self._race_avoided_count += 1
                 return
-            
+
             del self.suspicions[state.node]
             self._timer_tokens.pop(state.node, None)
             self._expired_count += 1
-        
+
         # Call callback outside of lock to avoid deadlock
         if self._on_suspicion_expired:
             self._on_suspicion_expired(state.node, state.incarnation)
@@ -334,7 +340,7 @@ class SuspicionManager:
         async with self._lock:
             state = self.suspicions.get(node)
             if state and incarnation > state.incarnation:
-                self._cancel_timer(state)
+                await self._cancel_timer(state)
                 del self.suspicions[node]
                 self._refuted_count += 1
                 return True
@@ -353,11 +359,11 @@ class SuspicionManager:
         async with self._lock:
             # Snapshot to avoid dict mutation during iteration
             for state in list(self.suspicions.values()):
-                self._cancel_timer(state)
+                await self._cancel_timer(state)
                 state.cleanup()  # Clean up confirmers set
             self.suspicions.clear()
             self._timer_tokens.clear()
-            
+
             # Cancel any pending fallback tasks
             for task in list(self._pending_fallback_tasks):
                 if not task.done():

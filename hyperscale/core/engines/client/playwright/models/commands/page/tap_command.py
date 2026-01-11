@@ -10,6 +10,7 @@ except Exception:
     
 from pydantic import (
     BaseModel,
+    ConfigDict,
     StrictBool,
     StrictFloat,
     StrictInt,
@@ -18,6 +19,8 @@ from pydantic import (
 
 
 class TapCommand(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     selector: StrictStr
     modifiers: Optional[
         Sequence[Literal["Alt", "Control", "ControlOrMeta", "Meta", "Shift"]]
@@ -28,6 +31,3 @@ class TapCommand(BaseModel):
     strict: Optional[StrictBool] = None
     trial: Optional[StrictBool] = None
     timeout: Optional[StrictInt | StrictFloat] = None
-
-    class Config:
-        arbitrary_types_allowed = True

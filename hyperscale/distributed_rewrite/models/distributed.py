@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from hyperscale.core.graph import Workflow
 from hyperscale.core.state import Context
-from hyperscale.core.jobs.models import WorkflowResults
+from hyperscale.reporting.common.results_types import WorkflowStats
 from typing import Any
 from .message import Message
 
@@ -99,17 +99,39 @@ class GateState(str, Enum):
 class DatacenterHealth(str, Enum):
     """
     Health classification for datacenter routing decisions.
-    
+
     Key insight: BUSY ≠ UNHEALTHY
     - BUSY = transient, will clear when workflows complete → accept job (queued)
     - UNHEALTHY = structural problem, requires intervention → try fallback
-    
+
     See AD-16 in docs/architecture.md for design rationale.
     """
     HEALTHY = "healthy"      # Managers responding, workers available, capacity exists
     BUSY = "busy"            # Managers responding, workers available, no immediate capacity
     DEGRADED = "degraded"    # Some managers responding, reduced capacity
     UNHEALTHY = "unhealthy"  # No managers responding OR all workers down
+
+
+class DatacenterRegistrationStatus(str, Enum):
+    """
+    Registration status for a datacenter (distinct from health).
+
+    Registration tracks whether managers have announced themselves to the gate.
+    Health classification only applies to READY datacenters.
+
+    State machine:
+      AWAITING_INITIAL → (first heartbeat) → INITIALIZING
+      INITIALIZING → (quorum heartbeats) → READY
+      INITIALIZING → (grace period, no quorum) → UNAVAILABLE
+      READY → (heartbeats continue) → READY
+      READY → (heartbeats stop, < quorum) → PARTIAL
+      READY → (all heartbeats stop) → UNAVAILABLE
+    """
+    AWAITING_INITIAL = "awaiting_initial"  # Configured but no heartbeats received yet
+    INITIALIZING = "initializing"          # Some managers registered, waiting for quorum
+    READY = "ready"                        # Quorum of managers registered, health classification applies
+    PARTIAL = "partial"                    # Was ready, now below quorum (degraded but not lost)
+    UNAVAILABLE = "unavailable"            # Was ready, lost all heartbeats (need recovery)
 
 
 class UpdateTier(str, Enum):
@@ -170,10 +192,18 @@ class ManagerPeerRegistration(Message):
 
     When a manager discovers a new peer (via SWIM or seed list),
     it sends this registration to establish the bidirectional relationship.
+
+    Protocol Version (AD-25):
+    - protocol_version_major/minor: For version compatibility checks
+    - capabilities: Comma-separated list of supported features
     """
     node: ManagerInfo            # Registering manager's info
     term: int                    # Current leadership term
     is_leader: bool              # Whether registering manager is leader
+    # Protocol version fields (AD-25) - defaults for backwards compatibility
+    protocol_version_major: int = 1
+    protocol_version_minor: int = 0
+    capabilities: str = ""       # Comma-separated feature list
 
 
 @dataclass(slots=True, kw_only=True)
@@ -183,6 +213,10 @@ class ManagerPeerRegistrationResponse(Message):
 
     Contains list of all known peer managers so the registering
     manager can discover the full cluster topology.
+
+    Protocol Version (AD-25):
+    - protocol_version_major/minor: For version compatibility checks
+    - capabilities: Comma-separated list of supported features
     """
     accepted: bool                          # Whether registration was accepted
     manager_id: str                         # Responding manager's node_id
@@ -190,6 +224,10 @@ class ManagerPeerRegistrationResponse(Message):
     term: int                               # Responding manager's term
     known_peers: list[ManagerInfo]          # All known peer managers (for discovery)
     error: str | None = None                # Error message if not accepted
+    # Protocol version fields (AD-25) - defaults for backwards compatibility
+    protocol_version_major: int = 1
+    protocol_version_minor: int = 0
+    capabilities: str = ""                  # Comma-separated feature list
 
 
 @dataclass(slots=True, kw_only=True)
@@ -199,11 +237,19 @@ class RegistrationResponse(Message):
 
     Contains list of all known healthy managers so worker can
     establish redundant communication channels.
+
+    Protocol Version (AD-25):
+    - protocol_version_major/minor: For version compatibility checks
+    - capabilities: Comma-separated negotiated features
     """
     accepted: bool                          # Whether registration was accepted
     manager_id: str                         # Responding manager's node_id
     healthy_managers: list[ManagerInfo]     # All known healthy managers (including self)
     error: str | None = None                # Error message if not accepted
+    # Protocol version fields (AD-25) - defaults for backwards compatibility
+    protocol_version_major: int = 1
+    protocol_version_minor: int = 0
+    capabilities: str = ""                  # Comma-separated negotiated features
 
 
 @dataclass(slots=True, kw_only=True)
@@ -238,13 +284,29 @@ class ManagerToWorkerRegistrationAck(Message):
 class WorkflowProgressAck(Message):
     """
     Acknowledgment for workflow progress updates.
-    
+
     Includes updated manager list so workers can maintain
     accurate view of cluster topology and leadership.
+
+    Also includes job_leader_addr for the specific job, enabling workers
+    to route progress updates to the correct manager even after failover.
+
+    Backpressure fields (AD-23):
+    When the manager's stats buffer fill level reaches thresholds, it signals
+    backpressure to workers via these fields. Workers should adjust their
+    update behavior accordingly (throttle, batch-only, or drop non-critical).
     """
     manager_id: str                         # Responding manager's node_id
-    is_leader: bool                         # Whether this manager is leader
+    is_leader: bool                         # Whether this manager is cluster leader
     healthy_managers: list[ManagerInfo]     # Current healthy managers
+    # Job leader address - the manager currently responsible for this job.
+    # None if the job is unknown or this manager doesn't track it.
+    # Workers should update their routing to send progress to this address.
+    job_leader_addr: tuple[str, int] | None = None
+    # AD-23: Backpressure fields for stats update throttling
+    backpressure_level: int = 0             # BackpressureLevel enum value (0=NONE, 1=THROTTLE, 2=BATCH, 3=REJECT)
+    backpressure_delay_ms: int = 0          # Suggested delay before next update (milliseconds)
+    backpressure_batch_only: bool = False   # Should sender switch to batch mode?
 
 
 # =============================================================================
@@ -279,6 +341,15 @@ class GateHeartbeat(Message):
     Piggybacking (like manager/worker discovery):
     - known_managers: Managers this gate knows about, for manager discovery
     - known_gates: Other gates this gate knows about (for gate cluster membership)
+    - job_leaderships: Jobs this gate leads (for distributed consistency, like managers)
+    - job_dc_managers: Per-DC manager leaders for each job (for query routing)
+
+    Health piggyback fields (AD-19):
+    - health_has_dc_connectivity: Whether gate has DC connectivity
+    - health_connected_dc_count: Number of connected datacenters
+    - health_throughput: Current job forwarding throughput
+    - health_expected_throughput: Expected throughput
+    - health_overload_state: Overload state from HybridOverloadDetector
     """
     node_id: str                 # Gate identifier
     datacenter: str              # Gate's home datacenter
@@ -289,36 +360,116 @@ class GateHeartbeat(Message):
     active_jobs: int             # Number of active global jobs
     active_datacenters: int      # Number of datacenters with active work
     manager_count: int           # Number of registered managers
+    tcp_host: str = ""           # Gate's TCP host (for proper storage/routing)
+    tcp_port: int = 0            # Gate's TCP port (for proper storage/routing)
     # Piggybacked discovery info - managers learn about other managers/gates
     # Maps node_id -> (tcp_host, tcp_port, udp_host, udp_port, datacenter)
     known_managers: dict[str, tuple[str, int, str, int, str]] = field(default_factory=dict)
     # Maps node_id -> (tcp_host, tcp_port, udp_host, udp_port)
     known_gates: dict[str, tuple[str, int, str, int]] = field(default_factory=dict)
+    # Per-job leadership - piggybacked on SWIM UDP for distributed consistency (like managers)
+    # Maps job_id -> (fencing_token, target_dc_count) for jobs this gate leads
+    job_leaderships: dict[str, tuple[int, int]] = field(default_factory=dict)
+    # Per-job per-DC manager leaders - for query routing after failover
+    # Maps job_id -> {dc_id -> (manager_host, manager_port)}
+    job_dc_managers: dict[str, dict[str, tuple[str, int]]] = field(default_factory=dict)
+    # Health piggyback fields (AD-19)
+    health_has_dc_connectivity: bool = True
+    health_connected_dc_count: int = 0
+    health_throughput: float = 0.0
+    health_expected_throughput: float = 0.0
+    health_overload_state: str = "healthy"
 
 
 @dataclass(slots=True, kw_only=True)
 class ManagerRegistrationResponse(Message):
     """
     Registration acknowledgment from gate to manager.
-    
+
     Contains list of all known healthy gates so manager can
     establish redundant communication channels.
+
+    Protocol Version (AD-25):
+    - protocol_version_major/minor: For version compatibility checks
+    - capabilities: Comma-separated negotiated features
     """
     accepted: bool                          # Whether registration was accepted
     gate_id: str                            # Responding gate's node_id
     healthy_gates: list[GateInfo]           # All known healthy gates (including self)
     error: str | None = None                # Error message if not accepted
+    # Protocol version fields (AD-25) - defaults for backwards compatibility
+    protocol_version_major: int = 1
+    protocol_version_minor: int = 0
+    capabilities: str = ""                  # Comma-separated negotiated features
+
+
+@dataclass(slots=True, kw_only=True)
+class GateRegistrationRequest(Message):
+    """
+    Registration request from gate to manager.
+
+    Gates register with all managers at startup (symmetric to managers
+    registering with all gates). This ensures managers know about all
+    gates for proper routing and health tracking.
+
+    Protocol Version (AD-25):
+    - protocol_version_major/minor: For version compatibility checks
+    - capabilities: Comma-separated list of supported features
+
+    Cluster Isolation (AD-28 Issue 2):
+    - cluster_id: Cluster identifier for isolation validation
+    - environment_id: Environment identifier for isolation validation
+    """
+    node_id: str                            # Gate's unique identifier
+    tcp_host: str                           # Gate's TCP host
+    tcp_port: int                           # Gate's TCP port
+    udp_host: str                           # Gate's UDP host
+    udp_port: int                           # Gate's UDP port
+    is_leader: bool                         # Whether this gate is the leader
+    term: int                               # Current leadership term
+    state: str                              # GateState value
+    cluster_id: str = "hyperscale"          # Cluster identifier for isolation
+    environment_id: str = "default"         # Environment identifier for isolation
+    active_jobs: int = 0                    # Number of active jobs
+    manager_count: int = 0                  # Number of known managers
+    # Protocol version fields (AD-25)
+    protocol_version_major: int = 1
+    protocol_version_minor: int = 0
+    capabilities: str = ""                  # Comma-separated feature list
+
+
+@dataclass(slots=True, kw_only=True)
+class GateRegistrationResponse(Message):
+    """
+    Registration acknowledgment from manager to gate.
+
+    Contains list of all known managers so gate can establish
+    redundant communication channels across datacenters.
+
+    Protocol Version (AD-25):
+    - protocol_version_major/minor: For version compatibility checks
+    - capabilities: Comma-separated negotiated features
+    """
+    accepted: bool                          # Whether registration was accepted
+    manager_id: str                         # Responding manager's node_id
+    datacenter: str                         # Manager's datacenter
+    healthy_managers: list[ManagerInfo]     # All known healthy managers
+    error: str | None = None                # Error message if not accepted
+    # Protocol version fields (AD-25)
+    protocol_version_major: int = 1
+    protocol_version_minor: int = 0
+    capabilities: str = ""                  # Comma-separated negotiated features
 
 
 @dataclass(slots=True, kw_only=True)
 class ManagerDiscoveryBroadcast(Message):
     """
     Broadcast from one gate to another about a newly discovered manager.
-    
+
     Used for cross-gate synchronization of manager discovery.
     When a manager registers with one gate, that gate broadcasts
     to all peer gates so they can also track the manager.
-    
+
     Includes manager status so peer gates can also update _datacenter_status.
     """
     datacenter: str                         # Manager's datacenter
@@ -366,14 +517,28 @@ class JobProgressAck(Message):
 class WorkerRegistration(Message):
     """
     Worker registration message sent to managers.
-    
+
     Contains worker identity and capacity information.
+
+    Protocol Version (AD-25):
+    - protocol_version_major/minor: For version compatibility checks
+    - capabilities: Comma-separated list of supported features
+
+    Cluster Isolation (AD-28 Issue 2):
+    - cluster_id: Cluster identifier for isolation validation
+    - environment_id: Environment identifier for isolation validation
     """
     node: NodeInfo               # Worker identity
     total_cores: int             # Total CPU cores available
     available_cores: int         # Currently free cores
     memory_mb: int               # Total memory in MB
     available_memory_mb: int     # Currently free memory
+    cluster_id: str              # Cluster identifier for isolation
+    environment_id: str          # Environment identifier for isolation
+    # Protocol version fields (AD-25) - defaults for backwards compatibility
+    protocol_version_major: int = 1
+    protocol_version_minor: int = 0
+    capabilities: str = ""       # Comma-separated feature list
 
 
 @dataclass(slots=True)
@@ -382,6 +547,12 @@ class WorkerHeartbeat(Message):
     Periodic heartbeat from worker to manager.
 
     Contains current state and resource utilization.
+
+    Health piggyback fields (AD-19):
+    - health_accepting_work: Whether worker is accepting new work
+    - health_throughput: Current workflow completions per interval
+    - health_expected_throughput: Expected throughput based on capacity
+    - health_overload_state: Overload state from HybridOverloadDetector
     """
     node_id: str                 # Worker identifier
     state: str                   # WorkerState value
@@ -395,6 +566,21 @@ class WorkerHeartbeat(Message):
     # TCP address for routing (populated in UDP heartbeats)
     tcp_host: str = ""
     tcp_port: int = 0
+    # Health piggyback fields (AD-19)
+    health_accepting_work: bool = True
+    health_throughput: float = 0.0
+    health_expected_throughput: float = 0.0
+    health_overload_state: str = "healthy"
+    # Extension request piggyback (AD-26)
+    # Workers can request deadline extensions via heartbeat instead of separate TCP call
+    extension_requested: bool = False
+    extension_reason: str = ""
+    extension_current_progress: float = 0.0  # 0.0-1.0 progress indicator (backward compatibility)
+    extension_estimated_completion: float = 0.0  # Estimated seconds until completion
+    extension_active_workflow_count: int = 0  # Number of workflows currently executing
+    # AD-26 Issue 4: Absolute progress metrics (preferred over relative progress)
+    extension_completed_items: int = 0  # Absolute count of completed items
+    extension_total_items: int = 0      # Total items to complete
 
 
 @dataclass(slots=True)
@@ -418,6 +604,21 @@ class ManagerHeartbeat(Message):
     Piggybacking:
     - job_leaderships: Jobs this manager leads (for distributed consistency)
     - known_gates: Gates this manager knows about (for gate discovery)
+
+    Health piggyback fields (AD-19):
+    - health_accepting_jobs: Whether manager is accepting new jobs
+    - health_has_quorum: Whether manager has worker quorum
+    - health_throughput: Current job/workflow throughput
+    - health_expected_throughput: Expected throughput based on capacity
+    - health_overload_state: Overload state from HybridOverloadDetector
+
+    Protocol Version (AD-25):
+    - protocol_version_major/minor: For version compatibility checks
+    - capabilities: Comma-separated list of supported features
+
+    Cluster Isolation (AD-28 Issue 2):
+    - cluster_id: Cluster identifier for isolation validation
+    - environment_id: Environment identifier for isolation validation
     """
     node_id: str                 # Manager identifier
     datacenter: str              # Datacenter identifier
@@ -430,6 +631,8 @@ class ManagerHeartbeat(Message):
     healthy_worker_count: int    # Number of workers responding to SWIM probes
     available_cores: int         # Total available cores across healthy workers
     total_cores: int             # Total cores across all registered workers
+    cluster_id: str = "hyperscale"  # Cluster identifier for isolation
+    environment_id: str = "default"  # Environment identifier for isolation
     state: str = "active"        # ManagerState value (syncing/active/draining)
     tcp_host: str = ""           # Manager's TCP host (for proper storage key)
     tcp_port: int = 0            # Manager's TCP port (for proper storage key)
@@ -441,6 +644,29 @@ class ManagerHeartbeat(Message):
     # Piggybacked gate discovery - gates learn about other gates from managers
     # Maps gate_id -> (tcp_host, tcp_port, udp_host, udp_port)
     known_gates: dict[str, tuple[str, int, str, int]] = field(default_factory=dict)
+    # Gate cluster leadership tracking - propagated among managers for consistency
+    # When a manager discovers a gate leader, it piggybacks this info to peer managers
+    current_gate_leader_id: str | None = None
+    current_gate_leader_host: str | None = None
+    current_gate_leader_port: int | None = None
+    # Health piggyback fields (AD-19)
+    health_accepting_jobs: bool = True
+    health_has_quorum: bool = True
+    health_throughput: float = 0.0
+    health_expected_throughput: float = 0.0
+    health_overload_state: str = "healthy"
+    # Extension and LHM tracking for cross-DC correlation (Phase 7)
+    # Used by gates to distinguish load from failures
+    workers_with_extensions: int = 0  # Workers currently with active extensions
+    lhm_score: int = 0  # Local Health Multiplier score (0-8, higher = more stressed)
+    # AD-37: Backpressure fields for gate throttling
+    # Gates use these to throttle forwarded updates when managers are under load
+    backpressure_level: int = 0  # BackpressureLevel enum value (0=NONE, 1=THROTTLE, 2=BATCH, 3=REJECT)
+    backpressure_delay_ms: int = 0  # Suggested delay before next update (milliseconds)
+    # Protocol version fields (AD-25) - defaults for backwards compatibility
+    protocol_version_major: int = 1
+    protocol_version_minor: int = 0
+    capabilities: str = ""       # Comma-separated feature list
 
 
 # =============================================================================
@@ -451,14 +677,32 @@ class ManagerHeartbeat(Message):
 class JobSubmission(Message):
     """
     Job submission from client to gate or manager.
-    
+
     A job contains one or more workflow classes to execute.
-    
+
+    Workflow format (cloudpickled):
+        list[tuple[str, list[str], Workflow]]
+        - str: workflow_id (client-generated, globally unique)
+        - list[str]: dependency workflow names
+        - Workflow: the workflow instance
+
+    The workflow_id is generated by the client to ensure consistency across
+    all datacenters. Gates and managers use these IDs to track and correlate
+    results from different DCs for the same logical workflow.
+
     If callback_addr is provided, the gate/manager will push status
     updates to the client via TCP instead of requiring polling.
+
+    If reporting_configs is provided (cloudpickled list of ReporterConfig),
+    the manager/gate will submit results to reporters after aggregation
+    and notify the client of success/failure per reporter.
+
+    Protocol Version (AD-25):
+    - protocol_version_major/minor: For version compatibility checks
+    - capabilities: Comma-separated list of features client supports
     """
     job_id: str                  # Unique job identifier
-    workflows: bytes             # Cloudpickled list of Workflow classes
+    workflows: bytes             # Cloudpickled list[tuple[str, list[str], Workflow]]
     vus: int                     # Virtual users (cores to use per workflow)
     timeout_seconds: float       # Maximum execution time
     datacenter_count: int = 1    # Number of DCs to run in (gates only)
@@ -470,21 +714,37 @@ class JobSubmission(Message):
     # Set by the job leader gate when dispatching to managers
     # Managers send results directly to this gate instead of all gates
     origin_gate_addr: tuple[str, int] | None = None
+    # Optional reporter configs for result submission
+    # Cloudpickled list of ReporterConfig objects
+    # If set, manager/gate submits results to these reporters after aggregation
+    reporting_configs: bytes = b''
+    # Protocol version fields (AD-25) - defaults for backwards compatibility
+    protocol_version_major: int = 1
+    protocol_version_minor: int = 0
+    capabilities: str = ""       # Comma-separated feature list
 
 
 @dataclass(slots=True)
 class JobAck(Message):
     """
     Acknowledgment of job submission.
-    
+
     Returned immediately after job is accepted for processing.
     If rejected due to not being leader, leader_addr provides redirect target.
+
+    Protocol Version (AD-25):
+    - protocol_version_major/minor: Server's protocol version
+    - capabilities: Comma-separated negotiated features
     """
     job_id: str                  # Job identifier
     accepted: bool               # Whether job was accepted
     error: str | None = None     # Error message if rejected
     queued_position: int = 0     # Position in queue (if queued)
     leader_addr: tuple[str, int] | None = None  # Leader address for redirect
+    # Protocol version fields (AD-25) - defaults for backwards compatibility
+    protocol_version_major: int = 1
+    protocol_version_minor: int = 0
+    capabilities: str = ""       # Comma-separated negotiated features
 
 
 @dataclass(slots=True)
@@ -538,6 +798,271 @@ class WorkflowDispatchAck(Message):
 
 
 # =============================================================================
+# Cancellation (AD-20)
+# =============================================================================
+
+@dataclass(slots=True)
+class JobCancelRequest(Message):
+    """
+    Request to cancel a running job (AD-20).
+
+    Can be sent from:
+    - Client -> Gate (global cancellation across all DCs)
+    - Client -> Manager (DC-local cancellation)
+    - Gate -> Manager (forwarding client request)
+    - Manager -> Worker (cancel specific workflows)
+
+    The fence_token is used for consistency:
+    - If provided, only cancel if the job's current fence token matches
+    - This prevents cancelling a restarted job after a crash recovery
+    """
+    job_id: str                  # Job to cancel
+    requester_id: str            # Who requested cancellation (for audit)
+    timestamp: float             # When cancellation was requested
+    fence_token: int = 0         # Fence token for consistency (0 = ignore)
+    reason: str = ""             # Optional cancellation reason
+
+
+@dataclass(slots=True)
+class JobCancelResponse(Message):
+    """
+    Response to a job cancellation request (AD-20).
+
+    Returned by:
+    - Gate: Aggregated result from all DCs
+    - Manager: DC-local result
+    - Worker: Workflow-level result
+    """
+    job_id: str                  # Job that was cancelled
+    success: bool                # Whether cancellation succeeded
+    cancelled_workflow_count: int = 0  # Number of workflows cancelled
+    already_cancelled: bool = False    # True if job was already cancelled
+    already_completed: bool = False    # True if job was already completed
+    error: str | None = None     # Error message if failed
+
+
+@dataclass(slots=True)
+class WorkflowCancelRequest(Message):
+    """
+    Request to cancel a specific workflow on a worker (AD-20).
+
+    Sent from Manager -> Worker for individual workflow cancellation.
+    """
+    job_id: str                  # Parent job ID
+    workflow_id: str             # Specific workflow to cancel
+    requester_id: str            # Who requested cancellation
+    timestamp: float             # When cancellation was requested
+
+
+@dataclass(slots=True)
+class WorkflowCancelResponse(Message):
+    """
+    Response to a workflow cancellation request (AD-20).
+
+    Returned by Worker -> Manager after attempting cancellation.
+    """
+    job_id: str                  # Parent job ID
+    workflow_id: str             # Workflow that was cancelled
+    success: bool                # Whether cancellation succeeded
+    was_running: bool = False    # True if workflow was actively running
+    already_completed: bool = False  # True if already finished
+    error: str | None = None     # Error message if failed
+
+
+@dataclass(slots=True)
+class WorkflowCancellationComplete(Message):
+    """
+    Push notification from Worker -> Manager when workflow cancellation completes.
+
+    Sent after _cancel_workflow() finishes (success or failure) to notify the
+    manager that the workflow has been fully cancelled and cleanup is done.
+    This enables the manager to:
+    1. Update workflow status to CANCELLED
+    2. Aggregate errors across all workers
+    3. Push completion notification to origin gate/client
+    """
+    job_id: str                      # Parent job ID
+    workflow_id: str                 # Workflow that was cancelled
+    success: bool                    # True if cancellation succeeded without errors
+    errors: list[str] = field(default_factory=list)  # Any errors during cancellation
+    cancelled_at: float = 0.0        # Timestamp when cancellation completed
+    node_id: str = ""                # Worker node ID that performed cancellation
+
+
+@dataclass(slots=True)
+class JobCancellationComplete(Message):
+    """
+    Push notification from Manager -> Gate/Client when job cancellation completes.
+
+    Sent after all workflows for a job have been cancelled. Aggregates results
+    from all workers and includes any errors encountered during cancellation.
+    This enables the client to:
+    1. Know when cancellation is fully complete (not just acknowledged)
+    2. See any errors that occurred during cancellation
+    3. Clean up local job state
+    """
+    job_id: str                      # Job that was cancelled
+    success: bool                    # True if all workflows cancelled without errors
+    cancelled_workflow_count: int = 0  # Number of workflows that were cancelled
+    total_workflow_count: int = 0    # Total workflows that needed cancellation
+    errors: list[str] = field(default_factory=list)  # Aggregated errors from all workers
+    cancelled_at: float = 0.0        # Timestamp when cancellation completed
+
+
+# =============================================================================
+# Workflow-Level Cancellation (Section 6)
+# =============================================================================
+
+
+class WorkflowCancellationStatus(str, Enum):
+    """Status result for workflow cancellation request."""
+    CANCELLED = "cancelled"              # Successfully cancelled
+    PENDING_CANCELLED = "pending_cancelled"  # Was pending, now cancelled
+    ALREADY_CANCELLED = "already_cancelled"  # Was already cancelled
+    ALREADY_COMPLETED = "already_completed"  # Already finished, can't cancel
+    NOT_FOUND = "not_found"              # Workflow not found
+    CANCELLING = "cancelling"            # Cancellation in progress
+
+
+@dataclass(slots=True)
+class SingleWorkflowCancelRequest(Message):
+    """
+    Request to cancel a specific workflow (Section 6).
+
+    Can be sent from:
+    - Client -> Gate (cross-DC workflow cancellation)
+    - Gate -> Manager (DC-specific workflow cancellation)
+    - Client -> Manager (direct DC workflow cancellation)
+
+    If cancel_dependents is True, all workflows that depend on this one
+    will also be cancelled recursively.
+    """
+    job_id: str                          # Parent job ID
+    workflow_id: str                     # Specific workflow to cancel
+    request_id: str                      # Unique request ID for tracking/dedup
+    requester_id: str                    # Who requested cancellation
+    timestamp: float                     # When request was made
+    cancel_dependents: bool = True       # Also cancel dependent workflows
+    origin_gate_addr: tuple[str, int] | None = None  # For result push
+    origin_client_addr: tuple[str, int] | None = None  # For direct client push
+
+
+@dataclass(slots=True)
+class SingleWorkflowCancelResponse(Message):
+    """
+    Response to a single workflow cancellation request (Section 6).
+
+    Contains the status of the cancellation and any dependents that
+    were also cancelled as a result.
+    """
+    job_id: str                          # Parent job ID
+    workflow_id: str                     # Requested workflow
+    request_id: str                      # Echoed request ID
+    status: str                          # WorkflowCancellationStatus value
+    cancelled_dependents: list[str] = field(default_factory=list)  # IDs of cancelled deps
+    errors: list[str] = field(default_factory=list)  # Any errors during cancellation
+    datacenter: str = ""                 # Responding datacenter
+
+
+@dataclass(slots=True)
+class WorkflowCancellationPeerNotification(Message):
+    """
+    Peer notification for workflow cancellation (Section 6).
+
+    Sent from manager-to-manager or gate-to-gate to synchronize
+    cancellation state across the cluster. Ensures all peers mark
+    the workflow (and dependents) as cancelled to prevent resurrection.
+    """
+    job_id: str                          # Parent job ID
+    workflow_id: str                     # Primary workflow cancelled
+    request_id: str                      # Original request ID
+    origin_node_id: str                  # Node that initiated cancellation
+    cancelled_workflows: list[str] = field(default_factory=list)  # All cancelled (incl deps)
+    timestamp: float = 0.0               # When cancellation occurred
+
+
+@dataclass(slots=True)
+class CancelledWorkflowInfo:
+    """
+    Tracking info for a cancelled workflow (Section 6).
+
+    Stored in manager's _cancelled_workflows bucket to prevent
+    resurrection of cancelled workflows.
+    """
+    job_id: str                          # Parent job ID
+    workflow_id: str                     # Cancelled workflow ID
+    cancelled_at: float                  # When cancelled
+    request_id: str                      # Original request ID
+    dependents: list[str] = field(default_factory=list)  # Cancelled dependents
+
+
+# =============================================================================
+# Adaptive Healthcheck Extensions (AD-26)
+# =============================================================================
+
+@dataclass(slots=True)
+class HealthcheckExtensionRequest(Message):
+    """
+    Request from worker for deadline extension (AD-26).
+
+    Workers can request deadline extensions when:
+    - Executing long-running workflows
+    - System is under heavy load but making progress
+    - Approaching timeout but not stuck
+
+    Extensions use logarithmic decay:
+    - First extension: base/2 (e.g., 15s with base=30s)
+    - Second extension: base/4 (e.g., 7.5s)
+    - Continues until min_grant is reached
+
+    Sent from: Worker -> Manager
+
+    AD-26 Issue 4: Absolute metrics provide more robust progress tracking
+    than relative 0-1 progress values. For long-running work, absolute
+    metrics (100 items → 101 items) are easier to track than relative
+    progress (0.995 → 0.996) and avoid float precision issues.
+    """
+    worker_id: str               # Worker requesting extension
+    reason: str                  # Why extension is needed
+    current_progress: float      # Progress metric (must increase for approval) - kept for backward compatibility
+    estimated_completion: float  # Estimated seconds until completion
+    active_workflow_count: int   # Number of workflows currently executing
+    # AD-26 Issue 4: Absolute progress metrics (preferred over relative progress)
+    completed_items: int | None = None  # Absolute count of completed items
+    total_items: int | None = None      # Total items to complete
+
+
+@dataclass(slots=True)
+class HealthcheckExtensionResponse(Message):
+    """
+    Response to a healthcheck extension request (AD-26).
+
+    If granted, the worker's deadline is extended by extension_seconds.
+    If denied, the denial_reason explains why.
+
+    Extensions may be denied if:
+    - Maximum extensions already granted
+    - No progress since last extension
+    - Worker is being evicted
+
+    Graceful exhaustion:
+    - is_exhaustion_warning: True when close to exhaustion (remaining <= threshold)
+    - grace_period_remaining: Seconds of grace time left after exhaustion
+    - in_grace_period: True if exhausted but still within grace period
+
+    Sent from: Manager -> Worker
+    """
+    granted: bool                # Whether extension was granted
+    extension_seconds: float     # Seconds of extension granted (0 if denied)
+    new_deadline: float          # New deadline timestamp (if granted)
+    remaining_extensions: int    # Number of extensions remaining
+    denial_reason: str | None = None  # Why extension was denied
+    is_exhaustion_warning: bool = False  # True if about to exhaust extensions
+    grace_period_remaining: float = 0.0  # Seconds of grace remaining after exhaustion
+    in_grace_period: bool = False  # True if exhausted but within grace period
+
+
+# =============================================================================
 # Status Updates and Reporting
 # =============================================================================
 
@@ -566,6 +1091,11 @@ class WorkflowProgress(Message):
     When cores_completed > 0, the manager can immediately provision new
     workflows to the freed cores without waiting for the entire workflow
     to complete on all cores.
+
+    Time alignment:
+    - collected_at: Unix timestamp when stats were collected at the worker.
+      Used for time-aligned aggregation across workers/DCs.
+    - timestamp: Monotonic timestamp for local ordering (not cross-node comparable).
     """
     job_id: str                  # Parent job
     workflow_id: str             # Workflow instance
@@ -576,7 +1106,8 @@ class WorkflowProgress(Message):
     rate_per_second: float       # Current execution rate
     elapsed_seconds: float       # Time since start
     step_stats: list["StepStats"] = field(default_factory=list)
-    timestamp: float = 0.0       # Monotonic timestamp
+    timestamp: float = 0.0       # Monotonic timestamp (local ordering)
+    collected_at: float = 0.0    # Unix timestamp when stats were collected (cross-node alignment)
     assigned_cores: list[int] = field(default_factory=list)  # Per-core assignment
     cores_completed: int = 0     # Cores that have finished their portion
     avg_cpu_percent: float = 0.0   # Average CPU utilization
@@ -605,7 +1136,7 @@ class WorkflowFinalResult(Message):
     workflow_id: str             # Workflow instance
     workflow_name: str           # Workflow class name
     status: str                  # COMPLETED | FAILED
-    results: dict[int, WorkflowResults]               # Cloudpickled dict[int, WorkflowResults]
+    results: list[WorkflowStats]  # Cloudpickled list[WorkflowResults]
     context_updates: bytes       # Cloudpickled context dict (for Provide hooks)
     error: str | None = None     # Error message if failed (no traceback)
     worker_id: str = ""          # Worker that executed this workflow
@@ -616,15 +1147,60 @@ class WorkflowFinalResult(Message):
 class WorkflowResult(Message):
     """
     Simplified workflow result for aggregation (without context).
-    
+
     Used in JobFinalResult for Manager -> Gate communication.
     Context is NOT included because gates don't need it.
+
+    For gate-bound jobs: results contains raw per-core WorkflowStats for cross-DC aggregation
+    For direct-client jobs: results contains aggregated WorkflowStats (single item list)
     """
     workflow_id: str             # Workflow instance ID
     workflow_name: str           # Workflow class name
     status: str                  # COMPLETED | FAILED
-    results: bytes               # Cloudpickled WorkflowStats
+    results: list[WorkflowStats] = field(default_factory=list)  # Per-core or aggregated stats
     error: str | None = None     # Error message if failed
+
+
+@dataclass(slots=True)
+class WorkflowDCResult:
+    """Per-datacenter workflow result for cross-DC visibility."""
+    datacenter: str              # Datacenter identifier
+    status: str                  # COMPLETED | FAILED
+    stats: WorkflowStats | None = None  # Aggregated stats for this DC (test workflows)
+    error: str | None = None     # Error message if failed
+    elapsed_seconds: float = 0.0
+    # Raw results list for non-test workflows (unaggregated)
+    raw_results: list[WorkflowStats] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class WorkflowResultPush(Message):
+    """
+    Push notification for a completed workflow's results.
+
+    Sent from Manager to Client (aggregated) or Manager to Gate (raw) as soon
+    as each workflow completes, without waiting for the entire job to finish.
+
+    For client-bound from manager: results contains single aggregated WorkflowStats, per_dc_results empty
+    For client-bound from gate: results contains cross-DC aggregated, per_dc_results has per-DC breakdown
+    For gate-bound: results contains raw per-core WorkflowStats list for cross-DC aggregation
+    """
+    job_id: str                  # Parent job
+    workflow_id: str             # Workflow instance ID
+    workflow_name: str           # Workflow class name
+    datacenter: str              # Source datacenter (or "aggregated" for cross-DC)
+    status: str                  # COMPLETED | FAILED
+    results: list[WorkflowStats] = field(default_factory=list)
+    error: str | None = None     # Error message if failed
+    elapsed_seconds: float = 0.0
+    # Per-DC breakdown (populated when gate aggregates cross-DC results)
+    per_dc_results: list[WorkflowDCResult] = field(default_factory=list)
+    # Completion timestamp for ordering
+    completed_at: float = 0.0    # Unix timestamp when workflow completed
+    # Whether this workflow contains test hooks (determines aggregation behavior)
+    # True: aggregate results using merge_results()
+    # False: return raw list of WorkflowStats per DC
+    is_test: bool = True
 
 
 @dataclass(slots=True)
@@ -692,6 +1268,11 @@ class JobProgress(Message):
     Aggregated job progress from manager to gate.
 
     Contains summary of all workflows in the job.
+
+    Time alignment:
+    - collected_at: Unix timestamp when stats were aggregated at the manager.
+      Used for time-aligned aggregation across DCs at the gate.
+    - timestamp: Monotonic timestamp for local ordering (not cross-node comparable).
     """
     job_id: str                  # Job identifier
     datacenter: str              # Reporting datacenter
@@ -701,7 +1282,8 @@ class JobProgress(Message):
     total_failed: int = 0        # Total actions failed
     overall_rate: float = 0.0    # Aggregate rate
     elapsed_seconds: float = 0.0 # Time since job start
-    timestamp: float = 0.0       # Monotonic timestamp
+    timestamp: float = 0.0       # Monotonic timestamp (local ordering)
+    collected_at: float = 0.0    # Unix timestamp when aggregated (cross-DC alignment)
     # Aggregated step stats across all workflows in the job
     step_stats: list["StepStats"] = field(default_factory=list)
     fence_token: int = 0         # Fencing token for at-most-once semantics
@@ -828,6 +1410,207 @@ class JobLeaderGateTransferAck(Message):
     accepted: bool = True        # Whether transfer was applied
 
 
+@dataclass(slots=True)
+class JobLeaderManagerTransfer(Message):
+    """
+    Notification that job leadership has transferred to a new manager (AD-31).
+
+    Sent from the new job leader manager to the origin gate when manager
+    failure triggers job ownership transfer within a datacenter. Gate updates
+    its _job_dc_managers mapping to route requests to the new leader manager.
+
+    Flow:
+    - Manager-A (job leader in DC) fails
+    - Manager-B (cluster leader) takes over job leadership
+    - Manager-B sends JobLeaderManagerTransfer to origin gate
+    - Gate updates _job_dc_managers[job_id][dc_id] = Manager-B address
+    """
+    job_id: str                     # Job being transferred
+    datacenter_id: str              # DC where leadership changed
+    new_manager_id: str             # Node ID of new job leader manager
+    new_manager_addr: tuple[str, int]  # TCP address of new leader manager
+    fence_token: int                # Incremented fence token for consistency
+    old_manager_id: str | None = None  # Node ID of old leader manager (if known)
+
+
+@dataclass(slots=True)
+class JobLeaderManagerTransferAck(Message):
+    """
+    Acknowledgment of job leader manager transfer.
+    """
+    job_id: str                  # Job being acknowledged
+    gate_id: str                 # Node ID of responding gate
+    accepted: bool = True        # Whether transfer was applied
+
+
+@dataclass(slots=True)
+class JobLeaderWorkerTransfer(Message):
+    """
+    Notification to workers that job leadership has transferred (AD-31).
+
+    Sent from the new job leader manager to workers with active workflows
+    for the job. Workers update their _workflow_job_leader mapping to route
+    progress updates to the new manager.
+
+    Flow:
+    - Manager-A (job leader) fails
+    - Manager-B takes over job leadership
+    - Manager-B sends JobLeaderWorkerTransfer to workers with active sub-workflows
+    - Workers update _workflow_job_leader for affected workflows
+    """
+    job_id: str                         # Job whose leadership transferred
+    workflow_ids: list[str]             # Workflow IDs affected (worker's active workflows)
+    new_manager_id: str                 # Node ID of new job leader manager
+    new_manager_addr: tuple[str, int]   # TCP address of new leader manager
+    fence_token: int                    # Fencing token for consistency
+    old_manager_id: str | None = None   # Node ID of old leader manager (if known)
+
+
+@dataclass(slots=True)
+class JobLeaderWorkerTransferAck(Message):
+    """
+    Acknowledgment of job leader worker transfer notification (Section 8.4).
+
+    Sent from worker to new job leader manager after processing transfer.
+    Contains workflow state information so the new leader can verify all workers acknowledged.
+    """
+    job_id: str                          # Job being acknowledged
+    worker_id: str                       # Node ID of responding worker
+    workflows_updated: int               # Number of workflow routings updated
+    accepted: bool = True                # Whether transfer was applied
+    rejection_reason: str = ""           # Reason if rejected (8.2)
+    fence_token_received: int = 0        # The fence token from the transfer (8.4)
+    workflow_states: dict[str, str] = field(default_factory=dict)  # workflow_id -> status (8.4)
+
+
+@dataclass(slots=True)
+class PendingTransfer:
+    """
+    Tracks a transfer that arrived before the job/workflow was known (Section 8.3).
+
+    This handles the edge case where a transfer notification arrives
+    before the original workflow dispatch.
+    """
+    job_id: str
+    workflow_ids: list[str]
+    new_manager_id: str
+    new_manager_addr: tuple[str, int]
+    fence_token: int
+    old_manager_id: str | None
+    received_at: float
+
+
+# =============================================================================
+# Section 9: Client Leadership Tracking Models
+# =============================================================================
+
+@dataclass(slots=True)
+class GateLeaderInfo:
+    """
+    Information about a gate acting as job leader for a specific job (Section 9.1.1).
+
+    Used by clients to track which gate is the authoritative source
+    for a job's status and control operations.
+    """
+    gate_addr: tuple[str, int]   # (host, port) of the gate
+    fence_token: int             # Fencing token for ordering
+    last_updated: float          # time.monotonic() when last updated
+
+
+@dataclass(slots=True)
+class ManagerLeaderInfo:
+    """
+    Information about a manager acting as job leader (Section 9.2.1).
+
+    Tracks manager leadership per datacenter for multi-DC deployments.
+    """
+    manager_addr: tuple[str, int]  # (host, port) of the manager
+    fence_token: int               # Fencing token for ordering
+    datacenter_id: str             # Which datacenter this manager serves
+    last_updated: float            # time.monotonic() when last updated
+
+
+@dataclass(slots=True)
+class OrphanedJobInfo:
+    """
+    Information about a job whose leaders are unknown/failed (Section 9.5.1).
+
+    Tracks jobs in orphan state pending either leader discovery or timeout.
+    """
+    job_id: str
+    orphan_timestamp: float              # When job became orphaned
+    last_known_gate: tuple[str, int] | None
+    last_known_manager: tuple[str, int] | None
+    datacenter_id: str = ""
+
+
+@dataclass(slots=True)
+class LeadershipRetryPolicy:
+    """
+    Configurable retry behavior for leadership changes (Section 9.3.3).
+
+    Controls how clients retry operations when leadership changes occur.
+    """
+    max_retries: int = 3
+    retry_delay: float = 0.5
+    exponential_backoff: bool = True
+    max_delay: float = 5.0
+
+
+@dataclass(slots=True)
+class GateJobLeaderTransfer(Message):
+    """
+    Notification to client that gate job leadership has transferred (Section 9.1.2).
+
+    Sent from new gate leader to client when taking over job leadership.
+    """
+    job_id: str
+    new_gate_id: str
+    new_gate_addr: tuple[str, int]
+    fence_token: int
+    old_gate_id: str | None = None
+    old_gate_addr: tuple[str, int] | None = None
+
+
+@dataclass(slots=True)
+class GateJobLeaderTransferAck(Message):
+    """
+    Acknowledgment of gate job leader transfer notification.
+    """
+    job_id: str
+    client_id: str
+    accepted: bool = True
+    rejection_reason: str = ""
+
+
+@dataclass(slots=True)
+class ManagerJobLeaderTransfer(Message):
+    """
+    Notification to client that manager job leadership has transferred (Section 9.2.2).
+
+    Typically forwarded by gate to client when a manager job leader changes.
+    """
+    job_id: str
+    new_manager_id: str
+    new_manager_addr: tuple[str, int]
+    fence_token: int
+    datacenter_id: str
+    old_manager_id: str | None = None
+    old_manager_addr: tuple[str, int] | None = None
+
+
+@dataclass(slots=True)
+class ManagerJobLeaderTransferAck(Message):
+    """
+    Acknowledgment of manager job leader transfer notification.
+    """
+    job_id: str
+    client_id: str
+    datacenter_id: str
+    accepted: bool = True
+    rejection_reason: str = ""
+
+
 # =============================================================================
 # Client Push Notifications
 # =============================================================================
@@ -929,6 +1712,163 @@ class RegisterCallbackResponse(Message):
     error: str | None = None          # Error message if failed
 
 
+@dataclass(slots=True)
+class ReporterResultPush(Message):
+    """
+    Push notification for reporter submission result.
+
+    Sent from Manager/Gate to Client after submitting results to a reporter.
+    Each reporter config generates one notification (success or failure).
+
+    This is sent as a background task completes, not batched.
+    Clients can track which reporters succeeded or failed for a job.
+    """
+    job_id: str                       # Job the results were for
+    reporter_type: str                # ReporterTypes enum value (e.g., "json", "datadog")
+    success: bool                     # Whether submission succeeded
+    error: str | None = None          # Error message if failed
+    elapsed_seconds: float = 0.0      # Time taken for submission
+    # Source information for multi-DC scenarios
+    source: str = ""                  # "manager" or "gate"
+    datacenter: str = ""              # Datacenter that submitted (manager only)
+
+
+@dataclass(slots=True)
+class RateLimitResponse(Message):
+    """
+    Response indicating rate limit exceeded.
+
+    Returned when a client exceeds their request rate limit.
+    Client should wait retry_after_seconds before retrying.
+
+    Protocol:
+    1. Client sends request via TCP
+    2. Server checks rate limit for client_id (from addr) + operation
+    3. If exceeded, returns RateLimitResponse with retry_after
+    4. Client waits and retries (using CooperativeRateLimiter)
+
+    Integration:
+    - Gate: Rate limits job_submit, job_status, cancel, workflow_query
+    - Manager: Rate limits workflow_dispatch, provision requests
+    - Both use ServerRateLimiter with per-client token buckets
+    """
+    operation: str                    # Operation that was rate limited
+    retry_after_seconds: float        # Seconds to wait before retry
+    error: str = "Rate limit exceeded"  # Error message
+    tokens_remaining: float = 0.0     # Remaining tokens (for debugging)
+
+
+# =============================================================================
+# Job Timeout Messages (AD-34)
+# =============================================================================
+
+@dataclass(slots=True)
+class JobProgressReport(Message):
+    """
+    Manager → Gate: Periodic progress report (AD-34 multi-DC coordination).
+
+    Sent every ~10 seconds during job execution to keep gate informed of
+    DC-local progress. Used by gate to detect global timeouts and stuck DCs.
+
+    Extension Integration (AD-26):
+    - total_extensions_granted: Total seconds of extensions granted in this DC
+    - max_worker_extension: Largest extension granted to any single worker
+    - workers_with_extensions: Count of workers currently with active extensions
+    """
+    job_id: str
+    datacenter: str
+    manager_id: str
+    manager_host: str  # For gate to send replies
+    manager_port: int
+    workflows_total: int
+    workflows_completed: int
+    workflows_failed: int
+    has_recent_progress: bool  # Any workflow progressed in last 10s
+    timestamp: float
+    fence_token: int  # Manager's fence token
+
+    # Extension tracking (AD-26 integration)
+    total_extensions_granted: float = 0.0  # Total seconds granted to workers
+    max_worker_extension: float = 0.0  # Largest extension granted
+    workers_with_extensions: int = 0  # Count of workers with active extensions
+
+
+@dataclass(slots=True)
+class JobTimeoutReport(Message):
+    """
+    Manager → Gate: DC-local timeout detected (AD-34 multi-DC coordination).
+
+    Sent when manager detects job timeout or stuck workflows in its datacenter.
+    Gate aggregates timeout reports from all DCs to declare global timeout.
+
+    Manager sends this but does NOT mark job failed locally - waits for gate's
+    global timeout decision (JobGlobalTimeout).
+    """
+    job_id: str
+    datacenter: str
+    manager_id: str
+    manager_host: str
+    manager_port: int
+    reason: str  # "timeout" | "stuck" | other descriptive reason
+    elapsed_seconds: float
+    fence_token: int
+
+
+@dataclass(slots=True)
+class JobGlobalTimeout(Message):
+    """
+    Gate → Manager: Global timeout declared (AD-34 multi-DC coordination).
+
+    Gate has determined the job is globally timed out (based on timeout reports
+    from DCs, overall timeout exceeded, or all DCs stuck). Manager must cancel
+    job locally and mark as timed out.
+
+    Fence token validation prevents stale timeout decisions after leader transfers.
+    """
+    job_id: str
+    reason: str  # Why gate timed out the job
+    timed_out_at: float  # Gate's timestamp
+    fence_token: int  # Gate's fence token for this decision
+
+
+@dataclass(slots=True)
+class JobLeaderTransfer(Message):
+    """
+    Manager → Gate: Notify gate of leader change (AD-34 multi-DC coordination).
+
+    Sent by new leader after taking over job leadership. Gate updates its
+    tracking to send future timeout decisions to the new leader.
+
+    Includes incremented fence token to prevent stale operations.
+    """
+    job_id: str
+    datacenter: str
+    new_leader_id: str
+    new_leader_host: str
+    new_leader_port: int
+    fence_token: int  # New leader's fence token
+
+
+@dataclass(slots=True)
+class JobFinalStatus(Message):
+    """
+    Manager → Gate: Final job status for cleanup (AD-34 lifecycle management).
+
+    Sent when job reaches terminal state (completed/failed/cancelled/timed out).
+    Gate uses this to clean up timeout tracking for the job.
+
+    When all DCs report terminal status, gate removes job from tracking to
+    prevent memory leaks.
+    """
+    job_id: str
+    datacenter: str
+    manager_id: str
+    status: str  # JobStatus.COMPLETED/FAILED/CANCELLED/TIMEOUT value
+    timestamp: float
+    fence_token: int
+
+
+
 # =============================================================================
 # State Synchronization
 # =============================================================================
@@ -977,7 +1917,7 @@ class ManagerStateSnapshot(Message):
 class GateStateSnapshot(Message):
     """
     Complete state snapshot from a gate.
-    
+
     Used for state sync between gates when a new leader is elected.
     Contains global job state and datacenter status.
     """
@@ -991,6 +1931,12 @@ class GateStateSnapshot(Message):
     # Manager discovery - shared between gates
     datacenter_managers: dict[str, list[tuple[str, int]]] = field(default_factory=dict)
     datacenter_manager_udp: dict[str, list[tuple[str, int]]] = field(default_factory=dict)
+    # Per-job leadership tracking (independent of SWIM cluster leadership)
+    job_leaders: dict[str, str] = field(default_factory=dict)  # job_id -> leader_node_id
+    job_leader_addrs: dict[str, tuple[str, int]] = field(default_factory=dict)  # job_id -> (host, tcp_port)
+    job_fencing_tokens: dict[str, int] = field(default_factory=dict)  # job_id -> fencing token (for leadership consistency)
+    # Per-job per-DC manager leader tracking (which manager accepted each job in each DC)
+    job_dc_managers: dict[str, dict[str, tuple[str, int]]] = field(default_factory=dict)  # job_id -> {dc_id -> (host, port)}
 
 
 @dataclass(slots=True)
@@ -1370,6 +2316,35 @@ class GatePingResponse(Message):
 
 
 # =============================================================================
+# Datacenter Query Messages
+# =============================================================================
+
+@dataclass(slots=True)
+class DatacenterListRequest(Message):
+    """
+    Request to list registered datacenters from a gate.
+
+    Clients use this to discover available datacenters before submitting jobs.
+    This is a lightweight query that returns datacenter identifiers and health status.
+    """
+    request_id: str = ""  # Optional request identifier for correlation
+
+
+@dataclass(slots=True)
+class DatacenterListResponse(Message):
+    """
+    Response containing list of registered datacenters.
+
+    Returns datacenter information including health status and capacity.
+    """
+    request_id: str = ""                 # Echoed from request
+    gate_id: str = ""                    # Responding gate's node_id
+    datacenters: list[DatacenterInfo] = field(default_factory=list)  # Per-DC info
+    total_available_cores: int = 0       # Total available cores across all DCs
+    healthy_datacenter_count: int = 0    # Count of healthy DCs
+
+
+# =============================================================================
 # Workflow Query Messages
 # =============================================================================
 
@@ -1448,7 +2423,7 @@ class GateWorkflowQueryResponse(Message):
     datacenters: list[DatacenterWorkflowStatus] = field(default_factory=list)
 
 
-@dataclass
+@dataclass(slots=True)
 class EagerWorkflowEntry:
     """
     Tracking entry for a workflow pending eager dispatch.
@@ -1466,4 +2441,169 @@ class EagerWorkflowEntry:
     dependencies: set[str]               # Set of workflow names this depends on
     completed_dependencies: set[str] = field(default_factory=set)  # Dependencies that have completed
     dispatched: bool = False             # Whether this workflow has been dispatched
-    cores_allocated: int = 0             # Cores allocated (set at dispatch time)
+
+
+# =============================================================================
+# Datacenter Registration State (Gate-side tracking)
+# =============================================================================
+
+@dataclass(slots=True)
+class ManagerRegistrationState:
+    """
+    Per-manager registration state tracked by a Gate.
+
+    Tracks when each manager registered and heartbeat patterns for
+    adaptive staleness detection. Generation IDs handle manager restarts.
+    """
+    manager_addr: tuple[str, int]        # (host, tcp_port)
+    node_id: str | None = None           # Manager's node_id (from first heartbeat)
+    generation: int = 0                  # Increments on manager restart (from heartbeat)
+
+    # Timing
+    first_seen_at: float = 0.0           # monotonic time of first heartbeat
+    last_heartbeat_at: float = 0.0       # monotonic time of most recent heartbeat
+
+    # Heartbeat interval tracking (for adaptive staleness)
+    heartbeat_count: int = 0             # Total heartbeats received
+    avg_heartbeat_interval: float = 5.0  # Running average interval (seconds)
+
+    @property
+    def is_registered(self) -> bool:
+        """Manager has sent at least one heartbeat."""
+        return self.first_seen_at > 0
+
+    def is_stale(self, now: float, staleness_multiplier: float = 3.0) -> bool:
+        """
+        Check if manager is stale based on adaptive interval.
+
+        A manager is stale if no heartbeat received for staleness_multiplier
+        times the average heartbeat interval.
+        """
+        if not self.is_registered:
+            return False
+        expected_interval = max(self.avg_heartbeat_interval, 1.0)
+        return (now - self.last_heartbeat_at) > (staleness_multiplier * expected_interval)
+
+    def record_heartbeat(self, now: float, node_id: str, generation: int) -> bool:
+        """
+        Record a heartbeat from this manager.
+
+        Returns True if this is a new generation (manager restarted).
+        """
+        is_new_generation = generation > self.generation
+
+        if is_new_generation or not self.is_registered:
+            # New registration or restart - reset state
+            self.node_id = node_id
+            self.generation = generation
+            self.first_seen_at = now
+            self.heartbeat_count = 1
+            self.avg_heartbeat_interval = 5.0  # Reset to default
+        else:
+            # Update running average of heartbeat interval
+            if self.last_heartbeat_at > 0:
+                interval = now - self.last_heartbeat_at
+                # Exponential moving average (alpha = 0.2)
+                self.avg_heartbeat_interval = 0.8 * self.avg_heartbeat_interval + 0.2 * interval
+            self.heartbeat_count += 1
+
+        self.last_heartbeat_at = now
+        return is_new_generation
+
+
+@dataclass(slots=True)
+class DatacenterRegistrationState:
+    """
+    Per-datacenter registration state tracked by a Gate.
+
+    Tracks which managers have registered and provides registration status
+    based on quorum requirements. Health classification only applies once
+    the datacenter is READY.
+    """
+    dc_id: str                                                      # Datacenter identifier
+    configured_managers: list[tuple[str, int]]                      # Manager addrs from config
+
+    # Per-manager tracking
+    manager_states: dict[tuple[str, int], ManagerRegistrationState] = field(default_factory=dict)
+
+    # Timing
+    first_heartbeat_at: float = 0.0      # When first manager registered (monotonic)
+    last_heartbeat_at: float = 0.0       # Most recent heartbeat from any manager (monotonic)
+
+    def get_registration_status(self, now: float, staleness_multiplier: float = 3.0) -> DatacenterRegistrationStatus:
+        """
+        Compute current registration status based on manager heartbeats.
+
+        Uses quorum (majority) of configured managers as the threshold
+        for READY status.
+        """
+        configured_count = len(self.configured_managers)
+        if configured_count == 0:
+            return DatacenterRegistrationStatus.UNAVAILABLE
+
+        # Count non-stale registered managers
+        active_count = sum(
+            1 for state in self.manager_states.values()
+            if state.is_registered and not state.is_stale(now, staleness_multiplier)
+        )
+
+        quorum = configured_count // 2 + 1
+
+        if active_count == 0:
+            if self.first_heartbeat_at == 0:
+                # Never received any heartbeats
+                return DatacenterRegistrationStatus.AWAITING_INITIAL
+            else:
+                # Had heartbeats before but all are now stale/lost
+                return DatacenterRegistrationStatus.UNAVAILABLE
+        elif active_count < quorum:
+            if self.first_heartbeat_at == 0 or self._was_ever_ready():
+                # Was ready before, now below quorum
+                return DatacenterRegistrationStatus.PARTIAL
+            else:
+                # Still coming up, not yet at quorum
+                return DatacenterRegistrationStatus.INITIALIZING
+        else:
+            # At or above quorum
+            return DatacenterRegistrationStatus.READY
+
+    def _was_ever_ready(self) -> bool:
+        """Check if this DC ever had quorum (any manager with heartbeat_count > 1)."""
+        # If any manager has received multiple heartbeats, we were likely ready before
+        return any(
+            state.heartbeat_count > 1
+            for state in self.manager_states.values()
+        )
+
+    def get_active_manager_count(self, now: float, staleness_multiplier: float = 3.0) -> int:
+        """Get count of non-stale registered managers."""
+        return sum(
+            1 for state in self.manager_states.values()
+            if state.is_registered and not state.is_stale(now, staleness_multiplier)
+        )
+
+    def record_heartbeat(
+        self,
+        manager_addr: tuple[str, int],
+        node_id: str,
+        generation: int,
+        now: float,
+    ) -> bool:
+        """
+        Record a heartbeat from a manager in this datacenter.
+
+        Returns True if this is a new manager or a manager restart (new generation).
+        """
+        if manager_addr not in self.manager_states:
+            self.manager_states[manager_addr] = ManagerRegistrationState(
+                manager_addr=manager_addr,
+            )
+
+        is_new = self.manager_states[manager_addr].record_heartbeat(now, node_id, generation)
+
+        # Update DC-level timing
+        if self.first_heartbeat_at == 0:
+            self.first_heartbeat_at = now
+        self.last_heartbeat_at = now
+
+        return is_new

@@ -15,10 +15,12 @@ except Exception:
     class Position:
         pass
 
-from pydantic import BaseModel, StrictBool, StrictFloat, StrictInt
+from pydantic import BaseModel, ConfigDict, StrictBool, StrictFloat, StrictInt
 
 
 class DragToCommand(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     target: Locator
     force: Optional[StrictBool] = None
     no_wait_after: Optional[StrictBool] = None
@@ -26,6 +28,3 @@ class DragToCommand(BaseModel):
     source_position: Optional[Position] = None
     target_position: Optional[Position] = None
     timeout: Optional[StrictInt | StrictFloat] = None
-
-    class Config:
-        arbitrary_types_allowed = True

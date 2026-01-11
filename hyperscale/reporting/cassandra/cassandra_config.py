@@ -1,12 +1,14 @@
 from ssl import SSLContext
 from typing import List, Optional
 
-from pydantic import BaseModel, StrictStr, StrictInt
+from pydantic import BaseModel, ConfigDict, StrictStr, StrictInt
 
 from hyperscale.reporting.common.types import ReporterTypes
 
 
 class CassandraConfig(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     hosts: List[StrictStr] = ["127.0.0.1"]
     port: StrictInt = 9042
     username: StrictStr | None = None
@@ -19,6 +21,3 @@ class CassandraConfig(BaseModel):
     replication: StrictInt = 3
     ssl: Optional[SSLContext] = None
     reporter_type: ReporterTypes = ReporterTypes.Cassandra
-
-    class Config:
-        arbitrary_types_allowed = True

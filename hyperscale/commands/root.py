@@ -1,4 +1,6 @@
 import asyncio
+import gc
+import os
 import logging
 import sys
 
@@ -86,7 +88,6 @@ async def hyperscale():
 
 def run():
     logging.disable(logging.CRITICAL)
-
     try:
         asyncio.run(CLI.run(args=sys.argv[1:]))
 
@@ -96,3 +97,4 @@ def run():
         asyncio.InvalidStateError,
     ):
         pass
+

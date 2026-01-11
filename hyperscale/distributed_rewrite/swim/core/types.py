@@ -27,8 +27,13 @@ Message = Literal[
     b'pre-vote-resp',    # Pre-vote response: pre-vote-resp:term:granted>candidate_addr
 ]
 
-# Node status in the membership list
-Status = Literal[b'JOIN', b'OK', b'SUSPECT', b'DEAD']
+# Node status in the membership list (AD-29 compliant)
+# UNCONFIRMED: Peer discovered but not yet confirmed via bidirectional communication
+# JOIN: Peer just joined the cluster
+# OK: Peer is alive and healthy (confirmed)
+# SUSPECT: Peer suspected of failure (only from OK state, never from UNCONFIRMED)
+# DEAD: Peer confirmed dead
+Status = Literal[b'UNCONFIRMED', b'JOIN', b'OK', b'SUSPECT', b'DEAD']
 
 # Type of membership update for gossip
 UpdateType = Literal['alive', 'suspect', 'dead', 'join', 'leave']

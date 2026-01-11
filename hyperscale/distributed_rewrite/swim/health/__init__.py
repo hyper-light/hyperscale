@@ -26,6 +26,20 @@ from .federated_health_monitor import (
     DCLeaderAnnouncement,
 )
 
+from .peer_health_awareness import (
+    PeerHealthAwareness,
+    PeerHealthAwarenessConfig,
+    PeerHealthInfo,
+    PeerLoadLevel,
+)
+
+from .out_of_band_health_channel import (
+    OutOfBandHealthChannel,
+    OOBHealthChannelConfig,
+    OOBProbeResult,
+    get_oob_port_for_swim_port,
+)
+
 
 __all__ = [
     # Local Health Multiplier
@@ -46,5 +60,15 @@ __all__ = [
     'CrossClusterProbe',
     'CrossClusterAck',
     'DCLeaderAnnouncement',
+    # Peer Health Awareness (Phase 6.2)
+    'PeerHealthAwareness',
+    'PeerHealthAwarenessConfig',
+    'PeerHealthInfo',
+    'PeerLoadLevel',
+    # Out-of-Band Health Channel (Phase 6.3)
+    'OutOfBandHealthChannel',
+    'OOBHealthChannelConfig',
+    'OOBProbeResult',
+    'get_oob_port_for_swim_port',
 ]
 

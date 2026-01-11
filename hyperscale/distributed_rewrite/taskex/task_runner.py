@@ -2,6 +2,7 @@ import asyncio
 import functools
 import shlex
 import signal
+import uuid
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from typing import (
     Any,
@@ -47,12 +48,12 @@ class TaskRunner:
         if config is None:
             config = Env()
 
+        self.instance_id = instance_id
         self.tasks: Dict[str, Task[Any]] = {}
         self.results: Dict[str, Any] = {}
         self._cleanup_interval = TimeParser(config.MERCURY_SYNC_CLEANUP_INTERVAL).time
         self._cleanup_task: Optional[asyncio.Task] = None
         self._run_cleanup: bool = False
-        self._snowflake_generator = SnowflakeGenerator(instance_id)
 
         self._executor: ThreadPoolExecutor | ProcessPoolExecutor | None = None
         if executor_type == "thread":
@@ -83,7 +84,7 @@ class TaskRunner:
         self._cleanup_task = asyncio.ensure_future(self._cleanup())
 
     def create_task_id(self):
-        return self._snowflake_generator.generate()
+        return uuid.uuid4().int >> 64
 
     def skip_tasks(self, task_names: list[str]) -> None:
         """
@@ -162,7 +163,6 @@ class TaskRunner:
         task = self.tasks.get(command_name)
         if task is None and call:
             task = Task(
-                self._snowflake_generator,
                 command_name,
                 call,
                 self._executor,
@@ -230,7 +230,6 @@ class TaskRunner:
         task = self.tasks.get(command_name)
         if task is None:
             task = Task(
-                self._snowflake_generator,
                 command_name,
                 command,
                 self._executor,
