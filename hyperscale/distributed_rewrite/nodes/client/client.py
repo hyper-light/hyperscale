@@ -36,6 +36,11 @@ from hyperscale.distributed_rewrite.models import (
     JobCancelResponse,
 )
 from hyperscale.distributed_rewrite.env.env import Env
+from hyperscale.distributed_rewrite.reliability.rate_limiting import (
+    AdaptiveRateLimiter,
+    AdaptiveRateLimitConfig,
+)
+from hyperscale.distributed_rewrite.reliability.overload import HybridOverloadDetector
 
 # Import all client modules
 from hyperscale.distributed_rewrite.nodes.client.config import ClientConfig
@@ -130,7 +135,14 @@ class HyperscaleClient(MercurySyncBaseServer):
             gates=tuple(gates or []),
             env=env,
         )
-        self._state = ClientState(env=env)
+        self._state = ClientState()
+
+        # Initialize rate limiter for progress updates (AD-24)
+        # Uses AdaptiveRateLimiter with operation limits: (300, 10.0) = 30/s
+        self._rate_limiter = AdaptiveRateLimiter(
+            overload_detector=HybridOverloadDetector(),
+            config=AdaptiveRateLimitConfig(),
+        )
 
         # Initialize all modules with dependency injection
         self._targets = ClientTargetSelector(
@@ -216,8 +228,8 @@ class HyperscaleClient(MercurySyncBaseServer):
         )
         self._windowed_stats_push_handler = WindowedStatsPushHandler(
             state=self._state,
-            config=self._config,
             logger=self._logger,
+            rate_limiter=self._rate_limiter,
         )
         self._cancellation_complete_handler = CancellationCompleteHandler(
             state=self._state,
