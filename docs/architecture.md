@@ -24384,3 +24384,530 @@ AD-39 extends the existing Logger with optional WAL-compliant features while mai
 - `hyperscale/logging/models/log.py` (LSN field addition)
 - `hyperscale/logging/config/durability_mode.py` (new enum)
 - `hyperscale/logging/snowflake/snowflake_generator.py` (LSN generation)
+
+---
+
+## Part 11: Deep asyncio Internals
+
+This section documents the critical asyncio compatibility patterns already present in LoggerStream that MUST be preserved and extended for WAL support. Understanding these patterns is essential for correct implementation.
+
+### 11.1 File Descriptor Duplication Pattern
+
+LoggerStream uses `os.dup()` to create independent file descriptors for stdout/stderr. This pattern enables asyncio-compatible stream writing:
+
+```python
+# Current implementation (logger_stream.py:465-507)
+async def _dup_stdout(self):
+    """
+    Create independent file descriptor for stdout.
+
+    Why duplication matters:
+    1. Allows asyncio.StreamWriter to manage the FD independently
+    2. Closing the duplicated FD doesn't affect original stdout
+    3. Enables asyncio's connect_write_pipe() to work correctly
+    """
+    # Step 1: Get the file descriptor (blocking call)
+    stdout_fileno = await self._loop.run_in_executor(
+        None,
+        sys.stderr.fileno  # Note: actually gets stderr's fileno
+    )
+
+    # Step 2: Duplicate the file descriptor (blocking call)
+    stdout_dup = await self._loop.run_in_executor(
+        None,
+        os.dup,
+        stdout_fileno,
+    )
+
+    # Step 3: Create file object from duplicated FD (blocking call)
+    return await self._loop.run_in_executor(
+        None,
+        functools.partial(
+            os.fdopen,
+            stdout_dup,
+            mode=sys.stdout.mode
+        )
+    )
+```
+
+**Key Insight**: Every syscall that could block is wrapped in `run_in_executor()`. Even `sys.stderr.fileno()` is wrapped because it could block on certain platforms or under load.
+
+### 11.2 asyncio Compatibility Requirements
+
+**Rule**: ALL blocking I/O operations MUST be executed via `run_in_executor()`.
+
+```
+═══════════════════════════════════════════════════════════════════════════
+                    BLOCKING OPERATIONS IN LOGGERSTREAM
+═══════════════════════════════════════════════════════════════════════════
+
+Operation                │ Location         │ Wrapper Pattern
+─────────────────────────┼──────────────────┼────────────────────────────────
+os.getcwd()              │ open_file:220    │ run_in_executor(None, os.getcwd)
+_open_file()             │ open_file:228    │ run_in_executor(None, _open_file, path)
+_rotate_logfile()        │ _rotate:271      │ run_in_executor(None, _rotate, ...)
+_close_file_at_path()    │ _close_file:429  │ run_in_executor(None, _close, path)
+_write_to_file()         │ _log_to_file:820 │ run_in_executor(None, _write, ...)
+sys.stderr.fileno()      │ _dup_stderr:489  │ run_in_executor(None, fileno)
+os.dup()                 │ _dup_stderr:494  │ run_in_executor(None, os.dup, fd)
+os.fdopen()              │ _dup_stderr:500  │ run_in_executor(None, partial(...))
+_stderr.write()          │ _log:723         │ run_in_executor(None, write, ...)
+```
+
+**Pattern for New Operations**:
+
+```python
+# WRONG - blocks the event loop
+data = file.read(4096)
+file.seek(0)
+os.fsync(file.fileno())
+
+# CORRECT - asyncio compatible
+data = await self._loop.run_in_executor(None, file.read, 4096)
+await self._loop.run_in_executor(None, file.seek, 0)
+await self._loop.run_in_executor(None, os.fsync, file.fileno())
+```
+
+### 11.3 File Locking Pattern
+
+LoggerStream uses per-file asyncio locks to prevent concurrent access:
+
+```python
+# Current pattern (logger_stream.py:99)
+self._file_locks: Dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+
+# Usage pattern (logger_stream.py:817-828)
+async def _log_to_file(self, ...):
+    file_lock = self._file_locks[logfile_path]
+    await file_lock.acquire()
+
+    try:
+        await self._loop.run_in_executor(
+            None,
+            self._write_to_file,
+            log,
+            logfile_path,
+        )
+    finally:
+        if file_lock.locked():
+            file_lock.release()
+```
+
+**Critical**: Use `asyncio.Lock()`, NOT `threading.Lock()`. Thread locks block the entire event loop when acquired.
+
+### 11.4 WAL Read Implementation Deep Dive
+
+Reading files for WAL recovery requires careful asyncio handling. Unlike writes (which can be fire-and-forget), reads must return data to the caller.
+
+#### 11.4.1 Read File Descriptor Strategy
+
+For concurrent read/write WAL operations, use separate file descriptors:
+
+```python
+class LoggerStream:
+    def __init__(self, ...):
+        # ...existing...
+
+        # WAL-specific: Separate read and write file descriptors
+        self._files: Dict[str, io.FileIO] = {}         # Write handles (existing)
+        self._read_files: Dict[str, io.FileIO] = {}    # NEW: Read handles
+        self._read_locks: Dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)  # NEW
+```
+
+**Why separate file descriptors?**:
+1. Write handle stays at EOF for appending
+2. Read handle can seek independently
+3. No position conflicts during concurrent operations
+4. Follows same pattern as stdout/stderr duplication
+
+#### 11.4.2 asyncio-Compatible Read Operations
+
+```python
+async def _open_read_file(self, logfile_path: str) -> io.FileIO:
+    """
+    Open a separate file descriptor for reading.
+
+    Critical: Uses run_in_executor for ALL blocking operations.
+    """
+    read_lock = self._read_locks[logfile_path]
+    await read_lock.acquire()
+
+    try:
+        if (
+            logfile_path not in self._read_files or
+            self._read_files[logfile_path].closed
+        ):
+            # Open file for reading (blocking operation)
+            read_file = await self._loop.run_in_executor(
+                None,
+                functools.partial(open, logfile_path, 'rb'),
+            )
+            self._read_files[logfile_path] = read_file
+
+        return self._read_files[logfile_path]
+
+    finally:
+        if read_lock.locked():
+            read_lock.release()
+
+
+async def read_entries(
+    self,
+    logfile_path: str,
+    from_offset: int = 0,
+) -> AsyncIterator[tuple[int, Log, int | None]]:
+    """
+    Read entries from file for WAL recovery.
+
+    CRITICAL ASYNCIO PATTERNS:
+    1. All read() calls via run_in_executor
+    2. All seek() calls via run_in_executor
+    3. All tell() calls via run_in_executor
+    4. Use asyncio.Lock for synchronization
+    5. Yield control regularly (asyncio.sleep(0) between entries)
+    """
+    BINARY_HEADER_SIZE = 16
+
+    read_file = await self._open_read_file(logfile_path)
+    read_lock = self._read_locks[logfile_path]
+
+    await read_lock.acquire()
+
+    try:
+        # Seek to starting position (blocking)
+        await self._loop.run_in_executor(
+            None,
+            read_file.seek,
+            from_offset,
+        )
+
+        offset = from_offset
+        entries_yielded = 0
+
+        while True:
+            if self._format == 'binary':
+                # Read header (blocking)
+                header = await self._loop.run_in_executor(
+                    None,
+                    read_file.read,
+                    BINARY_HEADER_SIZE,
+                )
+
+                if len(header) == 0:
+                    break  # EOF
+
+                if len(header) < BINARY_HEADER_SIZE:
+                    raise ValueError(f"Truncated header at offset {offset}")
+
+                # Parse header to get payload length
+                length = struct.unpack("<I", header[4:8])[0]
+
+                # Read payload (blocking)
+                payload = await self._loop.run_in_executor(
+                    None,
+                    read_file.read,
+                    length,
+                )
+
+                if len(payload) < length:
+                    raise ValueError(f"Truncated payload at offset {offset}")
+
+                log, lsn = self._decode_binary(header + payload)
+                entry_size = BINARY_HEADER_SIZE + length
+
+                yield offset, log, lsn
+                offset += entry_size
+
+            else:
+                # JSON format: line-delimited (blocking)
+                line = await self._loop.run_in_executor(
+                    None,
+                    read_file.readline,
+                )
+
+                if not line:
+                    break  # EOF
+
+                log = msgspec.json.decode(line.rstrip(b'\n'), type=Log)
+                lsn = getattr(log, 'lsn', None)
+
+                yield offset, log, lsn
+
+                # Get current position (blocking)
+                offset = await self._loop.run_in_executor(
+                    None,
+                    read_file.tell,
+                )
+
+            # Yield control to event loop periodically
+            entries_yielded += 1
+            if entries_yielded % 100 == 0:
+                await asyncio.sleep(0)
+
+    finally:
+        if read_lock.locked():
+            read_lock.release()
+```
+
+### 11.5 Batch fsync Timer - asyncio-Native Implementation
+
+**WRONG**: Using `threading.Timer` (blocks event loop):
+```python
+# DO NOT DO THIS
+import threading
+threading.Timer(0.010, self._flush_batch).start()  # Runs in separate thread!
+```
+
+**CORRECT**: Using asyncio-native scheduling:
+
+```python
+class LoggerStream:
+    def __init__(self, ...):
+        # ...existing...
+
+        # Batch fsync state
+        self._batch_timer_handle: asyncio.TimerHandle | None = None
+        self._batch_flush_task: asyncio.Task | None = None
+
+    async def _schedule_batch_fsync(self, logfile_path: str) -> asyncio.Future[None]:
+        """
+        Schedule entry for batch fsync using asyncio-native timer.
+
+        Returns a Future that resolves when fsync completes.
+        """
+        if self._batch_lock is None:
+            self._batch_lock = asyncio.Lock()
+
+        future: asyncio.Future[None] = self._loop.create_future()
+
+        async with self._batch_lock:
+            self._pending_batch.append((logfile_path, future))
+
+            # Start timer if this is the first entry in batch
+            if len(self._pending_batch) == 1:
+                # Schedule flush after batch_timeout_ms
+                self._batch_timer_handle = self._loop.call_later(
+                    self._batch_timeout_ms / 1000.0,  # Convert ms to seconds
+                    self._trigger_batch_flush,
+                    logfile_path,
+                )
+
+            # Immediate flush if batch is full
+            if len(self._pending_batch) >= self._batch_max_size:
+                if self._batch_timer_handle:
+                    self._batch_timer_handle.cancel()
+                    self._batch_timer_handle = None
+                await self._flush_batch(logfile_path)
+
+        return future
+
+    def _trigger_batch_flush(self, logfile_path: str) -> None:
+        """
+        Timer callback - schedules the actual flush as a task.
+
+        Note: call_later callback runs in the event loop, but we can't
+        await directly. Schedule as a task instead.
+        """
+        if self._batch_flush_task is None or self._batch_flush_task.done():
+            self._batch_flush_task = asyncio.create_task(
+                self._flush_batch(logfile_path)
+            )
+
+    async def _flush_batch(self, logfile_path: str) -> None:
+        """
+        Flush pending batch with single fsync.
+
+        Uses run_in_executor for fsync (blocking operation).
+        """
+        async with self._batch_lock:
+            if not self._pending_batch:
+                return
+
+            # Cancel any pending timer
+            if self._batch_timer_handle:
+                self._batch_timer_handle.cancel()
+                self._batch_timer_handle = None
+
+            logfile = self._files.get(logfile_path)
+            if logfile and not logfile.closed:
+                # fsync is blocking - must use executor
+                await self._loop.run_in_executor(
+                    None,
+                    os.fsync,
+                    logfile.fileno(),
+                )
+
+            # Signal all waiting futures
+            for _, future in self._pending_batch:
+                if not future.done():
+                    future.set_result(None)
+
+            self._pending_batch.clear()
+```
+
+### 11.6 Complete asyncio Pattern Summary
+
+```
+═══════════════════════════════════════════════════════════════════════════
+                    ASYNCIO PATTERNS FOR WAL IMPLEMENTATION
+═══════════════════════════════════════════════════════════════════════════
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│ PATTERN 1: Blocking Operations                                           │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│   ALWAYS wrap in run_in_executor():                                      │
+│   ├── file.read(n)     → await loop.run_in_executor(None, file.read, n) │
+│   ├── file.write(data) → await loop.run_in_executor(None, file.write, d)│
+│   ├── file.seek(pos)   → await loop.run_in_executor(None, file.seek, p) │
+│   ├── file.tell()      → await loop.run_in_executor(None, file.tell)    │
+│   ├── file.flush()     → await loop.run_in_executor(None, file.flush)   │
+│   ├── os.fsync(fd)     → await loop.run_in_executor(None, os.fsync, fd) │
+│   ├── open(path, mode) → await loop.run_in_executor(None, open, p, m)   │
+│   └── file.close()     → await loop.run_in_executor(None, file.close)   │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│ PATTERN 2: Synchronization                                               │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│   USE asyncio primitives, NOT threading:                                 │
+│   ├── asyncio.Lock()        NOT threading.Lock()                        │
+│   ├── asyncio.Event()       NOT threading.Event()                       │
+│   ├── asyncio.Condition()   NOT threading.Condition()                   │
+│   └── asyncio.Semaphore()   NOT threading.Semaphore()                   │
+│                                                                          │
+│   ALWAYS use try/finally with locks:                                     │
+│   │   await lock.acquire()                                              │
+│   │   try:                                                               │
+│   │       # ... critical section ...                                     │
+│   │   finally:                                                           │
+│   │       if lock.locked():                                              │
+│   │           lock.release()                                             │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│ PATTERN 3: Timers and Scheduling                                         │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│   USE asyncio timers, NOT threading.Timer:                               │
+│   ├── loop.call_later(delay, callback)  - for non-async callbacks       │
+│   ├── loop.call_at(when, callback)      - for absolute time scheduling  │
+│   └── asyncio.create_task(coro)         - for async work                │
+│                                                                          │
+│   Timer callbacks cannot be async - schedule a task:                     │
+│   │   def timer_callback():                                              │
+│   │       asyncio.create_task(self._async_handler())                    │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│ PATTERN 4: File Descriptor Management                                    │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│   Separate FDs for read and write:                                       │
+│   ├── Write FD: stays at EOF for appending                              │
+│   ├── Read FD: can seek independently                                   │
+│   └── Use os.dup() for independent control                              │
+│                                                                          │
+│   Each FD has its own asyncio.Lock():                                   │
+│   ├── self._file_locks[path]      - for write operations                │
+│   └── self._read_locks[path]      - for read operations                 │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│ PATTERN 5: Event Loop Yielding                                           │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│   Yield control during long operations:                                  │
+│   │   for i, entry in enumerate(entries):                               │
+│   │       # ... process entry ...                                        │
+│   │       if i % 100 == 0:                                              │
+│   │           await asyncio.sleep(0)  # Yield to event loop             │
+│                                                                          │
+│   This prevents starving other coroutines during bulk operations.        │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 11.7 Impact on AD-39 Implementation
+
+The asyncio patterns above affect the AD-39 implementation as follows:
+
+| AD-39 Feature | asyncio Impact |
+|---------------|----------------|
+| `_write_to_file` rewrite | Already wrapped in `run_in_executor()` - add fsync call inside |
+| Binary encoding | Pure CPU work - no executor needed |
+| Binary decoding | Pure CPU work - no executor needed |
+| LSN generation | SnowflakeGenerator is sync - no executor needed |
+| `read_entries` | ALL read/seek/tell operations need executor wrapping |
+| Batch fsync timer | MUST use `loop.call_later()`, NOT `threading.Timer` |
+| `_flush_batch` | fsync needs executor wrapping |
+| Separate read FD | Follow existing dup pattern with executor wrapping |
+
+### 11.8 Updated `_write_to_file` with Proper asyncio Handling
+
+The current `_write_to_file` is a synchronous method called via `run_in_executor()`. This pattern MUST be preserved - we extend the sync method, not convert it to async:
+
+```python
+def _write_to_file(
+    self,
+    log: Log,
+    logfile_path: str,
+    durability: DurabilityMode | None = None,
+) -> int | None:
+    """
+    Write log entry to file with configurable durability.
+
+    IMPORTANT: This is a SYNCHRONOUS method called via run_in_executor().
+    All operations here are blocking and that's OK because we're in a thread.
+
+    The caller (_log_to_file) wraps this in:
+        await self._loop.run_in_executor(None, self._write_to_file, ...)
+    """
+    if durability is None:
+        durability = self._durability
+
+    logfile = self._files.get(logfile_path)
+    if logfile is None or logfile.closed:
+        return None
+
+    # Generate LSN if enabled (sync operation - OK in executor thread)
+    lsn: int | None = None
+    if self._enable_lsn and self._sequence_generator:
+        lsn = self._sequence_generator.generate()
+        if lsn is not None:
+            log.lsn = lsn
+
+    # Encode based on format (sync - CPU bound, OK in executor thread)
+    if self._format == 'binary':
+        data = self._encode_binary(log, lsn)
+    else:
+        data = msgspec.json.encode(log) + b"\n"
+
+    # Write data (sync - blocking I/O, OK in executor thread)
+    logfile.write(data)
+
+    # Apply durability (sync - all blocking I/O, OK in executor thread)
+    match durability:
+        case DurabilityMode.NONE:
+            pass
+
+        case DurabilityMode.FLUSH:
+            logfile.flush()
+
+        case DurabilityMode.FSYNC:
+            logfile.flush()
+            os.fsync(logfile.fileno())  # Blocking - OK in thread
+
+        case DurabilityMode.FSYNC_BATCH:
+            logfile.flush()
+            # Note: Batch tracking happens in async caller
+
+    return lsn
+```
+
+**Critical**: The sync method stays sync. The async wrapper stays in `_log_to_file`. This preserves the existing pattern while adding durability support.
