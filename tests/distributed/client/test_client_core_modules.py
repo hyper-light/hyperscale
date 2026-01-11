@@ -15,7 +15,7 @@ Covers:
 
 import asyncio
 import time
-from unittest.mock import Mock, AsyncMock, patch
+from unittest.mock import Mock, AsyncMock
 
 import pytest
 
@@ -25,13 +25,7 @@ from hyperscale.distributed.nodes.client.leadership import ClientLeadershipTrack
 from hyperscale.distributed.nodes.client.tracking import ClientJobTracker
 from hyperscale.distributed.nodes.client.config import ClientConfig
 from hyperscale.distributed.nodes.client.state import ClientState
-from hyperscale.distributed.protocol.version import ProtocolVersion
-from hyperscale.distributed.models import (
-    ClientJobResult,
-    GateLeaderInfo,
-    ManagerLeaderInfo,
-    JobStatus,
-)
+from hyperscale.distributed.models import ClientJobResult
 
 
 def make_mock_logger():

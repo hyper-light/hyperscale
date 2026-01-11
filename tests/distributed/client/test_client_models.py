@@ -14,7 +14,6 @@ Covers:
 
 import asyncio
 import time
-from dataclasses import FrozenInstanceError
 
 import pytest
 

@@ -17,7 +17,6 @@ The Cancellation Propagation pattern ensures:
 """
 
 import time
-import pytest
 
 from hyperscale.distributed.models import (
     JobCancelRequest,
