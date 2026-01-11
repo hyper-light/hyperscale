@@ -21,13 +21,42 @@ from hyperscale.distributed_rewrite.nodes.worker.backpressure import WorkerBackp
 from hyperscale.distributed_rewrite.reliability import BackpressureLevel
 
 
+def _create_mock_state():
+    """Create a mock WorkerState with backpressure tracking for tests."""
+    state = MagicMock()
+    state._manager_backpressure = {}
+    state._backpressure_delay_ms = 0
+
+    def set_manager_backpressure(manager_id, level):
+        state._manager_backpressure[manager_id] = level
+
+    def get_max_backpressure_level():
+        if not state._manager_backpressure:
+            return BackpressureLevel.NONE
+        return max(state._manager_backpressure.values(), key=lambda x: x.value)
+
+    def set_backpressure_delay_ms(delay_ms):
+        state._backpressure_delay_ms = delay_ms
+
+    def get_backpressure_delay_ms():
+        return state._backpressure_delay_ms
+
+    state.set_manager_backpressure = MagicMock(side_effect=set_manager_backpressure)
+    state.get_max_backpressure_level = MagicMock(side_effect=get_max_backpressure_level)
+    state.set_backpressure_delay_ms = MagicMock(side_effect=set_backpressure_delay_ms)
+    state.get_backpressure_delay_ms = MagicMock(side_effect=get_backpressure_delay_ms)
+
+    return state
+
+
 class TestWorkerBackpressureManagerInitialization:
     """Test WorkerBackpressureManager initialization."""
 
     def test_happy_path_instantiation(self):
         """Test normal instantiation."""
+        state = _create_mock_state()
         logger = MagicMock()
-        manager = WorkerBackpressureManager(logger=logger)
+        manager = WorkerBackpressureManager(state, logger=logger)
 
         assert manager._logger == logger
         assert manager._poll_interval == 0.25
@@ -35,21 +64,24 @@ class TestWorkerBackpressureManagerInitialization:
 
     def test_custom_poll_interval(self):
         """Test with custom poll interval."""
-        manager = WorkerBackpressureManager(poll_interval=0.5)
+        state = _create_mock_state()
+        manager = WorkerBackpressureManager(state, poll_interval=0.5)
 
         assert manager._poll_interval == 0.5
 
     def test_with_registry(self):
         """Test with registry reference."""
+        state = _create_mock_state()
         logger = MagicMock()
         registry = MagicMock()
-        manager = WorkerBackpressureManager(logger=logger, registry=registry)
+        manager = WorkerBackpressureManager(state, logger=logger, registry=registry)
 
         assert manager._registry == registry
 
     def test_default_resource_getters(self):
         """Test default resource getters return 0."""
-        manager = WorkerBackpressureManager()
+        state = _create_mock_state()
+        manager = WorkerBackpressureManager(state)
 
         assert manager._get_cpu_percent() == 0.0
         assert manager._get_memory_percent() == 0.0
@@ -60,7 +92,8 @@ class TestWorkerBackpressureManagerResourceGetters:
 
     def test_set_resource_getters(self):
         """Test setting resource getter functions."""
-        manager = WorkerBackpressureManager()
+        state = _create_mock_state()
+        manager = WorkerBackpressureManager(state)
 
         cpu_getter = lambda: 75.0
         memory_getter = lambda: 60.0
@@ -76,22 +109,25 @@ class TestWorkerBackpressureManagerBackpressureTracking:
 
     def test_set_manager_backpressure(self):
         """Test setting manager backpressure level."""
-        manager = WorkerBackpressureManager()
+        state = _create_mock_state()
+        manager = WorkerBackpressureManager(state)
 
         manager.set_manager_backpressure("mgr-1", BackpressureLevel.THROTTLE)
 
-        assert manager._manager_backpressure["mgr-1"] == BackpressureLevel.THROTTLE
+        assert manager._state._manager_backpressure["mgr-1"] == BackpressureLevel.THROTTLE
 
     def test_get_max_backpressure_level_none(self):
         """Test max backpressure with no managers."""
-        manager = WorkerBackpressureManager()
+        state = _create_mock_state()
+        manager = WorkerBackpressureManager(state)
 
         level = manager.get_max_backpressure_level()
         assert level == BackpressureLevel.NONE
 
     def test_get_max_backpressure_level_single(self):
         """Test max backpressure with single manager."""
-        manager = WorkerBackpressureManager()
+        state = _create_mock_state()
+        manager = WorkerBackpressureManager(state)
 
         manager.set_manager_backpressure("mgr-1", BackpressureLevel.BATCH)
 
@@ -100,7 +136,8 @@ class TestWorkerBackpressureManagerBackpressureTracking:
 
     def test_get_max_backpressure_level_multiple(self):
         """Test max backpressure across multiple managers."""
-        manager = WorkerBackpressureManager()
+        state = _create_mock_state()
+        manager = WorkerBackpressureManager(state)
 
         manager.set_manager_backpressure("mgr-1", BackpressureLevel.NONE)
         manager.set_manager_backpressure("mgr-2", BackpressureLevel.BATCH)
@@ -111,7 +148,8 @@ class TestWorkerBackpressureManagerBackpressureTracking:
 
     def test_set_backpressure_delay_ms(self):
         """Test setting backpressure delay."""
-        manager = WorkerBackpressureManager()
+        state = _create_mock_state()
+        manager = WorkerBackpressureManager(state)
 
         manager.set_backpressure_delay_ms(500)
 
