@@ -336,13 +336,17 @@ class TestClientDiscovery:
     async def test_happy_path_ping_manager(self, discovery, send_tcp):
         """Test successful manager ping."""
         ping_response = ManagerPingResponse(
-            request_id="req-123",
-            manager_id="mgr-1",
-            datacenter="dc-east",
-            status="healthy",
-            worker_count=5,
-            active_jobs=10,
-        )
+                request_id="req-123",
+                manager_id="mgr-1",
+                datacenter="dc-east",
+                host="localhost",
+                port=7000,
+                is_leader=True,
+                state="healthy",
+                term=1,
+                worker_count=5,
+                active_job_count=10,
+            )
         send_tcp.return_value = (ping_response.dump(), None)
 
         result = await discovery.ping_manager(("manager1", 7000))
@@ -356,12 +360,17 @@ class TestClientDiscovery:
     async def test_happy_path_ping_gate(self, discovery, send_tcp):
         """Test successful gate ping."""
         ping_response = GatePingResponse(
-            request_id="req-456",
-            gate_id="gate-1",
-            status="healthy",
-            datacenter_count=3,
-            total_active_jobs=50,
-        )
+                request_id="req-456",
+                gate_id="gate-1",
+                datacenter="dc-1",
+                host="localhost",
+                port=9000,
+                is_leader=True,
+                state="healthy",
+                term=1,
+                datacenter_count=3,
+                active_job_count=50,
+            )
         send_tcp.return_value = (ping_response.dump(), None)
 
         result = await discovery.ping_gate(("gate1", 9000))
@@ -425,22 +434,30 @@ class TestClientDiscovery:
         async def mock_send(target, msg_type, data, timeout):
             if target[1] == 7000:
                 response = ManagerPingResponse(
-                    request_id="req-1",
-                    manager_id="mgr-1",
-                    datacenter="dc-east",
-                    status="healthy",
-                    worker_count=3,
-                    active_jobs=5,
-                )
+                request_id="req-1",
+                manager_id="mgr-1",
+                datacenter="dc-east",
+                host="localhost",
+                port=7000,
+                is_leader=True,
+                state="healthy",
+                term=1,
+                worker_count=3,
+                active_job_count=5,
+            )
             else:
                 response = ManagerPingResponse(
-                    request_id="req-2",
-                    manager_id="mgr-2",
-                    datacenter="dc-west",
-                    status="healthy",
-                    worker_count=4,
-                    active_jobs=8,
-                )
+                request_id="req-2",
+                manager_id="mgr-2",
+                datacenter="dc-west",
+                host="localhost",
+                port=7000,
+                is_leader=True,
+                state="healthy",
+                term=1,
+                worker_count=4,
+                active_job_count=8,
+            )
             return (response.dump(), None)
 
         send_tcp.side_effect = mock_send
@@ -459,13 +476,17 @@ class TestClientDiscovery:
         async def mock_send(target, msg_type, data, timeout):
             if target[1] == 7000:
                 response = ManagerPingResponse(
-                    request_id="req-1",
-                    manager_id="mgr-1",
-                    datacenter="dc-east",
-                    status="healthy",
-                    worker_count=3,
-                    active_jobs=5,
-                )
+                request_id="req-1",
+                manager_id="mgr-1",
+                datacenter="dc-east",
+                host="localhost",
+                port=7000,
+                is_leader=True,
+                state="healthy",
+                term=1,
+                worker_count=3,
+                active_job_count=5,
+            )
                 return (response.dump(), None)
             else:
                 # Second manager fails
@@ -486,20 +507,30 @@ class TestClientDiscovery:
         async def mock_send(target, msg_type, data, timeout):
             if target[1] == 9000:
                 response = GatePingResponse(
-                    request_id="req-1",
-                    gate_id="gate-1",
-                    status="healthy",
-                    datacenter_count=2,
-                    total_active_jobs=20,
-                )
+                request_id="req-1",
+                gate_id="gate-1",
+                datacenter="dc-1",
+                host="localhost",
+                port=9000,
+                is_leader=True,
+                state="healthy",
+                term=1,
+                datacenter_count=2,
+                active_job_count=20,
+            )
             else:
                 response = GatePingResponse(
-                    request_id="req-2",
-                    gate_id="gate-2",
-                    status="healthy",
-                    datacenter_count=2,
-                    total_active_jobs=25,
-                )
+                request_id="req-2",
+                gate_id="gate-2",
+                datacenter="dc-1",
+                host="localhost",
+                port=9000,
+                is_leader=True,
+                state="healthy",
+                term=1,
+                datacenter_count=2,
+                active_job_count=25,
+            )
             return (response.dump(), None)
 
         send_tcp.side_effect = mock_send
@@ -519,10 +550,9 @@ class TestClientDiscovery:
         """Test workflow query from managers."""
         workflow_info = WorkflowStatusInfo(
             workflow_name="TestWorkflow",
+            workflow_id="TestWorkflow-wf-1",
             job_id="job-123",
             status="running",
-            total_steps=10,
-            completed_steps=5,
         )
         query_response = WorkflowQueryResponse(
             request_id="req-query-1",
@@ -562,10 +592,9 @@ class TestClientDiscovery:
 
         workflow_info = WorkflowStatusInfo(
             workflow_name="TestWorkflow",
+            workflow_id="TestWorkflow-wf-1",
             job_id=job_id,
             status="completed",
-            total_steps=10,
-            completed_steps=10,
         )
         query_response = WorkflowQueryResponse(
             request_id="req-query",
@@ -588,10 +617,9 @@ class TestClientDiscovery:
         """Test workflow query via gate."""
         workflow_info = WorkflowStatusInfo(
             workflow_name="GateWorkflow",
+            workflow_id="GateWorkflow-wf-1",
             job_id="job-gate-1",
             status="running",
-            total_steps=5,
-            completed_steps=2,
         )
         dc_status = DatacenterWorkflowStatus(
             dc_id="dc-east",
@@ -639,12 +667,11 @@ class TestClientDiscovery:
         """Test querying workflows from all gates concurrently."""
         async def mock_send(target, msg_type, data, timeout):
             workflow_info = WorkflowStatusInfo(
-                workflow_name="MultiGateWorkflow",
-                job_id="job-multi",
-                status="running",
-                total_steps=10,
-                completed_steps=5,
-            )
+            workflow_name="MultiGateWorkflow",
+            workflow_id="MultiGateWorkflow-wf-1",
+            job_id="job-multi",
+            status="running",
+        )
             dc_status = DatacenterWorkflowStatus(
                 dc_id="dc-east",
                 workflows=[workflow_info],
@@ -675,11 +702,11 @@ class TestClientDiscovery:
     async def test_happy_path_get_datacenters(self, discovery, send_tcp):
         """Test getting datacenter list from gate."""
         dc_info = DatacenterInfo(
-            datacenter_id="dc-east",
-            manager_leader_addr=("manager1", 7000),
-            status="healthy",
+            dc_id="dc-east",
+            health="healthy",
+            leader_addr=("manager1", 7000),
             available_cores=100,
-            total_workers=10,
+            worker_count=10,
         )
         dc_response = DatacenterListResponse(
             request_id="req-dc",
@@ -734,12 +761,12 @@ class TestClientDiscovery:
         """Test getting datacenters from all gates concurrently."""
         async def mock_send(target, msg_type, data, timeout):
             dc_info = DatacenterInfo(
-                datacenter_id="dc-east",
-                manager_leader_addr=("manager1", 7000),
-                status="healthy",
-                available_cores=50,
-                total_workers=5,
-            )
+            dc_id="dc-east",
+            health="healthy",
+            leader_addr=("manager1", 7000),
+            available_cores=50,
+            worker_count=5,
+        )
             dc_response = DatacenterListResponse(
                 request_id=secrets.token_hex(8),
                 gate_id=f"gate-{target[1]}",
@@ -765,12 +792,12 @@ class TestClientDiscovery:
         async def mock_send(target, msg_type, data, timeout):
             if target[1] == 9000:
                 dc_info = DatacenterInfo(
-                    datacenter_id="dc-east",
-                    manager_leader_addr=("manager1", 7000),
-                    status="healthy",
-                    available_cores=50,
-                    total_workers=5,
-                )
+            dc_id="dc-east",
+            health="healthy",
+            leader_addr=("manager1", 7000),
+            available_cores=50,
+            worker_count=5,
+        )
                 dc_response = DatacenterListResponse(
                     request_id=secrets.token_hex(8),
                     gate_id="gate-1",
@@ -804,18 +831,26 @@ class TestClientDiscovery:
                 response = GatePingResponse(
                     request_id=secrets.token_hex(8),
                     gate_id=f"gate-{target[1]}",
-                    status="healthy",
-                    datacenter_count=2,
-                    total_active_jobs=10,
+                    datacenter="dc-1",
+                    host="localhost",
+                    port=target[1],
+                    is_leader=True,
+                    state="healthy",
+                    term=1,
+                    active_job_count=10,
                 )
             else:  # Manager
                 response = ManagerPingResponse(
                     request_id=secrets.token_hex(8),
                     manager_id=f"mgr-{target[1]}",
                     datacenter="dc-east",
-                    status="healthy",
+                    host="localhost",
+                    port=target[1],
+                    is_leader=True,
+                    state="healthy",
+                    term=1,
                     worker_count=3,
-                    active_jobs=5,
+                    active_job_count=5,
                 )
             return (response.dump(), None)
 
@@ -836,12 +871,11 @@ class TestClientDiscovery:
         async def mock_send(target, msg_type, data, timeout):
             if msg_type == "workflow_query":
                 workflow_info = WorkflowStatusInfo(
-                    workflow_name="TestWorkflow",
-                    job_id="job-123",
-                    status="running",
-                    total_steps=10,
-                    completed_steps=5,
-                )
+            workflow_name="TestWorkflow",
+            workflow_id="TestWorkflow-wf-1",
+            job_id="job-123",
+            status="running",
+        )
                 dc_status = DatacenterWorkflowStatus(
                     dc_id="dc-east",
                     workflows=[workflow_info],
@@ -853,12 +887,12 @@ class TestClientDiscovery:
                 )
             else:  # datacenter_list
                 dc_info = DatacenterInfo(
-                    datacenter_id="dc-east",
-                    manager_leader_addr=("manager1", 7000),
-                    status="healthy",
-                    available_cores=100,
-                    total_workers=10,
-                )
+            dc_id="dc-east",
+            health="healthy",
+            leader_addr=("manager1", 7000),
+            available_cores=100,
+            worker_count=10,
+        )
                 response = DatacenterListResponse(
                     request_id=secrets.token_hex(8),
                     gate_id="gate-1",
@@ -930,10 +964,9 @@ class TestClientDiscovery:
         """Test discovery with special characters in IDs."""
         workflow_info = WorkflowStatusInfo(
             workflow_name="Test-Workflow_123-🚀",
+            workflow_id="Test-Workflow_123-🚀-wf-1",
             job_id="job-ñ-中文",
             status="running",
-            total_steps=10,
-            completed_steps=5,
         )
         query_response = WorkflowQueryResponse(
             request_id="req-special",
@@ -951,13 +984,17 @@ class TestClientDiscovery:
     async def test_edge_case_ping_with_custom_timeout(self, discovery, send_tcp):
         """Test ping operations with custom timeout values."""
         ping_response = ManagerPingResponse(
-            request_id="req-timeout",
-            manager_id="mgr-1",
-            datacenter="dc-east",
-            status="healthy",
-            worker_count=5,
-            active_jobs=10,
-        )
+                request_id="req-timeout",
+                manager_id="mgr-1",
+                datacenter="dc-east",
+                host="localhost",
+                port=7000,
+                is_leader=True,
+                state="healthy",
+                term=1,
+                worker_count=5,
+                active_job_count=10,
+            )
         send_tcp.return_value = (ping_response.dump(), None)
 
         # Very short timeout
