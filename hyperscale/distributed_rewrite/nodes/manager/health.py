@@ -1,8 +1,8 @@
 """
 Manager health module for worker health monitoring.
 
-Handles SWIM callbacks, worker health tracking, AD-26 deadline extensions,
-and AD-30 hierarchical failure detection with job-level suspicion.
+Handles SWIM callbacks, worker health tracking, AD-18 hybrid overload detection,
+AD-26 deadline extensions, and AD-30 hierarchical failure detection with job-level suspicion.
 """
 
 import time
@@ -10,6 +10,7 @@ from enum import Enum
 from typing import TYPE_CHECKING
 
 from hyperscale.distributed_rewrite.models import WorkerHeartbeat
+from hyperscale.distributed_rewrite.reliability import HybridOverloadDetector
 from hyperscale.logging.hyperscale_logging_models import ServerDebug, ServerWarning
 
 if TYPE_CHECKING:

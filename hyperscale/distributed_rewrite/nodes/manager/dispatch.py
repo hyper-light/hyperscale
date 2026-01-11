@@ -2,6 +2,7 @@
 Manager dispatch module for workflow dispatch orchestration.
 
 Handles worker allocation, quorum coordination, and dispatch tracking.
+Implements AD-17 smart dispatch with health bucket selection.
 """
 
 import asyncio
@@ -12,6 +13,7 @@ from hyperscale.distributed_rewrite.models import (
     WorkflowDispatchAck,
     ProvisionRequest,
     ProvisionConfirm,
+    WorkerRegistration,
 )
 from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerDebug, ServerWarning
 
@@ -153,9 +155,15 @@ class ManagerDispatchCoordinator:
 
         return None
 
-    async def _select_worker(self, cores_required: int):
+    async def _select_worker(
+        self,
+        cores_required: int,
+    ) -> WorkerRegistration | None:
         """
-        Select a worker with sufficient capacity.
+        Select a worker using AD-17 health bucket selection.
+
+        Selection priority: HEALTHY > BUSY > DEGRADED (overloaded excluded).
+        Within each bucket, workers are sorted by capacity (descending).
 
         Args:
             cores_required: Number of cores required
@@ -163,23 +171,56 @@ class ManagerDispatchCoordinator:
         Returns:
             WorkerRegistration or None if no worker available
         """
-        healthy_ids = self._registry.get_healthy_worker_ids()
+        worker, worst_health = self._select_worker_with_fallback(cores_required)
 
-        for worker_id in healthy_ids:
-            worker = self._registry.get_worker(worker_id)
-            if not worker:
-                continue
+        # Log if we had to fall back to degraded workers
+        if worker and worst_health == "degraded":
+            self._task_runner.run(
+                self._logger.log,
+                ServerWarning(
+                    message=f"Dispatching to degraded worker {worker.node.node_id[:8]}..., no healthy workers available",
+                    node_host=self._config.host,
+                    node_port=self._config.tcp_port,
+                    node_id=self._node_id,
+                )
+            )
+        elif worker and worst_health == "busy":
+            self._task_runner.run(
+                self._logger.log,
+                ServerDebug(
+                    message=f"Dispatching to busy worker {worker.node.node_id[:8]}..., no healthy workers available",
+                    node_host=self._config.host,
+                    node_port=self._config.tcp_port,
+                    node_id=self._node_id,
+                )
+            )
 
-            # Check circuit breaker
-            if circuit := self._state._worker_circuits.get(worker_id):
-                if circuit.is_open():
-                    continue
+        return worker
 
-            # Check capacity (simplified - full impl uses WorkerPool)
-            if worker.node.total_cores >= cores_required:
-                return worker
+    def _select_worker_with_fallback(
+        self,
+        cores_required: int,
+    ) -> tuple[WorkerRegistration | None, str]:
+        """
+        Select worker with AD-17 fallback chain.
 
-        return None
+        Args:
+            cores_required: Number of cores required
+
+        Returns:
+            Tuple of (selected worker or None, worst health used)
+        """
+        # Get workers bucketed by health state
+        buckets = self._registry.get_workers_by_health_bucket(cores_required)
+
+        # Selection priority: HEALTHY > BUSY > DEGRADED
+        for health_level in ("healthy", "busy", "degraded"):
+            workers = buckets.get(health_level, [])
+            if workers:
+                # Workers are already sorted by capacity (descending)
+                return workers[0], health_level
+
+        return None, "unhealthy"
 
     async def request_quorum_provision(
         self,
