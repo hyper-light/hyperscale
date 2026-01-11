@@ -103,7 +103,7 @@ class TestMalformedPayload:
         lsn = 12345
 
         header = struct.pack("<IQ", len(payload), lsn)
-        crc = hashlib.crc32(header + payload) & 0xFFFFFFFF
+        crc = zlib.crc32(header + payload) & 0xFFFFFFFF
         data = struct.pack("<I", crc) + header + payload
 
         with open(log_path, "wb") as log_file:
