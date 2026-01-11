@@ -97,6 +97,49 @@ Tests all TCP message handlers from Section 15.1.4:
 - Large batch handling (1000 jobs)
 - Concurrent status updates and leader transfers
 
+### 5. `test_client_submission_and_cancellation.py`
+Tests ClientJobSubmitter and ClientCancellationManager from Sections 15.1.11 and 15.1.12:
+- **ClientJobSubmitter**: Job submission with retry, redirect, and rate limiting
+- **ClientCancellationManager**: Job cancellation with retry and completion tracking
+
+**Coverage:**
+- ✅ Happy path: Successful submission and cancellation
+- ✅ Negative path: No targets, invalid inputs
+- ✅ Failure mode: Transient errors, permanent failures, timeouts
+- ✅ Concurrency: Concurrent submissions and cancellations (10+ concurrent)
+- ✅ Edge cases: Large workflows, many concurrent jobs
+
+**Key Tests:**
+- Job submission with JobAck acceptance
+- Leader redirect following (AD-16)
+- Transient error retry with jitter (AD-21)
+- RateLimitResponse handling with retry_after (AD-32)
+- Message size validation (>5MB rejection)
+- Cancellation with await completion
+- Multiple concurrent operations
+
+### 6. `test_client_reporting_and_discovery.py`
+Tests ClientReportingManager and ClientDiscovery from Sections 15.1.9 and 15.1.10:
+- **ClientReportingManager**: Local file-based reporter submission (JSON/CSV/XML)
+- **ClientDiscovery**: Ping, workflow query, and datacenter discovery operations
+
+**Coverage:**
+- ✅ Happy path: Normal reporting and discovery operations
+- ✅ Negative path: No targets configured, invalid inputs
+- ✅ Failure mode: Reporter failures, network errors, timeouts
+- ✅ Concurrency: Concurrent pings, queries, and discovery (10+ concurrent)
+- ✅ Edge cases: Empty results, many targets, special characters
+
+**Key Tests:**
+- Default JSON reporter config creation
+- Best-effort reporting (failures don't raise)
+- Manager and gate ping operations
+- Concurrent ping_all_managers/gates
+- Workflow query with job target sticky routing
+- Multi-datacenter workflow query via gates
+- Datacenter discovery and health checking
+- Partial failure handling in concurrent operations
+
 ## Test Statistics
 
 | Test File | Test Classes | Test Methods | Lines of Code |
@@ -105,7 +148,9 @@ Tests all TCP message handlers from Section 15.1.4:
 | test_client_config_and_state.py | 2 | 35+ | 450+ |
 | test_client_core_modules.py | 4 | 35+ | 450+ |
 | test_client_tcp_handlers.py | 9 | 30+ | 550+ |
-| **TOTAL** | **22** | **140+** | **1950+** |
+| test_client_submission_and_cancellation.py | 2 | 20+ | 550+ |
+| test_client_reporting_and_discovery.py | 2 | 40+ | 850+ |
+| **TOTAL** | **26** | **200+** | **3350+** |
 
 ## Running the Tests
 
@@ -241,4 +286,5 @@ These tests are designed to run in CI/CD pipelines:
 - **Last Updated**: 2026-01-11
 - **Test Coverage**: ~95% of client module code
 - **AD Compliance**: All client-relevant ADs validated
-- **Performance**: <5s total test execution time
+- **Performance**: <10s total test execution time
+- **Completion Status**: ✅ ALL 12 client modules fully tested (TODO.md Section 15.1)
