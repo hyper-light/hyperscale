@@ -81,12 +81,16 @@ class ErrorStats:
         now = time.monotonic()
         self._timestamps.append(now)  # Deque maxlen handles overflow automatically
         self._prune_old_entries(now)
-        
+
         # Check if we should open the circuit
         if self._circuit_state == CircuitState.CLOSED:
             if len(self._timestamps) >= self.max_errors:
                 self._circuit_state = CircuitState.OPEN
                 self._circuit_opened_at = now
+
+    def record_failure(self) -> None:
+        """Record a failure occurrence (alias for record_error)."""
+        self.record_error()
     
     def record_success(self) -> None:
         """
