@@ -24,7 +24,7 @@ from hyperscale.distributed_rewrite.models import (
 from hyperscale.distributed_rewrite.protocol.version import CURRENT_PROTOCOL_VERSION
 from hyperscale.distributed_rewrite.nodes.client.state import ClientState
 from hyperscale.distributed_rewrite.nodes.client.config import ClientConfig, TRANSIENT_ERRORS
-from hyperscale.logging.hyperscale_logger import Logger
+from hyperscale.logging import Logger
 
 
 class ClientJobSubmitter:

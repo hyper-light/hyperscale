@@ -6,7 +6,7 @@ Handles JobCancellationComplete messages from gates/managers (AD-20).
 
 from hyperscale.distributed_rewrite.models import JobCancellationComplete
 from hyperscale.distributed_rewrite.nodes.client.state import ClientState
-from hyperscale.logging.hyperscale_logger import Logger
+from hyperscale.logging import Logger
 
 
 class CancellationCompleteHandler:

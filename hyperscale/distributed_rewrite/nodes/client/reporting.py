@@ -6,7 +6,7 @@ Handles submission to local file-based reporters (JSON/CSV/XML).
 
 from hyperscale.distributed_rewrite.nodes.client.state import ClientState
 from hyperscale.distributed_rewrite.nodes.client.config import ClientConfig
-from hyperscale.logging.hyperscale_logger import Logger
+from hyperscale.logging import Logger
 from hyperscale.reporting.reporter import Reporter
 from hyperscale.reporting.json import JSONConfig
 

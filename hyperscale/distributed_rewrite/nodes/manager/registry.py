@@ -19,7 +19,7 @@ from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerDebug
 if TYPE_CHECKING:
     from hyperscale.distributed_rewrite.nodes.manager.state import ManagerState
     from hyperscale.distributed_rewrite.nodes.manager.config import ManagerConfig
-    from hyperscale.logging.hyperscale_logger import Logger
+    from hyperscale.logging import Logger
 
 
 class ManagerRegistry:

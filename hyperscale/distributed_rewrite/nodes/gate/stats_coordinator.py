@@ -17,7 +17,7 @@ from hyperscale.distributed_rewrite.jobs import WindowedStatsCollector
 
 if TYPE_CHECKING:
     from hyperscale.distributed_rewrite.nodes.gate.state import GateRuntimeState
-    from hyperscale.logging.hyperscale_logger import Logger
+    from hyperscale.logging import Logger
     from hyperscale.taskex import TaskRunner
 
 

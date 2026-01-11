@@ -13,7 +13,7 @@ from hyperscale.logging.hyperscale_logging_models import ServerDebug, ServerWarn
 
 if TYPE_CHECKING:
     from hyperscale.distributed_rewrite.nodes.manager.config import ManagerConfig
-    from hyperscale.logging.hyperscale_logger import Logger
+    from hyperscale.logging import Logger
     from hyperscale.distributed_rewrite.nodes.manager.load_shedding import RequestPriority
 
 

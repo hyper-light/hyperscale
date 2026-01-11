@@ -12,7 +12,7 @@ from hyperscale.distributed_rewrite.protocol.version import (
     get_features_for_version,
 )
 from hyperscale.distributed_rewrite.nodes.client.state import ClientState
-from hyperscale.logging.hyperscale_logger import Logger
+from hyperscale.logging import Logger
 
 
 class ClientProtocol:

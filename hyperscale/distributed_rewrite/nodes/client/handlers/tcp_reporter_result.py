@@ -6,7 +6,7 @@ Handles ReporterResultPush messages indicating reporter submission completion.
 
 from hyperscale.distributed_rewrite.models import ReporterResultPush, ClientReporterResult
 from hyperscale.distributed_rewrite.nodes.client.state import ClientState
-from hyperscale.logging.hyperscale_logger import Logger
+from hyperscale.logging import Logger
 
 
 class ReporterResultPushHandler:

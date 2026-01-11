@@ -6,7 +6,7 @@ Handles JobStatusPush and JobBatchPush messages from gates/managers.
 
 from hyperscale.distributed_rewrite.models import JobStatusPush, JobBatchPush
 from hyperscale.distributed_rewrite.nodes.client.state import ClientState
-from hyperscale.logging.hyperscale_logger import Logger
+from hyperscale.logging import Logger
 
 
 class JobStatusPushHandler:

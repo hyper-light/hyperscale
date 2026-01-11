@@ -31,6 +31,8 @@ from .load_shedding import ManagerLoadShedder, RequestPriority, OverloadState
 from .in_flight import InFlightTracker, BoundedRequestExecutor
 
 __all__ = [
+    # Main Server Class
+    "ManagerServer",
     # Configuration and State
     "ManagerConfig",
     "create_manager_config_from_env",

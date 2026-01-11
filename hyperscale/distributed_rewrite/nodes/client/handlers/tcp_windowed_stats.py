@@ -8,7 +8,7 @@ import cloudpickle
 
 from hyperscale.distributed_rewrite.reliability.rate_limiting import RequestPriority
 from hyperscale.distributed_rewrite.nodes.client.state import ClientState
-from hyperscale.logging.hyperscale_logger import Logger
+from hyperscale.logging import Logger
 
 
 class WindowedStatsPushHandler:

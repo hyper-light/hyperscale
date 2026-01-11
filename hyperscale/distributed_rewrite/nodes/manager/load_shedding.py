@@ -3,29 +3,30 @@ Manager load shedding module.
 
 Implements AD-22 priority-based load shedding to protect the system
 under overload conditions while ensuring critical operations are never shed.
+
+Uses the centralized AD-37 message classification from the reliability module
+to ensure consistent priority handling across all node types.
 """
 
-from enum import IntEnum
 from typing import TYPE_CHECKING
 
+from hyperscale.distributed_rewrite.reliability import (
+    RequestPriority,
+    classify_handler_to_priority,
+    CONTROL_HANDLERS,
+    DISPATCH_HANDLERS,
+    DATA_HANDLERS,
+    TELEMETRY_HANDLERS,
+)
 from hyperscale.logging.hyperscale_logging_models import ServerDebug, ServerWarning
 
 if TYPE_CHECKING:
     from hyperscale.distributed_rewrite.nodes.manager.config import ManagerConfig
-    from hyperscale.logging.hyperscale_logger import Logger
+    from hyperscale.logging import Logger
 
 
-class RequestPriority(IntEnum):
-    """
-    Request priority levels for AD-22 load shedding.
-
-    Lower values = higher priority = shed last.
-    """
-
-    CRITICAL = 0  # Never shed: SWIM probes, cancellation, final results
-    HIGH = 1  # Shed under severe overload: job dispatch, workflow commands, state sync
-    NORMAL = 2  # Shed under moderate overload: progress updates, heartbeats, stats queries
-    LOW = 3  # Shed first: detailed metrics, telemetry, debug
+# Re-export RequestPriority for backwards compatibility
+__all__ = ["RequestPriority", "OverloadState", "ManagerLoadShedder"]
 
 
 class OverloadState:

@@ -14,7 +14,7 @@ from hyperscale.distributed_rewrite.models import (
 
 if TYPE_CHECKING:
     from hyperscale.distributed_rewrite.nodes.gate.state import GateRuntimeState
-    from hyperscale.logging.hyperscale_logger import Logger
+    from hyperscale.logging import Logger
 
 
 class GatePingHandler:

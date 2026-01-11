@@ -22,7 +22,7 @@ if TYPE_CHECKING:
     from hyperscale.distributed_rewrite.nodes.manager.config import ManagerConfig
     from hyperscale.distributed_rewrite.nodes.manager.registry import ManagerRegistry
     from hyperscale.distributed_rewrite.nodes.manager.leases import ManagerLeaseCoordinator
-    from hyperscale.logging.hyperscale_logger import Logger
+    from hyperscale.logging import Logger
 
 
 class ManagerDispatchCoordinator:
