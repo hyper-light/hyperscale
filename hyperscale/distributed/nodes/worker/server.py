@@ -7,7 +7,6 @@ All business logic is delegated to specialized modules.
 
 import asyncio
 import time
-from typing import TYPE_CHECKING
 
 from hyperscale.distributed.swim import HealthAwareServer, WorkerStateEmbedder
 from hyperscale.distributed.env import Env
@@ -50,10 +49,6 @@ from .handlers import (
     WorkflowProgressHandler,
     StateSyncHandler,
 )
-
-if TYPE_CHECKING:
-    from hyperscale.logging import Logger
-
 
 class WorkerServer(HealthAwareServer):
     """
@@ -408,11 +403,10 @@ class WorkerServer(HealthAwareServer):
         for manager_addr in self._seed_managers:
             await self._register_with_manager(manager_addr)
 
-        # Join SWIM cluster with managers
-        for manager_id in list(self._registry._healthy_manager_ids):
-            if manager_info := self._registry.get_manager(manager_id):
-                manager_udp_addr = (manager_info.udp_host, manager_info.udp_port)
-                self.join([manager_udp_addr])
+        # Join SWIM cluster with all known managers for healthchecks
+        for manager_info in list(self._registry._known_managers.values()):
+            manager_udp_addr = (manager_info.udp_host, manager_info.udp_port)
+            self.join([manager_udp_addr])
 
         # Start SWIM probe cycle
         self.start_probe_cycle()
