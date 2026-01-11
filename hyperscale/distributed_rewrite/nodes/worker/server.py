@@ -1,15 +1,14 @@
 """
-Worker server module.
+Worker server composition root (Phase 15.2.7 placeholder).
 
-This module re-exports WorkerServer from the original worker.py
-for backward compatibility during the refactoring process.
+This file will eventually contain the refactored WorkerServer as a
+composition root that wires all modules together.
 
-Once the refactoring is complete (Phase 15.2.7), this file will
-contain the composition root that wires all modules together.
+Currently, WorkerServer is imported from worker_impl.py via the
+package __init__.py.
 """
 
-# Re-export from original implementation for backward compatibility
-# The original worker.py remains the source of truth during refactoring
-from hyperscale.distributed_rewrite.nodes.worker_original import WorkerServer
+# Re-export from parent package __init__.py for convenience
+from hyperscale.distributed_rewrite.nodes.worker_impl import WorkerServer
 
 __all__ = ["WorkerServer"]
