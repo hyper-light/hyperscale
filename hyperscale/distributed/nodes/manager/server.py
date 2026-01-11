@@ -264,9 +264,11 @@ class ManagerServer(HealthAwareServer):
         self._state_sync = ManagerStateSync(
             state=self._manager_state,
             config=self._config,
+            registry=self._registry,
             logger=self._udp_logger,
             node_id=self._node_id.short,
             task_runner=self._task_runner,
+            send_tcp=self._send_to_peer,
         )
 
         # Leadership coordinator
@@ -276,6 +278,8 @@ class ManagerServer(HealthAwareServer):
             logger=self._udp_logger,
             node_id=self._node_id.short,
             task_runner=self._task_runner,
+            is_leader_fn=self.is_leader,
+            get_term_fn=lambda: self._leader_election.state.current_term if hasattr(self, '_leader_election') else 0,
         )
 
         # Stats coordinator

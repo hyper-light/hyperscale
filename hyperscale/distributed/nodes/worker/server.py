@@ -1,5 +1,5 @@
 """
-Worker server composition root (Phase 15.2.7).
+Worker server composition root.
 
 Thin orchestration layer that wires all worker modules together.
 All business logic is delegated to specialized modules.
@@ -25,6 +25,7 @@ from hyperscale.distributed.protocol.version import (
     NegotiatedCapabilities,
 )
 from hyperscale.distributed.server import tcp
+from hyperscale.logging.hyperscale_logging_models import ServerInfo
 
 from .config import WorkerConfig
 from .state import WorkerState
@@ -34,6 +35,13 @@ from .sync import WorkerStateSync
 from .health import WorkerHealthIntegration
 from .backpressure import WorkerBackpressureManager
 from .discovery import WorkerDiscoveryManager
+from .lifecycle import WorkerLifecycleManager
+from .registration import WorkerRegistrationHandler
+from .heartbeat import WorkerHeartbeatHandler
+from .progress import WorkerProgressReporter
+from .workflow_executor import WorkerWorkflowExecutor
+from .cancellation import WorkerCancellationHandler
+from .background_loops import WorkerBackgroundLoops
 from .handlers import (
     WorkflowDispatchHandler,
     WorkflowCancelHandler,
@@ -88,7 +96,7 @@ class WorkerServer(HealthAwareServer):
 
         # Initialize modules (will be fully wired after super().__init__)
         self._registry = WorkerRegistry(
-            logger=None,  # Set after parent init
+            logger=None,
             recovery_jitter_min=env.RECOVERY_JITTER_MIN,
             recovery_jitter_max=env.RECOVERY_JITTER_MAX,
             recovery_semaphore_size=env.RECOVERY_SEMAPHORE_SIZE,
@@ -123,26 +131,46 @@ class WorkerServer(HealthAwareServer):
             logger=None,
         )
 
-        # Runtime state
-        self._active_workflows: dict[str, WorkflowProgress] = {}
-        self._workflow_tokens: dict[str, str] = {}
-        self._workflow_cancel_events: dict[str, asyncio.Event] = {}
-        self._workflow_job_leader: dict[str, tuple[str, int]] = {}
-        self._workflow_fence_tokens: dict[str, int] = {}
-        self._pending_workflows: list = []
-        self._orphaned_workflows: dict[str, float] = {}
+        # New modular components
+        self._lifecycle_manager = WorkerLifecycleManager(
+            host=host,
+            tcp_port=tcp_port,
+            udp_port=udp_port,
+            total_cores=self._total_cores,
+            env=env,
+            logger=None,
+        )
 
-        # Section 8: Job leadership transfer
-        self._job_leader_transfer_locks: dict[str, asyncio.Lock] = {}
-        self._job_fence_tokens: dict[str, int] = {}
-        self._pending_transfers: dict = {}
+        # Initialize after we have discovery service
+        self._registration_handler: WorkerRegistrationHandler | None = None
+        self._heartbeat_handler: WorkerHeartbeatHandler | None = None
+        self._progress_reporter: WorkerProgressReporter | None = None
+        self._workflow_executor: WorkerWorkflowExecutor | None = None
+        self._cancellation_handler_impl: WorkerCancellationHandler | None = None
+        self._background_loops: WorkerBackgroundLoops | None = None
 
-        # Transfer metrics (8.6)
-        self._transfer_metrics_received: int = 0
-        self._transfer_metrics_accepted: int = 0
-        self._transfer_metrics_rejected_stale_token: int = 0
-        self._transfer_metrics_rejected_unknown_manager: int = 0
-        self._transfer_metrics_rejected_other: int = 0
+        # Runtime state (delegate to _worker_state)
+        self._active_workflows: dict[str, WorkflowProgress] = self._worker_state._active_workflows
+        self._workflow_tokens: dict[str, str] = self._worker_state._workflow_tokens
+        self._workflow_cancel_events: dict[str, asyncio.Event] = self._worker_state._workflow_cancel_events
+        self._workflow_job_leader: dict[str, tuple[str, int]] = self._worker_state._workflow_job_leader
+        self._workflow_fence_tokens: dict[str, int] = self._worker_state._workflow_fence_tokens
+        self._pending_workflows: list = self._worker_state._pending_workflows
+        self._orphaned_workflows: dict[str, float] = self._worker_state._orphaned_workflows
+
+        # Section 8: Job leadership transfer (delegate to state)
+        self._job_leader_transfer_locks: dict[str, asyncio.Lock] = self._worker_state._job_leader_transfer_locks
+        self._job_fence_tokens: dict[str, int] = self._worker_state._job_fence_tokens
+        self._pending_transfers: dict = self._worker_state._pending_transfers
+
+        # Transfer metrics (delegate to state)
+        @property
+        def _transfer_metrics_received(self) -> int:
+            return self._worker_state._transfer_metrics_received
+
+        @property
+        def _transfer_metrics_accepted(self) -> int:
+            return self._worker_state._transfer_metrics_accepted
 
         # Negotiated capabilities (AD-25)
         self._negotiated_capabilities: NegotiatedCapabilities | None = None
@@ -177,12 +205,12 @@ class WorkerServer(HealthAwareServer):
             get_health_throughput=self._executor.get_throughput,
             get_health_expected_throughput=self._executor.get_expected_throughput,
             get_health_overload_state=self._backpressure_manager.get_overload_state_str,
-            get_extension_requested=lambda: False,
-            get_extension_reason=lambda: "",
-            get_extension_current_progress=lambda: 0.0,
-            get_extension_completed_items=lambda: 0,
-            get_extension_total_items=lambda: 0,
-            get_extension_estimated_completion=lambda: 0.0,
+            get_extension_requested=lambda: self._worker_state._extension_requested,
+            get_extension_reason=lambda: self._worker_state._extension_reason,
+            get_extension_current_progress=lambda: self._worker_state._extension_current_progress,
+            get_extension_completed_items=lambda: self._worker_state._extension_completed_items,
+            get_extension_total_items=lambda: self._worker_state._extension_total_items,
+            get_extension_estimated_completion=lambda: self._worker_state._extension_estimated_completion,
             get_extension_active_workflow_count=lambda: len(self._active_workflows),
         )
 
@@ -197,14 +225,78 @@ class WorkerServer(HealthAwareServer):
             state_embedder=state_embedder,
         )
 
+        # Initialize components that need discovery service
+        self._registration_handler = WorkerRegistrationHandler(
+            registry=self._registry,
+            discovery_service=self._discovery_service,
+            logger=self._udp_logger,
+            node_capabilities=self._node_capabilities,
+        )
+
+        self._heartbeat_handler = WorkerHeartbeatHandler(
+            registry=self._registry,
+            logger=self._udp_logger,
+        )
+
+        self._progress_reporter = WorkerProgressReporter(
+            registry=self._registry,
+            state=self._worker_state,
+            logger=self._udp_logger,
+        )
+
+        self._workflow_executor = WorkerWorkflowExecutor(
+            core_allocator=self._core_allocator,
+            state=self._worker_state,
+            lifecycle=self._lifecycle_manager,
+            backpressure_manager=self._backpressure_manager,
+            env=env,
+            logger=self._udp_logger,
+        )
+
+        self._cancellation_handler_impl = WorkerCancellationHandler(
+            state=self._worker_state,
+            logger=self._udp_logger,
+            poll_interval=self._config.cancellation_poll_interval_seconds,
+        )
+
+        self._background_loops = WorkerBackgroundLoops(
+            registry=self._registry,
+            state=self._worker_state,
+            discovery_service=self._discovery_service,
+            logger=self._udp_logger,
+            backpressure_manager=self._backpressure_manager,
+        )
+
+        # Configure background loops
+        self._background_loops.configure(
+            dead_manager_reap_interval=self._config.dead_manager_reap_interval_seconds,
+            dead_manager_check_interval=self._config.dead_manager_check_interval_seconds,
+            orphan_grace_period=self._config.orphan_grace_period_seconds,
+            orphan_check_interval=self._config.orphan_check_interval_seconds,
+            discovery_failure_decay_interval=self._config.discovery_failure_decay_interval_seconds,
+            progress_flush_interval=self._config.progress_flush_interval_seconds,
+        )
+
         # Wire logger to modules after parent init
         self._wire_logger_to_modules()
+
+        # Set resource getters for backpressure
+        self._backpressure_manager.set_resource_getters(
+            self._get_cpu_percent,
+            self._get_memory_percent,
+        )
 
         # Register SWIM callbacks
         self.register_on_node_dead(self._health_integration.on_node_dead)
         self.register_on_node_join(self._health_integration.on_node_join)
         self._health_integration.set_failure_callback(self._on_manager_failure)
         self._health_integration.set_recovery_callback(self._on_manager_recovery)
+
+        # Set up heartbeat callbacks
+        self._heartbeat_handler.set_callbacks(
+            on_new_manager_discovered=self._on_new_manager_discovered,
+            on_job_leadership_update=self._on_job_leadership_update,
+        )
 
         # Initialize handlers
         self._dispatch_handler = WorkflowDispatchHandler(self)
@@ -220,6 +312,7 @@ class WorkerServer(HealthAwareServer):
         self._backpressure_manager._logger = self._udp_logger
         self._health_integration._logger = self._udp_logger
         self._discovery_manager._logger = self._udp_logger
+        self._lifecycle_manager._logger = self._udp_logger
 
     @property
     def node_info(self) -> NodeInfo:
@@ -264,19 +357,205 @@ class WorkerServer(HealthAwareServer):
 
     async def start(self, timeout: float | None = None) -> None:
         """Start the worker server."""
-        # Delegate to worker_impl for full implementation
-        from hyperscale.distributed.nodes.worker_impl import WorkerServer as ImplServer
-        await ImplServer.start(self, timeout)
+        # Setup logging config
+        self._lifecycle_manager.setup_logging_config()
+
+        # Start parent server
+        await super().start()
+
+        # Update node capabilities
+        self._node_capabilities = self._lifecycle_manager.get_node_capabilities(
+            self._node_id.full
+        )
+        self._registration_handler.set_node_capabilities(self._node_capabilities)
+
+        # Start monitors
+        await self._lifecycle_manager.start_monitors(
+            self._node_id.datacenter,
+            self._node_id.full,
+        )
+
+        # Setup server pool
+        await self._lifecycle_manager.setup_server_pool()
+
+        # Initialize remote manager
+        remote_manager = await self._lifecycle_manager.initialize_remote_manager(
+            self._updates_controller,
+            self._config.progress_update_interval,
+        )
+
+        # Set remote manager for cancellation
+        self._cancellation_handler_impl.set_remote_manager(remote_manager)
+
+        # Start remote manager
+        await self._lifecycle_manager.start_remote_manager()
+
+        # Run worker pool
+        await self._lifecycle_manager.run_worker_pool()
+
+        # Connect to workers
+        await self._lifecycle_manager.connect_to_workers(timeout)
+
+        # Set core availability callback
+        self._lifecycle_manager.set_on_cores_available(self._on_cores_available)
+
+        # Register with all seed managers
+        for manager_addr in self._seed_managers:
+            await self._register_with_manager(manager_addr)
+
+        # Join SWIM cluster with managers
+        for manager_id in list(self._registry._healthy_manager_ids):
+            if manager_info := self._registry.get_manager(manager_id):
+                manager_udp_addr = (manager_info.udp_host, manager_info.udp_port)
+                self.join([manager_udp_addr])
+
+        # Start SWIM probe cycle
+        self.start_probe_cycle()
+
+        # Start background loops
+        await self._start_background_loops()
+
+        await self._udp_logger.log(
+            ServerInfo(
+                message=f"Worker started with {self._total_cores} cores",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
 
     async def stop(self, drain_timeout: float = 5, broadcast_leave: bool = True) -> None:
-        """Stop the worker server."""
-        from hyperscale.distributed.nodes.worker_impl import WorkerServer as ImplServer
-        await ImplServer.stop(self, drain_timeout, broadcast_leave)
+        """Stop the worker server gracefully."""
+        self._running = False
+
+        # Stop background loops
+        await self._stop_background_loops()
+
+        # Stop modules
+        self._backpressure_manager.stop()
+        self._executor.stop()
+        if self._cancellation_handler_impl:
+            self._cancellation_handler_impl.stop()
+        if self._background_loops:
+            self._background_loops.stop()
+
+        # Shutdown remote manager and workers
+        await self._lifecycle_manager.shutdown_remote_manager()
+
+        # Stop monitors
+        await self._lifecycle_manager.stop_monitors(
+            self._node_id.datacenter,
+            self._node_id.full,
+        )
+
+        # Shutdown server pool
+        await self._lifecycle_manager.shutdown_server_pool()
+
+        # Kill child processes
+        await self._lifecycle_manager.kill_child_processes()
+
+        # Stop parent server
+        await super().stop(drain_timeout, broadcast_leave)
+
+        await self._udp_logger.log(
+            ServerInfo(
+                message="Worker stopped",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
 
     def abort(self):
-        """Abort the worker server."""
-        from hyperscale.distributed.nodes.worker_impl import WorkerServer as ImplServer
-        return ImplServer.abort(self)
+        """Abort the worker server immediately."""
+        self._running = False
+
+        # Cancel background tasks synchronously
+        self._lifecycle_manager.cancel_background_tasks_sync()
+
+        # Abort modules
+        self._lifecycle_manager.abort_monitors()
+        self._lifecycle_manager.abort_remote_manager()
+        self._lifecycle_manager.abort_server_pool()
+
+        # Abort parent server
+        super().abort()
+
+    async def _start_background_loops(self) -> None:
+        """Start all background loops."""
+        # Progress flush loop
+        self._progress_flush_task = asyncio.create_task(
+            self._background_loops.run_progress_flush_loop(
+                send_progress_to_job_leader=self._send_progress_to_job_leader,
+                aggregate_progress_by_job=self._aggregate_progress_by_job,
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id_short=self._node_id.short,
+                is_running=lambda: self._running,
+                get_healthy_managers=lambda: self._registry._healthy_manager_ids,
+            )
+        )
+        self._lifecycle_manager.add_background_task(self._progress_flush_task)
+
+        # Dead manager reap loop
+        self._dead_manager_reap_task = asyncio.create_task(
+            self._background_loops.run_dead_manager_reap_loop(
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id_short=self._node_id.short,
+                task_runner_run=self._task_runner.run,
+                is_running=lambda: self._running,
+            )
+        )
+        self._lifecycle_manager.add_background_task(self._dead_manager_reap_task)
+
+        # Cancellation poll loop
+        self._cancellation_poll_task = asyncio.create_task(
+            self._cancellation_handler_impl.run_cancellation_poll_loop(
+                get_manager_addr=self._registry.get_primary_manager_tcp_addr,
+                is_circuit_open=lambda: (
+                    self._registry.is_circuit_open(self._primary_manager_id)
+                    if self._primary_manager_id else False
+                ),
+                send_tcp=self.send_tcp,
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id_short=self._node_id.short,
+                task_runner_run=self._task_runner.run,
+                is_running=lambda: self._running,
+            )
+        )
+        self._lifecycle_manager.add_background_task(self._cancellation_poll_task)
+
+        # Orphan check loop
+        self._orphan_check_task = asyncio.create_task(
+            self._background_loops.run_orphan_check_loop(
+                cancel_workflow=self._cancel_workflow,
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id_short=self._node_id.short,
+                is_running=lambda: self._running,
+            )
+        )
+        self._lifecycle_manager.add_background_task(self._orphan_check_task)
+
+        # Discovery maintenance loop
+        self._discovery_maintenance_task = asyncio.create_task(
+            self._background_loops.run_discovery_maintenance_loop(
+                is_running=lambda: self._running,
+            )
+        )
+        self._lifecycle_manager.add_background_task(self._discovery_maintenance_task)
+
+        # Overload poll loop
+        self._overload_poll_task = asyncio.create_task(
+            self._backpressure_manager.run_overload_poll_loop()
+        )
+        self._lifecycle_manager.add_background_task(self._overload_poll_task)
+
+    async def _stop_background_loops(self) -> None:
+        """Stop all background loops."""
+        await self._lifecycle_manager.cancel_background_tasks()
 
     # =========================================================================
     # State Methods
@@ -313,15 +592,13 @@ class WorkerServer(HealthAwareServer):
 
     def _get_job_transfer_lock(self, job_id: str) -> asyncio.Lock:
         """Get or create a lock for job leadership transfers."""
-        if job_id not in self._job_leader_transfer_locks:
-            self._job_leader_transfer_locks[job_id] = asyncio.Lock()
-        return self._job_leader_transfer_locks[job_id]
+        return self._worker_state.get_or_create_job_transfer_lock(job_id)
 
     def _validate_transfer_fence_token(
         self, job_id: str, new_fence_token: int
     ) -> tuple[bool, str]:
         """Validate a transfer's fence token."""
-        current_token = self._job_fence_tokens.get(job_id, -1)
+        current_token = self._worker_state.get_job_fence_token(job_id)
         if new_fence_token <= current_token:
             return (False, f"Stale fence token: received {new_fence_token}, current {current_token}")
         return (True, "")
@@ -331,6 +608,58 @@ class WorkerServer(HealthAwareServer):
         if new_manager_id not in self._registry._known_managers:
             return (False, f"Unknown manager: {new_manager_id} not in known managers")
         return (True, "")
+
+    # =========================================================================
+    # Registration Methods
+    # =========================================================================
+
+    async def _register_with_manager(self, manager_addr: tuple[str, int]) -> bool:
+        """Register this worker with a manager."""
+        return await self._registration_handler.register_with_manager(
+            manager_addr=manager_addr,
+            node_info=self.node_info,
+            total_cores=self._total_cores,
+            available_cores=self._core_allocator.available_cores,
+            memory_mb=self._get_memory_mb(),
+            available_memory_mb=self._get_available_memory_mb(),
+            cluster_id=self._env.MERCURY_SYNC_CLUSTER_ID,
+            environment_id=self._env.MERCURY_SYNC_ENVIRONMENT_ID,
+            send_func=self._send_registration,
+        )
+
+    async def _send_registration(
+        self,
+        manager_addr: tuple[str, int],
+        data: bytes,
+        timeout: float = 5.0,
+    ) -> bytes | Exception:
+        """Send registration data to manager."""
+        try:
+            response, _ = await self.send_tcp(
+                manager_addr,
+                "worker_registration",
+                data,
+                timeout=timeout,
+            )
+            return response
+        except Exception as error:
+            return error
+
+    def _get_memory_mb(self) -> int:
+        """Get total memory in MB."""
+        try:
+            import psutil
+            return int(psutil.virtual_memory().total / (1024 * 1024))
+        except ImportError:
+            return 0
+
+    def _get_available_memory_mb(self) -> int:
+        """Get available memory in MB."""
+        try:
+            import psutil
+            return int(psutil.virtual_memory().available / (1024 * 1024))
+        except ImportError:
+            return 0
 
     # =========================================================================
     # Callbacks
@@ -345,51 +674,200 @@ class WorkerServer(HealthAwareServer):
         self._task_runner.run(self._handle_manager_recovery_async, manager_id)
 
     async def _handle_manager_failure_async(self, manager_id: str) -> None:
-        """Async handler for manager failure."""
-        from hyperscale.distributed.nodes.worker_impl import WorkerServer as ImplServer
-        await ImplServer._handle_manager_failure(self, manager_id)
+        """Handle manager failure - mark workflows as orphaned."""
+        self._registry.mark_manager_unhealthy(manager_id)
+
+        # Select new primary if needed
+        if self._primary_manager_id == manager_id:
+            await self._registry.select_new_primary_manager()
+
+        # Mark affected workflows as orphaned
+        manager_info = self._registry.get_manager(manager_id)
+        if not manager_info:
+            return
+
+        manager_addr = (manager_info.tcp_host, manager_info.tcp_port)
+        for workflow_id, leader_addr in list(self._workflow_job_leader.items()):
+            if leader_addr == manager_addr:
+                self._worker_state.mark_workflow_orphaned(workflow_id)
+
+        await self._udp_logger.log(
+            ServerInfo(
+                message=f"Manager {manager_id[:8]}... failed, affected workflows marked as orphaned",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
 
     async def _handle_manager_recovery_async(self, manager_id: str) -> None:
-        """Async handler for manager recovery."""
-        from hyperscale.distributed.nodes.worker_impl import WorkerServer as ImplServer
-        await ImplServer._handle_manager_recovery(self, manager_id)
+        """Handle manager recovery - mark as healthy."""
+        self._registry.mark_manager_healthy(manager_id)
+
+        await self._udp_logger.log(
+            ServerInfo(
+                message=f"Manager {manager_id[:8]}... recovered",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
 
     def _handle_manager_heartbeat(self, heartbeat, source_addr: tuple[str, int]) -> None:
         """Handle manager heartbeat from SWIM."""
-        from hyperscale.distributed.nodes.worker_impl import WorkerServer as ImplServer
-        ImplServer._handle_manager_heartbeat(self, heartbeat, source_addr)
+        self._heartbeat_handler.process_manager_heartbeat(
+            heartbeat=heartbeat,
+            source_addr=source_addr,
+            confirm_peer=self.confirm_peer,
+            node_host=self._host,
+            node_port=self._tcp_port,
+            node_id_short=self._node_id.short,
+            task_runner_run=self._task_runner.run,
+        )
+
+    def _on_new_manager_discovered(self, manager_addr: tuple[str, int]) -> None:
+        """Handle discovery of new manager via heartbeat."""
+        self._task_runner.run(self._register_with_manager, manager_addr)
+
+    def _on_job_leadership_update(
+        self,
+        job_leaderships: list[str],
+        manager_addr: tuple[str, int],
+        node_host: str,
+        node_port: int,
+        node_id_short: str,
+        task_runner_run: callable,
+    ) -> None:
+        """Handle job leadership claims from heartbeat."""
+        for workflow_id, leader_addr in list(self._workflow_job_leader.items()):
+            progress = self._active_workflows.get(workflow_id)
+            if progress and progress.job_id in job_leaderships:
+                if leader_addr != manager_addr:
+                    self._workflow_job_leader[workflow_id] = manager_addr
+                    self._worker_state.clear_workflow_orphaned(workflow_id)
+
+    def _on_cores_available(self, available_cores: int) -> None:
+        """Handle cores becoming available - notify manager."""
+        if not self._running or available_cores <= 0:
+            return
+
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                loop.create_task(self._notify_manager_cores_available(available_cores))
+        except RuntimeError:
+            pass
+
+    async def _notify_manager_cores_available(self, available_cores: int) -> None:
+        """Send core availability notification to manager."""
+        manager_addr = self._registry.get_primary_manager_tcp_addr()
+        if not manager_addr:
+            return
+
+        try:
+            heartbeat = self._get_heartbeat()
+            await self.send_tcp(
+                manager_addr,
+                "worker_heartbeat",
+                heartbeat.dump(),
+                timeout=1.0,
+            )
+        except Exception:
+            pass
 
     # =========================================================================
-    # Dispatch Execution Delegation (for tcp_dispatch.py)
+    # Dispatch Execution
     # =========================================================================
 
     async def _handle_dispatch_execution(
         self, dispatch, addr: tuple[str, int], allocation_result
     ) -> bytes:
-        """Delegate dispatch execution to worker_impl."""
-        from hyperscale.distributed.nodes.worker_impl import WorkerServer as ImplServer
-        return await ImplServer._handle_dispatch_execution(self, dispatch, addr, allocation_result)
+        """Handle the execution phase of a workflow dispatch."""
+        return await self._workflow_executor.handle_dispatch_execution(
+            dispatch=dispatch,
+            dispatching_addr=addr,
+            allocated_cores=allocation_result.allocated_cores,
+            task_runner_run=self._task_runner.run,
+            increment_version=self._increment_version,
+            node_id_full=self._node_id.full,
+            node_host=self._host,
+            node_port=self._tcp_port,
+        )
 
     def _cleanup_workflow_state(self, workflow_id: str) -> None:
         """Cleanup workflow state on failure."""
-        # Clear from tracking dicts
-        self._active_workflows.pop(workflow_id, None)
-        self._workflow_tokens.pop(workflow_id, None)
-        self._workflow_cancel_events.pop(workflow_id, None)
-        self._workflow_job_leader.pop(workflow_id, None)
-        self._workflow_fence_tokens.pop(workflow_id, None)
-        self._orphaned_workflows.pop(workflow_id, None)
+        self._worker_state.remove_active_workflow(workflow_id)
 
     # =========================================================================
-    # Cancellation Delegation (for tcp_cancel.py - AD-20)
+    # Cancellation
     # =========================================================================
 
     async def _cancel_workflow(
         self, workflow_id: str, reason: str
-    ) -> tuple[bool, str | None]:
-        """Delegate workflow cancellation to worker_impl."""
-        from hyperscale.distributed.nodes.worker_impl import WorkerServer as ImplServer
-        return await ImplServer._cancel_workflow(self, workflow_id, reason)
+    ) -> tuple[bool, list[str]]:
+        """Cancel a workflow and clean up resources."""
+        success, errors = await self._cancellation_handler_impl.cancel_workflow(
+            workflow_id=workflow_id,
+            reason=reason,
+            task_runner_cancel=self._task_runner.cancel,
+            increment_version=self._increment_version,
+        )
+
+        # Push cancellation complete to manager
+        progress = self._active_workflows.get(workflow_id)
+        if progress:
+            await self._progress_reporter.send_cancellation_complete(
+                job_id=progress.job_id,
+                workflow_id=workflow_id,
+                success=success,
+                errors=errors,
+                cancelled_at=time.time(),
+                node_id=self._node_id.full,
+                send_tcp=self.send_tcp,
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id_short=self._node_id.short,
+            )
+
+        return (success, errors)
+
+    # =========================================================================
+    # Progress Reporting
+    # =========================================================================
+
+    async def _send_progress_to_job_leader(self, progress: WorkflowProgress) -> bool:
+        """Send progress update to job leader."""
+        return await self._progress_reporter.send_progress_to_job_leader(
+            progress=progress,
+            send_tcp=self.send_tcp,
+            node_host=self._host,
+            node_port=self._tcp_port,
+            node_id_short=self._node_id.short,
+        )
+
+    def _aggregate_progress_by_job(
+        self, updates: dict[str, WorkflowProgress]
+    ) -> dict[str, WorkflowProgress]:
+        """Aggregate progress updates by job for BATCH mode."""
+        if not updates:
+            return updates
+
+        by_job: dict[str, list[WorkflowProgress]] = {}
+        for workflow_id, progress in updates.items():
+            job_id = progress.job_id
+            if job_id not in by_job:
+                by_job[job_id] = []
+            by_job[job_id].append(progress)
+
+        aggregated: dict[str, WorkflowProgress] = {}
+        for job_id, job_updates in by_job.items():
+            if len(job_updates) == 1:
+                aggregated[job_updates[0].workflow_id] = job_updates[0]
+            else:
+                best_update = max(job_updates, key=lambda p: p.completed_count)
+                aggregated[best_update.workflow_id] = best_update
+
+        return aggregated
 
     # =========================================================================
     # Environment Property (for tcp_dispatch.py)
@@ -468,6 +946,20 @@ class WorkerServer(HealthAwareServer):
         """Handle workflow status query."""
         active_ids = list(self._active_workflows.keys())
         return ",".join(active_ids).encode("utf-8")
+
+    @tcp.receive()
+    async def manager_to_worker_registration(
+        self, addr: tuple[str, int], data: bytes, clock_time: int
+    ) -> bytes:
+        """Handle bidirectional registration from manager."""
+        return self._registration_handler.process_manager_registration(
+            data=data,
+            node_id_full=self._node_id.full,
+            total_cores=self._total_cores,
+            available_cores=self._core_allocator.available_cores,
+            add_unconfirmed_peer=self.add_unconfirmed_peer,
+            add_to_probe_scheduler=self.add_to_probe_scheduler,
+        )
 
 
 __all__ = ["WorkerServer"]

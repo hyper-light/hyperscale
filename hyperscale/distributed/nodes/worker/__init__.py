@@ -40,6 +40,15 @@ from .cancellation import WorkerCancellationHandler
 from .health import WorkerHealthIntegration
 from .backpressure import WorkerBackpressureManager
 from .discovery import WorkerDiscoveryManager
+
+# New modular components (Phase 15.2.7)
+from .lifecycle import WorkerLifecycleManager
+from .registration import WorkerRegistrationHandler
+from .heartbeat import WorkerHeartbeatHandler
+from .progress import WorkerProgressReporter
+from .workflow_executor import WorkerWorkflowExecutor
+from .background_loops import WorkerBackgroundLoops
+
 from .server import WorkerServer
 
 __all__ = [
@@ -73,4 +82,11 @@ __all__ = [
     "WorkerHealthIntegration",
     "WorkerBackpressureManager",
     "WorkerDiscoveryManager",
+    # New modular components (Phase 15.2.7)
+    "WorkerLifecycleManager",
+    "WorkerRegistrationHandler",
+    "WorkerHeartbeatHandler",
+    "WorkerProgressReporter",
+    "WorkerWorkflowExecutor",
+    "WorkerBackgroundLoops",
 ]
