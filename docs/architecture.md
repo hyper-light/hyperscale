@@ -20338,6 +20338,362 @@ CRC32: Covers all fields except CRC32 itself
 
 ---
 
+## Part 3.1: Logger Suitability Analysis
+
+The hyperscale/logging Logger provides async file writing capabilities. This section analyzes its suitability for WAL vs Data Plane use cases.
+
+**Logger Capabilities** (from `hyperscale/logging/streams/logger_stream.py`):
+
+```python
+# Current Logger file writing pattern
+def _write_to_file(self, log: Log, logfile_path: str):
+    if (logfile := self._files.get(logfile_path)) and (logfile.closed is False):
+        logfile.write(msgspec.json.encode(log) + b"\n")
+        logfile.flush()  # <- Only flush, NO os.fsync()!
+```
+
+**Suitability Matrix**:
+
+| Requirement | Logger Has? | WAL Needs? | Data Plane Needs? |
+|-------------|-------------|------------|-------------------|
+| Async file I/O | ✅ Yes (run_in_executor) | ✅ Yes | ✅ Yes |
+| Per-file locking | ✅ Yes (asyncio.Lock) | ✅ Yes | ⚪ Optional |
+| fsync guarantee | ❌ No (flush only) | ✅ **Critical** | ❌ Not needed |
+| Sequence numbers | ❌ No | ✅ **Critical** | ❌ Not needed |
+| Binary format with CRC | ❌ No (JSON) | ✅ **Critical** | ❌ Not needed |
+| Read-back capability | ❌ No (write-only) | ✅ **Critical** | ❌ Not needed |
+| Retention/rotation | ✅ Yes | ✅ Yes | ✅ Yes |
+| Batch operations | ✅ Yes | ✅ Yes | ✅ Yes |
+| msgspec serialization | ✅ Yes | ✅ Yes | ✅ Yes |
+
+**Critical WAL Gap: No fsync**
+
+```python
+# Logger current implementation (INSUFFICIENT for WAL):
+logfile.write(data)
+logfile.flush()  # Flushes to OS buffer, NOT to disk
+
+# WAL REQUIRES explicit fsync:
+logfile.write(data)
+logfile.flush()
+os.fsync(logfile.fileno())  # Guarantees on-disk durability
+```
+
+Without fsync, data in OS buffers can be lost on:
+- Power failure
+- Kernel panic
+- Hardware failure
+
+**Critical WAL Gap: No Sequence Numbers**
+
+WAL requires monotonically increasing LSNs for:
+- Replication position tracking
+- Recovery point identification
+- Exactly-once processing guarantees
+
+**Critical WAL Gap: No Read-Back**
+
+WAL requires:
+```python
+# Logger does NOT provide:
+def read_from_offset(offset: int) -> list[Entry]: ...
+def get_committed_offset() -> int: ...
+def truncate_before(offset: int): ...  # For compaction
+```
+
+**Verdict**:
+
+| Use Case | Logger Suitable? | Recommendation |
+|----------|------------------|----------------|
+| **Control Plane WAL** | ❌ **No** | Build dedicated NodeWAL class |
+| **Data Plane Stats** | ✅ **Yes** | Use Logger as-is |
+| **Audit Logging** | ⚠️ **Partial** | Logger OK if crash loss acceptable |
+
+**Recommendation**: Build `NodeWAL` class that:
+1. **Reuses** Logger's async patterns (run_in_executor, per-file locks)
+2. **Adds** explicit fsync with group commit batching
+3. **Adds** binary segments with CRC checksums
+4. **Adds** sequence numbers via HLC
+5. **Adds** read-back and recovery capabilities
+
+**Data Plane uses Logger directly** for stats streaming where eventual consistency is acceptable.
+
+---
+
+## Part 3.2: Operation-Specific Durability
+
+Different operations require different durability guarantees. Using GLOBAL durability for everything adds 200-300ms latency to every operation - unacceptable for high-throughput stats.
+
+**Durability by Operation Type**:
+
+| Operation | Durability | Latency | Rationale |
+|-----------|------------|---------|-----------|
+| **Job Create** | GLOBAL | 50-300ms | Must survive region loss; authoritative |
+| **Job Cancel** | GLOBAL | 50-300ms | Safety-critical; must propagate everywhere |
+| **Job Complete** | GLOBAL | 50-300ms | Final state; audit trail requirement |
+| **Job Timeout** | GLOBAL | 50-300ms | Authoritative determination |
+| **Workflow Dispatch** | REGIONAL | 2-10ms | Manager is DC authority |
+| **Workflow Complete** | REGIONAL | 2-10ms | Aggregated to gate async |
+| **Workflow Cancel** | REGIONAL | 2-10ms | DC-local operation |
+| **Progress Update** | LOCAL | <1ms | High volume; manager aggregates |
+| **Stats Report** | NONE | ~0ms | Fire-and-forget; eventual consistency |
+| **Metrics Stream** | NONE | ~0ms | Batched, sampled at source |
+
+**State Diagram: Durability Decision**:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        Incoming Operation                                │
+└────────────────────────────────┬────────────────────────────────────────┘
+                                 │
+                    ┌────────────▼────────────┐
+                    │  Is it Job lifecycle?   │
+                    │  (create/cancel/complete)│
+                    └────────────┬────────────┘
+                            Yes  │  No
+           ┌─────────────────────┤
+           ▼                     ▼
+    ┌──────────────┐    ┌────────────────────┐
+    │    GLOBAL    │    │ Is it Workflow     │
+    │  durability  │    │ lifecycle?         │
+    └──────────────┘    └─────────┬──────────┘
+                             Yes  │  No
+                   ┌──────────────┤
+                   ▼              ▼
+           ┌──────────────┐  ┌────────────────────┐
+           │   REGIONAL   │  │ Is it progress     │
+           │  durability  │  │ from worker?       │
+           └──────────────┘  └─────────┬──────────┘
+                                  Yes  │  No
+                       ┌───────────────┤
+                       ▼               ▼
+               ┌──────────────┐  ┌──────────────┐
+               │    LOCAL     │  │    NONE      │
+               │  (optional)  │  │ fire-and-forget│
+               └──────────────┘  └──────────────┘
+```
+
+---
+
+## Part 3.3: Acknowledgment Windows (Worker Communication)
+
+Workers under load cannot provide timely acks. Instead of blocking on worker responses, use **Acknowledgment Windows**.
+
+**Traditional Approach (WRONG for workers under load)**:
+
+```
+Manager ──► Worker: Dispatch workflow
+           │
+           ├── Wait for ACK (blocking)  ← Worker is busy, 500ms+ delay
+           │
+           ▼
+Manager: Timeout or slow operation
+```
+
+**Acknowledgment Window Approach (CORRECT)**:
+
+```
+Manager ──► Worker: Dispatch workflow
+           │
+           ├── Start "ack window" timer (e.g., 5 seconds)
+           │
+           ├── Continue processing other work (non-blocking)
+           │
+           ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        Acknowledgment Window                             │
+├─────────────────────────────────────────────────────────────────────────┤
+│  Within window:                                                          │
+│    • Worker sends progress update → Workflow confirmed running          │
+│    • Worker sends completion → Workflow completed                       │
+│    • Worker sends error → Workflow failed                               │
+│                                                                          │
+│  Window expires with no communication:                                   │
+│    • Health check worker                                                │
+│    • If worker healthy: extend window                                   │
+│    • If worker unhealthy: mark workflow for reschedule                  │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+**Acknowledgment Window State Machine**:
+
+```
+┌────────────┐
+│ DISPATCHED │ ─── Workflow sent to worker
+└─────┬──────┘
+      │ Start ack window timer
+      ▼
+┌────────────────┐     Progress received      ┌───────────┐
+│ AWAITING_ACK   │ ───────────────────────────►│ CONFIRMED │
+└─────┬──────────┘                             └───────────┘
+      │ Window expires
+      ▼
+┌────────────────┐     Worker healthy         ┌───────────────┐
+│ WINDOW_EXPIRED │ ───────────────────────────►│ EXTEND_WINDOW │
+└─────┬──────────┘                             └───────────────┘
+      │ Worker unhealthy
+      ▼
+┌────────────────┐
+│ RESCHEDULE     │ ─── Workflow needs new worker
+└────────────────┘
+```
+
+---
+
+## Part 3.4: Circuit Breakers for Cross-DC Communication
+
+Cross-DC communication can be slow or fail entirely. Use circuit breakers to prevent cascading failures.
+
+**Circuit Breaker States**:
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                         Circuit Breaker States                          │
+├────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│   ┌────────┐     Failures exceed     ┌──────┐     Probe succeeds       │
+│   │ CLOSED │ ─────threshold─────────►│ OPEN │ ──────────────────┐      │
+│   └───┬────┘                         └───┬──┘                   │      │
+│       │                                  │                      │      │
+│       │ Success                          │ Probe interval       │      │
+│       │                                  │ elapsed              │      │
+│       │                                  ▼                      │      │
+│       │                           ┌───────────┐                 │      │
+│       └───────────────────────────│ HALF_OPEN │◄────────────────┘      │
+│                  Probe succeeds   └───────────┘                        │
+│                                         │                              │
+│                                         │ Probe fails                  │
+│                                         ▼                              │
+│                                    [Back to OPEN]                      │
+│                                                                         │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+**Circuit Breaker Behavior by State**:
+
+| State | Behavior | On Success | On Failure |
+|-------|----------|------------|------------|
+| CLOSED | Normal operation | Remain CLOSED | Increment failure count |
+| OPEN | Reject immediately, queue for later | N/A | N/A |
+| HALF_OPEN | Allow probe request | → CLOSED | → OPEN |
+
+**Cross-DC Circuit Breaker Configuration**:
+
+```python
+@dataclass
+class CrossDCCircuitBreakerConfig:
+    """Configuration for cross-DC circuit breakers."""
+
+    failure_threshold: int = 5         # Failures before opening
+    success_threshold: int = 3         # Successes in HALF_OPEN before closing
+    open_timeout_seconds: float = 30.0 # Time before probing
+
+    # Per-DC tracking
+    half_open_max_probes: int = 1      # Concurrent probes allowed
+
+    # Queue behavior when OPEN
+    queue_max_size: int = 1000         # Max queued operations
+    queue_timeout_seconds: float = 60.0 # Queue entry TTL
+```
+
+**Integration with Job Submission**:
+
+```
+Client ──► Gate: SubmitJob(target_dcs=[dc-east, dc-west])
+              │
+              ├── dc-east circuit: CLOSED → Send immediately
+              │
+              ├── dc-west circuit: OPEN → Queue for later
+              │
+              ├── Return "ACCEPTED" to client
+              │
+              └── Background: When dc-west recovers, replay queue
+```
+
+---
+
+## Part 3.5: Coalesced Stats Reporting
+
+Stats are high-volume, low-criticality. Reduce cross-DC traffic through coalescing.
+
+**Stats Flow Without Coalescing (WRONG)**:
+
+```
+10,000 progress updates/second from workers
+         │
+         ▼
+10,000 messages/second to Manager
+         │
+         ▼
+10,000 messages/second to Gate (cross-DC!)  ← Network overwhelmed
+```
+
+**Stats Flow With Coalescing (CORRECT)**:
+
+```
+10,000 progress updates/second from workers
+         │
+         │ Workers: batch every 100ms or 1000 events
+         ▼
+100 batched messages/second to Manager
+         │
+         │ Manager: aggregate per-job, report every 500ms
+         ▼
+2 aggregated messages/second to Gate (cross-DC)  ← 5000x reduction
+```
+
+**Coalescing Configuration**:
+
+```python
+@dataclass
+class StatsCoalescingConfig:
+    """Configuration for stats aggregation."""
+
+    # Worker → Manager
+    worker_batch_interval_ms: int = 100      # Max time before flush
+    worker_batch_max_events: int = 1000      # Max events before flush
+
+    # Manager → Gate
+    manager_aggregate_interval_ms: int = 500 # Aggregation window
+    manager_sample_rate: float = 0.1         # Sample 10% of detailed metrics
+
+    # Gate storage
+    gate_stats_retention_seconds: int = 3600 # Keep 1 hour of stats
+    gate_stats_use_logger: bool = True       # Use Logger for stats storage
+```
+
+**Aggregated Stats Model** (suitable for Logger):
+
+```python
+@dataclass
+class AggregatedJobStats:
+    """Aggregated stats for a job, sent Manager → Gate."""
+
+    job_id: str
+    dc_id: str
+    timestamp: float
+
+    # Counts
+    workflows_running: int
+    workflows_completed: int
+    workflows_failed: int
+
+    # Rates (computed from samples)
+    requests_per_second: float
+    errors_per_second: float
+
+    # Latencies (percentiles)
+    latency_p50_ms: float
+    latency_p95_ms: float
+    latency_p99_ms: float
+
+    # Resource usage (sampled)
+    cpu_percent_avg: float
+    memory_mb_avg: float
+```
+
+---
+
 ## Part 4: Commit Pipeline
 
 Three-stage commit with progressive durability guarantees:
