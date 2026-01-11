@@ -123,49 +123,41 @@ class ManagerLoadShedder:
         self._total_processed: int = 0
 
     def _init_priority_map(self) -> None:
-        """Initialize message type to priority mapping."""
-        # CRITICAL - Never shed
-        critical_types = {
-            "ping",
-            "pong",
-            "swim_probe",
-            "swim_ack",
-            "cancel_job",
-            "cancel_workflow",
-            "final_result",
-            "job_complete",
-            "leadership_transfer",
-            "leadership_claim",
-        }
+        """
+        Initialize message type to priority mapping.
 
-        # HIGH - Shed under severe overload
-        high_types = {
-            "job_submit",
-            "workflow_dispatch",
-            "state_sync_request",
-            "state_sync_response",
-            "provision_request",
-            "provision_confirm",
-            "worker_registration",
-        }
+        Uses the centralized AD-37 handler classification from the reliability module
+        to ensure consistent priority handling across all node types.
+        """
+        # Use centralized AD-37 handler sets for classification
+        for handler_name in CONTROL_HANDLERS:
+            self._priority_map[handler_name] = RequestPriority.CRITICAL
+        for handler_name in DISPATCH_HANDLERS:
+            self._priority_map[handler_name] = RequestPriority.HIGH
+        for handler_name in DATA_HANDLERS:
+            self._priority_map[handler_name] = RequestPriority.NORMAL
+        for handler_name in TELEMETRY_HANDLERS:
+            self._priority_map[handler_name] = RequestPriority.LOW
 
-        # NORMAL - Shed under moderate overload
-        normal_types = {
-            "progress_update",
-            "stats_query",
-            "heartbeat",
-            "worker_heartbeat",
-            "register_callback",
-            "reconnect",
+        # Legacy message type aliases for backwards compatibility
+        # These map to the same handlers in different naming conventions
+        legacy_aliases = {
+            "pong": RequestPriority.CRITICAL,  # alias for ack
+            "swim_probe": RequestPriority.CRITICAL,  # alias for ping
+            "swim_ack": RequestPriority.CRITICAL,  # alias for ack
+            "final_result": RequestPriority.CRITICAL,  # alias for workflow_final_result
+            "job_complete": RequestPriority.CRITICAL,  # completion signal
+            "leadership_claim": RequestPriority.CRITICAL,  # leadership operation
+            "job_submit": RequestPriority.HIGH,  # alias for submit_job
+            "provision_request": RequestPriority.HIGH,  # quorum protocol
+            "provision_confirm": RequestPriority.HIGH,  # quorum protocol
+            "worker_registration": RequestPriority.HIGH,  # alias for worker_register
+            "progress_update": RequestPriority.NORMAL,  # alias for workflow_progress
+            "stats_query": RequestPriority.NORMAL,  # stats operations
+            "register_callback": RequestPriority.NORMAL,  # callback registration
+            "reconnect": RequestPriority.NORMAL,  # reconnection handling
         }
-
-        for msg_type in critical_types:
-            self._priority_map[msg_type] = RequestPriority.CRITICAL
-        for msg_type in high_types:
-            self._priority_map[msg_type] = RequestPriority.HIGH
-        for msg_type in normal_types:
-            self._priority_map[msg_type] = RequestPriority.NORMAL
-        # Everything else defaults to LOW
+        self._priority_map.update(legacy_aliases)
 
     def classify_request(self, message_type: str) -> RequestPriority:
         """
@@ -214,6 +206,34 @@ class ManagerLoadShedder:
         """
         priority = self.classify_request(message_type)
         return self.should_shed(priority)
+
+    def should_shed_handler(self, handler_name: str) -> bool:
+        """
+        Check if handler should be shed using AD-37 MessageClass classification.
+
+        This is the preferred method for AD-37 compliant load shedding.
+        Uses the centralized classify_handler_to_priority function.
+
+        Args:
+            handler_name: Name of the handler (e.g., "receive_workflow_progress")
+
+        Returns:
+            True if handler should be shed
+        """
+        priority = classify_handler_to_priority(handler_name)
+        return self.should_shed(priority)
+
+    def classify_handler(self, handler_name: str) -> RequestPriority:
+        """
+        Classify handler using AD-37 MessageClass classification.
+
+        Args:
+            handler_name: Name of the handler
+
+        Returns:
+            RequestPriority based on AD-37 MessageClass
+        """
+        return classify_handler_to_priority(handler_name)
 
     def on_request_start(self) -> None:
         """Called when request processing starts."""
