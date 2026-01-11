@@ -6,8 +6,8 @@ The manager coordinates job execution within a datacenter, dispatching workflows
 to workers and reporting status to gates.
 """
 
-# Re-export ManagerServer from parent module (monolithic manager.py during transition)
-from hyperscale.distributed.nodes.manager_impl import ManagerServer
+# Export ManagerServer from new modular server implementation
+from .server import ManagerServer
 
 from .config import ManagerConfig, create_manager_config_from_env
 from .state import ManagerState

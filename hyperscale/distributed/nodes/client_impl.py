@@ -32,11 +32,11 @@ from typing import Callable
 
 import cloudpickle
 
-from hyperscale.distributed_rewrite.server import tcp
-from hyperscale.distributed_rewrite.server.server.mercury_sync_base_server import MercurySyncBaseServer
+from hyperscale.distributed.server import tcp
+from hyperscale.distributed.server.server.mercury_sync_base_server import MercurySyncBaseServer
 from hyperscale.core.jobs.protocols.constants import MAX_DECOMPRESSED_SIZE
-from hyperscale.distributed_rewrite.errors import MessageTooLargeError
-from hyperscale.distributed_rewrite.models import (
+from hyperscale.distributed.errors import MessageTooLargeError
+from hyperscale.distributed.models import (
     JobSubmission,
     JobAck,
     JobStatus,
@@ -76,14 +76,14 @@ from hyperscale.distributed_rewrite.models import (
     ClientWorkflowResult,
     ClientJobResult,
 )
-from hyperscale.distributed_rewrite.env.env import Env
-from hyperscale.distributed_rewrite.reliability.rate_limiting import (
+from hyperscale.distributed.env.env import Env
+from hyperscale.distributed.reliability.rate_limiting import (
     AdaptiveRateLimiter,
     AdaptiveRateLimitConfig,
     RequestPriority,
 )
-from hyperscale.distributed_rewrite.reliability.overload import HybridOverloadDetector
-from hyperscale.distributed_rewrite.protocol.version import (
+from hyperscale.distributed.reliability.overload import HybridOverloadDetector
+from hyperscale.distributed.protocol.version import (
     CURRENT_PROTOCOL_VERSION,
     ProtocolVersion,
     NegotiatedCapabilities,
@@ -178,7 +178,7 @@ class HyperscaleClient(MercurySyncBaseServer):
         }
 
         # Progress update callbacks (for streaming windowed stats)
-        from hyperscale.distributed_rewrite.jobs import WindowedStatsPush
+        from hyperscale.distributed.jobs import WindowedStatsPush
         self._progress_callbacks: dict[str, Callable[[WindowedStatsPush], None]] = {}
 
         # Rate limiter for progress updates using the same AdaptiveRateLimiter
@@ -1555,7 +1555,7 @@ class HyperscaleClient(MercurySyncBaseServer):
 
             import cloudpickle
             import time as time_module
-            from hyperscale.distributed_rewrite.jobs import WindowedStatsPush
+            from hyperscale.distributed.jobs import WindowedStatsPush
             push: WindowedStatsPush = cloudpickle.loads(data)
 
             # Call user callback if registered
