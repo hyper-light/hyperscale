@@ -1151,6 +1151,495 @@ class GateServer(HealthAwareServer):
             )
         return b'error'
 
+    @tcp.receive()
+    async def receive_job_progress_report(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+        transport: asyncio.Transport,
+    ):
+        """Receive progress report from manager (AD-34 multi-DC coordination)."""
+        try:
+            report = JobProgressReport.load(data)
+            await self._job_timeout_tracker.record_progress(report)
+            return b'ok'
+        except Exception as error:
+            await self.handle_exception(error, "receive_job_progress_report")
+            return b''
+
+    @tcp.receive()
+    async def receive_job_timeout_report(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+        transport: asyncio.Transport,
+    ):
+        """Receive DC-local timeout report from manager (AD-34 multi-DC coordination)."""
+        try:
+            report = JobTimeoutReport.load(data)
+            await self._job_timeout_tracker.record_timeout(report)
+            return b'ok'
+        except Exception as error:
+            await self.handle_exception(error, "receive_job_timeout_report")
+            return b''
+
+    @tcp.receive()
+    async def receive_job_leader_transfer(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+        transport: asyncio.Transport,
+    ):
+        """Receive manager leader transfer notification (AD-34 multi-DC coordination)."""
+        try:
+            report = JobLeaderTransfer.load(data)
+            await self._job_timeout_tracker.record_leader_transfer(report)
+            return b'ok'
+        except Exception as error:
+            await self.handle_exception(error, "receive_job_leader_transfer")
+            return b''
+
+    @tcp.receive()
+    async def receive_job_final_status(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+        transport: asyncio.Transport,
+    ):
+        """Receive final job status from manager (AD-34 lifecycle cleanup)."""
+        try:
+            report = JobFinalStatus.load(data)
+            await self._job_timeout_tracker.handle_final_status(report)
+            return b'ok'
+        except Exception as error:
+            await self.handle_exception(error, "receive_job_final_status")
+            return b''
+
+    @tcp.receive()
+    async def workflow_result_push(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+        transport: asyncio.Transport,
+    ):
+        """Handle workflow result push from manager."""
+        try:
+            push = WorkflowResultPush.load(data)
+
+            if not self._job_manager.has_job(push.job_id):
+                await self._forward_workflow_result_to_peers(push)
+                return b'ok'
+
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerDebug(
+                    message=f"Received workflow result for {push.job_id}:{push.workflow_id} from DC {push.datacenter}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+
+            if push.job_id not in self._workflow_dc_results:
+                self._workflow_dc_results[push.job_id] = {}
+            if push.workflow_id not in self._workflow_dc_results[push.job_id]:
+                self._workflow_dc_results[push.job_id][push.workflow_id] = {}
+            self._workflow_dc_results[push.job_id][push.workflow_id][push.datacenter] = push
+
+            target_dcs = self._job_manager.get_target_dcs(push.job_id)
+            received_dcs = set(self._workflow_dc_results[push.job_id][push.workflow_id].keys())
+
+            if target_dcs and received_dcs >= target_dcs:
+                await self._aggregate_and_forward_workflow_result(push.job_id, push.workflow_id)
+
+            return b'ok'
+
+        except Exception as error:
+            await self.handle_exception(error, "workflow_result_push")
+            return b'error'
+
+    @tcp.receive()
+    async def register_callback(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+        transport: asyncio.Transport,
+    ):
+        """Handle client callback registration for job reconnection."""
+        try:
+            client_id = f"{addr[0]}:{addr[1]}"
+            allowed, retry_after = self._check_rate_limit_for_operation(client_id, "reconnect")
+            if not allowed:
+                return RateLimitResponse(
+                    operation="reconnect",
+                    retry_after_seconds=retry_after,
+                ).dump()
+
+            request = RegisterCallback.load(data)
+            job_id = request.job_id
+
+            job = self._job_manager.get_job(job_id)
+            if not job:
+                response = RegisterCallbackResponse(
+                    job_id=job_id,
+                    success=False,
+                    error="Job not found",
+                )
+                return response.dump()
+
+            self._job_manager.set_callback(job_id, request.callback_addr)
+            self._progress_callbacks[job_id] = request.callback_addr
+
+            elapsed = time.monotonic() - job.timestamp if job.timestamp > 0 else 0.0
+
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerInfo(
+                    message=f"Client reconnected for job {job_id}, registered callback {request.callback_addr}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+
+            response = RegisterCallbackResponse(
+                job_id=job_id,
+                success=True,
+                status=job.status,
+                total_completed=job.total_completed,
+                total_failed=job.total_failed,
+                elapsed_seconds=elapsed,
+            )
+
+            return response.dump()
+
+        except Exception as error:
+            await self.handle_exception(error, "register_callback")
+            return b'error'
+
+    @tcp.receive()
+    async def workflow_query(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+        transport: asyncio.Transport,
+    ):
+        """Handle workflow status query from client."""
+        try:
+            client_id = f"{addr[0]}:{addr[1]}"
+            allowed, retry_after = self._check_rate_limit_for_operation(client_id, "workflow_query")
+            if not allowed:
+                return RateLimitResponse(
+                    operation="workflow_query",
+                    retry_after_seconds=retry_after,
+                ).dump()
+
+            request = WorkflowQueryRequest.load(data)
+            dc_results = await self._query_all_datacenters(request)
+
+            datacenters = [
+                DatacenterWorkflowStatus(dc_id=dc_id, workflows=workflows)
+                for dc_id, workflows in dc_results.items()
+            ]
+
+            response = GateWorkflowQueryResponse(
+                request_id=request.request_id,
+                gate_id=self._node_id.full,
+                datacenters=datacenters,
+            )
+
+            return response.dump()
+
+        except Exception as error:
+            await self.handle_exception(error, "workflow_query")
+            return b'error'
+
+    @tcp.receive()
+    async def datacenter_list(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+        transport: asyncio.Transport,
+    ):
+        """Handle datacenter list request from client."""
+        try:
+            client_id = f"{addr[0]}:{addr[1]}"
+            allowed, retry_after = self._check_rate_limit_for_operation(client_id, "datacenter_list")
+            if not allowed:
+                return RateLimitResponse(
+                    operation="datacenter_list",
+                    retry_after_seconds=retry_after,
+                ).dump()
+
+            request = DatacenterListRequest.load(data)
+
+            datacenters: list[DatacenterInfo] = []
+            total_available_cores = 0
+            healthy_datacenter_count = 0
+
+            for dc_id in self._datacenter_managers.keys():
+                status = self._classify_datacenter_health(dc_id)
+
+                leader_addr: tuple[str, int] | None = None
+                manager_statuses = self._datacenter_manager_status.get(dc_id, {})
+                for manager_addr, heartbeat in manager_statuses.items():
+                    if heartbeat.is_leader:
+                        leader_addr = (heartbeat.tcp_host, heartbeat.tcp_port)
+                        break
+
+                datacenters.append(DatacenterInfo(
+                    dc_id=dc_id,
+                    health=status.health,
+                    leader_addr=leader_addr,
+                    available_cores=status.available_capacity,
+                    manager_count=status.manager_count,
+                    worker_count=status.worker_count,
+                ))
+
+                total_available_cores += status.available_capacity
+                if status.health == DatacenterHealth.HEALTHY.value:
+                    healthy_datacenter_count += 1
+
+            response = DatacenterListResponse(
+                request_id=request.request_id,
+                gate_id=self._node_id.full,
+                datacenters=datacenters,
+                total_available_cores=total_available_cores,
+                healthy_datacenter_count=healthy_datacenter_count,
+            )
+
+            return response.dump()
+
+        except Exception as error:
+            await self.handle_exception(error, "datacenter_list")
+            return b'error'
+
+    @tcp.receive()
+    async def job_leadership_announcement(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+        transport: asyncio.Transport,
+    ):
+        """Handle job leadership announcement from peer gate."""
+        try:
+            announcement = JobLeadershipAnnouncement.load(data)
+
+            accepted = self._job_leadership_tracker.process_leadership_claim(
+                job_id=announcement.job_id,
+                claimer_id=announcement.leader_id,
+                claimer_addr=(announcement.leader_host, announcement.leader_tcp_port),
+                fencing_token=announcement.term,
+                metadata=announcement.workflow_count,
+            )
+
+            if accepted:
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerDebug(
+                        message=f"Recorded job {announcement.job_id[:8]}... leader: {announcement.leader_id[:8]}...",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+
+            return JobLeadershipAck(
+                job_id=announcement.job_id,
+                accepted=True,
+                responder_id=self._node_id.full,
+            ).dump()
+
+        except Exception as error:
+            await self.handle_exception(error, "job_leadership_announcement")
+            return JobLeadershipAck(
+                job_id="unknown",
+                accepted=False,
+                responder_id=self._node_id.full,
+                error=str(error),
+            ).dump()
+
+    @tcp.receive()
+    async def dc_leader_announcement(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+        transport: asyncio.Transport,
+    ):
+        """Handle DC leader announcement from peer gate."""
+        try:
+            announcement = DCLeaderAnnouncement.load(data)
+
+            updated = self._dc_health_monitor.update_leader(
+                datacenter=announcement.datacenter,
+                leader_udp_addr=announcement.leader_udp_addr,
+                leader_tcp_addr=announcement.leader_tcp_addr,
+                leader_node_id=announcement.leader_node_id,
+                leader_term=announcement.term,
+            )
+
+            if updated:
+                await self._udp_logger.log(
+                    ServerDebug(
+                        message=(
+                            f"Updated DC {announcement.datacenter} leader from peer: "
+                            f"{announcement.leader_node_id[:8]}... (term {announcement.term})"
+                        ),
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+
+            return b'ok'
+
+        except Exception as error:
+            await self.handle_exception(error, "dc_leader_announcement")
+            return b'error'
+
+    @tcp.receive()
+    async def job_leader_manager_transfer(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+        transport: asyncio.Transport,
+    ):
+        """Handle job leadership manager transfer notification from manager (AD-31)."""
+        try:
+            transfer = JobLeaderManagerTransfer.load(data)
+
+            job_known = (
+                transfer.job_id in self._job_dc_managers or
+                transfer.job_id in self._job_leadership_tracker
+            )
+            if not job_known:
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerWarning(
+                        message=f"Received manager transfer for unknown job {transfer.job_id[:8]}... from {transfer.new_manager_id[:8]}...",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+                return JobLeaderManagerTransferAck(
+                    job_id=transfer.job_id,
+                    gate_id=self._node_id.full,
+                    accepted=False,
+                ).dump()
+
+            old_manager_addr = self._job_leadership_tracker.get_dc_manager(
+                transfer.job_id, transfer.datacenter_id
+            )
+            if old_manager_addr is None and transfer.job_id in self._job_dc_managers:
+                old_manager_addr = self._job_dc_managers[transfer.job_id].get(transfer.datacenter_id)
+
+            accepted = await self._job_leadership_tracker.update_dc_manager_async(
+                job_id=transfer.job_id,
+                dc_id=transfer.datacenter_id,
+                manager_id=transfer.new_manager_id,
+                manager_addr=transfer.new_manager_addr,
+                fencing_token=transfer.fence_token,
+            )
+
+            if not accepted:
+                current_fence = self._job_leadership_tracker.get_dc_manager_fencing_token(
+                    transfer.job_id, transfer.datacenter_id
+                )
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerDebug(
+                        message=f"Rejected stale manager transfer for job {transfer.job_id[:8]}... (fence {transfer.fence_token} <= {current_fence})",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+                return JobLeaderManagerTransferAck(
+                    job_id=transfer.job_id,
+                    gate_id=self._node_id.full,
+                    accepted=False,
+                ).dump()
+
+            if transfer.job_id not in self._job_dc_managers:
+                self._job_dc_managers[transfer.job_id] = {}
+            self._job_dc_managers[transfer.job_id][transfer.datacenter_id] = transfer.new_manager_addr
+
+            self._clear_orphaned_job(transfer.job_id, transfer.new_manager_addr)
+
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerInfo(
+                    message=f"Updated job {transfer.job_id[:8]}... DC {transfer.datacenter_id} manager: {old_manager_addr} -> {transfer.new_manager_addr}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+
+            return JobLeaderManagerTransferAck(
+                job_id=transfer.job_id,
+                gate_id=self._node_id.full,
+                accepted=True,
+            ).dump()
+
+        except Exception as error:
+            await self.handle_exception(error, "job_leader_manager_transfer")
+            return JobLeaderManagerTransferAck(
+                job_id="unknown",
+                gate_id=self._node_id.full,
+                accepted=False,
+            ).dump()
+
+    @tcp.receive()
+    async def windowed_stats_push(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+        transport: asyncio.Transport,
+    ):
+        """Handle windowed stats push from Manager."""
+        try:
+            push: WindowedStatsPush = cloudpickle.loads(data)
+
+            from hyperscale.distributed.models import WorkflowProgress
+
+            for worker_stat in push.per_worker_stats:
+                progress = WorkflowProgress(
+                    job_id=push.job_id,
+                    workflow_id=push.workflow_id,
+                    workflow_name=push.workflow_name,
+                    status="running",
+                    completed_count=worker_stat.completed_count,
+                    failed_count=worker_stat.failed_count,
+                    rate_per_second=worker_stat.rate_per_second,
+                    elapsed_seconds=push.window_end - push.window_start,
+                    step_stats=worker_stat.step_stats,
+                    avg_cpu_percent=worker_stat.avg_cpu_percent,
+                    avg_memory_mb=worker_stat.avg_memory_mb,
+                    collected_at=(push.window_start + push.window_end) / 2,
+                )
+                worker_key = f"{push.datacenter}:{worker_stat.worker_id}"
+                await self._windowed_stats.add_progress(worker_key, progress)
+
+            return b'ok'
+
+        except Exception as error:
+            await self.handle_exception(error, "windowed_stats_push")
+            return b'error'
+
     # =========================================================================
     # Helper Methods (Required by Handlers and Coordinators)
     # =========================================================================

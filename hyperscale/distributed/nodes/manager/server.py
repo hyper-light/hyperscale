@@ -1359,6 +1359,254 @@ class ManagerServer(HealthAwareServer):
         """Get job leaderships for heartbeat embedding."""
         return self._leases.get_led_job_ids()
 
+    def _check_rate_limit_for_operation(
+        self,
+        client_id: str,
+        operation: str,
+    ) -> tuple[bool, float]:
+        """
+        Check if a client request is within rate limits for a specific operation.
+
+        Args:
+            client_id: Identifier for the client (typically addr as string)
+            operation: Type of operation being performed
+
+        Returns:
+            Tuple of (allowed, retry_after_seconds). If not allowed,
+            retry_after_seconds indicates when client can retry.
+        """
+        result = self._rate_limiter.check_rate_limit(client_id, operation)
+        return result.allowed, result.retry_after_seconds
+
+    def _get_rate_limit_metrics(self) -> dict:
+        """Get rate limiting metrics for monitoring."""
+        return self._rate_limiter.get_metrics()
+
+    def _cleanup_inactive_rate_limit_clients(self) -> int:
+        """
+        Clean up inactive clients from rate limiter.
+
+        Returns:
+            Number of clients cleaned up
+        """
+        return self._rate_limiter.cleanup_inactive_clients()
+
+    def _build_cancel_response(
+        self,
+        job_id: str,
+        success: bool,
+        error: str | None = None,
+        cancelled_count: int = 0,
+        already_cancelled: bool = False,
+        already_completed: bool = False,
+    ) -> bytes:
+        """Build cancel response in AD-20 format."""
+        return JobCancelResponse(
+            job_id=job_id,
+            success=success,
+            error=error,
+            cancelled_workflow_count=cancelled_count,
+            already_cancelled=already_cancelled,
+            already_completed=already_completed,
+        ).dump()
+
+    def _build_manager_heartbeat(self) -> ManagerHeartbeat:
+        """Build manager heartbeat for gates."""
+        return ManagerHeartbeat(
+            node_id=self._node_id.full,
+            datacenter=self._node_id.datacenter,
+            is_leader=self.is_leader(),
+            state=self._manager_state._manager_state.value,
+            worker_count=len(self._manager_state._workers),
+            healthy_worker_count=len(self._registry.get_healthy_worker_ids()),
+            available_cores=self._get_available_cores_for_healthy_workers(),
+            total_cores=self._get_total_cores(),
+            active_job_count=self._job_manager.job_count,
+            tcp_host=self._host,
+            tcp_port=self._tcp_port,
+            udp_host=self._host,
+            udp_port=self._udp_port,
+        )
+
+    def _get_healthy_gate_tcp_addrs(self) -> list[tuple[str, int]]:
+        """Get TCP addresses of healthy gates."""
+        return [
+            (gate.tcp_host, gate.tcp_port)
+            for gate_id, gate in self._manager_state._known_gates.items()
+            if gate_id in self._manager_state._healthy_gate_ids
+        ]
+
+    async def _push_cancellation_complete_to_origin(
+        self,
+        job_id: str,
+        success: bool,
+        errors: list[str],
+    ) -> None:
+        """Push cancellation complete notification to origin gate/client."""
+        callback_addr = self._manager_state._job_callbacks.get(job_id)
+        if not callback_addr:
+            callback_addr = self._manager_state._client_callbacks.get(job_id)
+
+        if callback_addr:
+            try:
+                from hyperscale.distributed.models import JobCancellationComplete
+
+                notification = JobCancellationComplete(
+                    job_id=job_id,
+                    success=success,
+                    errors=errors,
+                )
+                await self._send_to_client(
+                    callback_addr,
+                    "job_cancellation_complete",
+                    notification.dump(),
+                )
+            except Exception as error:
+                await self._udp_logger.log(
+                    ServerWarning(
+                        message=f"Failed to push cancellation complete to {callback_addr}: {error}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+
+    async def _notify_timeout_strategies_of_extension(
+        self,
+        worker_id: str,
+        extension_seconds: float,
+        worker_progress: float,
+    ) -> None:
+        """Notify timeout strategies of worker extension (AD-34 Part 10.4.7)."""
+        # Find jobs with workflows on this worker
+        for job in self._job_manager.iter_jobs():
+            if worker_id in job.workers:
+                strategy = self._manager_state._job_timeout_strategies.get(job.job_id)
+                if strategy and hasattr(strategy, "record_extension"):
+                    await strategy.record_extension(
+                        job_id=job.job_id,
+                        worker_id=worker_id,
+                        extension_seconds=extension_seconds,
+                    )
+
+    def _select_timeout_strategy(self, submission: JobSubmission) -> TimeoutStrategy:
+        """
+        Auto-detect timeout strategy based on deployment type (AD-34 Part 10.4.2).
+
+        Single-DC (no gate): LocalAuthorityTimeout - manager has full authority
+        Multi-DC (with gate): GateCoordinatedTimeout - gate coordinates globally
+
+        Args:
+            submission: Job submission with optional gate_addr
+
+        Returns:
+            Appropriate TimeoutStrategy instance
+        """
+        if submission.gate_addr:
+            return GateCoordinatedTimeout(self)
+        else:
+            return LocalAuthorityTimeout(self)
+
+    async def _suspect_worker_deadline_expired(self, worker_id: str) -> None:
+        """
+        Mark a worker as suspected when its deadline expires (AD-26 Issue 2).
+
+        Called when a worker's deadline has expired but is still within
+        the grace period.
+
+        Args:
+            worker_id: The worker node ID that missed its deadline
+        """
+        worker = self._manager_state._workers.get(worker_id)
+        if worker is None:
+            self._manager_state._worker_deadlines.pop(worker_id, None)
+            return
+
+        hierarchical_detector = self.get_hierarchical_detector()
+        if hierarchical_detector is None:
+            return
+
+        worker_addr = (worker.node.host, worker.node.udp_port)
+        current_status = await hierarchical_detector.get_node_status(worker_addr)
+
+        from hyperscale.distributed.nodes.manager.health import NodeStatus
+
+        if current_status in (NodeStatus.SUSPECTED_GLOBAL, NodeStatus.DEAD_GLOBAL):
+            return
+
+        await self.suspect_node_global(
+            node=worker_addr,
+            incarnation=0,
+            from_node=(self._host, self._udp_port),
+        )
+
+        await self._udp_logger.log(
+            ServerWarning(
+                message=f"Worker {worker_id[:8]}... deadline expired, marked as SUSPECTED (within grace period)",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+
+    async def _evict_worker_deadline_expired(self, worker_id: str) -> None:
+        """
+        Evict a worker when its deadline expires beyond the grace period (AD-26 Issue 2).
+
+        Args:
+            worker_id: The worker node ID to evict
+        """
+        await self._udp_logger.log(
+            ServerError(
+                message=f"Worker {worker_id[:8]}... deadline expired beyond grace period, evicting",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+
+        await self._handle_worker_failure(worker_id)
+        self._manager_state._worker_deadlines.pop(worker_id, None)
+
+    def _cleanup_job(self, job_id: str) -> None:
+        """
+        Clean up all state associated with a job.
+
+        Removes job from tracking dictionaries, cleans up workflow state,
+        and notifies relevant systems.
+        """
+        self._task_runner.run(self._job_manager.complete_job, job_id)
+        self._manager_state.clear_job_state(job_id)
+
+        if self._workflow_dispatcher:
+            self._task_runner.run(
+                self._workflow_dispatcher.cleanup_job,
+                job_id,
+            )
+
+        workflow_ids_to_remove = [
+            wf_id
+            for wf_id in self._manager_state._workflow_retries
+            if wf_id.startswith(f"{job_id}:")
+        ]
+        for wf_id in workflow_ids_to_remove:
+            self._manager_state._workflow_retries.pop(wf_id, None)
+
+        workflow_ids_to_remove = [
+            wf_id
+            for wf_id in self._manager_state._workflow_completion_events
+            if wf_id.startswith(f"{job_id}:")
+        ]
+        for wf_id in workflow_ids_to_remove:
+            self._manager_state._workflow_completion_events.pop(wf_id, None)
+
+    def _cleanup_reporter_tasks(self, job_id: str) -> None:
+        """Clean up reporter background tasks for a job."""
+        tasks = self._manager_state._job_reporter_tasks.pop(job_id, {})
+        for task in tasks.values():
+            if not task.done():
+                task.cancel()
+
     # =========================================================================
     # TCP Send Helpers
     # =========================================================================
@@ -1654,12 +1902,173 @@ class ManagerServer(HealthAwareServer):
         data: bytes,
         clock_time: int,
     ) -> bytes:
-        """Handle job cancellation request (AD-20)."""
+        """
+        Handle job cancellation request (AD-20).
+
+        Robust cancellation flow:
+        1. Verify job exists
+        2. Remove ALL pending workflows from dispatch queue
+        3. Cancel ALL running workflows on workers
+        4. Wait for verification that no workflows are still running
+        5. Return detailed per-workflow cancellation results
+
+        Accepts both legacy CancelJob and new JobCancelRequest formats at the
+        boundary, but normalizes to AD-20 internally.
+        """
         try:
-            request = JobCancelRequest.load(data)
-            return await self._cancellation.cancel_job(request, addr)
+            # Rate limit check (AD-24)
+            client_id = f"{addr[0]}:{addr[1]}"
+            allowed, retry_after = self._check_rate_limit_for_operation(client_id, "cancel")
+            if not allowed:
+                return RateLimitResponse(
+                    operation="cancel",
+                    retry_after_seconds=retry_after,
+                ).dump()
+
+            # Parse request - accept both formats at boundary, normalize to AD-20 internally
+            try:
+                cancel_request = JobCancelRequest.load(data)
+                job_id = cancel_request.job_id
+                fence_token = cancel_request.fence_token
+                requester_id = cancel_request.requester_id
+                timestamp = cancel_request.timestamp
+                reason = cancel_request.reason
+            except Exception:
+                # Normalize legacy CancelJob format to AD-20 fields
+                cancel = CancelJob.load(data)
+                job_id = cancel.job_id
+                fence_token = cancel.fence_token
+                requester_id = f"{addr[0]}:{addr[1]}"
+                timestamp = time.monotonic()
+                reason = "Legacy cancel request"
+
+            # Step 1: Verify job exists
+            job = self._job_manager.get_job(job_id)
+            if not job:
+                return self._build_cancel_response(job_id, success=False, error="Job not found")
+
+            # Check fence token if provided (prevents cancelling restarted jobs)
+            stored_fence = self._manager_state._job_fencing_tokens.get(job_id, 0)
+            if fence_token > 0 and stored_fence != fence_token:
+                error_msg = f"Fence token mismatch: expected {stored_fence}, got {fence_token}"
+                return self._build_cancel_response(job_id, success=False, error=error_msg)
+
+            # Check if already cancelled (idempotency)
+            if job.status == JobStatus.CANCELLED:
+                return self._build_cancel_response(job_id, success=True, already_cancelled=True)
+
+            # Check if already completed (cannot cancel)
+            if job.status == JobStatus.COMPLETED:
+                return self._build_cancel_response(
+                    job_id, success=False, already_completed=True, error="Job already completed"
+                )
+
+            # Track results
+            pending_cancelled: list[str] = []
+            running_cancelled: list[str] = []
+            workflow_errors: dict[str, str] = {}
+
+            # Step 2: Remove ALL pending workflows from dispatch queue FIRST
+            if self._workflow_dispatcher:
+                removed_pending = await self._workflow_dispatcher.cancel_pending_workflows(job_id)
+                pending_cancelled.extend(removed_pending)
+
+                # Mark pending workflows as cancelled
+                for workflow_id in removed_pending:
+                    self._manager_state._cancelled_workflows[workflow_id] = CancelledWorkflowInfo(
+                        workflow_id=workflow_id,
+                        job_id=job_id,
+                        cancelled_at=timestamp,
+                        reason=reason,
+                    )
+
+            # Step 3: Cancel ALL running workflows on workers
+            for workflow_id, workflow in job.workflows.items():
+                if workflow_id in pending_cancelled:
+                    continue
+
+                if workflow.status == WorkflowStatus.RUNNING and workflow.worker_id:
+                    worker = self._manager_state._workers.get(workflow.worker_id)
+                    if not worker:
+                        workflow_errors[workflow_id] = f"Worker {workflow.worker_id} not found"
+                        continue
+
+                    worker_addr = (worker.node.host, worker.node.tcp_port)
+
+                    try:
+                        cancel_data = WorkflowCancelRequest(
+                            job_id=job_id,
+                            workflow_id=workflow_id,
+                            requester_id=requester_id,
+                            timestamp=timestamp,
+                        ).dump()
+
+                        response = await self._send_to_worker(
+                            worker_addr,
+                            "cancel_workflow",
+                            cancel_data,
+                            timeout=5.0,
+                        )
+
+                        if isinstance(response, bytes):
+                            try:
+                                wf_response = WorkflowCancelResponse.load(response)
+                                if wf_response.success:
+                                    running_cancelled.append(workflow_id)
+                                    self._manager_state._cancelled_workflows[workflow_id] = CancelledWorkflowInfo(
+                                        workflow_id=workflow_id,
+                                        job_id=job_id,
+                                        cancelled_at=timestamp,
+                                        reason=reason,
+                                    )
+                                else:
+                                    error_msg = wf_response.error or "Worker reported cancellation failure"
+                                    workflow_errors[workflow_id] = error_msg
+                            except Exception as parse_error:
+                                workflow_errors[workflow_id] = f"Failed to parse worker response: {parse_error}"
+                        else:
+                            workflow_errors[workflow_id] = "No response from worker"
+
+                    except Exception as send_error:
+                        workflow_errors[workflow_id] = f"Failed to send cancellation to worker: {send_error}"
+
+            # Stop timeout tracking (AD-34 Part 10.4.9)
+            strategy = self._manager_state._job_timeout_strategies.get(job_id)
+            if strategy:
+                await strategy.stop_tracking(job_id, "cancelled")
+
+            # Update job status
+            job.status = JobStatus.CANCELLED
+            self._manager_state.increment_state_version()
+
+            # Build detailed response
+            successfully_cancelled = pending_cancelled + running_cancelled
+            total_cancelled = len(successfully_cancelled)
+            total_errors = len(workflow_errors)
+
+            overall_success = total_errors == 0
+
+            error_str = None
+            if workflow_errors:
+                error_details = [f"{wf_id[:8]}...: {err}" for wf_id, err in workflow_errors.items()]
+                error_str = f"{total_errors} workflow(s) failed: {'; '.join(error_details)}"
+
+            return self._build_cancel_response(
+                job_id,
+                success=overall_success,
+                cancelled_count=total_cancelled,
+                error=error_str,
+            )
 
         except Exception as error:
+            await self._udp_logger.log(
+                ServerError(
+                    message=f"Job cancel error: {error}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
             return JobCancelResponse(
                 job_id="",
                 success=False,
