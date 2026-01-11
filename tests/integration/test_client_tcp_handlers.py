@@ -412,7 +412,8 @@ class TestManagerLeaderTransferHandler:
         job_id = "mgr-transfer-job"
         datacenter_id = "dc-east"
 
-        handler = ManagerLeaderTransferHandler(state, logger, None)
+        leadership = ClientLeadershipTracker(state, logger)
+        handler = ManagerLeaderTransferHandler(state, logger, leadership)
 
         transfer = ManagerJobLeaderTransfer(
             job_id=job_id,
