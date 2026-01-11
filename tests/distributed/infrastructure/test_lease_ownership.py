@@ -17,7 +17,7 @@ import asyncio
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-from hyperscale.distributed.leases import JobLease, LeaseManager, LeaseState
+from hyperscale.distributed.leases import JobLease, LeaseManager
 
 
 def test_acquire_unclaimed():

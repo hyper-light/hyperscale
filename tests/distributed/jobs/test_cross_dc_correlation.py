@@ -14,7 +14,6 @@ Test Categories:
 """
 
 import time
-import pytest
 
 from hyperscale.distributed.datacenters import (
     CrossDCCorrelationDetector,

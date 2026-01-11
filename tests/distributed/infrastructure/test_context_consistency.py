@@ -31,7 +31,7 @@ from hyperscale.distributed.nodes.manager import ManagerServer
 from hyperscale.distributed.nodes.worker import WorkerServer
 from hyperscale.distributed.nodes.client import HyperscaleClient
 from hyperscale.distributed.env.env import Env
-from hyperscale.distributed.models import ManagerState, JobStatus
+from hyperscale.distributed.models import JobStatus
 from hyperscale.logging.config.logging_config import LoggingConfig
 
 # Initialize logging directory (required for server pool)

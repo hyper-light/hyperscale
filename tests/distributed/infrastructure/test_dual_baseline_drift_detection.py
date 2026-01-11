@@ -13,7 +13,6 @@ Tests cover:
 """
 
 import pytest
-import math
 
 from hyperscale.distributed.reliability.overload import (
     HybridOverloadDetector,

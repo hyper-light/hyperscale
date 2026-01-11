@@ -15,7 +15,6 @@ import asyncio
 import random
 import statistics
 import string
-import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
