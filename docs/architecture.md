@@ -20047,7 +20047,7 @@ T0+interval: Flush loop checks max signal
 
 ### AD-38: Global Job Ledger with Per-Node Write-Ahead Logging
 
-**Decision**: Implement a tiered durability architecture combining per-node Write-Ahead Logs (WAL) with a globally replicated Job Ledger for cross-datacenter job coordination.
+**Decision**: Implement a tiered durability architecture combining per-node Write-Ahead Logs (WAL) with a globally replicated Job Ledger for cross-datacenter job coordination, with operation-specific durability levels and separate control/data planes.
 
 **Related**: AD-20 (Cancellation), AD-33 (Federated Health Monitoring), AD-35 (Vivaldi Coordinates), AD-36 (Cross-DC Routing), AD-37 (Backpressure)
 
@@ -20057,38 +20057,106 @@ T0+interval: Flush loop checks max signal
 - Global ledger provides cross-region consistency and authoritative job state.
 - Event sourcing enables audit trail, conflict detection, and temporal queries.
 - Hybrid Logical Clocks provide causal ordering without requiring synchronized clocks.
+- **Workers are under heavy CPU/memory load during tests and MUST NOT participate in any consensus path.**
+- **Different operations have different durability requirements; one-size-fits-all is inefficient.**
+- **Stats/metrics streaming requires high throughput, not strong consistency (Data Plane).**
+
+**Operational Model**:
+
+Hyperscale operates with three distinct node types with different responsibilities:
+
+| Node Type | Role | Consensus Participation | Durability Responsibility |
+|-----------|------|------------------------|---------------------------|
+| **Gates** | Job submission, monitoring, cross-DC coordination | GLOBAL (full participant) | Job lifecycle (create/cancel/complete) |
+| **Managers** | Workflow dispatch, worker health, DC coordination | REGIONAL (within DC only) | Workflow lifecycle, aggregated stats |
+| **Workers** | Execute load tests (high CPU/memory) | NONE (fire-and-forget) | None - reports upward to manager |
+
+**Critical Design Constraint**: Workers running load tests may be slow to respond (100ms+ for acks). They MUST NOT be in any consensus or acknowledgment path. Managers are the "durability boundary" within each datacenter.
 
 **Architecture Overview**:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                         Global Job Ledger                                │
-│                    (Cross-Region Consensus Layer)                        │
-│                                                                          │
-│   Provides: Global ordering, cross-region consistency, authoritative     │
-│             state, conflict resolution, audit trail                      │
+│                    TIER 1: Global Job Ledger (Gates Only)                │
+│                    ─────────────────────────────────────                 │
+│   Participants: Gates (global consensus)                                 │
+│   Operations: Job create, cancel, complete, timeout                      │
+│   Durability: Survives region failure                                    │
+│   Latency: 50-300ms                                                      │
 └─────────────────────────────────────────────────────────────────────────┘
                                     ▲
-                                    │ Async replication
-                                    │ with causal ordering
+                                    │ Async replication (Causal+ consistency)
+                                    │ Circuit breakers for cross-DC failures
                                     │
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                      Regional Consensus Group                            │
-│                   (Raft/Multi-Paxos within region)                       │
-│                                                                          │
-│   Provides: Regional durability, fast local commits, leader election     │
+│                    TIER 2: Regional Consensus (Gates + Managers)         │
+│                    ────────────────────────────────────────              │
+│   Participants: Gates and Managers within datacenter                     │
+│   Operations: Workflow dispatch, workflow complete, job acceptance       │
+│   Durability: Survives node failure within DC                           │
+│   Latency: 2-10ms                                                        │
 └─────────────────────────────────────────────────────────────────────────┘
                                     ▲
-                                    │ Sync replication
-                                    │ within region
+                                    │ Sync replication within DC
                                     │
-┌───────────────┐  ┌───────────────┐  ┌───────────────┐
-│   Node WAL    │  │   Node WAL    │  │   Node WAL    │
-│   (Gate-1)    │  │   (Gate-2)    │  │   (Gate-3)    │
-│               │  │               │  │               │
-│ Local durability│ │ Local durability│ │ Local durability│
-│ Crash recovery │  │ Crash recovery │  │ Crash recovery │
-└───────────────┘  └───────────────┘  └───────────────┘
+┌───────────────────────────────────────────────────────────────────────────┐
+│                    TIER 3: Per-Node WAL (Gates + Managers Only)           │
+│                    ───────────────────────────────────────────            │
+│                                                                           │
+│   ┌─────────────┐     ┌─────────────┐     ┌─────────────┐                │
+│   │  Gate WAL   │     │ Manager WAL │     │ Manager WAL │                │
+│   │  (job ops)  │     │(workflow ops)│    │(workflow ops)│               │
+│   └─────────────┘     └─────────────┘     └─────────────┘                │
+│                                                                           │
+│   Durability: Survives process crash (<1ms)                              │
+└───────────────────────────────────────────────────────────────────────────┘
+                                    ▲
+                                    │ Fire-and-forget + Acknowledgment Windows
+                                    │ (NO consensus participation)
+                                    │
+┌───────────────────────────────────────────────────────────────────────────┐
+│                    WORKERS (No Durability Responsibility)                 │
+│                    ──────────────────────────────────────                 │
+│                                                                           │
+│   ┌─────────────┐     ┌─────────────┐     ┌─────────────┐                │
+│   │  Worker-1   │     │  Worker-2   │     │  Worker-N   │                │
+│   │ (executing) │     │ (executing) │     │ (executing) │                │
+│   │ High CPU/Mem│     │ High CPU/Mem│     │ High CPU/Mem│                │
+│   └─────────────┘     └─────────────┘     └─────────────┘                │
+│                                                                           │
+│   Reports: Progress updates (fire-and-forget to Manager)                 │
+│   Health: Manager detects failures via health checks, NOT consensus      │
+│   Recovery: Manager reschedules workflows without global coordination    │
+└───────────────────────────────────────────────────────────────────────────┘
+```
+
+**Separate Control Plane vs Data Plane**:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                           CONTROL PLANE                                  │
+│                    (Reliable, Lower Volume)                              │
+├─────────────────────────────────────────────────────────────────────────┤
+│  • Job commands (create, cancel)      → GLOBAL durability               │
+│  • Workflow commands (dispatch)       → REGIONAL durability             │
+│  • Leader election                    → REGIONAL durability             │
+│  • Cancellation propagation           → GLOBAL durability               │
+│                                                                          │
+│  Protocol: TCP with acks, consensus, WAL                                │
+│  Requires: NodeWAL with fsync, binary format, CRC checksums             │
+└─────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│                            DATA PLANE                                    │
+│                    (High Throughput, Eventual Consistency)              │
+├─────────────────────────────────────────────────────────────────────────┤
+│  • Progress updates from workers      → LOCAL or NONE                   │
+│  • Stats streaming to gates           → Batched, sampled               │
+│  • Metrics aggregation                → Eventual consistency OK         │
+│                                                                          │
+│  Protocol: Fire-and-forget TCP, UDP, batching, sampling                 │
+│  Uses: hyperscale/logging Logger (JSON, no fsync required)              │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
