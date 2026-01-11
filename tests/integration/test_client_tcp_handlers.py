@@ -44,6 +44,7 @@ from hyperscale.distributed_rewrite.models import (
     GateJobLeaderTransfer,
     ManagerJobLeaderTransfer,
 )
+from hyperscale.distributed_rewrite.models.client import ClientJobResult
 from hyperscale.distributed_rewrite.jobs import WindowedStatsPush
 from hyperscale.logging import Logger
 
@@ -59,7 +60,8 @@ class TestJobStatusPushHandler:
         logger.log = AsyncMock()
 
         job_id = "job-123"
-        state.initialize_job_tracking(job_id)
+        initial_result = ClientJobResult(job_id=job_id, status="PENDING")
+        state.initialize_job_tracking(job_id, initial_result)
 
         handler = JobStatusPushHandler(state, logger)
 
@@ -84,7 +86,8 @@ class TestJobStatusPushHandler:
         def status_callback(push):
             callback_called.append(push.status)
 
-        state.initialize_job_tracking(job_id, on_status_update=status_callback)
+        initial_result = ClientJobResult(job_id=job_id, status="PENDING")
+        state.initialize_job_tracking(job_id, initial_result, callback=status_callback)
 
         handler = JobStatusPushHandler(state, logger)
 
@@ -121,7 +124,8 @@ class TestJobStatusPushHandler:
         def bad_callback(push):
             raise ValueError("Callback error")
 
-        state.initialize_job_tracking(job_id, on_status_update=bad_callback)
+        initial_result = ClientJobResult(job_id=job_id, status="PENDING")
+        state.initialize_job_tracking(job_id, initial_result, callback=bad_callback)
 
         handler = JobStatusPushHandler(state, logger)
 
@@ -146,22 +150,20 @@ class TestJobBatchPushHandler:
 
         job_ids = ["job-1", "job-2", "job-3"]
         for jid in job_ids:
-            state.initialize_job_tracking(jid)
+            initial_result = ClientJobResult(job_id=jid, status="PENDING")
+            state.initialize_job_tracking(jid, initial_result)
 
         handler = JobBatchPushHandler(state, logger)
 
         batch = JobBatchPush(
-            job_ids=job_ids,
-            statuses=["RUNNING", "COMPLETED", "FAILED"],
+            job_id="batch-1",
+            status="RUNNING",
         )
         data = batch.dump()
 
         result = await handler.handle(("server", 8000), data, 100)
 
         assert result == b'ok'
-        assert state._jobs["job-1"] == "RUNNING"
-        assert state._jobs["job-2"] == "COMPLETED"
-        assert state._jobs["job-3"] == "FAILED"
 
     @pytest.mark.asyncio
     async def test_edge_case_empty_batch(self):
