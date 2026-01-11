@@ -199,10 +199,10 @@ class GateLeadershipCoordinator:
 
         transfer = JobLeaderGateTransfer(
             job_id=job_id,
-            old_leader_id=self._get_node_id().full,
-            new_leader_id=new_leader_id,
+            new_gate_id=new_leader_id,
+            new_gate_addr=new_leader_addr,
             fence_token=new_token,
-            reason=reason,
+            old_gate_id=self._get_node_id().full,
         )
 
         try:
@@ -250,8 +250,8 @@ class GateLeadershipCoordinator:
         if new_leader_id != my_id:
             return JobLeaderGateTransferAck(
                 job_id=job_id,
+                manager_id=my_id,
                 accepted=False,
-                error="Not the designated new leader",
             )
 
         # Accept the transfer
@@ -263,6 +263,7 @@ class GateLeadershipCoordinator:
 
         return JobLeaderGateTransferAck(
             job_id=job_id,
+            manager_id=my_id,
             accepted=True,
         )
 

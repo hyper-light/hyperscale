@@ -321,7 +321,7 @@ class TestHandleLeadershipAnnouncementNegativePath:
         )
 
         assert ack.accepted is False
-        assert "Higher fence token" in ack.error
+        assert ack.responder_id == "gate-001"
 
     def test_rejects_equal_fence_token(self):
         """Rejects announcement with equal fence token."""

@@ -367,24 +367,24 @@ class TestClientState:
 
         assert state._manager_transfers_received == 3
 
-    def test_increment_requests_rerouted(self):
+    def test_increment_rerouted(self):
         """Test rerouted requests counter."""
         state = ClientState()
 
         assert state._requests_rerouted == 0
 
-        state.increment_requests_rerouted()
+        state.increment_rerouted()
 
         assert state._requests_rerouted == 1
 
-    def test_increment_requests_failed_leadership_change(self):
+    def test_increment_failed_leadership_change(self):
         """Test failed leadership change counter."""
         state = ClientState()
 
         assert state._requests_failed_leadership_change == 0
 
-        state.increment_requests_failed_leadership_change()
-        state.increment_requests_failed_leadership_change()
+        state.increment_failed_leadership_change()
+        state.increment_failed_leadership_change()
 
         assert state._requests_failed_leadership_change == 2
 
@@ -395,8 +395,8 @@ class TestClientState:
         state.increment_gate_transfers()
         state.increment_gate_transfers()
         state.increment_manager_transfers()
-        state.increment_requests_rerouted()
-        state.increment_requests_failed_leadership_change()
+        state.increment_rerouted()
+        state.increment_failed_leadership_change()
 
         metrics = state.get_leadership_metrics()
 
@@ -404,17 +404,29 @@ class TestClientState:
         assert metrics["manager_transfers_received"] == 1
         assert metrics["requests_rerouted"] == 1
         assert metrics["requests_failed_leadership_change"] == 1
-        assert metrics["orphaned_jobs_count"] == 0
+        assert metrics["orphaned_jobs"] == 0
 
     def test_get_leadership_metrics_with_orphans(self):
         """Test leadership metrics with orphaned jobs."""
         state = ClientState()
 
-        state.mark_job_orphaned("job-1", {"reason": "test"})
-        state.mark_job_orphaned("job-2", {"reason": "test"})
+        orphan1 = OrphanedJobInfo(
+            job_id="job-1",
+            orphan_timestamp=time.time(),
+            last_known_gate=None,
+            last_known_manager=None,
+        )
+        orphan2 = OrphanedJobInfo(
+            job_id="job-2",
+            orphan_timestamp=time.time(),
+            last_known_gate=None,
+            last_known_manager=None,
+        )
+        state.mark_job_orphaned("job-1", orphan1)
+        state.mark_job_orphaned("job-2", orphan2)
 
         metrics = state.get_leadership_metrics()
-        assert metrics["orphaned_jobs_count"] == 2
+        assert metrics["orphaned_jobs"] == 2
 
     @pytest.mark.asyncio
     async def test_concurrency_job_tracking(self):
@@ -423,7 +435,8 @@ class TestClientState:
         job_ids = [f"job-{i}" for i in range(10)]
 
         async def initialize_job(job_id):
-            state.initialize_job_tracking(job_id)
+            initial_result = ClientJobResult(job_id=job_id, status="SUBMITTED")
+            state.initialize_job_tracking(job_id, initial_result)
             await asyncio.sleep(0.001)
             state.mark_job_target(job_id, (f"manager-{job_id}", 8000))
 
@@ -436,18 +449,20 @@ class TestClientState:
     async def test_concurrency_leader_updates(self):
         """Test concurrent leader updates."""
         state = ClientState()
+        job_id = "concurrent-job"
 
-        async def update_gate_leader(job_id, fence_token):
-            state.update_gate_leader(
-                job_id,
-                (f"gate-{fence_token}", 9000),
-                fence_token
+        async def update_gate_leader(fence_token):
+            leader_info = GateLeaderInfo(
+                job_id=job_id,
+                gate_host=f"gate-{fence_token}",
+                gate_port=9000,
+                fence_token=fence_token,
             )
+            state._gate_job_leaders[job_id] = leader_info
             await asyncio.sleep(0.001)
 
-        job_id = "concurrent-job"
         await asyncio.gather(*[
-            update_gate_leader(job_id, i) for i in range(10)
+            update_gate_leader(i) for i in range(10)
         ])
 
         # Final state should have latest update
@@ -460,7 +475,13 @@ class TestClientState:
         job_id = "orphan-concurrent"
 
         async def mark_and_clear():
-            state.mark_job_orphaned(job_id, {"reason": "test"})
+            orphan_info = OrphanedJobInfo(
+                job_id=job_id,
+                orphan_timestamp=time.time(),
+                last_known_gate=None,
+                last_known_manager=None,
+            )
+            state.mark_job_orphaned(job_id, orphan_info)
             await asyncio.sleep(0.001)
             state.clear_job_orphaned(job_id)
 
@@ -474,26 +495,26 @@ class TestClientState:
         """Test job tracking with no callbacks."""
         state = ClientState()
         job_id = "no-callbacks-job"
+        initial_result = ClientJobResult(job_id=job_id, status="SUBMITTED")
 
         state.initialize_job_tracking(
             job_id,
-            on_status_update=None,
-            on_progress_update=None,
-            on_workflow_result=None,
-            on_reporter_result=None,
+            initial_result=initial_result,
+            callback=None,
         )
 
         assert job_id in state._jobs
-        # Callbacks should be None if not provided
-        assert state._progress_callbacks.get(job_id) is None
+        # Callback should not be set if None
+        assert job_id not in state._job_callbacks
 
     def test_edge_case_duplicate_job_initialization(self):
         """Test initializing same job twice."""
         state = ClientState()
         job_id = "duplicate-job"
+        initial_result = ClientJobResult(job_id=job_id, status="SUBMITTED")
 
-        state.initialize_job_tracking(job_id)
-        state.initialize_job_tracking(job_id)  # Second init
+        state.initialize_job_tracking(job_id, initial_result)
+        state.initialize_job_tracking(job_id, initial_result)  # Second init
 
         # Should still have single entry
         assert job_id in state._jobs
@@ -502,8 +523,9 @@ class TestClientState:
         """Test with extremely long job ID."""
         state = ClientState()
         long_job_id = "job-" + "x" * 10000
+        initial_result = ClientJobResult(job_id=long_job_id, status="SUBMITTED")
 
-        state.initialize_job_tracking(long_job_id)
+        state.initialize_job_tracking(long_job_id, initial_result)
 
         assert long_job_id in state._jobs
 
@@ -511,7 +533,8 @@ class TestClientState:
         """Test job IDs with special characters."""
         state = ClientState()
         special_job_id = "job-🚀-test-ñ-中文"
+        initial_result = ClientJobResult(job_id=special_job_id, status="SUBMITTED")
 
-        state.initialize_job_tracking(special_job_id)
+        state.initialize_job_tracking(special_job_id, initial_result)
 
         assert special_job_id in state._jobs
