@@ -536,4 +536,8 @@ class ManagerHealthMonitor:
                 len(self._state._worker_latency_samples) +
                 len(self._state._peer_manager_latency_samples)
             ),
+            # AD-30 metrics
+            "job_suspicions": len(self._job_suspicions),
+            "global_dead_workers": len(self._global_dead_workers),
+            "jobs_with_dead_workers": len(self._job_dead_workers),
         }

@@ -14,9 +14,9 @@ from .leases import ManagerLeaseCoordinator
 from .workflow_lifecycle import ManagerWorkflowLifecycle
 from .dispatch import ManagerDispatchCoordinator
 from .sync import ManagerStateSync
-from .health import ManagerHealthMonitor
+from .health import ManagerHealthMonitor, NodeStatus, JobSuspicion
 from .leadership import ManagerLeadershipCoordinator
-from .stats import ManagerStatsCoordinator
+from .stats import ManagerStatsCoordinator, ProgressState, BackpressureLevel
 from .discovery import ManagerDiscoveryCoordinator
 
 __all__ = [
@@ -35,4 +35,11 @@ __all__ = [
     "ManagerLeadershipCoordinator",
     "ManagerStatsCoordinator",
     "ManagerDiscoveryCoordinator",
+    # AD-19 Progress State (Three-Signal Health)
+    "ProgressState",
+    # AD-23 Backpressure
+    "BackpressureLevel",
+    # AD-30 Hierarchical Failure Detection
+    "NodeStatus",
+    "JobSuspicion",
 ]
