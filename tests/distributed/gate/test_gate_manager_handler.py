@@ -245,8 +245,14 @@ class TestHandleStatusUpdateBackpressure:
 
     @pytest.mark.asyncio
     async def test_updates_dc_backpressure(self):
-        """Updates DC backpressure level."""
+        """Updates DC backpressure level when manager was previously tracked with backpressure."""
+        from hyperscale.distributed.models import BackpressureLevel
+
         state = GateRuntimeState()
+        # Pre-register manager with backpressure so that the heartbeat clears it
+        manager_addr = ("10.0.0.1", 8000)
+        state._manager_backpressure[manager_addr] = BackpressureLevel.MEDIUM
+
         updated_dcs = []
 
         handler = GateManagerHandler(

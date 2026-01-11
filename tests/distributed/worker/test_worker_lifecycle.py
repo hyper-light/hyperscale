@@ -29,6 +29,8 @@ class MockEnv:
         self.MERCURY_SYNC_CONNECT_SECONDS = "30s"
         self.MERCURY_SYNC_MONITOR_SAMPLE_WINDOW = "5s"
         self.MERCURY_SYNC_MONITOR_SAMPLE_INTERVAL = 0.1
+        self.MERCURY_SYNC_PROCESS_JOB_CPU_LIMIT = 85
+        self.MERCURY_SYNC_PROCESS_JOB_MEMORY_LIMIT = 2048
 
 
 class TestWorkerLifecycleManagerInitialization:
