@@ -1073,18 +1073,25 @@ nodes/gate/
 
 **Commit**: See git log
 
-#### 15.3.5 Gate TCP/UDP Handlers ⏳ PENDING
+#### 15.3.5 Gate TCP/UDP Handlers ✅ COMPLETE (Stubs)
 
-**Files**: `nodes/gate/handlers/*.py` (25 handlers)
+**Files**: `nodes/gate/handlers/*.py` (25 handlers - 9 stub files with dependency protocols)
 
-- [ ] **15.3.5.1** Extract job submission handlers (3 handlers)
-- [ ] **15.3.5.2** Extract DC status/progress handlers (5 handlers)
-- [ ] **15.3.5.3** Extract gate peer coordination handlers (4 handlers)
-- [ ] **15.3.5.4** Extract cancellation handlers (3 handlers)
-- [ ] **15.3.5.5** Extract leadership/lease handlers (4 handlers)
-- [ ] **15.3.5.6** Extract discovery/query handlers (6 handlers)
+- [x] **15.3.5.1** tcp_job_submission.py - Job submission handler (JobSubmissionDependencies)
+- [x] **15.3.5.2** tcp_manager_status.py - Manager status/register/discovery (ManagerStatusDependencies)
+- [x] **15.3.5.3** tcp_job_progress.py - Job progress/status/workflow results (JobProgressDependencies)
+- [x] **15.3.5.4** tcp_cancellation.py - Cancel job/workflow handlers (CancellationDependencies)
+- [x] **15.3.5.5** tcp_leadership.py - Leadership/lease transfer (LeadershipDependencies)
+- [x] **15.3.5.6** tcp_timeout.py - AD-34 timeout coordination (TimeoutDependencies)
+- [x] **15.3.5.7** tcp_discovery.py - Ping, callback, query handlers (DiscoveryDependencies)
+- [x] **15.3.5.8** tcp_sync.py - Gate state sync (SyncDependencies)
+- [x] **15.3.5.9** tcp_stats.py - Windowed stats and results (StatsDependencies)
 
-**AD Compliance Check Required**: Must preserve all gate coordination protocols
+**Note**: Handler stubs created with dependency protocols. Full extraction happens in 15.3.7 (composition root).
+
+**AD Compliance**: ✅ Handler stubs document all AD dependencies (AD-20, AD-22, AD-24, AD-25, AD-34, AD-36)
+
+**Commit**: See git log
 
 #### 15.3.6 Gate Core Modules ⏳ PENDING
 
