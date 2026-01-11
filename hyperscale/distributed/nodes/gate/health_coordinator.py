@@ -17,17 +17,17 @@ from hyperscale.distributed.models import (
     DatacenterStatus,
     ManagerHeartbeat,
 )
-from hyperscale.distributed.health import (
-    DatacenterHealthManager,
+from hyperscale.distributed.health import ManagerHealthState
+from hyperscale.distributed.datacenters import DatacenterHealthManager
+from hyperscale.distributed.swim.health import (
     FederatedHealthMonitor,
     DCReachability,
-    ManagerHealthState,
 )
 from hyperscale.distributed.reliability import (
     BackpressureLevel,
     BackpressureSignal,
-    DiscoveryService,
 )
+from hyperscale.distributed.discovery import DiscoveryService
 from hyperscale.logging import Logger
 from hyperscale.logging.hyperscale_logging_models import ServerInfo
 
