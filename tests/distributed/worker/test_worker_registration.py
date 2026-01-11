@@ -558,6 +558,7 @@ class TestWorkerRegistrationHandlerProcessManagerRegistration:
             tcp_port=8000,
             udp_host="192.168.1.200",
             udp_port=8001,
+            datacenter="dc-1",
             is_leader=False,
         )
 
@@ -567,6 +568,7 @@ class TestWorkerRegistrationHandlerProcessManagerRegistration:
             tcp_port=8000,
             udp_host="192.168.1.201",
             udp_port=8001,
+            datacenter="dc-1",
             is_leader=False,
         )
 
@@ -711,6 +713,7 @@ class TestWorkerRegistrationHandlerEdgeCases:
             tcp_port=8000,
             udp_host="192.168.1.200",
             udp_port=8001,
+            datacenter="dc-1",
             is_leader=False,
         )
 
