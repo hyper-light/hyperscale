@@ -1505,6 +1505,9 @@ class MercurySyncBaseServer(Generic[T]):
 
             self._udp_client_data[addr][handler_name].put_nowait((payload, clock_time))
 
+        except asyncio.QueueFull:
+            self._udp_drop_counter.increment_load_shed()
+
         except Exception as err:
             self._udp_client_data[addr][handler_name].put_nowait((err, clock_time))
 
