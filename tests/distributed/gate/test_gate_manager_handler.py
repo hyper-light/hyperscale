@@ -246,7 +246,7 @@ class TestHandleStatusUpdateBackpressure:
     @pytest.mark.asyncio
     async def test_updates_dc_backpressure(self):
         """Updates DC backpressure level when manager was previously tracked with backpressure."""
-        from hyperscale.distributed.models import BackpressureLevel
+        from hyperscale.distributed.reliability.backpressure import BackpressureLevel
 
         state = GateRuntimeState()
         # Pre-register manager with backpressure so that the heartbeat clears it
