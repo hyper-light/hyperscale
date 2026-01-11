@@ -385,19 +385,14 @@ class LoggerStream:
         self._update_logfile_metadata(logfile_path, logfile_metadata)
 
     async def close(self, shutdown_subscribed: bool = False):
+        was_running = self._consumer.status == ConsumerStatus.RUNNING
+
         self._consumer.stop()
 
         if shutdown_subscribed:
             await self._provider.signal_shutdown()
 
-        if (
-            self._consumer.status
-            in [
-                ConsumerStatus.RUNNING,
-                ConsumerStatus.CLOSING,
-            ]
-            and self._consumer.pending
-        ):
+        if was_running and self._consumer.pending:
             await self._consumer.wait_for_pending()
 
         while not self._queue.empty():
