@@ -27,6 +27,8 @@ class MockEnv:
         self.MERCURY_SYNC_LOGS_DIRECTORY = "/tmp/logs"
         self.MERCURY_SYNC_LOG_LEVEL = "INFO"
         self.MERCURY_SYNC_CONNECT_SECONDS = "30s"
+        self.MERCURY_SYNC_MONITOR_SAMPLE_WINDOW = "5s"
+        self.MERCURY_SYNC_MONITOR_SAMPLE_INTERVAL = 0.1
 
 
 class TestWorkerLifecycleManagerInitialization:

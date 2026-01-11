@@ -20,6 +20,54 @@ from hyperscale.distributed.nodes.worker.registry import WorkerRegistry
 from hyperscale.distributed.models import ManagerHeartbeat, ManagerInfo
 
 
+def create_manager_heartbeat(
+    node_id: str = "mgr-1",
+    datacenter: str = "dc-1",
+    is_leader: bool = False,
+    tcp_host: str = "192.168.1.100",
+    tcp_port: int = 8000,
+    job_leaderships: dict | None = None,
+) -> ManagerHeartbeat:
+    """Create a ManagerHeartbeat with all required fields."""
+    return ManagerHeartbeat(
+        node_id=node_id,
+        datacenter=datacenter,
+        is_leader=is_leader,
+        term=1,
+        version=1,
+        active_jobs=0,
+        active_workflows=0,
+        worker_count=5,
+        healthy_worker_count=5,
+        available_cores=40,
+        total_cores=60,
+        tcp_host=tcp_host,
+        tcp_port=tcp_port,
+        job_leaderships=job_leaderships or {},
+    )
+
+
+def create_manager_info(
+    node_id: str = "mgr-1",
+    tcp_host: str = "192.168.1.100",
+    tcp_port: int = 8000,
+    udp_host: str = "192.168.1.100",
+    udp_port: int = 8001,
+    datacenter: str = "dc-1",
+    is_leader: bool = False,
+) -> ManagerInfo:
+    """Create a ManagerInfo with all required fields."""
+    return ManagerInfo(
+        node_id=node_id,
+        tcp_host=tcp_host,
+        tcp_port=tcp_port,
+        udp_host=udp_host,
+        udp_port=udp_port,
+        datacenter=datacenter,
+        is_leader=is_leader,
+    )
+
+
 class TestWorkerHeartbeatHandlerInitialization:
     """Test WorkerHeartbeatHandler initialization."""
 
@@ -91,13 +139,12 @@ class TestWorkerHeartbeatHandlerProcessHeartbeat:
         on_new_manager = MagicMock()
         handler.set_callbacks(on_new_manager_discovered=on_new_manager)
 
-        heartbeat = ManagerHeartbeat(
+        heartbeat = create_manager_heartbeat(
             node_id="mgr-new",
             is_leader=False,
             tcp_host="192.168.1.100",
             tcp_port=8000,
             datacenter="dc-1",
-            job_leaderships=[],
         )
 
         confirm_peer = MagicMock()
@@ -128,23 +175,23 @@ class TestWorkerHeartbeatHandlerProcessHeartbeat:
         handler = WorkerHeartbeatHandler(registry=registry)
 
         # Add existing manager
-        existing_manager = ManagerInfo(
+        existing_manager = create_manager_info(
             node_id="mgr-1",
             tcp_host="192.168.1.100",
             tcp_port=8000,
             udp_host="192.168.1.100",
             udp_port=8001,
+            datacenter="dc-1",
             is_leader=False,
         )
         registry.add_manager("mgr-1", existing_manager)
 
-        heartbeat = ManagerHeartbeat(
+        heartbeat = create_manager_heartbeat(
             node_id="mgr-1",
-            is_leader=False,  # Same leadership status
+            is_leader=False,
             tcp_host="192.168.1.100",
             tcp_port=8000,
             datacenter="dc-1",
-            job_leaderships=[],
         )
 
         confirm_peer = MagicMock()
@@ -173,12 +220,13 @@ class TestWorkerHeartbeatHandlerProcessHeartbeat:
         handler = WorkerHeartbeatHandler(registry=registry, logger=logger)
 
         # Add existing non-leader manager
-        existing_manager = ManagerInfo(
+        existing_manager = create_manager_info(
             node_id="mgr-1",
             tcp_host="192.168.1.100",
             tcp_port=8000,
             udp_host="192.168.1.100",
             udp_port=8001,
+            datacenter="dc-1",
             is_leader=False,
         )
         registry.add_manager("mgr-1", existing_manager)
@@ -186,13 +234,12 @@ class TestWorkerHeartbeatHandlerProcessHeartbeat:
         # Set another manager as primary
         registry.set_primary_manager("mgr-other")
 
-        heartbeat = ManagerHeartbeat(
+        heartbeat = create_manager_heartbeat(
             node_id="mgr-1",
             is_leader=True,  # Now became leader
             tcp_host="192.168.1.100",
             tcp_port=8000,
             datacenter="dc-1",
-            job_leaderships=[],
         )
 
         confirm_peer = MagicMock()
@@ -223,13 +270,13 @@ class TestWorkerHeartbeatHandlerProcessHeartbeat:
         on_job_leadership = MagicMock()
         handler.set_callbacks(on_job_leadership_update=on_job_leadership)
 
-        heartbeat = ManagerHeartbeat(
+        heartbeat = create_manager_heartbeat(
             node_id="mgr-1",
             is_leader=False,
             tcp_host="192.168.1.100",
             tcp_port=8000,
             datacenter="dc-1",
-            job_leaderships=["job-1", "job-2"],
+            job_leaderships={"job-1": (1, 1), "job-2": (1, 1)},
         )
 
         confirm_peer = MagicMock()
@@ -248,7 +295,8 @@ class TestWorkerHeartbeatHandlerProcessHeartbeat:
         # Job leadership callback should be invoked
         on_job_leadership.assert_called_once()
         call_args = on_job_leadership.call_args[0]
-        assert call_args[0] == ["job-1", "job-2"]
+        assert "job-1" in call_args[0]
+        assert "job-2" in call_args[0]
         assert call_args[1] == ("192.168.1.100", 8000)  # TCP addr
 
     def test_process_heartbeat_no_job_leaderships(self) -> None:
@@ -259,13 +307,13 @@ class TestWorkerHeartbeatHandlerProcessHeartbeat:
         on_job_leadership = MagicMock()
         handler.set_callbacks(on_job_leadership_update=on_job_leadership)
 
-        heartbeat = ManagerHeartbeat(
+        heartbeat = create_manager_heartbeat(
             node_id="mgr-1",
             is_leader=False,
             tcp_host="192.168.1.100",
             tcp_port=8000,
             datacenter="dc-1",
-            job_leaderships=[],  # Empty
+            job_leaderships={},  # Empty
         )
 
         confirm_peer = MagicMock()
@@ -295,12 +343,13 @@ class TestWorkerHeartbeatHandlerPeerConfirmation:
         handler = WorkerHeartbeatHandler(registry=registry, logger=logger)
 
         # Add manager with UDP address
-        manager = ManagerInfo(
+        manager = create_manager_info(
             node_id="mgr-1",
             tcp_host="192.168.1.100",
             tcp_port=8000,
             udp_host="192.168.1.100",
             udp_port=8001,
+            datacenter="dc-1",
         )
         registry.add_manager("mgr-1", manager)
 
@@ -345,13 +394,12 @@ class TestWorkerHeartbeatHandlerTCPAddressInference:
         registry = WorkerRegistry(None)
         handler = WorkerHeartbeatHandler(registry=registry)
 
-        heartbeat = ManagerHeartbeat(
+        heartbeat = create_manager_heartbeat(
             node_id="mgr-1",
             is_leader=False,
             tcp_host="10.0.0.100",  # Different from UDP
             tcp_port=9000,
             datacenter="dc-1",
-            job_leaderships=[],
         )
 
         handler.process_manager_heartbeat(
@@ -373,13 +421,12 @@ class TestWorkerHeartbeatHandlerTCPAddressInference:
         registry = WorkerRegistry(None)
         handler = WorkerHeartbeatHandler(registry=registry)
 
-        heartbeat = ManagerHeartbeat(
+        heartbeat = create_manager_heartbeat(
             node_id="mgr-1",
             is_leader=False,
-            tcp_host=None,  # Not provided
-            tcp_port=None,
+            tcp_host="",  # Not provided
+            tcp_port=0,
             datacenter="dc-1",
-            job_leaderships=[],
         )
 
         handler.process_manager_heartbeat(
@@ -407,13 +454,12 @@ class TestWorkerHeartbeatHandlerEdgeCases:
 
         assert registry._primary_manager_id is None
 
-        heartbeat = ManagerHeartbeat(
+        heartbeat = create_manager_heartbeat(
             node_id="mgr-1",
             is_leader=True,
             tcp_host="192.168.1.100",
             tcp_port=8000,
             datacenter="dc-1",
-            job_leaderships=[],
         )
 
         handler.process_manager_heartbeat(
@@ -434,13 +480,12 @@ class TestWorkerHeartbeatHandlerEdgeCases:
         handler = WorkerHeartbeatHandler(registry=registry)
 
         for i in range(5):
-            heartbeat = ManagerHeartbeat(
+            heartbeat = create_manager_heartbeat(
                 node_id="mgr-1",
                 is_leader=False,
                 tcp_host="192.168.1.100",
                 tcp_port=8000,
                 datacenter=f"dc-{i}",  # Changing datacenter
-                job_leaderships=[],
             )
 
             handler.process_manager_heartbeat(
@@ -461,13 +506,12 @@ class TestWorkerHeartbeatHandlerEdgeCases:
         registry = WorkerRegistry(None)
         handler = WorkerHeartbeatHandler(registry=registry)
 
-        heartbeat = ManagerHeartbeat(
+        heartbeat = create_manager_heartbeat(
             node_id="mgr-🚀-test-ñ",
             is_leader=False,
             tcp_host="192.168.1.100",
             tcp_port=8000,
             datacenter="dc-1",
-            job_leaderships=[],
         )
 
         handler.process_manager_heartbeat(
@@ -490,15 +534,15 @@ class TestWorkerHeartbeatHandlerEdgeCases:
         on_job_leadership = MagicMock()
         handler.set_callbacks(on_job_leadership_update=on_job_leadership)
 
-        job_ids = [f"job-{i}" for i in range(100)]
+        job_leaderships = {f"job-{i}": (1, 1) for i in range(100)}
 
-        heartbeat = ManagerHeartbeat(
+        heartbeat = create_manager_heartbeat(
             node_id="mgr-1",
             is_leader=False,
             tcp_host="192.168.1.100",
             tcp_port=8000,
             datacenter="dc-1",
-            job_leaderships=job_ids,
+            job_leaderships=job_leaderships,
         )
 
         handler.process_manager_heartbeat(

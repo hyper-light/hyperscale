@@ -121,8 +121,10 @@ class TestWorkerRegistrationHandlerRegisterWithManager:
 
         node_info = NodeInfo(
             node_id="worker-123",
+            role="worker",
             host="192.168.1.1",
             port=8000,
+            datacenter="dc-1",
         )
 
         send_func = AsyncMock(return_value=b"OK")
@@ -164,8 +166,10 @@ class TestWorkerRegistrationHandlerRegisterWithManager:
 
         node_info = NodeInfo(
             node_id="worker-123",
+            role="worker",
             host="192.168.1.1",
             port=8000,
+            datacenter="dc-1",
         )
 
         send_func = AsyncMock()
@@ -203,8 +207,10 @@ class TestWorkerRegistrationHandlerRegisterWithManager:
 
         node_info = NodeInfo(
             node_id="worker-123",
+            role="worker",
             host="192.168.1.1",
             port=8000,
+            datacenter="dc-1",
         )
 
         call_count = [0]
@@ -250,8 +256,10 @@ class TestWorkerRegistrationHandlerRegisterWithManager:
 
         node_info = NodeInfo(
             node_id="worker-123",
+            role="worker",
             host="192.168.1.1",
             port=8000,
+            datacenter="dc-1",
         )
 
         send_func = AsyncMock(side_effect=RuntimeError("Connection failed"))
@@ -293,6 +301,7 @@ class TestWorkerRegistrationHandlerProcessResponse:
             tcp_port=8000,
             udp_host="192.168.1.100",
             udp_port=8001,
+            datacenter="dc-1",
             is_leader=True,
         )
 
@@ -369,6 +378,7 @@ class TestWorkerRegistrationHandlerProcessResponse:
             tcp_port=8000,
             udp_host="192.168.1.100",
             udp_port=8001,
+            datacenter="dc-1",
             is_leader=False,
         )
 
@@ -378,6 +388,7 @@ class TestWorkerRegistrationHandlerProcessResponse:
             tcp_port=8000,
             udp_host="192.168.1.101",
             udp_port=8001,
+            datacenter="dc-1",
             is_leader=True,
         )
 
@@ -453,6 +464,7 @@ class TestWorkerRegistrationHandlerProcessManagerRegistration:
             tcp_port=8000,
             udp_host="192.168.1.200",
             udp_port=8001,
+            datacenter="dc-1",
             is_leader=False,
         )
 
@@ -502,6 +514,7 @@ class TestWorkerRegistrationHandlerProcessManagerRegistration:
             tcp_port=8000,
             udp_host="192.168.1.200",
             udp_port=8001,
+            datacenter="dc-1",
             is_leader=True,
         )
 
