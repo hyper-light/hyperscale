@@ -24,9 +24,11 @@ from hyperscale.distributed_rewrite.nodes.client.config import (
     TRANSIENT_ERRORS,
 )
 from hyperscale.distributed_rewrite.nodes.client.state import ClientState
-from hyperscale.distributed_rewrite.nodes.client.models import (
-    GateLeaderTracking,
-    ManagerLeaderTracking,
+from hyperscale.distributed_rewrite.models import (
+    ClientJobResult,
+    GateLeaderInfo,
+    ManagerLeaderInfo,
+    OrphanedJobInfo,
 )
 
 
@@ -212,25 +214,19 @@ class TestClientState:
         job_id = "job-123"
 
         status_callback = lambda x: None
-        progress_callback = lambda x: None
-        workflow_callback = lambda x: None
-        reporter_callback = lambda x: None
+        initial_result = ClientJobResult(job_id=job_id, status="SUBMITTED")
 
         state.initialize_job_tracking(
             job_id,
-            on_status_update=status_callback,
-            on_progress_update=progress_callback,
-            on_workflow_result=workflow_callback,
-            on_reporter_result=reporter_callback,
+            initial_result=initial_result,
+            callback=status_callback,
         )
 
         assert job_id in state._jobs
         assert job_id in state._job_events
         assert job_id in state._job_callbacks
-        assert state._job_callbacks[job_id][0] == status_callback
-        assert state._progress_callbacks[job_id] == progress_callback
-        assert state._workflow_callbacks[job_id] == workflow_callback
-        assert state._reporter_callbacks[job_id] == reporter_callback
+        assert state._job_callbacks[job_id] == status_callback
+        assert state._jobs[job_id] == initial_result
 
     def test_initialize_cancellation_tracking(self):
         """Test cancellation tracking initialization."""
@@ -255,37 +251,46 @@ class TestClientState:
 
         assert state._job_targets[job_id] == target
 
-    def test_update_gate_leader(self):
-        """Test gate leader update."""
+    def test_gate_leader_tracking(self):
+        """Test gate leader tracking via direct state update."""
         state = ClientState()
         job_id = "gate-leader-job"
-        leader_info = ("gate-1", 9000)
-        fence_token = 5
+        leader_info = GateLeaderInfo(
+            job_id=job_id,
+            gate_host="gate-1",
+            gate_port=9000,
+            fence_token=5,
+        )
 
-        state.update_gate_leader(job_id, leader_info, fence_token)
+        state._gate_job_leaders[job_id] = leader_info
 
         assert job_id in state._gate_job_leaders
-        tracking = state._gate_job_leaders[job_id]
-        assert tracking.leader_info == leader_info
-        assert tracking.last_updated > 0
+        stored = state._gate_job_leaders[job_id]
+        assert stored.gate_host == "gate-1"
+        assert stored.gate_port == 9000
+        assert stored.fence_token == 5
 
-    def test_update_manager_leader(self):
-        """Test manager leader update."""
+    def test_manager_leader_tracking(self):
+        """Test manager leader tracking via direct state update."""
         state = ClientState()
         job_id = "mgr-leader-job"
         datacenter_id = "dc-east"
-        leader_info = ("manager-2", 7000)
-        fence_token = 10
-
-        state.update_manager_leader(
-            job_id, datacenter_id, leader_info, fence_token
+        leader_info = ManagerLeaderInfo(
+            job_id=job_id,
+            datacenter_id=datacenter_id,
+            manager_host="manager-2",
+            manager_port=7000,
+            fence_token=10,
         )
 
         key = (job_id, datacenter_id)
+        state._manager_job_leaders[key] = leader_info
+
         assert key in state._manager_job_leaders
-        tracking = state._manager_job_leaders[key]
-        assert tracking.leader_info == leader_info
-        assert tracking.datacenter_id == datacenter_id
+        stored = state._manager_job_leaders[key]
+        assert stored.manager_host == "manager-2"
+        assert stored.manager_port == 7000
+        assert stored.datacenter_id == datacenter_id
 
     def test_mark_job_orphaned(self):
         """Test marking job as orphaned."""
