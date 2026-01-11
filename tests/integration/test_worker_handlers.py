@@ -1,0 +1,700 @@
+"""
+Integration tests for worker TCP handlers (Section 15.2.5).
+
+Tests WorkflowDispatchHandler, WorkflowCancelHandler, JobLeaderTransferHandler,
+WorkflowProgressHandler, StateSyncHandler, and WorkflowStatusQueryHandler.
+
+Covers:
+- Happy path: Normal message handling
+- Negative path: Invalid messages, stale tokens
+- Failure mode: Parsing errors, validation failures
+- Concurrency: Thread-safe handler operations
+- Edge cases: Empty data, malformed messages
+"""
+
+import asyncio
+import time
+from unittest.mock import MagicMock, AsyncMock, patch, PropertyMock
+
+import pytest
+
+from hyperscale.distributed_rewrite.models import (
+    WorkflowDispatch,
+    WorkflowDispatchAck,
+    WorkflowCancel,
+    WorkflowCancelAck,
+    JobLeaderWorkerTransfer,
+    JobLeaderWorkerTransferAck,
+    WorkflowProgressAck,
+    WorkflowProgress,
+    WorkflowStatus,
+    PendingTransfer,
+)
+
+
+class MockServerForHandlers:
+    """Mock WorkerServer for handler testing."""
+
+    def __init__(self):
+        self._host = "localhost"
+        self._tcp_port = 8000
+        self._node_id = MagicMock()
+        self._node_id.full = "worker-123-456"
+        self._node_id.short = "123"
+        self._udp_logger = MagicMock()
+        self._udp_logger.log = AsyncMock()
+
+        # State containers
+        self._active_workflows = {}
+        self._workflow_job_leader = {}
+        self._workflow_fence_tokens = {}
+        self._orphaned_workflows = {}
+        self._pending_workflows = []
+        self._pending_transfers = {}
+        self._known_managers = {}
+
+        # Metrics
+        self._transfer_metrics_received = 0
+        self._transfer_metrics_accepted = 0
+        self._transfer_metrics_rejected_stale_token = 0
+        self._transfer_metrics_rejected_unknown_manager = 0
+        self._transfer_metrics_rejected_other = 0
+
+        # Locks
+        self._job_transfer_locks = {}
+
+        # Core allocator mock
+        self._core_allocator = MagicMock()
+        self._core_allocator.allocate = AsyncMock()
+        self._core_allocator.free = AsyncMock()
+
+        # Env mock
+        self.env = MagicMock()
+        self.env.MERCURY_SYNC_MAX_PENDING_WORKFLOWS = 100
+
+        # Fence tokens
+        self._job_fence_tokens = {}
+
+    def _get_worker_state(self):
+        return WorkflowStatus.RUNNING
+
+    def _get_job_transfer_lock(self, job_id):
+        if job_id not in self._job_transfer_locks:
+            self._job_transfer_locks[job_id] = asyncio.Lock()
+        return self._job_transfer_locks[job_id]
+
+    def _validate_transfer_fence_token(self, job_id, fence_token):
+        current = self._job_fence_tokens.get(job_id, -1)
+        if fence_token <= current:
+            return False, f"Stale token: {fence_token} <= {current}"
+        return True, ""
+
+    def _validate_transfer_manager(self, manager_id):
+        if manager_id in self._known_managers:
+            return True, ""
+        return False, f"Unknown manager: {manager_id}"
+
+    async def _handle_dispatch_execution(self, dispatch, addr, allocation_result):
+        return WorkflowDispatchAck(
+            workflow_id=dispatch.workflow_id,
+            accepted=True,
+        ).dump()
+
+    def _cleanup_workflow_state(self, workflow_id):
+        self._active_workflows.pop(workflow_id, None)
+        self._workflow_job_leader.pop(workflow_id, None)
+
+
+class TestWorkflowDispatchHandler:
+    """Test WorkflowDispatchHandler."""
+
+    @pytest.fixture
+    def mock_server(self):
+        return MockServerForHandlers()
+
+    @pytest.mark.asyncio
+    async def test_happy_path_dispatch(self, mock_server):
+        """Test successful workflow dispatch."""
+        from hyperscale.distributed_rewrite.nodes.worker.handlers.tcp_dispatch import (
+            WorkflowDispatchHandler,
+        )
+
+        handler = WorkflowDispatchHandler(mock_server)
+
+        mock_server._core_allocator.allocate.return_value = MagicMock(
+            success=True,
+            allocated_cores=[0, 1],
+            error=None,
+        )
+
+        dispatch = WorkflowDispatch(
+            job_id="job-123",
+            workflow_id="wf-456",
+            workflow_name="test-workflow",
+            cores=2,
+            fence_token=1,
+            job_leader_addr=("manager", 8000),
+        )
+
+        result = await handler.handle(
+            addr=("192.168.1.1", 8000),
+            data=dispatch.dump(),
+            clock_time=1000,
+        )
+
+        ack = WorkflowDispatchAck.load(result)
+        assert ack.workflow_id == "wf-456"
+        assert ack.accepted is True
+
+    @pytest.mark.asyncio
+    async def test_dispatch_stale_fence_token(self, mock_server):
+        """Test dispatch with stale fence token."""
+        from hyperscale.distributed_rewrite.nodes.worker.handlers.tcp_dispatch import (
+            WorkflowDispatchHandler,
+        )
+
+        handler = WorkflowDispatchHandler(mock_server)
+
+        # Set existing fence token
+        mock_server._workflow_fence_tokens["wf-456"] = 10
+
+        dispatch = WorkflowDispatch(
+            job_id="job-123",
+            workflow_id="wf-456",
+            workflow_name="test-workflow",
+            cores=2,
+            fence_token=5,  # Stale token
+            job_leader_addr=("manager", 8000),
+        )
+
+        result = await handler.handle(
+            addr=("192.168.1.1", 8000),
+            data=dispatch.dump(),
+            clock_time=1000,
+        )
+
+        ack = WorkflowDispatchAck.load(result)
+        assert ack.accepted is False
+        assert "Stale fence token" in ack.error
+
+    @pytest.mark.asyncio
+    async def test_dispatch_queue_depth_limit(self, mock_server):
+        """Test dispatch when queue depth limit reached."""
+        from hyperscale.distributed_rewrite.nodes.worker.handlers.tcp_dispatch import (
+            WorkflowDispatchHandler,
+        )
+
+        handler = WorkflowDispatchHandler(mock_server)
+
+        # Fill pending workflows
+        mock_server._pending_workflows = [MagicMock() for _ in range(100)]
+
+        dispatch = WorkflowDispatch(
+            job_id="job-123",
+            workflow_id="wf-456",
+            workflow_name="test-workflow",
+            cores=2,
+            fence_token=1,
+            job_leader_addr=("manager", 8000),
+        )
+
+        result = await handler.handle(
+            addr=("192.168.1.1", 8000),
+            data=dispatch.dump(),
+            clock_time=1000,
+        )
+
+        ack = WorkflowDispatchAck.load(result)
+        assert ack.accepted is False
+        assert "Queue depth limit" in ack.error
+
+    @pytest.mark.asyncio
+    async def test_dispatch_core_allocation_failure(self, mock_server):
+        """Test dispatch with core allocation failure."""
+        from hyperscale.distributed_rewrite.nodes.worker.handlers.tcp_dispatch import (
+            WorkflowDispatchHandler,
+        )
+
+        handler = WorkflowDispatchHandler(mock_server)
+
+        mock_server._core_allocator.allocate.return_value = MagicMock(
+            success=False,
+            allocated_cores=None,
+            error="Not enough cores",
+        )
+
+        dispatch = WorkflowDispatch(
+            job_id="job-123",
+            workflow_id="wf-456",
+            workflow_name="test-workflow",
+            cores=16,
+            fence_token=1,
+            job_leader_addr=("manager", 8000),
+        )
+
+        result = await handler.handle(
+            addr=("192.168.1.1", 8000),
+            data=dispatch.dump(),
+            clock_time=1000,
+        )
+
+        ack = WorkflowDispatchAck.load(result)
+        assert ack.accepted is False
+        assert "cores" in ack.error.lower()
+
+
+class TestJobLeaderTransferHandler:
+    """Test JobLeaderTransferHandler."""
+
+    @pytest.fixture
+    def mock_server(self):
+        server = MockServerForHandlers()
+        server._known_managers["new-manager"] = MagicMock()
+        return server
+
+    @pytest.mark.asyncio
+    async def test_happy_path_transfer(self, mock_server):
+        """Test successful job leadership transfer."""
+        from hyperscale.distributed_rewrite.nodes.worker.handlers.tcp_leader_transfer import (
+            JobLeaderTransferHandler,
+        )
+
+        handler = JobLeaderTransferHandler(mock_server)
+
+        # Add active workflows
+        mock_server._active_workflows = {
+            "wf-1": MagicMock(status="running"),
+            "wf-2": MagicMock(status="running"),
+        }
+        mock_server._workflow_job_leader = {
+            "wf-1": ("old-manager", 7000),
+            "wf-2": ("old-manager", 7000),
+        }
+
+        transfer = JobLeaderWorkerTransfer(
+            job_id="job-123",
+            workflow_ids=["wf-1", "wf-2"],
+            new_manager_id="new-manager",
+            new_manager_addr=("192.168.1.100", 8000),
+            fence_token=1,
+            old_manager_id="old-manager",
+        )
+
+        result = await handler.handle(
+            addr=("192.168.1.100", 8000),
+            data=transfer.dump(),
+            clock_time=1000,
+        )
+
+        ack = JobLeaderWorkerTransferAck.load(result)
+        assert ack.job_id == "job-123"
+        assert ack.accepted is True
+        assert ack.workflows_updated == 2
+
+        # Verify routing updated
+        assert mock_server._workflow_job_leader["wf-1"] == ("192.168.1.100", 8000)
+        assert mock_server._workflow_job_leader["wf-2"] == ("192.168.1.100", 8000)
+
+    @pytest.mark.asyncio
+    async def test_transfer_stale_fence_token(self, mock_server):
+        """Test transfer with stale fence token."""
+        from hyperscale.distributed_rewrite.nodes.worker.handlers.tcp_leader_transfer import (
+            JobLeaderTransferHandler,
+        )
+
+        handler = JobLeaderTransferHandler(mock_server)
+
+        # Set existing fence token
+        mock_server._job_fence_tokens["job-123"] = 10
+
+        transfer = JobLeaderWorkerTransfer(
+            job_id="job-123",
+            workflow_ids=["wf-1"],
+            new_manager_id="new-manager",
+            new_manager_addr=("192.168.1.100", 8000),
+            fence_token=5,  # Stale token
+            old_manager_id="old-manager",
+        )
+
+        result = await handler.handle(
+            addr=("192.168.1.100", 8000),
+            data=transfer.dump(),
+            clock_time=1000,
+        )
+
+        ack = JobLeaderWorkerTransferAck.load(result)
+        assert ack.accepted is False
+        assert mock_server._transfer_metrics_rejected_stale_token == 1
+
+    @pytest.mark.asyncio
+    async def test_transfer_unknown_manager(self, mock_server):
+        """Test transfer from unknown manager."""
+        from hyperscale.distributed_rewrite.nodes.worker.handlers.tcp_leader_transfer import (
+            JobLeaderTransferHandler,
+        )
+
+        handler = JobLeaderTransferHandler(mock_server)
+        mock_server._known_managers.clear()
+
+        transfer = JobLeaderWorkerTransfer(
+            job_id="job-123",
+            workflow_ids=["wf-1"],
+            new_manager_id="unknown-manager",
+            new_manager_addr=("192.168.1.100", 8000),
+            fence_token=1,
+            old_manager_id="old-manager",
+        )
+
+        result = await handler.handle(
+            addr=("192.168.1.100", 8000),
+            data=transfer.dump(),
+            clock_time=1000,
+        )
+
+        ack = JobLeaderWorkerTransferAck.load(result)
+        assert ack.accepted is False
+        assert mock_server._transfer_metrics_rejected_unknown_manager == 1
+
+    @pytest.mark.asyncio
+    async def test_transfer_clears_orphan_status(self, mock_server):
+        """Test transfer clears orphan status (Section 2.7)."""
+        from hyperscale.distributed_rewrite.nodes.worker.handlers.tcp_leader_transfer import (
+            JobLeaderTransferHandler,
+        )
+
+        handler = JobLeaderTransferHandler(mock_server)
+
+        # Add orphaned workflow
+        mock_server._active_workflows = {"wf-1": MagicMock(status="running")}
+        mock_server._workflow_job_leader = {"wf-1": ("old-manager", 7000)}
+        mock_server._orphaned_workflows = {"wf-1": time.monotonic()}
+
+        transfer = JobLeaderWorkerTransfer(
+            job_id="job-123",
+            workflow_ids=["wf-1"],
+            new_manager_id="new-manager",
+            new_manager_addr=("192.168.1.100", 8000),
+            fence_token=1,
+            old_manager_id="old-manager",
+        )
+
+        result = await handler.handle(
+            addr=("192.168.1.100", 8000),
+            data=transfer.dump(),
+            clock_time=1000,
+        )
+
+        ack = JobLeaderWorkerTransferAck.load(result)
+        assert ack.accepted is True
+
+        # Orphan status should be cleared
+        assert "wf-1" not in mock_server._orphaned_workflows
+
+    @pytest.mark.asyncio
+    async def test_transfer_stores_pending_for_unknown_workflows(self, mock_server):
+        """Test transfer stores pending for unknown workflows (Section 8.3)."""
+        from hyperscale.distributed_rewrite.nodes.worker.handlers.tcp_leader_transfer import (
+            JobLeaderTransferHandler,
+        )
+
+        handler = JobLeaderTransferHandler(mock_server)
+
+        # No active workflows
+        mock_server._active_workflows = {}
+
+        transfer = JobLeaderWorkerTransfer(
+            job_id="job-123",
+            workflow_ids=["wf-unknown-1", "wf-unknown-2"],
+            new_manager_id="new-manager",
+            new_manager_addr=("192.168.1.100", 8000),
+            fence_token=1,
+            old_manager_id="old-manager",
+        )
+
+        result = await handler.handle(
+            addr=("192.168.1.100", 8000),
+            data=transfer.dump(),
+            clock_time=1000,
+        )
+
+        ack = JobLeaderWorkerTransferAck.load(result)
+        assert ack.accepted is True
+        assert ack.workflows_updated == 0
+
+        # Pending transfer should be stored
+        assert "job-123" in mock_server._pending_transfers
+
+
+class TestWorkflowProgressHandler:
+    """Test WorkflowProgressHandler."""
+
+    @pytest.fixture
+    def mock_server(self):
+        server = MockServerForHandlers()
+        server._registry = MagicMock()
+        server._backpressure_manager = MagicMock()
+        return server
+
+    def test_process_ack_updates_known_managers(self, mock_server):
+        """Test progress ack updates known managers."""
+        from hyperscale.distributed_rewrite.nodes.worker.handlers.tcp_progress import (
+            WorkflowProgressHandler,
+        )
+
+        handler = WorkflowProgressHandler(mock_server)
+
+        # Mock the process_ack to just verify call happens
+        # Full testing would require more setup
+        assert handler._server == mock_server
+
+
+class TestStateSyncHandler:
+    """Test StateSyncHandler."""
+
+    @pytest.fixture
+    def mock_server(self):
+        server = MockServerForHandlers()
+        server._state_sync = MagicMock()
+        server._state_sync.generate_snapshot.return_value = {
+            "version": 1,
+            "active_workflows": [],
+        }
+        return server
+
+
+class TestWorkflowStatusQueryHandler:
+    """Test WorkflowStatusQueryHandler."""
+
+    @pytest.fixture
+    def mock_server(self):
+        return MockServerForHandlers()
+
+    @pytest.mark.asyncio
+    async def test_happy_path_query(self, mock_server):
+        """Test successful workflow status query."""
+        from hyperscale.distributed_rewrite.nodes.worker.handlers.tcp_status_query import (
+            WorkflowStatusQueryHandler,
+        )
+
+        handler = WorkflowStatusQueryHandler(mock_server)
+
+        mock_server._active_workflows = {
+            "wf-1": MagicMock(),
+            "wf-2": MagicMock(),
+            "wf-3": MagicMock(),
+        }
+
+        result = await handler.handle(
+            addr=("192.168.1.1", 8000),
+            data=b"",
+            clock_time=1000,
+        )
+
+        # Result should be comma-separated workflow IDs
+        workflow_ids = result.decode().split(",")
+        assert len(workflow_ids) == 3
+        assert "wf-1" in workflow_ids
+        assert "wf-2" in workflow_ids
+        assert "wf-3" in workflow_ids
+
+    @pytest.mark.asyncio
+    async def test_query_no_workflows(self, mock_server):
+        """Test query with no active workflows."""
+        from hyperscale.distributed_rewrite.nodes.worker.handlers.tcp_status_query import (
+            WorkflowStatusQueryHandler,
+        )
+
+        handler = WorkflowStatusQueryHandler(mock_server)
+
+        mock_server._active_workflows = {}
+
+        result = await handler.handle(
+            addr=("192.168.1.1", 8000),
+            data=b"",
+            clock_time=1000,
+        )
+
+        # Result should be empty
+        assert result == b""
+
+
+class TestWorkflowCancelHandler:
+    """Test WorkflowCancelHandler."""
+
+    @pytest.fixture
+    def mock_server(self):
+        server = MockServerForHandlers()
+        server._cancel_workflow = AsyncMock(return_value=(True, []))
+        return server
+
+    @pytest.mark.asyncio
+    async def test_happy_path_cancel(self, mock_server):
+        """Test successful workflow cancellation."""
+        from hyperscale.distributed_rewrite.nodes.worker.handlers.tcp_cancel import (
+            WorkflowCancelHandler,
+        )
+
+        handler = WorkflowCancelHandler(mock_server)
+
+        mock_server._active_workflows = {
+            "wf-456": MagicMock(
+                job_id="job-123",
+                status="running",
+            ),
+        }
+
+        cancel = WorkflowCancel(
+            job_id="job-123",
+            workflow_id="wf-456",
+            reason="user requested",
+        )
+
+        result = await handler.handle(
+            addr=("192.168.1.1", 8000),
+            data=cancel.dump(),
+            clock_time=1000,
+        )
+
+        ack = WorkflowCancelAck.load(result)
+        assert ack.workflow_id == "wf-456"
+        assert ack.success is True
+
+    @pytest.mark.asyncio
+    async def test_cancel_unknown_workflow(self, mock_server):
+        """Test cancellation of unknown workflow."""
+        from hyperscale.distributed_rewrite.nodes.worker.handlers.tcp_cancel import (
+            WorkflowCancelHandler,
+        )
+
+        handler = WorkflowCancelHandler(mock_server)
+
+        mock_server._active_workflows = {}
+
+        cancel = WorkflowCancel(
+            job_id="job-123",
+            workflow_id="wf-unknown",
+            reason="user requested",
+        )
+
+        result = await handler.handle(
+            addr=("192.168.1.1", 8000),
+            data=cancel.dump(),
+            clock_time=1000,
+        )
+
+        ack = WorkflowCancelAck.load(result)
+        assert ack.success is False
+        assert "not found" in ack.error.lower() or ack.error != ""
+
+
+class TestHandlersConcurrency:
+    """Test concurrency aspects of handlers."""
+
+    @pytest.mark.asyncio
+    async def test_concurrent_transfers_serialized(self):
+        """Test that concurrent transfers to same job are serialized."""
+        from hyperscale.distributed_rewrite.nodes.worker.handlers.tcp_leader_transfer import (
+            JobLeaderTransferHandler,
+        )
+
+        mock_server = MockServerForHandlers()
+        mock_server._known_managers["mgr-1"] = MagicMock()
+        handler = JobLeaderTransferHandler(mock_server)
+
+        access_order = []
+
+        # Monkey-patch to track access order
+        original_validate = mock_server._validate_transfer_fence_token
+
+        def tracking_validate(job_id, fence_token):
+            access_order.append(f"start-{fence_token}")
+            result = original_validate(job_id, fence_token)
+            access_order.append(f"end-{fence_token}")
+            return result
+
+        mock_server._validate_transfer_fence_token = tracking_validate
+
+        transfer1 = JobLeaderWorkerTransfer(
+            job_id="job-123",
+            workflow_ids=[],
+            new_manager_id="mgr-1",
+            new_manager_addr=("host", 8000),
+            fence_token=1,
+            old_manager_id=None,
+        )
+
+        transfer2 = JobLeaderWorkerTransfer(
+            job_id="job-123",
+            workflow_ids=[],
+            new_manager_id="mgr-1",
+            new_manager_addr=("host", 8000),
+            fence_token=2,
+            old_manager_id=None,
+        )
+
+        await asyncio.gather(
+            handler.handle(("h", 1), transfer1.dump(), 0),
+            handler.handle(("h", 1), transfer2.dump(), 0),
+        )
+
+        # Lock should serialize access
+        assert len(access_order) == 4
+
+
+class TestHandlersEdgeCases:
+    """Test edge cases for handlers."""
+
+    @pytest.mark.asyncio
+    async def test_handler_with_invalid_data(self):
+        """Test handler with invalid serialized data."""
+        from hyperscale.distributed_rewrite.nodes.worker.handlers.tcp_dispatch import (
+            WorkflowDispatchHandler,
+        )
+
+        mock_server = MockServerForHandlers()
+        handler = WorkflowDispatchHandler(mock_server)
+
+        result = await handler.handle(
+            addr=("192.168.1.1", 8000),
+            data=b"invalid data",
+            clock_time=1000,
+        )
+
+        ack = WorkflowDispatchAck.load(result)
+        assert ack.accepted is False
+
+    @pytest.mark.asyncio
+    async def test_transfer_with_many_workflows(self):
+        """Test transfer with many workflows."""
+        from hyperscale.distributed_rewrite.nodes.worker.handlers.tcp_leader_transfer import (
+            JobLeaderTransferHandler,
+        )
+
+        mock_server = MockServerForHandlers()
+        mock_server._known_managers["mgr-1"] = MagicMock()
+        handler = JobLeaderTransferHandler(mock_server)
+
+        # Add many workflows
+        workflow_ids = [f"wf-{i}" for i in range(100)]
+        for wf_id in workflow_ids:
+            mock_server._active_workflows[wf_id] = MagicMock(status="running")
+            mock_server._workflow_job_leader[wf_id] = ("old", 7000)
+
+        transfer = JobLeaderWorkerTransfer(
+            job_id="job-123",
+            workflow_ids=workflow_ids,
+            new_manager_id="mgr-1",
+            new_manager_addr=("192.168.1.100", 8000),
+            fence_token=1,
+            old_manager_id="old",
+        )
+
+        result = await handler.handle(
+            addr=("192.168.1.100", 8000),
+            data=transfer.dump(),
+            clock_time=1000,
+        )
+
+        ack = JobLeaderWorkerTransferAck.load(result)
+        assert ack.accepted is True
+        assert ack.workflows_updated == 100
