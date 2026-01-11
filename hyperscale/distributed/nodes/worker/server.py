@@ -18,6 +18,7 @@ from hyperscale.distributed.models import (
     WorkerState as WorkerStateEnum,
     WorkerStateSnapshot,
     WorkflowProgress,
+    WorkerHeartbeat,
 )
 from hyperscale.distributed.jobs import CoreAllocator
 from hyperscale.distributed.protocol.version import (
@@ -291,6 +292,10 @@ class WorkerServer(HealthAwareServer):
         self.register_on_node_join(self._health_integration.on_node_join)
         self._health_integration.set_failure_callback(self._on_manager_failure)
         self._health_integration.set_recovery_callback(self._on_manager_recovery)
+
+        # AD-29: Register peer confirmation callback to activate managers only after
+        # successful SWIM communication (probe/ack or heartbeat reception)
+        self.register_on_peer_confirmed(self._on_peer_confirmed)
 
         # Set up heartbeat callbacks
         self._heartbeat_handler.set_callbacks(
