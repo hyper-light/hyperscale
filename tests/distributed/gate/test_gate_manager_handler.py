@@ -468,16 +468,14 @@ class TestHandleDiscoveryHappyPath:
         handler = create_mock_handler(state=state)
 
         broadcast = ManagerDiscoveryBroadcast(
-            source_gate_id="gate-002",
-            manager_id="manager-001",
             datacenter="dc-east",
-            tcp_host="10.0.0.1",
-            tcp_port=8000,
-            udp_host="10.0.0.1",
-            udp_port=8001,
-            is_leader=True,
+            manager_tcp_addr=("10.0.0.1", 8000),
+            manager_udp_addr=("10.0.0.1", 8001),
+            source_gate_id="gate-002",
             worker_count=5,
+            healthy_worker_count=5,
             available_cores=40,
+            total_cores=60,
         )
 
         async def mock_handle_exception(error, context):
@@ -501,16 +499,14 @@ class TestHandleDiscoveryHappyPath:
         handler = create_mock_handler(state=state)
 
         broadcast = ManagerDiscoveryBroadcast(
-            source_gate_id="gate-002",
-            manager_id="manager-001",
             datacenter="dc-east",
-            tcp_host="10.0.0.1",
-            tcp_port=8000,
-            udp_host="10.0.0.1",
-            udp_port=8001,
-            is_leader=True,
+            manager_tcp_addr=("10.0.0.1", 8000),
+            manager_udp_addr=("10.0.0.1", 8001),
+            source_gate_id="gate-002",
             worker_count=5,
+            healthy_worker_count=5,
             available_cores=40,
+            total_cores=60,
         )
 
         async def mock_handle_exception(error, context):
