@@ -68,7 +68,7 @@ class TestJobStatusPushHandler:
 
         handler = JobStatusPushHandler(state, logger)
 
-        push = JobStatusPush(job_id=job_id, status="RUNNING")
+        push = JobStatusPush(job_id=job_id, status="RUNNING", message="Status update")
         data = push.dump()
 
         result = await handler.handle(("server", 8000), data, 100)
@@ -94,7 +94,7 @@ class TestJobStatusPushHandler:
 
         handler = JobStatusPushHandler(state, logger)
 
-        push = JobStatusPush(job_id=job_id, status="COMPLETED")
+        push = JobStatusPush(job_id=job_id, status="COMPLETED", message="Status update")
         data = push.dump()
 
         await handler.handle(("server", 8000), data, 100)
@@ -132,7 +132,7 @@ class TestJobStatusPushHandler:
 
         handler = JobStatusPushHandler(state, logger)
 
-        push = JobStatusPush(job_id=job_id, status="RUNNING")
+        push = JobStatusPush(job_id=job_id, status="RUNNING", message="Status update")
         data = push.dump()
 
         # Should not raise, should handle gracefully
@@ -228,8 +228,13 @@ class TestJobFinalResultHandler:
 
         handler = JobFinalResultHandler(state, logger)
 
-        result_data = {"metrics": {"total": 100}}
-        final_result = JobFinalResult(job_id=job_id, result=result_data)
+        final_result = JobFinalResult(
+            job_id=job_id,
+            datacenter="dc-test",
+            status="completed",
+            total_completed=100,
+            total_failed=0,
+        )
         data = final_result.dump()
 
         response = await handler.handle(("server", 8000), data, 100)
@@ -258,8 +263,13 @@ class TestJobFinalResultHandler:
 
         handler = JobFinalResultHandler(state, logger)
 
-        result_data = {"metrics": {"total": 50}}
-        final_result = JobFinalResult(job_id=job_id, result=result_data)
+        final_result = JobFinalResult(
+            job_id=job_id,
+            datacenter="dc-test",
+            status="completed",
+            total_completed=50,
+            total_failed=0,
+        )
         data = final_result.dump()
 
         await handler.handle(("server", 8000), data, 100)
@@ -347,7 +357,8 @@ class TestGateLeaderTransferHandler:
 
         result = await handler.handle(("gate-1", 9000), data, 100)
 
-        assert result == b'ok'
+        ack = GateJobLeaderTransferAck.load(result)
+        assert ack.accepted is True
         # Should update gate leader
         assert job_id in state._gate_job_leaders
 
@@ -401,7 +412,8 @@ class TestGateLeaderTransferHandler:
 
         result = await handler.handle(("gate-1", 9000), data, 100)
 
-        assert result == b'ok'
+        ack = GateJobLeaderTransferAck.load(result)
+        assert ack.accepted is True
 
 
 class TestManagerLeaderTransferHandler:
@@ -430,7 +442,8 @@ class TestManagerLeaderTransferHandler:
 
         result = await handler.handle(("manager-1", 7000), data, 100)
 
-        assert result == b'ok'
+        ack = ManagerJobLeaderTransferAck.load(result)
+        assert ack.accepted is True
         key = (job_id, datacenter_id)
         assert key in state._manager_job_leaders
 
@@ -616,4 +629,5 @@ class TestHandlersConcurrency:
         ])
 
         # All should succeed (monotonically increasing tokens)
-        assert all(r == b'ok' for r in results)
+        acks = [GateJobLeaderTransferAck.load(r) for r in results]
+        assert all(ack.accepted is True for ack in acks)
