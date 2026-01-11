@@ -18,7 +18,6 @@ from hyperscale.core.jobs.models import (
     JobContext,
     ReceivedReceipt,
     Response,
-    StepStatsType,
     StepStatsUpdate,
     WorkflowCancellation,
     WorkflowCancellationStatus,
