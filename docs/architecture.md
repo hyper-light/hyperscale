@@ -34745,3 +34745,1181 @@ async def select_datacenter_for_job(
 │                                                                          │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
+
+## AD-42: SLO-Aware Health and Routing
+
+**Related**: AD-16 (Datacenter Health Classification), AD-35 (Vivaldi Coordinates), AD-36 (Datacenter Routing), AD-41 (Resource Guards)
+
+---
+
+### Part 1: Problem Statement
+
+#### The Latency Visibility Gap
+
+Current routing uses RTT estimation (AD-35 Vivaldi) and load factors (AD-36) but lacks visibility into actual application-level latency SLOs:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    THE LATENCY VISIBILITY GAP                            │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  WHAT WE HAVE:                          WHAT WE NEED:                   │
+│  ─────────────────                      ─────────────                   │
+│                                                                          │
+│  Vivaldi RTT:                           Application Latency:            │
+│  - Network round-trip estimate          - Actual dispatch → response    │
+│  - Point estimate + uncertainty         - p50, p95, p99 percentiles     │
+│  - Good for routing, not SLO tracking   - SLO compliance scoring        │
+│                                                                          │
+│  Load Factor:                           SLO Awareness:                  │
+│  - Queue depth                          - Per-DC latency trends         │
+│  - CPU utilization                      - Violation detection           │
+│  - Throughput-focused                   - Proactive routing adjustment  │
+│                                                                          │
+│  Health Buckets (AD-16):                Latency Health Signal:          │
+│  - Manager liveness/readiness           - SLO-based health contribution │
+│  - Binary: healthy/degraded             - Continuous: meeting/warning/  │
+│  - Reactive: fail then route away         violating/critical            │
+│                                          - Predictive: route before fail│
+│                                                                          │
+│  CONSEQUENCE OF THE GAP:                                                 │
+│                                                                          │
+│  DC "A" reports: RTT=50ms, load=1.2, bucket=HEALTHY                     │
+│  Actual latency: p50=45ms (good), p95=350ms (SLO VIOLATION!)            │
+│                                                                          │
+│  Router thinks DC "A" is great, keeps sending traffic                   │
+│  Users experience p95 > 200ms target, SLO breach undetected             │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Requirements
+
+1. **Streaming Percentiles**: Track p50, p95, p99 without storing all samples
+2. **Memory Bounded**: O(δ) memory regardless of sample count
+3. **Mergeable**: Combine percentile sketches across SWIM tiers
+4. **Time Windowed**: Only consider recent data (last 5 minutes)
+5. **SLO Definition**: Configurable latency targets per-job or global
+6. **Routing Integration**: SLO factor in AD-36 scoring formula
+7. **Health Integration**: SLO signal informs AD-16 health classification
+8. **Resource Correlation**: AD-41 resource pressure predicts latency (proactive)
+9. **SWIM Distribution**: Data flows through existing SWIM gossip hierarchy
+10. **Pure Python**: pip-installable, asyncio-compatible
+
+### Part 2: Architecture Comparison
+
+Before selecting an implementation approach, we evaluated four streaming percentile algorithms:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    STREAMING PERCENTILE ALGORITHMS                       │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  ┌──────────────────┬─────────────────┬─────────────────────────────┐   │
+│  │ Algorithm        │ Weakness        │ Comparison                   │   │
+│  ├──────────────────┼─────────────────┼─────────────────────────────┤   │
+│  │ HDR Histogram    │ Fixed range     │ T-Digest: dynamic range,    │   │
+│  │                  │ required        │ no pre-configuration         │   │
+│  ├──────────────────┼─────────────────┼─────────────────────────────┤   │
+│  │ P² Algorithm     │ Single quantile │ T-Digest: all quantiles,    │   │
+│  │                  │ at a time       │ mergeable across nodes       │   │
+│  ├──────────────────┼─────────────────┼─────────────────────────────┤   │
+│  │ Sorted buffer    │ O(n) memory     │ T-Digest: O(δ) memory,      │   │
+│  │                  │ unbounded       │ bounded at ~100 centroids    │   │
+│  ├──────────────────┼─────────────────┼─────────────────────────────┤   │
+│  │ Random sampling  │ Tail inaccuracy │ T-Digest: tail-optimized    │   │
+│  │                  │                 │ compression (p99, p99.9)     │   │
+│  └──────────────────┴─────────────────┴─────────────────────────────┘   │
+│                                                                          │
+│  RECOMMENDATION: T-Digest                                                │
+│                                                                          │
+│  Properties:                                                             │
+│  - Constant memory: O(δ) where δ controls accuracy (~100 centroids)    │
+│  - Accuracy: ~0.1% at tails (p99, p99.9), ~1% at median                │
+│  - Mergeable: Can combine digests from multiple SWIM nodes             │
+│  - Streaming: Update in O(1) amortized                                  │
+│  - Pure Python: Implementable with numpy (existing dependency)         │
+│                                                                          │
+│  WHY T-DIGEST FOR SLO:                                                   │
+│  - p95/p99 are typical SLO targets → tail accuracy critical            │
+│  - Workers, Managers, Gates all contribute → mergeability essential    │
+│  - Long-running jobs → bounded memory required                          │
+│  - Cross-DC aggregation → merge without transferring all samples       │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Part 3: SWIM Hierarchy for SLO Data
+
+SLO data flows through the existing 3-tier SWIM hierarchy, piggybacked on heartbeats:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    SLO DATA FLOW THROUGH SWIM HIERARCHY                  │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  TIER 1: WORKERS ←SWIM→ MANAGERS (per datacenter)                       │
+│  ─────────────────────────────────────────────────                      │
+│                                                                          │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │                        DATACENTER A                              │    │
+│  │                                                                  │    │
+│  │    Worker 1        Worker 2        Worker 3                     │    │
+│  │    ┌───────┐       ┌───────┐       ┌───────┐                    │    │
+│  │    │SWIM   │       │SWIM   │       │SWIM   │                    │    │
+│  │    │embed: │       │embed: │       │embed: │                    │    │
+│  │    │Worker │       │Worker │       │Worker │                    │    │
+│  │    │Hbeat  │       │Hbeat  │       │Hbeat  │                    │    │
+│  │    │+slo   │       │+slo   │       │+slo   │                    │    │
+│  │    └───┬───┘       └───┬───┘       └───┬───┘                    │    │
+│  │        │               │               │                        │    │
+│  │        └───────────────┼───────────────┘                        │    │
+│  │                        │ SWIM UDP                               │    │
+│  │                        ▼                                        │    │
+│  │    ┌─────────────────────────────────────────────────────┐      │    │
+│  │    │              MANAGER SWIM CLUSTER                    │      │    │
+│  │    │                                                      │      │    │
+│  │    │   Manager A1 ◀──SWIM──▶ Manager A2 ◀──SWIM──▶ A3    │      │    │
+│  │    │   ┌────────┐            ┌────────┐           ┌────┐ │      │    │
+│  │    │   │Merges  │            │Merges  │           │... │ │      │    │
+│  │    │   │Worker  │            │Worker  │           │    │ │      │    │
+│  │    │   │Digests │◀──────────▶│Digests │◀─────────▶│    │ │      │    │
+│  │    │   │        │  gossip    │        │           │    │ │      │    │
+│  │    │   └────────┘            └────────┘           └────┘ │      │    │
+│  │    └─────────────────────────────────────────────────────┘      │    │
+│  │                                                                  │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+│                                                                          │
+│  TIER 2: MANAGERS → GATES (TCP, cross-datacenter)                       │
+│  ─────────────────────────────────────────────────                      │
+│                                                                          │
+│     DC A Managers              DC B Managers              DC C          │
+│     ┌────────────┐            ┌────────────┐            ┌─────┐         │
+│     │ DC-level   │            │ DC-level   │            │ ... │         │
+│     │ SLO Summary│            │ SLO Summary│            │     │         │
+│     └─────┬──────┘            └─────┬──────┘            └──┬──┘         │
+│           │                         │                      │            │
+│           │ TCP ManagerHeartbeat    │                      │            │
+│           └─────────────────────────┼──────────────────────┘            │
+│                                     ▼                                   │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │                       GATE SWIM CLUSTER                          │    │
+│  │                                                                  │    │
+│  │     Gate 1 ◀────SWIM UDP────▶ Gate 2 ◀────SWIM UDP────▶ Gate 3  │    │
+│  │     ┌──────┐                  ┌──────┐                  ┌──────┐│    │
+│  │     │Rcv DC│                  │Rcv DC│                  │Rcv DC││    │
+│  │     │SLO   │◀────────────────▶│SLO   │◀────────────────▶│SLO   ││    │
+│  │     │Data  │      gossip      │Data  │                  │Data  ││    │
+│  │     └──────┘                  └──────┘                  └──────┘│    │
+│  │                                                                  │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+│                                                                          │
+│  DATA AT EACH TIER:                                                      │
+│                                                                          │
+│  Worker → Manager (SWIM):                                                │
+│    WorkerHeartbeat + latency_samples: list[float]                       │
+│                    + latency_digest_delta: bytes (incremental)          │
+│                                                                          │
+│  Manager ↔ Manager (SWIM):                                              │
+│    ManagerHeartbeat + slo_summary: dict[job_id, SLOSummary]             │
+│                     + dc_slo_health: str (HEALTHY/BUSY/DEGRADED)        │
+│                                                                          │
+│  Manager → Gate (TCP):                                                   │
+│    ManagerHeartbeat + slo_summary (per-DC aggregate)                    │
+│                     + dc_slo_health                                     │
+│                                                                          │
+│  Gate ↔ Gate (SWIM):                                                    │
+│    GateHeartbeat + dc_slo_summaries: dict[dc_id, SLOSummary]            │
+│                  + dc_slo_health: dict[dc_id, str]                      │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Part 4: Gossip Payload Design
+
+To minimize gossip overhead, we use compact summaries rather than full T-Digests:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    COMPACT SLO GOSSIP PAYLOADS                           │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  FULL T-DIGEST:                                                          │
+│  - ~100 centroids × 16 bytes = ~1.6KB per job                           │
+│  - Too large for SWIM gossip (UDP MTU ~1400 bytes)                      │
+│                                                                          │
+│  COMPACT SLO SUMMARY (for gossip):                                       │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │  @dataclass(slots=True)                                          │    │
+│  │  class SLOSummary:                                               │    │
+│  │      """Compact SLO summary for SWIM gossip (~32 bytes)."""      │    │
+│  │      p50_ms: float           # 4 bytes                           │    │
+│  │      p95_ms: float           # 4 bytes                           │    │
+│  │      p99_ms: float           # 4 bytes                           │    │
+│  │      sample_count: int       # 4 bytes                           │    │
+│  │      compliance_score: float # 4 bytes (pre-computed)            │    │
+│  │      routing_factor: float   # 4 bytes (for AD-36 scoring)       │    │
+│  │      updated_at: float       # 8 bytes (monotonic timestamp)     │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+│                                                                          │
+│  GOSSIP BUDGET ANALYSIS:                                                 │
+│                                                                          │
+│  Per-job SLO:          100 jobs × 32 bytes = 3.2 KB                     │
+│  Per-DC summary:       10 DCs × 32 bytes = 320 bytes                    │
+│  Per-DC health signal: 10 DCs × 8 bytes = 80 bytes                      │
+│  ─────────────────────────────────────────────────────                  │
+│  Total additional:     ~3.6 KB (acceptable for SWIM)                    │
+│                                                                          │
+│  HIERARCHICAL STATE:                                                     │
+│                                                                          │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │                                                                  │    │
+│  │  LAYER 1: LOCAL STATE (Full Fidelity)                           │    │
+│  │  ─────────────────────────────────────                          │    │
+│  │  Job Owner (Gate) or DC Leader (Manager) maintains:             │    │
+│  │  - Full T-Digest (~1.6KB per job)                               │    │
+│  │  - Exact percentile computation                                  │    │
+│  │  - Time-windowed samples                                         │    │
+│  │                                                                  │    │
+│  │  LAYER 2: GOSSIP STATE (Compact Summaries)                      │    │
+│  │  ─────────────────────────────────────────                      │    │
+│  │  Piggybacked in heartbeats:                                      │    │
+│  │  - SLOSummary (32 bytes per job/DC)                             │    │
+│  │  - Pre-computed routing_factor for immediate use                 │    │
+│  │  - Version/timestamp for staleness detection                     │    │
+│  │                                                                  │    │
+│  │  LAYER 3: MERGED STATE (Cluster-Wide View)                      │    │
+│  │  ─────────────────────────────────────────                      │    │
+│  │  Each node merges peer summaries using version ordering:         │    │
+│  │  - Latest version wins for same job/DC                          │    │
+│  │  - O(log n) convergence via SWIM gossip                         │    │
+│  │                                                                  │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Part 5: Environment Configuration
+
+All SLO parameters are configurable via the Env class:
+
+```python
+# ==========================================================================
+# SLO-Aware Routing Settings (AD-42)
+# ==========================================================================
+
+# T-Digest configuration
+SLO_TDIGEST_DELTA: StrictFloat = 100.0  # Compression parameter (higher = more accurate)
+SLO_TDIGEST_MAX_UNMERGED: StrictInt = 2048  # Max unmerged points before compression
+
+# Time windowing
+SLO_WINDOW_DURATION_SECONDS: StrictFloat = 60.0  # Each window bucket duration
+SLO_MAX_WINDOWS: StrictInt = 5  # Windows to retain (5 × 60s = 5 minutes)
+SLO_EVALUATION_WINDOW_SECONDS: StrictFloat = 300.0  # Window for SLO evaluation
+
+# Default SLO targets (can be overridden per-job)
+SLO_P50_TARGET_MS: StrictFloat = 50.0  # Median latency target
+SLO_P95_TARGET_MS: StrictFloat = 200.0  # 95th percentile target (primary)
+SLO_P99_TARGET_MS: StrictFloat = 500.0  # 99th percentile target (extreme tail)
+
+# SLO weight distribution (must sum to 1.0)
+SLO_P50_WEIGHT: StrictFloat = 0.2  # Weight for p50 in composite score
+SLO_P95_WEIGHT: StrictFloat = 0.5  # Weight for p95 (primary SLO)
+SLO_P99_WEIGHT: StrictFloat = 0.3  # Weight for p99
+
+# Confidence and scoring
+SLO_MIN_SAMPLE_COUNT: StrictInt = 100  # Minimum samples for confident scoring
+SLO_FACTOR_MIN: StrictFloat = 0.5  # Minimum SLO factor (maximum bonus)
+SLO_FACTOR_MAX: StrictFloat = 3.0  # Maximum SLO factor (maximum penalty)
+SLO_SCORE_WEIGHT: StrictFloat = 0.4  # Weight of SLO deviation in routing score
+
+# Health classification thresholds (SLO → AD-16 health signal)
+SLO_BUSY_P50_RATIO: StrictFloat = 1.5  # p50 at 1.5× target → BUSY
+SLO_DEGRADED_P95_RATIO: StrictFloat = 2.0  # p95 at 2× target → DEGRADED
+SLO_DEGRADED_P99_RATIO: StrictFloat = 3.0  # p99 at 3× target → DEGRADED
+SLO_UNHEALTHY_P99_RATIO: StrictFloat = 5.0  # p99 at 5× target → UNHEALTHY
+
+# Sustained violation windows for health transitions
+SLO_BUSY_WINDOW_SECONDS: StrictFloat = 60.0  # Sustained violation for BUSY
+SLO_DEGRADED_WINDOW_SECONDS: StrictFloat = 180.0  # Sustained violation for DEGRADED
+SLO_UNHEALTHY_WINDOW_SECONDS: StrictFloat = 300.0  # Sustained violation for UNHEALTHY
+
+# Resource correlation (AD-41 integration)
+SLO_ENABLE_RESOURCE_PREDICTION: StrictBool = True  # Use AD-41 metrics to predict SLO
+SLO_CPU_LATENCY_CORRELATION: StrictFloat = 0.7  # CPU pressure → latency correlation
+SLO_MEMORY_LATENCY_CORRELATION: StrictFloat = 0.4  # Memory pressure → latency (GC)
+SLO_PREDICTION_BLEND_WEIGHT: StrictFloat = 0.4  # Weight of predicted vs observed SLO
+
+# Gossip settings
+SLO_GOSSIP_SUMMARY_TTL_SECONDS: StrictFloat = 30.0  # Staleness threshold for summaries
+SLO_GOSSIP_MAX_JOBS_PER_HEARTBEAT: StrictInt = 100  # Max job summaries per heartbeat
+```
+
+### Part 6: T-Digest Implementation
+
+Pure Python T-Digest with numpy for performance:
+
+```python
+"""
+T-Digest implementation for streaming percentile estimation (AD-42).
+
+Based on the algorithm by Ted Dunning:
+https://github.com/tdunning/t-digest
+
+Key properties:
+- Streaming: Update in O(log δ) amortized
+- Accurate: ~0.1% error at tails (p99, p99.9)
+- Mergeable: Combine digests from SWIM nodes
+- Bounded: O(δ) memory where δ ≈ 100 centroids
+"""
+
+from dataclasses import dataclass, field
+
+import numpy as np
+
+from hyperscale.distributed.env import Env
+
+
+@dataclass(slots=True)
+class Centroid:
+    """A weighted centroid in the T-Digest."""
+    mean: float
+    weight: float
+
+
+@dataclass
+class TDigest:
+    """
+    T-Digest for streaming quantile estimation.
+
+    Uses the scaling function k1 (which provides better accuracy at tails):
+    k(q) = δ/2 * (arcsin(2q - 1) / π + 0.5)
+    """
+
+    _env: Env = field(default_factory=Env)
+
+    # Internal state
+    _centroids: list[Centroid] = field(default_factory=list, init=False)
+    _unmerged: list[float] = field(default_factory=list, init=False)
+    _total_weight: float = field(default=0.0, init=False)
+    _min: float = field(default=float('inf'), init=False)
+    _max: float = field(default=float('-inf'), init=False)
+
+    @property
+    def delta(self) -> float:
+        """Compression parameter from environment."""
+        return self._env.SLO_TDIGEST_DELTA
+
+    @property
+    def max_unmerged(self) -> int:
+        """Max unmerged points from environment."""
+        return self._env.SLO_TDIGEST_MAX_UNMERGED
+
+    def add(self, value: float, weight: float = 1.0) -> None:
+        """Add a value to the digest."""
+        self._unmerged.append(value)
+        self._total_weight += weight
+        self._min = min(self._min, value)
+        self._max = max(self._max, value)
+
+        if len(self._unmerged) >= self.max_unmerged:
+            self._compress()
+
+    def add_batch(self, values: list[float]) -> None:
+        """Add multiple values efficiently."""
+        for v in values:
+            self.add(v)
+
+    def _compress(self) -> None:
+        """Compress unmerged points into centroids."""
+        if not self._unmerged:
+            return
+
+        # Combine existing centroids with unmerged points
+        all_points: list[tuple[float, float]] = []
+        for c in self._centroids:
+            all_points.append((c.mean, c.weight))
+        for v in self._unmerged:
+            all_points.append((v, 1.0))
+
+        # Sort by value
+        all_points.sort(key=lambda x: x[0])
+
+        # Rebuild centroids using clustering
+        new_centroids: list[Centroid] = []
+
+        if not all_points:
+            self._centroids = new_centroids
+            self._unmerged.clear()
+            return
+
+        # Start with first point
+        current_mean = all_points[0][0]
+        current_weight = all_points[0][1]
+        cumulative_weight = current_weight
+
+        for mean, weight in all_points[1:]:
+            # Calculate the size limit for the current centroid
+            q = cumulative_weight / self._total_weight if self._total_weight > 0 else 0.5
+            limit = self._k_inverse(self._k(q) + 1.0) - q
+            max_weight = self._total_weight * limit
+
+            if current_weight + weight <= max_weight:
+                # Merge into current centroid
+                new_weight = current_weight + weight
+                current_mean = (current_mean * current_weight + mean * weight) / new_weight
+                current_weight = new_weight
+            else:
+                # Save current centroid and start new one
+                new_centroids.append(Centroid(current_mean, current_weight))
+                current_mean = mean
+                current_weight = weight
+
+            cumulative_weight += weight
+
+        # Don't forget the last centroid
+        new_centroids.append(Centroid(current_mean, current_weight))
+
+        self._centroids = new_centroids
+        self._unmerged.clear()
+
+    def _k(self, q: float) -> float:
+        """Scaling function k(q) = δ/2 * (arcsin(2q-1)/π + 0.5)"""
+        return (self.delta / 2.0) * (np.arcsin(2.0 * q - 1.0) / np.pi + 0.5)
+
+    def _k_inverse(self, k: float) -> float:
+        """Inverse scaling function."""
+        return 0.5 * (np.sin((k / (self.delta / 2.0) - 0.5) * np.pi) + 1.0)
+
+    def quantile(self, q: float) -> float:
+        """Get the value at quantile q (0 <= q <= 1)."""
+        if q < 0.0 or q > 1.0:
+            raise ValueError(f"Quantile must be in [0, 1], got {q}")
+
+        self._compress()
+
+        if not self._centroids:
+            return 0.0
+
+        if q == 0.0:
+            return self._min
+        if q == 1.0:
+            return self._max
+
+        target_weight = q * self._total_weight
+        cumulative = 0.0
+
+        for i, centroid in enumerate(self._centroids):
+            if cumulative + centroid.weight >= target_weight:
+                if i == 0:
+                    weight_after = cumulative + centroid.weight / 2
+                    if target_weight <= weight_after:
+                        ratio = target_weight / max(weight_after, 1e-10)
+                        return self._min + ratio * (centroid.mean - self._min)
+
+                prev = self._centroids[i - 1] if i > 0 else None
+                if prev is not None:
+                    mid_prev = cumulative - prev.weight / 2
+                    mid_curr = cumulative + centroid.weight / 2
+                    ratio = (target_weight - mid_prev) / max(mid_curr - mid_prev, 1e-10)
+                    return prev.mean + ratio * (centroid.mean - prev.mean)
+
+                return centroid.mean
+
+            cumulative += centroid.weight
+
+        return self._max
+
+    def p50(self) -> float:
+        """Median."""
+        return self.quantile(0.50)
+
+    def p95(self) -> float:
+        """95th percentile."""
+        return self.quantile(0.95)
+
+    def p99(self) -> float:
+        """99th percentile."""
+        return self.quantile(0.99)
+
+    def count(self) -> float:
+        """Total weight (count if weights are 1)."""
+        return self._total_weight
+
+    def merge(self, other: "TDigest") -> "TDigest":
+        """Merge another digest into this one (for SWIM aggregation)."""
+        other._compress()
+        for c in other._centroids:
+            self._unmerged.extend([c.mean] * int(c.weight))
+
+        self._total_weight += other._total_weight
+        self._min = min(self._min, other._min)
+        self._max = max(self._max, other._max)
+
+        self._compress()
+        return self
+
+    def to_bytes(self) -> bytes:
+        """Serialize for SWIM gossip transfer."""
+        self._compress()
+        import msgspec
+        return msgspec.msgpack.encode({
+            "centroids": [(c.mean, c.weight) for c in self._centroids],
+            "total_weight": self._total_weight,
+            "min": self._min if self._min != float('inf') else None,
+            "max": self._max if self._max != float('-inf') else None,
+        })
+
+    @classmethod
+    def from_bytes(cls, data: bytes, env: Env | None = None) -> "TDigest":
+        """Deserialize from SWIM gossip transfer."""
+        import msgspec
+        parsed = msgspec.msgpack.decode(data)
+        digest = cls(_env=env or Env())
+        digest._centroids = [
+            Centroid(mean=m, weight=w)
+            for m, w in parsed.get("centroids", [])
+        ]
+        digest._total_weight = parsed.get("total_weight", 0.0)
+        digest._min = parsed.get("min") if parsed.get("min") is not None else float('inf')
+        digest._max = parsed.get("max") if parsed.get("max") is not None else float('-inf')
+        return digest
+```
+
+### Part 7: SLO Models and Compliance Scoring
+
+```python
+"""
+SLO definitions and compliance scoring (AD-42).
+"""
+
+from dataclasses import dataclass, field
+from enum import Enum, auto
+from time import monotonic
+
+from hyperscale.distributed.env import Env
+
+
+class SLOComplianceLevel(Enum):
+    """SLO compliance classification."""
+    EXCEEDING = auto()  # Well below targets (bonus)
+    MEETING = auto()  # At or below targets
+    WARNING = auto()  # Approaching targets (80-100%)
+    VIOLATING = auto()  # Above targets (100-150%)
+    CRITICAL = auto()  # Severely above targets (>150%)
+
+
+@dataclass(frozen=True, slots=True)
+class LatencySLO:
+    """Latency SLO definition with Env-configurable defaults."""
+
+    p50_target_ms: float
+    p95_target_ms: float
+    p99_target_ms: float
+    p50_weight: float
+    p95_weight: float
+    p99_weight: float
+    min_sample_count: int
+    evaluation_window_seconds: float
+
+    @classmethod
+    def from_env(cls, env: Env) -> "LatencySLO":
+        """Create SLO from environment configuration."""
+        return cls(
+            p50_target_ms=env.SLO_P50_TARGET_MS,
+            p95_target_ms=env.SLO_P95_TARGET_MS,
+            p99_target_ms=env.SLO_P99_TARGET_MS,
+            p50_weight=env.SLO_P50_WEIGHT,
+            p95_weight=env.SLO_P95_WEIGHT,
+            p99_weight=env.SLO_P99_WEIGHT,
+            min_sample_count=env.SLO_MIN_SAMPLE_COUNT,
+            evaluation_window_seconds=env.SLO_EVALUATION_WINDOW_SECONDS,
+        )
+
+
+@dataclass(slots=True)
+class LatencyObservation:
+    """Observed latency percentiles for a target."""
+
+    target_id: str  # datacenter_id, manager_id, etc.
+    p50_ms: float
+    p95_ms: float
+    p99_ms: float
+    sample_count: int
+    window_start: float
+    window_end: float
+
+    def is_stale(self, max_age_seconds: float) -> bool:
+        return (monotonic() - self.window_end) > max_age_seconds
+
+
+@dataclass(slots=True)
+class SLOComplianceScore:
+    """Computed SLO compliance for a target."""
+
+    target_id: str
+    p50_ratio: float
+    p95_ratio: float
+    p99_ratio: float
+    composite_score: float
+    confidence: float
+    compliance_level: SLOComplianceLevel
+    routing_factor: float  # For AD-36 scoring integration
+
+    @classmethod
+    def calculate(
+        cls,
+        target_id: str,
+        observation: LatencyObservation,
+        slo: LatencySLO,
+        env: Env,
+    ) -> "SLOComplianceScore":
+        """Calculate compliance score from observation."""
+
+        # Calculate ratios
+        p50_ratio = observation.p50_ms / slo.p50_target_ms
+        p95_ratio = observation.p95_ms / slo.p95_target_ms
+        p99_ratio = observation.p99_ms / slo.p99_target_ms
+
+        # Weighted composite
+        composite = (
+            slo.p50_weight * p50_ratio +
+            slo.p95_weight * p95_ratio +
+            slo.p99_weight * p99_ratio
+        )
+
+        # Confidence based on sample count
+        confidence = min(1.0, observation.sample_count / slo.min_sample_count)
+
+        # Adjust composite for low confidence (assume neutral)
+        if confidence < 1.0:
+            composite = composite * confidence + 1.0 * (1.0 - confidence)
+
+        # Classification
+        if composite < 0.8:
+            level = SLOComplianceLevel.EXCEEDING
+        elif composite < 1.0:
+            level = SLOComplianceLevel.MEETING
+        elif composite < 1.2:
+            level = SLOComplianceLevel.WARNING
+        elif composite < 1.5:
+            level = SLOComplianceLevel.VIOLATING
+        else:
+            level = SLOComplianceLevel.CRITICAL
+
+        # Routing factor from environment
+        a_slo = env.SLO_SCORE_WEIGHT
+        routing_factor = 1.0 + a_slo * (composite - 1.0)
+        routing_factor = max(env.SLO_FACTOR_MIN, min(env.SLO_FACTOR_MAX, routing_factor))
+
+        return cls(
+            target_id=target_id,
+            p50_ratio=p50_ratio,
+            p95_ratio=p95_ratio,
+            p99_ratio=p99_ratio,
+            composite_score=composite,
+            confidence=confidence,
+            compliance_level=level,
+            routing_factor=routing_factor,
+        )
+```
+
+### Part 8: Integration with AD-16 Health Classification
+
+SLO violations contribute to datacenter health classification:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    SLO → AD-16 HEALTH INTEGRATION                        │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  COMPOSITE HEALTH = min(manager_signal, resource_signal, slo_signal)    │
+│                                                                          │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │                                                                  │    │
+│  │  MANAGER SIGNAL (existing AD-16):                               │    │
+│  │  - All managers NOT liveness → UNHEALTHY                        │    │
+│  │  - Majority managers NOT readiness → DEGRADED                   │    │
+│  │  - Otherwise → HEALTHY                                          │    │
+│  │                                                                  │    │
+│  │  RESOURCE SIGNAL (AD-41):                                       │    │
+│  │  - Cluster CPU > 95% sustained → UNHEALTHY                      │    │
+│  │  - Cluster CPU > 80% sustained → DEGRADED                       │    │
+│  │  - Cluster CPU 60-80% → BUSY                                    │    │
+│  │  - Otherwise → HEALTHY                                          │    │
+│  │                                                                  │    │
+│  │  SLO SIGNAL (NEW AD-42):                                        │    │
+│  │  - p99 > 5× target for 5 minutes → UNHEALTHY                    │    │
+│  │  - p95 > 2× OR p99 > 3× for 3 minutes → DEGRADED                │    │
+│  │  - p50 > 1.5× for 1 minute → BUSY                               │    │
+│  │  - Otherwise → HEALTHY                                          │    │
+│  │                                                                  │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+│                                                                          │
+│  IMPLEMENTATION:                                                         │
+│                                                                          │
+│  @dataclass                                                              │
+│  class SLOHealthClassifier:                                              │
+│      """Converts SLO compliance to AD-16 health signal."""               │
+│                                                                          │
+│      _env: Env                                                           │
+│      _violation_start: dict[str, float] = field(default_factory=dict)   │
+│                                                                          │
+│      def compute_health_signal(                                          │
+│          self,                                                           │
+│          dc_id: str,                                                     │
+│          slo: LatencySLO,                                                │
+│          observation: LatencyObservation,                                │
+│      ) -> str:                                                           │
+│          """Returns: HEALTHY, BUSY, DEGRADED, or UNHEALTHY."""           │
+│                                                                          │
+│          now = monotonic()                                               │
+│                                                                          │
+│          p50_ratio = observation.p50_ms / slo.p50_target_ms              │
+│          p95_ratio = observation.p95_ms / slo.p95_target_ms              │
+│          p99_ratio = observation.p99_ms / slo.p99_target_ms              │
+│                                                                          │
+│          # Track violation duration                                       │
+│          is_violating = (                                                │
+│              p50_ratio > self._env.SLO_BUSY_P50_RATIO or                 │
+│              p95_ratio > 1.0 or                                          │
+│              p99_ratio > 1.0                                             │
+│          )                                                               │
+│                                                                          │
+│          if is_violating:                                                │
+│              if dc_id not in self._violation_start:                      │
+│                  self._violation_start[dc_id] = now                      │
+│              duration = now - self._violation_start[dc_id]               │
+│          else:                                                           │
+│              self._violation_start.pop(dc_id, None)                      │
+│              return "HEALTHY"                                            │
+│                                                                          │
+│          # Check thresholds with sustained duration                      │
+│          if (p99_ratio >= self._env.SLO_UNHEALTHY_P99_RATIO and          │
+│              duration >= self._env.SLO_UNHEALTHY_WINDOW_SECONDS):        │
+│              return "UNHEALTHY"                                          │
+│                                                                          │
+│          if (duration >= self._env.SLO_DEGRADED_WINDOW_SECONDS and       │
+│              (p95_ratio >= self._env.SLO_DEGRADED_P95_RATIO or           │
+│               p99_ratio >= self._env.SLO_DEGRADED_P99_RATIO)):           │
+│              return "DEGRADED"                                           │
+│                                                                          │
+│          if (duration >= self._env.SLO_BUSY_WINDOW_SECONDS and           │
+│              p50_ratio >= self._env.SLO_BUSY_P50_RATIO):                 │
+│              return "BUSY"                                               │
+│                                                                          │
+│          return "HEALTHY"                                                │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Part 9: Integration with AD-41 Resource Guards
+
+Resource pressure from AD-41 predicts latency violations before they occur:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    RESOURCE → LATENCY PREDICTION (AD-41 + AD-42)         │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  OBSERVATION: Resource pressure predicts latency degradation             │
+│                                                                          │
+│  CPU Pressure Timeline:                                                  │
+│  ────────────────────────────────────────────────────────────────▶      │
+│  40%      50%      60%      70%      80%      90%                       │
+│   │        │        │        │        │        │                        │
+│   │        │        │        │        │        └─ p99 spikes (queue)    │
+│   │        │        │        │        └─ p95 rises                      │
+│   │        │        │        └─ p50 starts climbing                     │
+│   │        │        └─ PREDICTIVE SIGNAL (AD-41 detects)                │
+│   │        │                                                            │
+│   ▼        ▼                                                            │
+│  Normal  Warning Zone                                                    │
+│                                                                          │
+│  IMPLEMENTATION:                                                         │
+│                                                                          │
+│  @dataclass                                                              │
+│  class ResourceAwareSLOPredictor:                                        │
+│      """Predicts SLO violations from AD-41 resource metrics."""          │
+│                                                                          │
+│      _env: Env                                                           │
+│                                                                          │
+│      def predict_slo_risk(                                               │
+│          self,                                                           │
+│          cpu_pressure: float,      # From AD-41 Kalman filter           │
+│          cpu_uncertainty: float,   # Kalman uncertainty                 │
+│          memory_pressure: float,                                         │
+│          memory_uncertainty: float,                                      │
+│          current_slo_score: float, # From T-Digest observation          │
+│      ) -> float:                                                         │
+│          """                                                             │
+│          Returns predicted SLO risk factor (1.0 = normal, >1.0 = risk). │
+│                                                                          │
+│          Uses Kalman uncertainty to weight prediction confidence.        │
+│          High uncertainty → less weight on resource signal.              │
+│          """                                                             │
+│          # Weight by inverse uncertainty                                 │
+│          cpu_confidence = 1.0 / (1.0 + cpu_uncertainty / 20.0)          │
+│          mem_confidence = 1.0 / (1.0 + memory_uncertainty / 1e8)        │
+│                                                                          │
+│          cpu_contribution = (                                            │
+│              cpu_pressure *                                              │
+│              self._env.SLO_CPU_LATENCY_CORRELATION *                     │
+│              cpu_confidence                                              │
+│          )                                                               │
+│          mem_contribution = (                                            │
+│              memory_pressure *                                           │
+│              self._env.SLO_MEMORY_LATENCY_CORRELATION *                  │
+│              mem_confidence                                              │
+│          )                                                               │
+│                                                                          │
+│          predicted_risk = 1.0 + cpu_contribution + mem_contribution     │
+│                                                                          │
+│          # Blend predicted with observed                                 │
+│          blend = self._env.SLO_PREDICTION_BLEND_WEIGHT                   │
+│          return (1.0 - blend) * current_slo_score + blend * predicted_risk│
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Part 10: Extended Routing Scorer (AD-36 Integration)
+
+```python
+"""
+SLO-aware routing scorer (extends AD-36).
+"""
+
+from dataclasses import dataclass
+
+from hyperscale.distributed.env import Env
+from hyperscale.distributed.routing.candidate_filter import DatacenterCandidate
+from hyperscale.distributed.resources.slo.slo_models import SLOComplianceScore
+
+
+@dataclass(slots=True)
+class SLOAwareRoutingScore:
+    """Extended routing score with SLO factor."""
+
+    datacenter_id: str
+
+    # Base components (from AD-36)
+    rtt_ucb_ms: float
+    load_factor: float
+    quality_penalty: float
+    preference_multiplier: float
+
+    # Resource component (from AD-41)
+    resource_factor: float
+
+    # SLO component (NEW)
+    slo_factor: float
+    slo_compliance: SLOComplianceScore | None
+
+    # Final score (lower is better)
+    final_score: float
+
+
+class SLOAwareRoutingScorer:
+    """
+    SLO-aware routing scorer (extends AD-36 RoutingScorer).
+
+    Extended score formula:
+        score = rtt_ucb × load_factor × quality_penalty ×
+                resource_factor × slo_factor × pref_mult
+
+    Component sources:
+        rtt_ucb:           AD-35 Vivaldi coordinates
+        load_factor:       AD-36 queue/utilization
+        quality_penalty:   AD-35 coordinate quality
+        resource_factor:   AD-41 CPU/memory pressure
+        slo_factor:        AD-42 latency SLO compliance
+        pref_mult:         AD-36 preferred DC bonus
+    """
+
+    def __init__(self, env: Env) -> None:
+        self._env = env
+
+    def score_datacenter(
+        self,
+        candidate: DatacenterCandidate,
+        slo_compliance: SLOComplianceScore | None = None,
+        resource_pressure: tuple[float, float] | None = None,  # (cpu, mem)
+        is_preferred: bool = False,
+    ) -> SLOAwareRoutingScore:
+        """Score a datacenter with SLO and resource awareness."""
+
+        # Calculate utilization
+        if candidate.total_cores > 0:
+            utilization = 1.0 - (candidate.available_cores / candidate.total_cores)
+        else:
+            utilization = 1.0
+
+        # Queue factor
+        queue_smoothing = 10.0
+        queue_normalized = candidate.queue_depth / (
+            candidate.queue_depth + queue_smoothing
+        )
+
+        # Load factor (from AD-36)
+        load_factor = (
+            1.0
+            + 0.5 * utilization
+            + 0.3 * queue_normalized
+            + 0.2 * candidate.circuit_breaker_pressure
+        )
+        load_factor = min(load_factor, 5.0)
+
+        # Quality penalty (from AD-36)
+        quality_penalty = 1.0 + 0.5 * (1.0 - candidate.coordinate_quality)
+        quality_penalty = min(quality_penalty, 2.0)
+
+        # Resource factor (from AD-41)
+        if resource_pressure is not None:
+            cpu_pressure, mem_pressure = resource_pressure
+            resource_factor = 1.0 + 0.3 * cpu_pressure + 0.2 * mem_pressure
+            resource_factor = min(resource_factor, 2.5)
+        else:
+            resource_factor = 1.0
+
+        # SLO factor (NEW)
+        if slo_compliance is not None:
+            slo_factor = slo_compliance.routing_factor
+        else:
+            slo_factor = 1.0
+        slo_factor = max(
+            self._env.SLO_FACTOR_MIN,
+            min(self._env.SLO_FACTOR_MAX, slo_factor)
+        )
+
+        # Preference multiplier
+        pref_mult = 0.9 if is_preferred else 1.0
+
+        # Final score (lower is better)
+        final_score = (
+            candidate.rtt_ucb_ms *
+            load_factor *
+            quality_penalty *
+            resource_factor *
+            slo_factor *
+            pref_mult
+        )
+
+        return SLOAwareRoutingScore(
+            datacenter_id=candidate.datacenter_id,
+            rtt_ucb_ms=candidate.rtt_ucb_ms,
+            load_factor=load_factor,
+            quality_penalty=quality_penalty,
+            preference_multiplier=pref_mult,
+            resource_factor=resource_factor,
+            slo_factor=slo_factor,
+            slo_compliance=slo_compliance,
+            final_score=final_score,
+        )
+```
+
+### Part 11: Data Flow Example
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    SLO-AWARE ROUTING DATA FLOW EXAMPLE                   │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  1. LATENCY COLLECTION (Worker → Manager via SWIM)                      │
+│  ─────────────────────────────────────────────────                      │
+│                                                                          │
+│  Worker completes workflow step:                                         │
+│    step_latency = 145.3ms                                               │
+│    worker_heartbeat.latency_samples.append(145.3)                       │
+│                                                                          │
+│  SWIM probe to Manager embeds WorkerHeartbeat with samples              │
+│                                                                          │
+│  Manager receives and updates T-Digest:                                  │
+│    digest.add_batch(heartbeat.latency_samples)                          │
+│                                                                          │
+│  2. MANAGER AGGREGATION (Manager ↔ Manager via SWIM)                    │
+│  ────────────────────────────────────────────────────                   │
+│                                                                          │
+│  Manager computes DC-level SLO summary:                                  │
+│    p50 = digest.p50()  # 45ms                                           │
+│    p95 = digest.p95()  # 180ms                                          │
+│    p99 = digest.p99()  # 420ms                                          │
+│    summary = SLOSummary(p50=45, p95=180, p99=420, count=1523)           │
+│                                                                          │
+│  Summary piggybacked in ManagerHeartbeat to peer managers               │
+│                                                                          │
+│  3. GATE AGGREGATION (Manager → Gate via TCP, Gate ↔ Gate via SWIM)     │
+│  ──────────────────────────────────────────────────────────────────     │
+│                                                                          │
+│  Gate receives ManagerHeartbeat with DC SLO summary                     │
+│  Gate gossips summary to peer gates via GateHeartbeat                   │
+│                                                                          │
+│  4. ROUTING DECISION                                                     │
+│  ────────────────────                                                   │
+│                                                                          │
+│  New job arrives at Gate:                                                │
+│                                                                          │
+│  For each DC candidate:                                                  │
+│    observation = LatencyObservation(                                     │
+│        target_id="dc-east",                                             │
+│        p50_ms=45, p95_ms=180, p99_ms=420,                               │
+│        sample_count=1523                                                 │
+│    )                                                                     │
+│                                                                          │
+│    compliance = SLOComplianceScore.calculate(                            │
+│        observation=observation,                                          │
+│        slo=LatencySLO.from_env(env),                                    │
+│    )                                                                     │
+│    # → composite_score=0.88, routing_factor=0.95                        │
+│                                                                          │
+│    score = SLOAwareRoutingScorer.score_datacenter(                       │
+│        candidate=dc_candidate,                                           │
+│        slo_compliance=compliance,                                        │
+│        resource_pressure=(0.65, 0.45),  # From AD-41                    │
+│    )                                                                     │
+│                                                                          │
+│  Route to DC with lowest final_score                                     │
+│                                                                          │
+│  5. COMPARISON: MEETING SLO vs VIOLATING SLO                            │
+│  ─────────────────────────────────────────────                          │
+│                                                                          │
+│  DC "east" (meeting SLO):                                                │
+│    p50=45ms, p95=180ms, p99=420ms                                       │
+│    ratios: 0.90, 0.90, 0.84                                             │
+│    composite: 0.88, routing_factor: 0.95                                │
+│    score = 145 × 1.2 × 1.05 × 1.15 × 0.95 × 1.0 = 199.5                │
+│                                                                          │
+│  DC "west" (violating SLO):                                              │
+│    p50=80ms, p95=350ms, p99=800ms                                       │
+│    ratios: 1.60, 1.75, 1.60                                             │
+│    composite: 1.68, routing_factor: 1.27                                │
+│    score = 120 × 1.1 × 1.0 × 1.10 × 1.27 × 1.0 = 184.5                 │
+│                                                                          │
+│  Even with lower RTT (120 vs 145), DC "west" scores worse due to        │
+│  SLO violation penalty. If violation were more severe (ratio > 2.0),    │
+│  DC "east" would clearly win despite higher RTT.                        │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Part 12: Implementation Guide
+
+#### File Structure
+
+```
+hyperscale/distributed/
+├── slo/
+│   ├── __init__.py
+│   ├── tdigest.py              # T-Digest implementation
+│   ├── slo_models.py           # LatencySLO, SLOComplianceScore
+│   ├── latency_tracker.py      # LatencyDigestTracker (time-windowed)
+│   ├── slo_health_classifier.py # SLO → AD-16 health signal
+│   ├── resource_predictor.py   # AD-41 → SLO prediction
+│   └── slo_gossip.py           # SWIM piggybacking for SLO data
+├── routing/
+│   ├── slo_aware_scorer.py     # SLOAwareRoutingScorer
+│   └── ... (existing)
+└── env/
+    └── env.py                  # Add SLO_* configuration
+```
+
+#### Integration Points
+
+1. **WorkerHeartbeat** (distributed/models/distributed.py):
+   - Add `latency_samples: list[float]` field
+   - Add `latency_digest_delta: bytes` field (optional, for incremental updates)
+
+2. **ManagerHeartbeat** (distributed/models/distributed.py):
+   - Add `slo_summary: dict[str, SLOSummary]` field (job_id → summary)
+   - Add `dc_slo_health: str` field (HEALTHY/BUSY/DEGRADED/UNHEALTHY)
+
+3. **GateHeartbeat** (distributed/models/distributed.py):
+   - Add `dc_slo_summaries: dict[str, SLOSummary]` field (dc_id → summary)
+   - Add `dc_slo_health: dict[str, str]` field (dc_id → health signal)
+
+4. **WorkerStateEmbedder** (distributed/swim/core/state_embedder.py):
+   - Collect latency samples from workflow execution
+   - Embed in WorkerHeartbeat for SWIM gossip
+
+5. **ManagerStateEmbedder** (distributed/swim/core/state_embedder.py):
+   - Aggregate worker digests into DC-level summary
+   - Embed in ManagerHeartbeat for SWIM/TCP gossip
+
+6. **GateStateEmbedder** (distributed/swim/core/state_embedder.py):
+   - Collect DC summaries from ManagerHeartbeats
+   - Gossip to peer gates via GateHeartbeat
+
+7. **GateJobRouter** (distributed/routing/gate_job_router.py):
+   - Use SLOAwareRoutingScorer instead of RoutingScorer
+   - Pass SLO compliance and resource pressure to scoring
+
+8. **DatacenterHealthManager** (distributed/datacenters/datacenter_health_manager.py):
+   - Integrate SLO health signal into composite health
+
+### Part 13: Failure Mode Analysis
+
+| Failure | Impact | Mitigation |
+|---------|--------|------------|
+| Worker latency samples lost | Incomplete digest | Merge from peers; use best available |
+| Manager digest stale | Inaccurate DC SLO | Staleness detection; use peer data |
+| Gate receives conflicting summaries | Inconsistent view | Latest version wins (timestamp) |
+| T-Digest compression loses accuracy | Percentile error | Use δ=100 for ~0.1% tail accuracy |
+| SLO misconfigured (too tight) | All DCs "violating" | Minimum samples before penalty |
+| SLO misconfigured (too loose) | Violations undetected | Monitor actual p95/p99 externally |
+| Resource prediction wrong | Bad routing | Blend with observed SLO (40/60 mix) |
+| Gossip delayed | Stale SLO data | 30s staleness threshold |
+| DC flapping SLO state | Routing oscillation | Hysteresis from AD-36 still applies |
+
+### Part 14: Design Decision Summary
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    AD-42 DESIGN DECISION SUMMARY                         │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  DECISION                  CHOICE                 RATIONALE              │
+│  ────────────────────────────────────────────────────────────────────── │
+│                                                                          │
+│  Percentile algorithm      T-Digest               Tail-accurate,         │
+│                                                   mergeable, bounded     │
+│                                                   memory, pure Python    │
+│                                                                          │
+│  Gossip format             Compact summary        Full digest too large  │
+│                            (32 bytes/job)         for SWIM; summary has  │
+│                                                   pre-computed factor    │
+│                                                                          │
+│  Latency source            Workflow step          End-to-end captures    │
+│                            execution time         actual user experience │
+│                                                                          │
+│  SLO configuration         Env variables          Consistent with        │
+│                            + per-job override     existing patterns      │
+│                                                                          │
+│  Health integration        Worst signal wins      Conservative; ensures  │
+│                            (manager ∩ resource    problems not hidden    │
+│                            ∩ slo)                                        │
+│                                                                          │
+│  Resource prediction       Kalman uncertainty     High confidence →      │
+│                            weighted               trust prediction more  │
+│                                                                          │
+│  Routing integration       Multiplicative         Compounds with         │
+│                            factor in AD-36        existing load/quality  │
+│                                                                          │
+│  Time windowing            5-minute default       Balances freshness     │
+│                            (Env configurable)     with stability         │
+│                                                                          │
+│  SWIM tier integration     Piggyback on           Zero additional        │
+│                            existing heartbeats    network messages       │
+│                                                                          │
+│  WHY THIS IS CORRECT:                                                    │
+│                                                                          │
+│  1. T-Digest is mathematically optimal for streaming tail percentiles  │
+│  2. SWIM piggybacking uses existing infrastructure (no new protocols)  │
+│  3. Compact summaries fit within UDP MTU constraints                    │
+│  4. Resource prediction enables proactive routing (AD-41 synergy)      │
+│  5. Health integration ensures SLO violations affect routing (AD-16)   │
+│  6. Scoring integration is multiplicative (AD-36 formula extension)    │
+│  7. All parameters are Env-configurable for tuning                     │
+│  8. Pure Python + numpy (existing dependency)                          │
+│  9. Asyncio-compatible throughout                                       │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
