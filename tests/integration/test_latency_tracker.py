@@ -258,7 +258,7 @@ class TestLatencyTrackerFailureModes:
         time.sleep(0.05)
         tracker.record_latency("peer-1", 200.0)  # Will expire
 
-        time.sleep(0.08)
+        time.sleep(0.12)  # Wait long enough for both to expire (0.05 + 0.12 = 0.17 > 0.15)
 
         # First two should have expired
         tracker.record_latency("peer-1", 10.0)  # Fresh
