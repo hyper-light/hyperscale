@@ -541,3 +541,237 @@ class ManagerHealthMonitor:
             "global_dead_workers": len(self._global_dead_workers),
             "jobs_with_dead_workers": len(self._job_dead_workers),
         }
+
+
+class ExtensionTracker:
+    """
+    Tracks healthcheck extensions for a worker (AD-26).
+
+    Implements logarithmic grant reduction to prevent abuse
+    while allowing legitimate long-running operations.
+
+    Grant formula: grant = max(min_grant, base_deadline / (2^extension_count))
+
+    Extension denied if:
+    - No progress since last extension
+    - Total extensions exceed max
+    - Node is already marked suspect
+    """
+
+    __slots__ = (
+        "worker_id",
+        "base_deadline",
+        "min_grant",
+        "max_extensions",
+        "extension_count",
+        "last_progress",
+        "total_extended",
+    )
+
+    def __init__(
+        self,
+        worker_id: str,
+        base_deadline: float = 30.0,
+        min_grant: float = 1.0,
+        max_extensions: int = 5,
+    ) -> None:
+        """
+        Initialize extension tracker.
+
+        Args:
+            worker_id: Worker being tracked
+            base_deadline: Base deadline in seconds
+            min_grant: Minimum grant amount in seconds
+            max_extensions: Maximum number of extensions allowed
+        """
+        self.worker_id = worker_id
+        self.base_deadline = base_deadline
+        self.min_grant = min_grant
+        self.max_extensions = max_extensions
+        self.extension_count = 0
+        self.last_progress = 0.0
+        self.total_extended = 0.0
+
+    def request_extension(
+        self,
+        reason: str,
+        current_progress: float,
+    ) -> tuple[bool, float]:
+        """
+        Request deadline extension.
+
+        Args:
+            reason: Reason for extension ("long_workflow", "gc_pause", etc.)
+            current_progress: Current progress 0.0-1.0
+
+        Returns:
+            (granted, extension_seconds) tuple
+        """
+        # Deny if too many extensions
+        if self.extension_count >= self.max_extensions:
+            return False, 0.0
+
+        # Deny if no progress (except first extension)
+        if current_progress <= self.last_progress and self.extension_count > 0:
+            return False, 0.0
+
+        # Calculate grant with logarithmic reduction
+        grant = max(
+            self.min_grant,
+            self.base_deadline / (2 ** self.extension_count)
+        )
+
+        self.extension_count += 1
+        self.last_progress = current_progress
+        self.total_extended += grant
+
+        return True, grant
+
+    def reset(self) -> None:
+        """Reset tracker when worker completes operation or recovers."""
+        self.extension_count = 0
+        self.last_progress = 0.0
+        self.total_extended = 0.0
+
+    def get_remaining_extensions(self) -> int:
+        """Get number of remaining extensions available."""
+        return max(0, self.max_extensions - self.extension_count)
+
+    def get_denial_reason(self, current_progress: float) -> str:
+        """
+        Get reason for denial.
+
+        Args:
+            current_progress: Current progress value
+
+        Returns:
+            Human-readable denial reason
+        """
+        if self.extension_count >= self.max_extensions:
+            return f"Maximum extensions ({self.max_extensions}) exceeded"
+        if current_progress <= self.last_progress:
+            return f"No progress since last extension (was {self.last_progress:.2f}, now {current_progress:.2f})"
+        return "Extension denied"
+
+
+class HealthcheckExtensionManager:
+    """
+    Manages healthcheck extensions for all workers (AD-26).
+
+    Handles extension requests from workers and updates deadlines.
+    """
+
+    def __init__(
+        self,
+        config: "ManagerConfig",
+        logger: "Logger",
+        node_id: str,
+        task_runner,
+    ) -> None:
+        self._config = config
+        self._logger = logger
+        self._node_id = node_id
+        self._task_runner = task_runner
+
+        # Per-worker extension trackers
+        self._extension_trackers: dict[str, ExtensionTracker] = {}
+        # Current deadlines per worker
+        self._worker_deadlines: dict[str, float] = {}
+
+    def handle_extension_request(
+        self,
+        worker_id: str,
+        reason: str,
+        current_progress: float,
+        estimated_completion: float,
+    ) -> tuple[bool, float, float, int, str | None]:
+        """
+        Process extension request from worker.
+
+        Args:
+            worker_id: Worker requesting extension
+            reason: Reason for request
+            current_progress: Current progress 0.0-1.0
+            estimated_completion: Unix timestamp of estimated completion
+
+        Returns:
+            (granted, extension_seconds, new_deadline, remaining_extensions, denial_reason)
+        """
+        tracker = self._extension_trackers.setdefault(
+            worker_id,
+            ExtensionTracker(worker_id=worker_id)
+        )
+
+        granted, extension_seconds = tracker.request_extension(
+            reason=reason,
+            current_progress=current_progress,
+        )
+
+        if granted:
+            current_deadline = self._worker_deadlines.get(
+                worker_id,
+                time.monotonic() + 30.0
+            )
+            new_deadline = current_deadline + extension_seconds
+            self._worker_deadlines[worker_id] = new_deadline
+
+            self._task_runner.run(
+                self._logger.log,
+                ServerDebug(
+                    message=f"Granted {extension_seconds:.1f}s extension to worker {worker_id[:8]}... (progress={current_progress:.2f})",
+                    node_host=self._config.host,
+                    node_port=self._config.tcp_port,
+                    node_id=self._node_id,
+                )
+            )
+
+            return (
+                True,
+                extension_seconds,
+                new_deadline,
+                tracker.get_remaining_extensions(),
+                None,
+            )
+        else:
+            denial_reason = tracker.get_denial_reason(current_progress)
+
+            self._task_runner.run(
+                self._logger.log,
+                ServerWarning(
+                    message=f"Denied extension to worker {worker_id[:8]}...: {denial_reason}",
+                    node_host=self._config.host,
+                    node_port=self._config.tcp_port,
+                    node_id=self._node_id,
+                )
+            )
+
+            return (
+                False,
+                0.0,
+                self._worker_deadlines.get(worker_id, 0.0),
+                tracker.get_remaining_extensions(),
+                denial_reason,
+            )
+
+    def on_worker_healthy(self, worker_id: str) -> None:
+        """Reset extension tracker when worker completes successfully."""
+        if worker_id in self._extension_trackers:
+            self._extension_trackers[worker_id].reset()
+
+    def on_worker_removed(self, worker_id: str) -> None:
+        """Cleanup when worker is removed."""
+        self._extension_trackers.pop(worker_id, None)
+        self._worker_deadlines.pop(worker_id, None)
+
+    def get_worker_deadline(self, worker_id: str) -> float | None:
+        """Get current deadline for a worker."""
+        return self._worker_deadlines.get(worker_id)
+
+    def get_metrics(self) -> dict:
+        """Get extension manager metrics."""
+        return {
+            "tracked_workers": len(self._extension_trackers),
+            "total_extensions_granted": sum(
+                t.extension_count for t in self._extension_trackers.values()
+            ),
+        }
