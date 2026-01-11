@@ -8,7 +8,7 @@ and windowed stats aggregation.
 import asyncio
 import pytest
 from dataclasses import dataclass, field
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 from hyperscale.distributed.nodes.gate.stats_coordinator import GateStatsCoordinator
 from hyperscale.distributed.nodes.gate.state import GateRuntimeState

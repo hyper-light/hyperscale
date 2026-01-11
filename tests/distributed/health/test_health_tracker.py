@@ -9,9 +9,6 @@ Tests:
 """
 
 import time
-from unittest.mock import patch
-
-import pytest
 
 from hyperscale.distributed.health import (
     EvictionDecision,

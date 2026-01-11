@@ -10,9 +10,7 @@ Tests the integration of HealthGossipBuffer with SWIM messages including:
 """
 
 import time
-from dataclasses import dataclass
-from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 

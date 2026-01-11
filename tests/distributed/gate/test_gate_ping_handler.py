@@ -7,7 +7,7 @@ Tests ping/health check request handling.
 import asyncio
 import pytest
 from dataclasses import dataclass, field
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 from hyperscale.distributed.nodes.gate.handlers.tcp_ping import GatePingHandler
 from hyperscale.distributed.nodes.gate.state import GateRuntimeState
