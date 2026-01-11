@@ -6,6 +6,7 @@ Configures pytest-asyncio for async test support.
 
 import asyncio
 import pytest
+from tests.unit.distributed.messaging.mocks import MockServerInterface
 
 
 # Configure pytest-asyncio mode in pytest.ini or pyproject.toml is preferred,
@@ -24,3 +25,9 @@ def event_loop():
     loop = asyncio.new_event_loop()
     yield loop
     loop.close()
+
+@pytest.fixture
+def mock_server() -> MockServerInterface:
+    """Create a mock server interface for testing."""
+    return MockServerInterface()
+
