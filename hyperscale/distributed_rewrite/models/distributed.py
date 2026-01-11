@@ -7,11 +7,15 @@ in the distributed Hyperscale architecture.
 
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import TYPE_CHECKING, Any
+
 from hyperscale.core.graph import Workflow
 from hyperscale.core.state import Context
 from hyperscale.reporting.common.results_types import WorkflowStats
-from typing import Any
 from .message import Message
+
+if TYPE_CHECKING:
+    from hyperscale.distributed_rewrite.models.coordinates import NetworkCoordinate
 
 
 # =============================================================================
@@ -566,6 +570,8 @@ class WorkerHeartbeat(Message):
     # TCP address for routing (populated in UDP heartbeats)
     tcp_host: str = ""
     tcp_port: int = 0
+    # Network coordinate for RTT estimation (AD-35)
+    coordinate: "NetworkCoordinate | None" = None
     # Health piggyback fields (AD-19)
     health_accepting_work: bool = True
     health_throughput: float = 0.0
