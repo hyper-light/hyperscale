@@ -300,18 +300,25 @@ class ManagerServer(HealthAwareServer):
         # Load shedding (AD-22)
         self._overload_detector = HybridOverloadDetector()
         self._load_shedder = ManagerLoadShedder(
-            overload_detector=self._overload_detector,
+            config=self._config,
             logger=self._udp_logger,
             node_id=self._node_id.short,
             task_runner=self._task_runner,
         )
 
         # In-flight tracking (AD-32)
-        self._in_flight = InFlightTracker()
-        self._bounded_executor = BoundedRequestExecutor(
-            tracker=self._in_flight,
+        self._in_flight = InFlightTracker(
+            config=self._config,
             logger=self._udp_logger,
             node_id=self._node_id.short,
+            task_runner=self._task_runner,
+        )
+        self._bounded_executor = BoundedRequestExecutor(
+            in_flight=self._in_flight,
+            load_shedder=self._load_shedder,
+            logger=self._udp_logger,
+            node_id=self._node_id.short,
+            task_runner=self._task_runner,
         )
 
         # JobManager for race-safe job/workflow state
