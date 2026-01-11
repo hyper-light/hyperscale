@@ -74,7 +74,7 @@ class TestJobStatusPushHandler:
         result = await handler.handle(("server", 8000), data, 100)
 
         assert result == b'ok'
-        assert state._jobs[job_id] == "RUNNING"
+        assert state._jobs[job_id].status == "RUNNING"
 
     @pytest.mark.asyncio
     async def test_status_with_callback(self):
