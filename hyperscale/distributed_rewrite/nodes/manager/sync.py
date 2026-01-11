@@ -2,7 +2,8 @@
 Manager state sync module.
 
 Handles state synchronization with workers and peer managers during
-leader election and recovery scenarios.
+leader election and recovery scenarios. Uses AD-21 jitter strategies
+for retry delays to prevent thundering herd.
 """
 
 import asyncio
@@ -13,6 +14,10 @@ from hyperscale.distributed_rewrite.models import (
     StateSyncResponse,
     WorkerStateSnapshot,
     ManagerStateSnapshot,
+)
+from hyperscale.distributed_rewrite.reliability import (
+    calculate_jittered_delay,
+    JitterStrategy,
 )
 from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerDebug, ServerWarning, ServerError
 
