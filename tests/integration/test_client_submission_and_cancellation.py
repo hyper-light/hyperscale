@@ -52,7 +52,7 @@ class TestClientJobSubmitter:
         self.logger.log = AsyncMock()
         self.targets = ClientTargetSelector(self.config, self.state)
         self.tracker = ClientJobTracker(self.state, self.logger)
-        self.protocol = ClientProtocol(self.state)
+        self.protocol = ClientProtocol(self.state, self.logger)
 
     @pytest.mark.asyncio
     async def test_happy_path_successful_submission(self):
