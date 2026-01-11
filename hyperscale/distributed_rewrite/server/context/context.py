@@ -1,6 +1,6 @@
 import asyncio
 from collections import defaultdict
-from typing import Literal, TypeVar, Generic, Any, Callable
+from typing import TypeVar, Generic, Any, Callable
 
 
 Update = Callable[[Any], Any]

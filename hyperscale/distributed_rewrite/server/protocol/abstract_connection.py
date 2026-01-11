@@ -1,6 +1,6 @@
 import asyncio
 from abc import ABC, abstractmethod
-from typing import Tuple
+
 from .receive_buffer import ReceiveBuffer
 
 
@@ -15,7 +15,7 @@ class AbstractConnection(ABC):
         self,
         data: ReceiveBuffer,
         transport: asyncio.Transport,
-        addr: Tuple[str, int] | None = None,
+        addr: tuple[str, int] | None = None,
     ):
         pass
     

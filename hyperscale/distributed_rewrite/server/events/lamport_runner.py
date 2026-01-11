@@ -1,6 +1,6 @@
 from __future__ import annotations
 import asyncio
-from typing import Generic, TypeVar
+from typing import TypeVar
 from collections import defaultdict
 from .lamport_clock import LamportClock
 from .lamport_message import LamportMessage

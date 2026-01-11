@@ -1,6 +1,6 @@
 import os
 from pydantic import BaseModel
-from typing import Dict, Type, TypeVar, Union
+from typing import Dict, TypeVar, Union
 
 from dotenv import dotenv_values
 

@@ -13,7 +13,7 @@ Key responsibilities:
 
 import time
 from dataclasses import dataclass, field
-from typing import Protocol, Callable, Awaitable
+from typing import Protocol, Callable
 
 from hyperscale.distributed_rewrite.models import (
     DatacenterHealth,
