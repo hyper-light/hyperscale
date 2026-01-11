@@ -152,8 +152,9 @@ class AsyncDNSResolver:
     """Internal aiodns resolver for SRV queries."""
 
     def __post_init__(self) -> None:
-        """Initialize the semaphore and aiodns resolver."""
-        self._resolution_semaphore = asyncio.Semaphore(self.max_concurrent_resolutions)
+        """Initialize the aiodns resolver. Semaphore is lazily created when first needed."""
+        # Note: asyncio.Semaphore requires a running event loop, so we lazily
+        # initialize it in _do_resolve() and _do_resolve_srv() instead of here.
         self._aiodns_resolver = aiodns.DNSResolver()
 
     @staticmethod
