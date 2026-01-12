@@ -327,6 +327,43 @@ class WorkerWorkflowExecutor:
             # Trigger server cleanup
             self._lifecycle.start_server_cleanup()
 
+        elapsed_seconds = time.monotonic() - start_time
+
+        if self._event_logger is not None:
+            if progress.status == WorkflowStatus.COMPLETED.value:
+                await self._event_logger.log(
+                    WorkerJobCompleted(
+                        message=f"Completed job {dispatch.job_id}",
+                        node_id=node_id_full,
+                        node_host=node_host,
+                        node_port=node_port,
+                        job_id=dispatch.job_id,
+                        workflow_id=dispatch.workflow_id,
+                        elapsed_seconds=elapsed_seconds,
+                        completed_count=progress.completed_count,
+                        failed_count=progress.failed_count,
+                    ),
+                    name="worker_events",
+                )
+            elif progress.status in (
+                WorkflowStatus.FAILED.value,
+                WorkflowStatus.CANCELLED.value,
+            ):
+                await self._event_logger.log(
+                    WorkerJobFailed(
+                        message=f"Failed job {dispatch.job_id}",
+                        node_id=node_id_full,
+                        node_host=node_host,
+                        node_port=node_port,
+                        job_id=dispatch.job_id,
+                        workflow_id=dispatch.workflow_id,
+                        elapsed_seconds=elapsed_seconds,
+                        error_message=workflow_error,
+                        error_type=type(error).__name__ if error else None,
+                    ),
+                    name="worker_events",
+                )
+
         # Build final result for sending
         final_result = WorkflowFinalResult(
             job_id=dispatch.job_id,
