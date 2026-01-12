@@ -330,6 +330,71 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         self._message_dispatcher = MessageDispatcher(self._server_adapter)
         register_default_handlers(self._message_dispatcher, self._server_adapter)
 
+    def _create_background_task(
+        self,
+        coro,
+        name: str,
+    ) -> asyncio.Task:
+        """
+        Create a background task with automatic error logging.
+
+        This helper ensures that background tasks don't fail silently by
+        attaching a done callback that logs any exceptions. Use this instead
+        of bare asyncio.create_task() for all long-running background tasks.
+
+        Args:
+            coro: The coroutine to run as a background task.
+            name: A descriptive name for the task (used in error messages).
+
+        Returns:
+            The created asyncio.Task with error callback attached.
+        """
+        task = asyncio.create_task(coro, name=name)
+        task.add_done_callback(lambda t: self._handle_background_task_error(t, name))
+        return task
+
+    def _handle_background_task_error(self, task: asyncio.Task, name: str) -> None:
+        """
+        Handle errors from background tasks by logging them.
+
+        This callback is attached to all background tasks created via
+        _create_background_task(). It prevents silent failures by ensuring
+        all task exceptions are logged.
+
+        Args:
+            task: The completed task.
+            name: The descriptive name of the task.
+        """
+        if task.cancelled():
+            return
+
+        exception = task.exception()
+        if exception is None:
+            return
+
+        # Get node ID for logging context
+        node_id_short = getattr(self, "_node_id", None)
+        if node_id_short is not None:
+            node_id_short = node_id_short.short
+        else:
+            node_id_short = "unknown"
+
+        # Log the error via task runner (fire-and-forget async logging)
+        if self._task_runner is not None and self._udp_logger is not None:
+            self._task_runner.run(
+                self._udp_logger.log(
+                    ServerError(
+                        message=f"Background task '{name}' failed: {exception}",
+                        node_id=node_id_short,
+                        error_type=type(exception).__name__,
+                    )
+                )
+            )
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Properties
+    # ─────────────────────────────────────────────────────────────────────────
+
     @property
     def node_id(self) -> NodeId:
         """Get this server's unique node identifier."""

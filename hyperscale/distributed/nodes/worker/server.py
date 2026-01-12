@@ -741,9 +741,23 @@ class WorkerServer(HealthAwareServer):
         self._worker_state._extension_completed_items = completed_items
         self._worker_state._extension_total_items = total_items
         self._worker_state._extension_estimated_completion = estimated_completion
-        self._worker_state._extension_active_workflow_count = len(
-            self._active_workflows
-        )
+        active_workflow_count = len(self._active_workflows)
+        self._worker_state._extension_active_workflow_count = active_workflow_count
+
+        if self._event_logger is not None:
+            self._task_runner.run(
+                self._event_logger.log,
+                WorkerExtensionRequested(
+                    message=f"Extension requested: {reason}",
+                    node_id=self._node_id.full,
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    reason=reason,
+                    estimated_completion_seconds=estimated_completion,
+                    active_workflow_count=active_workflow_count,
+                ),
+                "worker_events",
+            )
 
     def clear_extension_request(self) -> None:
         """
