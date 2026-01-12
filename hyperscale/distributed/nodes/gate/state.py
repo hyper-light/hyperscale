@@ -41,6 +41,9 @@ class GateRuntimeState:
         # Counter protection lock (for race-free increments)
         self._counter_lock: asyncio.Lock | None = None
 
+        # Lock creation lock (protects creation of per-resource locks)
+        self._lock_creation_lock: asyncio.Lock | None = None
+
         # Gate peer state
         self._gate_udp_to_tcp: dict[tuple[str, int], tuple[str, int]] = {}
         self._active_gate_peers: set[tuple[str, int]] = set()
@@ -103,14 +106,23 @@ class GateRuntimeState:
 
     def initialize_locks(self) -> None:
         self._counter_lock = asyncio.Lock()
+        self._lock_creation_lock = asyncio.Lock()
 
     def _get_counter_lock(self) -> asyncio.Lock:
         if self._counter_lock is None:
             self._counter_lock = asyncio.Lock()
         return self._counter_lock
 
-    def get_or_create_peer_lock(self, peer_addr: tuple[str, int]) -> asyncio.Lock:
-        return self._peer_state_locks.setdefault(peer_addr, asyncio.Lock())
+    def _get_lock_creation_lock(self) -> asyncio.Lock:
+        if self._lock_creation_lock is None:
+            self._lock_creation_lock = asyncio.Lock()
+        return self._lock_creation_lock
+
+    async def get_or_create_peer_lock(self, peer_addr: tuple[str, int]) -> asyncio.Lock:
+        async with self._get_lock_creation_lock():
+            if peer_addr not in self._peer_state_locks:
+                self._peer_state_locks[peer_addr] = asyncio.Lock()
+            return self._peer_state_locks[peer_addr]
 
     async def increment_peer_epoch(self, peer_addr: tuple[str, int]) -> int:
         async with self._get_counter_lock():
@@ -119,16 +131,17 @@ class GateRuntimeState:
             self._peer_state_epoch[peer_addr] = new_epoch
             return new_epoch
 
-    def get_peer_epoch(self, peer_addr: tuple[str, int]) -> int:
-        return self._peer_state_epoch.get(peer_addr, 0)
+    async def get_peer_epoch(self, peer_addr: tuple[str, int]) -> int:
+        async with self._get_counter_lock():
+            return self._peer_state_epoch.get(peer_addr, 0)
 
-    def add_active_peer(self, peer_addr: tuple[str, int]) -> None:
-        """Add a peer to the active set."""
-        self._active_gate_peers.add(peer_addr)
+    async def add_active_peer(self, peer_addr: tuple[str, int]) -> None:
+        async with self._get_counter_lock():
+            self._active_gate_peers.add(peer_addr)
 
-    def remove_active_peer(self, peer_addr: tuple[str, int]) -> None:
-        """Remove a peer from the active set."""
-        self._active_gate_peers.discard(peer_addr)
+    async def remove_active_peer(self, peer_addr: tuple[str, int]) -> None:
+        async with self._get_counter_lock():
+            self._active_gate_peers.discard(peer_addr)
 
     def remove_peer_lock(self, peer_addr: tuple[str, int]) -> None:
         """Remove lock and epoch when peer disconnects to prevent memory leak."""
