@@ -217,3 +217,51 @@ async def test_idempotent_operations():
     await ring.remove_node("gate-1:9000")
     await ring.remove_node("gate-1:9000")
     assert await ring.node_count() == 0, "Ring should be empty after removal"
+
+
+@pytest.mark.asyncio
+async def test_thread_safety():
+    """Test thread safety with concurrent operations."""
+    import asyncio
+    from concurrent.futures import ThreadPoolExecutor
+
+    ring = ConsistentHashRing(virtual_nodes=100)
+    errors: list[str] = []
+    iterations = 1000
+    loop = asyncio.get_event_loop()
+
+    def add_remove_nodes(thread_id: int):
+        async def work():
+            for i in range(iterations):
+                node_id = f"gate-{thread_id}-{i % 10}:9000"
+                await ring.add_node(node_id)
+                await ring.get_node(f"job-{thread_id}-{i}")
+                await ring.remove_node(node_id)
+
+        try:
+            asyncio.run(work())
+        except Exception as e:
+            errors.append(f"Thread {thread_id}: {e}")
+
+    def lookup_keys(thread_id: int):
+        async def work():
+            for i in range(iterations):
+                await ring.get_node(f"job-{thread_id}-{i}")
+                await ring.get_backup(f"job-{thread_id}-{i}")
+                await ring.get_nodes_for_key(f"job-{thread_id}-{i}", count=2)
+
+        try:
+            asyncio.run(work())
+        except Exception as e:
+            errors.append(f"Lookup thread {thread_id}: {e}")
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = []
+        for i in range(4):
+            futures.append(executor.submit(add_remove_nodes, i))
+            futures.append(executor.submit(lookup_keys, i + 4))
+
+        for f in futures:
+            f.result()
+
+    assert len(errors) == 0, f"{len(errors)} thread safety errors: {errors}"

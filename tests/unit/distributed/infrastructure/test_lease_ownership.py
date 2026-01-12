@@ -287,3 +287,35 @@ async def test_cleanup_task():
 
     assert len(expired_leases) > 0, "Should have detected expired lease"
     assert expired_leases[0].job_id == "job-123"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_operations():
+    """Test thread safety of lease operations."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    manager = LeaseManager("gate-1:9000", default_duration=1.0)
+    errors: list[str] = []
+    iterations = 500
+
+    def acquire_renew_release(thread_id: int):
+        async def work():
+            for i in range(iterations):
+                job_id = f"job-{thread_id}-{i % 10}"
+                await manager.acquire(job_id)
+                await manager.renew(job_id)
+                await manager.is_owner(job_id)
+                await manager.get_fence_token(job_id)
+                await manager.release(job_id)
+
+        try:
+            asyncio.run(work())
+        except Exception as e:
+            errors.append(f"Thread {thread_id}: {e}")
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = [executor.submit(acquire_renew_release, i) for i in range(4)]
+        for f in futures:
+            f.result()
+
+    assert len(errors) == 0, f"{len(errors)} thread safety errors: {errors}"
