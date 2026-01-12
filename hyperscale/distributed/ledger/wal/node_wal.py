@@ -4,7 +4,7 @@ import asyncio
 import os
 import struct
 from pathlib import Path
-from typing import TYPE_CHECKING, AsyncIterator
+from typing import TYPE_CHECKING, Any, AsyncIterator
 
 import aiofiles
 import aiofiles.os
@@ -45,7 +45,7 @@ class NodeWAL:
     ) -> None:
         self._path = path
         self._clock = clock
-        self._file: aiofiles.threadpool.binary.AsyncBufferedIOBase | None = None
+        self._file: Any = None
         self._write_lock = asyncio.Lock()
         self._next_lsn: int = 0
         self._last_synced_lsn: int = -1

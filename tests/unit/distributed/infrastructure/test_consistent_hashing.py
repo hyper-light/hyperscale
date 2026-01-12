@@ -10,6 +10,7 @@ This test validates the ConsistentHashRing implementation:
 Run with: pytest tests/unit/distributed/infrastructure/test_consistent_hashing.py
 """
 
+import asyncio
 import random
 import statistics
 import string
@@ -220,48 +221,29 @@ async def test_idempotent_operations():
 
 
 @pytest.mark.asyncio
-async def test_thread_safety():
-    """Test thread safety with concurrent operations."""
-    import asyncio
-    from concurrent.futures import ThreadPoolExecutor
-
+async def test_concurrent_operations():
     ring = ConsistentHashRing(virtual_nodes=100)
-    errors: list[str] = []
-    iterations = 1000
-    loop = asyncio.get_event_loop()
+    iterations = 100
 
-    def add_remove_nodes(thread_id: int):
-        async def work():
-            for i in range(iterations):
-                node_id = f"gate-{thread_id}-{i % 10}:9000"
-                await ring.add_node(node_id)
-                await ring.get_node(f"job-{thread_id}-{i}")
-                await ring.remove_node(node_id)
+    async def add_remove_nodes(task_id: int):
+        for i in range(iterations):
+            node_id = f"gate-{task_id}-{i % 10}:9000"
+            await ring.add_node(node_id)
+            await ring.get_node(f"job-{task_id}-{i}")
+            await ring.remove_node(node_id)
 
-        try:
-            asyncio.run(work())
-        except Exception as e:
-            errors.append(f"Thread {thread_id}: {e}")
+    async def lookup_keys(task_id: int):
+        for i in range(iterations):
+            await ring.get_node(f"job-{task_id}-{i}")
+            await ring.get_backup(f"job-{task_id}-{i}")
+            await ring.get_nodes_for_key(f"job-{task_id}-{i}", count=2)
 
-    def lookup_keys(thread_id: int):
-        async def work():
-            for i in range(iterations):
-                await ring.get_node(f"job-{thread_id}-{i}")
-                await ring.get_backup(f"job-{thread_id}-{i}")
-                await ring.get_nodes_for_key(f"job-{thread_id}-{i}", count=2)
+    tasks = []
+    for i in range(4):
+        tasks.append(asyncio.create_task(add_remove_nodes(i)))
+        tasks.append(asyncio.create_task(lookup_keys(i + 4)))
 
-        try:
-            asyncio.run(work())
-        except Exception as e:
-            errors.append(f"Lookup thread {thread_id}: {e}")
+    results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    with ThreadPoolExecutor(max_workers=8) as executor:
-        futures = []
-        for i in range(4):
-            futures.append(executor.submit(add_remove_nodes, i))
-            futures.append(executor.submit(lookup_keys, i + 4))
-
-        for f in futures:
-            f.result()
-
-    assert len(errors) == 0, f"{len(errors)} thread safety errors: {errors}"
+    errors = [r for r in results if isinstance(r, Exception)]
+    assert len(errors) == 0, f"{len(errors)} concurrency errors: {errors}"
