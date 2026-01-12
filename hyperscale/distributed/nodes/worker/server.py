@@ -424,6 +424,8 @@ class WorkerServer(HealthAwareServer):
                 name="worker_events",
             )
 
+            self._workflow_executor.set_event_logger(self._event_logger)
+
         # Update node capabilities
         self._node_capabilities = self._lifecycle_manager.get_node_capabilities(
             self._node_id.full

@@ -76,8 +76,20 @@ class WorkerWorkflowExecutor:
         self._env = env
         self._logger = logger
 
+        # Event logger for crash forensics (AD-47)
+        self._event_logger: Logger | None = None
+
         # Core environment for workflow runner (lazily initialized)
         self._core_env: CoreEnv | None = None
+
+    def set_event_logger(self, logger: "Logger | None") -> None:
+        """
+        Set the event logger for crash forensics.
+
+        Args:
+            logger: Logger instance configured for event logging, or None to disable.
+        """
+        self._event_logger = logger
 
     def _get_core_env(self) -> CoreEnv:
         """Get or create CoreEnv for workflow execution."""
