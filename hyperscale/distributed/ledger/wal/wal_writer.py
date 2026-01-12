@@ -66,6 +66,7 @@ class WALWriterConfig:
     batch_max_bytes: int = 1024 * 1024
     queue_max_size: int = 10000
     overflow_size: int = 1000
+    preserve_newest: bool = True
     throttle_threshold: float = 0.70
     batch_threshold: float = 0.85
     reject_threshold: float = 0.95
@@ -127,6 +128,7 @@ class WALWriter:
         queue_config = RobustQueueConfig(
             maxsize=self._config.queue_max_size,
             overflow_size=self._config.overflow_size,
+            preserve_newest=self._config.preserve_newest,
             throttle_threshold=self._config.throttle_threshold,
             batch_threshold=self._config.batch_threshold,
             reject_threshold=self._config.reject_threshold,
