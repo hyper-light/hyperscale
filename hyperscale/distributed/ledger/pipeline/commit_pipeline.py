@@ -144,18 +144,21 @@ class CommitPipeline:
                         entry=entry,
                         level_achieved=level_achieved,
                         error=RuntimeError("Global replication failed"),
+                        backpressure=backpressure,
                     )
             except asyncio.TimeoutError:
                 return CommitResult(
                     entry=entry,
                     level_achieved=level_achieved,
                     error=asyncio.TimeoutError("Global replication timed out"),
+                    backpressure=backpressure,
                 )
             except Exception as exc:
                 return CommitResult(
                     entry=entry,
                     level_achieved=level_achieved,
                     error=exc,
+                    backpressure=backpressure,
                 )
 
         return CommitResult(entry=entry, level_achieved=level_achieved)
