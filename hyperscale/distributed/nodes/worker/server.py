@@ -575,9 +575,7 @@ class WorkerServer(HealthAwareServer):
         super().abort()
 
     async def _start_background_loops(self) -> None:
-        """Start all background loops."""
-        # Progress flush loop
-        self._progress_flush_task = asyncio.create_task(
+        self._progress_flush_task = self._create_background_task(
             self._background_loops.run_progress_flush_loop(
                 send_progress_to_job_leader=self._send_progress_to_job_leader,
                 aggregate_progress_by_job=self._aggregate_progress_by_job,
@@ -586,24 +584,24 @@ class WorkerServer(HealthAwareServer):
                 node_id_short=self._node_id.short,
                 is_running=lambda: self._running,
                 get_healthy_managers=lambda: self._registry._healthy_manager_ids,
-            )
+            ),
+            "progress_flush",
         )
         self._lifecycle_manager.add_background_task(self._progress_flush_task)
 
-        # Dead manager reap loop
-        self._dead_manager_reap_task = asyncio.create_task(
+        self._dead_manager_reap_task = self._create_background_task(
             self._background_loops.run_dead_manager_reap_loop(
                 node_host=self._host,
                 node_port=self._tcp_port,
                 node_id_short=self._node_id.short,
                 task_runner_run=self._task_runner.run,
                 is_running=lambda: self._running,
-            )
+            ),
+            "dead_manager_reap",
         )
         self._lifecycle_manager.add_background_task(self._dead_manager_reap_task)
 
-        # Cancellation poll loop
-        self._cancellation_poll_task = asyncio.create_task(
+        self._cancellation_poll_task = self._create_background_task(
             self._cancellation_handler_impl.run_cancellation_poll_loop(
                 get_manager_addr=self._registry.get_primary_manager_tcp_addr,
                 is_circuit_open=lambda: (
@@ -617,33 +615,34 @@ class WorkerServer(HealthAwareServer):
                 node_id_short=self._node_id.short,
                 task_runner_run=self._task_runner.run,
                 is_running=lambda: self._running,
-            )
+            ),
+            "cancellation_poll",
         )
         self._lifecycle_manager.add_background_task(self._cancellation_poll_task)
 
-        # Orphan check loop
-        self._orphan_check_task = asyncio.create_task(
+        self._orphan_check_task = self._create_background_task(
             self._background_loops.run_orphan_check_loop(
                 cancel_workflow=self._cancel_workflow,
                 node_host=self._host,
                 node_port=self._tcp_port,
                 node_id_short=self._node_id.short,
                 is_running=lambda: self._running,
-            )
+            ),
+            "orphan_check",
         )
         self._lifecycle_manager.add_background_task(self._orphan_check_task)
 
-        # Discovery maintenance loop
-        self._discovery_maintenance_task = asyncio.create_task(
+        self._discovery_maintenance_task = self._create_background_task(
             self._background_loops.run_discovery_maintenance_loop(
                 is_running=lambda: self._running,
-            )
+            ),
+            "discovery_maintenance",
         )
         self._lifecycle_manager.add_background_task(self._discovery_maintenance_task)
 
-        # Overload poll loop
-        self._overload_poll_task = asyncio.create_task(
-            self._backpressure_manager.run_overload_poll_loop()
+        self._overload_poll_task = self._create_background_task(
+            self._backpressure_manager.run_overload_poll_loop(),
+            "overload_poll",
         )
         self._lifecycle_manager.add_background_task(self._overload_poll_task)
 
@@ -1057,8 +1056,8 @@ class WorkerServer(HealthAwareServer):
             self._cores_notification_task is None
             or self._cores_notification_task.done()
         ):
-            self._cores_notification_task = asyncio.create_task(
-                self._flush_cores_notification()
+            self._cores_notification_task = self._create_background_task(
+                self._flush_cores_notification(), "cores_notification"
             )
 
     async def _flush_cores_notification(self) -> None:

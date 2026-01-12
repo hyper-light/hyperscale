@@ -705,27 +705,38 @@ class ManagerServer(HealthAwareServer):
         ]
 
     def _start_background_tasks(self) -> None:
-        """Start all background tasks."""
-        self._dead_node_reap_task = asyncio.create_task(self._dead_node_reap_loop())
-        self._orphan_scan_task = asyncio.create_task(self._orphan_scan_loop())
-        self._discovery_maintenance_task = asyncio.create_task(
-            self._discovery.maintenance_loop()
+        self._dead_node_reap_task = self._create_background_task(
+            self._dead_node_reap_loop(), "dead_node_reap"
         )
-        self._job_responsiveness_task = asyncio.create_task(
-            self._job_responsiveness_loop()
+        self._orphan_scan_task = self._create_background_task(
+            self._orphan_scan_loop(), "orphan_scan"
         )
-        self._stats_push_task = asyncio.create_task(self._stats_push_loop())
-        self._gate_heartbeat_task = asyncio.create_task(self._gate_heartbeat_loop())
-        self._rate_limit_cleanup_task = asyncio.create_task(
-            self._rate_limit_cleanup_loop()
+        self._discovery_maintenance_task = self._create_background_task(
+            self._discovery.maintenance_loop(), "discovery_maintenance"
         )
-        self._job_cleanup_task = asyncio.create_task(self._job_cleanup_loop())
-        self._unified_timeout_task = asyncio.create_task(self._unified_timeout_loop())
-        self._deadline_enforcement_task = asyncio.create_task(
-            self._deadline_enforcement_loop()
+        self._job_responsiveness_task = self._create_background_task(
+            self._job_responsiveness_loop(), "job_responsiveness"
         )
-        self._peer_job_state_sync_task = asyncio.create_task(
-            self._peer_job_state_sync_loop()
+        self._stats_push_task = self._create_background_task(
+            self._stats_push_loop(), "stats_push"
+        )
+        self._gate_heartbeat_task = self._create_background_task(
+            self._gate_heartbeat_loop(), "gate_heartbeat"
+        )
+        self._rate_limit_cleanup_task = self._create_background_task(
+            self._rate_limit_cleanup_loop(), "rate_limit_cleanup"
+        )
+        self._job_cleanup_task = self._create_background_task(
+            self._job_cleanup_loop(), "job_cleanup"
+        )
+        self._unified_timeout_task = self._create_background_task(
+            self._unified_timeout_loop(), "unified_timeout"
+        )
+        self._deadline_enforcement_task = self._create_background_task(
+            self._deadline_enforcement_loop(), "deadline_enforcement"
+        )
+        self._peer_job_state_sync_task = self._create_background_task(
+            self._peer_job_state_sync_loop(), "peer_job_state_sync"
         )
 
     async def _cancel_background_tasks(self) -> None:

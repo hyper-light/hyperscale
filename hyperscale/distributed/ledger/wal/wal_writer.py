@@ -146,6 +146,36 @@ class WALWriter:
         self._pending_state_change: tuple[QueueState, BackpressureSignal] | None = None
         self._state_change_task: asyncio.Task[None] | None = None
 
+    def _create_background_task(self, coro, name: str) -> asyncio.Task:
+        task = asyncio.create_task(coro, name=name)
+        task.add_done_callback(lambda t: self._handle_background_task_error(t, name))
+        return task
+
+    def _handle_background_task_error(self, task: asyncio.Task, name: str) -> None:
+        if task.cancelled():
+            return
+
+        exception = task.exception()
+        if exception is None:
+            return
+
+        self._metrics.total_errors += 1
+        if self._error is None:
+            self._error = exception
+
+        if self._logger is not None and self._loop is not None:
+            self._loop.call_soon(
+                lambda: asyncio.create_task(
+                    self._logger.log(
+                        WALError(
+                            message=f"Background task '{name}' failed: {exception}",
+                            path=str(self._path),
+                            error_type=type(exception).__name__,
+                        )
+                    )
+                )
+            )
+
     async def start(self) -> None:
         if self._running:
             return
@@ -154,9 +184,9 @@ class WALWriter:
         self._running = True
         self._path.parent.mkdir(parents=True, exist_ok=True)
 
-        self._writer_task = asyncio.create_task(
+        self._writer_task = self._create_background_task(
             self._writer_loop(),
-            name=f"wal-writer-{self._path.name}",
+            f"wal-writer-{self._path.name}",
         )
 
     async def stop(self) -> None:
@@ -296,8 +326,9 @@ class WALWriter:
         self._pending_state_change = (queue_state, backpressure)
 
         if self._state_change_task is None or self._state_change_task.done():
-            self._state_change_task = asyncio.create_task(
-                self._flush_state_change_callback()
+            self._state_change_task = self._create_background_task(
+                self._flush_state_change_callback(),
+                f"wal-state-change-{self._path.name}",
             )
 
     async def _flush_state_change_callback(self) -> None:

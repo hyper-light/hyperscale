@@ -2773,6 +2773,22 @@ class GateServer(HealthAwareServer):
                     self._job_leadership_tracker.release_leadership(job_id)
                     self._job_dc_managers.pop(job_id, None)
 
+                    reporter_tasks = self._job_reporter_tasks.pop(job_id, None)
+                    if reporter_tasks:
+                        for task in reporter_tasks.values():
+                            if task and not task.done():
+                                task.cancel()
+
+                    self._job_stats_crdt.pop(job_id, None)
+
+                    state_reporter_tasks = self._state._job_reporter_tasks.pop(
+                        job_id, None
+                    )
+                    if state_reporter_tasks:
+                        for task in state_reporter_tasks.values():
+                            if task and not task.done():
+                                task.cancel()
+
                     if self._job_router:
                         self._job_router.cleanup_job_state(job_id)
 
