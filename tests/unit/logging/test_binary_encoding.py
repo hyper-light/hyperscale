@@ -43,7 +43,8 @@ class TestBinaryEncode:
         assert len(encoded) >= BINARY_HEADER_SIZE
 
         crc_stored = struct.unpack("<I", encoded[:4])[0]
-        length, lsn_stored = struct.unpack("<IQ", encoded[4:16])
+        length, lsn_high, lsn_low = struct.unpack("<IQQ", encoded[4:28])
+        lsn_stored = (lsn_high << 64) | lsn_low
 
         assert lsn_stored == lsn
         assert length == len(encoded) - BINARY_HEADER_SIZE
@@ -66,7 +67,7 @@ class TestBinaryEncode:
         crc_stored = struct.unpack("<I", encoded[:4])[0]
 
         length = struct.unpack("<I", encoded[4:8])[0]
-        crc_computed = zlib.crc32(encoded[4 : 16 + length]) & 0xFFFFFFFF
+        crc_computed = zlib.crc32(encoded[4 : BINARY_HEADER_SIZE + length]) & 0xFFFFFFFF
 
         assert crc_stored == crc_computed
 
@@ -85,7 +86,8 @@ class TestBinaryEncode:
 
         encoded = binary_logger_stream._encode_binary(log, lsn=None)
 
-        lsn_stored = struct.unpack("<Q", encoded[8:16])[0]
+        lsn_high, lsn_low = struct.unpack("<QQ", encoded[8:24])
+        lsn_stored = (lsn_high << 64) | lsn_low
         assert lsn_stored == 0
 
 

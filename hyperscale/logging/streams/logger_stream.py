@@ -8,7 +8,6 @@ import struct
 import sys
 import threading
 import zlib
-from collections import defaultdict
 from typing import (
     Any,
     AsyncIterator,
@@ -163,10 +162,12 @@ class LoggerStream:
         self._batch_flush_task: asyncio.Task[None] | None = None
 
         self._read_files: Dict[str, io.FileIO] = {}
-        self._read_locks: Dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+        self._read_locks: Dict[str, asyncio.Lock] = {}
 
     @property
-    def has_active_subscriptions(self):
+    def has_active_subscriptions(self) -> bool:
+        if self._provider is None:
+            return False
         return self._provider.subscriptions_count > 0
 
     async def initialize(
@@ -256,6 +257,16 @@ class LoggerStream:
             self._loop,
         )
 
+    def _get_file_lock(self, logfile_path: str) -> asyncio.Lock:
+        if logfile_path not in self._file_locks:
+            self._file_locks[logfile_path] = asyncio.Lock()
+        return self._file_locks[logfile_path]
+
+    def _get_read_lock(self, logfile_path: str) -> asyncio.Lock:
+        if logfile_path not in self._read_locks:
+            self._read_locks[logfile_path] = asyncio.Lock()
+        return self._read_locks[logfile_path]
+
     async def open_file(
         self,
         filename: str,
@@ -267,7 +278,7 @@ class LoggerStream:
             self._cwd = await self._loop.run_in_executor(None, os.getcwd)
 
         logfile_path = self._to_logfile_path(filename, directory=directory)
-        file_lock = self._file_locks[logfile_path]
+        file_lock = self._get_file_lock(logfile_path)
 
         await file_lock.acquire()
         try:
