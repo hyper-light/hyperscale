@@ -26,12 +26,16 @@ from hyperscale.logging.config.durability_mode import DurabilityMode
 from hyperscale.logging.config.logging_config import LoggingConfig
 from hyperscale.logging.config.stream_type import StreamType
 from hyperscale.logging.models import Entry, Log, LogLevel
+from hyperscale.logging.exceptions import (
+    WALBatchOverflowError,
+    WALWriteError,
+)
+from hyperscale.logging.lsn import HybridLamportClock, LSN
 from hyperscale.logging.queue import (
     ConsumerStatus,
     LogConsumer,
     LogProvider,
 )
-from hyperscale.logging.lsn import HybridLamportClock, LSN
 from hyperscale.logging.snowflake import SnowflakeGenerator
 
 from .protocol import LoggerProtocol
@@ -109,7 +113,7 @@ class LoggerStream:
         self._compressor: zstandard.ZstdCompressor | None = None
 
         self._files: Dict[str, io.FileIO] = {}
-        self._file_locks: Dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+        self._file_locks: Dict[str, asyncio.Lock] = {}
         self._cwd: str | None = None
         self._default_logfile_path: str | None = None
 
@@ -181,8 +185,8 @@ class LoggerStream:
 
             self._compressor = self._compressor or zstandard.ZstdCompressor()
             self._loop = self._loop or asyncio.get_event_loop()
-            self._consumer = self._consumer or LogConsumer()
             self._provider = self._provider or LogProvider()
+            self._consumer = self._consumer or self._provider.create_consumer()
 
             await self._setup_stdout_writer(stdout_writer)
             await self._setup_stderr_writer(stderr_writer)
