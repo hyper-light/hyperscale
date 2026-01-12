@@ -303,3 +303,15 @@ class ManagerState:
             "cancelled_workflow_count": len(self._cancelled_workflows),
             "pending_cancellation_count": len(self._cancellation_pending_workflows),
         }
+
+    def record_workflow_latency(self, latency_ms: float) -> None:
+        """Record workflow completion latency for SLO tracking."""
+        self._workflow_latency_digest.add(latency_ms)
+
+    def get_workflow_latency_observation(self) -> "LatencyObservation | None":
+        """Get aggregated workflow latency observation for SLO reporting."""
+        from hyperscale.distributed.slo import LatencyObservation
+
+        return self._workflow_latency_digest.get_recent_observation(
+            target_id="workflows"
+        )
