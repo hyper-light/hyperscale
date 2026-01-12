@@ -237,3 +237,25 @@ class IdempotencyError(Entry, kw_only=True):
     idempotency_key: str | None = None
     job_id: str | None = None
     level: LogLevel = LogLevel.ERROR
+
+
+class WALDebug(Entry, kw_only=True):
+    path: str
+    level: LogLevel = LogLevel.DEBUG
+
+
+class WALInfo(Entry, kw_only=True):
+    path: str
+    level: LogLevel = LogLevel.INFO
+
+
+class WALWarning(Entry, kw_only=True):
+    path: str
+    error_type: str | None = None
+    level: LogLevel = LogLevel.WARN
+
+
+class WALError(Entry, kw_only=True):
+    path: str
+    error_type: str
+    level: LogLevel = LogLevel.ERROR

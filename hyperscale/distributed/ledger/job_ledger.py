@@ -4,11 +4,14 @@ import asyncio
 import time
 from pathlib import Path
 from types import MappingProxyType
-from typing import Callable, Awaitable, Mapping
+from typing import TYPE_CHECKING, Callable, Awaitable, Mapping
 
 from hyperscale.logging.lsn import HybridLamportClock
 
 from .archive.job_archive_store import JobArchiveStore
+
+if TYPE_CHECKING:
+    from hyperscale.logging import Logger
 from .cache.bounded_lru_cache import BoundedLRUCache
 from .consistency_level import ConsistencyLevel
 from .durability_level import DurabilityLevel
@@ -42,6 +45,7 @@ class JobLedger:
         "_jobs_snapshot",
         "_lock",
         "_next_fence_token",
+        "_logger",
     )
 
     def __init__(
@@ -53,6 +57,7 @@ class JobLedger:
         job_id_generator: JobIdGenerator,
         archive_store: JobArchiveStore,
         completed_cache_size: int = DEFAULT_COMPLETED_CACHE_SIZE,
+        logger: Logger | None = None,
     ) -> None:
         self._clock = clock
         self._wal = wal
@@ -60,6 +65,7 @@ class JobLedger:
         self._checkpoint_manager = checkpoint_manager
         self._job_id_generator = job_id_generator
         self._archive_store = archive_store
+        self._logger = logger
         self._completed_cache: BoundedLRUCache[str, JobState] = BoundedLRUCache(
             max_size=completed_cache_size
         )
@@ -80,14 +86,16 @@ class JobLedger:
         regional_replicator: Callable[[WALEntry], Awaitable[bool]] | None = None,
         global_replicator: Callable[[WALEntry], Awaitable[bool]] | None = None,
         completed_cache_size: int = DEFAULT_COMPLETED_CACHE_SIZE,
+        logger: Logger | None = None,
     ) -> JobLedger:
         clock = HybridLamportClock(node_id=node_id)
-        wal = await NodeWAL.open(path=wal_path, clock=clock)
+        wal = await NodeWAL.open(path=wal_path, clock=clock, logger=logger)
 
         pipeline = CommitPipeline(
             wal=wal,
             regional_replicator=regional_replicator,
             global_replicator=global_replicator,
+            logger=logger,
         )
 
         checkpoint_manager = CheckpointManager(checkpoint_dir=checkpoint_dir)
@@ -109,6 +117,7 @@ class JobLedger:
             job_id_generator=job_id_generator,
             archive_store=archive_store,
             completed_cache_size=completed_cache_size,
+            logger=logger,
         )
 
         await ledger._recover()

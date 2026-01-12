@@ -5,7 +5,7 @@ import struct
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import AsyncIterator, Mapping
+from typing import TYPE_CHECKING, AsyncIterator, Mapping
 
 from hyperscale.logging.lsn import HybridLamportClock
 from hyperscale.distributed.reliability.robust_queue import QueuePutResult, QueueState
@@ -19,6 +19,9 @@ from .entry_state import WALEntryState, TransitionResult
 from .wal_entry import HEADER_SIZE, WALEntry
 from .wal_status_snapshot import WALStatusSnapshot
 from .wal_writer import WALWriter, WALWriterConfig, WriteRequest, WALBackpressureError
+
+if TYPE_CHECKING:
+    from hyperscale.logging import Logger
 
 
 @dataclass(slots=True)
@@ -53,6 +56,7 @@ class NodeWAL:
         "_status_snapshot",
         "_pending_snapshot",
         "_state_lock",
+        "_logger",
     )
 
     def __init__(
@@ -60,10 +64,12 @@ class NodeWAL:
         path: Path,
         clock: HybridLamportClock,
         config: WALWriterConfig | None = None,
+        logger: Logger | None = None,
     ) -> None:
         self._path = path
         self._clock = clock
-        self._writer = WALWriter(path=path, config=config)
+        self._logger = logger
+        self._writer = WALWriter(path=path, config=config, logger=logger)
         self._loop: asyncio.AbstractEventLoop | None = None
         self._pending_entries_internal: dict[int, WALEntry] = {}
         self._status_snapshot = WALStatusSnapshot.initial()
@@ -76,8 +82,9 @@ class NodeWAL:
         path: Path,
         clock: HybridLamportClock,
         config: WALWriterConfig | None = None,
+        logger: Logger | None = None,
     ) -> NodeWAL:
-        wal = cls(path=path, clock=clock, config=config)
+        wal = cls(path=path, clock=clock, config=config, logger=logger)
         await wal._initialize()
         return wal
 

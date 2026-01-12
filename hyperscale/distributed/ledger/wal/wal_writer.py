@@ -4,7 +4,7 @@ import asyncio
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Awaitable
+from typing import TYPE_CHECKING, Callable, Awaitable
 
 from hyperscale.distributed.reliability.robust_queue import (
     RobustMessageQueue,
@@ -16,6 +16,10 @@ from hyperscale.distributed.reliability.backpressure import (
     BackpressureLevel,
     BackpressureSignal,
 )
+from hyperscale.logging.hyperscale_logging_models import WALError
+
+if TYPE_CHECKING:
+    from hyperscale.logging import Logger
 
 
 class WALBackpressureError(Exception):
@@ -103,6 +107,7 @@ class WALWriter:
         "_state_change_callback",
         "_pending_state_change",
         "_state_change_task",
+        "_logger",
     )
 
     def __init__(
@@ -113,9 +118,11 @@ class WALWriter:
             [QueueState, BackpressureSignal], Awaitable[None]
         ]
         | None = None,
+        logger: Logger | None = None,
     ) -> None:
         self._path = path
         self._config = config or WALWriterConfig()
+        self._logger = logger
 
         queue_config = RobustQueueConfig(
             maxsize=self._config.queue_max_size,
@@ -302,8 +309,18 @@ class WALWriter:
 
             try:
                 await callback(queue_state, backpressure)
-            except Exception:
-                pass
+            except Exception as exc:
+                self._metrics.total_errors += 1
+                if self._error is None:
+                    self._error = exc
+                if self._logger is not None:
+                    await self._logger.log(
+                        WALError(
+                            message=f"State change callback failed: {exc}",
+                            path=str(self._path),
+                            error_type=type(exc).__name__,
+                        )
+                    )
 
     async def _writer_loop(self) -> None:
         try:
@@ -419,8 +436,22 @@ class WALWriter:
         if len(self._current_batch) > 0:
             try:
                 await self._commit_batch()
-            except BaseException:
-                pass
+            except BaseException as exc:
+                self._metrics.total_errors += 1
+                if self._error is None:
+                    self._error = exc
+                if self._logger is not None:
+                    await self._logger.log(
+                        WALError(
+                            message=f"Failed to drain WAL during shutdown: {exc}",
+                            path=str(self._path),
+                            error_type=type(exc).__name__,
+                        )
+                    )
+                for request in self._current_batch.requests:
+                    if not request.future.done():
+                        request.future.set_exception(exc)
+                self._current_batch.clear()
 
     async def _fail_pending_requests(self, exception: BaseException) -> None:
         for request in self._current_batch.requests:

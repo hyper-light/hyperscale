@@ -13,6 +13,8 @@ from ..wal.entry_state import TransitionResult
 from ..wal.wal_entry import WALEntry
 
 if TYPE_CHECKING:
+    from hyperscale.logging import Logger
+
     from ..wal.node_wal import NodeWAL
 
 
@@ -74,6 +76,7 @@ class CommitPipeline:
         "_global_replicator",
         "_regional_timeout",
         "_global_timeout",
+        "_logger",
     )
 
     def __init__(
@@ -83,12 +86,14 @@ class CommitPipeline:
         global_replicator: Callable[[WALEntry], Awaitable[bool]] | None = None,
         regional_timeout: float = 10.0,
         global_timeout: float = 300.0,
+        logger: Logger | None = None,
     ) -> None:
         self._wal = wal
         self._regional_replicator = regional_replicator
         self._global_replicator = global_replicator
         self._regional_timeout = regional_timeout
         self._global_timeout = global_timeout
+        self._logger = logger
 
     async def commit(
         self,
