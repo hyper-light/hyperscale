@@ -1,12 +1,16 @@
 from .entry_state import WALEntryState
-from .wal_entry import WALEntry, HEADER_SIZE
-from .wal_status_snapshot import WALStatusSnapshot
 from .node_wal import NodeWAL
+from .wal_entry import HEADER_SIZE, WALEntry
+from .wal_status_snapshot import WALStatusSnapshot
+from .wal_writer import WALWriter, WriteBatch, WriteRequest
 
 __all__ = [
-    "WALEntryState",
-    "WALEntry",
     "HEADER_SIZE",
-    "WALStatusSnapshot",
     "NodeWAL",
+    "WALEntry",
+    "WALEntryState",
+    "WALStatusSnapshot",
+    "WALWriter",
+    "WriteBatch",
+    "WriteRequest",
 ]

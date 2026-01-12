@@ -291,7 +291,10 @@ class NodeWAL:
         ]
 
     async def iter_from(self, start_lsn: int) -> AsyncIterator[WALEntry]:
-        entries = await self._loop.run_in_executor(
+        loop = self._loop
+        assert loop is not None
+
+        entries = await loop.run_in_executor(
             None,
             self._read_entries_sync,
             start_lsn,
