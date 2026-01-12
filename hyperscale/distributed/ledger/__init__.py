@@ -16,7 +16,8 @@ Key components:
 from .consistency_level import ConsistencyLevel
 from .durability_level import DurabilityLevel
 from .job_id import JobIdGenerator
-from .job_ledger import JobLedger, JobState
+from .job_state import JobState
+from .job_ledger import JobLedger
 
 from .events import (
     JobEventType,
@@ -36,6 +37,7 @@ from .wal import (
     WALEntryState,
     WALEntry,
     HEADER_SIZE,
+    WALStatusSnapshot,
     NodeWAL,
 )
 
@@ -69,6 +71,7 @@ __all__ = [
     "WALEntryState",
     "WALEntry",
     "HEADER_SIZE",
+    "WALStatusSnapshot",
     "NodeWAL",
     "CommitPipeline",
     "CommitResult",
