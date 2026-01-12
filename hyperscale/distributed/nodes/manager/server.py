@@ -3213,7 +3213,7 @@ class ManagerServer(HealthAwareServer):
         try:
             # Rate limit check (AD-24)
             client_id = f"{addr[0]}:{addr[1]}"
-            allowed, retry_after = self._rate_limiter.check_rate_limit(
+            allowed, retry_after = await self._rate_limiter.check_rate_limit(
                 client_id, "job_submit"
             )
             if not allowed:
@@ -3552,7 +3552,7 @@ class ManagerServer(HealthAwareServer):
 
             # Rate limit check
             client_id = f"{addr[0]}:{addr[1]}"
-            allowed, retry_after = self._rate_limiter.check_rate_limit(
+            allowed, retry_after = await self._rate_limiter.check_rate_limit(
                 client_id, "cancel_workflow"
             )
             if not allowed:
@@ -3839,7 +3839,7 @@ class ManagerServer(HealthAwareServer):
         try:
             # Rate limit check
             client_id = f"{addr[0]}:{addr[1]}"
-            allowed, retry_after = self._rate_limiter.check_rate_limit(
+            allowed, retry_after = await self._rate_limiter.check_rate_limit(
                 client_id, "reconnect"
             )
             if not allowed:
@@ -3904,7 +3904,7 @@ class ManagerServer(HealthAwareServer):
         try:
             # Rate limit check
             client_id = f"{addr[0]}:{addr[1]}"
-            allowed, retry_after = self._rate_limiter.check_rate_limit(
+            allowed, retry_after = await self._rate_limiter.check_rate_limit(
                 client_id, "workflow_query"
             )
             if not allowed:
