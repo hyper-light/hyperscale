@@ -198,10 +198,8 @@ class TestWALWriterConcurrency:
     @pytest.mark.asyncio
     async def test_high_concurrency_stress(self, temp_wal_directory: str):
         wal_path = Path(temp_wal_directory) / "test.wal"
-        writer = WALWriter(
-            path=wal_path,
-            batch_max_entries=100,
-        )
+        config = WALWriterConfig(batch_max_entries=100)
+        writer = WALWriter(path=wal_path, config=config)
 
         await writer.start()
 
@@ -306,11 +304,11 @@ class TestWALWriterFutureResolution:
         temp_wal_directory: str,
     ):
         wal_path = Path(temp_wal_directory) / "test.wal"
-        writer = WALWriter(
-            path=wal_path,
+        config = WALWriterConfig(
             batch_timeout_microseconds=100000,
             batch_max_entries=10,
         )
+        writer = WALWriter(path=wal_path, config=config)
 
         await writer.start()
 

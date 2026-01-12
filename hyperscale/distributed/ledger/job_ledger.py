@@ -294,17 +294,17 @@ class JobLedger:
                 requestor_id=requestor_id,
             )
 
-            entry = await self._wal.append(
+            append_result = await self._wal.append(
                 event_type=JobEventType.JOB_CANCELLATION_REQUESTED,
                 payload=event.to_bytes(),
             )
 
-            result = await self._pipeline.commit(entry, durability)
+            result = await self._pipeline.commit(append_result.entry, durability)
 
             if result.success:
                 self._jobs_internal[job_id] = job.with_cancellation_requested(hlc=hlc)
                 self._publish_snapshot()
-                await self._wal.mark_applied(entry.lsn)
+                await self._wal.mark_applied(append_result.entry.lsn)
 
             return result
 
