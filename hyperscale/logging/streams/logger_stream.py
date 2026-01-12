@@ -308,7 +308,7 @@ class LoggerStream:
         self._files[logfile_path] = open(path, "ab+")
 
     async def _rotate(self, logfile_path: str, retention_policy: RetentionPolicy):
-        file_lock = self._file_locks[logfile_path]
+        file_lock = self._get_file_lock(logfile_path)
 
         await file_lock.acquire()
         try:
@@ -901,7 +901,7 @@ class LoggerStream:
     async def _write_log_to_file(
         self, entry: Entry, log: Log[T], logfile_path: str
     ) -> int | None:
-        file_lock = self._file_locks[logfile_path]
+        file_lock = self._get_file_lock(logfile_path)
 
         await file_lock.acquire()
         try:
@@ -1058,7 +1058,7 @@ class LoggerStream:
         logfile_path: str,
         from_offset: int = 0,
     ) -> AsyncIterator[tuple[int, Log[T], int | None]]:
-        read_lock = self._read_locks[logfile_path]
+        read_lock = self._get_read_lock(logfile_path)
 
         await read_lock.acquire()
         try:

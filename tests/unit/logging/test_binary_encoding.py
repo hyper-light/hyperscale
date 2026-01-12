@@ -43,7 +43,7 @@ class TestBinaryEncode:
         assert len(encoded) >= BINARY_HEADER_SIZE
 
         crc_stored = struct.unpack("<I", encoded[:4])[0]
-        length, lsn_high, lsn_low = struct.unpack("<IQQ", encoded[4:28])
+        length, lsn_high, lsn_low = struct.unpack("<IQQ", encoded[4:24])
         lsn_stored = (lsn_high << 64) | lsn_low
 
         assert lsn_stored == lsn
