@@ -201,6 +201,10 @@ class WorkerServer(HealthAwareServer):
         self._discovery_maintenance_task: asyncio.Task | None = None
         self._overload_poll_task: asyncio.Task | None = None
 
+        # Debounced cores notification (AD-38 fix: single in-flight task, coalesced updates)
+        self._pending_cores_notification: int | None = None
+        self._cores_notification_task: asyncio.Task | None = None
+
         # Create state embedder for SWIM
         state_embedder = WorkerStateEmbedder(
             get_node_id=lambda: self._node_id.full,
