@@ -1385,7 +1385,7 @@ class GateServer(HealthAwareServer):
         """Handle client callback registration for job reconnection."""
         try:
             client_id = f"{addr[0]}:{addr[1]}"
-            allowed, retry_after = self._check_rate_limit_for_operation(
+            allowed, retry_after = await self._check_rate_limit_for_operation(
                 client_id, "reconnect"
             )
             if not allowed:
@@ -1447,7 +1447,7 @@ class GateServer(HealthAwareServer):
         """Handle workflow status query from client."""
         try:
             client_id = f"{addr[0]}:{addr[1]}"
-            allowed, retry_after = self._check_rate_limit_for_operation(
+            allowed, retry_after = await self._check_rate_limit_for_operation(
                 client_id, "workflow_query"
             )
             if not allowed:
@@ -1487,7 +1487,7 @@ class GateServer(HealthAwareServer):
         """Handle datacenter list request from client."""
         try:
             client_id = f"{addr[0]}:{addr[1]}"
-            allowed, retry_after = self._check_rate_limit_for_operation(
+            allowed, retry_after = await self._check_rate_limit_for_operation(
                 client_id, "datacenter_list"
             )
             if not allowed:
