@@ -41,49 +41,93 @@ from enum import IntEnum
 
 # AD-37 Handler classification sets (duplicated from message_class.py to avoid circular import)
 # message_class.py imports MessagePriority from this module, so we can't import back
-_CONTROL_HANDLERS: frozenset[str] = frozenset({
-    # SWIM protocol
-    "ping", "ping_req", "ack", "nack", "indirect_ping", "indirect_ack",
-    # Cancellation (AD-20)
-    "cancel_workflow", "cancel_job", "workflow_cancelled", "job_cancellation_complete",
-    # Leadership transfer
-    "leadership_transfer", "job_leader_transfer", "receive_job_leader_transfer", "job_leader_worker_transfer",
-    # Failure detection
-    "suspect", "alive", "dead", "leave",
-})
+_CONTROL_HANDLERS: frozenset[str] = frozenset(
+    {
+        # SWIM protocol
+        "ping",
+        "ping_req",
+        "ack",
+        "nack",
+        "indirect_ping",
+        "indirect_ack",
+        # Cancellation (AD-20)
+        "cancel_workflow",
+        "cancel_job",
+        "workflow_cancelled",
+        "job_cancellation_complete",
+        # Leadership transfer
+        "leadership_transfer",
+        "job_leader_transfer",
+        "receive_job_leader_transfer",
+        "job_leader_worker_transfer",
+        # Failure detection
+        "suspect",
+        "alive",
+        "dead",
+        "leave",
+    }
+)
 
-_DISPATCH_HANDLERS: frozenset[str] = frozenset({
-    # Job dispatch
-    "submit_job", "receive_submit_job", "dispatch_workflow", "receive_workflow_dispatch",
-    # State sync
-    "state_sync_request", "state_sync_response", "request_state_sync",
-    # Registration
-    "worker_register", "receive_worker_register", "manager_register", "receive_manager_register",
-    # Workflow commands
-    "workflow_dispatch_ack", "workflow_final_result",
-})
+_DISPATCH_HANDLERS: frozenset[str] = frozenset(
+    {
+        # Job dispatch
+        "submit_job",
+        "receive_submit_job",
+        "dispatch_workflow",
+        "receive_workflow_dispatch",
+        # State sync
+        "state_sync_request",
+        "state_sync_response",
+        "request_state_sync",
+        # Registration
+        "worker_register",
+        "receive_worker_register",
+        "manager_register",
+        "receive_manager_register",
+        # Workflow commands
+        "workflow_dispatch_ack",
+        "workflow_final_result",
+    }
+)
 
-_DATA_HANDLERS: frozenset[str] = frozenset({
-    # Progress updates
-    "workflow_progress", "receive_workflow_progress", "workflow_progress_ack",
-    # Stats updates
-    "receive_stats_update", "send_stats_update",
-    # AD-34 timeout coordination
-    "receive_job_progress_report", "receive_job_timeout_report", "receive_job_global_timeout", "receive_job_final_status",
-    # Heartbeats (non-SWIM)
-    "heartbeat", "manager_heartbeat", "worker_heartbeat",
-    # Job progress (gate handlers)
-    "receive_job_progress",
-})
+_DATA_HANDLERS: frozenset[str] = frozenset(
+    {
+        # Progress updates
+        "workflow_progress",
+        "receive_workflow_progress",
+        "workflow_progress_ack",
+        # Stats updates
+        "receive_stats_update",
+        "send_stats_update",
+        # AD-34 timeout coordination
+        "receive_job_progress_report",
+        "receive_job_timeout_report",
+        "receive_job_global_timeout",
+        "receive_job_final_status",
+        # Heartbeats (non-SWIM)
+        "heartbeat",
+        "manager_heartbeat",
+        "worker_heartbeat",
+        # Job progress (gate handlers)
+        "receive_job_progress",
+    }
+)
 
-_TELEMETRY_HANDLERS: frozenset[str] = frozenset({
-    # Metrics
-    "metrics_report", "debug_stats", "trace_event",
-    # Health probes (non-critical)
-    "health_check", "readiness_check", "liveness_check",
-    # Federated health (best-effort)
-    "xprobe", "xack",
-})
+_TELEMETRY_HANDLERS: frozenset[str] = frozenset(
+    {
+        # Metrics
+        "metrics_report",
+        "debug_stats",
+        "trace_event",
+        # Health probes (non-critical)
+        "health_check",
+        "readiness_check",
+        "liveness_check",
+        # Federated health (best-effort)
+        "xprobe",
+        "xack",
+    }
+)
 
 
 class MessagePriority(IntEnum):
@@ -148,15 +192,23 @@ class PriorityLimits:
 
 
 @dataclass
-class InFlightTracker:
+class ProtocolInFlightTracker:
     """
-    Tracks in-flight tasks by priority with bounded execution.
+    Tracks in-flight tasks by priority with bounded execution at the protocol layer.
+
+    This tracker is designed for use in sync protocol callbacks (datagram_received,
+    data_received) where asyncio.Lock cannot be used. All operations are sync-safe
+    via GIL-protected integer operations.
+
+    Note: This is distinct from higher-level application trackers. The name
+    "ProtocolInFlightTracker" clarifies that this is for low-level network
+    protocol message handling in MercurySyncBaseServer.
 
     Thread-safety: All operations are sync-safe (GIL-protected integers).
     Called from sync protocol callbacks.
 
     Example:
-        tracker = InFlightTracker(limits=PriorityLimits(global_limit=1000))
+        tracker = ProtocolInFlightTracker(limits=PriorityLimits(global_limit=1000))
 
         def datagram_received(self, data, addr):
             priority = classify_message(data)
