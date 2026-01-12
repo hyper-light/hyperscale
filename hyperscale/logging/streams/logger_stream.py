@@ -541,10 +541,11 @@ class LoggerStream:
                 f"Valid extensions: {valid_extensions}"
             )
 
-        if self._config.directory:
-            directory = self._config.directory
-        elif directory is None:
-            directory = str(self._cwd) if self._cwd else os.getcwd()
+        if directory is None:
+            if self._config.directory:
+                directory = self._config.directory
+            else:
+                directory = str(self._cwd) if self._cwd else os.getcwd()
 
         return os.path.join(directory, str(filename_path))
 
