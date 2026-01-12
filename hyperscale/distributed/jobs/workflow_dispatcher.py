@@ -52,8 +52,8 @@ class WorkflowDispatcher:
 
     # Exponential backoff constants
     INITIAL_RETRY_DELAY = 1.0  # seconds
-    MAX_RETRY_DELAY = 60.0     # seconds
-    BACKOFF_MULTIPLIER = 2.0   # double delay each retry
+    MAX_RETRY_DELAY = 60.0  # seconds
+    BACKOFF_MULTIPLIER = 2.0  # double delay each retry
 
     def __init__(
         self,
@@ -64,8 +64,10 @@ class WorkflowDispatcher:
         manager_id: str,
         default_timeout_seconds: float = 300.0,
         max_dispatch_attempts: int = 5,
-        on_workflow_evicted: Callable[[str, str, str], Coroutine[Any, Any, None]] | None = None,
-        on_dispatch_failed: Callable[[str, str, str], Coroutine[Any, Any, None]] | None = None,
+        on_workflow_evicted: Callable[[str, str, str], Coroutine[Any, Any, None]]
+        | None = None,
+        on_dispatch_failed: Callable[[str, str, str], Coroutine[Any, Any, None]]
+        | None = None,
         get_leader_term: Callable[[], int] | None = None,
     ):
         """
@@ -130,9 +132,7 @@ class WorkflowDispatcher:
     async def register_workflows(
         self,
         submission: JobSubmission,
-        workflows: list[
-            tuple[str, list[str], Workflow]
-        ],
+        workflows: list[tuple[str, list[str], Workflow]],
     ) -> bool:
         """
         Register all workflows from a job submission.
@@ -152,19 +152,23 @@ class WorkflowDispatcher:
 
         # Build dependency graph
         graph = networkx.DiGraph()
-        workflow_by_id: dict[str, tuple[str, Workflow, int]] = {}  # workflow_id -> (name, workflow, vus)
+        workflow_by_id: dict[
+            str, tuple[str, Workflow, int]
+        ] = {}  # workflow_id -> (name, workflow, vus)
         priorities: dict[str, StagePriority] = {}
         is_test: dict[str, bool] = {}
 
         for wf_data in workflows:
-
             # Unpack with client-generated workflow_id
             workflow_id, dependencies, instance = wf_data
             try:
-
                 # Use the client-provided workflow_id (globally unique across DCs)
-                name = getattr(instance, 'name', None) or type(instance).__name__
-                vus = instance.vus if instance.vus and instance.vus > 0 else submission.vus
+                name = getattr(instance, "name", None) or type(instance).__name__
+                vus = (
+                    instance.vus
+                    if instance.vus and instance.vus > 0
+                    else submission.vus
+                )
 
                 # Register with JobManager
                 await self._job_manager.register_workflow(
@@ -240,7 +244,7 @@ class WorkflowDispatcher:
 
     def _get_workflow_priority(self, workflow: Workflow) -> StagePriority:
         """Determine dispatch priority for a workflow."""
-        priority = getattr(workflow, 'priority', None)
+        priority = getattr(workflow, "priority", None)
         if isinstance(priority, StagePriority):
             return priority
         return StagePriority.AUTO
@@ -248,10 +252,10 @@ class WorkflowDispatcher:
     def _is_test_workflow(self, workflow: Workflow) -> bool:
         """Check if a workflow is a test workflow."""
         # Check for test-related attributes or naming
-        name = getattr(workflow, 'name', type(workflow).__name__)
-        if 'test' in name.lower():
+        name = getattr(workflow, "name", type(workflow).__name__)
+        if "test" in name.lower():
             return True
-        return hasattr(workflow, 'is_test') and workflow.is_test
+        return hasattr(workflow, "is_test") and workflow.is_test
 
     # =========================================================================
     # Dependency Completion
@@ -308,7 +312,10 @@ class WorkflowDispatcher:
                 for key, pending in self._pending.items():
                     if pending.job_id != job_id:
                         continue
-                    if failed_wf_id in pending.dependencies and pending.workflow_id not in to_fail:
+                    if (
+                        failed_wf_id in pending.dependencies
+                        and pending.workflow_id not in to_fail
+                    ):
                         to_fail.add(pending.workflow_id)
                         queue.append(pending.workflow_id)
 
@@ -458,7 +465,9 @@ class WorkflowDispatcher:
                     cores = remaining_cores
                 else:
                     # Proportional allocation
-                    share = pending.vus / total_vus if total_vus > 0 else 1 / len(explicit)
+                    share = (
+                        pending.vus / total_vus if total_vus > 0 else 1 / len(explicit)
+                    )
                     cores = max(1, int(total_cores * share))
                     cores = min(cores, remaining_cores)
 
@@ -526,7 +535,9 @@ class WorkflowDispatcher:
             # Allocate cores from worker pool
             allocations = await self._worker_pool.allocate_cores(
                 cores_needed,
-                timeout=min(submission.timeout_seconds, 30.0),  # Don't wait too long for allocation
+                timeout=min(
+                    submission.timeout_seconds, 30.0
+                ),  # Don't wait too long for allocation
             )
 
             if not allocations:
@@ -555,7 +566,7 @@ class WorkflowDispatcher:
 
             # Dispatch to each worker, tracking success/failure for cleanup
             successful_dispatches: list[tuple[str, int]] = []  # (worker_id, cores)
-            failed_dispatches: list[tuple[str, int]] = []      # (worker_id, cores)
+            failed_dispatches: list[tuple[str, int]] = []  # (worker_id, cores)
 
             for worker_id, worker_cores in allocations:
                 # Calculate VUs for this worker
@@ -566,7 +577,9 @@ class WorkflowDispatcher:
 
                 # Get fence token for at-most-once dispatch (AD-10: incorporate leader term)
                 leader_term = self._get_leader_term() if self._get_leader_term else 0
-                fence_token = self._job_manager.get_next_fence_token(pending.job_id, leader_term)
+                fence_token = await self._job_manager.get_next_fence_token(
+                    pending.job_id, leader_term
+                )
 
                 # Create dispatch message
                 dispatch = WorkflowDispatch(
@@ -593,7 +606,9 @@ class WorkflowDispatcher:
                             worker_id=worker_id,
                             cores_allocated=worker_cores,
                         )
-                        await self._worker_pool.confirm_allocation(worker_id, worker_cores)
+                        await self._worker_pool.confirm_allocation(
+                            worker_id, worker_cores
+                        )
                         successful_dispatches.append((worker_id, worker_cores))
                     else:
                         await self._worker_pool.release_cores(worker_id, worker_cores)
@@ -699,7 +714,8 @@ class WorkflowDispatcher:
                 # Get all pending workflows for this job
                 async with self._pending_lock:
                     job_pending = [
-                        p for p in self._pending.values()
+                        p
+                        for p in self._pending.values()
                         if p.job_id == job_id and not p.dispatched
                     ]
 
@@ -709,7 +725,9 @@ class WorkflowDispatcher:
 
                 # Build list of events to wait on
                 # We wait on ANY workflow becoming ready OR cores becoming available
-                ready_events = [p.ready_event.wait() for p in job_pending if not p.dispatched]
+                ready_events = [
+                    p.ready_event.wait() for p in job_pending if not p.dispatched
+                ]
                 cores_event = self._worker_pool.wait_for_cores(timeout=5.0)
                 trigger_event = self._wait_dispatch_trigger()
 
@@ -718,7 +736,10 @@ class WorkflowDispatcher:
                     break
 
                 # Wait for any event with a timeout for periodic checks
-                tasks = [asyncio.create_task(coro) for coro in [*ready_events, cores_event, trigger_event]]
+                tasks = [
+                    asyncio.create_task(coro)
+                    for coro in [*ready_events, cores_event, trigger_event]
+                ]
                 try:
                     done, pending = await asyncio.wait(
                         tasks,
@@ -841,13 +862,22 @@ class WorkflowDispatcher:
                         reason = f"Dispatched workflow timed out after {age:.1f}s"
                     else:
                         reason = f"Pending workflow timed out after {age:.1f}s"
-                    keys_to_remove.append((key, pending.job_id, pending.workflow_id, reason, "evicted"))
+                    keys_to_remove.append(
+                        (key, pending.job_id, pending.workflow_id, reason, "evicted")
+                    )
                     continue
 
                 # Check for exceeded max retries
-                if pending.dispatch_attempts >= pending.max_dispatch_attempts and not pending.dispatched:
-                    reason = f"Dispatch failed after {pending.dispatch_attempts} attempts"
-                    keys_to_remove.append((key, pending.job_id, pending.workflow_id, reason, "failed"))
+                if (
+                    pending.dispatch_attempts >= pending.max_dispatch_attempts
+                    and not pending.dispatched
+                ):
+                    reason = (
+                        f"Dispatch failed after {pending.dispatch_attempts} attempts"
+                    )
+                    keys_to_remove.append(
+                        (key, pending.job_id, pending.workflow_id, reason, "failed")
+                    )
 
             # Remove workflows
             for key, job_id, workflow_id, reason, failure_type in keys_to_remove:
@@ -893,7 +923,9 @@ class WorkflowDispatcher:
         """Get count of dispatched workflows (optionally filtered by job_id)."""
         if job_id is None:
             return sum(1 for p in self._pending.values() if p.dispatched)
-        return sum(1 for p in self._pending.values() if p.job_id == job_id and p.dispatched)
+        return sum(
+            1 for p in self._pending.values() if p.job_id == job_id and p.dispatched
+        )
 
     # =========================================================================
     # Cleanup
@@ -914,8 +946,7 @@ class WorkflowDispatcher:
         # Clear pending workflows
         async with self._pending_lock:
             keys_to_remove = [
-                key for key in self._pending
-                if key.startswith(f"{job_id}:")
+                key for key in self._pending if key.startswith(f"{job_id}:")
             ]
             for key in keys_to_remove:
                 pending = self._pending.pop(key, None)
@@ -943,8 +974,7 @@ class WorkflowDispatcher:
         async with self._pending_lock:
             # Find all pending workflows for this job
             keys_to_remove = [
-                key for key in self._pending
-                if key.startswith(f"{job_id}:")
+                key for key in self._pending if key.startswith(f"{job_id}:")
             ]
 
             # Remove each pending workflow
@@ -961,15 +991,13 @@ class WorkflowDispatcher:
             if cancelled_workflow_ids:
                 await self._log_info(
                     f"Cancelled {len(cancelled_workflow_ids)} pending workflows for job cancellation",
-                    job_id=job_id
+                    job_id=job_id,
                 )
 
         return cancelled_workflow_ids
 
     async def cancel_pending_workflows_by_ids(
-        self,
-        job_id: str,
-        workflow_ids: list[str]
+        self, job_id: str, workflow_ids: list[str]
     ) -> list[str]:
         """
         Cancel specific pending workflows by their IDs (for single workflow cancellation).
@@ -1001,7 +1029,7 @@ class WorkflowDispatcher:
             if cancelled_workflow_ids:
                 await self._log_info(
                     f"Cancelled {len(cancelled_workflow_ids)} specific pending workflows",
-                    job_id=job_id
+                    job_id=job_id,
                 )
 
         return cancelled_workflow_ids
@@ -1042,7 +1070,7 @@ class WorkflowDispatcher:
         priority: StagePriority,
         is_test: bool,
         dependencies: set[str],
-        timeout_seconds: float
+        timeout_seconds: float,
     ) -> None:
         """
         Add a workflow back to the pending queue (AD-33 retry mechanism).
@@ -1071,7 +1099,7 @@ class WorkflowDispatcher:
                 await self._log_debug(
                     f"Workflow {workflow_id} already pending, skipping add",
                     job_id=job_id,
-                    workflow_id=workflow_id
+                    workflow_id=workflow_id,
                 )
                 return
 
@@ -1099,7 +1127,7 @@ class WorkflowDispatcher:
             await self._log_info(
                 f"Added workflow {workflow_id} back to pending queue for retry",
                 job_id=job_id,
-                workflow_id=workflow_id
+                workflow_id=workflow_id,
             )
 
         # Signal dispatch trigger to wake up dispatch loop
@@ -1120,26 +1148,62 @@ class WorkflowDispatcher:
             "dispatched_count": sum(1 for p in self._pending.values() if p.dispatched),
         }
 
-    async def _log_trace(self, message: str, job_id: str = "", workflow_id: str = "") -> None:
+    async def _log_trace(
+        self, message: str, job_id: str = "", workflow_id: str = ""
+    ) -> None:
         """Log a trace-level message."""
-        await self._logger.log(DispatcherTrace(message=message, **self._get_log_context(job_id, workflow_id)))
+        await self._logger.log(
+            DispatcherTrace(
+                message=message, **self._get_log_context(job_id, workflow_id)
+            )
+        )
 
-    async def _log_debug(self, message: str, job_id: str = "", workflow_id: str = "") -> None:
+    async def _log_debug(
+        self, message: str, job_id: str = "", workflow_id: str = ""
+    ) -> None:
         """Log a debug-level message."""
-        await self._logger.log(DispatcherDebug(message=message, **self._get_log_context(job_id, workflow_id)))
+        await self._logger.log(
+            DispatcherDebug(
+                message=message, **self._get_log_context(job_id, workflow_id)
+            )
+        )
 
-    async def _log_info(self, message: str, job_id: str = "", workflow_id: str = "") -> None:
+    async def _log_info(
+        self, message: str, job_id: str = "", workflow_id: str = ""
+    ) -> None:
         """Log an info-level message."""
-        await self._logger.log(DispatcherInfo(message=message, **self._get_log_context(job_id, workflow_id)))
+        await self._logger.log(
+            DispatcherInfo(
+                message=message, **self._get_log_context(job_id, workflow_id)
+            )
+        )
 
-    async def _log_warning(self, message: str, job_id: str = "", workflow_id: str = "") -> None:
+    async def _log_warning(
+        self, message: str, job_id: str = "", workflow_id: str = ""
+    ) -> None:
         """Log a warning-level message."""
-        await self._logger.log(DispatcherWarning(message=message, **self._get_log_context(job_id, workflow_id)))
+        await self._logger.log(
+            DispatcherWarning(
+                message=message, **self._get_log_context(job_id, workflow_id)
+            )
+        )
 
-    async def _log_error(self, message: str, job_id: str = "", workflow_id: str = "") -> None:
+    async def _log_error(
+        self, message: str, job_id: str = "", workflow_id: str = ""
+    ) -> None:
         """Log an error-level message."""
-        await self._logger.log(DispatcherError(message=message, **self._get_log_context(job_id, workflow_id)))
+        await self._logger.log(
+            DispatcherError(
+                message=message, **self._get_log_context(job_id, workflow_id)
+            )
+        )
 
-    async def _log_critical(self, message: str, job_id: str = "", workflow_id: str = "") -> None:
+    async def _log_critical(
+        self, message: str, job_id: str = "", workflow_id: str = ""
+    ) -> None:
         """Log a critical-level message."""
-        await self._logger.log(DispatcherCritical(message=message, **self._get_log_context(job_id, workflow_id)))
+        await self._logger.log(
+            DispatcherCritical(
+                message=message, **self._get_log_context(job_id, workflow_id)
+            )
+        )

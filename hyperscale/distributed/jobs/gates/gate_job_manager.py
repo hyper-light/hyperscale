@@ -208,17 +208,19 @@ class GateJobManager:
         """Set the fence token for a job."""
         self._job_fence_tokens[job_id] = token
 
-    def update_fence_token_if_higher(self, job_id: str, token: int) -> bool:
+    async def update_fence_token_if_higher(self, job_id: str, token: int) -> bool:
         """
         Update fence token only if new token is higher.
 
         Returns True if token was updated, False if rejected as stale.
+        Uses per-job lock to ensure atomicity.
         """
-        current = self._job_fence_tokens.get(job_id, 0)
-        if token > current:
-            self._job_fence_tokens[job_id] = token
-            return True
-        return False
+        async with self.lock_job(job_id):
+            current = self._job_fence_tokens.get(job_id, 0)
+            if token > current:
+                self._job_fence_tokens[job_id] = token
+                return True
+            return False
 
     # =========================================================================
     # Aggregation Helpers

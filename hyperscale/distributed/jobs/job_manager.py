@@ -85,7 +85,8 @@ class JobManager:
         self,
         datacenter: str,
         manager_id: str,
-        on_workflow_completed: Callable[[str, str], Coroutine[Any, Any, None]] | None = None,
+        on_workflow_completed: Callable[[str, str], Coroutine[Any, Any, None]]
+        | None = None,
     ):
         """
         Initialize JobManager.
@@ -105,12 +106,17 @@ class JobManager:
         self._jobs: dict[str, JobInfo] = {}
 
         # Quick lookup for workflow/sub-workflow -> job token mapping
-        self._workflow_to_job: dict[str, str] = {}  # workflow_token_str -> job_token_str
-        self._sub_workflow_to_job: dict[str, str] = {}  # sub_workflow_token_str -> job_token_str
+        self._workflow_to_job: dict[
+            str, str
+        ] = {}  # workflow_token_str -> job_token_str
+        self._sub_workflow_to_job: dict[
+            str, str
+        ] = {}  # sub_workflow_token_str -> job_token_str
 
         # Fence token tracking for at-most-once dispatch
         # Monotonically increasing per job to ensure workers can reject stale dispatches
-        self._job_fence_tokens: dict[str, int] = {}  # job_id -> current fence token
+        self._job_fence_tokens: dict[str, int] = {}
+        self._fence_token_lock: asyncio.Lock | None = None
 
         # Global lock for job creation/deletion (not per-job operations)
         self._global_lock = asyncio.Lock()
@@ -157,7 +163,13 @@ class JobManager:
     # Fence Token Management (AD-10 compliant)
     # =========================================================================
 
-    def get_next_fence_token(self, job_id: str, leader_term: int = 0) -> int:
+    def _get_fence_token_lock(self) -> asyncio.Lock:
+        """Get the fence token lock, creating lazily if needed."""
+        if self._fence_token_lock is None:
+            self._fence_token_lock = asyncio.Lock()
+        return self._fence_token_lock
+
+    async def get_next_fence_token(self, job_id: str, leader_term: int = 0) -> int:
         """
         Get the next fence token for a job, incorporating leader term (AD-10).
 
@@ -179,16 +191,17 @@ class JobManager:
         Returns:
             Fence token incorporating term and job-specific counter
 
-        Thread-safe: uses simple dict operations which are atomic in CPython.
+        Thread-safe: uses async lock to ensure atomic read-modify-write.
         """
-        current = self._job_fence_tokens.get(job_id, 0)
-        # Extract current counter (low 32 bits) and increment
-        current_counter = current & 0xFFFFFFFF
-        next_counter = current_counter + 1
-        # Combine term (high bits) with counter (low bits)
-        next_token = (leader_term << 32) | next_counter
-        self._job_fence_tokens[job_id] = next_token
-        return next_token
+        async with self._get_fence_token_lock():
+            current = self._job_fence_tokens.get(job_id, 0)
+            # Extract current counter (low 32 bits) and increment
+            current_counter = current & 0xFFFFFFFF
+            next_counter = current_counter + 1
+            # Combine term (high bits) with counter (low bits)
+            next_token = (leader_term << 32) | next_counter
+            self._job_fence_tokens[job_id] = next_token
+            return next_token
 
     def get_current_fence_token(self, job_id: str) -> int:
         """Get the current fence token for a job without incrementing."""
@@ -300,7 +313,9 @@ class JobManager:
         token = self.create_job_token(job_id)
         return self._jobs.get(str(token))
 
-    def get_job_for_workflow(self, workflow_token: str | TrackingToken) -> JobInfo | None:
+    def get_job_for_workflow(
+        self, workflow_token: str | TrackingToken
+    ) -> JobInfo | None:
         """Get job info by workflow token."""
         token_str = str(workflow_token)
         job_token_str = self._workflow_to_job.get(token_str)
@@ -308,7 +323,9 @@ class JobManager:
             return self._jobs.get(job_token_str)
         return None
 
-    def get_job_for_sub_workflow(self, sub_workflow_token: str | TrackingToken) -> JobInfo | None:
+    def get_job_for_sub_workflow(
+        self, sub_workflow_token: str | TrackingToken
+    ) -> JobInfo | None:
         """Get job info by sub-workflow token."""
         token_str = str(sub_workflow_token)
         job_token_str = self._sub_workflow_to_job.get(token_str)
@@ -359,13 +376,15 @@ class JobManager:
         """
         job = self.get_job_by_id(job_id)
         if not job:
-            await self._logger.log(JobManagerError(
-                message=f"[register_workflow] FAILED: job not found for job_id={job_id}",
-                manager_id=self._manager_id,
-                datacenter=self._datacenter,
-                job_id=job_id,
-                workflow_id=workflow_id,
-            ))
+            await self._logger.log(
+                JobManagerError(
+                    message=f"[register_workflow] FAILED: job not found for job_id={job_id}",
+                    manager_id=self._manager_id,
+                    datacenter=self._datacenter,
+                    job_id=job_id,
+                    workflow_id=workflow_id,
+                )
+            )
             return None
 
         workflow_token = self.create_workflow_token(job_id, workflow_id)
@@ -403,31 +422,37 @@ class JobManager:
         """
         job = self.get_job_by_id(job_id)
         if not job:
-            await self._logger.log(JobManagerError(
-                message=f"[register_sub_workflow] FAILED: job not found for job_id={job_id}",
-                manager_id=self._manager_id,
-                datacenter=self._datacenter,
-                job_id=job_id,
-                workflow_id=workflow_id,
-            ))
+            await self._logger.log(
+                JobManagerError(
+                    message=f"[register_sub_workflow] FAILED: job not found for job_id={job_id}",
+                    manager_id=self._manager_id,
+                    datacenter=self._datacenter,
+                    job_id=job_id,
+                    workflow_id=workflow_id,
+                )
+            )
             return None
 
         workflow_token = self.create_workflow_token(job_id, workflow_id)
         workflow_token_str = str(workflow_token)
-        sub_workflow_token = self.create_sub_workflow_token(job_id, workflow_id, worker_id)
+        sub_workflow_token = self.create_sub_workflow_token(
+            job_id, workflow_id, worker_id
+        )
         sub_workflow_token_str = str(sub_workflow_token)
 
         async with job.lock:
             # Get parent workflow
             parent = job.workflows.get(workflow_token_str)
             if not parent:
-                await self._logger.log(JobManagerError(
-                    message=f"[register_sub_workflow] FAILED: parent workflow not found for workflow_token={workflow_token_str}, job.workflows keys={list(job.workflows.keys())}",
-                    manager_id=self._manager_id,
-                    datacenter=self._datacenter,
-                    job_id=job_id,
-                    workflow_id=workflow_id,
-                ))
+                await self._logger.log(
+                    JobManagerError(
+                        message=f"[register_sub_workflow] FAILED: parent workflow not found for workflow_token={workflow_token_str}, job.workflows keys={list(job.workflows.keys())}",
+                        manager_id=self._manager_id,
+                        datacenter=self._datacenter,
+                        job_id=job_id,
+                        workflow_id=workflow_id,
+                    )
+                )
                 return None
 
             # Create sub-workflow info
@@ -505,24 +530,28 @@ class JobManager:
         token_str = str(sub_workflow_token)
         job = self.get_job_for_sub_workflow(token_str)
         if not job:
-            await self._logger.log(JobManagerError(
-                message=f"[record_sub_workflow_result] FAILED: job not found for token={token_str}, JobManager id={id(self)}, _sub_workflow_to_job keys={list(self._sub_workflow_to_job.keys())[:10]}...",
-                manager_id=self._manager_id,
-                datacenter=self._datacenter,
-                sub_workflow_token=token_str,
-            ))
+            await self._logger.log(
+                JobManagerError(
+                    message=f"[record_sub_workflow_result] FAILED: job not found for token={token_str}, JobManager id={id(self)}, _sub_workflow_to_job keys={list(self._sub_workflow_to_job.keys())[:10]}...",
+                    manager_id=self._manager_id,
+                    datacenter=self._datacenter,
+                    sub_workflow_token=token_str,
+                )
+            )
             return False, False
 
         async with job.lock:
             sub_wf = job.sub_workflows.get(token_str)
             if not sub_wf:
-                await self._logger.log(JobManagerError(
-                    message=f"[record_sub_workflow_result] FAILED: sub_wf not found for token={token_str}, job.sub_workflows keys={list(job.sub_workflows.keys())}",
-                    manager_id=self._manager_id,
-                    datacenter=self._datacenter,
-                    job_id=job.job_id,
-                    sub_workflow_token=token_str,
-                ))
+                await self._logger.log(
+                    JobManagerError(
+                        message=f"[record_sub_workflow_result] FAILED: sub_wf not found for token={token_str}, job.sub_workflows keys={list(job.sub_workflows.keys())}",
+                        manager_id=self._manager_id,
+                        datacenter=self._datacenter,
+                        job_id=job.job_id,
+                        sub_workflow_token=token_str,
+                    )
+                )
                 return False, False
 
             sub_wf.result = result
@@ -570,8 +599,12 @@ class JobManager:
             if not wf:
                 return False
 
-            if wf.status not in (WorkflowStatus.COMPLETED, WorkflowStatus.FAILED,
-                                WorkflowStatus.AGGREGATED, WorkflowStatus.AGGREGATION_FAILED):
+            if wf.status not in (
+                WorkflowStatus.COMPLETED,
+                WorkflowStatus.FAILED,
+                WorkflowStatus.AGGREGATED,
+                WorkflowStatus.AGGREGATION_FAILED,
+            ):
                 wf.status = WorkflowStatus.COMPLETED
                 wf.completion_event.set()
 
@@ -707,8 +740,12 @@ class JobManager:
 
             # Update job progress counters based on status transition
             # Only count transitions TO terminal states, not from them
-            if old_status not in (WorkflowStatus.COMPLETED, WorkflowStatus.FAILED,
-                                 WorkflowStatus.AGGREGATED, WorkflowStatus.AGGREGATION_FAILED):
+            if old_status not in (
+                WorkflowStatus.COMPLETED,
+                WorkflowStatus.FAILED,
+                WorkflowStatus.AGGREGATED,
+                WorkflowStatus.AGGREGATION_FAILED,
+            ):
                 if new_status == WorkflowStatus.COMPLETED:
                     job.workflows_completed += 1
                     wf.completion_event.set()
@@ -775,7 +812,9 @@ class JobManager:
 
         return results
 
-    def are_all_sub_workflows_complete(self, workflow_token: str | TrackingToken) -> bool:
+    def are_all_sub_workflows_complete(
+        self, workflow_token: str | TrackingToken
+    ) -> bool:
         """Check if all sub-workflows for a parent have results."""
         token_str = str(workflow_token)
         job = self.get_job_for_workflow(token_str)
@@ -808,8 +847,13 @@ class JobManager:
             return False
 
         return all(
-            wf.status in (WorkflowStatus.COMPLETED, WorkflowStatus.FAILED,
-                        WorkflowStatus.AGGREGATED, WorkflowStatus.AGGREGATION_FAILED)
+            wf.status
+            in (
+                WorkflowStatus.COMPLETED,
+                WorkflowStatus.FAILED,
+                WorkflowStatus.AGGREGATED,
+                WorkflowStatus.AGGREGATION_FAILED,
+            )
             for wf in job.workflows.values()
         )
 
@@ -821,7 +865,9 @@ class JobManager:
 
         return job.status
 
-    async def update_job_status(self, job_token: str | TrackingToken, status: str) -> bool:
+    async def update_job_status(
+        self, job_token: str | TrackingToken, status: str
+    ) -> bool:
         """
         Update job status.
 
@@ -897,10 +943,7 @@ class JobManager:
 
         Used for state sync between managers.
         """
-        return {
-            job.job_id: job.to_wire_progress()
-            for job in self._jobs.values()
-        }
+        return {job.job_id: job.to_wire_progress() for job in self._jobs.values()}
 
     # =========================================================================
     # Job Cleanup
