@@ -1,24 +1,23 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import struct
+import tempfile
 import zlib
 from pathlib import Path
 from typing import Any
 
-import aiofiles
 import msgspec
 
 from hyperscale.logging.lsn import LSN
 
+CHECKPOINT_MAGIC = b"HSCL"
+CHECKPOINT_VERSION = 1
+CHECKPOINT_HEADER_SIZE = 16
+
 
 class Checkpoint(msgspec.Struct, frozen=True):
-    """
-    Snapshot of ledger state at a point in time.
-
-    Enables efficient recovery without replaying entire WAL.
-    """
-
     local_lsn: int
     regional_lsn: int
     global_lsn: int
@@ -27,19 +26,17 @@ class Checkpoint(msgspec.Struct, frozen=True):
     created_at_ms: int
 
 
-CHECKPOINT_MAGIC = b"HSCL"
-CHECKPOINT_VERSION = 1
-
-
 class CheckpointManager:
-    __slots__ = ("_checkpoint_dir", "_lock", "_latest_checkpoint")
+    __slots__ = ("_checkpoint_dir", "_lock", "_latest_checkpoint", "_loop")
 
     def __init__(self, checkpoint_dir: Path) -> None:
         self._checkpoint_dir = checkpoint_dir
         self._lock = asyncio.Lock()
         self._latest_checkpoint: Checkpoint | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
 
     async def initialize(self) -> None:
+        self._loop = asyncio.get_running_loop()
         self._checkpoint_dir.mkdir(parents=True, exist_ok=True)
         await self._load_latest()
 
@@ -58,54 +55,99 @@ class CheckpointManager:
                 continue
 
     async def _read_checkpoint(self, path: Path) -> Checkpoint:
-        async with aiofiles.open(path, mode="rb") as file:
-            header = await file.read(8)
+        loop = self._loop
+        assert loop is not None
 
-            if len(header) < 8:
-                raise ValueError("Checkpoint file too small")
+        return await loop.run_in_executor(
+            None,
+            self._read_checkpoint_sync,
+            path,
+        )
 
-            magic = header[:4]
-            if magic != CHECKPOINT_MAGIC:
-                raise ValueError(f"Invalid checkpoint magic: {magic}")
+    def _read_checkpoint_sync(self, path: Path) -> Checkpoint:
+        with open(path, "rb") as file:
+            data = file.read()
 
-            version = struct.unpack(">I", header[4:8])[0]
-            if version != CHECKPOINT_VERSION:
-                raise ValueError(f"Unsupported checkpoint version: {version}")
+        if len(data) < CHECKPOINT_HEADER_SIZE:
+            raise ValueError("Checkpoint file too small")
 
-            length_bytes = await file.read(4)
-            data_length = struct.unpack(">I", length_bytes)[0]
+        magic = data[:4]
+        if magic != CHECKPOINT_MAGIC:
+            raise ValueError(f"Invalid checkpoint magic: {magic}")
 
-            crc_bytes = await file.read(4)
-            stored_crc = struct.unpack(">I", crc_bytes)[0]
+        version = struct.unpack(">I", data[4:8])[0]
+        if version != CHECKPOINT_VERSION:
+            raise ValueError(f"Unsupported checkpoint version: {version}")
 
-            data = await file.read(data_length)
-            computed_crc = zlib.crc32(data) & 0xFFFFFFFF
+        data_length = struct.unpack(">I", data[8:12])[0]
+        stored_crc = struct.unpack(">I", data[12:16])[0]
 
-            if stored_crc != computed_crc:
-                raise ValueError("Checkpoint CRC mismatch")
+        payload = data[CHECKPOINT_HEADER_SIZE : CHECKPOINT_HEADER_SIZE + data_length]
+        if len(payload) < data_length:
+            raise ValueError("Checkpoint file truncated")
 
-            return msgspec.msgpack.decode(data, type=Checkpoint)
+        computed_crc = zlib.crc32(payload) & 0xFFFFFFFF
+        if stored_crc != computed_crc:
+            raise ValueError("Checkpoint CRC mismatch")
+
+        return msgspec.msgpack.decode(payload, type=Checkpoint)
 
     async def save(self, checkpoint: Checkpoint) -> Path:
+        loop = self._loop
+        assert loop is not None
+
         async with self._lock:
-            filename = f"checkpoint_{checkpoint.created_at_ms}.bin"
-            path = self._checkpoint_dir / filename
-
-            data = msgspec.msgpack.encode(checkpoint)
-            crc = zlib.crc32(data) & 0xFFFFFFFF
-
-            header = CHECKPOINT_MAGIC + struct.pack(">I", CHECKPOINT_VERSION)
-            length_bytes = struct.pack(">I", len(data))
-            crc_bytes = struct.pack(">I", crc)
-
-            async with aiofiles.open(path, mode="wb") as file:
-                await file.write(header)
-                await file.write(length_bytes)
-                await file.write(crc_bytes)
-                await file.write(data)
-
+            path = await loop.run_in_executor(
+                None,
+                self._save_sync,
+                checkpoint,
+            )
             self._latest_checkpoint = checkpoint
             return path
+
+    def _save_sync(self, checkpoint: Checkpoint) -> Path:
+        filename = f"checkpoint_{checkpoint.created_at_ms}.bin"
+        final_path = self._checkpoint_dir / filename
+
+        payload = msgspec.msgpack.encode(checkpoint)
+        crc = zlib.crc32(payload) & 0xFFFFFFFF
+
+        header = (
+            CHECKPOINT_MAGIC
+            + struct.pack(">I", CHECKPOINT_VERSION)
+            + struct.pack(">I", len(payload))
+            + struct.pack(">I", crc)
+        )
+
+        temp_fd, temp_path_str = tempfile.mkstemp(
+            dir=self._checkpoint_dir,
+            prefix=".tmp_checkpoint_",
+            suffix=".bin",
+        )
+
+        try:
+            with os.fdopen(temp_fd, "wb") as file:
+                file.write(header)
+                file.write(payload)
+                file.flush()
+                os.fsync(file.fileno())
+
+            os.rename(temp_path_str, final_path)
+
+            dir_fd = os.open(self._checkpoint_dir, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+
+            return final_path
+
+        except Exception:
+            try:
+                os.unlink(temp_path_str)
+            except OSError:
+                pass
+            raise
 
     async def cleanup(self, keep_count: int = 3) -> int:
         async with self._lock:

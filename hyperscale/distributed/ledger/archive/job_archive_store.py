@@ -5,20 +5,21 @@ import os
 import tempfile
 from pathlib import Path
 
-import aiofiles
 import msgspec
 
 from ..job_state import JobState
 
 
 class JobArchiveStore:
-    __slots__ = ("_archive_dir", "_lock")
+    __slots__ = ("_archive_dir", "_lock", "_loop")
 
     def __init__(self, archive_dir: Path) -> None:
         self._archive_dir = archive_dir
         self._lock = asyncio.Lock()
+        self._loop: asyncio.AbstractEventLoop | None = None
 
     async def initialize(self) -> None:
+        self._loop = asyncio.get_running_loop()
         self._archive_dir.mkdir(parents=True, exist_ok=True)
 
     def _get_archive_path(self, job_id: str) -> Path:
@@ -37,42 +38,53 @@ class JobArchiveStore:
         if archive_path.exists():
             return True
 
+        loop = self._loop
+        assert loop is not None
+
         async with self._lock:
             if archive_path.exists():
                 return True
 
-            archive_path.parent.mkdir(parents=True, exist_ok=True)
-
-            data = msgspec.msgpack.encode(job_state.to_dict())
-
-            temp_fd, temp_path_str = tempfile.mkstemp(
-                dir=archive_path.parent,
-                prefix=".tmp_",
-                suffix=".bin",
+            await loop.run_in_executor(
+                None,
+                self._write_sync,
+                job_state,
+                archive_path,
             )
 
+            return True
+
+    def _write_sync(self, job_state: JobState, archive_path: Path) -> None:
+        archive_path.parent.mkdir(parents=True, exist_ok=True)
+
+        data = msgspec.msgpack.encode(job_state.to_dict())
+
+        temp_fd, temp_path_str = tempfile.mkstemp(
+            dir=archive_path.parent,
+            prefix=".tmp_",
+            suffix=".bin",
+        )
+
+        try:
+            with os.fdopen(temp_fd, "wb") as file:
+                file.write(data)
+                file.flush()
+                os.fsync(file.fileno())
+
+            os.rename(temp_path_str, archive_path)
+
+            dir_fd = os.open(archive_path.parent, os.O_RDONLY | os.O_DIRECTORY)
             try:
-                async with aiofiles.open(temp_fd, mode="wb", closefd=True) as temp_file:
-                    await temp_file.write(data)
-                    await temp_file.flush()
-                    os.fsync(temp_file.fileno())
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
 
-                os.rename(temp_path_str, archive_path)
-
-                dir_fd = os.open(archive_path.parent, os.O_RDONLY | os.O_DIRECTORY)
-                try:
-                    os.fsync(dir_fd)
-                finally:
-                    os.close(dir_fd)
-
-                return True
-
-            except Exception:
-                try:
-                    os.unlink(temp_path_str)
-                except OSError:
-                    pass
-                raise
+        except Exception:
+            try:
+                os.unlink(temp_path_str)
+            except OSError:
+                pass
+            raise
 
     async def read(self, job_id: str) -> JobState | None:
         archive_path = self._get_archive_path(job_id)
@@ -80,15 +92,25 @@ class JobArchiveStore:
         if not archive_path.exists():
             return None
 
+        loop = self._loop
+        assert loop is not None
+
         try:
-            async with aiofiles.open(archive_path, mode="rb") as file:
-                data = await file.read()
-
-            job_dict = msgspec.msgpack.decode(data)
-            return JobState.from_dict(job_id, job_dict)
-
+            return await loop.run_in_executor(
+                None,
+                self._read_sync,
+                job_id,
+                archive_path,
+            )
         except (OSError, msgspec.DecodeError):
             return None
+
+    def _read_sync(self, job_id: str, archive_path: Path) -> JobState:
+        with open(archive_path, "rb") as file:
+            data = file.read()
+
+        job_dict = msgspec.msgpack.decode(data)
+        return JobState.from_dict(job_id, job_dict)
 
     async def exists(self, job_id: str) -> bool:
         return self._get_archive_path(job_id).exists()
