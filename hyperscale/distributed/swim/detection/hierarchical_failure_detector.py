@@ -175,9 +175,9 @@ class HierarchicalFailureDetector:
         # Lock for state coordination
         self._lock = asyncio.Lock()
 
-        # Event history for debugging/monitoring
-        self._recent_events: list[FailureEvent] = []
+        # Event history for debugging/monitoring (bounded deque auto-evicts oldest)
         self._max_event_history: int = 100
+        self._recent_events: deque[FailureEvent] = deque(maxlen=self._max_event_history)
 
         self._pending_clear_tasks: set[asyncio.Task] = set()
 
@@ -741,8 +741,6 @@ class HierarchicalFailureDetector:
     def _record_event(self, event: FailureEvent) -> None:
         """Record a failure event for history/debugging."""
         self._recent_events.append(event)
-        if len(self._recent_events) > self._max_event_history:
-            self._recent_events.pop(0)
 
     # =========================================================================
     # Reconciliation
