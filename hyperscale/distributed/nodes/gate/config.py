@@ -89,6 +89,9 @@ class GateConfig:
     circuit_breaker_window_seconds: float = 30.0
     circuit_breaker_half_open_after_seconds: float = 10.0
 
+    # Job ledger configuration (AD-38)
+    ledger_data_dir: Path | None = None
+
 
 def create_gate_config(
     host: str,
