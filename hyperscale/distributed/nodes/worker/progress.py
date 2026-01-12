@@ -447,8 +447,16 @@ class WorkerProgressReporter:
                     timeout=5.0,
                 )
                 return
-            except Exception:
-                pass
+            except Exception as cancel_error:
+                if self._logger:
+                    await self._logger.log(
+                        ServerDebug(
+                            message=f"Failed to send cancellation to job leader: {cancel_error}",
+                            node_host=node_host,
+                            node_port=node_port,
+                            node_id=node_id_short,
+                        )
+                    )
 
         for manager_id in list(self._registry._healthy_manager_ids):
             if manager := self._registry.get_manager(manager_id):
@@ -464,7 +472,16 @@ class WorkerProgressReporter:
                         timeout=5.0,
                     )
                     return
-                except Exception:
+                except Exception as fallback_error:
+                    if self._logger:
+                        await self._logger.log(
+                            ServerDebug(
+                                message=f"Failed to send cancellation to fallback manager: {fallback_error}",
+                                node_host=node_host,
+                                node_port=node_port,
+                                node_id=node_id_short,
+                            )
+                        )
                     continue
 
         if self._logger:
