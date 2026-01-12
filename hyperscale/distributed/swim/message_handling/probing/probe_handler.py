@@ -115,7 +115,7 @@ class ProbeHandler(BaseHandler):
             return
 
         others = self._server.get_other_nodes(target)
-        base_timeout = self._server.get_current_timeout()
+        base_timeout = await self._server.get_current_timeout()
         timeout = self._server.get_lhm_adjusted_timeout(base_timeout)
         gather_timeout = timeout * 2
 
