@@ -2631,9 +2631,9 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         """Get this node's current incarnation number."""
         return self._incarnation_tracker.get_self_incarnation()
 
-    def increment_incarnation(self) -> int:
+    async def increment_incarnation(self) -> int:
         """Increment and return this node's incarnation number (for refutation)."""
-        return self._incarnation_tracker.increment_self_incarnation()
+        return await self._incarnation_tracker.increment_self_incarnation()
 
     def encode_message_with_incarnation(
         self,
