@@ -494,7 +494,7 @@ class IncarnationTracker:
 
         return False
 
-    def confirm_node(
+    async def confirm_node(
         self,
         node: tuple[str, int],
         incarnation: int = 0,
@@ -517,30 +517,28 @@ class IncarnationTracker:
         if timestamp is None:
             timestamp = time.monotonic()
 
-        existing = self.node_states.get(node)
+        async with self._lock:
+            existing = self.node_states.get(node)
 
-        # If not known, add as confirmed directly
-        if existing is None:
-            self.node_states[node] = NodeState(
-                status=b"OK",
-                incarnation=incarnation,
-                last_update_time=timestamp,
-            )
-            return True
+            if existing is None:
+                self.node_states[node] = NodeState(
+                    status=b"OK",
+                    incarnation=incarnation,
+                    last_update_time=timestamp,
+                )
+                return True
 
-        # If UNCONFIRMED, transition to OK
-        if existing.status == b"UNCONFIRMED":
-            existing.status = b"OK"
-            existing.incarnation = max(existing.incarnation, incarnation)
-            existing.last_update_time = timestamp
-            return True
+            if existing.status == b"UNCONFIRMED":
+                existing.status = b"OK"
+                existing.incarnation = max(existing.incarnation, incarnation)
+                existing.last_update_time = timestamp
+                return True
 
-        # Already confirmed (OK, SUSPECT, or DEAD) - update incarnation if higher
-        if incarnation > existing.incarnation:
-            existing.incarnation = incarnation
-            existing.last_update_time = timestamp
+            if incarnation > existing.incarnation:
+                existing.incarnation = incarnation
+                existing.last_update_time = timestamp
 
-        return False
+            return False
 
     def is_node_confirmed(self, node: tuple[str, int]) -> bool:
         """
