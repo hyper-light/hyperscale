@@ -101,7 +101,6 @@ class WorkerServer(HealthAwareServer):
         # Centralized runtime state (single source of truth)
         self._worker_state = WorkerState(self._core_allocator)
 
-        # AD-41: Resource monitoring with Kalman filtering
         self._resource_monitor = ProcessResourceMonitor()
 
         # Initialize modules (will be fully wired after super().__init__)
@@ -1256,22 +1255,18 @@ class WorkerServer(HealthAwareServer):
     # =========================================================================
 
     def _get_cpu_percent(self) -> float:
-        """Get CPU utilization percentage."""
-        try:
-            import psutil
-
-            return psutil.cpu_percent()
-        except ImportError:
-            return 0.0
+        """Get CPU utilization percentage from Kalman-filtered monitor."""
+        metrics = self._resource_monitor.get_last_metrics()
+        if metrics is not None:
+            return metrics.cpu_percent
+        return 0.0
 
     def _get_memory_percent(self) -> float:
-        """Get memory utilization percentage."""
-        try:
-            import psutil
-
-            return psutil.virtual_memory().percent
-        except ImportError:
-            return 0.0
+        """Get memory utilization percentage from Kalman-filtered monitor."""
+        metrics = self._resource_monitor.get_last_metrics()
+        if metrics is not None:
+            return metrics.memory_percent
+        return 0.0
 
     # =========================================================================
     # TCP Handlers - Delegate to handler classes
