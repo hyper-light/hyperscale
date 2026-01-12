@@ -362,6 +362,7 @@ class WorkerExtensionRequested(Entry, kw_only=True):
     node_id: str
     node_host: str
     node_port: int
-    job_id: str
-    requested_seconds: float
+    reason: str
+    estimated_completion_seconds: float
+    active_workflow_count: int
     level: LogLevel = LogLevel.DEBUG

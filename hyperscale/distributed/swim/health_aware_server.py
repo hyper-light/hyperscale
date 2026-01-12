@@ -29,6 +29,7 @@ from hyperscale.logging.hyperscale_logging_models import (
     ServerInfo,
     ServerDebug,
     ServerWarning,
+    ServerError,
 )
 
 # Core types and utilities
