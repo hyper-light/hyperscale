@@ -6,7 +6,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Callable, Awaitable, Mapping
 
-from hyperscale.logging.lsn import LSN, HybridLamportClock
+from hyperscale.logging.lsn import HybridLamportClock
 
 from .archive.job_archive_store import JobArchiveStore
 from .cache.bounded_lru_cache import BoundedLRUCache
@@ -367,7 +367,22 @@ class JobLedger:
         job_id: str,
         consistency: ConsistencyLevel = ConsistencyLevel.SESSION,
     ) -> JobState | None:
-        return self._jobs_snapshot.get(job_id)
+        active_job = self._jobs_snapshot.get(job_id)
+        if active_job is not None:
+            return active_job
+
+        return self._completed_cache.get(job_id)
+
+    async def get_archived_job(self, job_id: str) -> JobState | None:
+        cached_job = self._completed_cache.get(job_id)
+        if cached_job is not None:
+            return cached_job
+
+        archived_job = await self._archive_store.read(job_id)
+        if archived_job is not None:
+            self._completed_cache.put(job_id, archived_job)
+
+        return archived_job
 
     def get_all_jobs(self) -> Mapping[str, JobState]:
         return self._jobs_snapshot
@@ -377,7 +392,9 @@ class JobLedger:
             hlc = await self._clock.generate()
 
             job_states = {
-                job_id: job.to_dict() for job_id, job in self._jobs_internal.items()
+                job_id: job.to_dict()
+                for job_id, job in self._jobs_internal.items()
+                if not job.is_terminal
             }
 
             checkpoint = Checkpoint(
@@ -402,5 +419,17 @@ class JobLedger:
         return len(self._jobs_snapshot)
 
     @property
+    def active_job_count(self) -> int:
+        return len(self._jobs_internal)
+
+    @property
+    def cached_completed_count(self) -> int:
+        return len(self._completed_cache)
+
+    @property
     def pending_wal_entries(self) -> int:
         return self._wal.pending_count
+
+    @property
+    def archive_store(self) -> JobArchiveStore:
+        return self._archive_store
