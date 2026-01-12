@@ -4,10 +4,12 @@ import asyncio
 import time
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Callable, Awaitable, Mapping
+from typing import Callable, Awaitable, Mapping
 
 from hyperscale.logging.lsn import LSN, HybridLamportClock
 
+from .archive.job_archive_store import JobArchiveStore
+from .cache.bounded_lru_cache import BoundedLRUCache
 from .consistency_level import ConsistencyLevel
 from .durability_level import DurabilityLevel
 from .events.event_type import JobEventType
@@ -24,8 +26,7 @@ from .wal.wal_entry import WALEntry
 from .pipeline.commit_pipeline import CommitPipeline, CommitResult
 from .checkpoint.checkpoint import Checkpoint, CheckpointManager
 
-if TYPE_CHECKING:
-    pass
+DEFAULT_COMPLETED_CACHE_SIZE = 10000
 
 
 class JobLedger:
@@ -35,6 +36,8 @@ class JobLedger:
         "_pipeline",
         "_checkpoint_manager",
         "_job_id_generator",
+        "_archive_store",
+        "_completed_cache",
         "_jobs_internal",
         "_jobs_snapshot",
         "_lock",
@@ -48,12 +51,18 @@ class JobLedger:
         pipeline: CommitPipeline,
         checkpoint_manager: CheckpointManager,
         job_id_generator: JobIdGenerator,
+        archive_store: JobArchiveStore,
+        completed_cache_size: int = DEFAULT_COMPLETED_CACHE_SIZE,
     ) -> None:
         self._clock = clock
         self._wal = wal
         self._pipeline = pipeline
         self._checkpoint_manager = checkpoint_manager
         self._job_id_generator = job_id_generator
+        self._archive_store = archive_store
+        self._completed_cache: BoundedLRUCache[str, JobState] = BoundedLRUCache(
+            max_size=completed_cache_size
+        )
         self._jobs_internal: dict[str, JobState] = {}
         self._jobs_snapshot: Mapping[str, JobState] = MappingProxyType({})
         self._lock = asyncio.Lock()
@@ -64,11 +73,13 @@ class JobLedger:
         cls,
         wal_path: Path,
         checkpoint_dir: Path,
+        archive_dir: Path,
         region_code: str,
         gate_id: str,
         node_id: int,
         regional_replicator: Callable[[WALEntry], Awaitable[bool]] | None = None,
         global_replicator: Callable[[WALEntry], Awaitable[bool]] | None = None,
+        completed_cache_size: int = DEFAULT_COMPLETED_CACHE_SIZE,
     ) -> JobLedger:
         clock = HybridLamportClock(node_id=node_id)
         wal = await NodeWAL.open(path=wal_path, clock=clock)
@@ -82,6 +93,9 @@ class JobLedger:
         checkpoint_manager = CheckpointManager(checkpoint_dir=checkpoint_dir)
         await checkpoint_manager.initialize()
 
+        archive_store = JobArchiveStore(archive_dir=archive_dir)
+        await archive_store.initialize()
+
         job_id_generator = JobIdGenerator(
             region_code=region_code,
             gate_id=gate_id,
@@ -93,6 +107,8 @@ class JobLedger:
             pipeline=pipeline,
             checkpoint_manager=checkpoint_manager,
             job_id_generator=job_id_generator,
+            archive_store=archive_store,
+            completed_cache_size=completed_cache_size,
         )
 
         await ledger._recover()
@@ -113,7 +129,20 @@ class JobLedger:
         async for entry in self._wal.iter_from(start_lsn):
             self._apply_entry(entry)
 
+        await self._archive_terminal_jobs()
         self._publish_snapshot()
+
+    async def _archive_terminal_jobs(self) -> None:
+        terminal_job_ids: list[str] = []
+
+        for job_id, job_state in self._jobs_internal.items():
+            if job_state.is_terminal:
+                await self._archive_store.write_if_absent(job_state)
+                self._completed_cache.put(job_id, job_state)
+                terminal_job_ids.append(job_id)
+
+        for job_id in terminal_job_ids:
+            del self._jobs_internal[job_id]
 
     def _publish_snapshot(self) -> None:
         self._jobs_snapshot = MappingProxyType(dict(self._jobs_internal))
@@ -317,12 +346,17 @@ class JobLedger:
             result = await self._pipeline.commit(entry, durability)
 
             if result.success:
-                self._jobs_internal[job_id] = job.with_completion(
+                completed_job = job.with_completion(
                     final_status=final_status,
                     total_completed=total_completed,
                     total_failed=total_failed,
                     hlc=hlc,
                 )
+
+                await self._archive_store.write_if_absent(completed_job)
+                self._completed_cache.put(job_id, completed_job)
+                del self._jobs_internal[job_id]
+
                 self._publish_snapshot()
                 await self._wal.mark_applied(entry.lsn)
 
