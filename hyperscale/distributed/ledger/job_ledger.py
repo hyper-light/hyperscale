@@ -261,7 +261,11 @@ class JobLedger:
                 payload=event.to_bytes(),
             )
 
-            result = await self._pipeline.commit(append_result.entry, durability)
+            result = await self._pipeline.commit(
+                append_result.entry,
+                durability,
+                backpressure=append_result.backpressure,
+            )
 
             if result.success:
                 self._jobs_internal[job_id] = job.with_accepted(
