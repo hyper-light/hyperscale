@@ -51,9 +51,8 @@ class ServerAdapter:
         """Return node states from IncarnationTracker (AD-46)."""
         return self._server._incarnation_tracker.node_states
 
-    def get_current_timeout(self) -> float:
-        """Get the current base timeout value."""
-        return self._server._context.read("current_timeout")
+    async def get_current_timeout(self) -> float:
+        return await self._server._context.read("current_timeout")
 
     def get_other_nodes(
         self, exclude: tuple[str, int] | None = None
@@ -299,13 +298,11 @@ class ServerAdapter:
 
     # === Context Management ===
 
-    def context_with_value(self, target: tuple[str, int]) -> Any:
-        """Get async context manager for target-scoped operations."""
-        return self._server._context.with_value(target)
+    async def context_with_value(self, target: tuple[str, int]) -> Any:
+        return await self._server._context.with_value(target)
 
-    def write_context(self, key: Any, value: Any) -> None:
-        """Write value to context."""
-        self._server._context.write(key, value)
+    async def write_context(self, key: Any, value: Any) -> None:
+        await self._server._context.write(key, value)
 
     # === Leadership Broadcasting ===
 
