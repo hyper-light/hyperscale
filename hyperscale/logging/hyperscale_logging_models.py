@@ -295,6 +295,8 @@ class WorkerJobStarted(Entry, kw_only=True):
     node_port: int
     job_id: str
     workflow_id: str
+    allocated_vus: int
+    allocated_cores: int
     level: LogLevel = LogLevel.INFO
 
 
@@ -304,7 +306,9 @@ class WorkerJobCompleted(Entry, kw_only=True):
     node_port: int
     job_id: str
     workflow_id: str
-    duration_ms: float
+    elapsed_seconds: float
+    completed_count: int
+    failed_count: int
     level: LogLevel = LogLevel.INFO
 
 
@@ -314,8 +318,9 @@ class WorkerJobFailed(Entry, kw_only=True):
     node_port: int
     job_id: str
     workflow_id: str
-    error_type: str
-    duration_ms: float
+    elapsed_seconds: float
+    error_message: str | None
+    error_type: str | None
     level: LogLevel = LogLevel.ERROR
 
 
