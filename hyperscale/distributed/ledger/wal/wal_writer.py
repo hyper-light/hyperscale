@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 import asyncio
-import io
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import Callable, Awaitable
 
 from hyperscale.distributed.reliability.robust_queue import (
     RobustMessageQueue,
@@ -17,9 +16,6 @@ from hyperscale.distributed.reliability.backpressure import (
     BackpressureLevel,
     BackpressureSignal,
 )
-
-if TYPE_CHECKING:
-    pass
 
 
 class WALBackpressureError(Exception):
@@ -61,18 +57,11 @@ class WriteBatch:
 
 @dataclass(slots=True)
 class WALWriterConfig:
-    """Configuration for WALWriter."""
-
-    # Batching settings
     batch_timeout_microseconds: int = 500
     batch_max_entries: int = 1000
-    batch_max_bytes: int = 1024 * 1024  # 1MB
-
-    # Queue settings (primary + overflow)
+    batch_max_bytes: int = 1024 * 1024
     queue_max_size: int = 10000
     overflow_size: int = 1000
-
-    # Backpressure thresholds
     throttle_threshold: float = 0.70
     batch_threshold: float = 0.85
     reject_threshold: float = 0.95
@@ -80,8 +69,6 @@ class WALWriterConfig:
 
 @dataclass(slots=True)
 class WALWriterMetrics:
-    """Metrics for WAL writer observability."""
-
     total_submitted: int = 0
     total_written: int = 0
     total_batches: int = 0
@@ -90,7 +77,6 @@ class WALWriterMetrics:
     total_rejected: int = 0
     total_overflow: int = 0
     total_errors: int = 0
-
     peak_queue_size: int = 0
     peak_batch_size: int = 0
 
@@ -99,22 +85,8 @@ class WALWriter:
     """
     Asyncio-native WAL writer with group commit and backpressure.
 
-    Design principles:
-    - Fully asyncio-native with RobustMessageQueue for backpressure
-    - Batches writes: collect for N microseconds OR until batch full
-    - Single write() + single fsync() commits entire batch via executor
-    - File I/O delegated to thread pool (only sync operation)
-    - Comprehensive metrics and backpressure signaling
-
-    Throughput model:
-    - fsync at 500μs = 2,000 batches/sec
-    - 100 entries/batch = 200,000 entries/sec
-    - 1000 entries/batch = 2,000,000 entries/sec
-
-    Backpressure:
-    - Uses RobustMessageQueue with overflow buffer
-    - Graduated levels: NONE -> THROTTLE -> BATCH -> REJECT
-    - Never silently drops - returns QueuePutResult with status
+    Uses RobustMessageQueue for graduated backpressure (NONE -> THROTTLE -> BATCH -> REJECT).
+    File I/O is delegated to executor. Batches writes with configurable timeout and size limits.
     """
 
     __slots__ = (
@@ -135,7 +107,10 @@ class WALWriter:
         self,
         path: Path,
         config: WALWriterConfig | None = None,
-        state_change_callback: asyncio.coroutine | None = None,
+        state_change_callback: Callable[
+            [QueueState, BackpressureSignal], Awaitable[None]
+        ]
+        | None = None,
     ) -> None:
         self._path = path
         self._config = config or WALWriterConfig()
@@ -159,36 +134,29 @@ class WALWriter:
         self._state_change_callback = state_change_callback
 
     async def start(self) -> None:
-        """Start the WAL writer background task."""
         if self._running:
             return
 
         self._loop = asyncio.get_running_loop()
         self._running = True
-
-        # Ensure directory exists
         self._path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Start the writer task
         self._writer_task = asyncio.create_task(
             self._writer_loop(),
             name=f"wal-writer-{self._path.name}",
         )
 
     async def stop(self) -> None:
-        """Stop the WAL writer and wait for pending writes."""
         if not self._running:
             return
 
         self._running = False
 
-        # Signal shutdown by putting None
         try:
             self._queue._primary.put_nowait(None)  # type: ignore
         except asyncio.QueueFull:
             pass
 
-        # Wait for writer task to complete
         if self._writer_task is not None:
             try:
                 await asyncio.wait_for(self._writer_task, timeout=5.0)
@@ -201,22 +169,9 @@ class WALWriter:
             finally:
                 self._writer_task = None
 
-        # Fail any remaining requests
         await self._fail_pending_requests(RuntimeError("WAL writer stopped"))
 
     def submit(self, request: WriteRequest) -> QueuePutResult:
-        """
-        Submit a write request to the queue.
-
-        This is synchronous and non-blocking. Returns immediately with
-        the result indicating acceptance status and backpressure level.
-
-        Args:
-            request: The write request containing data and future
-
-        Returns:
-            QueuePutResult with acceptance status and backpressure info
-        """
         if not self._running:
             error = RuntimeError("WAL writer is not running")
             if not request.future.done():
@@ -244,7 +199,6 @@ class WALWriter:
 
         result = self._queue.put_nowait(request)
 
-        # Update metrics
         if result.accepted:
             self._metrics.total_submitted += 1
             if result.in_overflow:
@@ -263,7 +217,6 @@ class WALWriter:
             if not request.future.done():
                 request.future.set_exception(error)
 
-        # Track state transitions
         if result.queue_state != self._last_queue_state:
             self._last_queue_state = result.queue_state
             if self._state_change_callback is not None and self._loop is not None:
@@ -302,7 +255,6 @@ class WALWriter:
         return self._queue.get_backpressure_level()
 
     def get_queue_metrics(self) -> dict:
-        """Get combined metrics from writer and queue."""
         queue_metrics = self._queue.get_metrics()
         return {
             **queue_metrics,
@@ -319,7 +271,6 @@ class WALWriter:
         }
 
     async def _writer_loop(self) -> None:
-        """Main writer loop - collects batches and writes to disk."""
         try:
             while self._running:
                 await self._collect_batch()
@@ -327,11 +278,9 @@ class WALWriter:
                 if len(self._current_batch) > 0:
                     await self._commit_batch()
 
-            # Final drain on shutdown
             await self._drain_remaining()
 
         except asyncio.CancelledError:
-            # Graceful cancellation
             await self._drain_remaining()
             raise
 
@@ -341,17 +290,14 @@ class WALWriter:
             await self._fail_pending_requests(exception)
 
     async def _collect_batch(self) -> None:
-        """Collect requests into a batch with timeout."""
         batch_timeout = self._config.batch_timeout_microseconds / 1_000_000
 
         try:
-            # Wait for first request with timeout
             request = await asyncio.wait_for(
                 self._queue.get(),
                 timeout=batch_timeout,
             )
 
-            # Check for shutdown signal
             if request is None:
                 self._running = False
                 return
@@ -359,10 +305,8 @@ class WALWriter:
             self._current_batch.add(request)
 
         except asyncio.TimeoutError:
-            # No requests within timeout - that's fine
             return
 
-        # Collect more requests without waiting (non-blocking)
         while (
             len(self._current_batch) < self._config.batch_max_entries
             and self._current_batch.total_bytes < self._config.batch_max_bytes
@@ -380,7 +324,6 @@ class WALWriter:
                 break
 
     async def _commit_batch(self) -> None:
-        """Commit the current batch to disk with fsync."""
         if len(self._current_batch) == 0:
             return
 
@@ -391,14 +334,12 @@ class WALWriter:
         combined_data = b"".join(request.data for request in requests)
 
         try:
-            # Delegate file I/O to executor
             await loop.run_in_executor(
                 None,
                 self._sync_write_and_fsync,
                 combined_data,
             )
 
-            # Update metrics
             self._metrics.total_written += len(requests)
             self._metrics.total_batches += 1
             self._metrics.total_bytes_written += len(combined_data)
@@ -408,7 +349,6 @@ class WALWriter:
                 len(requests),
             )
 
-            # Resolve all futures successfully
             for request in requests:
                 if not request.future.done():
                     request.future.set_result(None)
@@ -417,7 +357,6 @@ class WALWriter:
             self._error = exception
             self._metrics.total_errors += 1
 
-            # Fail all futures in batch
             for request in requests:
                 if not request.future.done():
                     request.future.set_exception(exception)
@@ -428,15 +367,12 @@ class WALWriter:
             self._current_batch.clear()
 
     def _sync_write_and_fsync(self, data: bytes) -> None:
-        """Synchronous write and fsync - runs in executor."""
         with open(self._path, "ab", buffering=0) as file:
             file.write(data)
             file.flush()
             os.fsync(file.fileno())
 
     async def _drain_remaining(self) -> None:
-        """Drain and commit any remaining requests on shutdown."""
-        # Collect any remaining requests
         while not self._queue.empty():
             try:
                 request = self._queue.get_nowait()
@@ -445,23 +381,18 @@ class WALWriter:
             except asyncio.QueueEmpty:
                 break
 
-        # Commit final batch
         if len(self._current_batch) > 0:
             try:
                 await self._commit_batch()
             except BaseException:
-                # Already handled in _commit_batch
                 pass
 
     async def _fail_pending_requests(self, exception: BaseException) -> None:
-        """Fail all pending requests with the given exception."""
-        # Fail current batch
         for request in self._current_batch.requests:
             if not request.future.done():
                 request.future.set_exception(exception)
         self._current_batch.clear()
 
-        # Fail queued requests
         while not self._queue.empty():
             try:
                 request = self._queue.get_nowait()
