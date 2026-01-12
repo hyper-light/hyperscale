@@ -195,6 +195,9 @@ from hyperscale.distributed.routing import (
     GateJobRouterConfig,
     RoutingDecision as VivaldiRoutingDecision,
     DatacenterCandidate,
+    DispatchTimeTracker,
+    ObservedLatencyTracker,
+    BlendedLatencyScorer,
 )
 from hyperscale.distributed.capacity import (
     DatacenterCapacityAggregator,
