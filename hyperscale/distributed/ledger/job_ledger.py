@@ -392,7 +392,9 @@ class JobLedger:
 
         archived_job = await self._archive_store.read(job_id)
         if archived_job is not None:
-            self._completed_cache.put(job_id, archived_job)
+            async with self._lock:
+                if self._completed_cache.get(job_id) is None:
+                    self._completed_cache.put(job_id, archived_job)
 
         return archived_job
 
