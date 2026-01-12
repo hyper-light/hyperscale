@@ -59,8 +59,16 @@ class ReporterResultPushHandler:
             if callback:
                 try:
                     callback(push)
-                except Exception:
-                    pass  # Don't let callback errors break the handler
+                except Exception as callback_error:
+                    if self._logger:
+                        await self._logger.log(
+                            ServerWarning(
+                                message=f"Reporter result callback error: {callback_error}",
+                                node_host="client",
+                                node_port=0,
+                                node_id="client",
+                            )
+                        )
 
             return b"ok"
 
