@@ -1347,8 +1347,15 @@ class ManagerServer(HealthAwareServer):
                         )
                         if not isinstance(response, Exception):
                             sent_count += 1
-                    except Exception:
-                        pass
+                    except Exception as heartbeat_error:
+                        await self._udp_logger.log(
+                            ServerWarning(
+                                message=f"Failed to send heartbeat to gate: {heartbeat_error}",
+                                node_host=self._host,
+                                node_port=self._tcp_port,
+                                node_id=self._node_id.short,
+                            )
+                        )
 
                 if sent_count > 0:
                     await self._udp_logger.log(
@@ -1611,8 +1618,15 @@ class ManagerServer(HealthAwareServer):
                             sync_msg.dump(),
                             timeout=2.0,
                         )
-                    except Exception:
-                        pass
+                    except Exception as sync_error:
+                        await self._udp_logger.log(
+                            ServerWarning(
+                                message=f"Failed to sync job state to peer: {sync_error}",
+                                node_host=self._host,
+                                node_port=self._tcp_port,
+                                node_id=self._node_id.short,
+                            )
+                        )
 
             except asyncio.CancelledError:
                 break
@@ -3163,7 +3177,15 @@ class ManagerServer(HealthAwareServer):
                 responder_id=self._node_id.full,
             ).dump()
 
-        except Exception:
+        except Exception as context_sync_error:
+            await self._udp_logger.log(
+                ServerError(
+                    message=f"Context layer sync failed: {context_sync_error}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
             return ContextLayerSyncAck(
                 job_id="unknown",
                 layer_version=-1,
@@ -3996,8 +4018,15 @@ class ManagerServer(HealthAwareServer):
                     announcement.dump(),
                     timeout=2.0,
                 )
-            except Exception:
-                pass
+            except Exception as announcement_error:
+                await self._udp_logger.log(
+                    ServerWarning(
+                        message=f"Failed to send leadership announcement to peer {peer_addr}: {announcement_error}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
 
     async def _dispatch_job_workflows(
         self,
