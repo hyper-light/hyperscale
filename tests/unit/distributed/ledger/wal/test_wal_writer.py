@@ -9,8 +9,6 @@ from hyperscale.distributed.ledger.wal.wal_writer import (
     WALWriter,
     WALWriterConfig,
     WriteRequest,
-    WALBackpressureError,
-    WALWriterMetrics,
 )
 from hyperscale.distributed.reliability.backpressure import (
     BackpressureLevel,
