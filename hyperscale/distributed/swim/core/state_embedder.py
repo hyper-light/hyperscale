@@ -51,7 +51,7 @@ class StateEmbedder(Protocol):
         """
         ...
 
-    def process_state(
+    async def process_state(
         self,
         state_data: bytes,
         source_addr: tuple[str, int],
@@ -93,7 +93,7 @@ class NullStateEmbedder:
         """No state to embed."""
         return None
 
-    def process_state(
+    async def process_state(
         self,
         state_data: bytes,
         source_addr: tuple[str, int],
@@ -146,7 +146,9 @@ class WorkerStateEmbedder:
     get_memory_percent: Callable[[], float]
     get_state_version: Callable[[], int]
     get_active_workflows: Callable[[], dict[str, str]]
-    on_manager_heartbeat: Callable[[Any, tuple[str, int]], None] | None = None
+    on_manager_heartbeat: Callable[[Any, tuple[str, int]], Awaitable[None]] | None = (
+        None
+    )
     get_tcp_host: Callable[[], str] | None = None
     get_tcp_port: Callable[[], int] | None = None
     get_coordinate: Callable[[], NetworkCoordinate | None] | None = None
@@ -224,7 +226,7 @@ class WorkerStateEmbedder:
         )
         return heartbeat.dump()
 
-    def process_state(
+    async def process_state(
         self,
         state_data: bytes,
         source_addr: tuple[str, int],
@@ -234,7 +236,7 @@ class WorkerStateEmbedder:
             try:
                 obj = ManagerHeartbeat.load(state_data)  # Base unpickle
                 if isinstance(obj, ManagerHeartbeat):
-                    self.on_manager_heartbeat(obj, source_addr)
+                    await self.on_manager_heartbeat(obj, source_addr)
                     if self.on_peer_coordinate and obj.coordinate:
                         rtt_ms = self._probe_rtt_cache.pop(source_addr, None)
                         if rtt_ms is not None:
