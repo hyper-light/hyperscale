@@ -490,6 +490,19 @@ class WorkerServer(HealthAwareServer):
         """Stop the worker server gracefully."""
         self._running = False
 
+        if self._event_logger is not None:
+            await self._event_logger.log(
+                WorkerStopping(
+                    message="Worker stopping",
+                    node_id=self._node_id.full,
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    reason="graceful_shutdown",
+                ),
+                name="worker_events",
+            )
+            await self._event_logger.close()
+
         # Stop background loops
         await self._stop_background_loops()
 
