@@ -521,11 +521,10 @@ class TestWALWriterBackpressure:
         temp_wal_directory: str,
     ):
         wal_path = Path(temp_wal_directory) / "test.wal"
-        # Use overflow_size=0 so writes are rejected when primary queue is full
-        # (default preserve_newest=True would otherwise drop oldest and accept new)
         config = WALWriterConfig(
             queue_max_size=100,
-            overflow_size=0,
+            overflow_size=10,
+            preserve_newest=False,
             reject_threshold=0.95,
             batch_timeout_microseconds=10000000,
         )
