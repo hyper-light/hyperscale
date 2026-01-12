@@ -2146,8 +2146,15 @@ class GateServer(HealthAwareServer):
                         timeout=3.0,
                     )
                     return True
-                except Exception:
-                    pass
+                except Exception as forward_error:
+                    await self._udp_logger.log(
+                        ServerWarning(
+                            message=f"Failed to forward progress to manager: {forward_error}",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
         return False
 
     def _record_request_latency(self, latency_ms: float) -> None:
