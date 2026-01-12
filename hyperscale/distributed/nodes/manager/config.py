@@ -152,6 +152,7 @@ def create_manager_config_from_env(
     quorum_timeout: float = 5.0,
     max_workflow_retries: int = 3,
     workflow_timeout: float = 300.0,
+    wal_data_dir: Path | None = None,
 ) -> ManagerConfig:
     """
     Create manager configuration from environment variables.
@@ -246,4 +247,5 @@ def create_manager_config_from_env(
             env, "JOB_TIMEOUT_CHECK_INTERVAL", 30.0
         ),
         job_retention_seconds=getattr(env, "JOB_RETENTION_SECONDS", 3600.0),
+        wal_data_dir=wal_data_dir,
     )
