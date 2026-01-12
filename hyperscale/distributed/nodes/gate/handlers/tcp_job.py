@@ -346,18 +346,32 @@ class GateJobHandler:
             return ack_response
 
         except QuorumCircuitOpenError as error:
-            return JobAck(
+            error_ack = JobAck(
                 job_id=submission.job_id if "submission" in dir() else "unknown",
                 accepted=False,
                 error=str(error),
             ).dump()
+            if (
+                "idempotency_key" in dir()
+                and idempotency_key is not None
+                and self._idempotency_cache is not None
+            ):
+                await self._idempotency_cache.reject(idempotency_key, error_ack)
+            return error_ack
         except QuorumError as error:
             self._quorum_circuit.record_error()
-            return JobAck(
+            error_ack = JobAck(
                 job_id=submission.job_id if "submission" in dir() else "unknown",
                 accepted=False,
                 error=str(error),
             ).dump()
+            if (
+                "idempotency_key" in dir()
+                and idempotency_key is not None
+                and self._idempotency_cache is not None
+            ):
+                await self._idempotency_cache.reject(idempotency_key, error_ack)
+            return error_ack
         except Exception as error:
             await self._logger.log(
                 ServerError(
@@ -367,11 +381,18 @@ class GateJobHandler:
                     node_id=self._get_node_id().short,
                 )
             )
-            return JobAck(
+            error_ack = JobAck(
                 job_id="unknown",
                 accepted=False,
                 error=str(error),
             ).dump()
+            if (
+                "idempotency_key" in dir()
+                and idempotency_key is not None
+                and self._idempotency_cache is not None
+            ):
+                await self._idempotency_cache.reject(idempotency_key, error_ack)
+            return error_ack
 
     async def handle_status_request(
         self,
