@@ -229,6 +229,11 @@ class HierarchicalFailureDetector:
             except asyncio.CancelledError:
                 pass
 
+        for task in list(self._pending_clear_tasks):
+            if not task.done():
+                task.cancel()
+        self._pending_clear_tasks.clear()
+
         await self._global_wheel.stop()
         await self._job_manager.shutdown()
 
@@ -684,8 +689,9 @@ class HierarchicalFailureDetector:
         )
         self._record_event(event)
 
-        # Clear all job suspicions for this node (implied dead)
-        asyncio.create_task(self._clear_job_suspicions_for_node(node))
+        task = asyncio.create_task(self._clear_job_suspicions_for_node(node))
+        self._pending_clear_tasks.add(task)
+        task.add_done_callback(self._pending_clear_tasks.discard)
 
         # Call callback
         if self._on_global_death:
