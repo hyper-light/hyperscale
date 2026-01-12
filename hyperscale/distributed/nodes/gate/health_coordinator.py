@@ -118,7 +118,7 @@ class GateHealthCoordinator:
             source_addr: UDP source address of the heartbeat
         """
         dc_key = f"dc:{heartbeat.datacenter}"
-        if self._versioned_clock.is_entity_stale(dc_key, heartbeat.version):
+        if await self._versioned_clock.is_entity_stale(dc_key, heartbeat.version):
             return
 
         datacenter_id = heartbeat.datacenter
@@ -165,9 +165,7 @@ class GateHealthCoordinator:
             worker_count=heartbeat.healthy_worker_count,
         )
 
-        self._task_runner.run(
-            self._confirm_manager_for_dc, datacenter_id, manager_addr
-        )
+        self._task_runner.run(self._confirm_manager_for_dc, datacenter_id, manager_addr)
 
         self._dc_health_manager.update_manager(datacenter_id, manager_addr, heartbeat)
 
@@ -230,7 +228,9 @@ class GateHealthCoordinator:
 
         max_level = BackpressureLevel.NONE
         for manager_addr in dc_managers.keys():
-            level = self._state._manager_backpressure.get(manager_addr, BackpressureLevel.NONE)
+            level = self._state._manager_backpressure.get(
+                manager_addr, BackpressureLevel.NONE
+            )
             if level.value > max_level.value:
                 max_level = level
 
@@ -414,7 +414,9 @@ class GateHealthCoordinator:
                     break
         return active_count
 
-    def get_known_managers_for_piggyback(self) -> dict[str, tuple[str, int, str, int, str]]:
+    def get_known_managers_for_piggyback(
+        self,
+    ) -> dict[str, tuple[str, int, str, int, str]]:
         """
         Get known managers for piggybacking in SWIM heartbeats.
 
@@ -429,5 +431,11 @@ class GateHealthCoordinator:
                     tcp_port = heartbeat.tcp_port or manager_addr[1]
                     udp_host = heartbeat.udp_host or manager_addr[0]
                     udp_port = heartbeat.udp_port or manager_addr[1]
-                    result[heartbeat.node_id] = (tcp_host, tcp_port, udp_host, udp_port, dc_id)
+                    result[heartbeat.node_id] = (
+                        tcp_host,
+                        tcp_port,
+                        udp_host,
+                        udp_port,
+                        dc_id,
+                    )
         return result

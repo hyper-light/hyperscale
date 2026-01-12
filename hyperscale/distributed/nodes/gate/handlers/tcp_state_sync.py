@@ -378,7 +378,7 @@ class GateStateSyncHandler:
             if notification.leader_gate_id == my_id:
                 return b"ok"
 
-            if self._versioned_clock.is_entity_stale(
+            if await self._versioned_clock.is_entity_stale(
                 f"job-leader:{notification.job_id}",
                 notification.fence_token,
             ):
