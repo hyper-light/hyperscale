@@ -173,6 +173,13 @@ class WALWriter:
             finally:
                 self._writer_task = None
 
+        if self._state_change_task is not None and not self._state_change_task.done():
+            self._state_change_task.cancel()
+            try:
+                await self._state_change_task
+            except asyncio.CancelledError:
+                pass
+
         await self._fail_pending_requests(RuntimeError("WAL writer stopped"))
 
     def submit(self, request: WriteRequest) -> QueuePutResult:
