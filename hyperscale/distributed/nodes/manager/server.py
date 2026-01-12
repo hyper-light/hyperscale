@@ -951,7 +951,7 @@ class ManagerServer(HealthAwareServer):
         tcp_addr: tuple[str, int],
     ) -> None:
         """Handle manager peer recovery."""
-        peer_lock = self._manager_state.get_peer_state_lock(tcp_addr)
+        peer_lock = await self._manager_state.get_peer_state_lock(tcp_addr)
 
         async with peer_lock:
             initial_epoch = self._manager_state._peer_state_epoch.get(tcp_addr, 0)
