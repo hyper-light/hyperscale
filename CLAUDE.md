@@ -61,3 +61,5 @@ This document contains critical information about working with this codebase. Fo
 
 - After any fix or implementation of a todo, we generate a fresh commit. Do NOT run the tests. A user will run them and confirm.
 - Always commit everything - i.e. `git add -A && git commit -m "<MESSAGE_HERE>"
+- FORBIDDEN: Do not use threading module items EVER.
+- ALWAYS defer to the asyncio counterpart of a threading item
