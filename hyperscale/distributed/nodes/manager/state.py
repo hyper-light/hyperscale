@@ -6,7 +6,7 @@ job leadership, cancellation tracking, and metrics.
 """
 
 import asyncio
-from collections import defaultdict
+from collections import defaultdict, deque
 from typing import TYPE_CHECKING
 
 from hyperscale.distributed.models import (
@@ -134,10 +134,13 @@ class ManagerState:
         self._external_incarnation: int = 0
         self._manager_state: ManagerStateEnum = ManagerStateEnum.SYNCING
 
-        # Latency tracking
-        self._gate_latency_samples: list[tuple[float, float]] = []
-        self._peer_manager_latency_samples: dict[str, list[tuple[float, float]]] = {}
-        self._worker_latency_samples: dict[str, list[tuple[float, float]]] = {}
+        # Latency tracking (bounded deques to prevent memory leaks)
+        self._max_latency_samples: int = 1000
+        self._gate_latency_samples: deque[tuple[float, float]] = deque(
+            maxlen=self._max_latency_samples
+        )
+        self._peer_manager_latency_samples: dict[str, deque[tuple[float, float]]] = {}
+        self._worker_latency_samples: dict[str, deque[tuple[float, float]]] = {}
 
         # Throughput tracking (AD-19)
         self._dispatch_throughput_count: int = 0
