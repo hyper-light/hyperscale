@@ -445,6 +445,17 @@ class GateServer(HealthAwareServer):
         self._capacity_aggregator = DatacenterCapacityAggregator()
         self._spillover_evaluator = SpilloverEvaluator.from_env(env)
 
+        # Route learning (AD-45)
+        self._dispatch_time_tracker = DispatchTimeTracker()
+        self._observed_latency_tracker = ObservedLatencyTracker(
+            alpha=getattr(env, "ROUTE_LEARNING_EWMA_ALPHA", 0.1),
+            min_samples_for_confidence=getattr(env, "ROUTE_LEARNING_MIN_SAMPLES", 10),
+            max_staleness_seconds=getattr(
+                env, "ROUTE_LEARNING_MAX_STALENESS_SECONDS", 300.0
+            ),
+        )
+        self._blended_scorer = BlendedLatencyScorer(self._observed_latency_tracker)
+
         # Manager dispatcher
         self._manager_dispatcher = ManagerDispatcher(
             dispatch_timeout=5.0,
