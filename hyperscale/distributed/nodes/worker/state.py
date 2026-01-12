@@ -110,11 +110,23 @@ class WorkerState:
 
     def initialize_locks(self) -> None:
         self._version_lock = asyncio.Lock()
+        self._resource_creation_lock = asyncio.Lock()
+        self._counter_lock = asyncio.Lock()
 
     def _get_version_lock(self) -> asyncio.Lock:
         if self._version_lock is None:
             self._version_lock = asyncio.Lock()
         return self._version_lock
+
+    def _get_resource_creation_lock(self) -> asyncio.Lock:
+        if self._resource_creation_lock is None:
+            self._resource_creation_lock = asyncio.Lock()
+        return self._resource_creation_lock
+
+    def _get_counter_lock(self) -> asyncio.Lock:
+        if self._counter_lock is None:
+            self._counter_lock = asyncio.Lock()
+        return self._counter_lock
 
     async def increment_version(self) -> int:
         async with self._get_version_lock():
@@ -148,11 +160,11 @@ class WorkerState:
         self._healthy_manager_ids.add(manager_id)
         self._manager_unhealthy_since.pop(manager_id, None)
 
-    def mark_manager_unhealthy(self, manager_id: str) -> None:
-        """Mark a manager as unhealthy."""
-        self._healthy_manager_ids.discard(manager_id)
-        if manager_id not in self._manager_unhealthy_since:
-            self._manager_unhealthy_since[manager_id] = time.monotonic()
+    async def mark_manager_unhealthy(self, manager_id: str) -> None:
+        async with self._get_counter_lock():
+            self._healthy_manager_ids.discard(manager_id)
+            if manager_id not in self._manager_unhealthy_since:
+                self._manager_unhealthy_since[manager_id] = time.monotonic()
 
     def is_manager_healthy(self, manager_id: str) -> bool:
         """Check if a manager is in the healthy set."""
