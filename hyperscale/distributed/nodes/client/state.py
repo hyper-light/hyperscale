@@ -73,6 +73,9 @@ class ClientState:
         self._requests_failed_leadership_change: int = 0
         self._metrics_lock: asyncio.Lock | None = None
 
+        # Lock creation lock (protects creation of per-resource locks)
+        self._lock_creation_lock: asyncio.Lock | None = None
+
         # Gate connection state
         self._gate_connection_state: dict[tuple[str, int], str] = {}
 
@@ -128,7 +131,7 @@ class ClientState:
         """
         return self._job_targets.get(job_id)
 
-    def get_or_create_routing_lock(self, job_id: str) -> asyncio.Lock:
+    async def get_or_create_routing_lock(self, job_id: str) -> asyncio.Lock:
         """
         Get or create a routing lock for a job.
 
@@ -138,7 +141,10 @@ class ClientState:
         Returns:
             asyncio.Lock for this job's routing decisions
         """
-        return self._request_routing_locks.setdefault(job_id, asyncio.Lock())
+        async with self._get_lock_creation_lock():
+            if job_id not in self._request_routing_locks:
+                self._request_routing_locks[job_id] = asyncio.Lock()
+            return self._request_routing_locks[job_id]
 
     def mark_job_orphaned(self, job_id: str, orphan_info: OrphanedJobInfo) -> None:
         """
