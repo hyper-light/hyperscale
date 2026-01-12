@@ -9,6 +9,7 @@ import cloudpickle
 from hyperscale.distributed.reliability.rate_limiting import RequestPriority
 from hyperscale.distributed.nodes.client.state import ClientState
 from hyperscale.logging import Logger
+from hyperscale.logging.hyperscale_logging_models import ServerWarning
 
 
 class WindowedStatsPushHandler:
@@ -51,7 +52,7 @@ class WindowedStatsPushHandler:
                     priority=RequestPriority.NORMAL,
                 )
                 if not result.allowed:
-                    return b'rate_limited'
+                    return b"rate_limited"
 
             # Import WindowedStatsPush from jobs module (avoid circular import)
             from hyperscale.distributed.jobs import WindowedStatsPush
@@ -63,10 +64,18 @@ class WindowedStatsPushHandler:
             if callback:
                 try:
                     callback(push)
-                except Exception:
-                    pass  # Don't let callback errors break the handler
+                except Exception as callback_error:
+                    if self._logger:
+                        await self._logger.log(
+                            ServerWarning(
+                                message=f"Windowed stats callback error: {callback_error}",
+                                node_host="client",
+                                node_port=0,
+                                node_id="client",
+                            )
+                        )
 
-            return b'ok'
+            return b"ok"
 
         except Exception:
-            return b'error'
+            return b"error"
