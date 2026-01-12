@@ -21,6 +21,7 @@ from hyperscale.distributed.models import (
     WorkerHeartbeat,
 )
 from hyperscale.distributed.jobs import CoreAllocator
+from hyperscale.distributed.resources import ProcessResourceMonitor
 from hyperscale.distributed.protocol.version import (
     NodeCapabilities,
     NegotiatedCapabilities,
@@ -99,6 +100,9 @@ class WorkerServer(HealthAwareServer):
 
         # Centralized runtime state (single source of truth)
         self._worker_state = WorkerState(self._core_allocator)
+
+        # AD-41: Resource monitoring with Kalman filtering
+        self._resource_monitor = ProcessResourceMonitor()
 
         # Initialize modules (will be fully wired after super().__init__)
         self._registry = WorkerRegistry(
