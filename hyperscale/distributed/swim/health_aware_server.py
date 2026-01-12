@@ -1673,7 +1673,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         """Handle election errors through the error handler."""
         await self.handle_error(error)
 
-    def _broadcast_leadership_message(self, message: bytes) -> None:
+    async def _broadcast_leadership_message(self, message: bytes) -> None:
         """
         Broadcast a leadership message to all known nodes.
 
