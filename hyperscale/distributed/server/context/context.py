@@ -1,5 +1,4 @@
 import asyncio
-from collections import defaultdict
 from typing import TypeVar, Generic, Any, Callable
 
 
@@ -18,41 +17,44 @@ class Context(Generic[T]):
         self._value_locks_creation_lock = asyncio.Lock()
         self._store_lock = asyncio.Lock()
 
-    async def with_value(self, key: str) -> asyncio.Lock:
-        """Get or create a lock for the given key (thread-safe creation)."""
+    async def get_value_lock(self, key: str) -> asyncio.Lock:
         if key in self._value_locks:
             return self._value_locks[key]
 
         async with self._value_locks_creation_lock:
-            # Double-check after acquiring creation lock
             if key not in self._value_locks:
                 self._value_locks[key] = asyncio.Lock()
             return self._value_locks[key]
 
-        # Perform asynchronous cleanup here,
+    def with_value(self, key: str) -> asyncio.Lock:
+        if key not in self._value_locks:
+            self._value_locks[key] = asyncio.Lock()
+        return self._value_locks[key]
 
     async def read_with_lock(self, key: str):
-        async with self._lock:
+        async with self._store_lock:
             return self._store.get(key)
 
     def read(self, key: str, default: V | None = None):
         return self._store.get(key, default)
 
     async def update_with_lock(self, key: str, update: U):
-        async with self._value_locks[key]:
+        lock = await self.get_value_lock(key)
+        async with lock:
             self._store[key] = update(
                 self._store.get(key),
             )
 
             return self._store[key]
 
-    def update(self, key: str, update: V):
+    def update(self, key: str, update: U):
         self._store[key] = update(self._store.get(key))
 
         return self._store[key]
 
     async def write_with_lock(self, key: str, value: V):
-        async with self._value_locks[key]:
+        lock = await self.get_value_lock(key)
+        async with lock:
             self._store[key] = value
 
             return self._store[key]
