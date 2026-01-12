@@ -39,6 +39,10 @@ from .wal import (
     HEADER_SIZE,
     WALStatusSnapshot,
     NodeWAL,
+    TransitionResult,
+    WALAppendResult,
+    WALBackpressureError,
+    WALWriterConfig,
 )
 
 from .pipeline import (

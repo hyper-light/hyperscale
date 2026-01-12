@@ -14,10 +14,13 @@ __all__ = [
     "HEADER_SIZE",
     "NodeWAL",
     "TransitionResult",
+    "WALAppendResult",
+    "WALBackpressureError",
     "WALEntry",
     "WALEntryState",
     "WALStatusSnapshot",
     "WALWriter",
+    "WALWriterConfig",
     "WriteBatch",
     "WriteRequest",
 ]
