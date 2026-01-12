@@ -211,6 +211,9 @@ class WorkerServer(HealthAwareServer):
         self._pending_cores_notification: int | None = None
         self._cores_notification_task: asyncio.Task | None = None
 
+        # Event logger for crash forensics (AD-47)
+        self._event_logger: Logger | None = None
+
         # Create state embedder for SWIM
         state_embedder = WorkerStateEmbedder(
             get_node_id=lambda: self._node_id.full,
@@ -392,6 +395,34 @@ class WorkerServer(HealthAwareServer):
 
         # Start parent server
         await super().start()
+
+        if self._config.event_log_dir is not None:
+            self._event_logger = Logger()
+            self._event_logger.configure(
+                name="worker_events",
+                path=str(self._config.event_log_dir / "events.jsonl"),
+                durability=DurabilityMode.FLUSH,
+                log_format="json",
+                retention_policy={
+                    "max_size": "50MB",
+                    "max_age": "24h",
+                },
+            )
+            await self._event_logger.log(
+                WorkerStarted(
+                    message="Worker started",
+                    node_id=self._node_id.full,
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    manager_host=self._seed_managers[0][0]
+                    if self._seed_managers
+                    else None,
+                    manager_port=self._seed_managers[0][1]
+                    if self._seed_managers
+                    else None,
+                ),
+                name="worker_events",
+            )
 
         # Update node capabilities
         self._node_capabilities = self._lifecycle_manager.get_node_capabilities(
