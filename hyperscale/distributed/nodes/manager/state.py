@@ -162,41 +162,63 @@ class ManagerState:
         self._core_allocation_lock = asyncio.Lock()
         self._eager_dispatch_lock = asyncio.Lock()
         self._counter_lock = asyncio.Lock()
+        self._resource_creation_lock = asyncio.Lock()
 
     def _get_counter_lock(self) -> asyncio.Lock:
         if self._counter_lock is None:
             self._counter_lock = asyncio.Lock()
         return self._counter_lock
 
-    def get_peer_state_lock(self, peer_addr: tuple[str, int]) -> asyncio.Lock:
-        return self._peer_state_locks.setdefault(peer_addr, asyncio.Lock())
+    def _get_resource_creation_lock(self) -> asyncio.Lock:
+        if self._resource_creation_lock is None:
+            self._resource_creation_lock = asyncio.Lock()
+        return self._resource_creation_lock
 
-    def get_gate_state_lock(self, gate_id: str) -> asyncio.Lock:
-        return self._gate_state_locks.setdefault(gate_id, asyncio.Lock())
+    async def get_peer_state_lock(self, peer_addr: tuple[str, int]) -> asyncio.Lock:
+        async with self._get_resource_creation_lock():
+            if peer_addr not in self._peer_state_locks:
+                self._peer_state_locks[peer_addr] = asyncio.Lock()
+            return self._peer_state_locks[peer_addr]
 
-    def get_workflow_cancellation_lock(self, workflow_id: str) -> asyncio.Lock:
-        return self._workflow_cancellation_locks.setdefault(workflow_id, asyncio.Lock())
+    async def get_gate_state_lock(self, gate_id: str) -> asyncio.Lock:
+        async with self._get_resource_creation_lock():
+            if gate_id not in self._gate_state_locks:
+                self._gate_state_locks[gate_id] = asyncio.Lock()
+            return self._gate_state_locks[gate_id]
 
-    def get_dispatch_semaphore(
+    async def get_workflow_cancellation_lock(self, workflow_id: str) -> asyncio.Lock:
+        async with self._get_resource_creation_lock():
+            if workflow_id not in self._workflow_cancellation_locks:
+                self._workflow_cancellation_locks[workflow_id] = asyncio.Lock()
+            return self._workflow_cancellation_locks[workflow_id]
+
+    async def get_dispatch_semaphore(
         self, worker_id: str, max_concurrent: int
     ) -> asyncio.Semaphore:
-        if worker_id not in self._dispatch_semaphores:
-            self._dispatch_semaphores[worker_id] = asyncio.Semaphore(max_concurrent)
-        return self._dispatch_semaphores[worker_id]
+        async with self._get_resource_creation_lock():
+            if worker_id not in self._dispatch_semaphores:
+                self._dispatch_semaphores[worker_id] = asyncio.Semaphore(max_concurrent)
+            return self._dispatch_semaphores[worker_id]
 
-    def get_peer_latency_samples(self, peer_id: str) -> deque[tuple[float, float]]:
-        if peer_id not in self._peer_manager_latency_samples:
-            self._peer_manager_latency_samples[peer_id] = deque(
-                maxlen=self._max_latency_samples
-            )
-        return self._peer_manager_latency_samples[peer_id]
+    async def get_peer_latency_samples(
+        self, peer_id: str
+    ) -> deque[tuple[float, float]]:
+        async with self._get_resource_creation_lock():
+            if peer_id not in self._peer_manager_latency_samples:
+                self._peer_manager_latency_samples[peer_id] = deque(
+                    maxlen=self._max_latency_samples
+                )
+            return self._peer_manager_latency_samples[peer_id]
 
-    def get_worker_latency_samples(self, worker_id: str) -> deque[tuple[float, float]]:
-        if worker_id not in self._worker_latency_samples:
-            self._worker_latency_samples[worker_id] = deque(
-                maxlen=self._max_latency_samples
-            )
-        return self._worker_latency_samples[worker_id]
+    async def get_worker_latency_samples(
+        self, worker_id: str
+    ) -> deque[tuple[float, float]]:
+        async with self._get_resource_creation_lock():
+            if worker_id not in self._worker_latency_samples:
+                self._worker_latency_samples[worker_id] = deque(
+                    maxlen=self._max_latency_samples
+                )
+            return self._worker_latency_samples[worker_id]
 
     async def increment_fence_token(self) -> int:
         async with self._get_counter_lock():
