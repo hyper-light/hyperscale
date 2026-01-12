@@ -96,6 +96,8 @@ class WorkflowDispatcher:
                                Takes (job_id, workflow_id, reason) and is awaited
             get_leader_term: Callback to get current leader election term (AD-10 requirement).
                             Returns the current term for fence token generation.
+            retry_budget_manager: Optional retry budget manager (AD-44). If None, one is created.
+            env: Optional environment config. Used to create retry budget manager if not provided.
         """
         self._job_manager = job_manager
         self._worker_pool = worker_pool
@@ -108,6 +110,12 @@ class WorkflowDispatcher:
         self._on_dispatch_failed = on_dispatch_failed
         self._get_leader_term = get_leader_term
         self._logger = Logger()
+
+        if retry_budget_manager is not None:
+            self._retry_budget_manager = retry_budget_manager
+        else:
+            config = create_reliability_config_from_env(env or Env())
+            self._retry_budget_manager = RetryBudgetManager(config=config)
 
         # Pending workflows waiting for dependencies/cores
         # Key: f"{job_id}:{workflow_id}"
