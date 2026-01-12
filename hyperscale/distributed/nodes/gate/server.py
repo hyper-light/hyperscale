@@ -163,6 +163,12 @@ from hyperscale.distributed.jobs import (
     JobLeadershipTracker,
 )
 from hyperscale.distributed.ledger import JobLedger
+from hyperscale.distributed.idempotency import (
+    GateIdempotencyCache,
+    IdempotencyKey,
+    IdempotencyStatus,
+    create_idempotency_config_from_env,
+)
 from hyperscale.distributed.datacenters import (
     DatacenterHealthManager,
     ManagerDispatcher,
