@@ -207,7 +207,7 @@ class ManagerHealthMonitor:
             ),
         )
 
-    def record_latency_sample(
+    async def record_latency_sample(
         self,
         target_type: str,
         target_id: str,
@@ -227,9 +227,9 @@ class ManagerHealthMonitor:
         sample = (now, latency_ms)
 
         if target_type == "worker":
-            samples = self._state.get_worker_latency_samples(target_id)
+            samples = await self._state.get_worker_latency_samples(target_id)
         elif target_type == "peer":
-            samples = self._state.get_peer_latency_samples(target_id)
+            samples = await self._state.get_peer_latency_samples(target_id)
         elif target_type == "gate":
             samples = self._state._gate_latency_samples
         else:
