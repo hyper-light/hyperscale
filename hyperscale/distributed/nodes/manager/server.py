@@ -9,6 +9,7 @@ import asyncio
 import random
 import time
 import cloudpickle
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from hyperscale.core.graph.workflow import Workflow
@@ -121,6 +122,7 @@ from hyperscale.distributed.jobs import (
     WorkflowDispatcher,
     WindowedStatsCollector,
 )
+from hyperscale.distributed.ledger.wal import NodeWAL
 from hyperscale.distributed.jobs.timeout_strategy import (
     TimeoutStrategy,
     LocalAuthorityTimeout,
