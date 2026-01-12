@@ -957,16 +957,27 @@ class WorkerServer(HealthAwareServer):
                     )
 
     def _on_cores_available(self, available_cores: int) -> None:
-        """Handle cores becoming available - notify manager."""
+        """Handle cores becoming available - notify manager (debounced)."""
         if not self._running or available_cores <= 0:
             return
 
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                loop.create_task(self._notify_manager_cores_available(available_cores))
-        except RuntimeError:
-            pass
+        self._pending_cores_notification = available_cores
+
+        if (
+            self._cores_notification_task is None
+            or self._cores_notification_task.done()
+        ):
+            self._cores_notification_task = asyncio.create_task(
+                self._flush_cores_notification()
+            )
+
+    async def _flush_cores_notification(self) -> None:
+        """Send pending cores notifications to manager, coalescing rapid updates."""
+        while self._pending_cores_notification is not None and self._running:
+            cores_to_send = self._pending_cores_notification
+            self._pending_cores_notification = None
+
+            await self._notify_manager_cores_available(cores_to_send)
 
     async def _notify_manager_cores_available(self, available_cores: int) -> None:
         """Send core availability notification to manager."""
@@ -982,8 +993,16 @@ class WorkerServer(HealthAwareServer):
                 heartbeat.dump(),
                 timeout=1.0,
             )
-        except Exception:
-            pass
+        except Exception as error:
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerInfo(
+                    message=f"Failed to notify manager of core availability: {error}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                ),
+            )
 
     # =========================================================================
     # Dispatch Execution
