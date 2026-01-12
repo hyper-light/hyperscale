@@ -365,9 +365,13 @@ class BackpressureSignal:
     """
 
     level: BackpressureLevel
-    suggested_delay_ms: int = 0  # Suggested delay before next update
-    batch_only: bool = False  # Should sender switch to batch mode?
-    drop_non_critical: bool = False  # Should sender drop non-critical updates?
+    suggested_delay_ms: int = 0
+    batch_only: bool = False
+    drop_non_critical: bool = False
+
+    @property
+    def delay_ms(self) -> int:
+        return self.suggested_delay_ms
 
     @classmethod
     def from_level(cls, level: BackpressureLevel) -> "BackpressureSignal":

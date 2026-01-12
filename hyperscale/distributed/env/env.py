@@ -275,6 +275,12 @@ class Env(BaseModel):
         2.0  # Seconds between orphan grace period checks
     )
 
+    SPILLOVER_MAX_WAIT_SECONDS: StrictFloat = 60.0
+    SPILLOVER_MAX_LATENCY_PENALTY_MS: StrictFloat = 100.0
+    SPILLOVER_MIN_IMPROVEMENT_RATIO: StrictFloat = 0.5
+    SPILLOVER_ENABLED: StrictBool = True
+    CAPACITY_STALENESS_THRESHOLD_SECONDS: StrictFloat = 30.0
+
     # ==========================================================================
     # Overload Detection Settings (AD-18)
     # ==========================================================================
