@@ -12,7 +12,11 @@ from hyperscale.distributed.models import (
     JobLeaderWorkerTransferAck,
     PendingTransfer,
 )
-from hyperscale.logging.hyperscale_logging_models import ServerDebug, ServerInfo, ServerWarning
+from hyperscale.logging.hyperscale_logging_models import (
+    ServerDebug,
+    ServerInfo,
+    ServerWarning,
+)
 
 if TYPE_CHECKING:
     from ..server import WorkerServer
@@ -75,7 +79,7 @@ class JobLeaderTransferHandler:
             await self._log_transfer_start(transfer, job_id)
 
             # 8.1: Acquire per-job lock
-            job_lock = self._server._get_job_transfer_lock(job_id)
+            job_lock = await self._server._get_job_transfer_lock(job_id)
             async with job_lock:
                 # 8.2: Validate transfer
                 rejection = await self._validate_and_reject_transfer(transfer, job_id)
@@ -110,8 +114,12 @@ class JobLeaderTransferHandler:
 
                 # 8.7: Detailed logging
                 await self._log_transfer_result(
-                    transfer, job_id, workflows_updated, workflows_rescued,
-                    workflows_not_found, transfer_start_time
+                    transfer,
+                    job_id,
+                    workflows_updated,
+                    workflows_rescued,
+                    workflows_not_found,
+                    transfer_start_time,
                 )
 
                 # 8.4: Return detailed ack with workflow states
@@ -218,7 +226,9 @@ class JobLeaderTransferHandler:
         job_leader = self._server._workflow_job_leader
 
         # Partition workflows into found vs not found (comprehension)
-        workflows_not_found = [wf_id for wf_id in transfer.workflow_ids if wf_id not in active]
+        workflows_not_found = [
+            wf_id for wf_id in transfer.workflow_ids if wf_id not in active
+        ]
         found_workflows = [wf_id for wf_id in transfer.workflow_ids if wf_id in active]
 
         # Update job leader and collect states (comprehension with side effects via walrus)
@@ -232,7 +242,12 @@ class JobLeaderTransferHandler:
                 del orphaned[workflow_id]
                 workflows_rescued += 1
 
-        return (len(found_workflows), workflows_rescued, workflows_not_found, workflow_states)
+        return (
+            len(found_workflows),
+            workflows_rescued,
+            workflows_not_found,
+            workflow_states,
+        )
 
     async def _log_transfer_result(
         self,
