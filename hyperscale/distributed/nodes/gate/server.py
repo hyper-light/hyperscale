@@ -161,6 +161,7 @@ from hyperscale.distributed.jobs import (
     WindowedStatsPush,
     JobLeadershipTracker,
 )
+from hyperscale.distributed.ledger import JobLedger
 from hyperscale.distributed.datacenters import (
     DatacenterHealthManager,
     ManagerDispatcher,
@@ -245,6 +246,7 @@ class GateServer(HealthAwareServer):
         gate_peers: list[tuple[str, int]] | None = None,
         gate_udp_peers: list[tuple[str, int]] | None = None,
         lease_timeout: float = 30.0,
+        ledger_data_dir: Path | None = None,
     ):
         """
         Initialize the Gate server.
