@@ -334,6 +334,9 @@ class JobLedger:
             if job is None:
                 return None
 
+            if job.is_terminal:
+                return None
+
             hlc = await self._clock.generate()
 
             event = JobCompleted(

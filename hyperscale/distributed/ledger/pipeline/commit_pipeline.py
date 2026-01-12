@@ -9,7 +9,7 @@ from hyperscale.distributed.reliability.backpressure import (
 )
 
 from ..durability_level import DurabilityLevel
-from ..wal.entry_state import WALEntryState
+from ..wal.entry_state import TransitionResult
 from ..wal.wal_entry import WALEntry
 
 if TYPE_CHECKING:
@@ -109,7 +109,16 @@ class CommitPipeline:
             try:
                 regional_success = await self._replicate_regional(entry)
                 if regional_success:
-                    await self._wal.mark_regional(entry.lsn)
+                    transition_result = await self._wal.mark_regional(entry.lsn)
+                    if not transition_result.is_ok:
+                        return CommitResult(
+                            entry=entry,
+                            level_achieved=level_achieved,
+                            error=RuntimeError(
+                                f"WAL state transition failed: {transition_result.value}"
+                            ),
+                            backpressure=backpressure,
+                        )
                     level_achieved = DurabilityLevel.REGIONAL
                 else:
                     return CommitResult(
@@ -137,7 +146,16 @@ class CommitPipeline:
             try:
                 global_success = await self._replicate_global(entry)
                 if global_success:
-                    await self._wal.mark_global(entry.lsn)
+                    transition_result = await self._wal.mark_global(entry.lsn)
+                    if not transition_result.is_ok:
+                        return CommitResult(
+                            entry=entry,
+                            level_achieved=level_achieved,
+                            error=RuntimeError(
+                                f"WAL state transition failed: {transition_result.value}"
+                            ),
+                            backpressure=backpressure,
+                        )
                     level_achieved = DurabilityLevel.GLOBAL
                 else:
                     return CommitResult(

@@ -293,11 +293,15 @@ class WALWriter:
 
     async def _flush_state_change_callback(self) -> None:
         while self._pending_state_change is not None and self._running:
+            callback = self._state_change_callback
+            if callback is None:
+                return
+
             queue_state, backpressure = self._pending_state_change
             self._pending_state_change = None
 
             try:
-                await self._state_change_callback(queue_state, backpressure)
+                await callback(queue_state, backpressure)
             except Exception:
                 pass
 

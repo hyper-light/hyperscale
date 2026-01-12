@@ -15,7 +15,7 @@ from hyperscale.distributed.reliability.backpressure import (
 )
 
 from ..events.event_type import JobEventType
-from .entry_state import WALEntryState
+from .entry_state import WALEntryState, TransitionResult
 from .wal_entry import HEADER_SIZE, WALEntry
 from .wal_status_snapshot import WALStatusSnapshot
 from .wal_writer import WALWriter, WALWriterConfig, WriteRequest, WALBackpressureError
@@ -220,41 +220,72 @@ class NodeWAL:
 
         return WALAppendResult(entry=entry, queue_result=queue_result)
 
-    async def mark_regional(self, lsn: int) -> None:
+    async def mark_regional(self, lsn: int) -> TransitionResult:
         async with self._state_lock:
-            if lsn in self._pending_entries_internal:
-                entry = self._pending_entries_internal[lsn]
-                if entry.state == WALEntryState.PENDING:
-                    self._pending_entries_internal[lsn] = entry.with_state(
-                        WALEntryState.REGIONAL
-                    )
-                    self._pending_snapshot = MappingProxyType(
-                        dict(self._pending_entries_internal)
-                    )
+            entry = self._pending_entries_internal.get(lsn)
+            if entry is None:
+                return TransitionResult.ENTRY_NOT_FOUND
 
-    async def mark_global(self, lsn: int) -> None:
-        async with self._state_lock:
-            if lsn in self._pending_entries_internal:
-                entry = self._pending_entries_internal[lsn]
-                if entry.state <= WALEntryState.REGIONAL:
-                    self._pending_entries_internal[lsn] = entry.with_state(
-                        WALEntryState.GLOBAL
-                    )
-                    self._pending_snapshot = MappingProxyType(
-                        dict(self._pending_entries_internal)
-                    )
+            if entry.state == WALEntryState.REGIONAL:
+                return TransitionResult.ALREADY_AT_STATE
 
-    async def mark_applied(self, lsn: int) -> None:
+            if entry.state > WALEntryState.REGIONAL:
+                return TransitionResult.ALREADY_PAST_STATE
+
+            if entry.state != WALEntryState.PENDING:
+                return TransitionResult.INVALID_TRANSITION
+
+            self._pending_entries_internal[lsn] = entry.with_state(
+                WALEntryState.REGIONAL
+            )
+            self._pending_snapshot = MappingProxyType(
+                dict(self._pending_entries_internal)
+            )
+            return TransitionResult.SUCCESS
+
+    async def mark_global(self, lsn: int) -> TransitionResult:
         async with self._state_lock:
-            if lsn in self._pending_entries_internal:
-                entry = self._pending_entries_internal[lsn]
-                if entry.state <= WALEntryState.GLOBAL:
-                    self._pending_entries_internal[lsn] = entry.with_state(
-                        WALEntryState.APPLIED
-                    )
-                    self._pending_snapshot = MappingProxyType(
-                        dict(self._pending_entries_internal)
-                    )
+            entry = self._pending_entries_internal.get(lsn)
+            if entry is None:
+                return TransitionResult.ENTRY_NOT_FOUND
+
+            if entry.state == WALEntryState.GLOBAL:
+                return TransitionResult.ALREADY_AT_STATE
+
+            if entry.state > WALEntryState.GLOBAL:
+                return TransitionResult.ALREADY_PAST_STATE
+
+            if entry.state > WALEntryState.REGIONAL:
+                return TransitionResult.INVALID_TRANSITION
+
+            self._pending_entries_internal[lsn] = entry.with_state(WALEntryState.GLOBAL)
+            self._pending_snapshot = MappingProxyType(
+                dict(self._pending_entries_internal)
+            )
+            return TransitionResult.SUCCESS
+
+    async def mark_applied(self, lsn: int) -> TransitionResult:
+        async with self._state_lock:
+            entry = self._pending_entries_internal.get(lsn)
+            if entry is None:
+                return TransitionResult.ENTRY_NOT_FOUND
+
+            if entry.state == WALEntryState.APPLIED:
+                return TransitionResult.ALREADY_AT_STATE
+
+            if entry.state > WALEntryState.APPLIED:
+                return TransitionResult.ALREADY_PAST_STATE
+
+            if entry.state > WALEntryState.GLOBAL:
+                return TransitionResult.INVALID_TRANSITION
+
+            self._pending_entries_internal[lsn] = entry.with_state(
+                WALEntryState.APPLIED
+            )
+            self._pending_snapshot = MappingProxyType(
+                dict(self._pending_entries_internal)
+            )
+            return TransitionResult.SUCCESS
 
     async def compact(self, up_to_lsn: int) -> int:
         async with self._state_lock:
