@@ -6,6 +6,7 @@ for timeouts, intervals, retry policies, and protocol negotiation.
 """
 
 from dataclasses import dataclass, field
+from pathlib import Path
 
 
 @dataclass(slots=True)
@@ -24,12 +25,18 @@ class GateConfig:
     dc_id: str = "global"  # Gates typically span DCs
 
     # Datacenter manager addresses
-    datacenter_managers: dict[str, list[tuple[str, int]]] = field(default_factory=dict)  # TCP
-    datacenter_managers_udp: dict[str, list[tuple[str, int]]] = field(default_factory=dict)  # UDP for SWIM
+    datacenter_managers: dict[str, list[tuple[str, int]]] = field(
+        default_factory=dict
+    )  # TCP
+    datacenter_managers_udp: dict[str, list[tuple[str, int]]] = field(
+        default_factory=dict
+    )  # UDP for SWIM
 
     # Gate peer addresses
     gate_peers: list[tuple[str, int]] = field(default_factory=list)  # TCP
-    gate_peers_udp: list[tuple[str, int]] = field(default_factory=list)  # UDP for SWIM cluster
+    gate_peers_udp: list[tuple[str, int]] = field(
+        default_factory=list
+    )  # UDP for SWIM cluster
 
     # Lease configuration
     lease_timeout_seconds: float = 30.0

@@ -134,7 +134,6 @@ __all__ = [
     "Status",
     "UpdateType",
     "LeaderRole",
-    "Nodes",
     "Ctx",
     # Node Identity
     "NodeId",
