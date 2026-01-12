@@ -7,13 +7,15 @@ class TestTrace(Entry, kw_only=True):
     workflows: list[str]
     workers: int
     level: LogLevel = LogLevel.TRACE
-    
+
+
 class TestDebug(Entry, kw_only=True):
     test: str
     runner_type: str
     workflows: list[str]
     workers: int
     level: LogLevel = LogLevel.DEBUG
+
 
 class TestFatal(Entry, kw_only=True):
     test: str
@@ -22,12 +24,14 @@ class TestFatal(Entry, kw_only=True):
     workers: int
     level: LogLevel = LogLevel.FATAL
 
+
 class TestError(Entry, kw_only=True):
     test: str
     runner_type: str
     workflows: list[str]
     workers: int
     level: LogLevel = LogLevel.ERROR
+
 
 class TestInfo(Entry, kw_only=True):
     test: str
@@ -36,17 +40,20 @@ class TestInfo(Entry, kw_only=True):
     workers: int
     level: LogLevel = LogLevel.INFO
 
+
 class RemoteManagerInfo(Entry, kw_only=True):
     host: str
     port: int
     with_ssl: bool
     level: LogLevel = LogLevel.INFO
-    
+
+
 class GraphDebug(Entry, kw_only=True):
     graph: str
     workflows: list[str]
     workers: int
     level: LogLevel = LogLevel.DEBUG
+
 
 class WorkflowTrace(Entry, kw_only=True):
     workflow: str
@@ -56,6 +63,7 @@ class WorkflowTrace(Entry, kw_only=True):
     workers: int
     level: LogLevel = LogLevel.TRACE
 
+
 class WorkflowDebug(Entry, kw_only=True):
     workflow: str
     duration: str
@@ -63,6 +71,7 @@ class WorkflowDebug(Entry, kw_only=True):
     workflow_vus: int
     workers: int
     level: LogLevel = LogLevel.DEBUG
+
 
 class WorkflowInfo(Entry, kw_only=True):
     workflow: str
@@ -72,6 +81,7 @@ class WorkflowInfo(Entry, kw_only=True):
     workers: int
     level: LogLevel = LogLevel.INFO
 
+
 class WorkflowError(Entry, kw_only=True):
     workflow: str
     duration: str
@@ -80,6 +90,7 @@ class WorkflowError(Entry, kw_only=True):
     workers: int
     level: LogLevel = LogLevel.ERROR
 
+
 class WorkflowFatal(Entry, kw_only=True):
     workflow: str
     duration: str
@@ -87,7 +98,8 @@ class WorkflowFatal(Entry, kw_only=True):
     workflow_vus: int
     workers: int
     level: LogLevel = LogLevel.FATAL
-    
+
+
 class RunTrace(Entry, kw_only=True):
     node_id: str
     workflow: str
@@ -95,6 +107,7 @@ class RunTrace(Entry, kw_only=True):
     run_id: int
     workflow_vus: int
     level: LogLevel = LogLevel.TRACE
+
 
 class RunDebug(Entry, kw_only=True):
     node_id: str
@@ -104,6 +117,7 @@ class RunDebug(Entry, kw_only=True):
     workflow_vus: int
     level: LogLevel = LogLevel.DEBUG
 
+
 class RunInfo(Entry, kw_only=True):
     node_id: str
     workflow: str
@@ -111,6 +125,7 @@ class RunInfo(Entry, kw_only=True):
     run_id: int
     workflow_vus: int
     level: LogLevel = LogLevel.INFO
+
 
 class RunError(Entry, kw_only=True):
     node_id: str
@@ -120,6 +135,7 @@ class RunError(Entry, kw_only=True):
     workflow_vus: int
     level: LogLevel = LogLevel.ERROR
 
+
 class RunFatal(Entry, kw_only=True):
     node_id: str
     workflow: str
@@ -128,11 +144,13 @@ class RunFatal(Entry, kw_only=True):
     workflow_vus: int
     level: LogLevel = LogLevel.FATAL
 
+
 class ServerTrace(Entry, kw_only=True):
     node_id: str
     node_host: str
     node_port: int
     level: LogLevel = LogLevel.TRACE
+
 
 class ServerDebug(Entry, kw_only=True):
     node_id: str
@@ -140,11 +158,13 @@ class ServerDebug(Entry, kw_only=True):
     node_port: int
     level: LogLevel = LogLevel.DEBUG
 
+
 class ServerInfo(Entry, kw_only=True):
     node_id: str
     node_host: str
     node_port: int
     level: LogLevel = LogLevel.INFO
+
 
 class ServerWarning(Entry, kw_only=True):
     node_id: str
@@ -152,17 +172,20 @@ class ServerWarning(Entry, kw_only=True):
     node_port: int
     level: LogLevel = LogLevel.WARN
 
+
 class ServerError(Entry, kw_only=True):
     node_id: str
     node_host: str
     node_port: int
     level: LogLevel = LogLevel.ERROR
 
+
 class ServerFatal(Entry, kw_only=True):
     node_id: str
     node_host: str
     node_port: int
     level: LogLevel = LogLevel.FATAL
+
 
 class StatusUpdate(Entry, kw_only=True):
     node_id: str
@@ -177,6 +200,7 @@ class StatusUpdate(Entry, kw_only=True):
 
 class SilentDropStats(Entry, kw_only=True):
     """Periodic summary of silently dropped messages for security monitoring."""
+
     node_id: str
     node_host: str
     node_port: int
@@ -186,7 +210,30 @@ class SilentDropStats(Entry, kw_only=True):
     decompression_too_large_count: int
     decryption_failed_count: int
     malformed_message_count: int
-    load_shed_count: int = 0  # AD-32: Messages dropped due to priority-based load shedding
+    load_shed_count: int = (
+        0  # AD-32: Messages dropped due to priority-based load shedding
+    )
     total_dropped: int
     interval_seconds: float
     level: LogLevel = LogLevel.WARN
+
+
+class IdempotencyInfo(Entry, kw_only=True):
+    component: str
+    idempotency_key: str | None = None
+    job_id: str | None = None
+    level: LogLevel = LogLevel.INFO
+
+
+class IdempotencyWarning(Entry, kw_only=True):
+    component: str
+    idempotency_key: str | None = None
+    job_id: str | None = None
+    level: LogLevel = LogLevel.WARN
+
+
+class IdempotencyError(Entry, kw_only=True):
+    component: str
+    idempotency_key: str | None = None
+    job_id: str | None = None
+    level: LogLevel = LogLevel.ERROR
