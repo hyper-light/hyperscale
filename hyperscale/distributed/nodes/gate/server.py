@@ -2303,8 +2303,15 @@ class GateServer(HealthAwareServer):
                     broadcast.dump(),
                     timeout=2.0,
                 )
-            except Exception:
-                pass
+            except Exception as discovery_error:
+                await self._udp_logger.log(
+                    ServerWarning(
+                        message=f"Failed to send manager discovery broadcast: {discovery_error}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
 
     def _get_state_snapshot(self) -> GateStateSnapshot:
         """Get gate state snapshot."""
@@ -2355,7 +2362,15 @@ class GateServer(HealthAwareServer):
         try:
             await self.send(target, data, timeout=5)
             return True
-        except Exception:
+        except Exception as probe_error:
+            await self._udp_logger.log(
+                ServerDebug(
+                    message=f"Cross-cluster probe failed: {probe_error}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
             return False
 
     def _on_dc_health_change(self, datacenter: str, new_health: str) -> None:
