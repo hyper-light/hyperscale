@@ -413,7 +413,7 @@ class LoggerStream:
 
     async def _stop_consumer(self, shutdown_subscribed: bool) -> None:
         was_running = self._consumer.status == ConsumerStatus.RUNNING
-        self._consumer.stop()
+        await self._consumer.stop()
 
         if shutdown_subscribed:
             await self._provider.signal_shutdown()

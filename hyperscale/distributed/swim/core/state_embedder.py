@@ -14,6 +14,7 @@ for the HealthGossipBuffer, enabling O(log n) health state dissemination
 alongside membership gossip.
 """
 
+from collections.abc import Awaitable
 from dataclasses import dataclass, field
 from typing import Protocol, Callable, Any
 import time
