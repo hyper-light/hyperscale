@@ -47,7 +47,7 @@ class ProbeHandler(BaseHandler):
             return self._nack()
 
         # Process probe within context
-        async with self._server.context_with_value(target):
+        async with await self._server.context_with_value(target):
             nodes = self._server.read_nodes()
 
             # If probe is about self, send refutation
