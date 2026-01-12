@@ -93,11 +93,11 @@ class TestWALWriterBatching:
     @pytest.mark.asyncio
     async def test_batch_writes(self, temp_wal_directory: str):
         wal_path = Path(temp_wal_directory) / "test.wal"
-        writer = WALWriter(
-            path=wal_path,
+        config = WALWriterConfig(
             batch_timeout_microseconds=10000,
             batch_max_entries=50,
         )
+        writer = WALWriter(path=wal_path, config=config)
 
         await writer.start()
 
@@ -126,12 +126,12 @@ class TestWALWriterBatching:
     @pytest.mark.asyncio
     async def test_batch_max_bytes_triggers_commit(self, temp_wal_directory: str):
         wal_path = Path(temp_wal_directory) / "test.wal"
-        writer = WALWriter(
-            path=wal_path,
+        config = WALWriterConfig(
             batch_timeout_microseconds=1000000,
             batch_max_entries=1000,
             batch_max_bytes=1024,
         )
+        writer = WALWriter(path=wal_path, config=config)
 
         await writer.start()
 
