@@ -130,6 +130,11 @@ class GateRuntimeState:
         """Remove a peer from the active set."""
         self._active_gate_peers.discard(peer_addr)
 
+    def remove_peer_lock(self, peer_addr: tuple[str, int]) -> None:
+        """Remove lock and epoch when peer disconnects to prevent memory leak."""
+        self._peer_state_locks.pop(peer_addr, None)
+        self._peer_state_epoch.pop(peer_addr, None)
+
     def is_peer_active(self, peer_addr: tuple[str, int]) -> bool:
         """Check if a peer is in the active set."""
         return peer_addr in self._active_gate_peers
