@@ -182,9 +182,7 @@ class ConnectionPool(Generic[T]):
                     )
 
             if len(peer_connections) >= self.config.max_connections_per_peer:
-                raise RuntimeError(
-                    f"Max connections per peer reached for {peer_id}"
-                )
+                raise RuntimeError(f"Max connections per peer reached for {peer_id}")
 
         # Create new connection (outside lock)
         try:
@@ -203,6 +201,22 @@ class ConnectionPool(Generic[T]):
         )
 
         async with self._get_lock():
+            peer_connections = self._connections.get(peer_id, [])
+
+            if self._total_connections >= self.config.max_total_connections:
+                if self.close_fn is not None:
+                    await self.close_fn(connection)
+                raise RuntimeError(
+                    f"Connection pool exhausted (limit reached during creation)"
+                )
+
+            if len(peer_connections) >= self.config.max_connections_per_peer:
+                if self.close_fn is not None:
+                    await self.close_fn(connection)
+                raise RuntimeError(
+                    f"Max connections per peer reached for {peer_id} (limit reached during creation)"
+                )
+
             if peer_id not in self._connections:
                 self._connections[peer_id] = []
             self._connections[peer_id].append(pooled)
