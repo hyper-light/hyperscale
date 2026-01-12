@@ -104,7 +104,7 @@ class GateLeaderTransferHandler:
 
         try:
             transfer = GateJobLeaderTransfer.load(data)
-            routing_lock = self._state.get_or_create_routing_lock(transfer.job_id)
+            routing_lock = await self._state.get_or_create_routing_lock(transfer.job_id)
             async with routing_lock:
                 ack = await self._apply_transfer(transfer)
             return ack.dump()
@@ -220,7 +220,7 @@ class ManagerLeaderTransferHandler:
 
         try:
             transfer = ManagerJobLeaderTransfer.load(data)
-            routing_lock = self._state.get_or_create_routing_lock(transfer.job_id)
+            routing_lock = await self._state.get_or_create_routing_lock(transfer.job_id)
             async with routing_lock:
                 ack = await self._apply_transfer(transfer)
             return ack.dump()
