@@ -35,22 +35,25 @@ JobId = str
 
 class NodeStatus(Enum):
     """Status of a node from the perspective of failure detection."""
-    ALIVE = auto()          # Not suspected at any layer
+
+    ALIVE = auto()  # Not suspected at any layer
     SUSPECTED_GLOBAL = auto()  # Suspected at global layer (machine may be down)
-    SUSPECTED_JOB = auto()     # Suspected for specific job(s) only
-    DEAD_GLOBAL = auto()       # Declared dead at global layer
-    DEAD_JOB = auto()          # Declared dead for specific job
+    SUSPECTED_JOB = auto()  # Suspected for specific job(s) only
+    DEAD_GLOBAL = auto()  # Declared dead at global layer
+    DEAD_JOB = auto()  # Declared dead for specific job
 
 
 class FailureSource(Enum):
     """Source of a failure detection event."""
-    GLOBAL = auto()   # From global timing wheel
-    JOB = auto()      # From job-specific detection
+
+    GLOBAL = auto()  # From global timing wheel
+    JOB = auto()  # From job-specific detection
 
 
 @dataclass
 class HierarchicalConfig:
     """Configuration for hierarchical failure detection."""
+
     # Global layer config
     global_min_timeout: float = 5.0
     global_max_timeout: float = 30.0
@@ -87,6 +90,7 @@ class HierarchicalConfig:
 @dataclass
 class FailureEvent:
     """Event emitted when a node is declared dead."""
+
     node: NodeAddress
     source: FailureSource
     job_id: JobId | None  # Only set for JOB source
@@ -173,6 +177,8 @@ class HierarchicalFailureDetector:
         # Event history for debugging/monitoring
         self._recent_events: list[FailureEvent] = []
         self._max_event_history: int = 100
+
+        self._pending_clear_tasks: set[asyncio.Task] = set()
 
         # Stats
         self._global_deaths: int = 0
@@ -338,7 +344,9 @@ class HierarchicalFailureDetector:
     # AD-26: Adaptive Healthcheck Extensions
     # =========================================================================
 
-    def _get_or_create_extension_tracker(self, node: NodeAddress) -> ExtensionTracker | None:
+    def _get_or_create_extension_tracker(
+        self, node: NodeAddress
+    ) -> ExtensionTracker | None:
         """
         Get or create an ExtensionTracker for a node.
 
@@ -349,8 +357,8 @@ class HierarchicalFailureDetector:
             if len(self._extension_trackers) >= self._config.max_extension_trackers:
                 return None
             worker_id = f"{node[0]}:{node[1]}"
-            self._extension_trackers[node] = self._extension_tracker_config.create_tracker(
-                worker_id
+            self._extension_trackers[node] = (
+                self._extension_tracker_config.create_tracker(worker_id)
             )
         return self._extension_trackers[node]
 
@@ -406,9 +414,11 @@ class HierarchicalFailureDetector:
                 )
 
             # Request the extension
-            granted, extension_seconds, denial_reason, is_warning = tracker.request_extension(
-                reason=reason,
-                current_progress=current_progress,
+            granted, extension_seconds, denial_reason, is_warning = (
+                tracker.request_extension(
+                    reason=reason,
+                    current_progress=current_progress,
+                )
             )
 
             if granted:
@@ -452,7 +462,9 @@ class HierarchicalFailureDetector:
         """Get the extension tracker for a node (for debugging/monitoring)."""
         return self._extension_trackers.get(node)
 
-    def get_extension_status(self, node: NodeAddress) -> dict[str, float | int | bool] | None:
+    def get_extension_status(
+        self, node: NodeAddress
+    ) -> dict[str, float | int | bool] | None:
         """
         Get extension status for a node.
 
@@ -768,7 +780,11 @@ class HierarchicalFailureDetector:
                 # 2. Tracker has been reset (extension_count == 0)
                 # 3. Node is not globally dead (those are cleaned up on death)
                 is_suspected = await self._global_wheel.contains(node)
-                if not is_suspected and tracker.extension_count == 0 and node not in self._globally_dead:
+                if (
+                    not is_suspected
+                    and tracker.extension_count == 0
+                    and node not in self._globally_dead
+                ):
                     stale_tracker_nodes.append(node)
 
             for node in stale_tracker_nodes:
@@ -810,21 +826,17 @@ class HierarchicalFailureDetector:
             "global_suspected": global_stats["current_entries"],
             "global_deaths": self._global_deaths,
             "globally_dead_count": len(self._globally_dead),
-
             # Job layer
             "job_suspicions": job_stats["active_suspicions"],
             "job_deaths": self._job_deaths,
             "jobs_with_suspicions": job_stats["jobs_with_suspicions"],
-
             # Reconciliation
             "reconciliations": self._reconciliations,
             "job_suspicions_cleared_by_global": self._job_suspicions_cleared_by_global,
-
             # Timing wheel internals
             "wheel_entries_added": global_stats["entries_added"],
             "wheel_entries_expired": global_stats["entries_expired"],
             "wheel_cascade_count": global_stats["cascade_count"],
-
             # AD-26: Extension stats
             "extensions_requested": self._extensions_requested,
             "extensions_granted": self._extensions_granted,

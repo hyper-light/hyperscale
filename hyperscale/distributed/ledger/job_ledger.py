@@ -214,7 +214,6 @@ class JobLedger:
             entry = await self._wal.append(
                 event_type=JobEventType.JOB_CREATED,
                 payload=event.to_bytes(),
-                fsync=True,
             )
 
             result = await self._pipeline.commit(entry, durability)
@@ -256,7 +255,6 @@ class JobLedger:
             entry = await self._wal.append(
                 event_type=JobEventType.JOB_ACCEPTED,
                 payload=event.to_bytes(),
-                fsync=True,
             )
 
             result = await self._pipeline.commit(entry, durability)
@@ -299,7 +297,6 @@ class JobLedger:
             entry = await self._wal.append(
                 event_type=JobEventType.JOB_CANCELLATION_REQUESTED,
                 payload=event.to_bytes(),
-                fsync=True,
             )
 
             result = await self._pipeline.commit(entry, durability)
@@ -340,7 +337,6 @@ class JobLedger:
             entry = await self._wal.append(
                 event_type=JobEventType.JOB_COMPLETED,
                 payload=event.to_bytes(),
-                fsync=True,
             )
 
             result = await self._pipeline.commit(entry, durability)
