@@ -179,11 +179,17 @@ class ClientState:
 
     def initialize_locks(self) -> None:
         self._metrics_lock = asyncio.Lock()
+        self._lock_creation_lock = asyncio.Lock()
 
     def _get_metrics_lock(self) -> asyncio.Lock:
         if self._metrics_lock is None:
             self._metrics_lock = asyncio.Lock()
         return self._metrics_lock
+
+    def _get_lock_creation_lock(self) -> asyncio.Lock:
+        if self._lock_creation_lock is None:
+            self._lock_creation_lock = asyncio.Lock()
+        return self._lock_creation_lock
 
     async def increment_gate_transfers(self) -> None:
         async with self._get_metrics_lock():
