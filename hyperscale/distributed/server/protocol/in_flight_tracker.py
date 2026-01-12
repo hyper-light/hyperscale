@@ -439,7 +439,7 @@ class ProtocolInFlightTracker:
 
     def __repr__(self) -> str:
         return (
-            f"InFlightTracker("
+            f"ProtocolInFlightTracker("
             f"in_flight={self.total_in_flight}/{self.limits.global_limit}, "
             f"shed={self.total_shed})"
         )
