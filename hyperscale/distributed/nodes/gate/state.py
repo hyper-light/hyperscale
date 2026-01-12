@@ -101,20 +101,20 @@ class GateRuntimeState:
         self._forward_throughput_interval_start: float = 0.0
         self._forward_throughput_last_value: float = 0.0
 
-    # Gate peer methods
+    def initialize_locks(self) -> None:
+        self._counter_lock = asyncio.Lock()
+
     def get_or_create_peer_lock(self, peer_addr: tuple[str, int]) -> asyncio.Lock:
-        """Get or create a lock for the given peer address."""
         return self._peer_state_locks.setdefault(peer_addr, asyncio.Lock())
 
-    def increment_peer_epoch(self, peer_addr: tuple[str, int]) -> int:
-        """Increment and return the epoch for a peer address."""
-        current_epoch = self._peer_state_epoch.get(peer_addr, 0)
-        new_epoch = current_epoch + 1
-        self._peer_state_epoch[peer_addr] = new_epoch
-        return new_epoch
+    async def increment_peer_epoch(self, peer_addr: tuple[str, int]) -> int:
+        async with self._counter_lock:
+            current_epoch = self._peer_state_epoch.get(peer_addr, 0)
+            new_epoch = current_epoch + 1
+            self._peer_state_epoch[peer_addr] = new_epoch
+            return new_epoch
 
     def get_peer_epoch(self, peer_addr: tuple[str, int]) -> int:
-        """Get the current epoch for a peer address."""
         return self._peer_state_epoch.get(peer_addr, 0)
 
     def add_active_peer(self, peer_addr: tuple[str, int]) -> None:
@@ -186,10 +186,10 @@ class GateRuntimeState:
         key = self.get_lease_key(job_id, datacenter_id)
         self._leases.pop(key, None)
 
-    def next_fence_token(self) -> int:
-        """Get and increment the fence token."""
-        self._fence_token += 1
-        return self._fence_token
+    async def next_fence_token(self) -> int:
+        async with self._counter_lock:
+            self._fence_token += 1
+            return self._fence_token
 
     # Orphan/leadership methods
     def mark_leader_dead(self, leader_addr: tuple[str, int]) -> None:
@@ -243,10 +243,9 @@ class GateRuntimeState:
         self._cancellation_completion_events.pop(job_id, None)
         self._cancellation_errors.pop(job_id, None)
 
-    # Throughput methods
-    def record_forward(self) -> None:
-        """Record a forwarded job."""
-        self._forward_throughput_count += 1
+    async def record_forward(self) -> None:
+        async with self._counter_lock:
+            self._forward_throughput_count += 1
 
     def calculate_throughput(self, now: float, interval_seconds: float) -> float:
         """Calculate and reset throughput for the current interval."""
@@ -260,14 +259,12 @@ class GateRuntimeState:
             self._forward_throughput_interval_start = now
         return self._forward_throughput_last_value
 
-    # State version methods
-    def increment_state_version(self) -> int:
-        """Increment and return the state version."""
-        self._state_version += 1
-        return self._state_version
+    async def increment_state_version(self) -> int:
+        async with self._counter_lock:
+            self._state_version += 1
+            return self._state_version
 
     def get_state_version(self) -> int:
-        """Get the current state version."""
         return self._state_version
 
     # Gate state methods
