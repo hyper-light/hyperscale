@@ -166,6 +166,12 @@ class WorkflowDispatcher:
         """
         job_id = submission.job_id
 
+        await self._retry_budget_manager.create_budget(
+            job_id=job_id,
+            total=getattr(submission, "retry_budget", 0),
+            per_workflow=getattr(submission, "retry_budget_per_workflow", 0),
+        )
+
         # Build dependency graph
         graph = networkx.DiGraph()
         workflow_by_id: dict[
