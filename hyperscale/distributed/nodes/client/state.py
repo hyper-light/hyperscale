@@ -71,6 +71,7 @@ class ClientState:
         self._manager_transfers_received: int = 0
         self._requests_rerouted: int = 0
         self._requests_failed_leadership_change: int = 0
+        self._metrics_lock: asyncio.Lock | None = None
 
         # Gate connection state
         self._gate_connection_state: dict[tuple[str, int], str] = {}

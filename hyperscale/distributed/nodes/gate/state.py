@@ -38,6 +38,9 @@ class GateRuntimeState:
 
     def __init__(self) -> None:
         """Initialize empty state containers."""
+        # Counter protection lock (for race-free increments)
+        self._counter_lock: asyncio.Lock | None = None
+
         # Gate peer state
         self._gate_udp_to_tcp: dict[tuple[str, int], tuple[str, int]] = {}
         self._active_gate_peers: set[tuple[str, int]] = set()

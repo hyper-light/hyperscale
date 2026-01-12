@@ -41,6 +41,9 @@ class ManagerState:
 
     def __init__(self) -> None:
         """Initialize empty state containers."""
+        # Counter protection lock (for race-free increments)
+        self._counter_lock: asyncio.Lock | None = None
+
         # Gate tracking
         self._known_gates: dict[str, GateInfo] = {}
         self._healthy_gate_ids: set[str] = set()

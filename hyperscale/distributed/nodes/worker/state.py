@@ -85,6 +85,7 @@ class WorkerState:
 
         # State versioning
         self._state_version: int = 0
+        self._version_lock: asyncio.Lock | None = None
 
         # Extension request state (AD-26)
         self._extension_requested: bool = False
