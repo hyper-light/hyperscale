@@ -110,7 +110,7 @@ class GatePeerCoordinator:
         self._confirm_peer = confirm_peer
         self._handle_job_leader_failure = handle_job_leader_failure
 
-    def on_peer_confirmed(self, peer: tuple[str, int]) -> None:
+    async def on_peer_confirmed(self, peer: tuple[str, int]) -> None:
         """
         Add confirmed peer to active peer sets (AD-29).
 
@@ -125,7 +125,7 @@ class GatePeerCoordinator:
         if not tcp_addr:
             return
 
-        self._state.add_active_peer(tcp_addr)
+        await self._state.add_active_peer(tcp_addr)
         self._task_runner.run(
             self._logger.log,
             ServerDebug(
@@ -150,10 +150,10 @@ class GatePeerCoordinator:
             udp_addr: UDP address of the failed peer
             tcp_addr: TCP address of the failed peer
         """
-        peer_lock = self._state.get_or_create_peer_lock(tcp_addr)
+        peer_lock = await self._state.get_or_create_peer_lock(tcp_addr)
         async with peer_lock:
             await self._state.increment_peer_epoch(tcp_addr)
-            self._state.remove_active_peer(tcp_addr)
+            await self._state.remove_active_peer(tcp_addr)
 
             peer_host, peer_port = tcp_addr
             peer_id = f"{peer_host}:{peer_port}"
