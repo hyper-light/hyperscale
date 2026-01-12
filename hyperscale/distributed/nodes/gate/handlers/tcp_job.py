@@ -171,7 +171,7 @@ class GateJobHandler:
         """
         try:
             client_id = f"{addr[0]}:{addr[1]}"
-            allowed, retry_after = self._check_rate_limit(client_id, "job_submit")
+            allowed, retry_after = await self._check_rate_limit(client_id, "job_submit")
             if not allowed:
                 return RateLimitResponse(
                     operation="job_submit",
@@ -415,7 +415,7 @@ class GateJobHandler:
         start_time = time.monotonic()
         try:
             client_id = f"{addr[0]}:{addr[1]}"
-            allowed, retry_after = self._check_rate_limit(client_id, "job_status")
+            allowed, retry_after = await self._check_rate_limit(client_id, "job_status")
             if not allowed:
                 return RateLimitResponse(
                     operation="job_status",

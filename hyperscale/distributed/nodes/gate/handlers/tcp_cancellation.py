@@ -149,7 +149,7 @@ class GateCancellationHandler:
         """
         try:
             client_id = f"{addr[0]}:{addr[1]}"
-            allowed, retry_after = self._check_rate_limit(client_id, "cancel")
+            allowed, retry_after = await self._check_rate_limit(client_id, "cancel")
             if not allowed:
                 return RateLimitResponse(
                     operation="cancel",
@@ -402,7 +402,9 @@ class GateCancellationHandler:
             request = SingleWorkflowCancelRequest.load(data)
 
             client_id = f"{addr[0]}:{addr[1]}"
-            allowed, retry_after = self._check_rate_limit(client_id, "cancel_workflow")
+            allowed, retry_after = await self._check_rate_limit(
+                client_id, "cancel_workflow"
+            )
             if not allowed:
                 return RateLimitResponse(
                     operation="cancel_workflow",
