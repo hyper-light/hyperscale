@@ -280,7 +280,9 @@ class GatePeerCoordinator:
             heartbeat: Received gate heartbeat
             source_addr: UDP source address of the heartbeat
         """
-        if self._versioned_clock.is_entity_stale(heartbeat.node_id, heartbeat.version):
+        if await self._versioned_clock.is_entity_stale(
+            heartbeat.node_id, heartbeat.version
+        ):
             return
 
         self._state._gate_peer_info[source_addr] = heartbeat
