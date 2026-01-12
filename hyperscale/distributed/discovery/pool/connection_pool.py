@@ -305,24 +305,22 @@ class ConnectionPool(Generic[T]):
         Returns:
             Number of connections closed
         """
+        # Atomically remove peer connections and clear in_use tracking
         async with self._get_lock():
             peer_conns = self._connections.pop(peer_id, [])
+            for pooled in peer_conns:
+                conn_id = id(pooled.connection)
+                self._in_use.discard(conn_id)
+            closed = len(peer_conns)
+            self._total_connections -= closed
 
-        closed = 0
+        # Close connections outside lock to avoid holding during IO
         for pooled in peer_conns:
-            conn_id = id(pooled.connection)
-            self._in_use.discard(conn_id)
-
             if self.close_fn is not None:
                 try:
                     await self.close_fn(pooled.connection)
                 except Exception:
                     pass
-
-            closed += 1
-
-        async with self._get_lock():
-            self._total_connections -= closed
 
         return closed
 
