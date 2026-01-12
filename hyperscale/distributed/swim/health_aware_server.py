@@ -2071,7 +2071,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         Returns True if send was queued, False if skipped (node not OK).
         Failures are logged via error handler.
         """
-        base_timeout = self._context.read("current_timeout")
+        base_timeout = await self._context.read("current_timeout")
         timeout = self.get_lhm_adjusted_timeout(base_timeout)
 
         node_state = self._incarnation_tracker.get_node_state(node)
