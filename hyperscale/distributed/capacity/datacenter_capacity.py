@@ -55,9 +55,15 @@ class DatacenterCapacity:
 
         total_cores = sum(heartbeat.total_cores for heartbeat in heartbeats)
         available_cores = sum(heartbeat.available_cores for heartbeat in heartbeats)
-        pending_count = sum(heartbeat.pending_workflow_count for heartbeat in heartbeats)
-        pending_duration = sum(heartbeat.pending_duration_seconds for heartbeat in heartbeats)
-        active_remaining = sum(heartbeat.active_remaining_seconds for heartbeat in heartbeats)
+        pending_count = sum(
+            heartbeat.pending_workflow_count for heartbeat in heartbeats
+        )
+        pending_duration = sum(
+            heartbeat.pending_duration_seconds for heartbeat in heartbeats
+        )
+        active_remaining = sum(
+            heartbeat.active_remaining_seconds for heartbeat in heartbeats
+        )
 
         estimated_wait = _estimate_wait_time(
             available_cores,
@@ -97,7 +103,9 @@ class DatacenterCapacity:
         if self.total_cores <= 0:
             return float("inf")
 
-        total_work_remaining = self.active_remaining_seconds + self.pending_duration_seconds
+        total_work_remaining = (
+            self.active_remaining_seconds + self.pending_duration_seconds
+        )
         throughput = self.total_cores
         if throughput <= 0:
             return float("inf")
