@@ -36,11 +36,10 @@ MESSAGE_INCARNATION = secrets.token_bytes(8)
 
 def _generate_message_id() -> int:
     """Generate a unique message ID using Snowflake algorithm."""
-    message_id = _message_id_generator.generate()
-    # If generator returns None (sequence exhausted), wait and retry
+    message_id = _message_id_generator.generate_sync()
     while message_id is None:
-        time.sleep(0.001)  # Wait 1ms for next timestamp
-        message_id = _message_id_generator.generate()
+        time.sleep(0.001)
+        message_id = _message_id_generator.generate_sync()
     return message_id
 
 
@@ -105,21 +104,21 @@ class Message:
     def load(cls, data: bytes) -> Self:
         """
         Securely deserialize a message using restricted unpickling.
-        
+
         This prevents arbitrary code execution by blocking dangerous
         modules like os, subprocess, sys, etc.
-        
+
         Args:
             data: Pickled message bytes
-            
+
         Returns:
             The deserialized message
-            
+
         Raises:
             SecurityError: If the data tries to load blocked modules/classes
         """
         return RestrictedUnpickler(io.BytesIO(data)).load()
-    
+
     def dump(self) -> bytes:
         """Serialize the message using cloudpickle."""
         return cloudpickle.dumps(self)
