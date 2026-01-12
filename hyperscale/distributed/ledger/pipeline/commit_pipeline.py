@@ -94,11 +94,16 @@ class CommitPipeline:
         self,
         entry: WALEntry,
         required_level: DurabilityLevel,
+        backpressure: BackpressureSignal | None = None,
     ) -> CommitResult:
         level_achieved = DurabilityLevel.LOCAL
 
         if required_level == DurabilityLevel.LOCAL:
-            return CommitResult(entry=entry, level_achieved=level_achieved)
+            return CommitResult(
+                entry=entry,
+                level_achieved=level_achieved,
+                backpressure=backpressure,
+            )
 
         if required_level >= DurabilityLevel.REGIONAL:
             try:
@@ -111,18 +116,21 @@ class CommitPipeline:
                         entry=entry,
                         level_achieved=level_achieved,
                         error=RuntimeError("Regional replication failed"),
+                        backpressure=backpressure,
                     )
             except asyncio.TimeoutError:
                 return CommitResult(
                     entry=entry,
                     level_achieved=level_achieved,
                     error=asyncio.TimeoutError("Regional replication timed out"),
+                    backpressure=backpressure,
                 )
             except Exception as exc:
                 return CommitResult(
                     entry=entry,
                     level_achieved=level_achieved,
                     error=exc,
+                    backpressure=backpressure,
                 )
 
         if required_level >= DurabilityLevel.GLOBAL:
