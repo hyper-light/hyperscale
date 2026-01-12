@@ -58,6 +58,12 @@ class WorkerRegistry:
         self._manager_state_locks: dict[str, asyncio.Lock] = {}
         self._manager_state_epoch: dict[str, int] = {}
 
+        # Lock for creating per-resource locks
+        self._resource_creation_lock: asyncio.Lock = asyncio.Lock()
+
+        # Counter protection lock
+        self._counter_lock: asyncio.Lock = asyncio.Lock()
+
     def add_manager(self, manager_id: str, manager_info: ManagerInfo) -> None:
         """Add or update a known manager."""
         self._known_managers[manager_id] = manager_info
@@ -73,16 +79,16 @@ class WorkerRegistry:
                 return manager
         return None
 
-    def mark_manager_healthy(self, manager_id: str) -> None:
-        """Mark a manager as healthy."""
-        self._healthy_manager_ids.add(manager_id)
-        self._manager_unhealthy_since.pop(manager_id, None)
+    async def mark_manager_healthy(self, manager_id: str) -> None:
+        async with self._counter_lock:
+            self._healthy_manager_ids.add(manager_id)
+            self._manager_unhealthy_since.pop(manager_id, None)
 
-    def mark_manager_unhealthy(self, manager_id: str) -> None:
-        """Mark a manager as unhealthy."""
-        self._healthy_manager_ids.discard(manager_id)
-        if manager_id not in self._manager_unhealthy_since:
-            self._manager_unhealthy_since[manager_id] = time.monotonic()
+    async def mark_manager_unhealthy(self, manager_id: str) -> None:
+        async with self._counter_lock:
+            self._healthy_manager_ids.discard(manager_id)
+            if manager_id not in self._manager_unhealthy_since:
+                self._manager_unhealthy_since[manager_id] = time.monotonic()
 
     def is_manager_healthy(self, manager_id: str) -> bool:
         """Check if a manager is healthy."""
