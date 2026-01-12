@@ -550,7 +550,21 @@ class WorkflowDispatcher:
         pending.dispatch_in_progress = True
 
         try:
-            # Track this dispatch attempt
+            is_retry = pending.dispatch_attempts > 0
+
+            if is_retry:
+                allowed, reason = await self._retry_budget_manager.check_and_consume(
+                    pending.job_id, pending.workflow_id
+                )
+                if not allowed:
+                    await self._log_warning(
+                        f"Retry budget exhausted for workflow {pending.workflow_id}: {reason}",
+                        job_id=pending.job_id,
+                        workflow_id=pending.workflow_id,
+                    )
+                    pending.dispatch_attempts = pending.max_dispatch_attempts
+                    return False
+
             pending.dispatch_attempts += 1
             pending.last_dispatch_attempt = time.monotonic()
 
@@ -961,9 +975,12 @@ class WorkflowDispatcher:
         - Stops the dispatch loop task for this job
         - Clears all pending workflow entries
         - Clears ready_events to unblock any waiters
+        - Clears retry budget state (AD-44)
         """
         # Stop the dispatch loop first
         await self.stop_job_dispatch(job_id)
+
+        await self._retry_budget_manager.cleanup(job_id)
 
         # Clear pending workflows
         async with self._pending_lock:
