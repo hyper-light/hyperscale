@@ -128,7 +128,7 @@ class IncarnationTracker:
         """Get current incarnation number for this node."""
         return self.self_incarnation
 
-    def increment_self_incarnation(self) -> int:
+    async def increment_self_incarnation(self) -> int:
         """
         Increment own incarnation number.
         Called when refuting a suspicion about ourselves.
@@ -137,13 +137,14 @@ class IncarnationTracker:
         Raises:
             OverflowError: If incarnation would exceed MAX_INCARNATION.
         """
-        if self.self_incarnation >= MAX_INCARNATION:
-            raise OverflowError(
-                f"Incarnation number exhausted (at {MAX_INCARNATION}). "
-                "Node must restart to continue participating in cluster."
-            )
-        self.self_incarnation += 1
-        return self.self_incarnation
+        async with self._lock:
+            if self.self_incarnation >= MAX_INCARNATION:
+                raise OverflowError(
+                    f"Incarnation number exhausted (at {MAX_INCARNATION}). "
+                    "Node must restart to continue participating in cluster."
+                )
+            self.self_incarnation += 1
+            return self.self_incarnation
 
     def is_valid_incarnation(self, incarnation: int) -> bool:
         """
@@ -183,7 +184,7 @@ class IncarnationTracker:
         state = self.node_states.get(node)
         return state.incarnation if state else 0
 
-    def update_node(
+    async def update_node(
         self,
         node: tuple[str, int],
         status: Status,
@@ -212,17 +213,17 @@ class IncarnationTracker:
             if not self.is_valid_incarnation(incarnation):
                 return False
             if self.is_suspicious_jump(node, incarnation):
-                # Log suspicious activity but still reject
                 return False
 
-        if node not in self.node_states:
-            self.node_states[node] = NodeState(
-                status=status,
-                incarnation=incarnation,
-                last_update_time=timestamp,
-            )
-            return True
-        return self.node_states[node].update(status, incarnation, timestamp)
+        async with self._lock:
+            if node not in self.node_states:
+                self.node_states[node] = NodeState(
+                    status=status,
+                    incarnation=incarnation,
+                    last_update_time=timestamp,
+                )
+                return True
+            return self.node_states[node].update(status, incarnation, timestamp)
 
     def remove_node(self, node: tuple[str, int]) -> bool:
         """Remove a node from tracking. Returns True if it existed."""
