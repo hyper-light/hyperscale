@@ -158,9 +158,7 @@ class WorkerState:
 
     def get_or_create_manager_lock(self, manager_id: str) -> asyncio.Lock:
         """Get or create a state lock for a manager."""
-        if manager_id not in self._manager_state_locks:
-            self._manager_state_locks[manager_id] = asyncio.Lock()
-        return self._manager_state_locks[manager_id]
+        return self._manager_state_locks.setdefault(manager_id, asyncio.Lock())
 
     def increment_manager_epoch(self, manager_id: str) -> int:
         """Increment and return the epoch for a manager."""
@@ -256,9 +254,7 @@ class WorkerState:
         """Check if a workflow is orphaned."""
         return workflow_id in self._orphaned_workflows
 
-    def get_orphaned_workflows_expired(
-        self, grace_period_seconds: float
-    ) -> list[str]:
+    def get_orphaned_workflows_expired(self, grace_period_seconds: float) -> list[str]:
         """Get workflow IDs whose orphan grace period has expired."""
         current_time = time.monotonic()
         return [
@@ -273,9 +269,7 @@ class WorkerState:
 
     def get_or_create_job_transfer_lock(self, job_id: str) -> asyncio.Lock:
         """Get or create a transfer lock for a job."""
-        if job_id not in self._job_leader_transfer_locks:
-            self._job_leader_transfer_locks[job_id] = asyncio.Lock()
-        return self._job_leader_transfer_locks[job_id]
+        return self._job_leader_transfer_locks.setdefault(job_id, asyncio.Lock())
 
     def update_job_fence_token(self, job_id: str, fence_token: int) -> bool:
         """
