@@ -20,7 +20,12 @@ from hyperscale.distributed.reliability import (
     RetryExecutor,
     JitterStrategy,
 )
-from hyperscale.logging.hyperscale_logging_models import ServerDebug, ServerError, ServerInfo, ServerWarning
+from hyperscale.logging.hyperscale_logging_models import (
+    ServerDebug,
+    ServerError,
+    ServerInfo,
+    ServerWarning,
+)
 
 if TYPE_CHECKING:
     from hyperscale.logging import Logger
@@ -95,7 +100,7 @@ class WorkerProgressReporter:
         retry_config = RetryConfig(
             max_attempts=max_retries + 1,
             base_delay=base_delay,
-            max_delay=base_delay * (2 ** max_retries),
+            max_delay=base_delay * (2**max_retries),
             jitter=JitterStrategy.FULL,
         )
         executor = RetryExecutor(retry_config)
@@ -107,7 +112,7 @@ class WorkerProgressReporter:
                 progress.dump(),
                 timeout=1.0,
             )
-            if response and isinstance(response, bytes) and response != b'error':
+            if response and isinstance(response, bytes) and response != b"error":
                 self._process_ack(response, progress.workflow_id)
             else:
                 raise ConnectionError("Invalid or error response from manager")
@@ -115,8 +120,17 @@ class WorkerProgressReporter:
         try:
             await executor.execute(attempt_send, "progress_update")
             circuit.record_success()
-        except Exception:
+        except Exception as send_error:
             circuit.record_error()
+            if self._logger:
+                await self._logger.log(
+                    ServerWarning(
+                        message=f"Failed to send progress update: {send_error}",
+                        node_host=node_host,
+                        node_port=node_port,
+                        node_id=node_id_short,
+                    )
+                )
 
     async def send_progress_to_job_leader(
         self,
@@ -211,7 +225,7 @@ class WorkerProgressReporter:
                 timeout=1.0,
             )
 
-            if response and isinstance(response, bytes) and response != b'error':
+            if response and isinstance(response, bytes) and response != b"error":
                 self._process_ack(response, workflow_id)
                 circuit.record_success()
                 return True
@@ -253,7 +267,11 @@ class WorkerProgressReporter:
                         timeout=1.0,
                     )
 
-                    if response and isinstance(response, bytes) and response != b'error':
+                    if (
+                        response
+                        and isinstance(response, bytes)
+                        and response != b"error"
+                    ):
                         self._process_ack(response, progress.workflow_id)
                         circuit.record_success()
                     else:
@@ -307,7 +325,7 @@ class WorkerProgressReporter:
                         node_host=node_host,
                         node_port=node_port,
                         node_id=node_id_short,
-                    )
+                    ),
                 )
             return
 
@@ -324,7 +342,7 @@ class WorkerProgressReporter:
             retry_config = RetryConfig(
                 max_attempts=max_retries + 1,
                 base_delay=base_delay,
-                max_delay=base_delay * (2 ** max_retries),
+                max_delay=base_delay * (2**max_retries),
                 jitter=JitterStrategy.FULL,
             )
             executor = RetryExecutor(retry_config)
@@ -336,7 +354,7 @@ class WorkerProgressReporter:
                     final_result.dump(),
                     timeout=5.0,
                 )
-                if response and isinstance(response, bytes) and response != b'error':
+                if response and isinstance(response, bytes) and response != b"error":
                     return response
                 raise ConnectionError("Invalid or error response")
 
@@ -352,7 +370,7 @@ class WorkerProgressReporter:
                             node_host=node_host,
                             node_port=node_port,
                             node_id=node_id_short,
-                        )
+                        ),
                     )
                 return
 
@@ -484,7 +502,9 @@ class WorkerProgressReporter:
             if workflow_id and ack.job_leader_addr:
                 current_leader = self._state.get_workflow_job_leader(workflow_id)
                 if current_leader != ack.job_leader_addr:
-                    self._state.set_workflow_job_leader(workflow_id, ack.job_leader_addr)
+                    self._state.set_workflow_job_leader(
+                        workflow_id, ack.job_leader_addr
+                    )
 
             # Handle backpressure signal (AD-23)
             if ack.backpressure_level > 0:
@@ -494,10 +514,12 @@ class WorkerProgressReporter:
                     batch_only=ack.backpressure_batch_only,
                 )
                 self._state.set_manager_backpressure(ack.manager_id, signal.level)
-                self._state.set_backpressure_delay_ms(max(
-                    self._state.get_backpressure_delay_ms(),
-                    signal.suggested_delay_ms,
-                ))
+                self._state.set_backpressure_delay_ms(
+                    max(
+                        self._state.get_backpressure_delay_ms(),
+                        signal.suggested_delay_ms,
+                    )
+                )
 
         except Exception:
             pass
