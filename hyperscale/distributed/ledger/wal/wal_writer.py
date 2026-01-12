@@ -11,16 +11,12 @@ from typing import Callable
 
 @dataclass(slots=True)
 class WriteRequest:
-    """A request to write data to the WAL with completion callback."""
-
     data: bytes
     on_complete: Callable[[BaseException | None], None]
 
 
 @dataclass(slots=True)
 class WriteBatch:
-    """A batch of write requests to be committed together."""
-
     requests: list[WriteRequest] = field(default_factory=list)
     total_bytes: int = 0
 
@@ -156,7 +152,6 @@ class WALWriter:
                 self._file = None
 
     def _process_loop(self) -> None:
-        """Process write requests with batching."""
         while self._running:
             self._collect_batch()
 
@@ -164,7 +159,6 @@ class WALWriter:
                 self._commit_batch()
 
     def _collect_batch(self) -> None:
-        """Collect requests into a batch until timeout or limits reached."""
         try:
             request = self._queue.get(timeout=self._batch_timeout_seconds)
 
@@ -190,7 +184,6 @@ class WALWriter:
                 break
 
     def _commit_batch(self) -> None:
-        """Write all batched data and fsync once, then notify all waiters."""
         if self._file is None:
             exception = RuntimeError("WAL file is not open")
             self._fail_batch(exception)
@@ -216,7 +209,6 @@ class WALWriter:
             self._current_batch.clear()
 
     def _fail_batch(self, exception: BaseException) -> None:
-        """Fail all requests in current batch with the given exception."""
         for request in self._current_batch.requests:
             try:
                 request.on_complete(exception)
@@ -226,7 +218,6 @@ class WALWriter:
         self._current_batch.clear()
 
     def _fail_pending_requests(self, exception: BaseException) -> None:
-        """Fail all pending requests in queue."""
         self._fail_batch(exception)
 
         while True:
