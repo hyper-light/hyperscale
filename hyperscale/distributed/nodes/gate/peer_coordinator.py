@@ -207,10 +207,10 @@ class GatePeerCoordinator:
             udp_addr: UDP address of the recovered peer
             tcp_addr: TCP address of the recovered peer
         """
-        peer_lock = self._state.get_or_create_peer_lock(tcp_addr)
+        peer_lock = await self._state.get_or_create_peer_lock(tcp_addr)
 
         async with peer_lock:
-            initial_epoch = self._state.get_peer_epoch(tcp_addr)
+            initial_epoch = await self._state.get_peer_epoch(tcp_addr)
 
         async with self._recovery_semaphore:
             if self._recovery_jitter_max > 0:
@@ -220,7 +220,7 @@ class GatePeerCoordinator:
                 await asyncio.sleep(jitter)
 
             async with peer_lock:
-                current_epoch = self._state.get_peer_epoch(tcp_addr)
+                current_epoch = await self._state.get_peer_epoch(tcp_addr)
                 if current_epoch != initial_epoch:
                     self._task_runner.run(
                         self._logger.log,
@@ -234,7 +234,7 @@ class GatePeerCoordinator:
                     )
                     return
 
-                self._state.add_active_peer(tcp_addr)
+                await self._state.add_active_peer(tcp_addr)
 
                 peer_host, peer_port = tcp_addr
                 synthetic_peer_id = f"{peer_host}:{peer_port}"
