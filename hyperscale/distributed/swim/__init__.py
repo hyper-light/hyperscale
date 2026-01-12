@@ -1,7 +1,7 @@
 """
 SWIM + Lifeguard Protocol Implementation
 
-A Python implementation of the SWIM (Scalable Weakly-consistent 
+A Python implementation of the SWIM (Scalable Weakly-consistent
 Infection-style Process Group Membership) protocol with Lifeguard
 enhancements for more accurate failure detection.
 
@@ -14,7 +14,7 @@ Submodules:
 
 Usage:
     from swim import HealthAwareServer
-    
+
     server = HealthAwareServer(
         host='localhost',
         tcp_port=8670,
@@ -30,7 +30,6 @@ from .core import (
     Status as Status,
     UpdateType as UpdateType,
     LeaderRole as LeaderRole,
-    Nodes as Nodes,
     Ctx as Ctx,
     # Node Identity
     NodeId as NodeId,
@@ -87,7 +86,7 @@ from .health import (
     EventLoopHealthMonitor as EventLoopHealthMonitor,
     HealthSample as HealthSample,
     measure_event_loop_lag as measure_event_loop_lag,
-    GracefulDegradation as GracefulDegradation  ,
+    GracefulDegradation as GracefulDegradation,
     DegradationLevel as DegradationLevel,
     DegradationPolicy as DegradationPolicy,
     DEGRADATION_POLICIES as DEGRADATION_POLICIES,
@@ -122,4 +121,3 @@ from .leadership import (
 
 # Main server
 from .health_aware_server import HealthAwareServer as HealthAwareServer
-
