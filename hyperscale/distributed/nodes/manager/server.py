@@ -670,6 +670,9 @@ class ManagerServer(HealthAwareServer):
         # Cancel background tasks
         await self._cancel_background_tasks()
 
+        if self._node_wal is not None:
+            await self._node_wal.close()
+
         # Graceful shutdown
         await super().stop(
             drain_timeout=drain_timeout,
