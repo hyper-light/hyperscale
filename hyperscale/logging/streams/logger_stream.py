@@ -42,7 +42,8 @@ from .retention_policy import (
 
 T = TypeVar("T", bound=Entry)
 
-BINARY_HEADER_SIZE = 16
+BINARY_HEADER_SIZE_V1 = 16
+BINARY_HEADER_SIZE = 24
 DEFAULT_QUEUE_MAX_SIZE = 10000
 DEFAULT_BATCH_MAX_SIZE = 100
 
@@ -145,8 +146,10 @@ class LoggerStream:
         self._instance_id = instance_id
 
         self._sequence_generator: SnowflakeGenerator | None = None
+        self._lamport_clock: HybridLamportClock | None = None
         if enable_lsn:
             self._sequence_generator = SnowflakeGenerator(instance_id)
+            self._lamport_clock = HybridLamportClock(node_id=instance_id)
 
         self._pending_batch: list[tuple[str, asyncio.Future[None]]] = []
         self._batch_lock: asyncio.Lock | None = None
@@ -924,14 +927,22 @@ class LoggerStream:
         return lsn
 
     def _generate_lsn(self, log: Log[T]) -> int | None:
-        if not self._enable_lsn or not self._sequence_generator:
+        if not self._enable_lsn:
             return None
 
-        lsn = self._sequence_generator.generate()
-        if lsn is not None:
+        if self._lamport_clock is not None:
+            lsn_obj = self._lamport_clock.generate()
+            lsn = lsn_obj.to_int()
             log.lsn = lsn
+            return lsn
 
-        return lsn
+        if self._sequence_generator is not None:
+            lsn = self._sequence_generator.generate()
+            if lsn is not None:
+                log.lsn = lsn
+            return lsn
+
+        return None
 
     def _encode_log(self, log: Log[T], lsn: int | None) -> bytes:
         if self._log_format == "binary":
@@ -953,30 +964,43 @@ class LoggerStream:
         payload = msgspec.json.encode(log)
         lsn_value = lsn if lsn is not None else 0
 
-        header = struct.pack("<IQ", len(payload), lsn_value)
+        if self._lamport_clock is not None:
+            lsn_high = (lsn_value >> 64) & 0xFFFFFFFFFFFFFFFF
+            lsn_low = lsn_value & 0xFFFFFFFFFFFFFFFF
+            header = struct.pack("<IQQ", len(payload), lsn_high, lsn_low)
+        else:
+            header = struct.pack("<IQ", len(payload), lsn_value)
+
         crc = zlib.crc32(header + payload) & 0xFFFFFFFF
 
         return struct.pack("<I", crc) + header + payload
 
     def _decode_binary(self, data: bytes) -> tuple[Log[T], int]:
-        if len(data) < BINARY_HEADER_SIZE:
-            raise ValueError(f"Entry too short: {len(data)} < {BINARY_HEADER_SIZE}")
+        if len(data) < BINARY_HEADER_SIZE_V1:
+            raise ValueError(f"Entry too short: {len(data)} < {BINARY_HEADER_SIZE_V1}")
 
         crc_stored = struct.unpack("<I", data[:4])[0]
-        length, lsn = struct.unpack("<IQ", data[4:16])
 
-        if len(data) < BINARY_HEADER_SIZE + length:
+        if len(data) >= BINARY_HEADER_SIZE and self._lamport_clock is not None:
+            length, lsn_high, lsn_low = struct.unpack("<IQQ", data[4:24])
+            lsn = (lsn_high << 64) | lsn_low
+            header_size = BINARY_HEADER_SIZE
+        else:
+            length, lsn = struct.unpack("<IQ", data[4:16])
+            header_size = BINARY_HEADER_SIZE_V1
+
+        if len(data) < header_size + length:
             raise ValueError(
-                f"Truncated entry: have {len(data)}, need {BINARY_HEADER_SIZE + length}"
+                f"Truncated entry: have {len(data)}, need {header_size + length}"
             )
 
-        crc_computed = zlib.crc32(data[4 : 16 + length]) & 0xFFFFFFFF
+        crc_computed = zlib.crc32(data[4 : header_size + length]) & 0xFFFFFFFF
         if crc_stored != crc_computed:
             raise ValueError(
                 f"CRC mismatch: stored={crc_stored:#x}, computed={crc_computed:#x}"
             )
 
-        payload = data[16 : 16 + length]
+        payload = data[header_size : header_size + length]
         log = msgspec.json.decode(payload, type=Log)
 
         return log, lsn
