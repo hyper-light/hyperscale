@@ -96,11 +96,11 @@ class JoinHandler(BaseHandler):
             self._server.probe_scheduler.add_member(target)
 
             # AD-29: Confirm both sender and joining node
-            self._server.confirm_peer(source_addr)
-            self._server.confirm_peer(target)
+            await self._server.confirm_peer(source_addr)
+            await self._server.confirm_peer(target)
 
             # Update incarnation tracker
-            self._server.incarnation_tracker.update_node(
+            await self._server.incarnation_tracker.update_node(
                 target, b"OK", 0, time.monotonic()
             )
 

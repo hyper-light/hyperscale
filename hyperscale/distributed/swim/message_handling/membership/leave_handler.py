@@ -65,7 +65,7 @@ class LeaveHandler(BaseHandler):
             # Propagate leave to other nodes
             await self._propagate_leave(target, target_addr_bytes, message)
 
-            self._server.incarnation_tracker.update_node(
+            await self._server.incarnation_tracker.update_node(
                 target, b"DEAD", 0, time.monotonic()
             )
             self._server.update_probe_scheduler_membership()
