@@ -144,7 +144,7 @@ class SlidingWindowCounter:
         available_slots = self.max_requests - count
         if available_slots < 0:
             # Request exceeds max even with empty counter
-            return False, float('inf')
+            return False, float("inf")
 
         # After rotation: effective = 0 + total_count * (1 - progress)
         # We need: total_count * (1 - progress) <= available_slots
@@ -207,7 +207,7 @@ class SlidingWindowCounter:
                 if acquired:
                     return True
 
-                if wait_time == float('inf'):
+                if wait_time == float("inf"):
                     return False
 
                 # Wait in small increments to handle concurrency
@@ -308,7 +308,9 @@ class AdaptiveRateLimitConfig:
     # Async retry configuration for handling concurrency
     # When multiple coroutines are waiting for slots, they retry in small increments
     # to handle race conditions where only one can acquire after the calculated wait
-    async_retry_increment_factor: float = 0.1  # Fraction of window size per retry iteration
+    async_retry_increment_factor: float = (
+        0.1  # Fraction of window size per retry iteration
+    )
 
     def get_operation_limits(self, operation: str) -> tuple[int, float]:
         """Get max_requests and window_size for an operation."""
@@ -384,8 +386,9 @@ class AdaptiveRateLimiter:
             "overloaded": 0,
         }
 
-        # Lock for async operations
+        # Lock for async operations and counter creation
         self._async_lock = asyncio.Lock()
+        self._counter_creation_lock = asyncio.Lock()
 
     def check(
         self,
@@ -507,7 +510,7 @@ class AdaptiveRateLimiter:
                     max_wait - total_waited,
                 )
 
-                if wait_time <= 0 or result.retry_after_seconds == float('inf'):
+                if wait_time <= 0 or result.retry_after_seconds == float("inf"):
                     return result
 
                 await asyncio.sleep(wait_time)
@@ -686,7 +689,8 @@ class AdaptiveRateLimiter:
 
         # Count active clients (those with any counter)
         active_clients = len(self._operation_counters) + len(
-            set(self._client_stress_counters.keys()) - set(self._operation_counters.keys())
+            set(self._client_stress_counters.keys())
+            - set(self._operation_counters.keys())
         )
 
         return {
@@ -795,7 +799,7 @@ class TokenBucket:
 
         # If no refill rate, tokens will never become available
         if self.refill_rate <= 0:
-            return False, float('inf')
+            return False, float("inf")
 
         wait_seconds = tokens_needed / self.refill_rate
         return False, wait_seconds
@@ -950,12 +954,25 @@ class ServerRateLimiter:
                 # Convert (bucket_size, refill_rate) to (max_requests, window_size)
                 min_window = config.min_window_size_seconds
                 operation_limits = {}
-                for operation, (bucket_size, refill_rate) in config.operation_limits.items():
+                for operation, (
+                    bucket_size,
+                    refill_rate,
+                ) in config.operation_limits.items():
                     window_size = bucket_size / refill_rate if refill_rate > 0 else 10.0
-                    operation_limits[operation] = (bucket_size, max(min_window, window_size))
+                    operation_limits[operation] = (
+                        bucket_size,
+                        max(min_window, window_size),
+                    )
                 # Add default
-                default_window = config.default_bucket_size / config.default_refill_rate if config.default_refill_rate > 0 else 10.0
-                operation_limits["default"] = (config.default_bucket_size, max(min_window, default_window))
+                default_window = (
+                    config.default_bucket_size / config.default_refill_rate
+                    if config.default_refill_rate > 0
+                    else 10.0
+                )
+                operation_limits["default"] = (
+                    config.default_bucket_size,
+                    max(min_window, default_window),
+                )
                 adaptive_config.operation_limits = operation_limits
                 adaptive_config.default_max_requests = config.default_bucket_size
                 adaptive_config.default_window_size = max(min_window, default_window)
@@ -995,6 +1012,7 @@ class ServerRateLimiter:
 
         if not result.allowed and raise_on_limit:
             from hyperscale.core.jobs.protocols.rate_limiter import RateLimitExceeded
+
             raise RateLimitExceeded(f"Rate limit exceeded for {addr[0]}:{addr[1]}")
 
         return result.allowed
@@ -1016,7 +1034,9 @@ class ServerRateLimiter:
         Returns:
             RateLimitResult indicating if allowed and retry info
         """
-        return self._adaptive.check(client_id, operation, RequestPriority.NORMAL, tokens)
+        return self._adaptive.check(
+            client_id, operation, RequestPriority.NORMAL, tokens
+        )
 
     def check_rate_limit_with_priority(
         self,
@@ -1422,7 +1442,7 @@ async def execute_with_rate_limit_retry(
 
                     # Apply backoff multiplier for subsequent retries
                     if retries > 0:
-                        retry_after *= config.backoff_multiplier ** retries
+                        retry_after *= config.backoff_multiplier**retries
 
                     # Check if waiting would exceed our limits
                     if total_wait_time + retry_after > config.max_total_wait:
