@@ -28,7 +28,6 @@ from .leadership import ManagerLeadershipCoordinator
 from .stats import ManagerStatsCoordinator, ProgressState, BackpressureLevel
 from .discovery import ManagerDiscoveryCoordinator
 from .load_shedding import ManagerLoadShedder, RequestPriority, OverloadState
-from .in_flight import InFlightTracker, BoundedRequestExecutor
 from .rate_limiting import ManagerRateLimitingCoordinator
 from .version_skew import ManagerVersionSkewHandler
 
@@ -64,9 +63,6 @@ __all__ = [
     # AD-30 Hierarchical Failure Detection
     "NodeStatus",
     "JobSuspicion",
-    # AD-32 Bounded Execution
-    "InFlightTracker",
-    "BoundedRequestExecutor",
     # AD-24 Rate Limiting
     "ManagerRateLimitingCoordinator",
     # AD-25 Version Skew Handling
