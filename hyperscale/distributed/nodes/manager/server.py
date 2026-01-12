@@ -185,6 +185,7 @@ class ManagerServer(HealthAwareServer):
         quorum_timeout: float = 5.0,
         max_workflow_retries: int = 3,
         workflow_timeout: float = 300.0,
+        wal_data_dir: Path | None = None,
     ) -> None:
         """
         Initialize manager server.
@@ -218,7 +219,10 @@ class ManagerServer(HealthAwareServer):
             quorum_timeout=quorum_timeout,
             max_workflow_retries=max_workflow_retries,
             workflow_timeout=workflow_timeout,
+            wal_data_dir=wal_data_dir,
         )
+
+        self._node_wal: NodeWAL | None = None
 
         self._env = env
         self._seed_gates = gate_addrs or []
