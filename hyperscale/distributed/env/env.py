@@ -21,7 +21,7 @@ class Env(BaseModel):
     MERCURY_SYNC_LOGS_DIRECTORY: StrictStr = os.getcwd()
     MERCURY_SYNC_REQUEST_TIMEOUT: StrictStr = "30s"
     MERCURY_SYNC_LOG_LEVEL: StrictStr = "info"
-    MERCURY_SYNC_TASK_RUNNER_MAX_THREADS: StrictInt = os.cpu_count()
+    MERCURY_SYNC_TASK_RUNNER_MAX_THREADS: StrictInt = os.cpu_count() or 1
     MERCURY_SYNC_MAX_REQUEST_CACHE_SIZE: StrictInt = 100
     MERCURY_SYNC_ENABLE_REQUEST_CACHING: StrictBool = False
     MERCURY_SYNC_VERIFY_SSL_CERT: Literal["REQUIRED", "OPTIONAL", "NONE"] = "REQUIRED"
