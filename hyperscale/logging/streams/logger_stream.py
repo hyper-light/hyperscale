@@ -571,9 +571,15 @@ class LoggerStream:
         path: str | None = None,
         retention_policy: RetentionPolicyConfig | None = None,
         filter: Callable[[T], bool] | None = None,
-    ):
+    ) -> None:
         if self._closing:
             return
+
+        if self._durability in (DurabilityMode.FSYNC, DurabilityMode.FSYNC_BATCH):
+            raise TypeError(
+                "schedule() cannot be used with WAL durability modes (FSYNC, FSYNC_BATCH). "
+                "Use 'await log()' to ensure errors propagate to caller."
+            )
 
         task = asyncio.create_task(
             self.log(
@@ -922,6 +928,11 @@ class LoggerStream:
                 self._durability,
             )
         except Exception as err:
+            if self._durability in (DurabilityMode.FSYNC, DurabilityMode.FSYNC_BATCH):
+                raise WALWriteError(
+                    f"Failed to write to WAL file '{logfile_path}': {err}"
+                ) from err
+
             log_file, line_number, function_name = self._find_caller()
             await self._log_error(entry, log_file, line_number, function_name, err)
             return None
@@ -1194,6 +1205,16 @@ class LoggerStream:
 
         async with self._batch_lock:
             if len(self._pending_batch) >= self._batch_max_size:
+                if self._durability in (
+                    DurabilityMode.FSYNC,
+                    DurabilityMode.FSYNC_BATCH,
+                ):
+                    raise WALBatchOverflowError(
+                        f"Fsync batch full ({self._batch_max_size} entries). "
+                        f"Disk I/O not keeping up with write rate."
+                    )
+
+                self._log_batch_overflow_warning()
                 future.set_result(None)
                 return future
 
