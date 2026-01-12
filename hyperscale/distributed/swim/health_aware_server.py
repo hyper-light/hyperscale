@@ -596,7 +596,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
     # Peer Confirmation (AD-29)
     # =========================================================================
 
-    def add_unconfirmed_peer(
+    async def add_unconfirmed_peer(
         self, peer: tuple[str, int], role: str | None = None
     ) -> None:
         """
@@ -651,7 +651,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                 self._peer_roles[peer],
             )
 
-    def confirm_peer(self, peer: tuple[str, int], incarnation: int = 0) -> bool:
+    async def confirm_peer(self, peer: tuple[str, int], incarnation: int = 0) -> bool:
         """
         Mark a peer as confirmed after successful communication (AD-29 compliant).
 
@@ -803,7 +803,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             )
         )
 
-    def remove_peer_tracking(self, peer: tuple[str, int]) -> None:
+    async def remove_peer_tracking(self, peer: tuple[str, int]) -> None:
         """
         Remove a peer from all confirmation tracking (AD-29 Task 12.3.6).
 
