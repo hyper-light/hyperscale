@@ -83,7 +83,7 @@ class LeaveHandler(BaseHandler):
             return
 
         others = self._server.get_other_nodes(target)
-        base_timeout = self._server.get_current_timeout()
+        base_timeout = await self._server.get_current_timeout()
         gather_timeout = self._server.get_lhm_adjusted_timeout(base_timeout) * 2
 
         propagate_msg = message + b">" + target_addr_bytes
