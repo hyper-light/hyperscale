@@ -78,14 +78,12 @@ class BestEffortManager:
     async def check_all_completions(self):
         """Check all best-effort states for completion conditions."""
         now = time.monotonic()
-        async with self._lock:
-            states = list(self._states.items())
-
         completions: list[tuple[str, str, bool]] = []
-        for job_id, state in states:
-            should_complete, reason, success = state.check_completion(now)
-            if should_complete:
-                completions.append((job_id, reason, success))
+        async with self._lock:
+            for job_id, state in self._states.items():
+                should_complete, reason, success = state.check_completion(now)
+                if should_complete:
+                    completions.append((job_id, reason, success))
 
         return completions
 
