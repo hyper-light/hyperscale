@@ -36,7 +36,7 @@ class PingReqHandler(BaseHandler):
         target_addr_bytes = context.target_addr_bytes
 
         # Process within context
-        async with self._server.context_with_value(target):
+        async with await self._server.context_with_value(target):
             nodes = self._server.read_nodes()
 
             # Invalid target
@@ -75,7 +75,7 @@ class PingReqHandler(BaseHandler):
         target_addr_bytes: bytes | None,
     ) -> HandlerResult:
         """Probe target and return appropriate response."""
-        base_timeout = self._server.get_current_timeout()
+        base_timeout = await self._server.get_current_timeout()
         timeout = self._server.get_lhm_adjusted_timeout(base_timeout)
 
         try:
