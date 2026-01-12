@@ -67,7 +67,7 @@ class JoinHandler(BaseHandler):
             return self._ack(embed_state=False)
 
         # Process join within context
-        async with self._server.context_with_value(target):
+        async with await self._server.context_with_value(target):
             nodes = self._server.read_nodes()
 
             # Check if rejoin
@@ -87,7 +87,7 @@ class JoinHandler(BaseHandler):
             )
 
             # Add to membership
-            self._server.write_context(target, b"OK")
+            await self._server.write_context(target, b"OK")
 
             # Propagate join to other nodes
             await self._propagate_join(target, target_addr_bytes)
