@@ -51,6 +51,10 @@ from .checkpoint import (
     CheckpointManager,
 )
 
+from .archive import JobArchiveStore
+
+from .cache import BoundedLRUCache
+
 __all__ = [
     "JobLedger",
     "JobState",
@@ -77,4 +81,6 @@ __all__ = [
     "CommitResult",
     "Checkpoint",
     "CheckpointManager",
+    "JobArchiveStore",
+    "BoundedLRUCache",
 ]
