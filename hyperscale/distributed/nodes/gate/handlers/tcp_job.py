@@ -104,6 +104,7 @@ class GateJobHandler:
             quorum_circuit: Quorum operation circuit breaker
             load_shedder: Load shedding manager
             job_lease_manager: Job lease manager
+            idempotency_cache: Idempotency cache for duplicate detection
             get_node_id: Callback to get this gate's node ID
             get_host: Callback to get this gate's host
             get_tcp_port: Callback to get this gate's TCP port
