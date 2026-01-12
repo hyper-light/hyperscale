@@ -54,6 +54,12 @@ __all__ = [
     "RoutingScorer",
     "ScoringConfig",
     "DatacenterRoutingScore",
+    "BlendedScoringConfig",
+    "DatacenterRoutingScoreExtended",
+    "BlendedLatencyScorer",
+    "ObservedLatencyState",
+    "ObservedLatencyTracker",
+    "DispatchTimeTracker",
     # Hysteresis
     "HysteresisManager",
     "HysteresisConfig",
