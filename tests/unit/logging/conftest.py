@@ -5,7 +5,10 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from hyperscale.logging.config.durability_mode import DurabilityMode
-from hyperscale.logging.config.logging_config import LoggingConfig
+from hyperscale.logging.config.logging_config import (
+    LoggingConfig,
+    _global_logging_directory,
+)
 from hyperscale.logging.models import Entry, LogLevel
 from hyperscale.logging.streams.logger_stream import LoggerStream
 
@@ -20,9 +23,12 @@ def event_loop():
 @pytest.fixture(autouse=True)
 def configure_log_level():
     config = LoggingConfig()
+    original_directory = _global_logging_directory.get()
+    _global_logging_directory.set(None)
     config.update(log_level="debug")
     yield
     config.update(log_level="error")
+    _global_logging_directory.set(original_directory)
 
 
 @pytest.fixture
