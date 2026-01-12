@@ -449,9 +449,11 @@ class Logger:
             except (asyncio.CancelledError, asyncio.InvalidStateError):
                 pass
 
-    async def close(self):
+    async def close(self) -> None:
         if len(self._watch_tasks) > 0:
-            await asyncio.gather(*[self.stop_watch(name) for name in self._watch_tasks])
+            await asyncio.gather(
+                *[self.stop_watch(name) for name in list(self._watch_tasks.keys())]
+            )
 
         shutdown_subscribed = (
             len(
@@ -473,6 +475,9 @@ class Logger:
                     for context in self._contexts.values()
                 ]
             )
+
+        self._contexts.clear()
+        self._watch_tasks.clear()
 
     def abort(self):
         for context in self._contexts.values():

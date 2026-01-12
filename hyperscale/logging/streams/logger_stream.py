@@ -614,6 +614,21 @@ class LoggerStream:
         except Exception:
             pass
 
+    def _log_batch_overflow_warning(self) -> None:
+        stream_writer = self._stream_writers.get(StreamType.STDERR)
+        if not stream_writer or stream_writer.is_closing():
+            return
+
+        timestamp = datetime.datetime.now(datetime.UTC).isoformat()
+        warning = (
+            f"{timestamp} - WARN - Fsync batch full, dropping entry (data plane mode)\n"
+        )
+
+        try:
+            stream_writer.write(warning.encode())
+        except Exception:
+            pass
+
     async def log_prepared_batch(
         self,
         model_messages: dict[str, list[str]],
