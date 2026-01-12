@@ -30,6 +30,8 @@ from hyperscale.logging import Logger
 from hyperscale.logging.config import DurabilityMode
 from hyperscale.logging.hyperscale_logging_models import (
     ServerInfo,
+    WorkerExtensionRequested,
+    WorkerHealthcheckReceived,
     WorkerStarted,
     WorkerStopping,
 )
@@ -975,6 +977,19 @@ class WorkerServer(HealthAwareServer):
         self, heartbeat, source_addr: tuple[str, int]
     ) -> None:
         """Handle manager heartbeat from SWIM."""
+        if self._event_logger is not None:
+            await self._event_logger.log(
+                WorkerHealthcheckReceived(
+                    message=f"Healthcheck from {source_addr[0]}:{source_addr[1]}",
+                    node_id=self._node_id.full,
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    source_host=source_addr[0],
+                    source_port=source_addr[1],
+                ),
+                name="worker_events",
+            )
+
         self._heartbeat_handler.process_manager_heartbeat(
             heartbeat=heartbeat,
             source_addr=source_addr,
