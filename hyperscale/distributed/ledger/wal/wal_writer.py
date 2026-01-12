@@ -219,14 +219,9 @@ class WALWriter:
 
         if result.queue_state != self._last_queue_state:
             self._last_queue_state = result.queue_state
-            if self._state_change_callback is not None and self._loop is not None:
-                self._loop.call_soon(
-                    lambda: asyncio.create_task(
-                        self._state_change_callback(
-                            result.queue_state, result.backpressure
-                        )
-                    )
-                )
+            self._schedule_state_change_callback(
+                result.queue_state, result.backpressure
+            )
 
         return result
 
