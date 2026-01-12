@@ -295,7 +295,7 @@ class ServerInterface(Protocol):
 
     # === Leadership Broadcasting ===
 
-    def broadcast_leadership_message(self, message: bytes) -> None:
+    async def broadcast_leadership_message(self, message: bytes) -> None:
         """Broadcast a leadership message to all nodes."""
         ...
 
