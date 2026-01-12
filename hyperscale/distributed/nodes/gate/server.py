@@ -2603,8 +2603,15 @@ class GateServer(HealthAwareServer):
                 manager_response = WorkflowQueryResponse.load(response_data)
                 dc_results[dc_id] = manager_response.workflows
 
-            except Exception:
-                pass
+            except Exception as query_error:
+                await self._udp_logger.log(
+                    ServerWarning(
+                        message=f"Failed to query workflows from manager: {query_error}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
 
         job_dc_managers = (
             self._job_dc_managers.get(request.job_id, {}) if request.job_id else {}
