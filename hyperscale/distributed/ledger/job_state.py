@@ -6,6 +6,10 @@ import msgspec
 
 from hyperscale.logging.lsn import LSN
 
+TERMINAL_STATUSES: frozenset[str] = frozenset(
+    {"completed", "failed", "cancelled", "timed_out"}
+)
+
 
 class JobState(msgspec.Struct, frozen=True, array_like=True):
     job_id: str
@@ -92,6 +96,10 @@ class JobState(msgspec.Struct, frozen=True, array_like=True):
     def is_cancelled(self) -> bool:
         return self.cancelled
 
+    @property
+    def is_terminal(self) -> bool:
+        return self.status in TERMINAL_STATUSES
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "job_id": self.job_id,
@@ -102,10 +110,26 @@ class JobState(msgspec.Struct, frozen=True, array_like=True):
             "cancelled": self.cancelled,
             "completed_count": self.completed_count,
             "failed_count": self.failed_count,
+            "created_hlc": self.created_hlc.to_int(),
+            "last_hlc": self.last_hlc.to_int(),
         }
 
     @classmethod
     def from_dict(cls, job_id: str, data: dict[str, Any]) -> JobState:
+        created_hlc_raw = data.get("created_hlc", 0)
+        last_hlc_raw = data.get("last_hlc", 0)
+
+        created_hlc = (
+            LSN.from_int(created_hlc_raw)
+            if isinstance(created_hlc_raw, int)
+            else LSN(0, 0, 0, 0)
+        )
+        last_hlc = (
+            LSN.from_int(last_hlc_raw)
+            if isinstance(last_hlc_raw, int)
+            else LSN(0, 0, 0, 0)
+        )
+
         return cls(
             job_id=job_id,
             status=data.get("status", "pending"),
@@ -115,6 +139,6 @@ class JobState(msgspec.Struct, frozen=True, array_like=True):
             cancelled=data.get("cancelled", False),
             completed_count=data.get("completed_count", 0),
             failed_count=data.get("failed_count", 0),
-            created_hlc=LSN(0, 0, 0, 0),
-            last_hlc=LSN(0, 0, 0, 0),
+            created_hlc=created_hlc,
+            last_hlc=last_hlc,
         )
