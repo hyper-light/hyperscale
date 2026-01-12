@@ -1849,7 +1849,9 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         """Get the current number of known members."""
         return len(self._incarnation_tracker.node_states) or 1
 
-    def _on_suspicion_expired(self, node: tuple[str, int], incarnation: int) -> None:
+    async def _on_suspicion_expired(
+        self, node: tuple[str, int], incarnation: int
+    ) -> None:
         """Callback when a suspicion expires - mark node as DEAD."""
         self._metrics.increment("suspicions_expired")
         self._audit_log.record(
@@ -2125,7 +2127,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
 
         async def attempt_join() -> bool:
             await self.send(seed_node, join_msg, timeout=timeout)
-            self._incarnation_tracker.add_unconfirmed_node(seed_node)
+            await self._incarnation_tracker.add_unconfirmed_node(seed_node)
             self._probe_scheduler.add_member(seed_node)
             return True
 
