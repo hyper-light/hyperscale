@@ -51,6 +51,7 @@ from .handlers import (
     StateSyncHandler,
 )
 
+
 class WorkerServer(HealthAwareServer):
     """
     Worker node composition root.
@@ -154,16 +155,28 @@ class WorkerServer(HealthAwareServer):
         self._background_loops: WorkerBackgroundLoops | None = None
 
         # Runtime state (delegate to _worker_state)
-        self._active_workflows: dict[str, WorkflowProgress] = self._worker_state._active_workflows
+        self._active_workflows: dict[str, WorkflowProgress] = (
+            self._worker_state._active_workflows
+        )
         self._workflow_tokens: dict[str, str] = self._worker_state._workflow_tokens
-        self._workflow_cancel_events: dict[str, asyncio.Event] = self._worker_state._workflow_cancel_events
-        self._workflow_job_leader: dict[str, tuple[str, int]] = self._worker_state._workflow_job_leader
-        self._workflow_fence_tokens: dict[str, int] = self._worker_state._workflow_fence_tokens
+        self._workflow_cancel_events: dict[str, asyncio.Event] = (
+            self._worker_state._workflow_cancel_events
+        )
+        self._workflow_job_leader: dict[str, tuple[str, int]] = (
+            self._worker_state._workflow_job_leader
+        )
+        self._workflow_fence_tokens: dict[str, int] = (
+            self._worker_state._workflow_fence_tokens
+        )
         self._pending_workflows: list = self._worker_state._pending_workflows
-        self._orphaned_workflows: dict[str, float] = self._worker_state._orphaned_workflows
+        self._orphaned_workflows: dict[str, float] = (
+            self._worker_state._orphaned_workflows
+        )
 
         # Section 8: Job leadership transfer (delegate to state)
-        self._job_leader_transfer_locks: dict[str, asyncio.Lock] = self._worker_state._job_leader_transfer_locks
+        self._job_leader_transfer_locks: dict[str, asyncio.Lock] = (
+            self._worker_state._job_leader_transfer_locks
+        )
         self._job_fence_tokens: dict[str, int] = self._worker_state._job_fence_tokens
         self._pending_transfers: dict = self._worker_state._pending_transfers
 
@@ -203,9 +216,8 @@ class WorkerServer(HealthAwareServer):
             on_manager_heartbeat=self._handle_manager_heartbeat,
             get_tcp_host=lambda: self._host,
             get_tcp_port=lambda: self._tcp_port,
-            get_health_accepting_work=lambda: self._get_worker_state() in (
-                WorkerStateEnum.HEALTHY, WorkerStateEnum.DEGRADED
-            ),
+            get_health_accepting_work=lambda: self._get_worker_state()
+            in (WorkerStateEnum.HEALTHY, WorkerStateEnum.DEGRADED),
             get_health_throughput=self._executor.get_throughput,
             get_health_expected_throughput=self._executor.get_expected_throughput,
             get_health_overload_state=self._backpressure_manager.get_overload_state_str,
@@ -431,7 +443,9 @@ class WorkerServer(HealthAwareServer):
             )
         )
 
-    async def stop(self, drain_timeout: float = 5, broadcast_leave: bool = True) -> None:
+    async def stop(
+        self, drain_timeout: float = 5, broadcast_leave: bool = True
+    ) -> None:
         """Stop the worker server gracefully."""
         self._running = False
 
@@ -526,7 +540,8 @@ class WorkerServer(HealthAwareServer):
                 get_manager_addr=self._registry.get_primary_manager_tcp_addr,
                 is_circuit_open=lambda: (
                     self._registry.is_circuit_open(self._primary_manager_id)
-                    if self._primary_manager_id else False
+                    if self._primary_manager_id
+                    else False
                 ),
                 send_tcp=self.send_tcp,
                 node_host=self._host,
@@ -658,7 +673,9 @@ class WorkerServer(HealthAwareServer):
         self._worker_state._extension_completed_items = completed_items
         self._worker_state._extension_total_items = total_items
         self._worker_state._extension_estimated_completion = estimated_completion
-        self._worker_state._extension_active_workflow_count = len(self._active_workflows)
+        self._worker_state._extension_active_workflow_count = len(
+            self._active_workflows
+        )
 
     def clear_extension_request(self) -> None:
         """
@@ -693,7 +710,10 @@ class WorkerServer(HealthAwareServer):
         """Validate a transfer's fence token."""
         current_token = self._worker_state.get_job_fence_token(job_id)
         if new_fence_token <= current_token:
-            return (False, f"Stale fence token: received {new_fence_token}, current {current_token}")
+            return (
+                False,
+                f"Stale fence token: received {new_fence_token}, current {current_token}",
+            )
         return (True, "")
 
     def _validate_transfer_manager(self, new_manager_id: str) -> tuple[bool, str]:
@@ -712,6 +732,7 @@ class WorkerServer(HealthAwareServer):
         arrived before the workflow did.
         """
         import time as time_module
+
         pending = self._pending_transfers.get(job_id)
         if pending is None:
             return
@@ -741,12 +762,13 @@ class WorkerServer(HealthAwareServer):
                         node_host=self._host,
                         node_port=self._tcp_port,
                         node_id=self._node_id.short,
-                    )
+                    ),
                 )
 
             # Check if all workflows in the transfer have been seen
             remaining_workflows = [
-                wf_id for wf_id in pending.workflow_ids
+                wf_id
+                for wf_id in pending.workflow_ids
                 if wf_id not in self._active_workflows and wf_id != workflow_id
             ]
             if not remaining_workflows:
@@ -792,6 +814,7 @@ class WorkerServer(HealthAwareServer):
         """Get total memory in MB."""
         try:
             import psutil
+
             return int(psutil.virtual_memory().total / (1024 * 1024))
         except ImportError:
             return 0
@@ -800,6 +823,7 @@ class WorkerServer(HealthAwareServer):
         """Get available memory in MB."""
         try:
             import psutil
+
             return int(psutil.virtual_memory().available / (1024 * 1024))
         except ImportError:
             return 0
@@ -877,11 +901,13 @@ class WorkerServer(HealthAwareServer):
                         node_host=self._host,
                         node_port=self._tcp_port,
                         node_id=self._node_id.short,
-                    )
+                    ),
                 )
                 break
 
-    def _handle_manager_heartbeat(self, heartbeat, source_addr: tuple[str, int]) -> None:
+    async def _handle_manager_heartbeat(
+        self, heartbeat, source_addr: tuple[str, int]
+    ) -> None:
         """Handle manager heartbeat from SWIM."""
         self._heartbeat_handler.process_manager_heartbeat(
             heartbeat=heartbeat,
@@ -919,11 +945,11 @@ class WorkerServer(HealthAwareServer):
                         self._udp_logger.log,
                         ServerInfo(
                             message=f"Job leader update via SWIM: workflow {workflow_id[:8]}... "
-                                    f"job {job_id[:8]}... -> {manager_addr}",
+                            f"job {job_id[:8]}... -> {manager_addr}",
                             node_host=node_host,
                             node_port=node_port,
                             node_id=node_id_short,
-                        )
+                        ),
                     )
 
     def _on_cores_available(self, available_cores: int) -> None:
@@ -975,7 +1001,9 @@ class WorkerServer(HealthAwareServer):
         )
 
         # Section 8.3: Check for pending transfers that arrived before this dispatch
-        await self._check_pending_transfer_for_job(dispatch.job_id, dispatch.workflow_id)
+        await self._check_pending_transfer_for_job(
+            dispatch.job_id, dispatch.workflow_id
+        )
 
         return result
 
@@ -1115,6 +1143,7 @@ class WorkerServer(HealthAwareServer):
         """Get CPU utilization percentage."""
         try:
             import psutil
+
             return psutil.cpu_percent()
         except ImportError:
             return 0.0
@@ -1123,6 +1152,7 @@ class WorkerServer(HealthAwareServer):
         """Get memory utilization percentage."""
         try:
             import psutil
+
             return psutil.virtual_memory().percent
         except ImportError:
             return 0.0
@@ -1167,7 +1197,7 @@ class WorkerServer(HealthAwareServer):
         active_ids = list(self._active_workflows.keys())
         return ",".join(active_ids).encode("utf-8")
 
-    @tcp.handle('manager_register')
+    @tcp.handle("manager_register")
     async def handle_manager_register(
         self, addr: tuple[str, int], data: bytes, clock_time: int
     ) -> bytes:
@@ -1187,7 +1217,7 @@ class WorkerServer(HealthAwareServer):
             add_to_probe_scheduler=self.add_to_probe_scheduler,
         )
 
-    @tcp.handle('worker_register')
+    @tcp.handle("worker_register")
     async def handle_worker_register(
         self, addr: tuple[str, int], data: bytes, clock_time: int
     ) -> bytes:
@@ -1197,13 +1227,15 @@ class WorkerServer(HealthAwareServer):
         This handler processes RegistrationResponse when managers push registration
         acknowledgments to workers.
         """
-        accepted, primary_manager_id = self._registration_handler.process_registration_response(
-            data=data,
-            node_host=self._host,
-            node_port=self._tcp_port,
-            node_id_short=self._node_id.short,
-            add_unconfirmed_peer=self.add_unconfirmed_peer,
-            add_to_probe_scheduler=self.add_to_probe_scheduler,
+        accepted, primary_manager_id = (
+            self._registration_handler.process_registration_response(
+                data=data,
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id_short=self._node_id.short,
+                add_unconfirmed_peer=self.add_unconfirmed_peer,
+                add_to_probe_scheduler=self.add_to_probe_scheduler,
+            )
         )
 
         if accepted and primary_manager_id:
@@ -1214,7 +1246,7 @@ class WorkerServer(HealthAwareServer):
                     node_host=self._host,
                     node_port=self._tcp_port,
                     node_id=self._node_id.short,
-                )
+                ),
             )
 
         return data
