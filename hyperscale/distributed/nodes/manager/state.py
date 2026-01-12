@@ -178,6 +178,20 @@ class ManagerState:
             self._dispatch_semaphores[worker_id] = asyncio.Semaphore(max_concurrent)
         return self._dispatch_semaphores[worker_id]
 
+    def get_peer_latency_samples(self, peer_id: str) -> deque[tuple[float, float]]:
+        if peer_id not in self._peer_manager_latency_samples:
+            self._peer_manager_latency_samples[peer_id] = deque(
+                maxlen=self._max_latency_samples
+            )
+        return self._peer_manager_latency_samples[peer_id]
+
+    def get_worker_latency_samples(self, worker_id: str) -> deque[tuple[float, float]]:
+        if worker_id not in self._worker_latency_samples:
+            self._worker_latency_samples[worker_id] = deque(
+                maxlen=self._max_latency_samples
+            )
+        return self._worker_latency_samples[worker_id]
+
     async def increment_fence_token(self) -> int:
         async with self._get_counter_lock():
             self._fence_token += 1
