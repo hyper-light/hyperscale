@@ -169,6 +169,7 @@ class LoggerStream:
         self,
         stdout_writer: asyncio.StreamWriter | None = None,
         stderr_writer: asyncio.StreamWriter | None = None,
+        recovery_wal_path: str | None = None,
     ) -> asyncio.StreamWriter:
         async with self._init_lock:
             if self._initialized:
@@ -185,6 +186,9 @@ class LoggerStream:
 
             await self._setup_stdout_writer(stdout_writer)
             await self._setup_stderr_writer(stderr_writer)
+
+            if recovery_wal_path is not None and self._enable_lsn:
+                await self._recover_clock_from_wal(recovery_wal_path)
 
             self._initialized = True
 
@@ -1135,6 +1139,20 @@ class LoggerStream:
             pass
 
         return last_lsn
+
+    async def _recover_clock_from_wal(self, wal_path: str) -> None:
+        if self._lamport_clock is None:
+            return
+
+        last_lsn_int = await self.get_last_lsn(wal_path)
+        if last_lsn_int is None:
+            return
+
+        last_lsn = LSN.from_int(last_lsn_int)
+        self._lamport_clock = HybridLamportClock.recover(
+            node_id=self._instance_id,
+            last_lsn=last_lsn,
+        )
 
     async def _schedule_batch_fsync(self, logfile_path: str) -> asyncio.Future[None]:
         if self._closing:
