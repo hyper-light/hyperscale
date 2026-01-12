@@ -1835,26 +1835,21 @@ class GateServer(HealthAwareServer):
                 from_node=(self._host, self._udp_port),
             )
 
-    def _handle_embedded_manager_heartbeat(
+    async def _handle_embedded_manager_heartbeat(
         self,
-        dc_id: str,
-        manager_addr: tuple[str, int],
-        node_id: str,
-        is_leader: bool,
-        term: int,
-        worker_count: int,
-        available_cores: int,
+        heartbeat: ManagerHeartbeat,
+        source_addr: tuple[str, int],
     ) -> None:
         """Handle embedded manager heartbeat from SWIM."""
         if self._health_coordinator:
             self._health_coordinator.handle_embedded_manager_heartbeat(
-                dc_id,
-                manager_addr,
-                node_id,
-                is_leader,
-                term,
-                worker_count,
-                available_cores,
+                heartbeat.datacenter,
+                source_addr,
+                heartbeat.node_id,
+                heartbeat.is_leader,
+                heartbeat.term,
+                heartbeat.worker_count,
+                heartbeat.available_cores,
             )
 
     async def _handle_gate_peer_heartbeat(
