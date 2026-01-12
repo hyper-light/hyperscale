@@ -11,7 +11,9 @@ from typing import TYPE_CHECKING
 
 import cloudpickle
 
-from hyperscale.core.jobs.models.workflow_status import WorkflowStatus as CoreWorkflowStatus
+from hyperscale.core.jobs.models.workflow_status import (
+    WorkflowStatus as CoreWorkflowStatus,
+)
 from hyperscale.core.jobs.models import Env as CoreEnv
 from hyperscale.distributed.models import (
     StepStats,
@@ -21,7 +23,13 @@ from hyperscale.distributed.models import (
     WorkflowProgress,
     WorkflowStatus,
 )
-from hyperscale.logging.hyperscale_logging_models import ServerError
+from hyperscale.logging.hyperscale_logging_models import (
+    ServerError,
+    WorkerJobReceived,
+    WorkerJobStarted,
+    WorkerJobCompleted,
+    WorkerJobFailed,
+)
 
 if TYPE_CHECKING:
     from hyperscale.logging import Logger
@@ -199,7 +207,7 @@ class WorkerWorkflowExecutor:
         error: Exception | None = None
         workflow_error: str | None = None
         workflow_results: dict = {}
-        context_updates: bytes = b''
+        context_updates: bytes = b""
         progress_token = None
 
         try:
@@ -283,8 +291,8 @@ class WorkerWorkflowExecutor:
             workflow_id=dispatch.workflow_id,
             workflow_name=progress.workflow_name,
             status=progress.status,
-            results=workflow_results if workflow_results else b'',
-            context_updates=context_updates if context_updates else b'',
+            results=workflow_results if workflow_results else b"",
+            context_updates=context_updates if context_updates else b"",
             error=workflow_error,
             worker_id=node_id_full,
             worker_available_cores=self._core_allocator.available_cores,
@@ -351,7 +359,8 @@ class WorkerWorkflowExecutor:
                 progress.elapsed_seconds = time.monotonic() - start_time
                 progress.rate_per_second = (
                     workflow_status_update.completed_count / progress.elapsed_seconds
-                    if progress.elapsed_seconds > 0 else 0.0
+                    if progress.elapsed_seconds > 0
+                    else 0.0
                 )
                 progress.timestamp = time.monotonic()
                 progress.collected_at = time.time()
@@ -392,7 +401,10 @@ class WorkerWorkflowExecutor:
                     total_work = max(dispatch.vus * 100, 1)
                     estimated_complete = min(
                         total_cores,
-                        int(total_cores * (workflow_status_update.completed_count / total_work))
+                        int(
+                            total_cores
+                            * (workflow_status_update.completed_count / total_work)
+                        ),
                     )
                     progress.cores_completed = estimated_complete
 
@@ -420,6 +432,6 @@ class WorkerWorkflowExecutor:
                             node_host=node_host,
                             node_port=node_port,
                             node_id=node_id_short,
-                            message=f'Update Error: {str(err)} for workflow: {workflow_name} id: {progress.workflow_id}'
+                            message=f"Update Error: {str(err)} for workflow: {workflow_name} id: {progress.workflow_id}",
                         )
                     )
