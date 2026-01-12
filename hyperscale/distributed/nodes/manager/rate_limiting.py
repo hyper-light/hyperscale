@@ -104,7 +104,7 @@ class ManagerRateLimitingCoordinator:
         self._cleanup_last_run: float = time.monotonic()
         self._cleanup_task: asyncio.Task | None = None
 
-    def check_rate_limit(
+    async def check_rate_limit(
         self,
         client_id: str,
         operation: str,
@@ -112,6 +112,9 @@ class ManagerRateLimitingCoordinator:
     ) -> RateLimitResult:
         """
         Check if a request should be allowed based on rate limits.
+
+        Uses async lock internally to prevent race conditions when
+        multiple concurrent requests check/update the same counters.
 
         Args:
             client_id: Client identifier (usually node_id or address)
@@ -121,7 +124,7 @@ class ManagerRateLimitingCoordinator:
         Returns:
             RateLimitResult indicating if allowed
         """
-        return self._server_limiter.check_rate_limit_with_priority(
+        return await self._server_limiter.check_rate_limit_with_priority(
             client_id,
             operation,
             priority,
@@ -203,7 +206,7 @@ class ManagerRateLimitingCoordinator:
                 node_host=self._config.host,
                 node_port=self._config.tcp_port,
                 node_id=self._node_id,
-            )
+            ),
         )
 
     def is_outbound_blocked(self, operation: str) -> bool:
@@ -235,7 +238,7 @@ class ManagerRateLimitingCoordinator:
                     node_host=self._config.host,
                     node_port=self._config.tcp_port,
                     node_id=self._node_id,
-                )
+                ),
             )
 
         return cleaned
@@ -261,7 +264,7 @@ class ManagerRateLimitingCoordinator:
                             node_host=self._config.host,
                             node_port=self._config.tcp_port,
                             node_id=self._node_id,
-                        )
+                        ),
                     )
 
         self._cleanup_task = asyncio.create_task(cleanup_loop())
