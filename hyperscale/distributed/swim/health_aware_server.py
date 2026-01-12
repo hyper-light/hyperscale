@@ -25,7 +25,11 @@ from hyperscale.distributed.server.server.mercury_sync_base_server import (
 )
 from hyperscale.distributed.swim.coordinates import CoordinateTracker
 from hyperscale.distributed.models.coordinates import NetworkCoordinate, VivaldiConfig
-from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerDebug, ServerWarning
+from hyperscale.logging.hyperscale_logging_models import (
+    ServerInfo,
+    ServerDebug,
+    ServerWarning,
+)
 
 # Core types and utilities
 from .core.types import Status, Nodes, Ctx, UpdateType, Message
@@ -151,7 +155,9 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         self._node_id = NodeId.generate(datacenter=dc_id, priority=priority)
 
         # Store node role for role-aware failure detection (AD-35 Task 12.4.2)
-        self._node_role: str = node_role or "worker"  # Default to worker if not specified
+        self._node_role: str = (
+            node_role or "worker"
+        )  # Default to worker if not specified
 
         # Store Vivaldi config for metrics and observability (AD-35 Task 12.7)
         self._vivaldi_config: VivaldiConfig = vivaldi_config or VivaldiConfig()
@@ -434,7 +440,9 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             errors.append(f"Invalid node role: {self._node_role}")
 
         # Validate confirmation manager
-        confirmation_active = self._confirmation_manager.get_unconfirmed_peer_count() >= 0
+        confirmation_active = (
+            self._confirmation_manager.get_unconfirmed_peer_count() >= 0
+        )
 
         return {
             "coordinate_valid": coord_valid,
@@ -1120,7 +1128,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         """
         return self._state_embedder.get_state()
 
-    def _process_embedded_state(
+    async def _process_embedded_state(
         self,
         state_data: bytes,
         source_addr: tuple[str, int],
@@ -1135,7 +1143,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             state_data: Serialized state bytes from the remote node.
             source_addr: The (host, port) of the node that sent the state.
         """
-        self._state_embedder.process_state(state_data, source_addr)
+        await self._state_embedder.process_state(state_data, source_addr)
 
     async def _build_xprobe_response(
         self,
@@ -1260,7 +1268,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         # Vivaldi is always appended last, so strip first
         vivaldi_idx = message.find(b"#|v")
         if vivaldi_idx > 0:
-            vivaldi_piggyback = message[vivaldi_idx + 3:]  # Skip '#|v' separator
+            vivaldi_piggyback = message[vivaldi_idx + 3 :]  # Skip '#|v' separator
             msg_end = vivaldi_idx
 
         # Step 2: Find health gossip piggyback (#|h...)
@@ -1419,9 +1427,10 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         remaining_after_health = MAX_UDP_PAYLOAD - len(message_with_health)
         if remaining_after_health >= 150:
             import json
+
             coord = self._coordinate_tracker.get_coordinate()
             coord_dict = coord.to_dict()
-            coord_json = json.dumps(coord_dict, separators=(',', ':')).encode()
+            coord_json = json.dumps(coord_dict, separators=(",", ":")).encode()
             vivaldi_piggyback = b"#|v" + coord_json
 
             if len(message_with_health) + len(vivaldi_piggyback) <= MAX_UDP_PAYLOAD:
@@ -1570,7 +1579,9 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                         message=f"Unconfirmed peer {peer[0]}:{peer[1]} stale for {age:.1f}s (AD-29)",
                         node_host=self._host,
                         node_port=self._tcp_port,
-                        node_id=self._node_id.short if hasattr(self, '_node_id') else "unknown",
+                        node_id=self._node_id.short
+                        if hasattr(self, "_node_id")
+                        else "unknown",
                     )
                 )
 
@@ -1886,7 +1897,9 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
 
         n_members = self._get_member_count()
         # AD-35 Task 12.4.3: Include role in gossip updates
-        role = self._peer_roles.get(node, None) if hasattr(self, "_peer_roles") else None
+        role = (
+            self._peer_roles.get(node, None) if hasattr(self, "_peer_roles") else None
+        )
         # If this is our own node, use our role
         if node == self._get_self_udp_addr():
             role = self._node_role
@@ -2615,8 +2628,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
 
                 # Latency multiplier: 1.0x for same-DC, up to 10.0x for cross-continent
                 latency_multiplier = min(
-                    10.0,
-                    max(1.0, estimated_rtt_ms / reference_rtt_ms)
+                    10.0, max(1.0, estimated_rtt_ms / reference_rtt_ms)
                 )
 
                 # Confidence adjustment based on coordinate quality
