@@ -48,7 +48,7 @@ class LeaveHandler(BaseHandler):
             )
 
         # Process leave within context
-        async with self._server.context_with_value(target):
+        async with await self._server.context_with_value(target):
             nodes = self._server.read_nodes()
 
             if target not in nodes:
