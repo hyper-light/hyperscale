@@ -759,6 +759,7 @@ class GateServer(HealthAwareServer):
             quorum_circuit=self._quorum_circuit,
             load_shedder=self._load_shedder,
             job_lease_manager=self._job_lease_manager,
+            idempotency_cache=self._idempotency_cache,
             get_node_id=lambda: self._node_id,
             get_host=lambda: self._host,
             get_tcp_port=lambda: self._tcp_port,

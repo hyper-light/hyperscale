@@ -32,6 +32,11 @@ from hyperscale.distributed.swim.core.errors import (
     QuorumError,
     QuorumUnavailableError,
 )
+from hyperscale.distributed.idempotency import (
+    GateIdempotencyCache,
+    IdempotencyKey,
+    IdempotencyStatus,
+)
 from hyperscale.logging import Logger
 from hyperscale.logging.hyperscale_logging_models import (
     ServerDebug,
