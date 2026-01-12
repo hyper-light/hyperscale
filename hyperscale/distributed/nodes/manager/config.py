@@ -6,6 +6,7 @@ for timeouts, intervals, retry policies, and protocol negotiation.
 """
 
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from hyperscale.distributed.env import Env
 
@@ -134,6 +135,9 @@ class ManagerConfig:
     job_timeout_check_interval_seconds: float = 30.0
     job_retention_seconds: float = 3600.0
 
+    # WAL configuration (AD-38)
+    wal_data_dir: Path | None = None
+
 
 def create_manager_config_from_env(
     host: str,
@@ -198,8 +202,12 @@ def create_manager_config_from_env(
         job_cleanup_interval_seconds=env.JOB_CLEANUP_INTERVAL,
         dead_node_check_interval_seconds=env.MANAGER_DEAD_NODE_CHECK_INTERVAL,
         rate_limit_cleanup_interval_seconds=env.MANAGER_RATE_LIMIT_CLEANUP_INTERVAL,
-        rate_limit_default_max_requests=getattr(env, 'MANAGER_RATE_LIMIT_DEFAULT_MAX_REQUESTS', 100),
-        rate_limit_default_window_seconds=getattr(env, 'MANAGER_RATE_LIMIT_DEFAULT_WINDOW_SECONDS', 10.0),
+        rate_limit_default_max_requests=getattr(
+            env, "MANAGER_RATE_LIMIT_DEFAULT_MAX_REQUESTS", 100
+        ),
+        rate_limit_default_window_seconds=getattr(
+            env, "MANAGER_RATE_LIMIT_DEFAULT_WINDOW_SECONDS", 10.0
+        ),
         tcp_timeout_short_seconds=env.MANAGER_TCP_TIMEOUT_SHORT,
         tcp_timeout_standard_seconds=env.MANAGER_TCP_TIMEOUT_STANDARD,
         batch_push_interval_seconds=env.MANAGER_BATCH_PUSH_INTERVAL,
@@ -224,10 +232,18 @@ def create_manager_config_from_env(
         cluster_stabilization_timeout_seconds=env.CLUSTER_STABILIZATION_TIMEOUT,
         cluster_stabilization_poll_interval_seconds=env.CLUSTER_STABILIZATION_POLL_INTERVAL,
         heartbeat_interval_seconds=env.MANAGER_HEARTBEAT_INTERVAL,
-        gate_heartbeat_interval_seconds=getattr(env, 'MANAGER_GATE_HEARTBEAT_INTERVAL', 10.0),
+        gate_heartbeat_interval_seconds=getattr(
+            env, "MANAGER_GATE_HEARTBEAT_INTERVAL", 10.0
+        ),
         peer_sync_interval_seconds=env.MANAGER_PEER_SYNC_INTERVAL,
-        peer_job_sync_interval_seconds=getattr(env, 'MANAGER_PEER_JOB_SYNC_INTERVAL', 15.0),
-        throughput_interval_seconds=getattr(env, 'MANAGER_THROUGHPUT_INTERVAL_SECONDS', 10.0),
-        job_timeout_check_interval_seconds=getattr(env, 'JOB_TIMEOUT_CHECK_INTERVAL', 30.0),
-        job_retention_seconds=getattr(env, 'JOB_RETENTION_SECONDS', 3600.0),
+        peer_job_sync_interval_seconds=getattr(
+            env, "MANAGER_PEER_JOB_SYNC_INTERVAL", 15.0
+        ),
+        throughput_interval_seconds=getattr(
+            env, "MANAGER_THROUGHPUT_INTERVAL_SECONDS", 10.0
+        ),
+        job_timeout_check_interval_seconds=getattr(
+            env, "JOB_TIMEOUT_CHECK_INTERVAL", 30.0
+        ),
+        job_retention_seconds=getattr(env, "JOB_RETENTION_SECONDS", 3600.0),
     )
