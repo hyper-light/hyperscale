@@ -286,8 +286,14 @@ class WorkerProgressReporter:
                     else:
                         circuit.record_error()
 
-                except Exception:
+                except Exception as broadcast_error:
                     circuit.record_error()
+                    if self._logger:
+                        await self._logger.log(
+                            ServerDebug(
+                                message=f"Failed to broadcast progress to manager: {broadcast_error}",
+                            )
+                        )
 
     async def send_final_result(
         self,
