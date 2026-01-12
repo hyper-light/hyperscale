@@ -87,6 +87,12 @@ class WorkerState:
         self._state_version: int = 0
         self._version_lock: asyncio.Lock | None = None
 
+        # Lock for creating per-resource locks
+        self._resource_creation_lock: asyncio.Lock | None = None
+
+        # Counter protection lock (for race-free increments)
+        self._counter_lock: asyncio.Lock | None = None
+
         # Extension request state (AD-26)
         self._extension_requested: bool = False
         self._extension_reason: str = ""
