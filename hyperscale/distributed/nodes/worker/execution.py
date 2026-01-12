@@ -97,7 +97,7 @@ class WorkerExecutor:
         """Free cores allocated to a workflow."""
         await self._core_allocator.free(workflow_id)
 
-    def record_throughput_event(self, completion_time_seconds: float) -> None:
+    async def record_throughput_event(self, completion_time_seconds: float) -> None:
         """
         Record a workflow completion event for throughput tracking (AD-19).
 
@@ -106,7 +106,7 @@ class WorkerExecutor:
         Args:
             completion_time_seconds: Time taken to complete the workflow
         """
-        self._state.record_completion(completion_time_seconds)
+        await self._state.record_completion(completion_time_seconds)
 
     def get_throughput(self) -> float:
         """
@@ -206,7 +206,9 @@ class WorkerExecutor:
 
                     # THROTTLE level: add extra delay
                     elif self._backpressure_manager.should_throttle():
-                        throttle_delay = self._backpressure_manager.get_throttle_delay_seconds()
+                        throttle_delay = (
+                            self._backpressure_manager.get_throttle_delay_seconds()
+                        )
                         if throttle_delay > 0:
                             await asyncio.sleep(throttle_delay)
 
