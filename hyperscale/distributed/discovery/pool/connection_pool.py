@@ -225,17 +225,18 @@ class ConnectionPool(Generic[T]):
 
         return pooled
 
-    def release(self, pooled: PooledConnection[T]) -> None:
+    async def release(self, pooled: PooledConnection[T]) -> None:
         """
         Release a connection back to the pool.
 
         Args:
             pooled: The connection to release
         """
-        conn_id = id(pooled.connection)
-        self._in_use.discard(conn_id)
+        async with self._get_lock():
+            conn_id = id(pooled.connection)
+            self._in_use.discard(conn_id)
 
-    def mark_success(self, pooled: PooledConnection[T]) -> None:
+    async def mark_success(self, pooled: PooledConnection[T]) -> None:
         """
         Mark a connection as successful.
 
@@ -244,10 +245,11 @@ class ConnectionPool(Generic[T]):
         Args:
             pooled: The connection that succeeded
         """
-        pooled.consecutive_failures = 0
-        pooled.last_used = time.monotonic()
+        async with self._get_lock():
+            pooled.consecutive_failures = 0
+            pooled.last_used = time.monotonic()
 
-    def mark_failure(self, pooled: PooledConnection[T]) -> None:
+    async def mark_failure(self, pooled: PooledConnection[T]) -> None:
         """
         Mark a connection as failed.
 
@@ -257,11 +259,12 @@ class ConnectionPool(Generic[T]):
         Args:
             pooled: The connection that failed
         """
-        pooled.consecutive_failures += 1
-        pooled.last_used = time.monotonic()
+        async with self._get_lock():
+            pooled.consecutive_failures += 1
+            pooled.last_used = time.monotonic()
 
-        if pooled.consecutive_failures >= self.config.max_consecutive_failures:
-            pooled.state = ConnectionState.FAILED
+            if pooled.consecutive_failures >= self.config.max_consecutive_failures:
+                pooled.state = ConnectionState.FAILED
 
     async def close(self, pooled: PooledConnection[T]) -> None:
         """
