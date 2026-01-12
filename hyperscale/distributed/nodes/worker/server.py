@@ -845,7 +845,7 @@ class WorkerServer(HealthAwareServer):
         # Check if this workflow is in the pending transfer
         if workflow_id in pending.workflow_ids:
             # Apply the pending transfer
-            job_lock = self._get_job_transfer_lock(job_id)
+            job_lock = await self._get_job_transfer_lock(job_id)
             async with job_lock:
                 # Update job leader for this workflow
                 self._workflow_job_leader[workflow_id] = pending.new_manager_addr
