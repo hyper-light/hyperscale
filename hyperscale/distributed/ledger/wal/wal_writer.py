@@ -123,13 +123,17 @@ class WALWriter:
 
     def submit(self, request: WriteRequest) -> None:
         if not self._running:
+            error = RuntimeError("WAL writer is not running")
             loop = self._loop
             if loop is not None:
                 loop.call_soon_threadsafe(
                     self._resolve_future,
                     request.future,
-                    RuntimeError("WAL writer is not running"),
+                    error,
                 )
+            else:
+                if not request.future.done():
+                    request.future.set_exception(error)
             return
 
         if self._error is not None:
