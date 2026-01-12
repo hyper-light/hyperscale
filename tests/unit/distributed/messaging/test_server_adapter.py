@@ -253,7 +253,9 @@ class AsyncContextManager:
 class TestServerAdapterIdentity:
     """Tests for ServerAdapter identity methods."""
 
-    def test_udp_addr_slug(self, mock_health_aware_server: MockHealthAwareServer) -> None:
+    def test_udp_addr_slug(
+        self, mock_health_aware_server: MockHealthAwareServer
+    ) -> None:
         """Adapter returns server's udp_addr_slug."""
         adapter = ServerAdapter(mock_health_aware_server)
 
@@ -280,11 +282,9 @@ class TestServerAdapterIdentity:
 class TestServerAdapterStateAccess:
     """Tests for ServerAdapter state access methods."""
 
-    def test_read_nodes(
-        self, mock_health_aware_server: MockHealthAwareServer
-    ) -> None:
-        """Adapter delegates read_nodes to context."""
-        mock_health_aware_server._context.read.return_value = {
+    def test_read_nodes(self, mock_health_aware_server: MockHealthAwareServer) -> None:
+        """Adapter delegates read_nodes to incarnation tracker (AD-46)."""
+        mock_health_aware_server._incarnation_tracker.node_states = {
             ("192.168.1.1", 8000): "node_data"
         }
         adapter = ServerAdapter(mock_health_aware_server)
@@ -292,7 +292,6 @@ class TestServerAdapterStateAccess:
         nodes = adapter.read_nodes()
 
         assert ("192.168.1.1", 8000) in nodes
-        mock_health_aware_server._context.read.assert_called_with("nodes")
 
     def test_get_current_timeout(
         self, mock_health_aware_server: MockHealthAwareServer
@@ -451,16 +450,16 @@ class TestServerAdapterCommunication:
     """Tests for ServerAdapter communication methods."""
 
     @pytest.mark.asyncio
-    async def test_send(
-        self, mock_health_aware_server: MockHealthAwareServer
-    ) -> None:
+    async def test_send(self, mock_health_aware_server: MockHealthAwareServer) -> None:
         """Adapter delegates send to server."""
         adapter = ServerAdapter(mock_health_aware_server)
 
         result = await adapter.send(("192.168.1.1", 8000), b"test_data")
 
         assert result == b"ack"
-        assert ("192.168.1.1", 8000), b"test_data" in mock_health_aware_server._sent_messages
+        assert ("192.168.1.1", 8000), (
+            b"test_data" in mock_health_aware_server._sent_messages
+        )
 
     @pytest.mark.asyncio
     async def test_send_if_ok(
@@ -554,11 +553,12 @@ class TestServerAdapterComponentAccess:
         """Adapter returns server's hierarchical_detector."""
         adapter = ServerAdapter(mock_health_aware_server)
 
-        assert adapter.hierarchical_detector is mock_health_aware_server._hierarchical_detector
+        assert (
+            adapter.hierarchical_detector
+            is mock_health_aware_server._hierarchical_detector
+        )
 
-    def test_task_runner(
-        self, mock_health_aware_server: MockHealthAwareServer
-    ) -> None:
+    def test_task_runner(self, mock_health_aware_server: MockHealthAwareServer) -> None:
         """Adapter returns server's task_runner."""
         adapter = ServerAdapter(mock_health_aware_server)
 
@@ -578,11 +578,11 @@ class TestServerAdapterComponentAccess:
         """Adapter returns server's incarnation_tracker."""
         adapter = ServerAdapter(mock_health_aware_server)
 
-        assert adapter.incarnation_tracker is mock_health_aware_server._incarnation_tracker
+        assert (
+            adapter.incarnation_tracker is mock_health_aware_server._incarnation_tracker
+        )
 
-    def test_audit_log(
-        self, mock_health_aware_server: MockHealthAwareServer
-    ) -> None:
+    def test_audit_log(self, mock_health_aware_server: MockHealthAwareServer) -> None:
         """Adapter returns server's audit_log."""
         adapter = ServerAdapter(mock_health_aware_server)
 
@@ -594,7 +594,10 @@ class TestServerAdapterComponentAccess:
         """Adapter returns server's indirect_probe_manager."""
         adapter = ServerAdapter(mock_health_aware_server)
 
-        assert adapter.indirect_probe_manager is mock_health_aware_server._indirect_probe_manager
+        assert (
+            adapter.indirect_probe_manager
+            is mock_health_aware_server._indirect_probe_manager
+        )
 
     def test_pending_probe_acks(
         self, mock_health_aware_server: MockHealthAwareServer
@@ -602,7 +605,9 @@ class TestServerAdapterComponentAccess:
         """Adapter returns server's pending_probe_acks."""
         adapter = ServerAdapter(mock_health_aware_server)
 
-        assert adapter.pending_probe_acks is mock_health_aware_server._pending_probe_acks
+        assert (
+            adapter.pending_probe_acks is mock_health_aware_server._pending_probe_acks
+        )
 
 
 class TestServerAdapterValidation:
