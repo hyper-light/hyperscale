@@ -9,8 +9,10 @@ import pytest
 import tempfile
 
 from typing import Generator, AsyncGenerator
+from unittest.mock import AsyncMock, MagicMock
 
 from hyperscale.logging.config.durability_mode import DurabilityMode
+from hyperscale.logging.config.logging_config import _global_logging_directory
 from hyperscale.logging.models import Entry, LogLevel
 from hyperscale.logging.streams.logger_stream import LoggerStream
 
@@ -24,9 +26,18 @@ from tests.unit.distributed.messaging.mocks import MockServerInterface
 
 def pytest_configure(config):
     """Configure custom markers."""
-    config.addinivalue_line(
-        "markers", "asyncio: mark test as async"
-    )
+    config.addinivalue_line("markers", "asyncio: mark test as async")
+
+
+def create_mock_stream_writer() -> MagicMock:
+    mock_writer = MagicMock(spec=asyncio.StreamWriter)
+    mock_writer.write = MagicMock()
+    mock_writer.drain = AsyncMock()
+    mock_writer.close = MagicMock()
+    mock_writer.wait_closed = AsyncMock()
+    mock_writer.is_closing = MagicMock(return_value=False)
+    return mock_writer
+
 
 @pytest.fixture(scope="function")
 def event_loop():
@@ -35,10 +46,12 @@ def event_loop():
     yield loop
     loop.close()
 
+
 @pytest.fixture
 def mock_server() -> MockServerInterface:
     """Create a mock server interface for testing."""
     return MockServerInterface()
+
 
 @pytest.fixture
 def temp_log_directory() -> Generator[str, None]:
@@ -69,6 +82,9 @@ def sample_entry_factory():
 async def json_logger_stream(
     temp_log_directory: str,
 ) -> AsyncGenerator[LoggerStream, None]:
+    original_directory = _global_logging_directory.get()
+    _global_logging_directory.set(None)
+
     stream = LoggerStream(
         name="test_json",
         filename="test.json",
@@ -78,15 +94,22 @@ async def json_logger_stream(
         enable_lsn=True,
         instance_id=1,
     )
-    await stream.initialize()
+    await stream.initialize(
+        stdout_writer=create_mock_stream_writer(),
+        stderr_writer=create_mock_stream_writer(),
+    )
     yield stream
     await stream.close()
+    _global_logging_directory.set(original_directory)
 
 
 @pytest.fixture
 async def binary_logger_stream(
     temp_log_directory: str,
 ) -> AsyncGenerator[LoggerStream, None]:
+    original_directory = _global_logging_directory.get()
+    _global_logging_directory.set(None)
+
     stream = LoggerStream(
         name="test_binary",
         filename="test.wal",
@@ -96,15 +119,22 @@ async def binary_logger_stream(
         enable_lsn=True,
         instance_id=1,
     )
-    await stream.initialize()
+    await stream.initialize(
+        stdout_writer=create_mock_stream_writer(),
+        stderr_writer=create_mock_stream_writer(),
+    )
     yield stream
     await stream.close()
+    _global_logging_directory.set(original_directory)
 
 
 @pytest.fixture
 async def fsync_logger_stream(
     temp_log_directory: str,
 ) -> AsyncGenerator[LoggerStream, None]:
+    original_directory = _global_logging_directory.get()
+    _global_logging_directory.set(None)
+
     stream = LoggerStream(
         name="test_fsync",
         filename="test_fsync.wal",
@@ -114,15 +144,22 @@ async def fsync_logger_stream(
         enable_lsn=True,
         instance_id=1,
     )
-    await stream.initialize()
+    await stream.initialize(
+        stdout_writer=create_mock_stream_writer(),
+        stderr_writer=create_mock_stream_writer(),
+    )
     yield stream
     await stream.close()
+    _global_logging_directory.set(original_directory)
 
 
 @pytest.fixture
 async def batch_fsync_logger_stream(
     temp_log_directory: str,
 ) -> AsyncGenerator[LoggerStream, None]:
+    original_directory = _global_logging_directory.get()
+    _global_logging_directory.set(None)
+
     stream = LoggerStream(
         name="test_batch_fsync",
         filename="test_batch.wal",
@@ -132,15 +169,22 @@ async def batch_fsync_logger_stream(
         enable_lsn=True,
         instance_id=1,
     )
-    await stream.initialize()
+    await stream.initialize(
+        stdout_writer=create_mock_stream_writer(),
+        stderr_writer=create_mock_stream_writer(),
+    )
     yield stream
     await stream.close()
+    _global_logging_directory.set(original_directory)
 
 
 @pytest.fixture
 async def no_lsn_logger_stream(
     temp_log_directory: str,
 ) -> AsyncGenerator[LoggerStream, None]:
+    original_directory = _global_logging_directory.get()
+    _global_logging_directory.set(None)
+
     stream = LoggerStream(
         name="test_no_lsn",
         filename="test_no_lsn.json",
@@ -150,6 +194,10 @@ async def no_lsn_logger_stream(
         enable_lsn=False,
         instance_id=0,
     )
-    await stream.initialize()
+    await stream.initialize(
+        stdout_writer=create_mock_stream_writer(),
+        stderr_writer=create_mock_stream_writer(),
+    )
     yield stream
     await stream.close()
+    _global_logging_directory.set(original_directory)
