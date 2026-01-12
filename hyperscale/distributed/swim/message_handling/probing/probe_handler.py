@@ -90,7 +90,7 @@ class ProbeHandler(BaseHandler):
         self, target: tuple[str, int], source_addr_string: str
     ) -> None:
         """Forward probe to target with ack."""
-        base_timeout = self._server.get_current_timeout()
+        base_timeout = await self._server.get_current_timeout()
         timeout = self._server.get_lhm_adjusted_timeout(base_timeout)
 
         ack_with_state = self._server.build_ack_with_state_for_addr(
