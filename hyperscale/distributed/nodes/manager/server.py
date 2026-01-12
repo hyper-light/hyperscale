@@ -3219,7 +3219,7 @@ class ManagerServer(HealthAwareServer):
             if not rate_limit_result.allowed:
                 return RateLimitResponse(
                     operation="job_submit",
-                    retry_after_seconds=retry_after,
+                    retry_after_seconds=rate_limit_result.retry_after_seconds,
                 ).dump()
 
             # Load shedding check (AD-22)
@@ -3552,13 +3552,13 @@ class ManagerServer(HealthAwareServer):
 
             # Rate limit check
             client_id = f"{addr[0]}:{addr[1]}"
-            allowed, retry_after = await self._rate_limiter.check_rate_limit(
+            rate_limit_result = await self._rate_limiter.check_rate_limit(
                 client_id, "cancel_workflow"
             )
-            if not allowed:
+            if not rate_limit_result.allowed:
                 return RateLimitResponse(
                     operation="cancel_workflow",
-                    retry_after_seconds=retry_after,
+                    retry_after_seconds=rate_limit_result.retry_after_seconds,
                 ).dump()
 
             # Check if already cancelled
