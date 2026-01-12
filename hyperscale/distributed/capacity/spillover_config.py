@@ -25,9 +25,19 @@ class SpilloverConfig:
         Create a configuration instance from environment settings.
         """
         return cls(
-            max_wait_seconds=env.SPILLOVER_MAX_WAIT_SECONDS,
-            max_latency_penalty_ms=env.SPILLOVER_MAX_LATENCY_PENALTY_MS,
-            min_improvement_ratio=env.SPILLOVER_MIN_IMPROVEMENT_RATIO,
-            spillover_enabled=env.SPILLOVER_ENABLED,
-            capacity_staleness_threshold_seconds=env.CAPACITY_STALENESS_THRESHOLD_SECONDS,
+            max_wait_seconds=getattr(
+                env, "SPILLOVER_MAX_WAIT_SECONDS", cls.max_wait_seconds
+            ),
+            max_latency_penalty_ms=getattr(
+                env, "SPILLOVER_MAX_LATENCY_PENALTY_MS", cls.max_latency_penalty_ms
+            ),
+            min_improvement_ratio=getattr(
+                env, "SPILLOVER_MIN_IMPROVEMENT_RATIO", cls.min_improvement_ratio
+            ),
+            spillover_enabled=getattr(env, "SPILLOVER_ENABLED", cls.spillover_enabled),
+            capacity_staleness_threshold_seconds=getattr(
+                env,
+                "CAPACITY_STALENESS_THRESHOLD_SECONDS",
+                cls.capacity_staleness_threshold_seconds,
+            ),
         )

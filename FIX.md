@@ -1,22 +1,22 @@
-# Hardening Items (Non-blocking)
-
-## 1) Job stats aggregation for completed_count
-**Problem**: `JobInfo.completed_count` is still TODO and doesn’t aggregate from sub‑workflows.
-
-**Exact changes**:
-- Implement aggregation of completed sub‑workflows into `completed_count` during job updates.
-
-**References**:
-- `hyperscale/distributed_rewrite/models/jobs.py:344`
-
 ---
-
-## 2) Make timeout check interval configurable
-**Problem**: Manager timeout loop uses hardcoded `check_interval = 30.0`.
-
-**Exact changes**:
-- Add `JOB_TIMEOUT_CHECK_INTERVAL` to `env.py` and use it in `_unified_timeout_loop()`.
-
-**References**:
-- `hyperscale/distributed_rewrite/nodes/manager_impl.py:9377`
-- `hyperscale/distributed_rewrite/env/env.py:146`
+Summary Table
+| # | Severity | Issue | File:Line | Type |
+|---|----------|-------|-----------|------|
+| 1 | 🔴 CRITICAL | fsync parameter doesn't exist | job_ledger.py:217,259,302,343 | API Mismatch |
+| 2 | 🔴 CRITICAL | Unbounded queue | wal_writer.py:77 | Memory Leak |
+| 3 | 🔴 CRITICAL | Exception swallowing | wal_writer.py:191-192 | Policy Violation |
+| 4 | 🟠 HIGH | Futures hang when loop=None | wal_writer.py:302-309 | Deadlock |
+| 5 | 🟠 HIGH | Cache not thread-safe | bounded_lru_cache.py:27-36 | Race Condition |
+| 6 | 🟠 HIGH | Snapshot copy on every op | node_wal.py, job_ledger.py | Memory Leak |
+| 7 | 🟠 HIGH | Executor not shutdown | wal_writer.py:106-122 | Resource Leak |
+| 8 | 🟠 HIGH | Checkpoint save race | checkpoint.py:112-129 | Race Condition |
+| 9 | 🟠 HIGH | Snapshot read without lock | job_ledger.py:365-374 | Race Condition |
+| 10 | 🟡 MEDIUM | Missing terminal check | job_ledger.py:274-288 | Logic Error |
+| 11 | 🟡 MEDIUM | Invalid state transitions | job_state.py | State Machine |
+| 12 | 🟡 MEDIUM | Silent transition failures | node_wal.py:212-246 | Silent Failure |
+| 13 | 🟡 MEDIUM | REGIONAL state skipped | node_wal.py:228 | State Machine |
+| 14 | 🟡 MEDIUM | No queue bounds | wal_writer.py:77 | Backpressure |
+| 15 | 🟡 MEDIUM | No QueueFull handling | distributed/ledger/ | Backpressure |
+| 16 | 🟡 MEDIUM | No tier flow control | distributed/ledger/ | Backpressure |
+| 17 | 🟡 MEDIUM | Timeout cleanup | commit_pipeline.py:142-158 | Orphaned State |
+---
