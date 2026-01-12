@@ -196,6 +196,10 @@ from hyperscale.distributed.routing import (
     RoutingDecision as VivaldiRoutingDecision,
     DatacenterCandidate,
 )
+from hyperscale.distributed.capacity import (
+    DatacenterCapacityAggregator,
+    SpilloverEvaluator,
+)
 from hyperscale.logging.hyperscale_logging_models import (
     ServerInfo,
     ServerWarning,
