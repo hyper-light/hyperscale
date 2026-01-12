@@ -233,17 +233,8 @@ class WorkerProgressReporter:
             circuit.record_error()
             return False
 
-        except Exception as send_error:
+        except Exception:
             circuit.record_error()
-            if self._logger:
-                await self._logger.log(
-                    ServerWarning(
-                        message=f"Failed to send progress to job leader: {send_error}",
-                        node_host=node_host,
-                        node_port=node_port,
-                        node_id=node_id_short,
-                    )
-                )
             return False
 
     async def send_progress_to_all_managers(
