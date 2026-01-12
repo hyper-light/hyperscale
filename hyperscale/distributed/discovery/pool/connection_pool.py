@@ -273,23 +273,21 @@ class ConnectionPool(Generic[T]):
         Args:
             pooled: The connection to close
         """
-        pooled.state = ConnectionState.DRAINING
+        async with self._get_lock():
+            pooled.state = ConnectionState.DRAINING
+            conn_id = id(pooled.connection)
+            self._in_use.discard(conn_id)
 
-        # Remove from in_use
-        conn_id = id(pooled.connection)
-        self._in_use.discard(conn_id)
-
-        # Close the connection
+        # Close the connection (outside lock to avoid holding during IO)
         if self.close_fn is not None:
             try:
                 await self.close_fn(pooled.connection)
             except Exception:
                 pass  # Ignore close errors
 
-        pooled.state = ConnectionState.DISCONNECTED
-
         # Remove from pool
         async with self._get_lock():
+            pooled.state = ConnectionState.DISCONNECTED
             peer_conns = self._connections.get(pooled.peer_id)
             if peer_conns and pooled in peer_conns:
                 peer_conns.remove(pooled)
