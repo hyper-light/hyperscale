@@ -236,6 +236,18 @@ class Env(BaseModel):
     # AD-34: Job Timeout Settings
     JOB_TIMEOUT_CHECK_INTERVAL: StrictFloat = 30.0  # Seconds between job timeout checks
 
+    # AD-44: Retry Budget Configuration
+    RETRY_BUDGET_MAX: StrictInt = 50
+    RETRY_BUDGET_PER_WORKFLOW_MAX: StrictInt = 5
+    RETRY_BUDGET_DEFAULT: StrictInt = 10
+    RETRY_BUDGET_PER_WORKFLOW_DEFAULT: StrictInt = 3
+
+    # AD-44: Best-Effort Configuration
+    BEST_EFFORT_DEADLINE_MAX: StrictFloat = 3600.0
+    BEST_EFFORT_DEADLINE_DEFAULT: StrictFloat = 300.0
+    BEST_EFFORT_MIN_DCS_DEFAULT: StrictInt = 1
+    BEST_EFFORT_DEADLINE_CHECK_INTERVAL: StrictFloat = 5.0
+
     # Manager TCP Timeout Settings
     MANAGER_TCP_TIMEOUT_SHORT: StrictFloat = (
         2.0  # Short timeout for quick operations (peer sync, worker queries)
