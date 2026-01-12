@@ -333,15 +333,19 @@ class IncarnationTracker:
         now = time.monotonic()
         cutoff = now - self.dead_node_retention_seconds
 
-        to_remove = []
-        # Snapshot to avoid dict mutation during iteration
-        for node, state in list(self.node_states.items()):
-            if state.status == b"DEAD" and state.last_update_time < cutoff:
-                to_remove.append(node)
+        async with self._lock:
+            to_remove = []
+            for node, state in list(self.node_states.items()):
+                if state.status == b"DEAD" and state.last_update_time < cutoff:
+                    to_remove.append(node)
 
-        for node in to_remove:
-            state = self.node_states.pop(node)
-            self._cleanup_count += 1
+            removed_nodes: list[tuple[tuple[str, int], NodeState]] = []
+            for node in to_remove:
+                state = self.node_states.pop(node)
+                self._cleanup_count += 1
+                removed_nodes.append((node, state))
+
+        for node, state in removed_nodes:
             if self._on_node_evicted:
                 try:
                     self._on_node_evicted(node, state)
@@ -351,7 +355,7 @@ class IncarnationTracker:
                         f"{type(e).__name__}: {e}"
                     )
 
-        return len(to_remove)
+        return len(removed_nodes)
 
     async def evict_if_needed(self) -> int:
         """
@@ -365,35 +369,35 @@ class IncarnationTracker:
         Returns:
             Number of nodes evicted.
         """
-        if len(self.node_states) <= self.max_nodes:
-            return 0
+        async with self._lock:
+            if len(self.node_states) <= self.max_nodes:
+                return 0
 
-        to_evict_count = len(self.node_states) - self.max_nodes + 100  # Evict batch
+            to_evict_count = len(self.node_states) - self.max_nodes + 100
 
-        # Sort by (status_priority, last_update_time)
-        # UNCONFIRMED peers evicted first (AD-29)
-        status_priority = {
-            b"UNCONFIRMED": -1,
-            b"DEAD": 0,
-            b"SUSPECT": 1,
-            b"OK": 2,
-            b"JOIN": 2,
-        }
+            status_priority = {
+                b"UNCONFIRMED": -1,
+                b"DEAD": 0,
+                b"SUSPECT": 1,
+                b"OK": 2,
+                b"JOIN": 2,
+            }
 
-        # Snapshot to avoid dict mutation during iteration
-        sorted_nodes = sorted(
-            list(self.node_states.items()),
-            key=lambda x: (
-                status_priority.get(x[1].status, 2),
-                x[1].last_update_time,
-            ),
-        )
+            sorted_nodes = sorted(
+                list(self.node_states.items()),
+                key=lambda x: (
+                    status_priority.get(x[1].status, 2),
+                    x[1].last_update_time,
+                ),
+            )
 
-        evicted = 0
-        for node, state in sorted_nodes[:to_evict_count]:
-            del self.node_states[node]
-            self._eviction_count += 1
-            evicted += 1
+            evicted_nodes: list[tuple[tuple[str, int], NodeState]] = []
+            for node, state in sorted_nodes[:to_evict_count]:
+                del self.node_states[node]
+                self._eviction_count += 1
+                evicted_nodes.append((node, state))
+
+        for node, state in evicted_nodes:
             if self._on_node_evicted:
                 try:
                     self._on_node_evicted(node, state)
@@ -403,7 +407,7 @@ class IncarnationTracker:
                         f"{type(e).__name__}: {e}"
                     )
 
-        return evicted
+        return len(evicted_nodes)
 
     async def cleanup(self) -> dict[str, int]:
         """
