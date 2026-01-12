@@ -2374,7 +2374,7 @@ class ManagerServer(HealthAwareServer):
         try:
             # Rate limit check (AD-24)
             client_id = f"{addr[0]}:{addr[1]}"
-            allowed, retry_after = self._check_rate_limit_for_operation(
+            allowed, retry_after = await self._check_rate_limit_for_operation(
                 client_id, "cancel"
             )
             if not allowed:
@@ -2709,7 +2709,7 @@ class ManagerServer(HealthAwareServer):
 
             # Rate limit check (AD-24)
             client_id = f"{addr[0]}:{addr[1]}"
-            allowed, retry_after = self._check_rate_limit_for_operation(
+            allowed, retry_after = await self._check_rate_limit_for_operation(
                 client_id, "extension"
             )
             if not allowed:
