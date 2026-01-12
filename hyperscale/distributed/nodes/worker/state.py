@@ -178,19 +178,21 @@ class WorkerState:
             if (manager := self._known_managers.get(manager_id))
         ]
 
-    def get_or_create_manager_lock(self, manager_id: str) -> asyncio.Lock:
-        """Get or create a state lock for a manager."""
-        return self._manager_state_locks.setdefault(manager_id, asyncio.Lock())
+    async def get_or_create_manager_lock(self, manager_id: str) -> asyncio.Lock:
+        async with self._get_resource_creation_lock():
+            if manager_id not in self._manager_state_locks:
+                self._manager_state_locks[manager_id] = asyncio.Lock()
+            return self._manager_state_locks[manager_id]
 
-    def increment_manager_epoch(self, manager_id: str) -> int:
-        """Increment and return the epoch for a manager."""
-        current = self._manager_state_epoch.get(manager_id, 0)
-        self._manager_state_epoch[manager_id] = current + 1
-        return self._manager_state_epoch[manager_id]
+    async def increment_manager_epoch(self, manager_id: str) -> int:
+        async with self._get_counter_lock():
+            current = self._manager_state_epoch.get(manager_id, 0)
+            self._manager_state_epoch[manager_id] = current + 1
+            return self._manager_state_epoch[manager_id]
 
-    def get_manager_epoch(self, manager_id: str) -> int:
-        """Get current epoch for a manager."""
-        return self._manager_state_epoch.get(manager_id, 0)
+    async def get_manager_epoch(self, manager_id: str) -> int:
+        async with self._get_counter_lock():
+            return self._manager_state_epoch.get(manager_id, 0)
 
     # =========================================================================
     # Workflow Tracking
@@ -243,21 +245,24 @@ class WorkerState:
         """Update job leader address for a workflow."""
         self._workflow_job_leader[workflow_id] = leader_addr
 
-    def update_workflow_fence_token(self, workflow_id: str, fence_token: int) -> bool:
+    async def update_workflow_fence_token(
+        self, workflow_id: str, fence_token: int
+    ) -> bool:
         """
         Update fence token if it's newer than current.
 
         Returns True if token was accepted, False if stale.
         """
-        current = self._workflow_fence_tokens.get(workflow_id, -1)
-        if fence_token <= current:
-            return False
-        self._workflow_fence_tokens[workflow_id] = fence_token
-        return True
+        async with self._get_counter_lock():
+            current = self._workflow_fence_tokens.get(workflow_id, -1)
+            if fence_token <= current:
+                return False
+            self._workflow_fence_tokens[workflow_id] = fence_token
+            return True
 
-    def get_workflow_fence_token(self, workflow_id: str) -> int:
-        """Get current fence token for a workflow, or -1 if not set."""
-        return self._workflow_fence_tokens.get(workflow_id, -1)
+    async def get_workflow_fence_token(self, workflow_id: str) -> int:
+        async with self._get_counter_lock():
+            return self._workflow_fence_tokens.get(workflow_id, -1)
 
     # =========================================================================
     # Orphan Tracking (Section 2.7)
