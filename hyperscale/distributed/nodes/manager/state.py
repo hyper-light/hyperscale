@@ -74,7 +74,9 @@ class ManagerState:
         self._worker_job_last_progress: dict[tuple[str, str], float] = {}
         self._dispatch_semaphores: dict[str, asyncio.Semaphore] = {}
         # AD-17: Worker health states from heartbeats for smart dispatch
-        self._worker_health_states: dict[str, str] = {}  # worker_id -> "healthy"|"busy"|"stressed"|"overloaded"
+        self._worker_health_states: dict[
+            str, str
+        ] = {}  # worker_id -> "healthy"|"busy"|"stressed"|"overloaded"
 
         # Versioned state clock
         self._versioned_clock: VersionedStateClock = VersionedStateClock()
@@ -108,14 +110,15 @@ class ManagerState:
         # Workflow lifecycle (AD-33)
         self._workflow_lifecycle_states: "WorkflowStateMachine | None" = None
         self._workflow_completion_events: dict[str, asyncio.Event] = {}
-        self._workflow_results_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 
         # Job tracking
         self._job_submissions: dict[str, JobSubmission] = {}
         self._job_reporter_tasks: dict[str, dict[str, asyncio.Task]] = {}
         self._workflow_retries: dict[str, tuple[int, bytes, set[str]]] = {}
         self._job_timeout_strategies: dict[str, "TimeoutStrategy"] = {}
-        self._job_aggregated_results: dict[str, list["WorkflowStats"]] = defaultdict(list)
+        self._job_aggregated_results: dict[str, list["WorkflowStats"]] = defaultdict(
+            list
+        )
 
         # Core allocation
         self._cores_available_event: asyncio.Event = asyncio.Event()

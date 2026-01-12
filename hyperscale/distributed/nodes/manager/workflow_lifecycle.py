@@ -93,7 +93,7 @@ class ManagerWorkflowLifecycle:
                     node_host=self._config.host,
                     node_port=self._config.tcp_port,
                     node_id=self._node_id,
-                )
+                ),
             )
         else:
             self._task_runner.run(
@@ -103,7 +103,7 @@ class ManagerWorkflowLifecycle:
                     node_host=self._config.host,
                     node_port=self._config.tcp_port,
                     node_id=self._node_id,
-                )
+                ),
             )
 
         return success
@@ -265,4 +265,3 @@ class ManagerWorkflowLifecycle:
             workflow_id: Workflow ID to cleanup
         """
         self._state._workflow_completion_events.pop(workflow_id, None)
-        self._state._workflow_results_locks.pop(workflow_id, None)
