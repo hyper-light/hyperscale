@@ -78,7 +78,7 @@ class NodeWAL:
         if self._path.exists():
             await self._recover()
 
-        self._writer.start()
+        await self._writer.start()
 
     async def _recover(self) -> None:
         loop = self._loop
@@ -178,21 +178,9 @@ class NodeWAL:
 
             future: asyncio.Future[None] = loop.create_future()
 
-            def on_complete(exception: BaseException | None) -> None:
-                if exception is not None:
-                    loop.call_soon_threadsafe(
-                        future.set_exception,
-                        exception,
-                    )
-                else:
-                    loop.call_soon_threadsafe(
-                        future.set_result,
-                        None,
-                    )
-
             request = WriteRequest(
                 data=entry_bytes,
-                on_complete=on_complete,
+                future=future,
             )
 
             self._writer.submit(request)
@@ -360,7 +348,7 @@ class NodeWAL:
     async def close(self) -> None:
         async with self._state_lock:
             if not self._status_snapshot.closed:
-                self._writer.stop()
+                await self._writer.stop()
 
                 self._status_snapshot = WALStatusSnapshot(
                     next_lsn=self._status_snapshot.next_lsn,
