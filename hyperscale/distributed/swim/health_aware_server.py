@@ -3118,7 +3118,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             from_node=from_node,
             incarnation=incarnation,
         )
-        self._incarnation_tracker.update_node(
+        await self._incarnation_tracker.update_node(
             node,
             b"SUSPECT",
             incarnation,
@@ -3155,7 +3155,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                 node=node,
                 incarnation=incarnation,
             )
-            self._incarnation_tracker.update_node(
+            await self._incarnation_tracker.update_node(
                 node,
                 b"OK",
                 incarnation,
