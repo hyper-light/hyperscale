@@ -199,7 +199,8 @@ class DiscoveryService(Generic[T]):
         ewma_config = EWMAConfig(
             alpha=self.config.ewma_alpha,
             initial_estimate_ms=self.config.baseline_latency_ms,
-            failure_penalty_ms=self.config.baseline_latency_ms * self.config.latency_multiplier_threshold,
+            failure_penalty_ms=self.config.baseline_latency_ms
+            * self.config.latency_multiplier_threshold,
         )
         self._selector = AdaptiveEWMASelector(
             power_of_two_config=power_of_two_config,
@@ -303,9 +304,7 @@ class DiscoveryService(Generic[T]):
 
                     # Handle SRV records specially - each target may have a different port
                     if result.srv_records:
-                        discovered.extend(
-                            self._add_peers_from_srv_records(result)
-                        )
+                        discovered.extend(self._add_peers_from_srv_records(result))
                     else:
                         # Standard A/AAAA record handling
                         discovered.extend(
@@ -570,7 +569,9 @@ class DiscoveryService(Generic[T]):
                 )
                 return SelectionResult(
                     peer_id=sticky_peer_id,
-                    latency_estimate_ms=self._selector.get_effective_latency(sticky_peer_id),
+                    latency_estimate_ms=self._selector.get_effective_latency(
+                        sticky_peer_id
+                    ),
                     was_load_balanced=False,
                 )
 
@@ -706,7 +707,9 @@ class DiscoveryService(Generic[T]):
             peer_latencies: list[tuple[str, float]] = []
             for peer in healthy_peers:
                 if peer.peer_id not in used_peer_ids:
-                    effective_latency = self._selector.get_effective_latency(peer.peer_id)
+                    effective_latency = self._selector.get_effective_latency(
+                        peer.peer_id
+                    )
                     peer_latencies.append((peer.peer_id, effective_latency))
 
             # Sort by latency (ascending)
@@ -798,7 +801,7 @@ class DiscoveryService(Generic[T]):
         """
         return await self._connection_pool.acquire(peer_id, timeout=timeout)
 
-    def release_connection(self, pooled_connection: PooledConnection[T]) -> None:
+    async def release_connection(self, pooled_connection: PooledConnection[T]) -> None:
         """
         Release a connection back to the pool.
 
@@ -808,9 +811,11 @@ class DiscoveryService(Generic[T]):
         Args:
             pooled_connection: The pooled connection to release
         """
-        self._connection_pool.release(pooled_connection)
+        await self._connection_pool.release(pooled_connection)
 
-    def mark_connection_success(self, pooled_connection: PooledConnection[T]) -> None:
+    async def mark_connection_success(
+        self, pooled_connection: PooledConnection[T]
+    ) -> None:
         """
         Mark a pooled connection as having completed successfully.
 
@@ -820,9 +825,11 @@ class DiscoveryService(Generic[T]):
         Args:
             pooled_connection: The connection that succeeded
         """
-        self._connection_pool.mark_success(pooled_connection)
+        await self._connection_pool.mark_success(pooled_connection)
 
-    def mark_connection_failure(self, pooled_connection: PooledConnection[T]) -> None:
+    async def mark_connection_failure(
+        self, pooled_connection: PooledConnection[T]
+    ) -> None:
         """
         Mark a pooled connection as having failed.
 
@@ -832,7 +839,7 @@ class DiscoveryService(Generic[T]):
         Args:
             pooled_connection: The connection that failed
         """
-        self._connection_pool.mark_failure(pooled_connection)
+        await self._connection_pool.mark_failure(pooled_connection)
 
     async def close_connection(self, pooled_connection: PooledConnection[T]) -> None:
         """
@@ -899,7 +906,8 @@ class DiscoveryService(Generic[T]):
             List of healthy peers
         """
         return [
-            peer for peer in self._peers.values()
+            peer
+            for peer in self._peers.values()
             if peer.health in (PeerHealth.HEALTHY, PeerHealth.UNKNOWN)
         ]
 
@@ -1061,7 +1069,9 @@ class DiscoveryService(Generic[T]):
             "healthy_peer_count": len(self.get_healthy_peers()),
             "health_distribution": health_counts,
             "dns_cache_stats": self._resolver.cache_stats,
-            "last_discovery_seconds_ago": time.monotonic() - self._last_discovery if self._last_discovery > 0 else -1,
+            "last_discovery_seconds_ago": time.monotonic() - self._last_discovery
+            if self._last_discovery > 0
+            else -1,
             "selector_peer_count": self._selector.peer_count,
             "connection_pool_stats": self._connection_pool.get_stats(),
             "sticky_binding_stats": self._sticky_manager.get_stats(),
