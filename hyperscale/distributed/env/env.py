@@ -248,6 +248,13 @@ class Env(BaseModel):
     BEST_EFFORT_MIN_DCS_DEFAULT: StrictInt = 1
     BEST_EFFORT_DEADLINE_CHECK_INTERVAL: StrictFloat = 5.0
 
+    # AD-45: Adaptive Route Learning
+    ADAPTIVE_ROUTING_ENABLED: StrictBool = True
+    ADAPTIVE_ROUTING_EWMA_ALPHA: StrictFloat = 0.2
+    ADAPTIVE_ROUTING_MIN_SAMPLES: StrictInt = 10
+    ADAPTIVE_ROUTING_MAX_STALENESS_SECONDS: StrictFloat = 300.0
+    ADAPTIVE_ROUTING_LATENCY_CAP_MS: StrictFloat = 60000.0
+
     # Manager TCP Timeout Settings
     MANAGER_TCP_TIMEOUT_SHORT: StrictFloat = (
         2.0  # Short timeout for quick operations (peer sync, worker queries)
