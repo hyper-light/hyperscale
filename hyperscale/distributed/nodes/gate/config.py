@@ -92,6 +92,9 @@ class GateConfig:
     # Job ledger configuration (AD-38)
     ledger_data_dir: Path | None = None
 
+    # Job ledger configuration (AD-38)
+    ledger_data_dir: Path | None = None
+
 
 def create_gate_config(
     host: str,
