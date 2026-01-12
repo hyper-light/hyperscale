@@ -7,6 +7,7 @@ Handles ReporterResultPush messages indicating reporter submission completion.
 from hyperscale.distributed.models import ReporterResultPush, ClientReporterResult
 from hyperscale.distributed.nodes.client.state import ClientState
 from hyperscale.logging import Logger
+from hyperscale.logging.hyperscale_logging_models import ServerWarning
 
 
 class ReporterResultPushHandler:
@@ -61,7 +62,7 @@ class ReporterResultPushHandler:
                 except Exception:
                     pass  # Don't let callback errors break the handler
 
-            return b'ok'
+            return b"ok"
 
         except Exception:
-            return b'error'
+            return b"error"
