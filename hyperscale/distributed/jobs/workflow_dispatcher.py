@@ -39,6 +39,12 @@ from hyperscale.distributed.jobs.logging_models import (
     DispatcherError,
     DispatcherCritical,
 )
+from hyperscale.distributed.reliability import (
+    RetryBudgetManager,
+    ReliabilityConfig,
+    create_reliability_config_from_env,
+)
+from hyperscale.distributed.env import Env
 from hyperscale.logging import Logger
 
 
@@ -69,6 +75,8 @@ class WorkflowDispatcher:
         on_dispatch_failed: Callable[[str, str, str], Coroutine[Any, Any, None]]
         | None = None,
         get_leader_term: Callable[[], int] | None = None,
+        retry_budget_manager: RetryBudgetManager | None = None,
+        env: Env | None = None,
     ):
         """
         Initialize WorkflowDispatcher.
