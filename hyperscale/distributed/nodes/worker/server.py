@@ -26,7 +26,13 @@ from hyperscale.distributed.protocol.version import (
     NegotiatedCapabilities,
 )
 from hyperscale.distributed.server import tcp
-from hyperscale.logging.hyperscale_logging_models import ServerInfo
+from hyperscale.logging import Logger
+from hyperscale.logging.config import DurabilityMode
+from hyperscale.logging.hyperscale_logging_models import (
+    ServerInfo,
+    WorkerStarted,
+    WorkerStopping,
+)
 
 from .config import WorkerConfig
 from .state import WorkerState
