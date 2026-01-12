@@ -244,19 +244,19 @@ class ManagerState:
         """Get count of active manager peers (including self)."""
         return len(self._active_manager_peers) + 1
 
-    def is_peer_active(self, tcp_addr: tuple[str, int]) -> bool:
-        """Check if a peer is active."""
-        return tcp_addr in self._active_manager_peers
+    async def is_peer_active(self, tcp_addr: tuple[str, int]) -> bool:
+        async with self._get_counter_lock():
+            return tcp_addr in self._active_manager_peers
 
-    def add_active_peer(self, tcp_addr: tuple[str, int], node_id: str) -> None:
-        """Add a peer to active sets."""
-        self._active_manager_peers.add(tcp_addr)
-        self._active_manager_peer_ids.add(node_id)
+    async def add_active_peer(self, tcp_addr: tuple[str, int], node_id: str) -> None:
+        async with self._get_counter_lock():
+            self._active_manager_peers.add(tcp_addr)
+            self._active_manager_peer_ids.add(node_id)
 
-    def remove_active_peer(self, tcp_addr: tuple[str, int], node_id: str) -> None:
-        """Remove a peer from active sets."""
-        self._active_manager_peers.discard(tcp_addr)
-        self._active_manager_peer_ids.discard(node_id)
+    async def remove_active_peer(self, tcp_addr: tuple[str, int], node_id: str) -> None:
+        async with self._get_counter_lock():
+            self._active_manager_peers.discard(tcp_addr)
+            self._active_manager_peer_ids.discard(node_id)
 
     def clear_cancellation_state(self, job_id: str) -> None:
         """Clear cancellation tracking state for a job."""
