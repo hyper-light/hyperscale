@@ -975,7 +975,7 @@ class ServerRateLimiter:
         # Track for backward compatibility metrics
         self._clients_cleaned: int = 0
 
-    def check(
+    async def check(
         self,
         addr: tuple[str, int],
         raise_on_limit: bool = False,
@@ -997,7 +997,9 @@ class ServerRateLimiter:
             RateLimitExceeded: If raise_on_limit is True and rate is exceeded
         """
         client_id = f"{addr[0]}:{addr[1]}"
-        result = self._adaptive.check(client_id, "default", RequestPriority.NORMAL)
+        result = await self._adaptive.check(
+            client_id, "default", RequestPriority.NORMAL
+        )
 
         if not result.allowed and raise_on_limit:
             from hyperscale.core.jobs.protocols.rate_limiter import RateLimitExceeded
@@ -1006,7 +1008,7 @@ class ServerRateLimiter:
 
         return result.allowed
 
-    def check_rate_limit(
+    async def check_rate_limit(
         self,
         client_id: str,
         operation: str,
@@ -1023,11 +1025,11 @@ class ServerRateLimiter:
         Returns:
             RateLimitResult indicating if allowed and retry info
         """
-        return self._adaptive.check(
+        return await self._adaptive.check(
             client_id, operation, RequestPriority.NORMAL, tokens
         )
 
-    def check_rate_limit_with_priority(
+    async def check_rate_limit_with_priority(
         self,
         client_id: str,
         operation: str,
@@ -1049,7 +1051,7 @@ class ServerRateLimiter:
         Returns:
             RateLimitResult indicating if allowed
         """
-        return self._adaptive.check(client_id, operation, priority, tokens)
+        return await self._adaptive.check(client_id, operation, priority, tokens)
 
     async def check_rate_limit_async(
         self,
