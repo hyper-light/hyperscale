@@ -1231,7 +1231,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         # Add gossip piggyback (membership + health) - Phase 6.1 compliant
         return self._add_piggyback_safe(base_ack)
 
-    def _extract_embedded_state(
+    async def _extract_embedded_state(
         self,
         message: bytes,
         source_addr: tuple[str, int],
@@ -1321,7 +1321,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
 
         try:
             state_data = b64decode(encoded_state)
-            self._process_embedded_state(state_data, source_addr)
+            await self._process_embedded_state(state_data, source_addr)
         except Exception:
             # Invalid base64 or processing error - ignore silently
             pass
@@ -3673,7 +3673,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
 
         # Extract embedded state from response (Serf-style)
         # Response format: msg_type>host:port#|sbase64_state
-        clean_data = self._extract_embedded_state(data, addr)
+        clean_data = await self._extract_embedded_state(data, addr)
         return clean_data
 
     @udp.receive()
