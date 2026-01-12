@@ -170,11 +170,11 @@ class JobLeaderTransferHandler:
     ) -> bytes | None:
         """Validate transfer and return rejection response if invalid."""
         # Validate fence token
-        fence_valid, fence_reason = self._server._validate_transfer_fence_token(
+        fence_valid, fence_reason = await self._server._validate_transfer_fence_token(
             job_id, transfer.fence_token
         )
         if not fence_valid:
-            self._server._transfer_metrics_rejected_stale_token += 1
+            await self._server._worker_state.increment_transfer_rejected_stale_token()
             await self._server._udp_logger.log(
                 ServerWarning(
                     message=f"Rejected job leadership transfer for job {job_id[:8]}...: {fence_reason}",
