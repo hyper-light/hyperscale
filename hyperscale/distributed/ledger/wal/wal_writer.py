@@ -101,6 +101,8 @@ class WALWriter:
         "_error",
         "_last_queue_state",
         "_state_change_callback",
+        "_pending_state_change",
+        "_state_change_task",
     )
 
     def __init__(
@@ -132,6 +134,8 @@ class WALWriter:
         self._error: BaseException | None = None
         self._last_queue_state = QueueState.HEALTHY
         self._state_change_callback = state_change_callback
+        self._pending_state_change: tuple[QueueState, BackpressureSignal] | None = None
+        self._state_change_task: asyncio.Task[None] | None = None
 
     async def start(self) -> None:
         if self._running:
@@ -270,14 +274,25 @@ class WALWriter:
         queue_state: QueueState,
         backpressure: BackpressureSignal,
     ) -> None:
-        callback = self._state_change_callback
-        loop = self._loop
-        if callback is not None and loop is not None:
+        if self._state_change_callback is None or self._loop is None:
+            return
 
-            async def invoke_callback() -> None:
-                await callback(queue_state, backpressure)
+        self._pending_state_change = (queue_state, backpressure)
 
-            loop.call_soon(lambda: asyncio.create_task(invoke_callback()))
+        if self._state_change_task is None or self._state_change_task.done():
+            self._state_change_task = asyncio.create_task(
+                self._flush_state_change_callback()
+            )
+
+    async def _flush_state_change_callback(self) -> None:
+        while self._pending_state_change is not None and self._running:
+            queue_state, backpressure = self._pending_state_change
+            self._pending_state_change = None
+
+            try:
+                await self._state_change_callback(queue_state, backpressure)
+            except Exception:
+                pass
 
     async def _writer_loop(self) -> None:
         try:
