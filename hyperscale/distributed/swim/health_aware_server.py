@@ -1681,7 +1681,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         with error tracking.
         """
         self_addr = self._get_self_udp_addr()
-        base_timeout = self._context.read("current_timeout")
+        base_timeout = await self._context.read("current_timeout")
         timeout = self.get_lhm_adjusted_timeout(base_timeout)
 
         for node in list(self._incarnation_tracker.node_states.keys()):
