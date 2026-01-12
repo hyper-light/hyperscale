@@ -2770,8 +2770,15 @@ class GateServer(HealthAwareServer):
                         timeout=5.0,
                     )
 
-                except Exception:
-                    pass
+                except Exception as register_error:
+                    await self._udp_logger.log(
+                        ServerWarning(
+                            message=f"Failed to register with manager {manager_addr}: {register_error}",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
 
     # =========================================================================
     # Background Tasks
