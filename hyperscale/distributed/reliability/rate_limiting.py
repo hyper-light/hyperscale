@@ -544,7 +544,7 @@ class AdaptiveRateLimiter:
         # Lower value = higher priority, so priority <= min_priority means allowed
         return priority <= min_priority
 
-    def _check_operation_counter(
+    async def _check_operation_counter(
         self,
         client_id: str,
         operation: str,
@@ -552,7 +552,7 @@ class AdaptiveRateLimiter:
         tokens: int,
     ) -> "RateLimitResult":
         """Check and update per-operation counter for client."""
-        counter = self._get_or_create_operation_counter(client_id, operation)
+        counter = await self._get_or_create_operation_counter(client_id, operation)
         acquired, wait_time = counter.try_acquire(tokens)
 
         if acquired:
@@ -566,14 +566,14 @@ class AdaptiveRateLimiter:
 
         return self._reject_request(state, wait_time, counter.available_slots)
 
-    def _check_stress_counter(
+    async def _check_stress_counter(
         self,
         client_id: str,
         state: OverloadState,
         tokens: int,
     ) -> "RateLimitResult":
         """Check and update per-client stress counter."""
-        counter = self._get_or_create_stress_counter(client_id, state)
+        counter = await self._get_or_create_stress_counter(client_id, state)
         acquired, wait_time = counter.try_acquire(tokens)
 
         if acquired:
