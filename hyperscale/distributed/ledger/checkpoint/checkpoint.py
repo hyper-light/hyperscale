@@ -37,13 +37,24 @@ class CheckpointManager:
 
     async def initialize(self) -> None:
         self._loop = asyncio.get_running_loop()
-        self._checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+        await self._loop.run_in_executor(
+            None,
+            self._initialize_sync,
+        )
+
         await self._load_latest()
 
+    def _initialize_sync(self) -> None:
+        self._checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
     async def _load_latest(self) -> None:
-        checkpoint_files = sorted(
-            self._checkpoint_dir.glob("checkpoint_*.bin"),
-            reverse=True,
+        loop = self._loop
+        assert loop is not None
+
+        checkpoint_files = await loop.run_in_executor(
+            None,
+            self._list_checkpoint_files_sync,
         )
 
         for checkpoint_file in checkpoint_files:
@@ -53,6 +64,12 @@ class CheckpointManager:
                 return
             except (ValueError, OSError):
                 continue
+
+    def _list_checkpoint_files_sync(self) -> list[Path]:
+        return sorted(
+            self._checkpoint_dir.glob("checkpoint_*.bin"),
+            reverse=True,
+        )
 
     async def _read_checkpoint(self, path: Path) -> Checkpoint:
         loop = self._loop
@@ -96,14 +113,20 @@ class CheckpointManager:
         loop = self._loop
         assert loop is not None
 
+        path = await loop.run_in_executor(
+            None,
+            self._save_sync,
+            checkpoint,
+        )
+
         async with self._lock:
-            path = await loop.run_in_executor(
-                None,
-                self._save_sync,
-                checkpoint,
-            )
-            self._latest_checkpoint = checkpoint
-            return path
+            if (
+                self._latest_checkpoint is None
+                or checkpoint.created_at_ms > self._latest_checkpoint.created_at_ms
+            ):
+                self._latest_checkpoint = checkpoint
+
+        return path
 
     def _save_sync(self, checkpoint: Checkpoint) -> Path:
         filename = f"checkpoint_{checkpoint.created_at_ms}.bin"
@@ -150,21 +173,30 @@ class CheckpointManager:
             raise
 
     async def cleanup(self, keep_count: int = 3) -> int:
-        async with self._lock:
-            checkpoint_files = sorted(
-                self._checkpoint_dir.glob("checkpoint_*.bin"),
-                reverse=True,
-            )
+        loop = self._loop
+        assert loop is not None
 
-            removed_count = 0
-            for checkpoint_file in checkpoint_files[keep_count:]:
-                try:
-                    checkpoint_file.unlink()
-                    removed_count += 1
-                except OSError:
-                    pass
+        return await loop.run_in_executor(
+            None,
+            self._cleanup_sync,
+            keep_count,
+        )
 
-            return removed_count
+    def _cleanup_sync(self, keep_count: int) -> int:
+        checkpoint_files = sorted(
+            self._checkpoint_dir.glob("checkpoint_*.bin"),
+            reverse=True,
+        )
+
+        removed_count = 0
+        for checkpoint_file in checkpoint_files[keep_count:]:
+            try:
+                checkpoint_file.unlink()
+                removed_count += 1
+            except OSError:
+                pass
+
+        return removed_count
 
     @property
     def latest(self) -> Checkpoint | None:

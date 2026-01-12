@@ -11,15 +11,20 @@ from ..job_state import JobState
 
 
 class JobArchiveStore:
-    __slots__ = ("_archive_dir", "_lock", "_loop")
+    __slots__ = ("_archive_dir", "_loop")
 
     def __init__(self, archive_dir: Path) -> None:
         self._archive_dir = archive_dir
-        self._lock = asyncio.Lock()
         self._loop: asyncio.AbstractEventLoop | None = None
 
     async def initialize(self) -> None:
         self._loop = asyncio.get_running_loop()
+        await self._loop.run_in_executor(
+            None,
+            self._initialize_sync,
+        )
+
+    def _initialize_sync(self) -> None:
         self._archive_dir.mkdir(parents=True, exist_ok=True)
 
     def _get_archive_path(self, job_id: str) -> Path:
@@ -33,28 +38,22 @@ class JobArchiveStore:
         return self._archive_dir / "unknown" / f"{job_id}.bin"
 
     async def write_if_absent(self, job_state: JobState) -> bool:
-        archive_path = self._get_archive_path(job_state.job_id)
-
-        if archive_path.exists():
-            return True
-
         loop = self._loop
         assert loop is not None
 
-        async with self._lock:
-            if archive_path.exists():
-                return True
+        archive_path = self._get_archive_path(job_state.job_id)
 
-            await loop.run_in_executor(
-                None,
-                self._write_sync,
-                job_state,
-                archive_path,
-            )
+        return await loop.run_in_executor(
+            None,
+            self._write_if_absent_sync,
+            job_state,
+            archive_path,
+        )
 
+    def _write_if_absent_sync(self, job_state: JobState, archive_path: Path) -> bool:
+        if archive_path.exists():
             return True
 
-    def _write_sync(self, job_state: JobState, archive_path: Path) -> None:
         archive_path.parent.mkdir(parents=True, exist_ok=True)
 
         data = msgspec.msgpack.encode(job_state.to_dict())
@@ -79,6 +78,15 @@ class JobArchiveStore:
             finally:
                 os.close(dir_fd)
 
+            return True
+
+        except FileExistsError:
+            try:
+                os.unlink(temp_path_str)
+            except OSError:
+                pass
+            return True
+
         except Exception:
             try:
                 os.unlink(temp_path_str)
@@ -87,37 +95,56 @@ class JobArchiveStore:
             raise
 
     async def read(self, job_id: str) -> JobState | None:
-        archive_path = self._get_archive_path(job_id)
-
-        if not archive_path.exists():
-            return None
-
         loop = self._loop
         assert loop is not None
 
+        archive_path = self._get_archive_path(job_id)
+
+        return await loop.run_in_executor(
+            None,
+            self._read_sync,
+            job_id,
+            archive_path,
+        )
+
+    def _read_sync(self, job_id: str, archive_path: Path) -> JobState | None:
+        if not archive_path.exists():
+            return None
+
         try:
-            return await loop.run_in_executor(
-                None,
-                self._read_sync,
-                job_id,
-                archive_path,
-            )
+            with open(archive_path, "rb") as file:
+                data = file.read()
+
+            job_dict = msgspec.msgpack.decode(data)
+            return JobState.from_dict(job_id, job_dict)
+
         except (OSError, msgspec.DecodeError):
             return None
 
-    def _read_sync(self, job_id: str, archive_path: Path) -> JobState:
-        with open(archive_path, "rb") as file:
-            data = file.read()
-
-        job_dict = msgspec.msgpack.decode(data)
-        return JobState.from_dict(job_id, job_dict)
-
     async def exists(self, job_id: str) -> bool:
-        return self._get_archive_path(job_id).exists()
+        loop = self._loop
+        assert loop is not None
 
-    async def delete(self, job_id: str) -> bool:
         archive_path = self._get_archive_path(job_id)
 
+        return await loop.run_in_executor(
+            None,
+            archive_path.exists,
+        )
+
+    async def delete(self, job_id: str) -> bool:
+        loop = self._loop
+        assert loop is not None
+
+        archive_path = self._get_archive_path(job_id)
+
+        return await loop.run_in_executor(
+            None,
+            self._delete_sync,
+            archive_path,
+        )
+
+    def _delete_sync(self, archive_path: Path) -> bool:
         if not archive_path.exists():
             return False
 
@@ -128,7 +155,21 @@ class JobArchiveStore:
             return False
 
     async def cleanup_older_than(self, max_age_ms: int, current_time_ms: int) -> int:
+        loop = self._loop
+        assert loop is not None
+
+        return await loop.run_in_executor(
+            None,
+            self._cleanup_older_than_sync,
+            max_age_ms,
+            current_time_ms,
+        )
+
+    def _cleanup_older_than_sync(self, max_age_ms: int, current_time_ms: int) -> int:
         removed_count = 0
+
+        if not self._archive_dir.exists():
+            return removed_count
 
         for region_dir in self._archive_dir.iterdir():
             if not region_dir.is_dir():
