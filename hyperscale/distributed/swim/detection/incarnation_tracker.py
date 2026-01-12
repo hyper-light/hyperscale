@@ -225,12 +225,13 @@ class IncarnationTracker:
                 return True
             return self.node_states[node].update(status, incarnation, timestamp)
 
-    def remove_node(self, node: tuple[str, int]) -> bool:
+    async def remove_node(self, node: tuple[str, int]) -> bool:
         """Remove a node from tracking. Returns True if it existed."""
-        if node in self.node_states:
-            del self.node_states[node]
-            return True
-        return False
+        async with self._lock:
+            if node in self.node_states:
+                del self.node_states[node]
+                return True
+            return False
 
     def get_all_nodes(self) -> list[tuple[tuple[str, int], NodeState]]:
         """Get all known nodes and their states."""
@@ -447,7 +448,7 @@ class IncarnationTracker:
     # AD-29: Peer Confirmation Methods
     # =========================================================================
 
-    def add_unconfirmed_node(
+    async def add_unconfirmed_node(
         self,
         node: tuple[str, int],
         timestamp: float | None = None,
@@ -468,9 +469,19 @@ class IncarnationTracker:
         if timestamp is None:
             timestamp = time.monotonic()
 
-        # Don't demote existing confirmed nodes
-        existing = self.node_states.get(node)
-        if existing and existing.status != b"UNCONFIRMED":
+        async with self._lock:
+            existing = self.node_states.get(node)
+            if existing and existing.status != b"UNCONFIRMED":
+                return False
+
+            if node not in self.node_states:
+                self.node_states[node] = NodeState(
+                    status=b"UNCONFIRMED",
+                    incarnation=0,
+                    last_update_time=timestamp,
+                )
+                return True
+
             return False
 
         if node not in self.node_states:
