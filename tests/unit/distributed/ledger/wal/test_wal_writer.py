@@ -341,10 +341,8 @@ class TestWALWriterFutureResolution:
         temp_wal_directory: str,
     ):
         wal_path = Path(temp_wal_directory) / "test.wal"
-        writer = WALWriter(
-            path=wal_path,
-            batch_timeout_microseconds=100000,
-        )
+        config = WALWriterConfig(batch_timeout_microseconds=100000)
+        writer = WALWriter(path=wal_path, config=config)
 
         await writer.start()
 
