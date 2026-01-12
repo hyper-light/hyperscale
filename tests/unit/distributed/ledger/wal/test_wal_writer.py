@@ -507,7 +507,7 @@ class TestWALWriterBackpressure:
 
         for _ in range(90):
             future: asyncio.Future[None] = loop.create_future()
-            result = writer.submit(WriteRequest(data=b"x" * 10, future=future))
+            writer.submit(WriteRequest(data=b"x" * 10, future=future))
             futures.append(future)
 
         assert writer.backpressure_level >= BackpressureLevel.BATCH
