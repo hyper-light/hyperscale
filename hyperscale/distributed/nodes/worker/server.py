@@ -456,6 +456,13 @@ class WorkerServer(HealthAwareServer):
         # Stop background loops
         await self._stop_background_loops()
 
+        if self._cores_notification_task and not self._cores_notification_task.done():
+            self._cores_notification_task.cancel()
+            try:
+                await self._cores_notification_task
+            except asyncio.CancelledError:
+                pass
+
         # Stop modules
         self._backpressure_manager.stop()
         self._executor.stop()
@@ -501,6 +508,9 @@ class WorkerServer(HealthAwareServer):
 
         # Cancel background tasks synchronously
         self._lifecycle_manager.cancel_background_tasks_sync()
+
+        if self._cores_notification_task and not self._cores_notification_task.done():
+            self._cores_notification_task.cancel()
 
         # Abort modules
         self._lifecycle_manager.abort_monitors()
