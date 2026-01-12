@@ -211,6 +211,29 @@ class GateJobHandler:
             negotiated_features = client_features & our_features
             negotiated_caps_str = ",".join(sorted(negotiated_features))
 
+            idempotency_key: IdempotencyKey | None = None
+            if submission.idempotency_key and self._idempotency_cache is not None:
+                idempotency_key = IdempotencyKey(submission.idempotency_key)
+                found, entry = await self._idempotency_cache.check_or_insert(
+                    idempotency_key,
+                    submission.job_id,
+                    self._get_node_id().full,
+                )
+                if found and entry is not None:
+                    if entry.status in (
+                        IdempotencyStatus.COMMITTED,
+                        IdempotencyStatus.REJECTED,
+                    ):
+                        if entry.result is not None:
+                            return entry.result
+                        return JobAck(
+                            job_id=submission.job_id,
+                            accepted=entry.status == IdempotencyStatus.COMMITTED,
+                            error="Duplicate request"
+                            if entry.status == IdempotencyStatus.REJECTED
+                            else None,
+                        ).dump()
+
             if self._quorum_circuit.circuit_state == CircuitState.OPEN:
                 self._job_lease_manager.release(submission.job_id)
                 retry_after = self._quorum_circuit.half_open_after
@@ -308,7 +331,7 @@ class GateJobHandler:
                 self._dispatch_job_to_datacenters, submission, target_dcs
             )
 
-            return JobAck(
+            ack_response = JobAck(
                 job_id=submission.job_id,
                 accepted=True,
                 queued_position=self._job_manager.job_count(),
@@ -316,6 +339,11 @@ class GateJobHandler:
                 protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
                 capabilities=negotiated_caps_str,
             ).dump()
+
+            if idempotency_key is not None and self._idempotency_cache is not None:
+                await self._idempotency_cache.commit(idempotency_key, ack_response)
+
+            return ack_response
 
         except QuorumCircuitOpenError as error:
             return JobAck(
