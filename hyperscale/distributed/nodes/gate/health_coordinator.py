@@ -9,6 +9,7 @@ Handles datacenter health monitoring and classification:
 - Cross-DC correlation detection
 """
 
+import asyncio
 import time
 from typing import TYPE_CHECKING, Callable
 
