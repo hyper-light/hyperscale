@@ -38,7 +38,7 @@ class ServerInterface(Protocol):
         """Read the nodes dictionary from context."""
         ...
 
-    def get_current_timeout(self) -> float:
+    async def get_current_timeout(self) -> float:
         """Get the current base timeout value."""
         ...
 
@@ -285,11 +285,11 @@ class ServerInterface(Protocol):
 
     # === Context Management ===
 
-    def context_with_value(self, target: tuple[str, int]) -> Any:
+    async def context_with_value(self, target: tuple[str, int]) -> Any:
         """Get async context manager for target-scoped operations."""
         ...
 
-    def write_context(self, key: Any, value: Any) -> None:
+    async def write_context(self, key: Any, value: Any) -> None:
         """Write value to context."""
         ...
 
