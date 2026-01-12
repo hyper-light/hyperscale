@@ -86,13 +86,14 @@ class LamportRunner:
 
                     for node, waiter in self.registered.items():
                         if node != self.name:
-                            waiter.put_nowait(
+                            self._try_put_message(
+                                waiter,
                                 LamportMessage(
                                     message_type="ack",
                                     timestamp=next_time,
                                     sender=self.name,
                                     receiver=node,
-                                )
+                                ),
                             )
 
     async def stop(self):
