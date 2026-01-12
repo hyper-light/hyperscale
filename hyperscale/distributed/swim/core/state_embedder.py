@@ -326,9 +326,11 @@ class ManagerStateEmbedder:
     get_healthy_worker_count: Callable[[], int]
     get_available_cores: Callable[[], int]
     get_total_cores: Callable[[], int]
-    on_worker_heartbeat: Callable[[Any, tuple[str, int]], None]
-    on_manager_heartbeat: Callable[[Any, tuple[str, int]], None] | None = None
-    on_gate_heartbeat: Callable[[Any, tuple[str, int]], None] | None = None
+    on_worker_heartbeat: Callable[[Any, tuple[str, int]], Awaitable[None]]
+    on_manager_heartbeat: Callable[[Any, tuple[str, int]], Awaitable[None]] | None = (
+        None
+    )
+    on_gate_heartbeat: Callable[[Any, tuple[str, int]], Awaitable[None]] | None = None
     get_manager_state: Callable[[], str] | None = None
     get_tcp_host: Callable[[], str] | None = None
     get_tcp_port: Callable[[], int] | None = None
@@ -407,7 +409,7 @@ class ManagerStateEmbedder:
         )
         return heartbeat.dump()
 
-    def process_state(
+    async def process_state(
         self,
         state_data: bytes,
         source_addr: tuple[str, int],
@@ -425,20 +427,20 @@ class ManagerStateEmbedder:
         gate_handler = self.on_gate_heartbeat
 
         if isinstance(obj, WorkerHeartbeat):
-            self.on_worker_heartbeat(obj, source_addr)
+            await self.on_worker_heartbeat(obj, source_addr)
             if self.on_peer_coordinate and obj.coordinate:
                 rtt_ms = self._probe_rtt_cache.pop(source_addr, None)
                 if rtt_ms is not None:
                     self.on_peer_coordinate(obj.node_id, obj.coordinate, rtt_ms)
         elif isinstance(obj, ManagerHeartbeat) and manager_handler:
             if obj.node_id != self.get_node_id():
-                manager_handler(obj, source_addr)
+                await manager_handler(obj, source_addr)
                 if self.on_peer_coordinate and obj.coordinate:
                     rtt_ms = self._probe_rtt_cache.pop(source_addr, None)
                     if rtt_ms is not None:
                         self.on_peer_coordinate(obj.node_id, obj.coordinate, rtt_ms)
         elif isinstance(obj, GateHeartbeat) and gate_handler:
-            gate_handler(obj, source_addr)
+            await gate_handler(obj, source_addr)
             if self.on_peer_coordinate and obj.coordinate:
                 rtt_ms = self._probe_rtt_cache.pop(source_addr, None)
                 if rtt_ms is not None:
@@ -524,7 +526,7 @@ class GateStateEmbedder:
     get_active_jobs: Callable[[], int]
     get_active_datacenters: Callable[[], int]
     get_manager_count: Callable[[], int]
-    on_manager_heartbeat: Callable[[Any, tuple[str, int]], None]
+    on_manager_heartbeat: Callable[[Any, tuple[str, int]], Awaitable[None]]
     # Optional fields (with defaults)
     get_tcp_host: Callable[[], str] | None = None
     get_tcp_port: Callable[[], int] | None = None
@@ -533,7 +535,7 @@ class GateStateEmbedder:
     _probe_rtt_cache: dict[tuple[str, int], float] = field(
         default_factory=dict, init=False, repr=False
     )
-    on_gate_heartbeat: Callable[[Any, tuple[str, int]], None] | None = None
+    on_gate_heartbeat: Callable[[Any, tuple[str, int]], Awaitable[None]] | None = None
     # Piggybacking callbacks for discovery
     get_known_managers: (
         Callable[[], dict[str, tuple[str, int, str, int, str]]] | None
@@ -608,7 +610,7 @@ class GateStateEmbedder:
         )
         return heartbeat.dump()
 
-    def process_state(
+    async def process_state(
         self,
         state_data: bytes,
         source_addr: tuple[str, int],
@@ -620,20 +622,20 @@ class GateStateEmbedder:
             obj = cast(
                 ManagerHeartbeat | GateHeartbeat, ManagerHeartbeat.load(state_data)
             )  # Base unpickle
-        except Exception as e:
+        except Exception:
             return  # Invalid data
 
         handler = self.on_gate_heartbeat
 
         if isinstance(obj, ManagerHeartbeat):
-            self.on_manager_heartbeat(obj, source_addr)
+            await self.on_manager_heartbeat(obj, source_addr)
             if self.on_peer_coordinate and obj.coordinate:
                 rtt_ms = self._probe_rtt_cache.pop(source_addr, None)
                 if rtt_ms is not None:
                     self.on_peer_coordinate(obj.node_id, obj.coordinate, rtt_ms)
         elif isinstance(obj, GateHeartbeat) and handler:
             if obj.node_id != self.get_node_id():
-                handler(obj, source_addr)
+                await handler(obj, source_addr)
                 if self.on_peer_coordinate and obj.coordinate:
                     rtt_ms = self._probe_rtt_cache.pop(source_addr, None)
                     if rtt_ms is not None:
