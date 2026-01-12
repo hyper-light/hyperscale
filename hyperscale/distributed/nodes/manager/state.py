@@ -22,6 +22,7 @@ from hyperscale.distributed.models import (
 from hyperscale.distributed.server.events import VersionedStateClock
 from hyperscale.distributed.swim.core import ErrorStats
 from hyperscale.distributed.protocol.version import NegotiatedCapabilities
+from hyperscale.distributed.slo import TimeWindowedTDigest
 
 if TYPE_CHECKING:
     from hyperscale.core.state.context import Context
@@ -146,6 +147,8 @@ class ManagerState:
         self._dispatch_throughput_count: int = 0
         self._dispatch_throughput_interval_start: float = 0.0
         self._dispatch_throughput_last_value: float = 0.0
+
+        self._workflow_latency_digest = TimeWindowedTDigest()
 
         # Background tasks
         self._dead_node_reap_task: asyncio.Task | None = None
