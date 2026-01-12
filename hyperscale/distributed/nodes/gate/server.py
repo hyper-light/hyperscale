@@ -439,6 +439,9 @@ class GateServer(HealthAwareServer):
         for datacenter_id in self._datacenter_managers.keys():
             self._dc_health_manager.add_datacenter(datacenter_id)
 
+        self._capacity_aggregator = DatacenterCapacityAggregator()
+        self._spillover_evaluator = SpilloverEvaluator.from_env(env)
+
         # Manager dispatcher
         self._manager_dispatcher = ManagerDispatcher(
             dispatch_timeout=5.0,
