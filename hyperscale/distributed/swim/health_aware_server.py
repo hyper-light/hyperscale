@@ -626,7 +626,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             self._unconfirmed_peers.add(peer)
             self._unconfirmed_peer_added_at[peer] = time.monotonic()
             # AD-29: Add to incarnation tracker with formal UNCONFIRMED state
-            self._incarnation_tracker.add_unconfirmed_node(peer)
+            await self._incarnation_tracker.add_unconfirmed_node(peer)
 
             # AD-35 Task 12.5.6: Track with RoleAwareConfirmationManager
             from hyperscale.distributed.models.distributed import NodeRole
@@ -679,7 +679,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
 
         # AD-29: Update incarnation tracker with formal state transition
         # This transitions UNCONFIRMED → OK in the state machine
-        self._incarnation_tracker.confirm_node(peer, incarnation)
+        await self._incarnation_tracker.confirm_node(peer, incarnation)
 
         # AD-35 Task 12.5.6: Notify RoleAwareConfirmationManager
         peer_id = f"{peer[0]}:{peer[1]}"
@@ -814,7 +814,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         self._unconfirmed_peers.discard(peer)
         self._unconfirmed_peer_added_at.pop(peer, None)
         # AD-29: Also remove from formal state machine
-        self._incarnation_tracker.remove_node(peer)
+        await self._incarnation_tracker.remove_node(peer)
 
     # =========================================================================
     # Hierarchical Failure Detection
