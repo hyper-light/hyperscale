@@ -430,3 +430,14 @@ class WorkerState:
     def get_completion_sample_count(self) -> int:
         """Get count of completion time samples."""
         return len(self._completion_times)
+
+    def remove_manager_lock(self, manager_id: str) -> None:
+        """Remove lock and epoch when manager disconnects to prevent memory leak."""
+        self._manager_state_locks.pop(manager_id, None)
+        self._manager_state_epoch.pop(manager_id, None)
+
+    def remove_job_transfer_lock(self, job_id: str) -> None:
+        """Remove transfer lock and token when job completes to prevent memory leak."""
+        self._job_leader_transfer_locks.pop(job_id, None)
+        self._job_fence_tokens.pop(job_id, None)
+        self._pending_transfers.pop(job_id, None)

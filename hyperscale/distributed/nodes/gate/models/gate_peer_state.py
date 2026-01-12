@@ -88,3 +88,8 @@ class GatePeerState:
     def get_epoch(self, peer_addr: tuple[str, int]) -> int:
         """Get the current epoch for a peer address."""
         return self.peer_epochs.get(peer_addr, 0)
+
+    def remove_peer_lock(self, peer_addr: tuple[str, int]) -> None:
+        """Remove lock and epoch when peer disconnects to prevent memory leak."""
+        self.peer_locks.pop(peer_addr, None)
+        self.peer_epochs.pop(peer_addr, None)
