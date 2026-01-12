@@ -13,6 +13,7 @@ from hyperscale.distributed.models import (
 )
 from hyperscale.distributed.nodes.client.state import ClientState
 from hyperscale.logging import Logger
+from hyperscale.logging.hyperscale_logging_models import ServerWarning
 
 
 class WorkflowResultPushHandler:
@@ -75,7 +76,9 @@ class WorkflowResultPushHandler:
                     )
 
                 # Use push.completed_at if provided, otherwise use current time
-                completed_at = push.completed_at if push.completed_at > 0 else time.time()
+                completed_at = (
+                    push.completed_at if push.completed_at > 0 else time.time()
+                )
 
                 job.workflow_results[push.workflow_id] = ClientWorkflowResult(
                     workflow_id=push.workflow_id,
@@ -102,7 +105,7 @@ class WorkflowResultPushHandler:
                     push.job_id, push.workflow_name, stats
                 )
 
-            return b'ok'
+            return b"ok"
 
         except Exception:
-            return b'error'
+            return b"error"
