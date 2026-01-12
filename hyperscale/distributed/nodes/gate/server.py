@@ -969,6 +969,9 @@ class GateServer(HealthAwareServer):
         await self._dc_health_monitor.stop()
         await self._job_timeout_tracker.stop()
 
+        if self._job_ledger is not None:
+            await self._job_ledger.close()
+
         await super().stop(
             drain_timeout=drain_timeout,
             broadcast_leave=broadcast_leave,
