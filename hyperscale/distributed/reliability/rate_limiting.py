@@ -484,18 +484,16 @@ class AdaptiveRateLimiter:
             RateLimitResult indicating if request is allowed
         """
         async with self._async_lock:
-            result = self.check(client_id, operation, priority, tokens)
+            result = await self.check(client_id, operation, priority, tokens)
 
             if result.allowed or max_wait <= 0:
                 return result
 
-            # Get operation window size for calculating wait increment
             _, window_size = self._config.get_operation_limits(operation)
             wait_increment = window_size * self._config.async_retry_increment_factor
 
             total_waited = 0.0
             while total_waited < max_wait:
-                # Use the smaller of: calculated wait time, increment, or remaining time
                 wait_time = min(
                     result.retry_after_seconds,
                     wait_increment,
@@ -508,13 +506,11 @@ class AdaptiveRateLimiter:
                 await asyncio.sleep(wait_time)
                 total_waited += wait_time
 
-                # Re-check after wait (state may have changed)
-                result = self.check(client_id, operation, priority, tokens)
+                result = await self.check(client_id, operation, priority, tokens)
                 if result.allowed:
                     return result
 
-            # Final check after exhausting max_wait
-            return self.check(client_id, operation, priority, tokens)
+            return await self.check(client_id, operation, priority, tokens)
 
     def _priority_allows_bypass(
         self,
