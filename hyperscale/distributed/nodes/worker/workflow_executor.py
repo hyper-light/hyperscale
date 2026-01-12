@@ -139,6 +139,21 @@ class WorkerWorkflowExecutor:
         vus_for_workflow = dispatch.vus
         cores_to_allocate = dispatch.cores
 
+        if self._event_logger is not None:
+            await self._event_logger.log(
+                WorkerJobReceived(
+                    message=f"Received job {dispatch.job_id}",
+                    node_id=node_id_full,
+                    node_host=node_host,
+                    node_port=node_port,
+                    job_id=dispatch.job_id,
+                    workflow_id=workflow_id,
+                    source_manager_host=dispatching_addr[0],
+                    source_manager_port=dispatching_addr[1],
+                ),
+                name="worker_events",
+            )
+
         increment_version()
 
         # Create initial progress tracker
