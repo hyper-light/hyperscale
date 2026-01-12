@@ -2452,7 +2452,15 @@ class GateServer(HealthAwareServer):
                     timeout=3.0,
                 )
                 return True
-            except Exception:
+            except Exception as fallback_push_error:
+                await self._udp_logger.log(
+                    ServerDebug(
+                        message=f"Failed to push result to fallback gate: {fallback_push_error}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
                 continue
 
         return False
