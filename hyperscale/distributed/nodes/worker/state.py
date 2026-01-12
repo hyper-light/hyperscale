@@ -294,25 +294,28 @@ class WorkerState:
     # Job Leadership Transfer (Section 8)
     # =========================================================================
 
-    def get_or_create_job_transfer_lock(self, job_id: str) -> asyncio.Lock:
-        """Get or create a transfer lock for a job."""
-        return self._job_leader_transfer_locks.setdefault(job_id, asyncio.Lock())
+    async def get_or_create_job_transfer_lock(self, job_id: str) -> asyncio.Lock:
+        async with self._get_resource_creation_lock():
+            if job_id not in self._job_leader_transfer_locks:
+                self._job_leader_transfer_locks[job_id] = asyncio.Lock()
+            return self._job_leader_transfer_locks[job_id]
 
-    def update_job_fence_token(self, job_id: str, fence_token: int) -> bool:
+    async def update_job_fence_token(self, job_id: str, fence_token: int) -> bool:
         """
         Update job fence token if it's newer than current.
 
         Returns True if token was accepted, False if stale.
         """
-        current = self._job_fence_tokens.get(job_id, -1)
-        if fence_token <= current:
-            return False
-        self._job_fence_tokens[job_id] = fence_token
-        return True
+        async with self._get_counter_lock():
+            current = self._job_fence_tokens.get(job_id, -1)
+            if fence_token <= current:
+                return False
+            self._job_fence_tokens[job_id] = fence_token
+            return True
 
-    def get_job_fence_token(self, job_id: str) -> int:
-        """Get current fence token for a job, or -1 if not set."""
-        return self._job_fence_tokens.get(job_id, -1)
+    async def get_job_fence_token(self, job_id: str) -> int:
+        async with self._get_counter_lock():
+            return self._job_fence_tokens.get(job_id, -1)
 
     def add_pending_transfer(self, job_id: str, transfer: PendingTransfer) -> None:
         """Store a pending transfer for late-arriving workflows."""
@@ -326,25 +329,25 @@ class WorkerState:
         """Remove and return pending transfer for a job."""
         return self._pending_transfers.pop(job_id, None)
 
-    def increment_transfer_received(self) -> None:
-        """Increment transfer received counter."""
-        self._transfer_metrics_received += 1
+    async def increment_transfer_received(self) -> None:
+        async with self._get_counter_lock():
+            self._transfer_metrics_received += 1
 
-    def increment_transfer_accepted(self) -> None:
-        """Increment transfer accepted counter."""
-        self._transfer_metrics_accepted += 1
+    async def increment_transfer_accepted(self) -> None:
+        async with self._get_counter_lock():
+            self._transfer_metrics_accepted += 1
 
-    def increment_transfer_rejected_stale_token(self) -> None:
-        """Increment stale token rejection counter."""
-        self._transfer_metrics_rejected_stale_token += 1
+    async def increment_transfer_rejected_stale_token(self) -> None:
+        async with self._get_counter_lock():
+            self._transfer_metrics_rejected_stale_token += 1
 
-    def increment_transfer_rejected_unknown_manager(self) -> None:
-        """Increment unknown manager rejection counter."""
-        self._transfer_metrics_rejected_unknown_manager += 1
+    async def increment_transfer_rejected_unknown_manager(self) -> None:
+        async with self._get_counter_lock():
+            self._transfer_metrics_rejected_unknown_manager += 1
 
-    def increment_transfer_rejected_other(self) -> None:
-        """Increment other rejection counter."""
-        self._transfer_metrics_rejected_other += 1
+    async def increment_transfer_rejected_other(self) -> None:
+        async with self._get_counter_lock():
+            self._transfer_metrics_rejected_other += 1
 
     def get_transfer_metrics(self) -> dict:
         """Get transfer metrics summary."""
@@ -424,12 +427,12 @@ class WorkerState:
     # Throughput Tracking (AD-19)
     # =========================================================================
 
-    def record_completion(self, duration_seconds: float) -> None:
-        """Record a workflow completion for throughput tracking."""
-        self._throughput_completions += 1
-        self._completion_times.append(duration_seconds)
-        if len(self._completion_times) > 50:
-            self._completion_times.pop(0)
+    async def record_completion(self, duration_seconds: float) -> None:
+        async with self._get_counter_lock():
+            self._throughput_completions += 1
+            self._completion_times.append(duration_seconds)
+            if len(self._completion_times) > 50:
+                self._completion_times.pop(0)
 
     def get_throughput(self) -> float:
         """Get current throughput (completions per second)."""
