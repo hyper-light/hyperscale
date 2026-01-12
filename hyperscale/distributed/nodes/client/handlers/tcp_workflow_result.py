@@ -96,8 +96,16 @@ class WorkflowResultPushHandler:
             if callback:
                 try:
                     callback(push)
-                except Exception:
-                    pass  # Don't let callback errors break the handler
+                except Exception as callback_error:
+                    if self._logger:
+                        await self._logger.log(
+                            ServerWarning(
+                                message=f"Workflow result callback error: {callback_error}",
+                                node_host="client",
+                                node_port=0,
+                                node_id="client",
+                            )
+                        )
 
             # Submit to local file-based reporters (aggregated stats only, not per-DC)
             if stats and self._reporting_manager:
