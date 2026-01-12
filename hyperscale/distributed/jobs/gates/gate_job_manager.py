@@ -14,14 +14,12 @@ Key responsibilities:
 
 import asyncio
 import time
-from collections import defaultdict
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
 from hyperscale.distributed.models import (
     GlobalJobStatus,
     JobFinalResult,
-    JobProgress,
     JobStatus,
 )
 
@@ -63,27 +61,15 @@ class GateJobManager:
         self._job_fence_tokens: dict[str, int] = {}
 
         # Per-job locks for concurrent access safety
-        # Uses defaultdict to automatically create locks for new jobs
-        self._job_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+        self._job_locks: dict[str, asyncio.Lock] = {}
 
         # Global lock for job creation/deletion operations
         self._global_lock = asyncio.Lock()
 
-    # =========================================================================
-    # Locking
-    # =========================================================================
-
     @asynccontextmanager
     async def lock_job(self, job_id: str) -> AsyncIterator[None]:
-        """
-        Acquire the lock for a specific job.
-
-        Usage:
-            async with job_manager.lock_job(job_id):
-                # Safe to modify job state here
-                job = job_manager.get_job(job_id)
-                ...
-        """
+        if job_id not in self._job_locks:
+            self._job_locks[job_id] = asyncio.Lock()
         lock = self._job_locks[job_id]
         async with lock:
             yield
@@ -168,17 +154,13 @@ class GateJobManager:
     # DC Results Management
     # =========================================================================
 
-    def set_dc_result(
-        self, job_id: str, dc_id: str, result: JobFinalResult
-    ) -> None:
+    def set_dc_result(self, job_id: str, dc_id: str, result: JobFinalResult) -> None:
         """Set the final result from a datacenter."""
         if job_id not in self._job_dc_results:
             self._job_dc_results[job_id] = {}
         self._job_dc_results[job_id][dc_id] = result
 
-    def get_dc_result(
-        self, job_id: str, dc_id: str
-    ) -> JobFinalResult | None:
+    def get_dc_result(self, job_id: str, dc_id: str) -> JobFinalResult | None:
         """Get the final result from a datacenter."""
         return self._job_dc_results.get(job_id, {}).get(dc_id)
 
@@ -274,7 +256,7 @@ class GateJobManager:
             elif result.status == JobStatus.FAILED.value:
                 failed_dcs += 1
 
-            if hasattr(result, 'rate') and result.rate > 0:
+            if hasattr(result, "rate") and result.rate > 0:
                 rates.append(result.rate)
 
         # Update job with aggregated values
