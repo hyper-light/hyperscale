@@ -123,6 +123,7 @@ from hyperscale.distributed.jobs import (
     WindowedStatsCollector,
 )
 from hyperscale.distributed.ledger.wal import NodeWAL
+from hyperscale.logging.lsn import HybridLamportClock
 from hyperscale.distributed.jobs.timeout_strategy import (
     TimeoutStrategy,
     LocalAuthorityTimeout,
@@ -600,6 +601,14 @@ class ManagerServer(HealthAwareServer):
 
         # Start the underlying server
         await self.start_server(init_context=self._env.get_swim_init_context())
+
+        if self._config.wal_data_dir is not None:
+            wal_clock = HybridLamportClock(node_id=hash(self._node_id.full) & 0xFFFF)
+            self._node_wal = await NodeWAL.open(
+                path=self._config.wal_data_dir / "wal",
+                clock=wal_clock,
+                logger=self._udp_logger,
+            )
 
         # Update node capabilities with proper version
         self._node_capabilities = NodeCapabilities.current(
