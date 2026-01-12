@@ -1224,8 +1224,16 @@ class GateServer(HealthAwareServer):
                 self._observed_latency_tracker.record_job_latency(
                     result.datacenter, latency_ms
                 )
-        except Exception:
-            pass
+        except Exception as route_learning_error:
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerWarning(
+                    message=f"Route learning latency recording failed: {route_learning_error}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                ),
+            )
 
         if self._state_sync_handler:
             return await self._state_sync_handler.handle_job_final_result(
