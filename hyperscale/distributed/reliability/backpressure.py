@@ -272,6 +272,19 @@ class StatsBuffer:
             "total_dropped": self._total_dropped,
         }
 
+    def get_backpressure_signal(self) -> "BackpressureSignal":
+        """
+        Get current backpressure signal for embedding in responses.
+
+        This is a convenience wrapper that converts the backpressure level
+        to a full BackpressureSignal with suggested delays and behaviors.
+
+        Returns:
+            BackpressureSignal with level, suggested delay, and behavior hints
+        """
+        level = self.get_backpressure_level()
+        return BackpressureSignal.from_level(level)
+
     def clear(self) -> None:
         """Clear all data from all tiers."""
         self._hot.clear()
