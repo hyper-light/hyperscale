@@ -43,7 +43,7 @@ class JobStatusPushHandler:
 
             job = self._state._jobs.get(push.job_id)
             if not job:
-                return b'ok'  # Job not tracked, ignore
+                return b"ok"  # Job not tracked, ignore
 
             # Update job status
             job.status = push.status
@@ -57,8 +57,16 @@ class JobStatusPushHandler:
             if callback:
                 try:
                     callback(push)
-                except Exception:
-                    pass  # Don't let callback errors break us
+                except Exception as callback_error:
+                    if self._logger:
+                        await self._logger.log(
+                            ServerWarning(
+                                message=f"Job status callback error: {callback_error}",
+                                node_host="client",
+                                node_port=0,
+                                node_id="client",
+                            )
+                        )
 
             # If final, signal completion
             if push.is_final:
@@ -66,10 +74,10 @@ class JobStatusPushHandler:
                 if event:
                     event.set()
 
-            return b'ok'
+            return b"ok"
 
         except Exception:
-            return b'error'
+            return b"error"
 
 
 class JobBatchPushHandler:
@@ -106,7 +114,7 @@ class JobBatchPushHandler:
 
             job = self._state._jobs.get(push.job_id)
             if not job:
-                return b'ok'  # Job not tracked, ignore
+                return b"ok"  # Job not tracked, ignore
 
             # Update job status with batch stats
             job.status = push.status
@@ -115,7 +123,7 @@ class JobBatchPushHandler:
             job.overall_rate = push.overall_rate
             job.elapsed_seconds = push.elapsed_seconds
 
-            return b'ok'
+            return b"ok"
 
         except Exception:
-            return b'error'
+            return b"error"
