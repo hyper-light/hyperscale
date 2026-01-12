@@ -2,20 +2,45 @@ from __future__ import annotations
 
 import asyncio
 import struct
+from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, AsyncIterator, Mapping
+from typing import AsyncIterator, Mapping
 
 from hyperscale.logging.lsn import HybridLamportClock
+from hyperscale.distributed.reliability.robust_queue import QueuePutResult, QueueState
+from hyperscale.distributed.reliability.backpressure import (
+    BackpressureLevel,
+    BackpressureSignal,
+)
 
 from ..events.event_type import JobEventType
 from .entry_state import WALEntryState
 from .wal_entry import HEADER_SIZE, WALEntry
 from .wal_status_snapshot import WALStatusSnapshot
-from .wal_writer import WALWriter, WriteRequest
+from .wal_writer import WALWriter, WALWriterConfig, WriteRequest, WALBackpressureError
 
-if TYPE_CHECKING:
-    pass
+
+@dataclass(slots=True)
+class WALAppendResult:
+    entry: WALEntry
+    queue_result: QueuePutResult
+
+    @property
+    def backpressure(self) -> BackpressureSignal:
+        return self.queue_result.backpressure
+
+    @property
+    def backpressure_level(self) -> BackpressureLevel:
+        return self.queue_result.backpressure.level
+
+    @property
+    def queue_state(self) -> QueueState:
+        return self.queue_result.queue_state
+
+    @property
+    def in_overflow(self) -> bool:
+        return self.queue_result.in_overflow
 
 
 class NodeWAL:
@@ -34,18 +59,11 @@ class NodeWAL:
         self,
         path: Path,
         clock: HybridLamportClock,
-        batch_timeout_microseconds: int = 500,
-        batch_max_entries: int = 1000,
-        batch_max_bytes: int = 1024 * 1024,
+        config: WALWriterConfig | None = None,
     ) -> None:
         self._path = path
         self._clock = clock
-        self._writer = WALWriter(
-            path=path,
-            batch_timeout_microseconds=batch_timeout_microseconds,
-            batch_max_entries=batch_max_entries,
-            batch_max_bytes=batch_max_bytes,
-        )
+        self._writer = WALWriter(path=path, config=config)
         self._loop: asyncio.AbstractEventLoop | None = None
         self._pending_entries_internal: dict[int, WALEntry] = {}
         self._status_snapshot = WALStatusSnapshot.initial()
@@ -57,17 +75,9 @@ class NodeWAL:
         cls,
         path: Path,
         clock: HybridLamportClock,
-        batch_timeout_microseconds: int = 500,
-        batch_max_entries: int = 1000,
-        batch_max_bytes: int = 1024 * 1024,
+        config: WALWriterConfig | None = None,
     ) -> NodeWAL:
-        wal = cls(
-            path=path,
-            clock=clock,
-            batch_timeout_microseconds=batch_timeout_microseconds,
-            batch_max_entries=batch_max_entries,
-            batch_max_bytes=batch_max_bytes,
-        )
+        wal = cls(path=path, clock=clock, config=config)
         await wal._initialize()
         return wal
 
@@ -84,11 +94,7 @@ class NodeWAL:
         loop = self._loop
         assert loop is not None
 
-        recovery_result = await loop.run_in_executor(
-            None,
-            self._recover_sync,
-        )
-
+        recovery_result = await loop.run_in_executor(None, self._recover_sync)
         recovered_entries, next_lsn, last_synced_lsn = recovery_result
 
         for entry in recovered_entries:
@@ -109,6 +115,9 @@ class NodeWAL:
         recovered_entries: list[WALEntry] = []
         next_lsn = 0
         last_synced_lsn = -1
+
+        if not self._path.exists():
+            return recovered_entries, next_lsn, last_synced_lsn
 
         with open(self._path, "rb") as file:
             data = file.read()
@@ -151,7 +160,7 @@ class NodeWAL:
         self,
         event_type: JobEventType,
         payload: bytes,
-    ) -> WALEntry:
+    ) -> WALAppendResult:
         if self._status_snapshot.closed:
             raise RuntimeError("WAL is closed")
 
@@ -175,15 +184,17 @@ class NodeWAL:
             )
 
             entry_bytes = entry.to_bytes()
-
             future: asyncio.Future[None] = loop.create_future()
+            request = WriteRequest(data=entry_bytes, future=future)
 
-            request = WriteRequest(
-                data=entry_bytes,
-                future=future,
-            )
+            queue_result = self._writer.submit(request)
 
-            self._writer.submit(request)
+            if not queue_result.accepted:
+                raise WALBackpressureError(
+                    f"WAL rejected write due to backpressure: {queue_result.queue_state.name}",
+                    queue_state=queue_result.queue_state,
+                    backpressure=queue_result.backpressure,
+                )
 
             self._pending_entries_internal[lsn] = entry
 
@@ -207,7 +218,7 @@ class NodeWAL:
                 closed=False,
             )
 
-        return entry
+        return WALAppendResult(entry=entry, queue_result=queue_result)
 
     async def mark_regional(self, lsn: int) -> None:
         async with self._state_lock:
@@ -250,7 +261,7 @@ class NodeWAL:
             compacted_count = 0
             lsns_to_remove = []
 
-            for lsn, entry in self._pending_entries_internal.items():
+            for lsn, entry in list(self._pending_entries_internal.items()):
                 if lsn <= up_to_lsn and entry.state == WALEntryState.APPLIED:
                     lsns_to_remove.append(lsn)
                     compacted_count += 1
@@ -282,17 +293,16 @@ class NodeWAL:
         loop = self._loop
         assert loop is not None
 
-        entries = await loop.run_in_executor(
-            None,
-            self._read_entries_sync,
-            start_lsn,
-        )
+        entries = await loop.run_in_executor(None, self._read_entries_sync, start_lsn)
 
         for entry in entries:
             yield entry
 
     def _read_entries_sync(self, start_lsn: int) -> list[WALEntry]:
         entries: list[WALEntry] = []
+
+        if not self._path.exists():
+            return entries
 
         with open(self._path, "rb") as file:
             data = file.read()
@@ -344,6 +354,17 @@ class NodeWAL:
     @property
     def is_closed(self) -> bool:
         return self._status_snapshot.closed
+
+    @property
+    def backpressure_level(self) -> BackpressureLevel:
+        return self._writer.backpressure_level
+
+    @property
+    def queue_state(self) -> QueueState:
+        return self._writer.queue_state
+
+    def get_metrics(self) -> dict:
+        return self._writer.get_queue_metrics()
 
     async def close(self) -> None:
         async with self._state_lock:

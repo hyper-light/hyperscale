@@ -33,5 +33,5 @@ while true; do
     fi
 
     echo "[$TIMESTAMP] Waiting 60 seconds..."
-    sleep 60
+    sleep 20
 done
