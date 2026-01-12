@@ -939,7 +939,7 @@ class WorkerServer(HealthAwareServer):
 
     async def _handle_manager_failure_async(self, manager_id: str) -> None:
         """Handle manager failure - mark workflows as orphaned."""
-        self._registry.mark_manager_unhealthy(manager_id)
+        await self._registry.mark_manager_unhealthy(manager_id)
 
         # Select new primary if needed
         if self._primary_manager_id == manager_id:
