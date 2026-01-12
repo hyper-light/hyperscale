@@ -19,53 +19,36 @@ class Context(Generic[T]):
 
     async def get_value_lock(self, key: str) -> asyncio.Lock:
         async with self._value_locks_creation_lock:
-            return self._value_locks.setdefault(key, asyncio.Lock())
+            if key not in self._value_locks:
+                self._value_locks[key] = asyncio.Lock()
+            return self._value_locks[key]
 
-    def with_value(self, key: str) -> asyncio.Lock:
-        return self._value_locks.setdefault(key, asyncio.Lock())
+    async def with_value(self, key: str) -> asyncio.Lock:
+        async with self._value_locks_creation_lock:
+            if key not in self._value_locks:
+                self._value_locks[key] = asyncio.Lock()
+            return self._value_locks[key]
 
-    async def read_with_lock(self, key: str):
+    async def read(self, key: str, default: V | None = None):
         async with self._store_lock:
-            return self._store.get(key)
+            return self._store.get(key, default)
 
-    def read(self, key: str, default: V | None = None):
-        return self._store.get(key, default)
-
-    async def update_with_lock(self, key: str, update: U):
+    async def update(self, key: str, update: U):
         lock = await self.get_value_lock(key)
         async with lock:
-            self._store[key] = update(
-                self._store.get(key),
-            )
-
+            self._store[key] = update(self._store.get(key))
             return self._store[key]
 
-    def update(self, key: str, update: U):
-        self._store[key] = update(self._store.get(key))
-
-        return self._store[key]
-
-    async def write_with_lock(self, key: str, value: V):
+    async def write(self, key: str, value: V):
         lock = await self.get_value_lock(key)
         async with lock:
             self._store[key] = value
-
             return self._store[key]
 
-    def write(self, key: str, value: V):
-        self._store[key] = value
-        return self._store[key]
-
-    async def delete_with_lock(self, key: str):
+    async def delete(self, key: str):
         async with self._store_lock:
             del self._store[key]
 
-    def delete(self, key: str):
-        del self._store[key]
-
-    async def merge_with_lock(self, update: T):
+    async def merge(self, update: T):
         async with self._store_lock:
             self._store.update(update)
-
-    def merge(self, update: T):
-        self._store.update(update)
