@@ -60,12 +60,9 @@ class NodeHealthTracker(Generic[T]):
         state = self._states.get(node_id)
         if state is None:
             return False, "Node not tracked", False
-        if state.get_routing_decision() != RoutingDecision.EVICT:
-            return (
-                False,
-                f"Routing decision is {state.get_routing_decision().value}, not evict",
-                False,
-            )
+        decision = state.get_routing_decision()
+        if decision != RoutingDecision.EVICT:
+            return False, f"Routing decision is {decision.value}, not evict", False
         return self._evaluate_eviction(node_id)
 
     def mark_evicted(self, node_id: str) -> None:

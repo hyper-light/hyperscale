@@ -99,6 +99,9 @@ class LamportRunner:
     async def stop(self):
         self._running = False
 
+        if self._run_task is None:
+            return
+
         try:
             self._run_task.cancel()
             await self._run_task
