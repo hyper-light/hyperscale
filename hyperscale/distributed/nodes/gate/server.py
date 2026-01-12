@@ -1887,6 +1887,8 @@ class GateServer(HealthAwareServer):
         source_addr: tuple[str, int],
     ) -> None:
         """Handle embedded manager heartbeat from SWIM."""
+        self._capacity_aggregator.record_heartbeat(heartbeat)
+
         if self._health_coordinator:
             self._health_coordinator.handle_embedded_manager_heartbeat(
                 heartbeat.datacenter,
