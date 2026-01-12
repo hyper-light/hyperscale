@@ -213,7 +213,7 @@ class GateJobHandler:
 
             idempotency_key: IdempotencyKey | None = None
             if submission.idempotency_key and self._idempotency_cache is not None:
-                idempotency_key = IdempotencyKey(submission.idempotency_key)
+                idempotency_key = IdempotencyKey.parse(submission.idempotency_key)
                 found, entry = await self._idempotency_cache.check_or_insert(
                     idempotency_key,
                     submission.job_id,
