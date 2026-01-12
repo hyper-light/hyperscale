@@ -934,13 +934,16 @@ class LoggerStream:
     ) -> int | None:
         file_lock = self._get_file_lock(logfile_path)
 
+        lsn = await self._generate_lsn(log)
+
         await file_lock.acquire()
         try:
-            lsn = await self._loop.run_in_executor(
+            await self._loop.run_in_executor(
                 None,
                 self._write_to_file,
                 log,
                 logfile_path,
+                lsn,
                 self._durability,
             )
         except Exception as err:
@@ -965,28 +968,26 @@ class LoggerStream:
         self,
         log: Log[T],
         logfile_path: str,
+        lsn: int | None,
         durability: DurabilityMode | None = None,
-    ) -> int | None:
+    ) -> None:
         durability = durability or self._durability
 
         logfile = self._files.get(logfile_path)
         if not logfile or logfile.closed:
-            return None
+            return
 
-        lsn = self._generate_lsn(log)
         data = self._encode_log(log, lsn)
 
         logfile.write(data)
         self._sync_file(logfile, durability)
 
-        return lsn
-
-    def _generate_lsn(self, log: Log[T]) -> int | None:
+    async def _generate_lsn(self, log: Log[T]) -> int | None:
         if not self._enable_lsn:
             return None
 
         if self._lamport_clock is not None:
-            lsn_obj = self._lamport_clock.generate()
+            lsn_obj = await self._lamport_clock.generate()
             lsn = lsn_obj.to_int()
             log.lsn = lsn
             return lsn
