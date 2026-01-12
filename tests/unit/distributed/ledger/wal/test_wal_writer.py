@@ -5,7 +5,11 @@ from pathlib import Path
 
 import pytest
 
-from hyperscale.distributed.ledger.wal.wal_writer import WALWriter, WriteRequest
+from hyperscale.distributed.ledger.wal.wal_writer import (
+    WALWriter,
+    WALWriterConfig,
+    WriteRequest,
+)
 
 
 @pytest.fixture
