@@ -265,6 +265,20 @@ class WALWriter:
             "peak_batch_size": self._metrics.peak_batch_size,
         }
 
+    def _schedule_state_change_callback(
+        self,
+        queue_state: QueueState,
+        backpressure: BackpressureSignal,
+    ) -> None:
+        callback = self._state_change_callback
+        loop = self._loop
+        if callback is not None and loop is not None:
+
+            async def invoke_callback() -> None:
+                await callback(queue_state, backpressure)
+
+            loop.call_soon(lambda: asyncio.create_task(invoke_callback()))
+
     async def _writer_loop(self) -> None:
         try:
             while self._running:
