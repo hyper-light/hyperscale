@@ -59,7 +59,7 @@ class WorkerLifecycleManager:
         self._logger = logger
 
         # Compute derived ports
-        self._local_udp_port = udp_port + (total_cores ** 2)
+        self._local_udp_port = udp_port + (total_cores**2)
 
         # Initialize monitors
         self._cpu_monitor = CPUMonitor(env)
@@ -91,12 +91,12 @@ class WorkerLifecycleManager:
         """Get list of worker IP/port tuples for local processes."""
         if self._total_cores == 0:
             return []
-        base_worker_port = self._local_udp_port + (self._total_cores ** 2)
+        base_worker_port = self._local_udp_port + (self._total_cores**2)
         return [
             (self._host, port)
             for port in range(
                 base_worker_port,
-                base_worker_port + (self._total_cores ** 2),
+                base_worker_port + (self._total_cores**2),
                 self._total_cores,
             )
         ]
@@ -291,7 +291,8 @@ class WorkerLifecycleManager:
             children = await loop.run_in_executor(None, active_children)
             if children:
                 await asyncio.gather(
-                    *[loop.run_in_executor(None, child.kill) for child in children]
+                    *[loop.run_in_executor(None, child.kill) for child in children],
+                    return_exceptions=True,
                 )
         except RuntimeError:
             for child in active_children():
