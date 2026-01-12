@@ -1823,7 +1823,7 @@ class ManagerServer(HealthAwareServer):
             Tuple of (allowed, retry_after_seconds). If not allowed,
             retry_after_seconds indicates when client can retry.
         """
-        result = self._rate_limiter.check_rate_limit(client_id, operation)
+        result = await self._rate_limiter.check_rate_limit(client_id, operation)
         return result.allowed, result.retry_after_seconds
 
     def _get_rate_limit_metrics(self) -> dict:

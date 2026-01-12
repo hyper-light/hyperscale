@@ -2121,7 +2121,7 @@ class GateServer(HealthAwareServer):
         operation: str,
     ) -> tuple[bool, float]:
         """Check rate limit for an operation."""
-        result = self._rate_limiter.check_rate_limit(client_id, operation)
+        result = await self._rate_limiter.check_rate_limit(client_id, operation)
         return result.allowed, result.retry_after_seconds
 
     def _should_shed_request(self, request_type: str) -> bool:
