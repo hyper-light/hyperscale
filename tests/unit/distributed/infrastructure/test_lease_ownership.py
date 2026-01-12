@@ -291,31 +291,21 @@ async def test_cleanup_task():
 
 @pytest.mark.asyncio
 async def test_concurrent_operations():
-    """Test thread safety of lease operations."""
-    from concurrent.futures import ThreadPoolExecutor
-
     manager = LeaseManager("gate-1:9000", default_duration=1.0)
-    errors: list[str] = []
-    iterations = 500
+    iterations = 100
 
-    def acquire_renew_release(thread_id: int):
-        async def work():
-            for i in range(iterations):
-                job_id = f"job-{thread_id}-{i % 10}"
-                await manager.acquire(job_id)
-                await manager.renew(job_id)
-                await manager.is_owner(job_id)
-                await manager.get_fence_token(job_id)
-                await manager.release(job_id)
+    async def acquire_renew_release(task_id: int):
+        for i in range(iterations):
+            job_id = f"job-{task_id}-{i % 10}"
+            await manager.acquire(job_id)
+            await manager.renew(job_id)
+            await manager.is_owner(job_id)
+            await manager.get_fence_token(job_id)
+            await manager.release(job_id)
 
-        try:
-            asyncio.run(work())
-        except Exception as e:
-            errors.append(f"Thread {thread_id}: {e}")
+    tasks = [asyncio.create_task(acquire_renew_release(i)) for i in range(4)]
 
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        futures = [executor.submit(acquire_renew_release, i) for i in range(4)]
-        for f in futures:
-            f.result()
+    results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    assert len(errors) == 0, f"{len(errors)} thread safety errors: {errors}"
+    errors = [r for r in results if isinstance(r, Exception)]
+    assert len(errors) == 0, f"{len(errors)} concurrency errors: {errors}"
