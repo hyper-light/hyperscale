@@ -153,21 +153,15 @@ class ManagerState:
 
     def get_peer_state_lock(self, peer_addr: tuple[str, int]) -> asyncio.Lock:
         """Get or create a lock for a specific peer address."""
-        if peer_addr not in self._peer_state_locks:
-            self._peer_state_locks[peer_addr] = asyncio.Lock()
-        return self._peer_state_locks[peer_addr]
+        return self._peer_state_locks.setdefault(peer_addr, asyncio.Lock())
 
     def get_gate_state_lock(self, gate_id: str) -> asyncio.Lock:
         """Get or create a lock for a specific gate node_id."""
-        if gate_id not in self._gate_state_locks:
-            self._gate_state_locks[gate_id] = asyncio.Lock()
-        return self._gate_state_locks[gate_id]
+        return self._gate_state_locks.setdefault(gate_id, asyncio.Lock())
 
     def get_workflow_cancellation_lock(self, workflow_id: str) -> asyncio.Lock:
         """Get or create a lock for workflow cancellation."""
-        if workflow_id not in self._workflow_cancellation_locks:
-            self._workflow_cancellation_locks[workflow_id] = asyncio.Lock()
-        return self._workflow_cancellation_locks[workflow_id]
+        return self._workflow_cancellation_locks.setdefault(workflow_id, asyncio.Lock())
 
     def get_dispatch_semaphore(
         self, worker_id: str, max_concurrent: int
