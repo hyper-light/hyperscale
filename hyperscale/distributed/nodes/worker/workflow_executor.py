@@ -237,6 +237,21 @@ class WorkerWorkflowExecutor:
         context_updates: bytes = b""
         progress_token = None
 
+        if self._event_logger is not None:
+            await self._event_logger.log(
+                WorkerJobStarted(
+                    message=f"Started job {dispatch.job_id}",
+                    node_id=node_id_full,
+                    node_host=node_host,
+                    node_port=node_port,
+                    job_id=dispatch.job_id,
+                    workflow_id=dispatch.workflow_id,
+                    allocated_vus=allocated_vus,
+                    allocated_cores=allocated_cores,
+                ),
+                name="worker_events",
+            )
+
         try:
             # Phase 1: Setup
             workflow = dispatch.load_workflow()
