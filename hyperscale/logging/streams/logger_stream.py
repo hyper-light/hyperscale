@@ -31,6 +31,7 @@ from hyperscale.logging.queue import (
     LogConsumer,
     LogProvider,
 )
+from hyperscale.logging.lsn import HybridLamportClock, LSN
 from hyperscale.logging.snowflake import SnowflakeGenerator
 
 from .protocol import LoggerProtocol
