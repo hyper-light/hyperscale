@@ -7,6 +7,7 @@ import pytest
 
 from hyperscale.distributed.ledger.events.event_type import JobEventType
 from hyperscale.distributed.ledger.wal import NodeWAL, WALEntryState
+from hyperscale.distributed.ledger.wal.wal_writer import WALWriterConfig
 from hyperscale.logging.lsn import HybridLamportClock
 
 
@@ -49,14 +50,14 @@ class TestNodeWALBasicOperations:
         wal_path = Path(temp_wal_directory) / "test.wal"
         wal = await NodeWAL.open(path=wal_path, clock=clock)
 
-        entry = await wal.append(
+        result = await wal.append(
             event_type=JobEventType.JOB_CREATED,
             payload=b"test payload",
         )
 
-        assert entry.lsn == 0
-        assert entry.state == WALEntryState.PENDING
-        assert entry.payload == b"test payload"
+        assert result.entry.lsn == 0
+        assert result.entry.state == WALEntryState.PENDING
+        assert result.entry.payload == b"test payload"
         assert wal.next_lsn == 1
         assert wal.last_synced_lsn == 0
         assert wal.pending_count == 1
@@ -72,21 +73,21 @@ class TestNodeWALBasicOperations:
         wal_path = Path(temp_wal_directory) / "test.wal"
         wal = await NodeWAL.open(path=wal_path, clock=clock)
 
-        entries = []
+        results = []
         for idx in range(10):
-            entry = await wal.append(
+            result = await wal.append(
                 event_type=JobEventType.JOB_CREATED,
                 payload=f"payload_{idx}".encode(),
             )
-            entries.append(entry)
+            results.append(result)
 
-        assert len(entries) == 10
+        assert len(results) == 10
         assert wal.next_lsn == 10
         assert wal.last_synced_lsn == 9
         assert wal.pending_count == 10
 
-        for idx, entry in enumerate(entries):
-            assert entry.lsn == idx
+        for idx, result in enumerate(results):
+            assert result.entry.lsn == idx
 
         await wal.close()
 
@@ -152,12 +153,12 @@ class TestNodeWALRecovery:
         await wal.close()
 
         wal = await NodeWAL.open(path=wal_path, clock=clock)
-        entry = await wal.append(
+        result = await wal.append(
             event_type=JobEventType.JOB_CREATED,
             payload=b"after_recovery",
         )
 
-        assert entry.lsn == 3
+        assert result.entry.lsn == 3
 
         await wal.close()
 
@@ -172,12 +173,12 @@ class TestNodeWALStateTransitions:
         wal_path = Path(temp_wal_directory) / "test.wal"
         wal = await NodeWAL.open(path=wal_path, clock=clock)
 
-        entry = await wal.append(
+        result = await wal.append(
             event_type=JobEventType.JOB_CREATED,
             payload=b"test",
         )
 
-        await wal.mark_regional(entry.lsn)
+        await wal.mark_regional(result.entry.lsn)
 
         pending = wal.get_pending_entries()
         assert len(pending) == 1
@@ -194,13 +195,13 @@ class TestNodeWALStateTransitions:
         wal_path = Path(temp_wal_directory) / "test.wal"
         wal = await NodeWAL.open(path=wal_path, clock=clock)
 
-        entry = await wal.append(
+        result = await wal.append(
             event_type=JobEventType.JOB_CREATED,
             payload=b"test",
         )
 
-        await wal.mark_regional(entry.lsn)
-        await wal.mark_global(entry.lsn)
+        await wal.mark_regional(result.entry.lsn)
+        await wal.mark_global(result.entry.lsn)
 
         pending = wal.get_pending_entries()
         assert len(pending) == 1
@@ -217,14 +218,14 @@ class TestNodeWALStateTransitions:
         wal_path = Path(temp_wal_directory) / "test.wal"
         wal = await NodeWAL.open(path=wal_path, clock=clock)
 
-        entry = await wal.append(
+        result = await wal.append(
             event_type=JobEventType.JOB_CREATED,
             payload=b"test",
         )
 
-        await wal.mark_regional(entry.lsn)
-        await wal.mark_global(entry.lsn)
-        await wal.mark_applied(entry.lsn)
+        await wal.mark_regional(result.entry.lsn)
+        await wal.mark_global(result.entry.lsn)
+        await wal.mark_applied(result.entry.lsn)
 
         pending = wal.get_pending_entries()
         assert len(pending) == 0
@@ -241,14 +242,14 @@ class TestNodeWALStateTransitions:
         wal = await NodeWAL.open(path=wal_path, clock=clock)
 
         for idx in range(5):
-            entry = await wal.append(
+            result = await wal.append(
                 event_type=JobEventType.JOB_CREATED,
                 payload=f"entry_{idx}".encode(),
             )
             if idx < 3:
-                await wal.mark_regional(entry.lsn)
-                await wal.mark_global(entry.lsn)
-                await wal.mark_applied(entry.lsn)
+                await wal.mark_regional(result.entry.lsn)
+                await wal.mark_global(result.entry.lsn)
+                await wal.mark_applied(result.entry.lsn)
 
         compacted = await wal.compact(up_to_lsn=2)
 
@@ -269,22 +270,22 @@ class TestNodeWALConcurrency:
         wal = await NodeWAL.open(path=wal_path, clock=clock)
 
         async def append_entries(prefix: str, count: int):
-            entries = []
+            results = []
             for idx in range(count):
-                entry = await wal.append(
+                result = await wal.append(
                     event_type=JobEventType.JOB_CREATED,
                     payload=f"{prefix}_{idx}".encode(),
                 )
-                entries.append(entry)
-            return entries
+                results.append(result)
+            return results
 
-        results = await asyncio.gather(
+        all_results = await asyncio.gather(
             append_entries("task_a", 20),
             append_entries("task_b", 20),
             append_entries("task_c", 20),
         )
 
-        all_entries = [entry for batch in results for entry in batch]
+        all_entries = [result.entry for batch in all_results for result in batch]
         all_lsns = [entry.lsn for entry in all_entries]
 
         assert len(all_lsns) == 60
@@ -309,12 +310,12 @@ class TestNodeWALConcurrency:
 
         async def append_entries(count: int):
             for _ in range(count):
-                entry = await wal.append(
+                result = await wal.append(
                     event_type=JobEventType.JOB_CREATED,
                     payload=b"test",
                 )
                 async with entries_lock:
-                    appended_entries.append(entry.lsn)
+                    appended_entries.append(result.entry.lsn)
 
         async def transition_entries():
             await asyncio.sleep(0.001)
@@ -349,11 +350,8 @@ class TestNodeWALConcurrency:
         clock: HybridLamportClock,
     ):
         wal_path = Path(temp_wal_directory) / "test.wal"
-        wal = await NodeWAL.open(
-            path=wal_path,
-            clock=clock,
-            batch_max_entries=100,
-        )
+        config = WALWriterConfig(batch_max_entries=100)
+        wal = await NodeWAL.open(path=wal_path, clock=clock, config=config)
 
         async def writer(writer_id: int, count: int):
             for idx in range(count):
@@ -445,12 +443,12 @@ class TestNodeWALEdgeCases:
 
         large_payload = b"x" * (1024 * 100)
 
-        entry = await wal.append(
+        result = await wal.append(
             event_type=JobEventType.JOB_CREATED,
             payload=large_payload,
         )
 
-        assert entry.payload == large_payload
+        assert result.entry.payload == large_payload
 
         await wal.close()
 
@@ -531,3 +529,79 @@ class TestNodeWALDurability:
             assert entry.payload == f"durable_entry_{idx}".encode()
 
         await recovered.close()
+
+
+class TestNodeWALBackpressure:
+    @pytest.mark.asyncio
+    async def test_append_returns_backpressure_info(
+        self,
+        temp_wal_directory: str,
+        clock: HybridLamportClock,
+    ):
+        wal_path = Path(temp_wal_directory) / "test.wal"
+        wal = await NodeWAL.open(path=wal_path, clock=clock)
+
+        result = await wal.append(
+            event_type=JobEventType.JOB_CREATED,
+            payload=b"test",
+        )
+
+        assert result.queue_result is not None
+        assert result.queue_result.accepted is True
+        assert result.backpressure is not None
+
+        await wal.close()
+
+    @pytest.mark.asyncio
+    async def test_wal_exposes_backpressure_level(
+        self,
+        temp_wal_directory: str,
+        clock: HybridLamportClock,
+    ):
+        wal_path = Path(temp_wal_directory) / "test.wal"
+        wal = await NodeWAL.open(path=wal_path, clock=clock)
+
+        from hyperscale.distributed.reliability.backpressure import BackpressureLevel
+
+        assert wal.backpressure_level == BackpressureLevel.NONE
+
+        await wal.close()
+
+    @pytest.mark.asyncio
+    async def test_wal_exposes_queue_state(
+        self,
+        temp_wal_directory: str,
+        clock: HybridLamportClock,
+    ):
+        wal_path = Path(temp_wal_directory) / "test.wal"
+        wal = await NodeWAL.open(path=wal_path, clock=clock)
+
+        from hyperscale.distributed.reliability.robust_queue import QueueState
+
+        assert wal.queue_state == QueueState.HEALTHY
+
+        await wal.close()
+
+    @pytest.mark.asyncio
+    async def test_wal_exposes_metrics(
+        self,
+        temp_wal_directory: str,
+        clock: HybridLamportClock,
+    ):
+        wal_path = Path(temp_wal_directory) / "test.wal"
+        wal = await NodeWAL.open(path=wal_path, clock=clock)
+
+        for _ in range(5):
+            await wal.append(
+                event_type=JobEventType.JOB_CREATED,
+                payload=b"test",
+            )
+
+        metrics = wal.get_metrics()
+
+        assert "total_submitted" in metrics
+        assert "total_written" in metrics
+        assert metrics["total_submitted"] == 5
+        assert metrics["total_written"] == 5
+
+        await wal.close()
