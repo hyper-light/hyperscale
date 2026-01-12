@@ -253,6 +253,17 @@ class ManagerState:
         self._job_timeout_strategies.pop(job_id, None)
         self._job_aggregated_results.pop(job_id, None)
         self.clear_cancellation_state(job_id)
+        self._workflow_cancellation_locks.pop(job_id, None)
+
+    def remove_gate_lock(self, gate_id: str) -> None:
+        """Remove lock when gate disconnects to prevent memory leak."""
+        self._gate_state_locks.pop(gate_id, None)
+        self._gate_state_epoch.pop(gate_id, None)
+
+    def remove_peer_lock(self, peer_addr: tuple[str, int]) -> None:
+        """Remove lock when manager peer disconnects to prevent memory leak."""
+        self._peer_state_locks.pop(peer_addr, None)
+        self._peer_state_epoch.pop(peer_addr, None)
 
     def get_quorum_metrics(self) -> dict:
         """Get quorum-related metrics."""
