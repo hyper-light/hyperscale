@@ -3213,10 +3213,10 @@ class ManagerServer(HealthAwareServer):
         try:
             # Rate limit check (AD-24)
             client_id = f"{addr[0]}:{addr[1]}"
-            allowed, retry_after = await self._rate_limiter.check_rate_limit(
+            rate_limit_result = await self._rate_limiter.check_rate_limit(
                 client_id, "job_submit"
             )
-            if not allowed:
+            if not rate_limit_result.allowed:
                 return RateLimitResponse(
                     operation="job_submit",
                     retry_after_seconds=retry_after,
