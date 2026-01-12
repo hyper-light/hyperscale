@@ -73,6 +73,7 @@ class GateJobHandler:
         quorum_circuit: "ErrorStats",
         load_shedder: "LoadShedder",
         job_lease_manager: object,
+        idempotency_cache: GateIdempotencyCache[bytes] | None,
         get_node_id: Callable[[], "NodeId"],
         get_host: Callable[[], str],
         get_tcp_port: Callable[[], int],
@@ -129,6 +130,7 @@ class GateJobHandler:
         self._quorum_circuit = quorum_circuit
         self._load_shedder = load_shedder
         self._job_lease_manager = job_lease_manager
+        self._idempotency_cache = idempotency_cache
         self._get_node_id = get_node_id
         self._get_host = get_host
         self._get_tcp_port = get_tcp_port
