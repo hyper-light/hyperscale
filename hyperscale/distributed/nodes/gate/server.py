@@ -2725,7 +2725,15 @@ class GateServer(HealthAwareServer):
 
             return False
 
-        except Exception:
+        except Exception as sync_error:
+            await self._udp_logger.log(
+                ServerWarning(
+                    message=f"Failed to sync state from peer: {sync_error}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
             return False
 
     async def _register_with_managers(self) -> None:
