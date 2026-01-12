@@ -79,7 +79,6 @@ class Env(BaseModel):
         10.0  # How often to clean up expired job leases
     )
 
-    # Idempotency Settings (AD-40)
     IDEMPOTENCY_PENDING_TTL_SECONDS: StrictFloat = 60.0
     IDEMPOTENCY_COMMITTED_TTL_SECONDS: StrictFloat = 300.0
     IDEMPOTENCY_REJECTED_TTL_SECONDS: StrictFloat = 60.0
@@ -89,6 +88,7 @@ class Env(BaseModel):
     IDEMPOTENCY_PENDING_WAIT_TIMEOUT: StrictFloat = 30.0
 
     # Cluster Formation Settings
+
     CLUSTER_STABILIZATION_TIMEOUT: StrictFloat = (
         10.0  # Max seconds to wait for cluster to form
     )
