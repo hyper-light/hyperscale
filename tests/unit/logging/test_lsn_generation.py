@@ -189,8 +189,8 @@ class TestLSNWithDifferentInstanceIds:
         assert lsn2 is not None
         assert lsn1 != lsn2
 
-        instance1_from_lsn = (lsn1 >> 12) & 0x3FF
-        instance2_from_lsn = (lsn2 >> 12) & 0x3FF
+        instance1_from_lsn = (lsn1 >> 64) & 0xFFFF
+        instance2_from_lsn = (lsn2 >> 64) & 0xFFFF
 
         assert instance1_from_lsn == 1
         assert instance2_from_lsn == 2

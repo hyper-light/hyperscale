@@ -510,8 +510,17 @@ class LoggerStream:
                 self._close_file_at_path,
                 logfile_path,
             )
+
+            read_file = self._read_files.get(logfile_path)
+            if read_file and not read_file.closed:
+                await self._loop.run_in_executor(None, read_file.close)
         finally:
             file_lock.release()
+
+        self._files.pop(logfile_path, None)
+        self._file_locks.pop(logfile_path, None)
+        self._read_files.pop(logfile_path, None)
+        self._read_locks.pop(logfile_path, None)
 
     def _close_file_at_path(self, logfile_path: str):
         logfile = self._files.get(logfile_path)

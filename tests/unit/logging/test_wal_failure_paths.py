@@ -65,7 +65,7 @@ class TestTruncatedData:
         log_path = os.path.join(temp_log_directory, "header_only.wal")
 
         header = struct.pack("<I", 0)
-        header += struct.pack("<IQ", 100, 12345)
+        header += struct.pack("<IQQ", 100, 0, 12345)
 
         with open(log_path, "wb") as log_file:
             log_file.write(header)
