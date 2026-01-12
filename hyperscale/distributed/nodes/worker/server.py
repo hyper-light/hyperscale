@@ -799,15 +799,13 @@ class WorkerServer(HealthAwareServer):
     # Lock Helpers (Section 8)
     # =========================================================================
 
-    def _get_job_transfer_lock(self, job_id: str) -> asyncio.Lock:
-        """Get or create a lock for job leadership transfers."""
-        return self._worker_state.get_or_create_job_transfer_lock(job_id)
+    async def _get_job_transfer_lock(self, job_id: str) -> asyncio.Lock:
+        return await self._worker_state.get_or_create_job_transfer_lock(job_id)
 
-    def _validate_transfer_fence_token(
+    async def _validate_transfer_fence_token(
         self, job_id: str, new_fence_token: int
     ) -> tuple[bool, str]:
-        """Validate a transfer's fence token."""
-        current_token = self._worker_state.get_job_fence_token(job_id)
+        current_token = await self._worker_state.get_job_fence_token(job_id)
         if new_fence_token <= current_token:
             return (
                 False,
