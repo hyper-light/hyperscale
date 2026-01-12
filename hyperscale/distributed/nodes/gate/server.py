@@ -1212,6 +1212,21 @@ class GateServer(HealthAwareServer):
         transport: asyncio.Transport,
     ):
         """Handle job final result from manager."""
+        try:
+            result = JobFinalResult.load(data)
+            success = result.status in ("COMPLETED", "completed")
+            latency_ms = self._dispatch_time_tracker.record_completion(
+                result.job_id,
+                result.datacenter,
+                success=success,
+            )
+            if latency_ms is not None:
+                self._observed_latency_tracker.record_job_latency(
+                    result.datacenter, latency_ms
+                )
+        except Exception:
+            pass
+
         if self._state_sync_handler:
             return await self._state_sync_handler.handle_job_final_result(
                 addr, data, self._complete_job, self.handle_exception
