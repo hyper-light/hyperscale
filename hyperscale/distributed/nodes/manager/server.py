@@ -2316,7 +2316,17 @@ class ManagerServer(HealthAwareServer):
         try:
             result = WorkflowFinalResult.load(data)
 
-            # Update job manager
+            for stats in result.results:
+                if stats and isinstance(stats, dict) and "elapsed" in stats:
+                    elapsed_seconds = stats.get("elapsed", 0)
+                    if (
+                        isinstance(elapsed_seconds, (int, float))
+                        and elapsed_seconds > 0
+                    ):
+                        self._manager_state.record_workflow_latency(
+                            elapsed_seconds * 1000.0
+                        )
+
             self._job_manager.complete_workflow(
                 job_id=result.job_id,
                 workflow_id=result.workflow_id,
@@ -2324,10 +2334,8 @@ class ManagerServer(HealthAwareServer):
                 results=result.results,
             )
 
-            # Check if job is complete
             job = self._job_manager.get_job(result.job_id)
             if job and job.is_complete:
-                # Handle job completion
                 await self._handle_job_completion(result.job_id)
 
             return b"ok"
