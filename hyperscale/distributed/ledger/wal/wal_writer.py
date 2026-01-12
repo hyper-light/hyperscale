@@ -1,18 +1,18 @@
 from __future__ import annotations
 
+import asyncio
 import io
 import os
 import queue
-import threading
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
 
 
 @dataclass(slots=True)
 class WriteRequest:
     data: bytes
-    on_complete: Callable[[BaseException | None], None]
+    future: asyncio.Future[None]
 
 
 @dataclass(slots=True)
@@ -37,11 +37,11 @@ class WALWriter:
     Dedicated writer thread for WAL with group commit.
 
     Design principles:
-    - Single thread owns the file handle exclusively (no races, no leaks)
+    - Single-worker ThreadPoolExecutor owns the file handle exclusively
     - Batches writes: collect for N microseconds OR until batch full
     - Single write() + single fsync() commits entire batch
-    - Resolves all futures in batch after fsync completes
-    - File handle cleanup guaranteed by thread ownership
+    - Single call_soon_threadsafe resolves all futures in batch
+    - File handle cleanup guaranteed by executor thread ownership
 
     Throughput model:
     - fsync at 500μs = 2,000 batches/sec
@@ -53,7 +53,10 @@ class WALWriter:
         "_path",
         "_file",
         "_queue",
-        "_thread",
+        "_executor",
+        "_writer_future",
+        "_loop",
+        "_ready_event",
         "_running",
         "_batch_timeout_seconds",
         "_batch_max_entries",
@@ -72,7 +75,10 @@ class WALWriter:
         self._path = path
         self._file: io.FileIO | None = None
         self._queue: queue.Queue[WriteRequest | None] = queue.Queue()
-        self._thread: threading.Thread | None = None
+        self._executor: ThreadPoolExecutor | None = None
+        self._writer_future: Future[None] | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._ready_event: asyncio.Event | None = None
         self._running = False
         self._batch_timeout_seconds = batch_timeout_microseconds / 1_000_000
         self._batch_max_entries = batch_max_entries
@@ -80,36 +86,60 @@ class WALWriter:
         self._current_batch = WriteBatch()
         self._error: BaseException | None = None
 
-    def start(self) -> None:
+    async def start(self) -> None:
         if self._running:
             return
 
+        self._loop = asyncio.get_running_loop()
+        self._ready_event = asyncio.Event()
         self._running = True
-        self._thread = threading.Thread(
-            target=self._run,
-            name=f"wal-writer-{self._path.name}",
-            daemon=True,
-        )
-        self._thread.start()
 
-    def stop(self) -> None:
+        self._executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix=f"wal-writer-{self._path.name}",
+        )
+
+        self._writer_future = self._executor.submit(self._run)
+
+        await self._ready_event.wait()
+
+    async def stop(self) -> None:
         if not self._running:
             return
 
         self._running = False
         self._queue.put(None)
 
-        if self._thread is not None:
-            self._thread.join(timeout=5.0)
-            self._thread = None
+        if self._writer_future is not None:
+            loop = self._loop
+            assert loop is not None
+
+            await loop.run_in_executor(None, self._writer_future.result)
+            self._writer_future = None
+
+        if self._executor is not None:
+            self._executor.shutdown(wait=True)
+            self._executor = None
 
     def submit(self, request: WriteRequest) -> None:
         if not self._running:
-            request.on_complete(RuntimeError("WAL writer is not running"))
+            loop = self._loop
+            if loop is not None:
+                loop.call_soon_threadsafe(
+                    self._resolve_future,
+                    request.future,
+                    RuntimeError("WAL writer is not running"),
+                )
             return
 
         if self._error is not None:
-            request.on_complete(self._error)
+            loop = self._loop
+            if loop is not None:
+                loop.call_soon_threadsafe(
+                    self._resolve_future,
+                    request.future,
+                    self._error,
+                )
             return
 
         self._queue.put(request)
@@ -129,12 +159,20 @@ class WALWriter:
     def _run(self) -> None:
         try:
             self._open_file()
+            self._signal_ready()
             self._process_loop()
         except BaseException as exception:
             self._error = exception
             self._fail_pending_requests(exception)
         finally:
             self._close_file()
+
+    def _signal_ready(self) -> None:
+        loop = self._loop
+        ready_event = self._ready_event
+
+        if loop is not None and ready_event is not None:
+            loop.call_soon_threadsafe(ready_event.set)
 
     def _open_file(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -198,8 +236,11 @@ class WALWriter:
             self._file.flush()
             os.fsync(self._file.fileno())
 
-            for request in self._current_batch.requests:
-                request.on_complete(None)
+            futures = [request.future for request in self._current_batch.requests]
+
+            loop = self._loop
+            if loop is not None:
+                loop.call_soon_threadsafe(self._resolve_batch, futures, None)
 
         except BaseException as exception:
             self._fail_batch(exception)
@@ -208,25 +249,57 @@ class WALWriter:
         finally:
             self._current_batch.clear()
 
+    def _resolve_batch(
+        self,
+        futures: list[asyncio.Future[None]],
+        error: BaseException | None,
+    ) -> None:
+        for future in futures:
+            if future.cancelled():
+                continue
+
+            self._resolve_future(future, error)
+
+    def _resolve_future(
+        self,
+        future: asyncio.Future[None],
+        error: BaseException | None,
+    ) -> None:
+        if future.done():
+            return
+
+        if error is not None:
+            future.set_exception(error)
+        else:
+            future.set_result(None)
+
     def _fail_batch(self, exception: BaseException) -> None:
-        for request in self._current_batch.requests:
-            try:
-                request.on_complete(exception)
-            except Exception:
-                pass
+        futures = [request.future for request in self._current_batch.requests]
+
+        loop = self._loop
+        if loop is not None:
+            loop.call_soon_threadsafe(self._resolve_batch, futures, exception)
 
         self._current_batch.clear()
 
     def _fail_pending_requests(self, exception: BaseException) -> None:
         self._fail_batch(exception)
 
+        pending_futures: list[asyncio.Future[None]] = []
+
         while True:
             try:
                 request = self._queue.get_nowait()
                 if request is not None:
-                    try:
-                        request.on_complete(exception)
-                    except Exception:
-                        pass
+                    pending_futures.append(request.future)
             except queue.Empty:
                 break
+
+        if pending_futures:
+            loop = self._loop
+            if loop is not None:
+                loop.call_soon_threadsafe(
+                    self._resolve_batch,
+                    pending_futures,
+                    exception,
+                )
