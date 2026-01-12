@@ -1807,7 +1807,7 @@ class ManagerServer(HealthAwareServer):
         """Get job leaderships for heartbeat embedding."""
         return self._leases.get_led_job_ids()
 
-    def _check_rate_limit_for_operation(
+    async def _check_rate_limit_for_operation(
         self,
         client_id: str,
         operation: str,
