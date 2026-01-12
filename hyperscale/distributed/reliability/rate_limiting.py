@@ -390,7 +390,7 @@ class AdaptiveRateLimiter:
         self._async_lock = asyncio.Lock()
         self._counter_creation_lock = asyncio.Lock()
 
-    def check(
+    async def check(
         self,
         client_id: str,
         operation: str = "default",
@@ -418,34 +418,26 @@ class AdaptiveRateLimiter:
         self._total_requests += 1
         self._client_last_activity[client_id] = time.monotonic()
 
-        # Get current system state
         state = self._detector.get_state()
 
-        # Check priority-based bypass first (CRITICAL always passes)
         if priority == RequestPriority.CRITICAL:
             self._allowed_requests += 1
             self._global_counter.try_acquire(tokens)
             return RateLimitResult(allowed=True, retry_after_seconds=0.0)
 
-        # OVERLOADED: Only CRITICAL passes (handled above)
         if state == OverloadState.OVERLOADED:
             return self._reject_request(state)
 
-        # STRESSED: Apply per-client fair-share limiting
         if state == OverloadState.STRESSED:
-            return self._check_stress_counter(client_id, state, tokens)
+            return await self._check_stress_counter(client_id, state, tokens)
 
-        # BUSY: Check priority then per-operation limits
         if state == OverloadState.BUSY:
-            # LOW priority is shed unconditionally during BUSY
             if priority == RequestPriority.LOW:
                 return self._reject_request(state)
-            # HIGH and NORMAL go through operation limits
 
-        # HEALTHY or BUSY (non-LOW): Apply per-operation limits
-        return self._check_operation_counter(client_id, operation, state, tokens)
+        return await self._check_operation_counter(client_id, operation, state, tokens)
 
-    def check_simple(
+    async def check_simple(
         self,
         client_id: str,
         priority: RequestPriority = RequestPriority.NORMAL,
@@ -463,7 +455,7 @@ class AdaptiveRateLimiter:
         Returns:
             RateLimitResult indicating if request is allowed
         """
-        return self.check(client_id, "default", priority)
+        return await self.check(client_id, "default", priority)
 
     async def check_async(
         self,
