@@ -2177,7 +2177,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         ]
         self._probe_scheduler.update_members(members)
 
-        protocol_period = self._context.read("udp_poll_interval", 1.0)
+        protocol_period = await self._context.read("udp_poll_interval", 1.0)
         self._probe_scheduler.protocol_period = protocol_period
 
         while self._running and self._probe_scheduler._running:
@@ -2217,7 +2217,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             node_state = self._incarnation_tracker.get_node_state(target)
             incarnation = node_state.incarnation if node_state else 0
 
-            base_timeout = self._context.read("current_timeout")
+            base_timeout = await self._context.read("current_timeout")
             timeout = self.get_lhm_adjusted_timeout(base_timeout)
 
             target_addr = f"{target[0]}:{target[1]}".encode()
@@ -3251,7 +3251,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         if not proxies:
             return False
 
-        base_timeout = self._context.read("current_timeout")
+        base_timeout = await self._context.read("current_timeout")
         timeout = self.get_lhm_adjusted_timeout(base_timeout)
 
         probe = self._indirect_probe_manager.start_indirect_probe(
@@ -3365,7 +3365,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         self_addr_bytes = f"{self_addr[0]}:{self_addr[1]}".encode()
         msg = b"alive:" + str(new_incarnation).encode() + b">" + self_addr_bytes
 
-        base_timeout = self._context.read("current_timeout")
+        base_timeout = await self._context.read("current_timeout")
         timeout = self.get_lhm_adjusted_timeout(base_timeout)
 
         successful = 0
@@ -3456,7 +3456,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         target_addr_bytes = f"{target[0]}:{target[1]}".encode()
         msg = b"suspect:" + str(incarnation).encode() + b">" + target_addr_bytes
 
-        base_timeout = self._context.read("current_timeout")
+        base_timeout = await self._context.read("current_timeout")
         timeout = self.get_lhm_adjusted_timeout(base_timeout)
 
         successful = 0
@@ -3521,7 +3521,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         Returns True on success, False on failure.
         """
         if timeout is None:
-            base_timeout = self._context.read("current_timeout")
+            base_timeout = await self._context.read("current_timeout")
             timeout = self.get_lhm_adjusted_timeout(base_timeout)
 
         try:
@@ -3547,7 +3547,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
 
         Returns True if target appears alive, False otherwise.
         """
-        base_timeout = self._context.read("current_timeout")
+        base_timeout = await self._context.read("current_timeout")
         timeout = self.get_lhm_adjusted_timeout(base_timeout)
 
         target_addr = f"{target[0]}:{target[1]}".encode()
