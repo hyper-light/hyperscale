@@ -26,13 +26,13 @@ class Env(BaseModel):
     MERCURY_SYNC_ENABLE_REQUEST_CACHING: StrictBool = False
     MERCURY_SYNC_VERIFY_SSL_CERT: Literal["REQUIRED", "OPTIONAL", "NONE"] = "REQUIRED"
     MERCURY_SYNC_TLS_VERIFY_HOSTNAME: StrictStr = "false"  # Set to "true" in production
-    
+
     # Monitor Settings (for CPU/Memory monitors in workers)
     MERCURY_SYNC_MONITOR_SAMPLE_WINDOW: StrictStr = "5s"
     MERCURY_SYNC_MONITOR_SAMPLE_INTERVAL: StrictStr | StrictInt | StrictFloat = 0.1
     MERCURY_SYNC_PROCESS_JOB_CPU_LIMIT: StrictFloat | StrictInt = 85
     MERCURY_SYNC_PROCESS_JOB_MEMORY_LIMIT: StrictInt | StrictFloat = 2048
-    
+
     # Local Server Pool / RemoteGraphManager Settings (used by workers)
     MERCURY_SYNC_CONNECT_TIMEOUT: StrictStr = "1s"
     MERCURY_SYNC_RETRY_INTERVAL: StrictStr = "1s"
@@ -43,7 +43,7 @@ class Env(BaseModel):
     MERCURY_SYNC_CONTEXT_POLL_RATE: StrictStr = "0.1s"
     MERCURY_SYNC_SHUTDOWN_POLL_RATE: StrictStr = "0.1s"
     MERCURY_SYNC_DUPLICATE_JOB_POLICY: Literal["reject", "replace"] = "replace"
-    
+
     # SWIM Protocol Settings
     # Tuned for faster failure detection while avoiding false positives:
     # - Total detection time: ~4-8 seconds (probe timeout + suspicion)
@@ -52,132 +52,235 @@ class Env(BaseModel):
     SWIM_MIN_PROBE_TIMEOUT: StrictInt = 1
     SWIM_CURRENT_TIMEOUT: StrictInt = 1  # Reduced from 2 - faster initial probe timeout
     SWIM_UDP_POLL_INTERVAL: StrictInt = 1  # Reduced from 2 - more frequent probing
-    SWIM_SUSPICION_MIN_TIMEOUT: StrictFloat = 1.5  # Reduced from 2.0 - faster confirmation
-    SWIM_SUSPICION_MAX_TIMEOUT: StrictFloat = 8.0  # Reduced from 15.0 - faster failure declaration
+    SWIM_SUSPICION_MIN_TIMEOUT: StrictFloat = (
+        1.5  # Reduced from 2.0 - faster confirmation
+    )
+    SWIM_SUSPICION_MAX_TIMEOUT: StrictFloat = (
+        8.0  # Reduced from 15.0 - faster failure declaration
+    )
     # Refutation rate limiting - prevents incarnation exhaustion attacks
     # If an attacker sends many probes/suspects about us, we limit how fast we increment incarnation
     SWIM_REFUTATION_RATE_LIMIT_TOKENS: StrictInt = 5  # Max refutations per window
     SWIM_REFUTATION_RATE_LIMIT_WINDOW: StrictFloat = 10.0  # Window duration in seconds
-    
+
     # Leader Election Settings
     LEADER_HEARTBEAT_INTERVAL: StrictFloat = 2.0  # Seconds between leader heartbeats
     LEADER_ELECTION_TIMEOUT_BASE: StrictFloat = 5.0  # Base election timeout
     LEADER_ELECTION_TIMEOUT_JITTER: StrictFloat = 2.0  # Random jitter added to timeout
     LEADER_PRE_VOTE_TIMEOUT: StrictFloat = 2.0  # Timeout for pre-vote phase
     LEADER_LEASE_DURATION: StrictFloat = 5.0  # Leader lease duration in seconds
-    LEADER_MAX_LHM: StrictInt = 4  # Max LHM score for leader eligibility (higher = more tolerant)
+    LEADER_MAX_LHM: StrictInt = (
+        4  # Max LHM score for leader eligibility (higher = more tolerant)
+    )
 
     # Job Lease Settings (Gate per-job ownership)
     JOB_LEASE_DURATION: StrictFloat = 30.0  # Duration of job ownership lease in seconds
-    JOB_LEASE_CLEANUP_INTERVAL: StrictFloat = 10.0  # How often to clean up expired job leases
+    JOB_LEASE_CLEANUP_INTERVAL: StrictFloat = (
+        10.0  # How often to clean up expired job leases
+    )
+
+    # Idempotency Settings (AD-40)
+    IDEMPOTENCY_PENDING_TTL_SECONDS: StrictFloat = 60.0
+    IDEMPOTENCY_COMMITTED_TTL_SECONDS: StrictFloat = 300.0
+    IDEMPOTENCY_REJECTED_TTL_SECONDS: StrictFloat = 60.0
+    IDEMPOTENCY_MAX_ENTRIES: StrictInt = 100_000
+    IDEMPOTENCY_CLEANUP_INTERVAL_SECONDS: StrictFloat = 10.0
+    IDEMPOTENCY_WAIT_FOR_PENDING: StrictBool = True
+    IDEMPOTENCY_PENDING_WAIT_TIMEOUT: StrictFloat = 30.0
 
     # Cluster Formation Settings
-    CLUSTER_STABILIZATION_TIMEOUT: StrictFloat = 10.0  # Max seconds to wait for cluster to form
-    CLUSTER_STABILIZATION_POLL_INTERVAL: StrictFloat = 0.5  # How often to check cluster membership
-    LEADER_ELECTION_JITTER_MAX: StrictFloat = 3.0  # Max random delay before starting first election
-    
+    CLUSTER_STABILIZATION_TIMEOUT: StrictFloat = (
+        10.0  # Max seconds to wait for cluster to form
+    )
+    CLUSTER_STABILIZATION_POLL_INTERVAL: StrictFloat = (
+        0.5  # How often to check cluster membership
+    )
+    LEADER_ELECTION_JITTER_MAX: StrictFloat = (
+        3.0  # Max random delay before starting first election
+    )
+
     # Federated Health Monitor Settings (Gate -> DC Leader probing)
     # These are tuned for high-latency, globally distributed links
     FEDERATED_PROBE_INTERVAL: StrictFloat = 2.0  # Seconds between probes to each DC
-    FEDERATED_PROBE_TIMEOUT: StrictFloat = 5.0  # Timeout for single probe (high for cross-DC)
-    FEDERATED_SUSPICION_TIMEOUT: StrictFloat = 30.0  # Time before suspected -> unreachable
-    FEDERATED_MAX_CONSECUTIVE_FAILURES: StrictInt = 5  # Failures before marking suspected
-    
+    FEDERATED_PROBE_TIMEOUT: StrictFloat = (
+        5.0  # Timeout for single probe (high for cross-DC)
+    )
+    FEDERATED_SUSPICION_TIMEOUT: StrictFloat = (
+        30.0  # Time before suspected -> unreachable
+    )
+    FEDERATED_MAX_CONSECUTIVE_FAILURES: StrictInt = (
+        5  # Failures before marking suspected
+    )
+
     # Circuit Breaker Settings
     CIRCUIT_BREAKER_MAX_ERRORS: StrictInt = 3
     CIRCUIT_BREAKER_WINDOW_SECONDS: StrictFloat = 30.0
     CIRCUIT_BREAKER_HALF_OPEN_AFTER: StrictFloat = 10.0
 
     # Worker Progress Update Settings (tuned for real-time terminal UI)
-    WORKER_PROGRESS_UPDATE_INTERVAL: StrictFloat = 0.05  # How often to collect progress locally (50ms)
-    WORKER_PROGRESS_FLUSH_INTERVAL: StrictFloat = 0.05  # How often to send buffered updates to manager (50ms)
+    WORKER_PROGRESS_UPDATE_INTERVAL: StrictFloat = (
+        0.05  # How often to collect progress locally (50ms)
+    )
+    WORKER_PROGRESS_FLUSH_INTERVAL: StrictFloat = (
+        0.05  # How often to send buffered updates to manager (50ms)
+    )
     WORKER_MAX_CORES: StrictInt | None = None
 
     # Worker Dead Manager Cleanup Settings
-    WORKER_DEAD_MANAGER_REAP_INTERVAL: StrictFloat = 900.0  # Seconds before reaping dead managers (15 minutes)
-    WORKER_DEAD_MANAGER_CHECK_INTERVAL: StrictFloat = 60.0  # Seconds between dead manager checks
+    WORKER_DEAD_MANAGER_REAP_INTERVAL: StrictFloat = (
+        900.0  # Seconds before reaping dead managers (15 minutes)
+    )
+    WORKER_DEAD_MANAGER_CHECK_INTERVAL: StrictFloat = (
+        60.0  # Seconds between dead manager checks
+    )
 
     # Worker Cancellation Polling Settings
-    WORKER_CANCELLATION_POLL_INTERVAL: StrictFloat = 5.0  # Seconds between cancellation poll requests
+    WORKER_CANCELLATION_POLL_INTERVAL: StrictFloat = (
+        5.0  # Seconds between cancellation poll requests
+    )
 
     # Worker TCP Timeout Settings
     WORKER_TCP_TIMEOUT_SHORT: StrictFloat = 2.0  # Short timeout for quick operations
-    WORKER_TCP_TIMEOUT_STANDARD: StrictFloat = 5.0  # Standard timeout for progress/result pushes
+    WORKER_TCP_TIMEOUT_STANDARD: StrictFloat = (
+        5.0  # Standard timeout for progress/result pushes
+    )
 
     # Worker Orphan Grace Period Settings (Section 2.7)
     # Grace period before cancelling workflows when job leader manager fails
     # Should be longer than expected election + takeover time
-    WORKER_ORPHAN_GRACE_PERIOD: StrictFloat = 5.0  # Seconds to wait for JobLeaderWorkerTransfer
-    WORKER_ORPHAN_CHECK_INTERVAL: StrictFloat = 1.0  # Seconds between orphan grace period checks
+    WORKER_ORPHAN_GRACE_PERIOD: StrictFloat = (
+        5.0  # Seconds to wait for JobLeaderWorkerTransfer
+    )
+    WORKER_ORPHAN_CHECK_INTERVAL: StrictFloat = (
+        1.0  # Seconds between orphan grace period checks
+    )
 
     # Worker Job Leadership Transfer Settings (Section 8)
     # TTL for pending transfers that arrive before workflows are known
-    WORKER_PENDING_TRANSFER_TTL: StrictFloat = 60.0  # Seconds to retain pending transfers
+    WORKER_PENDING_TRANSFER_TTL: StrictFloat = (
+        60.0  # Seconds to retain pending transfers
+    )
 
     # Manager Startup and Dispatch Settings
-    MANAGER_STARTUP_SYNC_DELAY: StrictFloat = 2.0  # Seconds to wait for leader election before state sync
-    MANAGER_STATE_SYNC_TIMEOUT: StrictFloat = 5.0  # Timeout for state sync request to leader
+    MANAGER_STARTUP_SYNC_DELAY: StrictFloat = (
+        2.0  # Seconds to wait for leader election before state sync
+    )
+    MANAGER_STATE_SYNC_TIMEOUT: StrictFloat = (
+        5.0  # Timeout for state sync request to leader
+    )
     MANAGER_STATE_SYNC_RETRIES: StrictInt = 3  # Number of retries for state sync
-    MANAGER_DISPATCH_CORE_WAIT_TIMEOUT: StrictFloat = 5.0  # Max seconds to wait per iteration for cores
-    MANAGER_HEARTBEAT_INTERVAL: StrictFloat = 5.0  # Seconds between manager heartbeats to gates
-    MANAGER_PEER_SYNC_INTERVAL: StrictFloat = 10.0  # Seconds between job state sync to peer managers
+    MANAGER_DISPATCH_CORE_WAIT_TIMEOUT: StrictFloat = (
+        5.0  # Max seconds to wait per iteration for cores
+    )
+    MANAGER_HEARTBEAT_INTERVAL: StrictFloat = (
+        5.0  # Seconds between manager heartbeats to gates
+    )
+    MANAGER_PEER_SYNC_INTERVAL: StrictFloat = (
+        10.0  # Seconds between job state sync to peer managers
+    )
 
     # Job Cleanup Settings
-    COMPLETED_JOB_MAX_AGE: StrictFloat = 300.0  # Seconds to retain completed jobs (5 minutes)
-    FAILED_JOB_MAX_AGE: StrictFloat = 3600.0  # Seconds to retain failed/cancelled/timeout jobs (1 hour)
+    COMPLETED_JOB_MAX_AGE: StrictFloat = (
+        300.0  # Seconds to retain completed jobs (5 minutes)
+    )
+    FAILED_JOB_MAX_AGE: StrictFloat = (
+        3600.0  # Seconds to retain failed/cancelled/timeout jobs (1 hour)
+    )
     JOB_CLEANUP_INTERVAL: StrictFloat = 60.0  # Seconds between cleanup checks
 
     # Cancelled Workflow Cleanup Settings (Section 6)
-    CANCELLED_WORKFLOW_TTL: StrictFloat = 3600.0  # Seconds to retain cancelled workflow info (1 hour)
-    CANCELLED_WORKFLOW_CLEANUP_INTERVAL: StrictFloat = 60.0  # Seconds between cleanup checks
+    CANCELLED_WORKFLOW_TTL: StrictFloat = (
+        3600.0  # Seconds to retain cancelled workflow info (1 hour)
+    )
+    CANCELLED_WORKFLOW_CLEANUP_INTERVAL: StrictFloat = (
+        60.0  # Seconds between cleanup checks
+    )
 
     # Client Leadership Transfer Settings (Section 9)
-    CLIENT_ORPHAN_GRACE_PERIOD: StrictFloat = 15.0  # Seconds to wait for leadership transfer cascade
-    CLIENT_ORPHAN_CHECK_INTERVAL: StrictFloat = 2.0  # Seconds between orphan grace period checks
-    CLIENT_RESPONSE_FRESHNESS_TIMEOUT: StrictFloat = 10.0  # Seconds to consider response stale after leadership change
+    CLIENT_ORPHAN_GRACE_PERIOD: StrictFloat = (
+        15.0  # Seconds to wait for leadership transfer cascade
+    )
+    CLIENT_ORPHAN_CHECK_INTERVAL: StrictFloat = (
+        2.0  # Seconds between orphan grace period checks
+    )
+    CLIENT_RESPONSE_FRESHNESS_TIMEOUT: StrictFloat = (
+        10.0  # Seconds to consider response stale after leadership change
+    )
 
     # Manager Dead Node Cleanup Settings
-    MANAGER_DEAD_WORKER_REAP_INTERVAL: StrictFloat = 900.0  # Seconds before reaping dead workers (15 minutes)
-    MANAGER_DEAD_PEER_REAP_INTERVAL: StrictFloat = 900.0  # Seconds before reaping dead manager peers (15 minutes)
-    MANAGER_DEAD_GATE_REAP_INTERVAL: StrictFloat = 900.0  # Seconds before reaping dead gates (15 minutes)
-    MANAGER_DEAD_NODE_CHECK_INTERVAL: StrictFloat = 60.0  # Seconds between dead node checks
-    MANAGER_RATE_LIMIT_CLEANUP_INTERVAL: StrictFloat = 60.0  # Seconds between rate limit client cleanup
+    MANAGER_DEAD_WORKER_REAP_INTERVAL: StrictFloat = (
+        900.0  # Seconds before reaping dead workers (15 minutes)
+    )
+    MANAGER_DEAD_PEER_REAP_INTERVAL: StrictFloat = (
+        900.0  # Seconds before reaping dead manager peers (15 minutes)
+    )
+    MANAGER_DEAD_GATE_REAP_INTERVAL: StrictFloat = (
+        900.0  # Seconds before reaping dead gates (15 minutes)
+    )
+    MANAGER_DEAD_NODE_CHECK_INTERVAL: StrictFloat = (
+        60.0  # Seconds between dead node checks
+    )
+    MANAGER_RATE_LIMIT_CLEANUP_INTERVAL: StrictFloat = (
+        60.0  # Seconds between rate limit client cleanup
+    )
 
     # AD-30: Job Responsiveness Settings
     # Threshold for detecting stuck workflows - workers without progress for this duration are suspected
-    JOB_RESPONSIVENESS_THRESHOLD: StrictFloat = 60.0  # Seconds without progress before suspicion
-    JOB_RESPONSIVENESS_CHECK_INTERVAL: StrictFloat = 15.0  # Seconds between responsiveness checks
+    JOB_RESPONSIVENESS_THRESHOLD: StrictFloat = (
+        60.0  # Seconds without progress before suspicion
+    )
+    JOB_RESPONSIVENESS_CHECK_INTERVAL: StrictFloat = (
+        15.0  # Seconds between responsiveness checks
+    )
 
     # AD-34: Job Timeout Settings
     JOB_TIMEOUT_CHECK_INTERVAL: StrictFloat = 30.0  # Seconds between job timeout checks
 
     # Manager TCP Timeout Settings
-    MANAGER_TCP_TIMEOUT_SHORT: StrictFloat = 2.0  # Short timeout for quick operations (peer sync, worker queries)
-    MANAGER_TCP_TIMEOUT_STANDARD: StrictFloat = 5.0  # Standard timeout for job dispatch, result forwarding
+    MANAGER_TCP_TIMEOUT_SHORT: StrictFloat = (
+        2.0  # Short timeout for quick operations (peer sync, worker queries)
+    )
+    MANAGER_TCP_TIMEOUT_STANDARD: StrictFloat = (
+        5.0  # Standard timeout for job dispatch, result forwarding
+    )
 
     # Manager Batch Stats Settings
-    MANAGER_BATCH_PUSH_INTERVAL: StrictFloat = 0.25  # Seconds between batch stats pushes to clients (when no gates)
+    MANAGER_BATCH_PUSH_INTERVAL: StrictFloat = (
+        0.25  # Seconds between batch stats pushes to clients (when no gates)
+    )
 
     # ==========================================================================
     # Gate Settings
     # ==========================================================================
     GATE_JOB_CLEANUP_INTERVAL: StrictFloat = 60.0  # Seconds between job cleanup checks
-    GATE_RATE_LIMIT_CLEANUP_INTERVAL: StrictFloat = 60.0  # Seconds between rate limit client cleanup
-    GATE_BATCH_STATS_INTERVAL: StrictFloat = 0.25  # Seconds between batch stats pushes to clients
+    GATE_RATE_LIMIT_CLEANUP_INTERVAL: StrictFloat = (
+        60.0  # Seconds between rate limit client cleanup
+    )
+    GATE_BATCH_STATS_INTERVAL: StrictFloat = (
+        0.25  # Seconds between batch stats pushes to clients
+    )
     GATE_TCP_TIMEOUT_SHORT: StrictFloat = 2.0  # Short timeout for quick operations
-    GATE_TCP_TIMEOUT_STANDARD: StrictFloat = 5.0  # Standard timeout for job dispatch, result forwarding
+    GATE_TCP_TIMEOUT_STANDARD: StrictFloat = (
+        5.0  # Standard timeout for job dispatch, result forwarding
+    )
     GATE_TCP_TIMEOUT_FORWARD: StrictFloat = 3.0  # Timeout for forwarding to peers
 
     # Gate Orphan Job Grace Period Settings (Section 7)
     # Grace period before marking orphaned jobs as failed when job leader manager dies
     # Should be longer than expected election + takeover time
-    GATE_ORPHAN_GRACE_PERIOD: StrictFloat = 10.0  # Seconds to wait for JobLeaderGateTransfer
-    GATE_ORPHAN_CHECK_INTERVAL: StrictFloat = 2.0  # Seconds between orphan grace period checks
+    GATE_ORPHAN_GRACE_PERIOD: StrictFloat = (
+        10.0  # Seconds to wait for JobLeaderGateTransfer
+    )
+    GATE_ORPHAN_CHECK_INTERVAL: StrictFloat = (
+        2.0  # Seconds between orphan grace period checks
+    )
 
     # ==========================================================================
     # Overload Detection Settings (AD-18)
     # ==========================================================================
-    OVERLOAD_EMA_ALPHA: StrictFloat = 0.1  # Smoothing factor for baseline (lower = more stable)
+    OVERLOAD_EMA_ALPHA: StrictFloat = (
+        0.1  # Smoothing factor for baseline (lower = more stable)
+    )
     OVERLOAD_CURRENT_WINDOW: StrictInt = 10  # Samples for current average
     OVERLOAD_TREND_WINDOW: StrictInt = 20  # Samples for trend calculation
     OVERLOAD_MIN_SAMPLES: StrictInt = 3  # Minimum samples before delta detection
@@ -223,7 +326,9 @@ class Env(BaseModel):
     # ==========================================================================
     RATE_LIMIT_DEFAULT_BUCKET_SIZE: StrictInt = 100  # Default token bucket size
     RATE_LIMIT_DEFAULT_REFILL_RATE: StrictFloat = 10.0  # Tokens per second
-    RATE_LIMIT_CLIENT_IDLE_TIMEOUT: StrictFloat = 300.0  # Cleanup idle clients after 5min
+    RATE_LIMIT_CLIENT_IDLE_TIMEOUT: StrictFloat = (
+        300.0  # Cleanup idle clients after 5min
+    )
     RATE_LIMIT_CLEANUP_INTERVAL: StrictFloat = 60.0  # Run cleanup every minute
     RATE_LIMIT_MAX_RETRIES: StrictInt = 3  # Max retry attempts when rate limited
     RATE_LIMIT_MAX_TOTAL_WAIT: StrictFloat = 60.0  # Max total wait time for retries
@@ -238,12 +343,20 @@ class Env(BaseModel):
     RECOVERY_JITTER_MIN: StrictFloat = 0.05  # Reduced from 0.1 - minimal delay
 
     # Concurrency caps - limit simultaneous recovery operations to prevent overload
-    RECOVERY_MAX_CONCURRENT: StrictInt = 5  # Max concurrent recovery operations per node type
-    RECOVERY_SEMAPHORE_SIZE: StrictInt = 5  # Semaphore size for limiting concurrent recovery
-    DISPATCH_MAX_CONCURRENT_PER_WORKER: StrictInt = 3  # Max concurrent dispatches to a single worker
+    RECOVERY_MAX_CONCURRENT: StrictInt = (
+        5  # Max concurrent recovery operations per node type
+    )
+    RECOVERY_SEMAPHORE_SIZE: StrictInt = (
+        5  # Semaphore size for limiting concurrent recovery
+    )
+    DISPATCH_MAX_CONCURRENT_PER_WORKER: StrictInt = (
+        3  # Max concurrent dispatches to a single worker
+    )
 
     # Message queue backpressure - prevent memory exhaustion under load
-    MESSAGE_QUEUE_MAX_SIZE: StrictInt = 1000  # Max pending messages per client connection
+    MESSAGE_QUEUE_MAX_SIZE: StrictInt = (
+        1000  # Max pending messages per client connection
+    )
     MESSAGE_QUEUE_WARN_SIZE: StrictInt = 800  # Warn threshold (80% of max)
 
     # ==========================================================================
@@ -253,24 +366,38 @@ class Env(BaseModel):
     EXTENSION_MIN_GRANT: StrictFloat = 1.0  # Minimum extension grant in seconds
     EXTENSION_MAX_EXTENSIONS: StrictInt = 5  # Maximum extensions per cycle
     EXTENSION_EVICTION_THRESHOLD: StrictInt = 3  # Failures before eviction
-    EXTENSION_EXHAUSTION_WARNING_THRESHOLD: StrictInt = 1  # Remaining extensions to trigger warning
-    EXTENSION_EXHAUSTION_GRACE_PERIOD: StrictFloat = 10.0  # Seconds of grace after exhaustion before kill
+    EXTENSION_EXHAUSTION_WARNING_THRESHOLD: StrictInt = (
+        1  # Remaining extensions to trigger warning
+    )
+    EXTENSION_EXHAUSTION_GRACE_PERIOD: StrictFloat = (
+        10.0  # Seconds of grace after exhaustion before kill
+    )
 
     # ==========================================================================
     # Orphaned Workflow Scanner Settings
     # ==========================================================================
-    ORPHAN_SCAN_INTERVAL: StrictFloat = 120.0  # Seconds between orphan scans (2 minutes)
-    ORPHAN_SCAN_WORKER_TIMEOUT: StrictFloat = 5.0  # Timeout for querying workers during scan
+    ORPHAN_SCAN_INTERVAL: StrictFloat = (
+        120.0  # Seconds between orphan scans (2 minutes)
+    )
+    ORPHAN_SCAN_WORKER_TIMEOUT: StrictFloat = (
+        5.0  # Timeout for querying workers during scan
+    )
 
     # ==========================================================================
     # Time-Windowed Stats Streaming Settings
     # ==========================================================================
-    STATS_WINDOW_SIZE_MS: StrictFloat = 50.0  # Window bucket size in milliseconds (smaller = more granular)
+    STATS_WINDOW_SIZE_MS: StrictFloat = (
+        50.0  # Window bucket size in milliseconds (smaller = more granular)
+    )
     # Drift tolerance allows for network latency between worker send and manager receive
     # Workers now send directly (not buffered), so we only need network latency margin
     STATS_DRIFT_TOLERANCE_MS: StrictFloat = 25.0  # Network latency allowance only
-    STATS_PUSH_INTERVAL_MS: StrictFloat = 50.0  # How often to flush windows and push (ms)
-    STATS_MAX_WINDOW_AGE_MS: StrictFloat = 5000.0  # Max age before window is dropped (cleanup)
+    STATS_PUSH_INTERVAL_MS: StrictFloat = (
+        50.0  # How often to flush windows and push (ms)
+    )
+    STATS_MAX_WINDOW_AGE_MS: StrictFloat = (
+        5000.0  # Max age before window is dropped (cleanup)
+    )
 
     # Status update processing interval (seconds) - controls how often _process_status_updates runs
     # during workflow completion wait. Lower values = more responsive UI updates.
@@ -284,48 +411,86 @@ class Env(BaseModel):
     # Manager Stats Buffer Settings (AD-23)
     # ==========================================================================
     # Tiered retention for stats with backpressure based on buffer fill levels
-    MANAGER_STATS_HOT_MAX_ENTRIES: StrictInt = 1000  # Max entries in hot tier ring buffer
+    MANAGER_STATS_HOT_MAX_ENTRIES: StrictInt = (
+        1000  # Max entries in hot tier ring buffer
+    )
     MANAGER_STATS_THROTTLE_THRESHOLD: StrictFloat = 0.70  # Throttle at 70% fill
     MANAGER_STATS_BATCH_THRESHOLD: StrictFloat = 0.85  # Batch-only at 85% fill
-    MANAGER_STATS_REJECT_THRESHOLD: StrictFloat = 0.95  # Reject non-critical at 95% fill
+    MANAGER_STATS_REJECT_THRESHOLD: StrictFloat = (
+        0.95  # Reject non-critical at 95% fill
+    )
 
     # ==========================================================================
     # Cross-DC Correlation Settings (Phase 7)
     # ==========================================================================
     # These settings control correlation detection for cascade eviction prevention
     # Tuned for globally distributed datacenters with high latency
-    CROSS_DC_CORRELATION_WINDOW: StrictFloat = 30.0  # Seconds window for correlation detection
-    CROSS_DC_CORRELATION_LOW_THRESHOLD: StrictInt = 2  # Min DCs failing for LOW correlation
-    CROSS_DC_CORRELATION_MEDIUM_THRESHOLD: StrictInt = 3  # Min DCs failing for MEDIUM correlation
-    CROSS_DC_CORRELATION_HIGH_COUNT_THRESHOLD: StrictInt = 4  # Min DCs failing for HIGH (count)
-    CROSS_DC_CORRELATION_HIGH_FRACTION: StrictFloat = 0.5  # Fraction of DCs for HIGH (requires count too)
-    CROSS_DC_CORRELATION_BACKOFF: StrictFloat = 60.0  # Backoff duration after correlation detected
+    CROSS_DC_CORRELATION_WINDOW: StrictFloat = (
+        30.0  # Seconds window for correlation detection
+    )
+    CROSS_DC_CORRELATION_LOW_THRESHOLD: StrictInt = (
+        2  # Min DCs failing for LOW correlation
+    )
+    CROSS_DC_CORRELATION_MEDIUM_THRESHOLD: StrictInt = (
+        3  # Min DCs failing for MEDIUM correlation
+    )
+    CROSS_DC_CORRELATION_HIGH_COUNT_THRESHOLD: StrictInt = (
+        4  # Min DCs failing for HIGH (count)
+    )
+    CROSS_DC_CORRELATION_HIGH_FRACTION: StrictFloat = (
+        0.5  # Fraction of DCs for HIGH (requires count too)
+    )
+    CROSS_DC_CORRELATION_BACKOFF: StrictFloat = (
+        60.0  # Backoff duration after correlation detected
+    )
 
     # Anti-flapping settings for cross-DC correlation
-    CROSS_DC_FAILURE_CONFIRMATION: StrictFloat = 5.0  # Seconds failure must persist before counting
-    CROSS_DC_RECOVERY_CONFIRMATION: StrictFloat = 30.0  # Seconds recovery must persist before healthy
-    CROSS_DC_FLAP_THRESHOLD: StrictInt = 3  # State changes in window to be considered flapping
+    CROSS_DC_FAILURE_CONFIRMATION: StrictFloat = (
+        5.0  # Seconds failure must persist before counting
+    )
+    CROSS_DC_RECOVERY_CONFIRMATION: StrictFloat = (
+        30.0  # Seconds recovery must persist before healthy
+    )
+    CROSS_DC_FLAP_THRESHOLD: StrictInt = (
+        3  # State changes in window to be considered flapping
+    )
     CROSS_DC_FLAP_DETECTION_WINDOW: StrictFloat = 120.0  # Window for flap detection
-    CROSS_DC_FLAP_COOLDOWN: StrictFloat = 300.0  # Cooldown after flapping before can be stable
+    CROSS_DC_FLAP_COOLDOWN: StrictFloat = (
+        300.0  # Cooldown after flapping before can be stable
+    )
 
     # Latency-based correlation settings
     CROSS_DC_ENABLE_LATENCY_CORRELATION: StrictBool = True
-    CROSS_DC_LATENCY_ELEVATED_THRESHOLD_MS: StrictFloat = 100.0  # Latency above this is elevated
-    CROSS_DC_LATENCY_CRITICAL_THRESHOLD_MS: StrictFloat = 500.0  # Latency above this is critical
+    CROSS_DC_LATENCY_ELEVATED_THRESHOLD_MS: StrictFloat = (
+        100.0  # Latency above this is elevated
+    )
+    CROSS_DC_LATENCY_CRITICAL_THRESHOLD_MS: StrictFloat = (
+        500.0  # Latency above this is critical
+    )
     CROSS_DC_MIN_LATENCY_SAMPLES: StrictInt = 3  # Min samples before latency decisions
     CROSS_DC_LATENCY_SAMPLE_WINDOW: StrictFloat = 60.0  # Window for latency samples
-    CROSS_DC_LATENCY_CORRELATION_FRACTION: StrictFloat = 0.5  # Fraction of DCs for latency correlation
+    CROSS_DC_LATENCY_CORRELATION_FRACTION: StrictFloat = (
+        0.5  # Fraction of DCs for latency correlation
+    )
 
     # Extension-based correlation settings
     CROSS_DC_ENABLE_EXTENSION_CORRELATION: StrictBool = True
-    CROSS_DC_EXTENSION_COUNT_THRESHOLD: StrictInt = 2  # Extensions to consider DC under load
-    CROSS_DC_EXTENSION_CORRELATION_FRACTION: StrictFloat = 0.5  # Fraction of DCs for extension correlation
+    CROSS_DC_EXTENSION_COUNT_THRESHOLD: StrictInt = (
+        2  # Extensions to consider DC under load
+    )
+    CROSS_DC_EXTENSION_CORRELATION_FRACTION: StrictFloat = (
+        0.5  # Fraction of DCs for extension correlation
+    )
     CROSS_DC_EXTENSION_WINDOW: StrictFloat = 120.0  # Window for extension tracking
 
     # LHM-based correlation settings
     CROSS_DC_ENABLE_LHM_CORRELATION: StrictBool = True
-    CROSS_DC_LHM_STRESSED_THRESHOLD: StrictInt = 3  # LHM score (0-8) to consider DC stressed
-    CROSS_DC_LHM_CORRELATION_FRACTION: StrictFloat = 0.5  # Fraction of DCs for LHM correlation
+    CROSS_DC_LHM_STRESSED_THRESHOLD: StrictInt = (
+        3  # LHM score (0-8) to consider DC stressed
+    )
+    CROSS_DC_LHM_CORRELATION_FRACTION: StrictFloat = (
+        0.5  # Fraction of DCs for LHM correlation
+    )
 
     # ==========================================================================
     # Discovery Service Settings (AD-28)
@@ -335,51 +500,85 @@ class Env(BaseModel):
     ENVIRONMENT_ID: StrictStr = "default"  # Environment identifier for isolation
 
     # DNS-based peer discovery
-    DISCOVERY_DNS_NAMES: StrictStr = ""  # Comma-separated DNS names for manager discovery
+    DISCOVERY_DNS_NAMES: StrictStr = (
+        ""  # Comma-separated DNS names for manager discovery
+    )
     DISCOVERY_DNS_CACHE_TTL: StrictFloat = 60.0  # DNS cache TTL in seconds
     DISCOVERY_DNS_TIMEOUT: StrictFloat = 5.0  # DNS resolution timeout in seconds
     DISCOVERY_DEFAULT_PORT: StrictInt = 9091  # Default port for discovered peers
 
     # DNS Security (Phase 2) - Protects against cache poisoning, hijacking, spoofing
-    DISCOVERY_DNS_ALLOWED_CIDRS: StrictStr = ""  # Comma-separated CIDRs (e.g., "10.0.0.0/8,172.16.0.0/12")
-    DISCOVERY_DNS_BLOCK_PRIVATE_FOR_PUBLIC: StrictBool = False  # Block private IPs for public hostnames
-    DISCOVERY_DNS_DETECT_IP_CHANGES: StrictBool = True  # Enable IP change anomaly detection
-    DISCOVERY_DNS_MAX_IP_CHANGES: StrictInt = 5  # Max IP changes before rapid rotation alert
-    DISCOVERY_DNS_IP_CHANGE_WINDOW: StrictFloat = 300.0  # Window for tracking IP changes (5 min)
-    DISCOVERY_DNS_REJECT_ON_VIOLATION: StrictBool = True  # Reject IPs failing security validation
+    DISCOVERY_DNS_ALLOWED_CIDRS: StrictStr = (
+        ""  # Comma-separated CIDRs (e.g., "10.0.0.0/8,172.16.0.0/12")
+    )
+    DISCOVERY_DNS_BLOCK_PRIVATE_FOR_PUBLIC: StrictBool = (
+        False  # Block private IPs for public hostnames
+    )
+    DISCOVERY_DNS_DETECT_IP_CHANGES: StrictBool = (
+        True  # Enable IP change anomaly detection
+    )
+    DISCOVERY_DNS_MAX_IP_CHANGES: StrictInt = (
+        5  # Max IP changes before rapid rotation alert
+    )
+    DISCOVERY_DNS_IP_CHANGE_WINDOW: StrictFloat = (
+        300.0  # Window for tracking IP changes (5 min)
+    )
+    DISCOVERY_DNS_REJECT_ON_VIOLATION: StrictBool = (
+        True  # Reject IPs failing security validation
+    )
 
     # Locality configuration
-    DISCOVERY_DATACENTER_ID: StrictStr = ""  # Local datacenter ID for locality-aware selection
+    DISCOVERY_DATACENTER_ID: StrictStr = (
+        ""  # Local datacenter ID for locality-aware selection
+    )
     DISCOVERY_REGION_ID: StrictStr = ""  # Local region ID for locality-aware selection
     DISCOVERY_PREFER_SAME_DC: StrictBool = True  # Prefer same-DC peers over cross-DC
 
     # Adaptive peer selection (Power of Two Choices with EWMA)
-    DISCOVERY_CANDIDATE_SET_SIZE: StrictInt = 3  # Number of candidates for power-of-two selection
-    DISCOVERY_EWMA_ALPHA: StrictFloat = 0.3  # EWMA smoothing factor for latency tracking
-    DISCOVERY_BASELINE_LATENCY_MS: StrictFloat = 50.0  # Baseline latency for EWMA initialization
-    DISCOVERY_LATENCY_MULTIPLIER_THRESHOLD: StrictFloat = 2.0  # Latency threshold multiplier
+    DISCOVERY_CANDIDATE_SET_SIZE: StrictInt = (
+        3  # Number of candidates for power-of-two selection
+    )
+    DISCOVERY_EWMA_ALPHA: StrictFloat = (
+        0.3  # EWMA smoothing factor for latency tracking
+    )
+    DISCOVERY_BASELINE_LATENCY_MS: StrictFloat = (
+        50.0  # Baseline latency for EWMA initialization
+    )
+    DISCOVERY_LATENCY_MULTIPLIER_THRESHOLD: StrictFloat = (
+        2.0  # Latency threshold multiplier
+    )
     DISCOVERY_MIN_PEERS_PER_TIER: StrictInt = 1  # Minimum peers per locality tier
 
     # Probing and health
-    DISCOVERY_MAX_CONCURRENT_PROBES: StrictInt = 10  # Max concurrent DNS resolutions/probes
+    DISCOVERY_MAX_CONCURRENT_PROBES: StrictInt = (
+        10  # Max concurrent DNS resolutions/probes
+    )
     DISCOVERY_PROBE_INTERVAL: StrictFloat = 30.0  # Seconds between peer health probes
-    DISCOVERY_FAILURE_DECAY_INTERVAL: StrictFloat = 60.0  # Seconds between failure count decay
+    DISCOVERY_FAILURE_DECAY_INTERVAL: StrictFloat = (
+        60.0  # Seconds between failure count decay
+    )
 
     # ==========================================================================
     # Bounded Pending Response Queues Settings (AD-32)
     # ==========================================================================
     # Priority-aware bounded execution with load shedding
     # CRITICAL (SWIM) never shed, LOW shed first under load
-    PENDING_RESPONSE_MAX_CONCURRENT: StrictInt = 1000  # Global limit across all priorities
+    PENDING_RESPONSE_MAX_CONCURRENT: StrictInt = (
+        1000  # Global limit across all priorities
+    )
     PENDING_RESPONSE_HIGH_LIMIT: StrictInt = 500  # HIGH priority limit
     PENDING_RESPONSE_NORMAL_LIMIT: StrictInt = 300  # NORMAL priority limit
     PENDING_RESPONSE_LOW_LIMIT: StrictInt = 200  # LOW priority limit (shed first)
-    PENDING_RESPONSE_WARN_THRESHOLD: StrictFloat = 0.8  # Log warning at this % of global limit
+    PENDING_RESPONSE_WARN_THRESHOLD: StrictFloat = (
+        0.8  # Log warning at this % of global limit
+    )
 
     # Client-side per-destination queue settings (AD-32)
     OUTGOING_QUEUE_SIZE: StrictInt = 500  # Per-destination queue size
     OUTGOING_OVERFLOW_SIZE: StrictInt = 100  # Overflow ring buffer size
-    OUTGOING_MAX_DESTINATIONS: StrictInt = 1000  # Max tracked destinations (LRU evicted)
+    OUTGOING_MAX_DESTINATIONS: StrictInt = (
+        1000  # Max tracked destinations (LRU evicted)
+    )
 
     @classmethod
     def types_map(cls) -> Dict[str, Callable[[str], PrimaryType]]:
@@ -603,7 +802,7 @@ class Env(BaseModel):
             "OUTGOING_OVERFLOW_SIZE": int,
             "OUTGOING_MAX_DESTINATIONS": int,
         }
-    
+
     def get_swim_init_context(self) -> dict:
         """
         Get SWIM protocol init_context from environment settings.
@@ -615,29 +814,29 @@ class Env(BaseModel):
         import asyncio
 
         return {
-            'max_probe_timeout': self.SWIM_MAX_PROBE_TIMEOUT,
-            'min_probe_timeout': self.SWIM_MIN_PROBE_TIMEOUT,
-            'current_timeout': self.SWIM_CURRENT_TIMEOUT,
-            'nodes': defaultdict(asyncio.Queue),  # Required for probe cycle
-            'udp_poll_interval': self.SWIM_UDP_POLL_INTERVAL,
-            'suspicion_min_timeout': self.SWIM_SUSPICION_MIN_TIMEOUT,
-            'suspicion_max_timeout': self.SWIM_SUSPICION_MAX_TIMEOUT,
-            'refutation_rate_limit_tokens': self.SWIM_REFUTATION_RATE_LIMIT_TOKENS,
-            'refutation_rate_limit_window': self.SWIM_REFUTATION_RATE_LIMIT_WINDOW,
+            "max_probe_timeout": self.SWIM_MAX_PROBE_TIMEOUT,
+            "min_probe_timeout": self.SWIM_MIN_PROBE_TIMEOUT,
+            "current_timeout": self.SWIM_CURRENT_TIMEOUT,
+            "nodes": defaultdict(asyncio.Queue),  # Required for probe cycle
+            "udp_poll_interval": self.SWIM_UDP_POLL_INTERVAL,
+            "suspicion_min_timeout": self.SWIM_SUSPICION_MIN_TIMEOUT,
+            "suspicion_max_timeout": self.SWIM_SUSPICION_MAX_TIMEOUT,
+            "refutation_rate_limit_tokens": self.SWIM_REFUTATION_RATE_LIMIT_TOKENS,
+            "refutation_rate_limit_window": self.SWIM_REFUTATION_RATE_LIMIT_WINDOW,
         }
-    
+
     def get_circuit_breaker_config(self) -> dict:
         """Get circuit breaker configuration from environment settings."""
         return {
-            'max_errors': self.CIRCUIT_BREAKER_MAX_ERRORS,
-            'window_seconds': self.CIRCUIT_BREAKER_WINDOW_SECONDS,
-            'half_open_after': self.CIRCUIT_BREAKER_HALF_OPEN_AFTER,
+            "max_errors": self.CIRCUIT_BREAKER_MAX_ERRORS,
+            "window_seconds": self.CIRCUIT_BREAKER_WINDOW_SECONDS,
+            "half_open_after": self.CIRCUIT_BREAKER_HALF_OPEN_AFTER,
         }
-    
+
     def get_leader_election_config(self) -> dict:
         """
         Get leader election configuration from environment settings.
-        
+
         These settings control:
         - How often the leader sends heartbeats
         - How long followers wait before starting an election
@@ -645,14 +844,14 @@ class Env(BaseModel):
         - LHM threshold for leader eligibility (higher = more tolerant to load)
         """
         return {
-            'heartbeat_interval': self.LEADER_HEARTBEAT_INTERVAL,
-            'election_timeout_base': self.LEADER_ELECTION_TIMEOUT_BASE,
-            'election_timeout_jitter': self.LEADER_ELECTION_TIMEOUT_JITTER,
-            'pre_vote_timeout': self.LEADER_PRE_VOTE_TIMEOUT,
-            'lease_duration': self.LEADER_LEASE_DURATION,
-            'max_leader_lhm': self.LEADER_MAX_LHM,
+            "heartbeat_interval": self.LEADER_HEARTBEAT_INTERVAL,
+            "election_timeout_base": self.LEADER_ELECTION_TIMEOUT_BASE,
+            "election_timeout_jitter": self.LEADER_ELECTION_TIMEOUT_JITTER,
+            "pre_vote_timeout": self.LEADER_PRE_VOTE_TIMEOUT,
+            "lease_duration": self.LEADER_LEASE_DURATION,
+            "max_leader_lhm": self.LEADER_MAX_LHM,
         }
-    
+
     def get_federated_health_config(self) -> dict:
         """
         Get federated health monitor configuration from environment settings.
@@ -664,10 +863,10 @@ class Env(BaseModel):
         - Longer suspicion period (tolerate transient issues)
         """
         return {
-            'probe_interval': self.FEDERATED_PROBE_INTERVAL,
-            'probe_timeout': self.FEDERATED_PROBE_TIMEOUT,
-            'suspicion_timeout': self.FEDERATED_SUSPICION_TIMEOUT,
-            'max_consecutive_failures': self.FEDERATED_MAX_CONSECUTIVE_FAILURES,
+            "probe_interval": self.FEDERATED_PROBE_INTERVAL,
+            "probe_timeout": self.FEDERATED_PROBE_TIMEOUT,
+            "suspicion_timeout": self.FEDERATED_SUSPICION_TIMEOUT,
+            "max_consecutive_failures": self.FEDERATED_MAX_CONSECUTIVE_FAILURES,
         }
 
     def get_overload_config(self):
@@ -776,7 +975,9 @@ class Env(BaseModel):
 
         Controls how clients retry after being rate limited.
         """
-        from hyperscale.distributed.reliability.rate_limiting import RateLimitRetryConfig
+        from hyperscale.distributed.reliability.rate_limiting import (
+            RateLimitRetryConfig,
+        )
 
         return RateLimitRetryConfig(
             max_retries=self.RATE_LIMIT_MAX_RETRIES,
@@ -905,7 +1106,11 @@ class Env(BaseModel):
         # Parse DNS names from comma-separated string
         dns_names: list[str] = []
         if self.DISCOVERY_DNS_NAMES:
-            dns_names = [name.strip() for name in self.DISCOVERY_DNS_NAMES.split(",") if name.strip()]
+            dns_names = [
+                name.strip()
+                for name in self.DISCOVERY_DNS_NAMES.split(",")
+                if name.strip()
+            ]
 
         # Parse allowed CIDRs from comma-separated string
         dns_allowed_cidrs: list[str] = []
@@ -962,11 +1167,11 @@ class Env(BaseModel):
         - Enabling immediate execution (no queue latency for most messages)
         """
         return {
-            'global_limit': self.PENDING_RESPONSE_MAX_CONCURRENT,
-            'high_limit': self.PENDING_RESPONSE_HIGH_LIMIT,
-            'normal_limit': self.PENDING_RESPONSE_NORMAL_LIMIT,
-            'low_limit': self.PENDING_RESPONSE_LOW_LIMIT,
-            'warn_threshold': self.PENDING_RESPONSE_WARN_THRESHOLD,
+            "global_limit": self.PENDING_RESPONSE_MAX_CONCURRENT,
+            "high_limit": self.PENDING_RESPONSE_HIGH_LIMIT,
+            "normal_limit": self.PENDING_RESPONSE_NORMAL_LIMIT,
+            "low_limit": self.PENDING_RESPONSE_LOW_LIMIT,
+            "warn_threshold": self.PENDING_RESPONSE_WARN_THRESHOLD,
         }
 
     def get_outgoing_queue_config(self) -> dict:
@@ -979,7 +1184,7 @@ class Env(BaseModel):
         - LRU eviction when max destinations reached
         """
         return {
-            'queue_size': self.OUTGOING_QUEUE_SIZE,
-            'overflow_size': self.OUTGOING_OVERFLOW_SIZE,
-            'max_destinations': self.OUTGOING_MAX_DESTINATIONS,
+            "queue_size": self.OUTGOING_QUEUE_SIZE,
+            "overflow_size": self.OUTGOING_OVERFLOW_SIZE,
+            "max_destinations": self.OUTGOING_MAX_DESTINATIONS,
         }
