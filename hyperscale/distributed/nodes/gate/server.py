@@ -477,6 +477,10 @@ class GateServer(HealthAwareServer):
         # Job router (AD-36) - initialized in start()
         self._job_router: GateJobRouter | None = None
 
+        # Idempotency cache (AD-40) - initialized in start() after task_runner is available
+        self._idempotency_cache: GateIdempotencyCache[bytes] | None = None
+        self._idempotency_config = create_idempotency_config_from_env(env)
+
         # State version
         self._state_version = 0
 
@@ -935,6 +939,13 @@ class GateServer(HealthAwareServer):
             coordinate_tracker=self._coordinate_tracker,
             get_datacenter_candidates=self._build_datacenter_candidates,
         )
+
+        self._idempotency_cache = GateIdempotencyCache(
+            config=self._idempotency_config,
+            task_runner=self._task_runner,
+            logger=self._udp_logger,
+        )
+        await self._idempotency_cache.start()
 
         # Initialize coordinators and handlers
         self._init_coordinators()
