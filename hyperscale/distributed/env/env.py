@@ -697,6 +697,16 @@ class Env(BaseModel):
             "MANAGER_TCP_TIMEOUT_STANDARD": float,
             # Manager batch stats settings
             "MANAGER_BATCH_PUSH_INTERVAL": float,
+            # AD-44 retry budget settings
+            "RETRY_BUDGET_MAX": int,
+            "RETRY_BUDGET_PER_WORKFLOW_MAX": int,
+            "RETRY_BUDGET_DEFAULT": int,
+            "RETRY_BUDGET_PER_WORKFLOW_DEFAULT": int,
+            # AD-44 best-effort settings
+            "BEST_EFFORT_DEADLINE_MAX": float,
+            "BEST_EFFORT_DEADLINE_DEFAULT": float,
+            "BEST_EFFORT_MIN_DCS_DEFAULT": int,
+            "BEST_EFFORT_DEADLINE_CHECK_INTERVAL": float,
             # Gate settings
             "GATE_JOB_CLEANUP_INTERVAL": float,
             "GATE_RATE_LIMIT_CLEANUP_INTERVAL": float,

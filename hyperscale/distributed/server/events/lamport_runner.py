@@ -34,18 +34,31 @@ class LamportRunner:
     def subscribe(self, runner: LamportRunner):
         self.registered[runner.name] = runner.waiter
 
+    def _try_put_message(
+        self,
+        waiter: asyncio.Queue[LamportMessage],
+        message: LamportMessage,
+    ) -> bool:
+        try:
+            waiter.put_nowait(message)
+            return True
+        except asyncio.QueueFull:
+            self._dropped_messages += 1
+            return False
+
     async def update(self):
         next_time = await self.clock.increment()
         self.processed = next_time
 
         for node, waiter in self.registered.items():
             if node != self.name:
-                waiter.put_nowait(
+                self._try_put_message(
+                    waiter,
                     LamportMessage(
                         timestamp=next_time,
                         sender=self.name,
                         receiver=node,
-                    )
+                    ),
                 )
 
     async def ack(self, time: int):
