@@ -1697,7 +1697,7 @@ class GateServer(HealthAwareServer):
         """Confirm a peer via SWIM."""
         self.confirm_peer(peer_addr)
 
-    async def _complete_job(self, job_id: str, result: object) -> asyncio.Task:
+    async def _complete_job(self, job_id: str, result: object) -> None:
         """Complete a job and notify client."""
         job = self._job_manager.get_job(job_id)
         if job:
@@ -1705,7 +1705,6 @@ class GateServer(HealthAwareServer):
             self._job_manager.set_job(job_id, job)
 
         await self._send_immediate_update(job_id, "completed", None)
-        return asyncio.create_task(asyncio.sleep(0))
 
     def _get_peer_state_lock(self, peer_addr: tuple[str, int]) -> asyncio.Lock:
         """Get or create lock for a peer."""

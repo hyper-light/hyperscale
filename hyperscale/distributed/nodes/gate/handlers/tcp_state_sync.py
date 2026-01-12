@@ -123,7 +123,7 @@ class GateStateSyncHandler:
                     node_host=self._get_host(),
                     node_port=self._get_tcp_port(),
                     node_id=self._get_node_id().short,
-                )
+                ),
             )
 
             snapshot = self._get_state_snapshot()
@@ -179,22 +179,22 @@ class GateStateSyncHandler:
                         node_host=self._get_host(),
                         node_port=self._get_tcp_port(),
                         node_id=self._get_node_id().short,
-                    )
+                    ),
                 )
-                return b'error'
+                return b"error"
 
             if response.state_version <= self._state.get_state_version():
                 self._task_runner.run(
                     self._logger.log,
                     ServerDebug(
                         message=f"Ignoring stale state sync from {response.responder_id[:8]}... "
-                                f"(remote version {response.state_version} <= local {self._state.get_state_version()})",
+                        f"(remote version {response.state_version} <= local {self._state.get_state_version()})",
                         node_host=self._get_host(),
                         node_port=self._get_tcp_port(),
                         node_id=self._get_node_id().short,
-                    )
+                    ),
                 )
-                return b'ok'
+                return b"ok"
 
             if response.snapshot:
                 self._apply_state_snapshot(response.snapshot)
@@ -206,14 +206,14 @@ class GateStateSyncHandler:
                     node_host=self._get_host(),
                     node_port=self._get_tcp_port(),
                     node_id=self._get_node_id().short,
-                )
+                ),
             )
 
-            return b'ok'
+            return b"ok"
 
         except Exception as error:
             await handle_exception(error, "handle_state_sync_response")
-            return b'error'
+            return b"error"
 
     async def handle_lease_transfer(
         self,
@@ -241,11 +241,11 @@ class GateStateSyncHandler:
                 self._logger.log,
                 ServerInfo(
                     message=f"Receiving lease transfer from {transfer.source_gate_id[:8]}... "
-                            f"for job {transfer.job_id[:8]}...",
+                    f"for job {transfer.job_id[:8]}...",
                     node_host=self._get_host(),
                     node_port=self._get_tcp_port(),
                     node_id=self._get_node_id().short,
-                )
+                ),
             )
 
             if self._job_manager.has_job(transfer.job_id):
@@ -273,11 +273,11 @@ class GateStateSyncHandler:
                 self._logger.log,
                 ServerInfo(
                     message=f"Accepted lease transfer for job {transfer.job_id[:8]}... "
-                            f"(new fence token: {new_fence_token})",
+                    f"(new fence token: {new_fence_token})",
                     node_host=self._get_host(),
                     node_port=self._get_tcp_port(),
                     node_id=self._get_node_id().short,
-                )
+                ),
             )
 
             return LeaseTransferAck(
@@ -299,7 +299,7 @@ class GateStateSyncHandler:
         self,
         addr: tuple[str, int],
         data: bytes,
-        complete_job: Callable[[str, object], "asyncio.Task"],
+        complete_job: Callable[[str, object], "asyncio.Coroutine[None, None, None]"],
         handle_exception: Callable,
     ) -> bytes:
         """
@@ -323,11 +323,11 @@ class GateStateSyncHandler:
                 self._logger.log,
                 ServerInfo(
                     message=f"Received final result for job {result.job_id[:8]}... "
-                            f"(status={result.status}, from DC {result.datacenter})",
+                    f"(status={result.status}, from DC {result.datacenter})",
                     node_host=self._get_host(),
                     node_port=self._get_tcp_port(),
                     node_id=self._get_node_id().short,
-                )
+                ),
             )
 
             current_fence = self._job_manager.get_fence_token(result.job_id)
@@ -336,21 +336,21 @@ class GateStateSyncHandler:
                     self._logger.log,
                     ServerDebug(
                         message=f"Rejecting stale final result for {result.job_id}: "
-                                f"fence_token {result.fence_token} < {current_fence}",
+                        f"fence_token {result.fence_token} < {current_fence}",
                         node_host=self._get_host(),
                         node_port=self._get_tcp_port(),
                         node_id=self._get_node_id().short,
-                    )
+                    ),
                 )
-                return b'ok'
+                return b"ok"
 
             await complete_job(result.job_id, result)
 
-            return b'ok'
+            return b"ok"
 
         except Exception as error:
             await handle_exception(error, "handle_job_final_result")
-            return b'error'
+            return b"error"
 
     async def handle_job_leadership_notification(
         self,
@@ -376,13 +376,13 @@ class GateStateSyncHandler:
 
             my_id = self._get_node_id().full
             if notification.leader_gate_id == my_id:
-                return b'ok'
+                return b"ok"
 
             if self._versioned_clock.is_entity_stale(
                 f"job-leader:{notification.job_id}",
                 notification.fence_token,
             ):
-                return b'ok'
+                return b"ok"
 
             self._job_leadership_tracker.record_peer_leadership(
                 job_id=notification.job_id,
@@ -401,15 +401,15 @@ class GateStateSyncHandler:
                 self._logger.log,
                 ServerDebug(
                     message=f"Recorded job leadership: {notification.job_id[:8]}... -> "
-                            f"{notification.leader_gate_id[:8]}... (fence {notification.fence_token})",
+                    f"{notification.leader_gate_id[:8]}... (fence {notification.fence_token})",
                     node_host=self._get_host(),
                     node_port=self._get_tcp_port(),
                     node_id=self._get_node_id().short,
-                )
+                ),
             )
 
-            return b'ok'
+            return b"ok"
 
         except Exception as error:
             await handle_exception(error, "handle_job_leadership_notification")
-            return b'error'
+            return b"error"
