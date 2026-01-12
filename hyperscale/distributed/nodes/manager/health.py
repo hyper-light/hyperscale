@@ -151,11 +151,11 @@ class ManagerHealthMonitor:
         self._state._worker_unhealthy_since.pop(worker_id, None)
 
         # Update deadline if worker provided one
-        if hasattr(heartbeat, 'deadline') and heartbeat.deadline:
+        if hasattr(heartbeat, "deadline") and heartbeat.deadline:
             self._state._worker_deadlines[worker_id] = heartbeat.deadline
 
         # AD-17/AD-18: Update worker health state from heartbeat for smart dispatch
-        worker_health_state = getattr(heartbeat, 'health_overload_state', 'healthy')
+        worker_health_state = getattr(heartbeat, "health_overload_state", "healthy")
         self._registry.update_worker_health_state(worker_id, worker_health_state)
 
         self._task_runner.run(
@@ -165,7 +165,7 @@ class ManagerHealthMonitor:
                 node_host=self._config.host,
                 node_port=self._config.tcp_port,
                 node_id=self._node_id,
-            )
+            ),
         )
 
     def handle_worker_failure(self, worker_id: str) -> None:
@@ -185,7 +185,7 @@ class ManagerHealthMonitor:
                 node_host=self._config.host,
                 node_port=self._config.tcp_port,
                 node_id=self._node_id,
-            )
+            ),
         )
 
     def handle_worker_recovery(self, worker_id: str) -> None:
@@ -204,7 +204,7 @@ class ManagerHealthMonitor:
                 node_host=self._config.host,
                 node_port=self._config.tcp_port,
                 node_id=self._node_id,
-            )
+            ),
         )
 
     def record_latency_sample(
@@ -227,16 +227,15 @@ class ManagerHealthMonitor:
         sample = (now, latency_ms)
 
         if target_type == "worker":
-            samples = self._state._worker_latency_samples.setdefault(target_id, [])
+            samples = self._state.get_worker_latency_samples(target_id)
         elif target_type == "peer":
-            samples = self._state._peer_manager_latency_samples.setdefault(target_id, [])
+            samples = self._state.get_peer_latency_samples(target_id)
         elif target_type == "gate":
             samples = self._state._gate_latency_samples
         else:
             return
 
         samples.append(sample)
-        self._prune_latency_samples(samples)
 
         # AD-18: Feed latency to hybrid overload detector for manager self-health
         self._overload_detector.record_latency(latency_ms)
@@ -316,8 +315,7 @@ class ManagerHealthMonitor:
             job_id: Job ID to cleanup
         """
         keys_to_remove = [
-            key for key in self._state._worker_job_last_progress
-            if key[0] == job_id
+            key for key in self._state._worker_job_last_progress if key[0] == job_id
         ]
         for key in keys_to_remove:
             self._state._worker_job_last_progress.pop(key, None)
@@ -358,7 +356,7 @@ class ManagerHealthMonitor:
                 node_host=self._config.host,
                 node_port=self._config.tcp_port,
                 node_id=self._node_id,
-            )
+            ),
         )
 
     def confirm_job_suspicion(self, job_id: str, worker_id: str) -> None:
@@ -392,7 +390,7 @@ class ManagerHealthMonitor:
                     node_host=self._config.host,
                     node_port=self._config.tcp_port,
                     node_id=self._node_id,
-                )
+                ),
             )
 
     def check_job_suspicion_expiry(self) -> list[tuple[str, str]]:
@@ -425,7 +423,7 @@ class ManagerHealthMonitor:
                         node_host=self._config.host,
                         node_port=self._config.tcp_port,
                         node_id=self._node_id,
-                    )
+                    ),
                 )
 
         return expired
@@ -493,10 +491,7 @@ class ManagerHealthMonitor:
         self._global_dead_workers.add(worker_id)
 
         # Clear all job suspicions for this worker
-        keys_to_remove = [
-            key for key in self._job_suspicions
-            if key[1] == worker_id
-        ]
+        keys_to_remove = [key for key in self._job_suspicions if key[1] == worker_id]
         for key in keys_to_remove:
             del self._job_suspicions[key]
 
@@ -511,7 +506,7 @@ class ManagerHealthMonitor:
                 node_host=self._config.host,
                 node_port=self._config.tcp_port,
                 node_id=self._node_id,
-            )
+            ),
         )
 
     def clear_global_death(self, worker_id: str) -> None:
@@ -530,10 +525,7 @@ class ManagerHealthMonitor:
         Args:
             job_id: Job ID to cleanup
         """
-        keys_to_remove = [
-            key for key in self._job_suspicions
-            if key[0] == job_id
-        ]
+        keys_to_remove = [key for key in self._job_suspicions if key[0] == job_id]
         for key in keys_to_remove:
             del self._job_suspicions[key]
 
@@ -573,8 +565,8 @@ class ManagerHealthMonitor:
             "unhealthy_workers": self.get_unhealthy_worker_count(),
             "total_workers": len(self._state._workers),
             "tracked_latency_targets": (
-                len(self._state._worker_latency_samples) +
-                len(self._state._peer_manager_latency_samples)
+                len(self._state._worker_latency_samples)
+                + len(self._state._peer_manager_latency_samples)
             ),
             # AD-18 metrics
             "manager_overload_state": overload_diag.get("current_state", "healthy"),
@@ -660,10 +652,7 @@ class ExtensionTracker:
             return False, 0.0
 
         # Calculate grant with logarithmic reduction
-        grant = max(
-            self.min_grant,
-            self.base_deadline / (2 ** self.extension_count)
-        )
+        grant = max(self.min_grant, self.base_deadline / (2**self.extension_count))
 
         self.extension_count += 1
         self.last_progress = current_progress
@@ -742,8 +731,7 @@ class HealthcheckExtensionManager:
             (granted, extension_seconds, new_deadline, remaining_extensions, denial_reason)
         """
         tracker = self._extension_trackers.setdefault(
-            worker_id,
-            ExtensionTracker(worker_id=worker_id)
+            worker_id, ExtensionTracker(worker_id=worker_id)
         )
 
         granted, extension_seconds = tracker.request_extension(
@@ -753,8 +741,7 @@ class HealthcheckExtensionManager:
 
         if granted:
             current_deadline = self._worker_deadlines.get(
-                worker_id,
-                time.monotonic() + 30.0
+                worker_id, time.monotonic() + 30.0
             )
             new_deadline = current_deadline + extension_seconds
             self._worker_deadlines[worker_id] = new_deadline
@@ -766,7 +753,7 @@ class HealthcheckExtensionManager:
                     node_host=self._config.host,
                     node_port=self._config.tcp_port,
                     node_id=self._node_id,
-                )
+                ),
             )
 
             return (
@@ -786,7 +773,7 @@ class HealthcheckExtensionManager:
                     node_host=self._config.host,
                     node_port=self._config.tcp_port,
                     node_id=self._node_id,
-                )
+                ),
             )
 
             return (
