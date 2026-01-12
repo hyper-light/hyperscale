@@ -315,7 +315,9 @@ class GateServer(HealthAwareServer):
         self._known_gates: dict[str, GateInfo] = {}
 
         # Datacenter manager status
-        self._datacenter_manager_status: dict[str, dict[tuple[str, int], ManagerHeartbeat]] = {}
+        self._datacenter_manager_status: dict[
+            str, dict[tuple[str, int], ManagerHeartbeat]
+        ] = {}
         self._manager_last_status: dict[tuple[str, int], float] = {}
 
         # Health state tracking (AD-19)
@@ -344,7 +346,7 @@ class GateServer(HealthAwareServer):
         self._forward_throughput_interval_start: float = time.monotonic()
         self._forward_throughput_last_value: float = 0.0
         self._forward_throughput_interval_seconds: float = getattr(
-            env, 'GATE_THROUGHPUT_INTERVAL_SECONDS', 10.0
+            env, "GATE_THROUGHPUT_INTERVAL_SECONDS", 10.0
         )
 
         # Rate limiting (AD-24)
@@ -352,7 +354,9 @@ class GateServer(HealthAwareServer):
 
         # Protocol version (AD-25)
         self._node_capabilities = NodeCapabilities.current(node_version=f"gate-{dc_id}")
-        self._manager_negotiated_caps: dict[tuple[str, int], NegotiatedCapabilities] = {}
+        self._manager_negotiated_caps: dict[
+            tuple[str, int], NegotiatedCapabilities
+        ] = {}
 
         # Versioned state clock
         self._versioned_clock = VersionedStateClock()
@@ -364,7 +368,9 @@ class GateServer(HealthAwareServer):
         self._job_hash_ring = ConsistentHashRing(replicas=150)
 
         # Workflow results tracking
-        self._workflow_dc_results: dict[str, dict[str, dict[str, WorkflowResultPush]]] = {}
+        self._workflow_dc_results: dict[
+            str, dict[str, dict[str, WorkflowResultPush]]
+        ] = {}
         self._job_workflow_ids: dict[str, set[str]] = {}
 
         # Per-job leadership tracking
@@ -451,8 +457,8 @@ class GateServer(HealthAwareServer):
         # Job timeout tracker (AD-34)
         self._job_timeout_tracker = GateJobTimeoutTracker(
             gate=self,
-            check_interval=getattr(env, 'GATE_TIMEOUT_CHECK_INTERVAL', 15.0),
-            stuck_threshold=getattr(env, 'GATE_ALL_DC_STUCK_THRESHOLD', 180.0),
+            check_interval=getattr(env, "GATE_TIMEOUT_CHECK_INTERVAL", 15.0),
+            stuck_threshold=getattr(env, "GATE_ALL_DC_STUCK_THRESHOLD", 180.0),
         )
 
         # Job router (AD-36) - initialized in start()
@@ -467,9 +473,9 @@ class GateServer(HealthAwareServer):
         # Quorum circuit breaker
         cb_config = env.get_circuit_breaker_config()
         self._quorum_circuit = ErrorStats(
-            max_errors=cb_config['max_errors'],
-            window_seconds=cb_config['window_seconds'],
-            half_open_after=cb_config['half_open_after'],
+            max_errors=cb_config["max_errors"],
+            window_seconds=cb_config["window_seconds"],
+            half_open_after=cb_config["half_open_after"],
         )
 
         # Recovery semaphore
@@ -486,32 +492,37 @@ class GateServer(HealthAwareServer):
         self._tcp_timeout_forward: float = env.GATE_TCP_TIMEOUT_FORWARD
 
         # State embedder for SWIM heartbeats
-        self.set_state_embedder(GateStateEmbedder(
-            get_node_id=lambda: self._node_id.full,
-            get_datacenter=lambda: self._node_id.datacenter,
-            is_leader=self.is_leader,
-            get_term=lambda: self._leader_election.state.current_term,
-            get_state_version=lambda: self._state_version,
-            get_gate_state=lambda: self._gate_state.value,
-            get_active_jobs=lambda: self._job_manager.job_count(),
-            get_active_datacenters=lambda: self._count_active_datacenters(),
-            get_manager_count=lambda: sum(
-                len(managers) for managers in self._datacenter_managers.values()
-            ),
-            get_tcp_host=lambda: self._host,
-            get_tcp_port=lambda: self._tcp_port,
-            on_manager_heartbeat=self._handle_embedded_manager_heartbeat,
-            on_gate_heartbeat=self._handle_gate_peer_heartbeat,
-            get_known_managers=self._get_known_managers_for_piggyback,
-            get_known_gates=self._get_known_gates_for_piggyback,
-            get_job_leaderships=self._get_job_leaderships_for_piggyback,
-            get_job_dc_managers=self._get_job_dc_managers_for_piggyback,
-            get_health_has_dc_connectivity=lambda: len(self._datacenter_managers) > 0,
-            get_health_connected_dc_count=self._count_active_datacenters,
-            get_health_throughput=self._get_forward_throughput,
-            get_health_expected_throughput=self._get_expected_forward_throughput,
-            get_health_overload_state=lambda: self._overload_detector.get_state(0.0, 0.0),
-        ))
+        self.set_state_embedder(
+            GateStateEmbedder(
+                get_node_id=lambda: self._node_id.full,
+                get_datacenter=lambda: self._node_id.datacenter,
+                is_leader=self.is_leader,
+                get_term=lambda: self._leader_election.state.current_term,
+                get_state_version=lambda: self._state_version,
+                get_gate_state=lambda: self._gate_state.value,
+                get_active_jobs=lambda: self._job_manager.job_count(),
+                get_active_datacenters=lambda: self._count_active_datacenters(),
+                get_manager_count=lambda: sum(
+                    len(managers) for managers in self._datacenter_managers.values()
+                ),
+                get_tcp_host=lambda: self._host,
+                get_tcp_port=lambda: self._tcp_port,
+                on_manager_heartbeat=self._handle_embedded_manager_heartbeat,
+                on_gate_heartbeat=self._handle_gate_peer_heartbeat,
+                get_known_managers=self._get_known_managers_for_piggyback,
+                get_known_gates=self._get_known_gates_for_piggyback,
+                get_job_leaderships=self._get_job_leaderships_for_piggyback,
+                get_job_dc_managers=self._get_job_dc_managers_for_piggyback,
+                get_health_has_dc_connectivity=lambda: len(self._datacenter_managers)
+                > 0,
+                get_health_connected_dc_count=self._count_active_datacenters,
+                get_health_throughput=self._get_forward_throughput,
+                get_health_expected_throughput=self._get_expected_forward_throughput,
+                get_health_overload_state=lambda: self._overload_detector.get_state(
+                    0.0, 0.0
+                ),
+            )
+        )
 
         # Register callbacks
         self.register_on_node_dead(self._on_node_dead)
@@ -536,10 +547,10 @@ class GateServer(HealthAwareServer):
         # Federated Health Monitor
         fed_config = env.get_federated_health_config()
         self._dc_health_monitor = FederatedHealthMonitor(
-            probe_interval=fed_config['probe_interval'],
-            probe_timeout=fed_config['probe_timeout'],
-            suspicion_timeout=fed_config['suspicion_timeout'],
-            max_consecutive_failures=fed_config['max_consecutive_failures'],
+            probe_interval=fed_config["probe_interval"],
+            probe_timeout=fed_config["probe_timeout"],
+            suspicion_timeout=fed_config["suspicion_timeout"],
+            max_consecutive_failures=fed_config["max_consecutive_failures"],
         )
 
         # Cross-DC correlation detector
@@ -551,7 +562,9 @@ class GateServer(HealthAwareServer):
 
         # Discovery services (AD-28)
         self._dc_manager_discovery: dict[str, DiscoveryService] = {}
-        self._discovery_failure_decay_interval: float = env.DISCOVERY_FAILURE_DECAY_INTERVAL
+        self._discovery_failure_decay_interval: float = (
+            env.DISCOVERY_FAILURE_DECAY_INTERVAL
+        )
         self._discovery_maintenance_task: asyncio.Task | None = None
 
         for datacenter_id, manager_addrs in self._datacenter_managers.items():
@@ -630,7 +643,9 @@ class GateServer(HealthAwareServer):
             logger=self._udp_logger,
             task_runner=self._task_runner,
             get_job_target_dcs=self._job_manager.get_target_dcs,
-            get_dc_manager_addr=lambda job_id, dc_id: self._job_dc_managers.get(job_id, {}).get(dc_id),
+            get_dc_manager_addr=lambda job_id, dc_id: self._job_dc_managers.get(
+                job_id, {}
+            ).get(dc_id),
             send_tcp=self._send_tcp,
             is_job_leader=self._job_leadership_tracker.is_leader,
         )
@@ -675,7 +690,7 @@ class GateServer(HealthAwareServer):
             gate_health_config=vars(self._gate_health_config),
             recovery_semaphore=self._recovery_semaphore,
             recovery_jitter_min=0.0,
-            recovery_jitter_max=getattr(self.env, 'GATE_RECOVERY_JITTER_MAX', 1.0),
+            recovery_jitter_max=getattr(self.env, "GATE_RECOVERY_JITTER_MAX", 1.0),
             get_node_id=lambda: self._node_id,
             get_host=lambda: self._host,
             get_tcp_port=lambda: self._tcp_port,
@@ -863,9 +878,13 @@ class GateServer(HealthAwareServer):
             on_dc_leader_change=self._on_dc_leader_change,
         )
 
-        for datacenter_id, manager_udp_addrs in list(self._datacenter_manager_udp.items()):
+        for datacenter_id, manager_udp_addrs in list(
+            self._datacenter_manager_udp.items()
+        ):
             if manager_udp_addrs:
-                self._dc_health_monitor.add_datacenter(datacenter_id, manager_udp_addrs[0])
+                self._dc_health_monitor.add_datacenter(
+                    datacenter_id, manager_udp_addrs[0]
+                )
 
         await self._dc_health_monitor.start()
 
@@ -880,7 +899,9 @@ class GateServer(HealthAwareServer):
         self._task_runner.run(self._windowed_stats_push_loop)
 
         # Discovery maintenance (AD-28)
-        self._discovery_maintenance_task = asyncio.create_task(self._discovery_maintenance_loop())
+        self._discovery_maintenance_task = asyncio.create_task(
+            self._discovery_maintenance_loop()
+        )
 
         # Start timeout tracker (AD-34)
         await self._job_timeout_tracker.start()
@@ -902,7 +923,7 @@ class GateServer(HealthAwareServer):
         await self._udp_logger.log(
             ServerInfo(
                 message=f"Gate started with {len(self._datacenter_managers)} DCs, "
-                        f"state={self._gate_state.value}",
+                f"state={self._gate_state.value}",
                 node_host=self._host,
                 node_port=self._tcp_port,
                 node_id=self._node_id.short,
@@ -917,7 +938,10 @@ class GateServer(HealthAwareServer):
         """Stop the gate server."""
         self._running = False
 
-        if self._discovery_maintenance_task and not self._discovery_maintenance_task.done():
+        if (
+            self._discovery_maintenance_task
+            and not self._discovery_maintenance_task.done()
+        ):
             self._discovery_maintenance_task.cancel()
             try:
                 await self._discovery_maintenance_task
@@ -949,7 +973,7 @@ class GateServer(HealthAwareServer):
             return await self._manager_handler.handle_status_update(
                 addr, data, self.handle_exception
             )
-        return b'error'
+        return b"error"
 
     @tcp.receive()
     async def manager_register(
@@ -964,7 +988,7 @@ class GateServer(HealthAwareServer):
             return await self._manager_handler.handle_register(
                 addr, data, transport, self.handle_exception
             )
-        return b'error'
+        return b"error"
 
     @tcp.receive()
     async def manager_discovery(
@@ -979,7 +1003,7 @@ class GateServer(HealthAwareServer):
             return await self._manager_handler.handle_discovery(
                 addr, data, self.handle_exception
             )
-        return b'error'
+        return b"error"
 
     @tcp.receive()
     async def job_submission(
@@ -994,7 +1018,7 @@ class GateServer(HealthAwareServer):
             return await self._job_handler.handle_submission(
                 addr, data, self.handle_exception
             )
-        return b'error'
+        return b"error"
 
     @tcp.receive()
     async def receive_job_status_request(
@@ -1009,7 +1033,7 @@ class GateServer(HealthAwareServer):
             return await self._job_handler.handle_status_request(
                 addr, data, self.handle_exception
             )
-        return b''
+        return b""
 
     @tcp.receive()
     async def receive_job_progress(
@@ -1024,7 +1048,7 @@ class GateServer(HealthAwareServer):
             return await self._job_handler.handle_progress(
                 addr, data, self.handle_exception
             )
-        return b'error'
+        return b"error"
 
     @tcp.receive()
     async def receive_gate_ping(
@@ -1039,7 +1063,7 @@ class GateServer(HealthAwareServer):
             return await self._ping_handler.handle_ping(
                 addr, data, self.handle_exception
             )
-        return b'error'
+        return b"error"
 
     @tcp.receive()
     async def receive_cancel_job(
@@ -1054,7 +1078,7 @@ class GateServer(HealthAwareServer):
             return await self._cancellation_handler.handle_cancel_job(
                 addr, data, self.handle_exception
             )
-        return b'error'
+        return b"error"
 
     @tcp.receive()
     async def receive_job_cancellation_complete(
@@ -1069,7 +1093,7 @@ class GateServer(HealthAwareServer):
             return await self._cancellation_handler.handle_cancellation_complete(
                 addr, data, self.handle_exception
             )
-        return b'error'
+        return b"error"
 
     @tcp.receive()
     async def receive_cancel_single_workflow(
@@ -1084,7 +1108,7 @@ class GateServer(HealthAwareServer):
             return await self._cancellation_handler.handle_cancel_single_workflow(
                 addr, data, self.handle_exception
             )
-        return b'error'
+        return b"error"
 
     @tcp.receive()
     async def state_sync(
@@ -1099,7 +1123,7 @@ class GateServer(HealthAwareServer):
             return await self._state_sync_handler.handle_state_sync_request(
                 addr, data, self.handle_exception
             )
-        return b'error'
+        return b"error"
 
     @tcp.receive()
     async def lease_transfer(
@@ -1114,7 +1138,7 @@ class GateServer(HealthAwareServer):
             return await self._state_sync_handler.handle_lease_transfer(
                 addr, data, self.handle_exception
             )
-        return b'error'
+        return b"error"
 
     @tcp.receive()
     async def job_final_result(
@@ -1129,7 +1153,7 @@ class GateServer(HealthAwareServer):
             return await self._state_sync_handler.handle_job_final_result(
                 addr, data, self._complete_job, self.handle_exception
             )
-        return b'error'
+        return b"error"
 
     @tcp.receive()
     async def job_leadership_notification(
@@ -1144,7 +1168,7 @@ class GateServer(HealthAwareServer):
             return await self._state_sync_handler.handle_job_leadership_notification(
                 addr, data, self.handle_exception
             )
-        return b'error'
+        return b"error"
 
     @tcp.receive()
     async def receive_job_progress_report(
@@ -1158,10 +1182,10 @@ class GateServer(HealthAwareServer):
         try:
             report = JobProgressReport.load(data)
             await self._job_timeout_tracker.record_progress(report)
-            return b'ok'
+            return b"ok"
         except Exception as error:
             await self.handle_exception(error, "receive_job_progress_report")
-            return b''
+            return b""
 
     @tcp.receive()
     async def receive_job_timeout_report(
@@ -1175,10 +1199,10 @@ class GateServer(HealthAwareServer):
         try:
             report = JobTimeoutReport.load(data)
             await self._job_timeout_tracker.record_timeout(report)
-            return b'ok'
+            return b"ok"
         except Exception as error:
             await self.handle_exception(error, "receive_job_timeout_report")
-            return b''
+            return b""
 
     @tcp.receive()
     async def receive_job_leader_transfer(
@@ -1192,10 +1216,10 @@ class GateServer(HealthAwareServer):
         try:
             report = JobLeaderTransfer.load(data)
             await self._job_timeout_tracker.record_leader_transfer(report)
-            return b'ok'
+            return b"ok"
         except Exception as error:
             await self.handle_exception(error, "receive_job_leader_transfer")
-            return b''
+            return b""
 
     @tcp.receive()
     async def receive_job_final_status(
@@ -1209,10 +1233,10 @@ class GateServer(HealthAwareServer):
         try:
             report = JobFinalStatus.load(data)
             await self._job_timeout_tracker.handle_final_status(report)
-            return b'ok'
+            return b"ok"
         except Exception as error:
             await self.handle_exception(error, "receive_job_final_status")
-            return b''
+            return b""
 
     @tcp.receive()
     async def workflow_result_push(
@@ -1228,7 +1252,7 @@ class GateServer(HealthAwareServer):
 
             if not self._job_manager.has_job(push.job_id):
                 await self._forward_workflow_result_to_peers(push)
-                return b'ok'
+                return b"ok"
 
             self._task_runner.run(
                 self._udp_logger.log,
@@ -1237,26 +1261,32 @@ class GateServer(HealthAwareServer):
                     node_host=self._host,
                     node_port=self._tcp_port,
                     node_id=self._node_id.short,
-                )
+                ),
             )
 
             if push.job_id not in self._workflow_dc_results:
                 self._workflow_dc_results[push.job_id] = {}
             if push.workflow_id not in self._workflow_dc_results[push.job_id]:
                 self._workflow_dc_results[push.job_id][push.workflow_id] = {}
-            self._workflow_dc_results[push.job_id][push.workflow_id][push.datacenter] = push
+            self._workflow_dc_results[push.job_id][push.workflow_id][
+                push.datacenter
+            ] = push
 
             target_dcs = self._job_manager.get_target_dcs(push.job_id)
-            received_dcs = set(self._workflow_dc_results[push.job_id][push.workflow_id].keys())
+            received_dcs = set(
+                self._workflow_dc_results[push.job_id][push.workflow_id].keys()
+            )
 
             if target_dcs and received_dcs >= target_dcs:
-                await self._aggregate_and_forward_workflow_result(push.job_id, push.workflow_id)
+                await self._aggregate_and_forward_workflow_result(
+                    push.job_id, push.workflow_id
+                )
 
-            return b'ok'
+            return b"ok"
 
         except Exception as error:
             await self.handle_exception(error, "workflow_result_push")
-            return b'error'
+            return b"error"
 
     @tcp.receive()
     async def register_callback(
@@ -1269,7 +1299,9 @@ class GateServer(HealthAwareServer):
         """Handle client callback registration for job reconnection."""
         try:
             client_id = f"{addr[0]}:{addr[1]}"
-            allowed, retry_after = self._check_rate_limit_for_operation(client_id, "reconnect")
+            allowed, retry_after = self._check_rate_limit_for_operation(
+                client_id, "reconnect"
+            )
             if not allowed:
                 return RateLimitResponse(
                     operation="reconnect",
@@ -1300,7 +1332,7 @@ class GateServer(HealthAwareServer):
                     node_host=self._host,
                     node_port=self._tcp_port,
                     node_id=self._node_id.short,
-                )
+                ),
             )
 
             response = RegisterCallbackResponse(
@@ -1316,7 +1348,7 @@ class GateServer(HealthAwareServer):
 
         except Exception as error:
             await self.handle_exception(error, "register_callback")
-            return b'error'
+            return b"error"
 
     @tcp.receive()
     async def workflow_query(
@@ -1329,7 +1361,9 @@ class GateServer(HealthAwareServer):
         """Handle workflow status query from client."""
         try:
             client_id = f"{addr[0]}:{addr[1]}"
-            allowed, retry_after = self._check_rate_limit_for_operation(client_id, "workflow_query")
+            allowed, retry_after = self._check_rate_limit_for_operation(
+                client_id, "workflow_query"
+            )
             if not allowed:
                 return RateLimitResponse(
                     operation="workflow_query",
@@ -1354,7 +1388,7 @@ class GateServer(HealthAwareServer):
 
         except Exception as error:
             await self.handle_exception(error, "workflow_query")
-            return b'error'
+            return b"error"
 
     @tcp.receive()
     async def datacenter_list(
@@ -1367,7 +1401,9 @@ class GateServer(HealthAwareServer):
         """Handle datacenter list request from client."""
         try:
             client_id = f"{addr[0]}:{addr[1]}"
-            allowed, retry_after = self._check_rate_limit_for_operation(client_id, "datacenter_list")
+            allowed, retry_after = self._check_rate_limit_for_operation(
+                client_id, "datacenter_list"
+            )
             if not allowed:
                 return RateLimitResponse(
                     operation="datacenter_list",
@@ -1390,14 +1426,16 @@ class GateServer(HealthAwareServer):
                         leader_addr = (heartbeat.tcp_host, heartbeat.tcp_port)
                         break
 
-                datacenters.append(DatacenterInfo(
-                    dc_id=dc_id,
-                    health=status.health,
-                    leader_addr=leader_addr,
-                    available_cores=status.available_capacity,
-                    manager_count=status.manager_count,
-                    worker_count=status.worker_count,
-                ))
+                datacenters.append(
+                    DatacenterInfo(
+                        dc_id=dc_id,
+                        health=status.health,
+                        leader_addr=leader_addr,
+                        available_cores=status.available_capacity,
+                        manager_count=status.manager_count,
+                        worker_count=status.worker_count,
+                    )
+                )
 
                 total_available_cores += status.available_capacity
                 if status.health == DatacenterHealth.HEALTHY.value:
@@ -1415,7 +1453,7 @@ class GateServer(HealthAwareServer):
 
         except Exception as error:
             await self.handle_exception(error, "datacenter_list")
-            return b'error'
+            return b"error"
 
     @tcp.receive()
     async def job_leadership_announcement(
@@ -1445,7 +1483,7 @@ class GateServer(HealthAwareServer):
                         node_host=self._host,
                         node_port=self._tcp_port,
                         node_id=self._node_id.short,
-                    )
+                    ),
                 )
 
             return JobLeadershipAck(
@@ -1496,11 +1534,11 @@ class GateServer(HealthAwareServer):
                     )
                 )
 
-            return b'ok'
+            return b"ok"
 
         except Exception as error:
             await self.handle_exception(error, "dc_leader_announcement")
-            return b'error'
+            return b"error"
 
     @tcp.receive()
     async def job_leader_manager_transfer(
@@ -1515,8 +1553,8 @@ class GateServer(HealthAwareServer):
             transfer = JobLeaderManagerTransfer.load(data)
 
             job_known = (
-                transfer.job_id in self._job_dc_managers or
-                transfer.job_id in self._job_leadership_tracker
+                transfer.job_id in self._job_dc_managers
+                or transfer.job_id in self._job_leadership_tracker
             )
             if not job_known:
                 self._task_runner.run(
@@ -1526,7 +1564,7 @@ class GateServer(HealthAwareServer):
                         node_host=self._host,
                         node_port=self._tcp_port,
                         node_id=self._node_id.short,
-                    )
+                    ),
                 )
                 return JobLeaderManagerTransferAck(
                     job_id=transfer.job_id,
@@ -1538,7 +1576,9 @@ class GateServer(HealthAwareServer):
                 transfer.job_id, transfer.datacenter_id
             )
             if old_manager_addr is None and transfer.job_id in self._job_dc_managers:
-                old_manager_addr = self._job_dc_managers[transfer.job_id].get(transfer.datacenter_id)
+                old_manager_addr = self._job_dc_managers[transfer.job_id].get(
+                    transfer.datacenter_id
+                )
 
             accepted = await self._job_leadership_tracker.update_dc_manager_async(
                 job_id=transfer.job_id,
@@ -1549,8 +1589,10 @@ class GateServer(HealthAwareServer):
             )
 
             if not accepted:
-                current_fence = self._job_leadership_tracker.get_dc_manager_fencing_token(
-                    transfer.job_id, transfer.datacenter_id
+                current_fence = (
+                    self._job_leadership_tracker.get_dc_manager_fencing_token(
+                        transfer.job_id, transfer.datacenter_id
+                    )
                 )
                 self._task_runner.run(
                     self._udp_logger.log,
@@ -1559,7 +1601,7 @@ class GateServer(HealthAwareServer):
                         node_host=self._host,
                         node_port=self._tcp_port,
                         node_id=self._node_id.short,
-                    )
+                    ),
                 )
                 return JobLeaderManagerTransferAck(
                     job_id=transfer.job_id,
@@ -1569,7 +1611,9 @@ class GateServer(HealthAwareServer):
 
             if transfer.job_id not in self._job_dc_managers:
                 self._job_dc_managers[transfer.job_id] = {}
-            self._job_dc_managers[transfer.job_id][transfer.datacenter_id] = transfer.new_manager_addr
+            self._job_dc_managers[transfer.job_id][transfer.datacenter_id] = (
+                transfer.new_manager_addr
+            )
 
             self._clear_orphaned_job(transfer.job_id, transfer.new_manager_addr)
 
@@ -1580,7 +1624,7 @@ class GateServer(HealthAwareServer):
                     node_host=self._host,
                     node_port=self._tcp_port,
                     node_id=self._node_id.short,
-                )
+                ),
             )
 
             return JobLeaderManagerTransferAck(
@@ -1629,11 +1673,11 @@ class GateServer(HealthAwareServer):
                 worker_key = f"{push.datacenter}:{worker_stat.worker_id}"
                 await self._windowed_stats.add_progress(worker_key, progress)
 
-            return b'ok'
+            return b"ok"
 
         except Exception as error:
             await self.handle_exception(error, "windowed_stats_push")
-            return b'error'
+            return b"error"
 
     # =========================================================================
     # Helper Methods (Required by Handlers and Coordinators)
@@ -1679,13 +1723,17 @@ class GateServer(HealthAwareServer):
         """Handle node death via SWIM."""
         gate_tcp_addr = self._gate_udp_to_tcp.get(node_addr)
         if gate_tcp_addr:
-            self._task_runner.run(self._handle_gate_peer_failure, node_addr, gate_tcp_addr)
+            self._task_runner.run(
+                self._handle_gate_peer_failure, node_addr, gate_tcp_addr
+            )
 
     def _on_node_join(self, node_addr: tuple[str, int]) -> None:
         """Handle node join via SWIM."""
         gate_tcp_addr = self._gate_udp_to_tcp.get(node_addr)
         if gate_tcp_addr:
-            self._task_runner.run(self._handle_gate_peer_recovery, node_addr, gate_tcp_addr)
+            self._task_runner.run(
+                self._handle_gate_peer_recovery, node_addr, gate_tcp_addr
+            )
 
     async def _handle_gate_peer_failure(
         self,
@@ -1723,7 +1771,7 @@ class GateServer(HealthAwareServer):
                 node_host=self._host,
                 node_port=self._tcp_port,
                 node_id=self._node_id.short,
-            )
+            ),
         )
 
     def _on_gate_lose_leadership(self) -> None:
@@ -1735,7 +1783,7 @@ class GateServer(HealthAwareServer):
                 node_host=self._host,
                 node_port=self._tcp_port,
                 node_id=self._node_id.short,
-            )
+            ),
         )
 
     def _on_manager_globally_dead(
@@ -1751,7 +1799,7 @@ class GateServer(HealthAwareServer):
                 node_host=self._host,
                 node_port=self._tcp_port,
                 node_id=self._node_id.short,
-            )
+            ),
         )
 
     def _on_manager_dead_for_dc(
@@ -1776,7 +1824,7 @@ class GateServer(HealthAwareServer):
         incarnation = 0
         health_state = self._datacenter_manager_status.get(dc_id, {}).get(manager_addr)
         if health_state:
-            incarnation = getattr(health_state, 'incarnation', 0)
+            incarnation = getattr(health_state, "incarnation", 0)
 
         detector = self.get_hierarchical_detector()
         if detector:
@@ -1800,41 +1848,55 @@ class GateServer(HealthAwareServer):
         """Handle embedded manager heartbeat from SWIM."""
         if self._health_coordinator:
             self._health_coordinator.handle_embedded_manager_heartbeat(
-                dc_id, manager_addr, node_id, is_leader, term, worker_count, available_cores
+                dc_id,
+                manager_addr,
+                node_id,
+                is_leader,
+                term,
+                worker_count,
+                available_cores,
             )
 
-    def _handle_gate_peer_heartbeat(
+    async def _handle_gate_peer_heartbeat(
         self,
-        udp_addr: tuple[str, int],
         heartbeat: GateHeartbeat,
+        udp_addr: tuple[str, int],
     ) -> None:
         """Handle gate peer heartbeat from SWIM."""
         self._gate_peer_info[udp_addr] = heartbeat
 
         if heartbeat.node_id and heartbeat.tcp_host and heartbeat.tcp_port:
-            self._job_hash_ring.add_node(
+            await self._job_hash_ring.add_node(
                 node_id=heartbeat.node_id,
                 tcp_host=heartbeat.tcp_host,
                 tcp_port=heartbeat.tcp_port,
             )
 
-    def _get_known_managers_for_piggyback(self) -> list[tuple[str, tuple[str, int], int, int]]:
+    def _get_known_managers_for_piggyback(
+        self,
+    ) -> list[tuple[str, tuple[str, int], int, int]]:
         """Get known managers for SWIM piggyback."""
         result = []
         for dc_id, managers in self._datacenter_manager_status.items():
             for addr, status in managers.items():
-                result.append((dc_id, addr, status.worker_count, status.available_cores))
+                result.append(
+                    (dc_id, addr, status.worker_count, status.available_cores)
+                )
         return result
 
     def _get_known_gates_for_piggyback(self) -> list[GateInfo]:
         """Get known gates for SWIM piggyback."""
         return list(self._known_gates.values())
 
-    def _get_job_leaderships_for_piggyback(self) -> list[tuple[str, str, tuple[str, int], int]]:
+    def _get_job_leaderships_for_piggyback(
+        self,
+    ) -> list[tuple[str, str, tuple[str, int], int]]:
         """Get job leaderships for SWIM piggyback."""
         return self._job_leadership_tracker.get_all_leaderships()
 
-    def _get_job_dc_managers_for_piggyback(self) -> dict[str, dict[str, tuple[str, int]]]:
+    def _get_job_dc_managers_for_piggyback(
+        self,
+    ) -> dict[str, dict[str, tuple[str, int]]]:
         """Get job DC managers for SWIM piggyback."""
         return dict(self._job_dc_managers)
 
@@ -1852,7 +1914,9 @@ class GateServer(HealthAwareServer):
         now = time.monotonic()
         elapsed = now - self._forward_throughput_interval_start
         if elapsed >= self._forward_throughput_interval_seconds:
-            throughput = self._forward_throughput_count / elapsed if elapsed > 0 else 0.0
+            throughput = (
+                self._forward_throughput_count / elapsed if elapsed > 0 else 0.0
+            )
             self._forward_throughput_last_value = throughput
             self._forward_throughput_count = 0
             self._forward_throughput_interval_start = now
@@ -1895,8 +1959,14 @@ class GateServer(HealthAwareServer):
                 job_id=job_id or f"temp-{time.monotonic()}",
                 preferred_datacenters=set(preferred) if preferred else None,
             )
-            primary_dcs = decision.primary_datacenters[:count] if decision.primary_datacenters else []
-            fallback_dcs = decision.fallback_datacenters + decision.primary_datacenters[count:]
+            primary_dcs = (
+                decision.primary_datacenters[:count]
+                if decision.primary_datacenters
+                else []
+            )
+            fallback_dcs = (
+                decision.fallback_datacenters + decision.primary_datacenters[count:]
+            )
 
             if not decision.primary_bucket:
                 dc_health = self._get_all_datacenter_health()
@@ -1920,12 +1990,21 @@ class GateServer(HealthAwareServer):
                 return ([], [], "initializing")
             return ([], [], "unhealthy")
 
-        healthy = [dc for dc, status in dc_health.items()
-                   if status.health == DatacenterHealth.HEALTHY.value]
-        busy = [dc for dc, status in dc_health.items()
-                if status.health == DatacenterHealth.BUSY.value]
-        degraded = [dc for dc, status in dc_health.items()
-                    if status.health == DatacenterHealth.DEGRADED.value]
+        healthy = [
+            dc
+            for dc, status in dc_health.items()
+            if status.health == DatacenterHealth.HEALTHY.value
+        ]
+        busy = [
+            dc
+            for dc, status in dc_health.items()
+            if status.health == DatacenterHealth.BUSY.value
+        ]
+        degraded = [
+            dc
+            for dc, status in dc_health.items()
+            if status.health == DatacenterHealth.DEGRADED.value
+        ]
 
         if healthy:
             worst_health = "healthy"
@@ -1947,11 +2026,13 @@ class GateServer(HealthAwareServer):
         candidates = []
         for dc_id in self._datacenter_managers.keys():
             status = self._classify_datacenter_health(dc_id)
-            candidates.append(DatacenterCandidate(
-                datacenter_id=dc_id,
-                health=status.health,
-                available_capacity=status.available_capacity,
-            ))
+            candidates.append(
+                DatacenterCandidate(
+                    datacenter_id=dc_id,
+                    health=status.health,
+                    available_capacity=status.available_capacity,
+                )
+            )
         return candidates
 
     def _check_rate_limit_for_operation(
@@ -1999,16 +2080,18 @@ class GateServer(HealthAwareServer):
                 if tcp_addr == peer_addr:
                     heartbeat = self._gate_peer_info.get(udp_addr)
                     if heartbeat:
-                        gates.append(GateInfo(
-                            gate_id=heartbeat.node_id,
-                            tcp_host=heartbeat.tcp_host,
-                            tcp_port=heartbeat.tcp_port,
-                            udp_host=udp_addr[0],
-                            udp_port=udp_addr[1],
-                            is_leader=heartbeat.is_leader,
-                            term=heartbeat.term,
-                            state=heartbeat.state,
-                        ))
+                        gates.append(
+                            GateInfo(
+                                gate_id=heartbeat.node_id,
+                                tcp_host=heartbeat.tcp_host,
+                                tcp_port=heartbeat.tcp_port,
+                                udp_host=udp_addr[0],
+                                udp_port=udp_addr[1],
+                                is_leader=heartbeat.is_leader,
+                                term=heartbeat.term,
+                                state=heartbeat.state,
+                            )
+                        )
                     break
 
         return gates
@@ -2020,7 +2103,9 @@ class GateServer(HealthAwareServer):
     ) -> None:
         """Broadcast job leadership to peer gates."""
         if self._leadership_coordinator:
-            await self._leadership_coordinator.broadcast_job_leadership(job_id, target_dc_count)
+            await self._leadership_coordinator.broadcast_job_leadership(
+                job_id, target_dc_count
+            )
 
     async def _dispatch_job_to_datacenters(
         self,
@@ -2110,7 +2195,9 @@ class GateServer(HealthAwareServer):
     ) -> None:
         """Send immediate update to client."""
         if self._stats_coordinator:
-            await self._stats_coordinator.send_immediate_update(job_id, event_type, payload)
+            await self._stats_coordinator.send_immediate_update(
+                job_id, event_type, payload
+            )
 
     def _record_manager_heartbeat(
         self,
@@ -2260,7 +2347,7 @@ class GateServer(HealthAwareServer):
                 node_host=self._host,
                 node_port=self._tcp_port,
                 node_id=self._node_id.short,
-            )
+            ),
         )
 
     def _on_dc_latency(self, datacenter: str, latency_ms: float) -> None:
@@ -2287,7 +2374,7 @@ class GateServer(HealthAwareServer):
                 node_host=self._host,
                 node_port=self._tcp_port,
                 node_id=self._node_id.short,
-            )
+            ),
         )
 
     async def _forward_workflow_result_to_peers(self, push: WorkflowResultPush) -> bool:
@@ -2333,7 +2420,9 @@ class GateServer(HealthAwareServer):
         workflow_id: str,
     ) -> None:
         """Aggregate workflow results from all DCs and forward to client."""
-        workflow_results = self._workflow_dc_results.get(job_id, {}).get(workflow_id, {})
+        workflow_results = self._workflow_dc_results.get(job_id, {}).get(
+            workflow_id, {}
+        )
         if not workflow_results:
             return
 
@@ -2360,22 +2449,26 @@ class GateServer(HealthAwareServer):
                     else:
                         dc_aggregated_stats = dc_push.results[0]
 
-                per_dc_results.append(WorkflowDCResult(
-                    datacenter=datacenter,
-                    status=dc_push.status,
-                    stats=dc_aggregated_stats,
-                    error=dc_push.error,
-                    elapsed_seconds=dc_push.elapsed_seconds,
-                ))
+                per_dc_results.append(
+                    WorkflowDCResult(
+                        datacenter=datacenter,
+                        status=dc_push.status,
+                        stats=dc_aggregated_stats,
+                        error=dc_push.error,
+                        elapsed_seconds=dc_push.elapsed_seconds,
+                    )
+                )
             else:
-                per_dc_results.append(WorkflowDCResult(
-                    datacenter=datacenter,
-                    status=dc_push.status,
-                    stats=None,
-                    error=dc_push.error,
-                    elapsed_seconds=dc_push.elapsed_seconds,
-                    raw_results=dc_push.results,
-                ))
+                per_dc_results.append(
+                    WorkflowDCResult(
+                        datacenter=datacenter,
+                        status=dc_push.status,
+                        stats=None,
+                        error=dc_push.error,
+                        elapsed_seconds=dc_push.elapsed_seconds,
+                        raw_results=dc_push.results,
+                    )
+                )
 
             if dc_push.status == "FAILED":
                 has_failure = True
@@ -2432,7 +2525,7 @@ class GateServer(HealthAwareServer):
                         node_host=self._host,
                         node_port=self._tcp_port,
                         node_id=self._node_id.short,
-                    )
+                    ),
                 )
 
         if job_id in self._workflow_dc_results:
@@ -2453,7 +2546,7 @@ class GateServer(HealthAwareServer):
                     request.dump(),
                     timeout=5.0,
                 )
-                if isinstance(response_data, Exception) or response_data == b'error':
+                if isinstance(response_data, Exception) or response_data == b"error":
                     return
 
                 manager_response = WorkflowQueryResponse.load(response_data)
@@ -2462,7 +2555,9 @@ class GateServer(HealthAwareServer):
             except Exception:
                 pass
 
-        job_dc_managers = self._job_dc_managers.get(request.job_id, {}) if request.job_id else {}
+        job_dc_managers = (
+            self._job_dc_managers.get(request.job_id, {}) if request.job_id else {}
+        )
 
         query_tasks = []
         for dc_id in self._datacenter_managers.keys():
@@ -2515,7 +2610,7 @@ class GateServer(HealthAwareServer):
         start_time = time.monotonic()
 
         while True:
-            nodes = self._context.read('nodes')
+            nodes = self._context.read("nodes")
             self_addr = (self._host, self._udp_port)
             visible_peers = len([n for n in nodes.keys() if n != self_addr])
 
@@ -2587,10 +2682,14 @@ class GateServer(HealthAwareServer):
                         cluster_id=self.env.CLUSTER_ID,
                         environment_id=self.env.ENVIRONMENT_ID,
                         active_jobs=self._job_manager.count_active_jobs(),
-                        manager_count=sum(len(addrs) for addrs in self._datacenter_managers.values()),
+                        manager_count=sum(
+                            len(addrs) for addrs in self._datacenter_managers.values()
+                        ),
                         protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
                         protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
-                        capabilities=",".join(sorted(self._node_capabilities.capabilities)),
+                        capabilities=",".join(
+                            sorted(self._node_capabilities.capabilities)
+                        ),
                     )
 
                     await self.send_tcp(
@@ -2616,8 +2715,7 @@ class GateServer(HealthAwareServer):
 
                 now = time.monotonic()
                 expired = [
-                    key for key, lease in self._leases.items()
-                    if lease.expires_at < now
+                    key for key, lease in self._leases.items() if lease.expires_at < now
                 ]
                 for key in expired:
                     self._leases.pop(key, None)
@@ -2645,7 +2743,7 @@ class GateServer(HealthAwareServer):
 
                 for job_id, job in list(self._job_manager.items()):
                     if job.status in terminal_states:
-                        age = now - getattr(job, 'timestamp', now)
+                        age = now - getattr(job, "timestamp", now)
                         if age > self._job_max_age:
                             jobs_to_remove.append(job_id)
 

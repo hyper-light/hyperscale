@@ -266,7 +266,7 @@ class GatePeerCoordinator:
             ),
         )
 
-    def handle_gate_heartbeat(
+    async def handle_gate_heartbeat(
         self,
         heartbeat: GateHeartbeat,
         source_addr: tuple[str, int],
@@ -306,8 +306,7 @@ class GatePeerCoordinator:
             role="gate",
         )
 
-        self._task_runner.run(
-            self._job_hash_ring.add_node,
+        await self._job_hash_ring.add_node(
             node_id=heartbeat.node_id,
             tcp_host=peer_tcp_host,
             tcp_port=peer_tcp_port,
