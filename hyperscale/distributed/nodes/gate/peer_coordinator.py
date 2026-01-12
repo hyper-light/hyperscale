@@ -31,7 +31,10 @@ from .state import GateRuntimeState
 if TYPE_CHECKING:
     from hyperscale.distributed.swim.core import NodeId
     from hyperscale.distributed.hash_ring import ConsistentHashRing
-    from hyperscale.distributed.tracking import JobForwardingTracker, JobLeadershipTracker
+    from hyperscale.distributed.tracking import (
+        JobForwardingTracker,
+        JobLeadershipTracker,
+    )
     from hyperscale.distributed.versioning import VersionedClock
     from taskex import TaskRunner
 
@@ -130,7 +133,7 @@ class GatePeerCoordinator:
                 node_host=self._get_host(),
                 node_port=self._get_tcp_port(),
                 node_id=self._get_node_id().short,
-            )
+            ),
         )
 
     async def handle_peer_failure(
@@ -160,9 +163,9 @@ class GatePeerCoordinator:
             real_peer_id = peer_heartbeat.node_id if peer_heartbeat else peer_id
 
             if peer_heartbeat:
-                self._job_hash_ring.remove_node(peer_heartbeat.node_id)
+                await self._job_hash_ring.remove_node(peer_heartbeat.node_id)
             else:
-                self._job_hash_ring.remove_node(peer_id)
+                await self._job_hash_ring.remove_node(peer_id)
 
             self._job_forwarding_tracker.unregister_peer(real_peer_id)
 
@@ -173,7 +176,7 @@ class GatePeerCoordinator:
                 node_host=self._get_host(),
                 node_port=self._get_tcp_port(),
                 node_id=self._get_node_id().short,
-            )
+            ),
         )
 
         await self._handle_job_leader_failure(tcp_addr)
@@ -186,7 +189,7 @@ class GatePeerCoordinator:
                 node_host=self._get_host(),
                 node_port=self._get_tcp_port(),
                 node_id=self._get_node_id().short,
-            )
+            ),
         )
 
     async def handle_peer_recovery(
@@ -211,7 +214,9 @@ class GatePeerCoordinator:
 
         async with self._recovery_semaphore:
             if self._recovery_jitter_max > 0:
-                jitter = random.uniform(self._recovery_jitter_min, self._recovery_jitter_max)
+                jitter = random.uniform(
+                    self._recovery_jitter_min, self._recovery_jitter_max
+                )
                 await asyncio.sleep(jitter)
 
             async with peer_lock:
@@ -221,11 +226,11 @@ class GatePeerCoordinator:
                         self._logger.log,
                         ServerDebug(
                             message=f"Gate peer recovery for {tcp_addr} aborted: epoch changed "
-                                    f"({initial_epoch} -> {current_epoch}) during jitter",
+                            f"({initial_epoch} -> {current_epoch}) during jitter",
                             node_host=self._get_host(),
                             node_port=self._get_tcp_port(),
                             node_id=self._get_node_id().short,
-                        )
+                        ),
                     )
                     return
 
@@ -247,7 +252,7 @@ class GatePeerCoordinator:
                 node_host=self._get_host(),
                 node_port=self._get_tcp_port(),
                 node_id=self._get_node_id().short,
-            )
+            ),
         )
 
         active_count = self._state.get_active_peer_count() + 1
@@ -258,7 +263,7 @@ class GatePeerCoordinator:
                 node_host=self._get_host(),
                 node_port=self._get_tcp_port(),
                 node_id=self._get_node_id().short,
-            )
+            ),
         )
 
     def handle_gate_heartbeat(
@@ -301,7 +306,8 @@ class GatePeerCoordinator:
             role="gate",
         )
 
-        self._job_hash_ring.add_node(
+        self._task_runner.run(
+            self._job_hash_ring.add_node,
             node_id=heartbeat.node_id,
             tcp_host=peer_tcp_host,
             tcp_port=peer_tcp_port,
@@ -326,7 +332,7 @@ class GatePeerCoordinator:
         health_state.update_readiness(
             has_dc_connectivity=heartbeat.connected_dc_count > 0,
             connected_dc_count=heartbeat.connected_dc_count,
-            overload_state=getattr(heartbeat, 'overload_state', 'healthy'),
+            overload_state=getattr(heartbeat, "overload_state", "healthy"),
         )
 
         self._task_runner.run(
@@ -345,15 +351,17 @@ class GatePeerCoordinator:
         gates: list[GateInfo] = []
 
         node_id = self._get_node_id()
-        gates.append(GateInfo(
-            node_id=node_id.full,
-            tcp_host=self._get_host(),
-            tcp_port=self._get_tcp_port(),
-            udp_host=self._get_host(),
-            udp_port=self._get_udp_port(),
-            datacenter=node_id.datacenter,
-            is_leader=False,
-        ))
+        gates.append(
+            GateInfo(
+                node_id=node_id.full,
+                tcp_host=self._get_host(),
+                tcp_port=self._get_tcp_port(),
+                udp_host=self._get_host(),
+                udp_port=self._get_udp_port(),
+                datacenter=node_id.datacenter,
+                is_leader=False,
+            )
+        )
 
         for tcp_addr in list(self._state._active_gate_peers):
             udp_addr: tuple[str, int] | None = None
@@ -368,25 +376,29 @@ class GatePeerCoordinator:
             peer_heartbeat = self._state._gate_peer_info.get(udp_addr)
 
             if peer_heartbeat:
-                gates.append(GateInfo(
-                    node_id=peer_heartbeat.node_id,
-                    tcp_host=tcp_addr[0],
-                    tcp_port=tcp_addr[1],
-                    udp_host=udp_addr[0],
-                    udp_port=udp_addr[1],
-                    datacenter=peer_heartbeat.datacenter,
-                    is_leader=peer_heartbeat.is_leader,
-                ))
+                gates.append(
+                    GateInfo(
+                        node_id=peer_heartbeat.node_id,
+                        tcp_host=tcp_addr[0],
+                        tcp_port=tcp_addr[1],
+                        udp_host=udp_addr[0],
+                        udp_port=udp_addr[1],
+                        datacenter=peer_heartbeat.datacenter,
+                        is_leader=peer_heartbeat.is_leader,
+                    )
+                )
             else:
-                gates.append(GateInfo(
-                    node_id=f"gate-{tcp_addr[0]}:{tcp_addr[1]}",
-                    tcp_host=tcp_addr[0],
-                    tcp_port=tcp_addr[1],
-                    udp_host=udp_addr[0],
-                    udp_port=udp_addr[1],
-                    datacenter=node_id.datacenter,
-                    is_leader=False,
-                ))
+                gates.append(
+                    GateInfo(
+                        node_id=f"gate-{tcp_addr[0]}:{tcp_addr[1]}",
+                        tcp_host=tcp_addr[0],
+                        tcp_port=tcp_addr[1],
+                        udp_host=udp_addr[0],
+                        udp_port=udp_addr[1],
+                        datacenter=node_id.datacenter,
+                        is_leader=False,
+                    )
+                )
 
         return gates
 
