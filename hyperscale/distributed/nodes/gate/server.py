@@ -1709,9 +1709,7 @@ class GateServer(HealthAwareServer):
 
     def _get_peer_state_lock(self, peer_addr: tuple[str, int]) -> asyncio.Lock:
         """Get or create lock for a peer."""
-        if peer_addr not in self._peer_state_locks:
-            self._peer_state_locks[peer_addr] = asyncio.Lock()
-        return self._peer_state_locks[peer_addr]
+        return self._peer_state_locks.setdefault(peer_addr, asyncio.Lock())
 
     def _on_peer_confirmed(self, peer: tuple[str, int]) -> None:
         """Handle peer confirmation via SWIM (AD-29)."""

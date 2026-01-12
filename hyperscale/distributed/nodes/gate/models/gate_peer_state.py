@@ -76,9 +76,7 @@ class GatePeerState:
 
     def get_or_create_peer_lock(self, peer_addr: tuple[str, int]) -> asyncio.Lock:
         """Get or create a lock for the given peer address."""
-        if peer_addr not in self.peer_locks:
-            self.peer_locks[peer_addr] = asyncio.Lock()
-        return self.peer_locks[peer_addr]
+        return self.peer_locks.setdefault(peer_addr, asyncio.Lock())
 
     def increment_epoch(self, peer_addr: tuple[str, int]) -> int:
         """Increment and return the epoch for a peer address."""

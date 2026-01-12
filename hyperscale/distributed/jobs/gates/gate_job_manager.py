@@ -68,9 +68,7 @@ class GateJobManager:
 
     @asynccontextmanager
     async def lock_job(self, job_id: str) -> AsyncIterator[None]:
-        if job_id not in self._job_locks:
-            self._job_locks[job_id] = asyncio.Lock()
-        lock = self._job_locks[job_id]
+        lock = self._job_locks.setdefault(job_id, asyncio.Lock())
         async with lock:
             yield
 

@@ -110,9 +110,7 @@ class WorkerRegistry:
 
     def get_or_create_manager_lock(self, manager_id: str) -> asyncio.Lock:
         """Get or create a state lock for a manager."""
-        if manager_id not in self._manager_state_locks:
-            self._manager_state_locks[manager_id] = asyncio.Lock()
-        return self._manager_state_locks[manager_id]
+        return self._manager_state_locks.setdefault(manager_id, asyncio.Lock())
 
     def increment_manager_epoch(self, manager_id: str) -> int:
         """Increment and return the epoch for a manager."""
@@ -221,9 +219,7 @@ class WorkerRegistry:
         self._primary_manager_id = None
         return None
 
-    def find_manager_by_udp_addr(
-        self, udp_addr: tuple[str, int]
-    ) -> str | None:
+    def find_manager_by_udp_addr(self, udp_addr: tuple[str, int]) -> str | None:
         """Find manager ID by UDP address."""
         for manager_id, manager in self._known_managers.items():
             if (manager.udp_host, manager.udp_port) == udp_addr:

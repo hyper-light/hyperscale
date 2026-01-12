@@ -49,7 +49,9 @@ class GateRuntimeState:
 
         # Datacenter/manager state
         self._dc_registration_states: dict[str, DatacenterRegistrationState] = {}
-        self._datacenter_manager_status: dict[str, dict[tuple[str, int], ManagerHeartbeat]] = {}
+        self._datacenter_manager_status: dict[
+            str, dict[tuple[str, int], ManagerHeartbeat]
+        ] = {}
         self._manager_last_status: dict[tuple[str, int], float] = {}
         self._manager_health: dict[tuple[str, tuple[str, int]], ManagerHealthState] = {}
 
@@ -59,10 +61,14 @@ class GateRuntimeState:
         self._dc_backpressure: dict[str, BackpressureLevel] = {}
 
         # Protocol negotiation
-        self._manager_negotiated_caps: dict[tuple[str, int], NegotiatedCapabilities] = {}
+        self._manager_negotiated_caps: dict[
+            tuple[str, int], NegotiatedCapabilities
+        ] = {}
 
         # Job state (handled by GateJobManager, but some local tracking)
-        self._workflow_dc_results: dict[str, dict[str, dict[str, WorkflowResultPush]]] = {}
+        self._workflow_dc_results: dict[
+            str, dict[str, dict[str, WorkflowResultPush]]
+        ] = {}
         self._job_workflow_ids: dict[str, set[str]] = {}
         self._job_dc_managers: dict[str, dict[str, tuple[str, int]]] = {}
         self._job_submissions: dict[str, JobSubmission] = {}
@@ -95,9 +101,7 @@ class GateRuntimeState:
     # Gate peer methods
     def get_or_create_peer_lock(self, peer_addr: tuple[str, int]) -> asyncio.Lock:
         """Get or create a lock for the given peer address."""
-        if peer_addr not in self._peer_state_locks:
-            self._peer_state_locks[peer_addr] = asyncio.Lock()
-        return self._peer_state_locks[peer_addr]
+        return self._peer_state_locks.setdefault(peer_addr, asyncio.Lock())
 
     def increment_peer_epoch(self, peer_addr: tuple[str, int]) -> int:
         """Increment and return the epoch for a peer address."""
@@ -167,7 +171,9 @@ class GateRuntimeState:
         key = self.get_lease_key(job_id, datacenter_id)
         return self._leases.get(key)
 
-    def set_lease(self, job_id: str, datacenter_id: str, lease: DatacenterLease) -> None:
+    def set_lease(
+        self, job_id: str, datacenter_id: str, lease: DatacenterLease
+    ) -> None:
         """Set the lease for a job-DC pair."""
         key = self.get_lease_key(job_id, datacenter_id)
         self._leases[key] = lease
@@ -243,7 +249,9 @@ class GateRuntimeState:
         """Calculate and reset throughput for the current interval."""
         elapsed = now - self._forward_throughput_interval_start
         if elapsed >= interval_seconds:
-            throughput = self._forward_throughput_count / elapsed if elapsed > 0 else 0.0
+            throughput = (
+                self._forward_throughput_count / elapsed if elapsed > 0 else 0.0
+            )
             self._forward_throughput_last_value = throughput
             self._forward_throughput_count = 0
             self._forward_throughput_interval_start = now

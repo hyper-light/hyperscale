@@ -27,9 +27,7 @@ class Context(Generic[T]):
             return self._value_locks[key]
 
     def with_value(self, key: str) -> asyncio.Lock:
-        if key not in self._value_locks:
-            self._value_locks[key] = asyncio.Lock()
-        return self._value_locks[key]
+        return self._value_locks.setdefault(key, asyncio.Lock())
 
     async def read_with_lock(self, key: str):
         async with self._store_lock:

@@ -137,9 +137,7 @@ class ClientState:
         Returns:
             asyncio.Lock for this job's routing decisions
         """
-        if job_id not in self._request_routing_locks:
-            self._request_routing_locks[job_id] = asyncio.Lock()
-        return self._request_routing_locks[job_id]
+        return self._request_routing_locks.setdefault(job_id, asyncio.Lock())
 
     def mark_job_orphaned(self, job_id: str, orphan_info: OrphanedJobInfo) -> None:
         """
