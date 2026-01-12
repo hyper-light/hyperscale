@@ -161,7 +161,11 @@ class CommitPipeline:
                     backpressure=backpressure,
                 )
 
-        return CommitResult(entry=entry, level_achieved=level_achieved)
+        return CommitResult(
+            entry=entry,
+            level_achieved=level_achieved,
+            backpressure=backpressure,
+        )
 
     async def _replicate_regional(self, entry: WALEntry) -> bool:
         if self._regional_replicator is None:
