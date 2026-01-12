@@ -98,7 +98,7 @@ class ManagerDispatchCoordinator:
         worker_id = worker.node.node_id
 
         # Get dispatch semaphore for worker
-        semaphore = self._state.get_dispatch_semaphore(
+        semaphore = await self._state.get_dispatch_semaphore(
             worker_id,
             self._config.dispatch_max_concurrent_per_worker,
         )
