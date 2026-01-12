@@ -126,7 +126,9 @@ from hyperscale.distributed.jobs.timeout_strategy import (
     LocalAuthorityTimeout,
     GateCoordinatedTimeout,
 )
-from hyperscale.distributed.workflow import WorkflowStateMachine as WorkflowLifecycleStateMachine
+from hyperscale.distributed.workflow import (
+    WorkflowStateMachine as WorkflowLifecycleStateMachine,
+)
 from hyperscale.logging.hyperscale_logging_models import (
     ServerInfo,
     ServerWarning,
@@ -327,7 +329,9 @@ class ManagerServer(HealthAwareServer):
             node_id=self._node_id.short,
             task_runner=self._task_runner,
             is_leader_fn=self.is_leader,
-            get_term_fn=lambda: self._leader_election.state.current_term if hasattr(self, '_leader_election') else 0,
+            get_term_fn=lambda: self._leader_election.state.current_term
+            if hasattr(self, "_leader_election")
+            else 0,
         )
 
         # Stats coordinator
@@ -435,18 +439,18 @@ class ManagerServer(HealthAwareServer):
         # Federated health monitor for gate probing
         fed_config = self._env.get_federated_health_config()
         self._gate_health_monitor = FederatedHealthMonitor(
-            probe_interval=fed_config['probe_interval'],
-            probe_timeout=fed_config['probe_timeout'],
-            suspicion_timeout=fed_config['suspicion_timeout'],
-            max_consecutive_failures=fed_config['max_consecutive_failures'],
+            probe_interval=fed_config["probe_interval"],
+            probe_timeout=fed_config["probe_timeout"],
+            suspicion_timeout=fed_config["suspicion_timeout"],
+            max_consecutive_failures=fed_config["max_consecutive_failures"],
         )
 
         # Gate circuit breaker
         cb_config = self._env.get_circuit_breaker_config()
         self._gate_circuit = ErrorStats(
-            max_errors=cb_config['max_errors'],
-            window_seconds=cb_config['window_seconds'],
-            half_open_after=cb_config['half_open_after'],
+            max_errors=cb_config["max_errors"],
+            window_seconds=cb_config["window_seconds"],
+            half_open_after=cb_config["half_open_after"],
         )
 
         # Quorum circuit breaker
@@ -457,7 +461,9 @@ class ManagerServer(HealthAwareServer):
         )
 
         # Recovery semaphore
-        self._recovery_semaphore = asyncio.Semaphore(self._config.recovery_max_concurrent)
+        self._recovery_semaphore = asyncio.Semaphore(
+            self._config.recovery_max_concurrent
+        )
 
         # Role validator for mTLS
         self._role_validator = RoleValidator(
@@ -487,12 +493,16 @@ class ManagerServer(HealthAwareServer):
         # Gate UDP to TCP mapping
         for idx, tcp_addr in enumerate(self._seed_gates):
             if idx < len(self._gate_udp_addrs):
-                self._manager_state._gate_udp_to_tcp[self._gate_udp_addrs[idx]] = tcp_addr
+                self._manager_state._gate_udp_to_tcp[self._gate_udp_addrs[idx]] = (
+                    tcp_addr
+                )
 
         # Manager UDP to TCP mapping
         for idx, tcp_addr in enumerate(self._seed_managers):
             if idx < len(self._manager_udp_peers):
-                self._manager_state._manager_udp_to_tcp[self._manager_udp_peers[idx]] = tcp_addr
+                self._manager_state._manager_udp_to_tcp[
+                    self._manager_udp_peers[idx]
+                ] = tcp_addr
 
     def _register_callbacks(self) -> None:
         """Register SWIM and leadership callbacks."""
@@ -529,7 +539,9 @@ class ManagerServer(HealthAwareServer):
             get_active_jobs=lambda: self._job_manager.job_count,
             get_active_workflows=self._get_active_workflow_count,
             get_worker_count=lambda: len(self._manager_state._workers),
-            get_healthy_worker_count=lambda: len(self._registry.get_healthy_worker_ids()),
+            get_healthy_worker_count=lambda: len(
+                self._registry.get_healthy_worker_ids()
+            ),
             get_available_cores=self._get_available_cores_for_healthy_workers,
             get_total_cores=self._get_total_cores,
             on_worker_heartbeat=self._handle_embedded_worker_heartbeat,
@@ -540,19 +552,24 @@ class ManagerServer(HealthAwareServer):
             get_tcp_port=lambda: self._tcp_port,
             get_udp_host=lambda: self._host,
             get_udp_port=lambda: self._udp_port,
-            get_health_accepting_jobs=lambda: self._manager_state._manager_state == ManagerStateEnum.ACTIVE,
+            get_health_accepting_jobs=lambda: self._manager_state._manager_state
+            == ManagerStateEnum.ACTIVE,
             get_health_has_quorum=self._has_quorum_available,
             get_health_throughput=self._get_dispatch_throughput,
             get_health_expected_throughput=self._get_expected_dispatch_throughput,
-            get_health_overload_state=lambda: self._overload_detector.get_state(0.0, 0.0),
+            get_health_overload_state=lambda: self._overload_detector.get_state(
+                0.0, 0.0
+            ),
             get_current_gate_leader_id=lambda: self._manager_state._current_gate_leader_id,
             get_current_gate_leader_host=lambda: (
                 self._manager_state._current_gate_leader_addr[0]
-                if self._manager_state._current_gate_leader_addr else None
+                if self._manager_state._current_gate_leader_addr
+                else None
             ),
             get_current_gate_leader_port=lambda: (
                 self._manager_state._current_gate_leader_addr[1]
-                if self._manager_state._current_gate_leader_addr else None
+                if self._manager_state._current_gate_leader_addr
+                else None
             ),
             get_known_gates=self._get_known_gates_for_heartbeat,
             get_job_leaderships=self._get_job_leaderships_for_heartbeat,
@@ -644,7 +661,7 @@ class ManagerServer(HealthAwareServer):
         broadcast_leave: bool = True,
     ) -> None:
         """Stop the manager server."""
-        if not self._running and not hasattr(self, '_started'):
+        if not self._running and not hasattr(self, "_started"):
             return
 
         self._running = False
@@ -699,11 +716,17 @@ class ManagerServer(HealthAwareServer):
         )
         self._stats_push_task = asyncio.create_task(self._stats_push_loop())
         self._gate_heartbeat_task = asyncio.create_task(self._gate_heartbeat_loop())
-        self._rate_limit_cleanup_task = asyncio.create_task(self._rate_limit_cleanup_loop())
+        self._rate_limit_cleanup_task = asyncio.create_task(
+            self._rate_limit_cleanup_loop()
+        )
         self._job_cleanup_task = asyncio.create_task(self._job_cleanup_loop())
         self._unified_timeout_task = asyncio.create_task(self._unified_timeout_loop())
-        self._deadline_enforcement_task = asyncio.create_task(self._deadline_enforcement_loop())
-        self._peer_job_state_sync_task = asyncio.create_task(self._peer_job_state_sync_loop())
+        self._deadline_enforcement_task = asyncio.create_task(
+            self._deadline_enforcement_loop()
+        )
+        self._peer_job_state_sync_task = asyncio.create_task(
+            self._peer_job_state_sync_loop()
+        )
 
     async def _cancel_background_tasks(self) -> None:
         """Cancel all background tasks."""
@@ -808,7 +831,9 @@ class ManagerServer(HealthAwareServer):
         worker_id = self._manager_state._worker_addr_to_id.get(node_addr)
         if worker_id:
             if worker_id not in self._manager_state._worker_unhealthy_since:
-                self._manager_state._worker_unhealthy_since[worker_id] = time.monotonic()
+                self._manager_state._worker_unhealthy_since[worker_id] = (
+                    time.monotonic()
+                )
             self._task_runner.run(self._handle_worker_failure, worker_id)
             return
 
@@ -1001,7 +1026,7 @@ class ManagerServer(HealthAwareServer):
     # Heartbeat Handlers
     # =========================================================================
 
-    def _handle_embedded_worker_heartbeat(
+    async def _handle_embedded_worker_heartbeat(
         self,
         heartbeat: WorkerHeartbeat,
         source_addr: tuple[str, int],
@@ -1018,7 +1043,7 @@ class ManagerServer(HealthAwareServer):
                 queue_depth=heartbeat.queue_depth,
             )
 
-    def _handle_manager_peer_heartbeat(
+    async def _handle_manager_peer_heartbeat(
         self,
         heartbeat: ManagerHeartbeat,
         source_addr: tuple[str, int],
@@ -1042,7 +1067,7 @@ class ManagerServer(HealthAwareServer):
         # Confirm peer
         self.confirm_peer(source_addr)
 
-    def _handle_gate_heartbeat(
+    async def _handle_gate_heartbeat(
         self,
         heartbeat: GateHeartbeat,
         source_addr: tuple[str, int],
@@ -1101,9 +1126,7 @@ class ManagerServer(HealthAwareServer):
                     self._registry.unregister_worker(worker_id)
 
                 # Reap dead peers
-                peer_reap_threshold = (
-                    now - self._config.dead_peer_reap_interval_seconds
-                )
+                peer_reap_threshold = now - self._config.dead_peer_reap_interval_seconds
                 peers_to_reap = [
                     peer_id
                     for peer_id, unhealthy_since in self._manager_state._manager_peer_unhealthy_since.items()
@@ -1113,9 +1136,7 @@ class ManagerServer(HealthAwareServer):
                     self._registry.unregister_manager_peer(peer_id)
 
                 # Reap dead gates
-                gate_reap_threshold = (
-                    now - self._config.dead_gate_reap_interval_seconds
-                )
+                gate_reap_threshold = now - self._config.dead_gate_reap_interval_seconds
                 gates_to_reap = [
                     gate_id
                     for gate_id, unhealthy_since in self._manager_state._gate_unhealthy_since.items()
@@ -1183,7 +1204,10 @@ class ManagerServer(HealthAwareServer):
                         manager_tracked_ids: set[str] = set()
                         for job in self._job_manager.iter_jobs():
                             for wf_id, wf in job.workflows.items():
-                                if wf.worker_id == worker_id and wf.status == WorkflowStatus.RUNNING:
+                                if (
+                                    wf.worker_id == worker_id
+                                    and wf.status == WorkflowStatus.RUNNING
+                                ):
                                     manager_tracked_ids.add(wf_id)
 
                         # Workflows we track but worker doesn't have = orphaned
@@ -1200,7 +1224,9 @@ class ManagerServer(HealthAwareServer):
                             )
                             # Re-queue for dispatch
                             if self._workflow_dispatcher:
-                                await self._workflow_dispatcher.requeue_workflow(orphaned_id)
+                                await self._workflow_dispatcher.requeue_workflow(
+                                    orphaned_id
+                                )
 
                     except Exception as worker_error:
                         await self._udp_logger.log(
@@ -1255,9 +1281,7 @@ class ManagerServer(HealthAwareServer):
         """Periodically push stats to gates/clients."""
         while self._running:
             try:
-                await asyncio.sleep(
-                    self._config.batch_push_interval_seconds
-                )
+                await asyncio.sleep(self._config.batch_push_interval_seconds)
 
                 # Push aggregated stats
                 await self._stats.push_batch_stats()
@@ -1394,8 +1418,15 @@ class ManagerServer(HealthAwareServer):
                 jobs_cleaned = 0
 
                 for job in list(self._job_manager.iter_jobs()):
-                    if job.status in (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED):
-                        if job.completed_at and (current_time - job.completed_at) > retention_seconds:
+                    if job.status in (
+                        JobStatus.COMPLETED,
+                        JobStatus.FAILED,
+                        JobStatus.CANCELLED,
+                    ):
+                        if (
+                            job.completed_at
+                            and (current_time - job.completed_at) > retention_seconds
+                        ):
                             self._cleanup_job(job.job_id)
                             jobs_cleaned += 1
 
@@ -1440,7 +1471,9 @@ class ManagerServer(HealthAwareServer):
                 if not self.is_leader():
                     continue
 
-                for job_id, strategy in list(self._manager_state._job_timeout_strategies.items()):
+                for job_id, strategy in list(
+                    self._manager_state._job_timeout_strategies.items()
+                ):
                     try:
                         timed_out, reason = await strategy.check_timeout(job_id)
                         if timed_out:
@@ -1454,7 +1487,11 @@ class ManagerServer(HealthAwareServer):
                             )
                             # Cancel the job due to timeout
                             job = self._job_manager.get_job(job_id)
-                            if job and job.status not in (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED):
+                            if job and job.status not in (
+                                JobStatus.COMPLETED,
+                                JobStatus.FAILED,
+                                JobStatus.CANCELLED,
+                            ):
                                 job.status = JobStatus.FAILED
                                 self._manager_state.increment_state_version()
                     except Exception as check_error:
@@ -1546,11 +1583,12 @@ class ManagerServer(HealthAwareServer):
                         sync_msg = JobStateSyncMessage(
                             source_id=self._node_id.full,
                             job_leaderships={
-                                job_id: self._node_id.full
-                                for job_id in led_jobs
+                                job_id: self._node_id.full for job_id in led_jobs
                             },
                             fence_tokens={
-                                job_id: self._manager_state._job_fencing_tokens.get(job_id, 0)
+                                job_id: self._manager_state._job_fencing_tokens.get(
+                                    job_id, 0
+                                )
                                 for job_id in led_jobs
                             },
                             state_version=self._manager_state._state_version,
@@ -1652,9 +1690,7 @@ class ManagerServer(HealthAwareServer):
             ]
 
             for job_id in jobs_to_takeover:
-                self._leases.claim_job_leadership(
-                    job_id, (self._host, self._tcp_port)
-                )
+                self._leases.claim_job_leadership(job_id, (self._host, self._tcp_port))
 
     async def _resume_timeout_tracking_for_all_jobs(self) -> None:
         """Resume timeout tracking for all jobs as new leader."""
@@ -1675,10 +1711,13 @@ class ManagerServer(HealthAwareServer):
     def _get_active_workflow_count(self) -> int:
         """Get count of active workflows."""
         return sum(
-            len([
-                w for w in job.workflows.values()
-                if w.status == WorkflowStatus.RUNNING
-            ])
+            len(
+                [
+                    w
+                    for w in job.workflows.values()
+                    if w.status == WorkflowStatus.RUNNING
+                ]
+            )
             for job in self._job_manager.iter_jobs()
         )
 
@@ -1694,9 +1733,7 @@ class ManagerServer(HealthAwareServer):
 
     def _get_total_cores(self) -> int:
         """Get total cores across all workers."""
-        return sum(
-            w.total_cores for w in self._manager_state._workers.values()
-        )
+        return sum(w.total_cores for w in self._manager_state._workers.values())
 
     def _get_job_worker_count(self, job_id: str) -> int:
         """Get number of workers for a job."""
@@ -2303,7 +2340,9 @@ class ManagerServer(HealthAwareServer):
         try:
             # Rate limit check (AD-24)
             client_id = f"{addr[0]}:{addr[1]}"
-            allowed, retry_after = self._check_rate_limit_for_operation(client_id, "cancel")
+            allowed, retry_after = self._check_rate_limit_for_operation(
+                client_id, "cancel"
+            )
             if not allowed:
                 return RateLimitResponse(
                     operation="cancel",
@@ -2330,22 +2369,33 @@ class ManagerServer(HealthAwareServer):
             # Step 1: Verify job exists
             job = self._job_manager.get_job(job_id)
             if not job:
-                return self._build_cancel_response(job_id, success=False, error="Job not found")
+                return self._build_cancel_response(
+                    job_id, success=False, error="Job not found"
+                )
 
             # Check fence token if provided (prevents cancelling restarted jobs)
             stored_fence = self._manager_state._job_fencing_tokens.get(job_id, 0)
             if fence_token > 0 and stored_fence != fence_token:
-                error_msg = f"Fence token mismatch: expected {stored_fence}, got {fence_token}"
-                return self._build_cancel_response(job_id, success=False, error=error_msg)
+                error_msg = (
+                    f"Fence token mismatch: expected {stored_fence}, got {fence_token}"
+                )
+                return self._build_cancel_response(
+                    job_id, success=False, error=error_msg
+                )
 
             # Check if already cancelled (idempotency)
             if job.status == JobStatus.CANCELLED:
-                return self._build_cancel_response(job_id, success=True, already_cancelled=True)
+                return self._build_cancel_response(
+                    job_id, success=True, already_cancelled=True
+                )
 
             # Check if already completed (cannot cancel)
             if job.status == JobStatus.COMPLETED:
                 return self._build_cancel_response(
-                    job_id, success=False, already_completed=True, error="Job already completed"
+                    job_id,
+                    success=False,
+                    already_completed=True,
+                    error="Job already completed",
                 )
 
             # Track results
@@ -2355,16 +2405,20 @@ class ManagerServer(HealthAwareServer):
 
             # Step 2: Remove ALL pending workflows from dispatch queue FIRST
             if self._workflow_dispatcher:
-                removed_pending = await self._workflow_dispatcher.cancel_pending_workflows(job_id)
+                removed_pending = (
+                    await self._workflow_dispatcher.cancel_pending_workflows(job_id)
+                )
                 pending_cancelled.extend(removed_pending)
 
                 # Mark pending workflows as cancelled
                 for workflow_id in removed_pending:
-                    self._manager_state._cancelled_workflows[workflow_id] = CancelledWorkflowInfo(
-                        workflow_id=workflow_id,
-                        job_id=job_id,
-                        cancelled_at=timestamp,
-                        reason=reason,
+                    self._manager_state._cancelled_workflows[workflow_id] = (
+                        CancelledWorkflowInfo(
+                            workflow_id=workflow_id,
+                            job_id=job_id,
+                            cancelled_at=timestamp,
+                            reason=reason,
+                        )
                     )
 
             # Step 3: Cancel ALL running workflows on workers
@@ -2375,7 +2429,9 @@ class ManagerServer(HealthAwareServer):
                 if workflow.status == WorkflowStatus.RUNNING and workflow.worker_id:
                     worker = self._manager_state._workers.get(workflow.worker_id)
                     if not worker:
-                        workflow_errors[workflow_id] = f"Worker {workflow.worker_id} not found"
+                        workflow_errors[workflow_id] = (
+                            f"Worker {workflow.worker_id} not found"
+                        )
                         continue
 
                     worker_addr = (worker.node.host, worker.node.tcp_port)
@@ -2400,22 +2456,31 @@ class ManagerServer(HealthAwareServer):
                                 wf_response = WorkflowCancelResponse.load(response)
                                 if wf_response.success:
                                     running_cancelled.append(workflow_id)
-                                    self._manager_state._cancelled_workflows[workflow_id] = CancelledWorkflowInfo(
+                                    self._manager_state._cancelled_workflows[
+                                        workflow_id
+                                    ] = CancelledWorkflowInfo(
                                         workflow_id=workflow_id,
                                         job_id=job_id,
                                         cancelled_at=timestamp,
                                         reason=reason,
                                     )
                                 else:
-                                    error_msg = wf_response.error or "Worker reported cancellation failure"
+                                    error_msg = (
+                                        wf_response.error
+                                        or "Worker reported cancellation failure"
+                                    )
                                     workflow_errors[workflow_id] = error_msg
                             except Exception as parse_error:
-                                workflow_errors[workflow_id] = f"Failed to parse worker response: {parse_error}"
+                                workflow_errors[workflow_id] = (
+                                    f"Failed to parse worker response: {parse_error}"
+                                )
                         else:
                             workflow_errors[workflow_id] = "No response from worker"
 
                     except Exception as send_error:
-                        workflow_errors[workflow_id] = f"Failed to send cancellation to worker: {send_error}"
+                        workflow_errors[workflow_id] = (
+                            f"Failed to send cancellation to worker: {send_error}"
+                        )
 
             # Stop timeout tracking (AD-34 Part 10.4.9)
             strategy = self._manager_state._job_timeout_strategies.get(job_id)
@@ -2435,8 +2500,12 @@ class ManagerServer(HealthAwareServer):
 
             error_str = None
             if workflow_errors:
-                error_details = [f"{wf_id[:8]}...: {err}" for wf_id, err in workflow_errors.items()]
-                error_str = f"{total_errors} workflow(s) failed: {'; '.join(error_details)}"
+                error_details = [
+                    f"{wf_id[:8]}...: {err}" for wf_id, err in workflow_errors.items()
+                ]
+                error_str = (
+                    f"{total_errors} workflow(s) failed: {'; '.join(error_details)}"
+                )
 
             return self._build_cancel_response(
                 job_id,
@@ -2493,7 +2562,9 @@ class ManagerServer(HealthAwareServer):
             )
 
             # Track this workflow as complete
-            pending = self._manager_state._cancellation_pending_workflows.get(job_id, set())
+            pending = self._manager_state._cancellation_pending_workflows.get(
+                job_id, set()
+            )
             if workflow_id in pending:
                 pending.discard(workflow_id)
 
@@ -2507,7 +2578,9 @@ class ManagerServer(HealthAwareServer):
                 # Check if all workflows for this job have reported
                 if not pending:
                     # All workflows cancelled - fire completion event and push to origin
-                    event = self._manager_state._cancellation_completion_events.get(job_id)
+                    event = self._manager_state._cancellation_completion_events.get(
+                        job_id
+                    )
                     if event:
                         event.set()
 
@@ -2523,8 +2596,12 @@ class ManagerServer(HealthAwareServer):
                     )
 
                     # Cleanup tracking structures
-                    self._manager_state._cancellation_pending_workflows.pop(job_id, None)
-                    self._manager_state._cancellation_completion_events.pop(job_id, None)
+                    self._manager_state._cancellation_pending_workflows.pop(
+                        job_id, None
+                    )
+                    self._manager_state._cancellation_completion_events.pop(
+                        job_id, None
+                    )
                     self._manager_state._cancellation_initiated_at.pop(job_id, None)
 
             # Also delegate to cancellation coordinator for additional handling
@@ -2598,7 +2675,9 @@ class ManagerServer(HealthAwareServer):
 
             # Rate limit check (AD-24)
             client_id = f"{addr[0]}:{addr[1]}"
-            allowed, retry_after = self._check_rate_limit_for_operation(client_id, "extension")
+            allowed, retry_after = self._check_rate_limit_for_operation(
+                client_id, "extension"
+            )
             if not allowed:
                 return HealthcheckExtensionResponse(
                     granted=False,
@@ -2652,12 +2731,15 @@ class ManagerServer(HealthAwareServer):
                 hierarchical_detector = self.get_hierarchical_detector()
                 if hierarchical_detector:
                     worker_addr = (worker.node.host, worker.node.udp_port)
-                    swim_granted, swim_extension, swim_denial, is_warning = (
-                        await hierarchical_detector.request_extension(
-                            node=worker_addr,
-                            reason=request.reason,
-                            current_progress=request.current_progress,
-                        )
+                    (
+                        swim_granted,
+                        swim_extension,
+                        swim_denial,
+                        is_warning,
+                    ) = await hierarchical_detector.request_extension(
+                        node=worker_addr,
+                        reason=request.reason,
+                        current_progress=request.current_progress,
                     )
                     if not swim_granted:
                         await self._udp_logger.log(
@@ -2695,8 +2777,8 @@ class ManagerServer(HealthAwareServer):
                 )
 
                 # Check if worker should be evicted
-                should_evict, eviction_reason = self._worker_health_manager.should_evict_worker(
-                    worker_id
+                should_evict, eviction_reason = (
+                    self._worker_health_manager.should_evict_worker(worker_id)
                 )
                 if should_evict:
                     await self._udp_logger.log(
@@ -2891,7 +2973,7 @@ class ManagerServer(HealthAwareServer):
 
             # Skip if already registered
             if worker_id in self._manager_state._workers:
-                return b'ok'
+                return b"ok"
 
             # Schedule direct registration with the worker
             worker_tcp_addr = tuple(broadcast.worker_tcp_addr)
@@ -2913,7 +2995,7 @@ class ManagerServer(HealthAwareServer):
                 worker_snapshot,
             )
 
-            return b'ok'
+            return b"ok"
 
         except Exception as error:
             await self._udp_logger.log(
@@ -2924,7 +3006,7 @@ class ManagerServer(HealthAwareServer):
                     node_id=self._node_id.short,
                 )
             )
-            return b'error'
+            return b"error"
 
     @tcp.receive()
     async def receive_worker_status_update(
@@ -2940,7 +3022,7 @@ class ManagerServer(HealthAwareServer):
             # Process heartbeat via WorkerPool
             await self._worker_pool.process_heartbeat(heartbeat.node_id, heartbeat)
 
-            return b'ok'
+            return b"ok"
 
         except Exception as error:
             await self._udp_logger.log(
@@ -2951,7 +3033,7 @@ class ManagerServer(HealthAwareServer):
                     node_id=self._node_id.short,
                 )
             )
-            return b'error'
+            return b"error"
 
     @tcp.receive()
     async def worker_heartbeat(
@@ -2969,10 +3051,12 @@ class ManagerServer(HealthAwareServer):
 
             # Trigger dispatch for active jobs
             if self._workflow_dispatcher:
-                for job_id, submission in list(self._manager_state._job_submissions.items()):
+                for job_id, submission in list(
+                    self._manager_state._job_submissions.items()
+                ):
                     await self._workflow_dispatcher.try_dispatch(job_id, submission)
 
-            return b'ok'
+            return b"ok"
 
         except Exception as error:
             await self._udp_logger.log(
@@ -2983,7 +3067,7 @@ class ManagerServer(HealthAwareServer):
                     node_id=self._node_id.short,
                 )
             )
-            return b'error'
+            return b"error"
 
     @tcp.receive()
     async def context_forward(
@@ -2998,7 +3082,7 @@ class ManagerServer(HealthAwareServer):
 
             # Verify we are the job leader
             if not self._is_job_leader(forward.job_id):
-                return b'not_leader'
+                return b"not_leader"
 
             # Apply context updates
             await self._apply_context_updates(
@@ -3008,7 +3092,7 @@ class ManagerServer(HealthAwareServer):
                 forward.context_timestamps,
             )
 
-            return b'ok'
+            return b"ok"
 
         except Exception as error:
             await self._udp_logger.log(
@@ -3019,7 +3103,7 @@ class ManagerServer(HealthAwareServer):
                     node_id=self._node_id.short,
                 )
             )
-            return b'error'
+            return b"error"
 
     @tcp.receive()
     async def context_layer_sync(
@@ -3033,7 +3117,9 @@ class ManagerServer(HealthAwareServer):
             sync = ContextLayerSync.load(data)
 
             # Check if this is a newer layer version
-            current_version = self._manager_state._job_layer_version.get(sync.job_id, -1)
+            current_version = self._manager_state._job_layer_version.get(
+                sync.job_id, -1
+            )
             if sync.layer_version <= current_version:
                 return ContextLayerSyncAck(
                     job_id=sync.job_id,
@@ -3085,7 +3171,9 @@ class ManagerServer(HealthAwareServer):
         try:
             # Rate limit check (AD-24)
             client_id = f"{addr[0]}:{addr[1]}"
-            allowed, retry_after = self._rate_limiter.check_rate_limit(client_id, "job_submit")
+            allowed, retry_after = self._rate_limiter.check_rate_limit(
+                client_id, "job_submit"
+            )
             if not allowed:
                 return RateLimitResponse(
                     operation="job_submit",
@@ -3107,8 +3195,8 @@ class ManagerServer(HealthAwareServer):
 
             # Protocol version negotiation (AD-25)
             client_version = ProtocolVersion(
-                major=getattr(submission, 'protocol_version_major', 1),
-                minor=getattr(submission, 'protocol_version_minor', 0),
+                major=getattr(submission, "protocol_version_major", 1),
+                minor=getattr(submission, "protocol_version_minor", 0),
             )
 
             if client_version.major != CURRENT_PROTOCOL_VERSION.major:
@@ -3121,14 +3209,18 @@ class ManagerServer(HealthAwareServer):
                 ).dump()
 
             # Negotiate capabilities
-            client_caps_str = getattr(submission, 'capabilities', '')
-            client_features = set(client_caps_str.split(',')) if client_caps_str else set()
+            client_caps_str = getattr(submission, "capabilities", "")
+            client_features = (
+                set(client_caps_str.split(",")) if client_caps_str else set()
+            )
             our_features = get_features_for_version(CURRENT_PROTOCOL_VERSION)
             negotiated_features = client_features & our_features
-            negotiated_caps_str = ','.join(sorted(negotiated_features))
+            negotiated_caps_str = ",".join(sorted(negotiated_features))
 
             # Unpickle workflows
-            workflows: list[tuple[str, list[str], Workflow]] = restricted_loads(submission.workflows)
+            workflows: list[tuple[str, list[str], Workflow]] = restricted_loads(
+                submission.workflows
+            )
 
             # Only active managers accept jobs
             if self._manager_state._manager_state != ManagerStateEnum.ACTIVE:
@@ -3141,7 +3233,11 @@ class ManagerServer(HealthAwareServer):
             # Create job using JobManager
             callback_addr = None
             if submission.callback_addr:
-                callback_addr = tuple(submission.callback_addr) if isinstance(submission.callback_addr, list) else submission.callback_addr
+                callback_addr = (
+                    tuple(submission.callback_addr)
+                    if isinstance(submission.callback_addr, list)
+                    else submission.callback_addr
+                )
 
             job_info = await self._job_manager.create_job(
                 submission=submission,
@@ -3162,22 +3258,33 @@ class ManagerServer(HealthAwareServer):
                 timeout_seconds=submission.timeout_seconds,
                 gate_addr=tuple(submission.gate_addr) if submission.gate_addr else None,
             )
-            self._manager_state._job_timeout_strategies[submission.job_id] = timeout_strategy
+            self._manager_state._job_timeout_strategies[submission.job_id] = (
+                timeout_strategy
+            )
 
             # Set job leadership
             self._manager_state._job_leaders[submission.job_id] = self._node_id.full
-            self._manager_state._job_leader_addrs[submission.job_id] = (self._host, self._tcp_port)
+            self._manager_state._job_leader_addrs[submission.job_id] = (
+                self._host,
+                self._tcp_port,
+            )
             self._manager_state._job_fencing_tokens[submission.job_id] = 1
             self._manager_state._job_layer_version[submission.job_id] = 0
             self._manager_state._job_contexts[submission.job_id] = Context()
 
             # Store callbacks
             if submission.callback_addr:
-                self._manager_state._job_callbacks[submission.job_id] = submission.callback_addr
-                self._manager_state._progress_callbacks[submission.job_id] = submission.callback_addr
+                self._manager_state._job_callbacks[submission.job_id] = (
+                    submission.callback_addr
+                )
+                self._manager_state._progress_callbacks[submission.job_id] = (
+                    submission.callback_addr
+                )
 
             if submission.origin_gate_addr:
-                self._manager_state._job_origin_gates[submission.job_id] = submission.origin_gate_addr
+                self._manager_state._job_origin_gates[submission.job_id] = (
+                    submission.origin_gate_addr
+                )
 
             self._manager_state.increment_state_version()
 
@@ -3227,9 +3334,11 @@ class ManagerServer(HealthAwareServer):
         try:
             timeout_msg = JobGlobalTimeout.load(data)
 
-            strategy = self._manager_state._job_timeout_strategies.get(timeout_msg.job_id)
+            strategy = self._manager_state._job_timeout_strategies.get(
+                timeout_msg.job_id
+            )
             if not strategy:
-                return b''
+                return b""
 
             accepted = await strategy.handle_global_timeout(
                 timeout_msg.job_id,
@@ -3238,7 +3347,9 @@ class ManagerServer(HealthAwareServer):
             )
 
             if accepted:
-                self._manager_state._job_timeout_strategies.pop(timeout_msg.job_id, None)
+                self._manager_state._job_timeout_strategies.pop(
+                    timeout_msg.job_id, None
+                )
                 await self._udp_logger.log(
                     ServerInfo(
                         message=f"Job {timeout_msg.job_id} globally timed out: {timeout_msg.reason}",
@@ -3248,7 +3359,7 @@ class ManagerServer(HealthAwareServer):
                     )
                 )
 
-            return b''
+            return b""
 
         except Exception as error:
             await self._udp_logger.log(
@@ -3259,7 +3370,7 @@ class ManagerServer(HealthAwareServer):
                     node_id=self._node_id.short,
                 )
             )
-            return b''
+            return b""
 
     @tcp.receive()
     async def provision_request(
@@ -3275,9 +3386,10 @@ class ManagerServer(HealthAwareServer):
             # Check if we can confirm
             worker = self._worker_pool.get_worker(request.target_worker)
             can_confirm = (
-                worker is not None and
-                self._worker_pool.is_worker_healthy(request.target_worker) and
-                (worker.available_cores - worker.reserved_cores) >= request.cores_required
+                worker is not None
+                and self._worker_pool.is_worker_healthy(request.target_worker)
+                and (worker.available_cores - worker.reserved_cores)
+                >= request.cores_required
             )
 
             return ProvisionConfirm(
@@ -3310,7 +3422,7 @@ class ManagerServer(HealthAwareServer):
         try:
             ProvisionCommit.load(data)  # Validate message format
             self._manager_state.increment_state_version()
-            return b'ok'
+            return b"ok"
 
         except Exception as error:
             await self._udp_logger.log(
@@ -3321,7 +3433,7 @@ class ManagerServer(HealthAwareServer):
                     node_id=self._node_id.short,
                 )
             )
-            return b'error'
+            return b"error"
 
     @tcp.receive()
     async def workflow_cancellation_query(
@@ -3398,7 +3510,9 @@ class ManagerServer(HealthAwareServer):
 
             # Rate limit check
             client_id = f"{addr[0]}:{addr[1]}"
-            allowed, retry_after = self._rate_limiter.check_rate_limit(client_id, "cancel_workflow")
+            allowed, retry_after = self._rate_limiter.check_rate_limit(
+                client_id, "cancel_workflow"
+            )
             if not allowed:
                 return RateLimitResponse(
                     operation="cancel_workflow",
@@ -3429,12 +3543,14 @@ class ManagerServer(HealthAwareServer):
                 ).dump()
 
             # Add to cancelled workflows
-            self._manager_state._cancelled_workflows[request.workflow_id] = CancelledWorkflowInfo(
-                job_id=request.job_id,
-                workflow_id=request.workflow_id,
-                cancelled_at=time.monotonic(),
-                request_id=request.request_id,
-                dependents=[],
+            self._manager_state._cancelled_workflows[request.workflow_id] = (
+                CancelledWorkflowInfo(
+                    job_id=request.job_id,
+                    workflow_id=request.workflow_id,
+                    cancelled_at=time.monotonic(),
+                    request_id=request.request_id,
+                    dependents=[],
+                )
             )
 
             return SingleWorkflowCancelResponse(
@@ -3469,12 +3585,14 @@ class ManagerServer(HealthAwareServer):
             # Add all cancelled workflows to our bucket
             for wf_id in notification.cancelled_workflows:
                 if wf_id not in self._manager_state._cancelled_workflows:
-                    self._manager_state._cancelled_workflows[wf_id] = CancelledWorkflowInfo(
-                        job_id=notification.job_id,
-                        workflow_id=wf_id,
-                        cancelled_at=notification.timestamp or time.monotonic(),
-                        request_id=notification.request_id,
-                        dependents=[],
+                    self._manager_state._cancelled_workflows[wf_id] = (
+                        CancelledWorkflowInfo(
+                            job_id=notification.job_id,
+                            workflow_id=wf_id,
+                            cancelled_at=notification.timestamp or time.monotonic(),
+                            request_id=notification.request_id,
+                            dependents=[],
+                        )
                     )
 
             return b"OK"
@@ -3510,7 +3628,9 @@ class ManagerServer(HealthAwareServer):
                 ).dump()
 
             # Record job leadership
-            self._manager_state._job_leaders[announcement.job_id] = announcement.leader_id
+            self._manager_state._job_leaders[announcement.job_id] = (
+                announcement.leader_id
+            )
             self._manager_state._job_leader_addrs[announcement.job_id] = (
                 announcement.leader_host,
                 announcement.leader_tcp_port,
@@ -3545,7 +3665,7 @@ class ManagerServer(HealthAwareServer):
                     node_id=self._node_id.short,
                 )
             )
-            return b'error'
+            return b"error"
 
     @tcp.receive()
     async def job_state_sync(
@@ -3577,13 +3697,19 @@ class ManagerServer(HealthAwareServer):
                 job.timestamp = time.monotonic()
 
             # Update fencing token
-            current_token = self._manager_state._job_fencing_tokens.get(sync_msg.job_id, 0)
+            current_token = self._manager_state._job_fencing_tokens.get(
+                sync_msg.job_id, 0
+            )
             if sync_msg.fencing_token > current_token:
-                self._manager_state._job_fencing_tokens[sync_msg.job_id] = sync_msg.fencing_token
+                self._manager_state._job_fencing_tokens[sync_msg.job_id] = (
+                    sync_msg.fencing_token
+                )
 
             # Update origin gate
             if sync_msg.origin_gate_addr:
-                self._manager_state._job_origin_gates[sync_msg.job_id] = sync_msg.origin_gate_addr
+                self._manager_state._job_origin_gates[sync_msg.job_id] = (
+                    sync_msg.origin_gate_addr
+                )
 
             return JobStateSyncAck(
                 job_id=sync_msg.job_id,
@@ -3600,7 +3726,7 @@ class ManagerServer(HealthAwareServer):
                     node_id=self._node_id.short,
                 )
             )
-            return b'error'
+            return b"error"
 
     @tcp.receive()
     async def job_leader_gate_transfer(
@@ -3614,7 +3740,9 @@ class ManagerServer(HealthAwareServer):
             transfer = JobLeaderGateTransfer.load(data)
 
             # Use fence token for consistency
-            current_fence = self._manager_state._job_fencing_tokens.get(transfer.job_id, 0)
+            current_fence = self._manager_state._job_fencing_tokens.get(
+                transfer.job_id, 0
+            )
             if transfer.fence_token < current_fence:
                 return JobLeaderGateTransferAck(
                     job_id=transfer.job_id,
@@ -3623,10 +3751,14 @@ class ManagerServer(HealthAwareServer):
                 ).dump()
 
             # Update origin gate
-            self._manager_state._job_origin_gates[transfer.job_id] = transfer.new_gate_addr
+            self._manager_state._job_origin_gates[transfer.job_id] = (
+                transfer.new_gate_addr
+            )
 
             if transfer.fence_token > current_fence:
-                self._manager_state._job_fencing_tokens[transfer.job_id] = transfer.fence_token
+                self._manager_state._job_fencing_tokens[transfer.job_id] = (
+                    transfer.fence_token
+                )
 
             await self._udp_logger.log(
                 ServerInfo(
@@ -3652,7 +3784,7 @@ class ManagerServer(HealthAwareServer):
                     node_id=self._node_id.short,
                 )
             )
-            return b'error'
+            return b"error"
 
     @tcp.receive()
     async def register_callback(
@@ -3665,7 +3797,9 @@ class ManagerServer(HealthAwareServer):
         try:
             # Rate limit check
             client_id = f"{addr[0]}:{addr[1]}"
-            allowed, retry_after = self._rate_limiter.check_rate_limit(client_id, "reconnect")
+            allowed, retry_after = self._rate_limiter.check_rate_limit(
+                client_id, "reconnect"
+            )
             if not allowed:
                 return RateLimitResponse(
                     operation="reconnect",
@@ -3715,7 +3849,7 @@ class ManagerServer(HealthAwareServer):
                     node_id=self._node_id.short,
                 )
             )
-            return b'error'
+            return b"error"
 
     @tcp.receive()
     async def workflow_query(
@@ -3728,7 +3862,9 @@ class ManagerServer(HealthAwareServer):
         try:
             # Rate limit check
             client_id = f"{addr[0]}:{addr[1]}"
-            allowed, retry_after = self._rate_limiter.check_rate_limit(client_id, "workflow_query")
+            allowed, retry_after = self._rate_limiter.check_rate_limit(
+                client_id, "workflow_query"
+            )
             if not allowed:
                 return RateLimitResponse(
                     operation="workflow_query",
@@ -3772,18 +3908,20 @@ class ManagerServer(HealthAwareServer):
                                 failed_count += sub_info.progress.failed_count
                                 rate_per_second += sub_info.progress.rate_per_second
 
-                    workflows.append(WorkflowStatusInfo(
-                        workflow_id=workflow_id,
-                        workflow_name=wf_info.name,
-                        status=status,
-                        is_enqueued=is_enqueued,
-                        queue_position=0,
-                        provisioned_cores=provisioned_cores,
-                        completed_count=completed_count,
-                        failed_count=failed_count,
-                        rate_per_second=rate_per_second,
-                        assigned_workers=assigned_workers,
-                    ))
+                    workflows.append(
+                        WorkflowStatusInfo(
+                            workflow_id=workflow_id,
+                            workflow_name=wf_info.name,
+                            status=status,
+                            is_enqueued=is_enqueued,
+                            queue_position=0,
+                            provisioned_cores=provisioned_cores,
+                            completed_count=completed_count,
+                            failed_count=failed_count,
+                            rate_per_second=rate_per_second,
+                            assigned_workers=assigned_workers,
+                        )
+                    )
 
             return WorkflowQueryResponse(
                 request_id=request.request_id,
@@ -3801,7 +3939,7 @@ class ManagerServer(HealthAwareServer):
                     node_id=self._node_id.short,
                 )
             )
-            return b'error'
+            return b"error"
 
     # =========================================================================
     # Helper Methods - Job Submission
@@ -3904,7 +4042,9 @@ class ManagerServer(HealthAwareServer):
         timestamps = cloudpickle.loads(timestamps_bytes) if timestamps_bytes else {}
 
         for key, value in updates.items():
-            timestamp = timestamps.get(key, self._manager_state.increment_context_lamport_clock())
+            timestamp = timestamps.get(
+                key, self._manager_state.increment_context_lamport_clock()
+            )
             await context.update(
                 workflow_id,
                 key,
