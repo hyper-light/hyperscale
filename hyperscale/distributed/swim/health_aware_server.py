@@ -3042,7 +3042,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             ),
         )
 
-    def update_node_state(
+    async def update_node_state(
         self,
         node: tuple[str, int],
         status: Status,
@@ -3061,7 +3061,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         prev_status = previous_state.status if previous_state else b"UNKNOWN"
 
         # Perform the actual update
-        updated = self._incarnation_tracker.update_node(
+        updated = await self._incarnation_tracker.update_node(
             node, status, incarnation, timestamp
         )
 
