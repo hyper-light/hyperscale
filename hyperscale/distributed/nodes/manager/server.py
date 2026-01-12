@@ -624,6 +624,7 @@ class ManagerServer(HealthAwareServer):
             manager_id=self._node_id.full,
             datacenter=self._node_id.datacenter,
             send_dispatch=self._send_workflow_dispatch,
+            env=self.env,
         )
 
         # Mark as started
