@@ -372,28 +372,22 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         if exception is None:
             return
 
-        # Get node ID for logging context
-        node_id_short = getattr(self, "_node_id", None)
-        if node_id_short is not None:
-            node_id_short = node_id_short.short
-        else:
-            node_id_short = "unknown"
+        node_id_value = getattr(self, "_node_id", None)
+        node_id_short = node_id_value.short if node_id_value is not None else "unknown"
 
-        # Log the error via task runner (fire-and-forget async logging)
+        host, port = self._get_self_udp_addr()
+
         if self._task_runner is not None and self._udp_logger is not None:
             self._task_runner.run(
                 self._udp_logger.log(
                     ServerError(
-                        message=f"Background task '{name}' failed: {exception}",
+                        message=f"Background task '{name}' failed ({type(exception).__name__}): {exception}",
                         node_id=node_id_short,
-                        error_type=type(exception).__name__,
+                        node_host=host,
+                        node_port=port,
                     )
                 )
             )
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # Properties
-    # ─────────────────────────────────────────────────────────────────────────
 
     @property
     def node_id(self) -> NodeId:
