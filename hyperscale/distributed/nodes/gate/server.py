@@ -2605,9 +2605,14 @@ class GateServer(HealthAwareServer):
         start_time = time.monotonic()
 
         while True:
-            nodes = self._context.read("nodes")
             self_addr = (self._host, self._udp_port)
-            visible_peers = len([n for n in nodes.keys() if n != self_addr])
+            visible_peers = len(
+                [
+                    n
+                    for n in self._incarnation_tracker.node_states.keys()
+                    if n != self_addr
+                ]
+            )
 
             if visible_peers >= expected_peers:
                 return

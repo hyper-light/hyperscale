@@ -65,13 +65,6 @@ class LeaveHandler(BaseHandler):
             # Propagate leave to other nodes
             await self._propagate_leave(target, target_addr_bytes, message)
 
-            # Update queue
-            await self._server.safe_queue_put(
-                nodes[target], (context.clock_time, b"DEAD"), target
-            )
-            self._server.write_context("nodes", nodes)
-
-            # Update incarnation tracker and probe scheduler
             self._server.incarnation_tracker.update_node(
                 target, b"DEAD", 0, time.monotonic()
             )

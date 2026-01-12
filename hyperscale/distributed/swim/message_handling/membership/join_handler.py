@@ -16,7 +16,9 @@ from hyperscale.distributed.swim.message_handling.core import BaseHandler
 
 
 # SWIM protocol version prefix (included in join messages)
-SWIM_VERSION_PREFIX = f"v{CURRENT_PROTOCOL_VERSION.major}.{CURRENT_PROTOCOL_VERSION.minor}".encode()
+SWIM_VERSION_PREFIX = (
+    f"v{CURRENT_PROTOCOL_VERSION.major}.{CURRENT_PROTOCOL_VERSION.minor}".encode()
+)
 
 
 class JoinHandler(BaseHandler):
@@ -89,11 +91,6 @@ class JoinHandler(BaseHandler):
 
             # Propagate join to other nodes
             await self._propagate_join(target, target_addr_bytes)
-
-            # Update queue
-            await self._server.safe_queue_put(
-                nodes[target], (context.clock_time, b"OK"), target
-            )
 
             # Update probe scheduler
             self._server.probe_scheduler.add_member(target)

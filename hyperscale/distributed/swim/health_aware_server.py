@@ -32,7 +32,7 @@ from hyperscale.logging.hyperscale_logging_models import (
 )
 
 # Core types and utilities
-from .core.types import Status, Nodes, Ctx, UpdateType, Message
+from .core.types import Status, Ctx, UpdateType, Message
 from .core.node_id import NodeId, NodeAddress
 from .core.errors import (
     SwimError,
@@ -44,7 +44,6 @@ from .core.errors import (
     ProtocolError,
     MalformedMessageError,
     UnexpectedError,
-    QueueFullError,
     StaleMessageError,
     ConnectionRefusedError as SwimConnectionRefusedError,
     ResourceError,
@@ -1621,13 +1620,11 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         Leadership messages are critical - schedule them via task runner
         with error tracking.
         """
-        nodes: Nodes = self._context.read("nodes")
         self_addr = self._get_self_udp_addr()
         base_timeout = self._context.read("current_timeout")
         timeout = self.get_lhm_adjusted_timeout(base_timeout)
 
-        # Snapshot nodes to avoid dict mutation during iteration
-        for node in list(nodes.keys()):
+        for node in list(self._incarnation_tracker.node_states.keys()):
             if node != self_addr:
                 # Use task runner but schedule error-aware send
                 self._task_runner.run(
@@ -1790,13 +1787,10 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
 
     def _get_member_count(self) -> int:
         """Get the current number of known members."""
-        nodes = self._context.read("nodes")
-        return len(nodes) if nodes else 1
+        return len(self._incarnation_tracker.node_states) or 1
 
     def _on_suspicion_expired(self, node: tuple[str, int], incarnation: int) -> None:
         """Callback when a suspicion expires - mark node as DEAD."""
-        # DEBUG: Track when nodes are marked DEAD
-
         self._metrics.increment("suspicions_expired")
         self._audit_log.record(
             AuditEventType.NODE_CONFIRMED_DEAD,
@@ -1809,13 +1803,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             incarnation,
             time.monotonic(),
         )
-        # Queue the death notification for gossip
         self.queue_gossip_update("dead", node, incarnation)
-        nodes: Nodes = self._context.read("nodes")
-        if node in nodes:
-            self._safe_queue_put_sync(
-                nodes[node], (int(time.monotonic()), b"DEAD"), node
-            )
 
         # Update probe scheduler to stop probing this dead node
         self.update_probe_scheduler_membership()
@@ -1826,59 +1814,6 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                 callback(node)
             except Exception as e:
                 self._task_runner.run(self.handle_exception, e, "on_node_dead_callback")
-
-    def _safe_queue_put_sync(
-        self,
-        queue: asyncio.Queue,
-        item: tuple,
-        node: tuple[str, int],
-    ) -> bool:
-        """
-        Synchronous version of _safe_queue_put for use in sync callbacks.
-
-        If queue is full, schedules error logging as a task and drops the update.
-        """
-        try:
-            queue.put_nowait(item)
-            return True
-        except asyncio.QueueFull:
-            # Schedule error logging via task runner since we can't await in sync context
-            self._task_runner.run(
-                self.handle_error,
-                QueueFullError(
-                    f"Node queue full for {node[0]}:{node[1]}, dropping update",
-                    node=node,
-                    queue_size=queue.qsize(),
-                ),
-            )
-            return False
-
-    async def _safe_queue_put(
-        self,
-        queue: asyncio.Queue,
-        item: tuple,
-        node: tuple[str, int],
-    ) -> bool:
-        """
-        Safely put an item into a node's queue with overflow handling.
-
-        If queue is full, logs QueueFullError and drops the update.
-        This prevents blocking on slow consumers.
-
-        Returns True if successful, False if queue was full.
-        """
-        try:
-            queue.put_nowait(item)
-            return True
-        except asyncio.QueueFull:
-            await self.handle_error(
-                QueueFullError(
-                    f"Node queue full for {node[0]}:{node[1]}, dropping update",
-                    node=node,
-                    queue_size=queue.qsize(),
-                )
-            )
-            return False
 
     def queue_gossip_update(
         self,
@@ -1992,12 +1927,9 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
 
     def get_other_nodes(self, node: tuple[str, int]):
         target_host, target_port = node
-        nodes: Nodes = self._context.read("nodes")
-        # Use list() to snapshot keys before iteration to prevent
-        # "dictionary changed size during iteration" errors
         return [
             (host, port)
-            for host, port in list(nodes.keys())
+            for host, port in list(self._incarnation_tracker.node_states.keys())
             if not (host == target_host and port == target_port)
         ]
 
@@ -2082,21 +2014,9 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         base_timeout = self._context.read("current_timeout")
         timeout = self.get_lhm_adjusted_timeout(base_timeout)
 
-        # Check node status
-        nodes: Nodes = self._context.read("nodes")
-        node_entry = nodes.get(node)
-        if not node_entry:
+        node_state = self._incarnation_tracker.get_node_state(node)
+        if node_state is None or node_state.status != b"OK":
             return False
-
-        try:
-            _, status = node_entry.get_nowait()
-            if status != b"OK":
-                return False
-        except asyncio.QueueEmpty:
-            return False
-
-        # Note: Piggyback is added centrally in send() hook via _add_piggyback_safe()
-        # The include_piggyback parameter is kept for backwards compatibility but ignored
 
         # Track the send and log failures
         try:
@@ -2145,9 +2065,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
 
         async def attempt_join() -> bool:
             await self.send(seed_node, join_msg, timeout=timeout)
-            # Add seed to our known nodes dict (defaultdict auto-creates Queue)
-            nodes: Nodes = self._context.read("nodes")
-            _ = nodes[seed_node]  # Access to create entry via defaultdict
+            self._incarnation_tracker.add_unconfirmed_node(seed_node)
             self._probe_scheduler.add_member(seed_node)
             return True
 
@@ -2191,9 +2109,12 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         await self.start_cleanup()
 
         self._probe_scheduler._running = True
-        nodes: Nodes = self._context.read("nodes")
         self_addr = self._get_self_udp_addr()
-        members = [node for node in list(nodes.keys()) if node != self_addr]
+        members = [
+            node
+            for node in list(self._incarnation_tracker.node_states.keys())
+            if node != self_addr
+        ]
         self._probe_scheduler.update_members(members)
 
         protocol_period = self._context.read("udp_poll_interval", 1.0)
@@ -2380,15 +2301,13 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
 
     def update_probe_scheduler_membership(self) -> None:
         """Update the probe scheduler with current membership, excluding DEAD nodes."""
-        nodes: Nodes = self._context.read("nodes")
         self_addr = self._get_self_udp_addr()
         members = []
-        for node in list(nodes.keys()):
+        for node, node_state in self._incarnation_tracker.node_states.items():
             if node == self_addr:
                 continue
-            # Check if node is DEAD via incarnation tracker
-            node_state = self._incarnation_tracker.get_node_state(node)
-            if node_state and node_state.status == b"DEAD":
+            # Exclude DEAD nodes from probe scheduling
+            if node_state.status == b"DEAD":
                 continue
             members.append(node)
         self._probe_scheduler.update_members(members)
@@ -2443,11 +2362,11 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         if broadcast_leave:
             try:
                 leave_msg = b"leave>" + f"{self_addr[0]}:{self_addr[1]}".encode()
-                nodes: Nodes = self._context.read("nodes")
                 timeout = self.get_lhm_adjusted_timeout(1.0)
 
                 send_failures = 0
-                for node in list(nodes.keys()):
+                node_addresses = list(self._incarnation_tracker.node_states.keys())
+                for node in node_addresses:
                     if node != self_addr:
                         try:
                             await self.send(node, leave_msg, timeout=timeout)
@@ -2466,7 +2385,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                 if send_failures > 0:
                     await self._udp_logger.log(
                         ServerDebug(
-                            message=f"Leave broadcast: {send_failures}/{len(nodes) - 1} sends failed",
+                            message=f"Leave broadcast: {send_failures}/{len(node_addresses) - 1} sends failed",
                             node_host=self._host,
                             node_port=self._port,
                             node_id=self._node_id.numeric_id,
@@ -3204,13 +3123,11 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         1. They may be slow to respond, causing indirect probe timeouts
         2. We want to reduce load on already-stressed nodes
         """
-        nodes: Nodes = self._context.read("nodes")
         self_addr = self._get_self_udp_addr()
 
-        # Snapshot nodes.items() to avoid dict mutation during iteration
         all_candidates = [
             node
-            for node, queue in list(nodes.items())
+            for node in self._incarnation_tracker.node_states.keys()
             if node != target and node != self_addr
         ]
 
@@ -3383,7 +3300,6 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
 
         new_incarnation = self.increment_incarnation()
 
-        nodes: Nodes = self._context.read("nodes")
         self_addr = self._get_self_udp_addr()
 
         self_addr_bytes = f"{self_addr[0]}:{self_addr[1]}".encode()
@@ -3395,8 +3311,8 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         successful = 0
         failed = 0
 
-        # Snapshot nodes to avoid dict mutation during iteration
-        for node in list(nodes.keys()):
+        node_addresses = list(self._incarnation_tracker.node_states.keys())
+        for node in node_addresses:
             if node != self_addr:
                 success = await self._send_with_retry(node, msg, timeout)
                 if success:
@@ -3475,7 +3391,6 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
 
         Tracks send failures for monitoring but continues to all nodes.
         """
-        nodes: Nodes = self._context.read("nodes")
         self_addr = self._get_self_udp_addr()
 
         target_addr_bytes = f"{target[0]}:{target[1]}".encode()
@@ -3487,8 +3402,8 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         successful = 0
         failed = 0
 
-        # Snapshot nodes to avoid dict mutation during iteration
-        for node in list(nodes.keys()):
+        node_addresses = list(self._incarnation_tracker.node_states.keys())
+        for node in node_addresses:
             if node != self_addr and node != target:
                 success = await self._send_broadcast_message(node, msg, timeout)
                 if success:

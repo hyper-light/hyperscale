@@ -48,8 +48,8 @@ class ServerAdapter:
     # === State Access ===
 
     def read_nodes(self) -> dict[tuple[str, int], Any]:
-        """Read the nodes dictionary from context."""
-        return self._server._context.read("nodes")
+        """Return node states from IncarnationTracker (AD-46)."""
+        return self._server._incarnation_tracker.node_states
 
     def get_current_timeout(self) -> float:
         """Get the current base timeout value."""
@@ -286,8 +286,8 @@ class ServerAdapter:
         item: tuple[int, bytes],
         node: tuple[str, int],
     ) -> bool:
-        """Safely put item in node's queue."""
-        return await self._server._safe_queue_put(queue, item, node)
+        """Deprecated (AD-46): Use incarnation_tracker.update_node() instead."""
+        return True
 
     async def clear_stale_state(self, node: tuple[str, int]) -> None:
         """Clear stale state for a node."""

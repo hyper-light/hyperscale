@@ -842,17 +842,13 @@ class Env(BaseModel):
         """
         Get SWIM protocol init_context from environment settings.
 
-        Note: The 'nodes' dict is created fresh each time as it needs
-        to be unique per server instance (contains asyncio.Queue objects).
+        Note (AD-46): Node state is stored in IncarnationTracker.node_states,
+        NOT in a 'nodes' queue dict. The legacy queue pattern has been removed.
         """
-        from collections import defaultdict
-        import asyncio
-
         return {
             "max_probe_timeout": self.SWIM_MAX_PROBE_TIMEOUT,
             "min_probe_timeout": self.SWIM_MIN_PROBE_TIMEOUT,
             "current_timeout": self.SWIM_CURRENT_TIMEOUT,
-            "nodes": defaultdict(asyncio.Queue),  # Required for probe cycle
             "udp_poll_interval": self.SWIM_UDP_POLL_INTERVAL,
             "suspicion_min_timeout": self.SWIM_SUSPICION_MIN_TIMEOUT,
             "suspicion_max_timeout": self.SWIM_SUSPICION_MAX_TIMEOUT,
