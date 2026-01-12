@@ -2115,7 +2115,7 @@ class GateServer(HealthAwareServer):
             )
         return candidates
 
-    def _check_rate_limit_for_operation(
+    async def _check_rate_limit_for_operation(
         self,
         client_id: str,
         operation: str,
