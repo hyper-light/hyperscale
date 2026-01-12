@@ -259,3 +259,115 @@ class WALError(Entry, kw_only=True):
     path: str
     error_type: str
     level: LogLevel = LogLevel.ERROR
+
+
+class WorkerStarted(Entry, kw_only=True):
+    node_id: str
+    node_host: str
+    node_port: int
+    manager_host: str | None = None
+    manager_port: int | None = None
+    level: LogLevel = LogLevel.INFO
+
+
+class WorkerStopping(Entry, kw_only=True):
+    node_id: str
+    node_host: str
+    node_port: int
+    reason: str | None = None
+    level: LogLevel = LogLevel.INFO
+
+
+class WorkerJobReceived(Entry, kw_only=True):
+    node_id: str
+    node_host: str
+    node_port: int
+    job_id: str
+    workflow_id: str
+    source_manager_host: str
+    source_manager_port: int
+    level: LogLevel = LogLevel.INFO
+
+
+class WorkerJobStarted(Entry, kw_only=True):
+    node_id: str
+    node_host: str
+    node_port: int
+    job_id: str
+    workflow_id: str
+    allocated_vus: int
+    allocated_cores: int
+    level: LogLevel = LogLevel.INFO
+
+
+class WorkerJobCompleted(Entry, kw_only=True):
+    node_id: str
+    node_host: str
+    node_port: int
+    job_id: str
+    workflow_id: str
+    elapsed_seconds: float
+    completed_count: int
+    failed_count: int
+    level: LogLevel = LogLevel.INFO
+
+
+class WorkerJobFailed(Entry, kw_only=True):
+    node_id: str
+    node_host: str
+    node_port: int
+    job_id: str
+    workflow_id: str
+    elapsed_seconds: float
+    error_message: str | None
+    error_type: str | None
+    level: LogLevel = LogLevel.ERROR
+
+
+class WorkerActionStarted(Entry, kw_only=True):
+    node_id: str
+    node_host: str
+    node_port: int
+    job_id: str
+    action_name: str
+    level: LogLevel = LogLevel.TRACE
+
+
+class WorkerActionCompleted(Entry, kw_only=True):
+    node_id: str
+    node_host: str
+    node_port: int
+    job_id: str
+    action_name: str
+    duration_ms: float
+    level: LogLevel = LogLevel.TRACE
+
+
+class WorkerActionFailed(Entry, kw_only=True):
+    node_id: str
+    node_host: str
+    node_port: int
+    job_id: str
+    action_name: str
+    error_type: str
+    duration_ms: float
+    level: LogLevel = LogLevel.WARN
+
+
+class WorkerHealthcheckReceived(Entry, kw_only=True):
+    node_id: str
+    node_host: str
+    node_port: int
+    source_host: str
+    source_port: int
+    level: LogLevel = LogLevel.TRACE
+
+
+class WorkerExtensionRequested(Entry, kw_only=True):
+    node_id: str
+    node_host: str
+    node_port: int
+    reason: str
+    estimated_completion_seconds: float
+    active_workflow_count: int
+    level: LogLevel = LogLevel.DEBUG

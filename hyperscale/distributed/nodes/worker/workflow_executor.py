@@ -11,7 +11,9 @@ from typing import TYPE_CHECKING
 
 import cloudpickle
 
-from hyperscale.core.jobs.models.workflow_status import WorkflowStatus as CoreWorkflowStatus
+from hyperscale.core.jobs.models.workflow_status import (
+    WorkflowStatus as CoreWorkflowStatus,
+)
 from hyperscale.core.jobs.models import Env as CoreEnv
 from hyperscale.distributed.models import (
     StepStats,
@@ -21,7 +23,13 @@ from hyperscale.distributed.models import (
     WorkflowProgress,
     WorkflowStatus,
 )
-from hyperscale.logging.hyperscale_logging_models import ServerError
+from hyperscale.logging.hyperscale_logging_models import (
+    ServerError,
+    WorkerJobReceived,
+    WorkerJobStarted,
+    WorkerJobCompleted,
+    WorkerJobFailed,
+)
 
 if TYPE_CHECKING:
     from hyperscale.logging import Logger
@@ -68,8 +76,20 @@ class WorkerWorkflowExecutor:
         self._env = env
         self._logger = logger
 
+        # Event logger for crash forensics (AD-47)
+        self._event_logger: Logger | None = None
+
         # Core environment for workflow runner (lazily initialized)
         self._core_env: CoreEnv | None = None
+
+    def set_event_logger(self, logger: "Logger | None") -> None:
+        """
+        Set the event logger for crash forensics.
+
+        Args:
+            logger: Logger instance configured for event logging, or None to disable.
+        """
+        self._event_logger = logger
 
     def _get_core_env(self) -> CoreEnv:
         """Get or create CoreEnv for workflow execution."""
@@ -118,6 +138,21 @@ class WorkerWorkflowExecutor:
         workflow_id = dispatch.workflow_id
         vus_for_workflow = dispatch.vus
         cores_to_allocate = dispatch.cores
+
+        if self._event_logger is not None:
+            await self._event_logger.log(
+                WorkerJobReceived(
+                    message=f"Received job {dispatch.job_id}",
+                    node_id=node_id_full,
+                    node_host=node_host,
+                    node_port=node_port,
+                    job_id=dispatch.job_id,
+                    workflow_id=workflow_id,
+                    source_manager_host=dispatching_addr[0],
+                    source_manager_port=dispatching_addr[1],
+                ),
+                name="worker_events",
+            )
 
         increment_version()
 
@@ -199,8 +234,23 @@ class WorkerWorkflowExecutor:
         error: Exception | None = None
         workflow_error: str | None = None
         workflow_results: dict = {}
-        context_updates: bytes = b''
+        context_updates: bytes = b""
         progress_token = None
+
+        if self._event_logger is not None:
+            await self._event_logger.log(
+                WorkerJobStarted(
+                    message=f"Started job {dispatch.job_id}",
+                    node_id=node_id_full,
+                    node_host=node_host,
+                    node_port=node_port,
+                    job_id=dispatch.job_id,
+                    workflow_id=dispatch.workflow_id,
+                    allocated_vus=allocated_vus,
+                    allocated_cores=allocated_cores,
+                ),
+                name="worker_events",
+            )
 
         try:
             # Phase 1: Setup
@@ -277,14 +327,51 @@ class WorkerWorkflowExecutor:
             # Trigger server cleanup
             self._lifecycle.start_server_cleanup()
 
+        elapsed_seconds = time.monotonic() - start_time
+
+        if self._event_logger is not None:
+            if progress.status == WorkflowStatus.COMPLETED.value:
+                await self._event_logger.log(
+                    WorkerJobCompleted(
+                        message=f"Completed job {dispatch.job_id}",
+                        node_id=node_id_full,
+                        node_host=node_host,
+                        node_port=node_port,
+                        job_id=dispatch.job_id,
+                        workflow_id=dispatch.workflow_id,
+                        elapsed_seconds=elapsed_seconds,
+                        completed_count=progress.completed_count,
+                        failed_count=progress.failed_count,
+                    ),
+                    name="worker_events",
+                )
+            elif progress.status in (
+                WorkflowStatus.FAILED.value,
+                WorkflowStatus.CANCELLED.value,
+            ):
+                await self._event_logger.log(
+                    WorkerJobFailed(
+                        message=f"Failed job {dispatch.job_id}",
+                        node_id=node_id_full,
+                        node_host=node_host,
+                        node_port=node_port,
+                        job_id=dispatch.job_id,
+                        workflow_id=dispatch.workflow_id,
+                        elapsed_seconds=elapsed_seconds,
+                        error_message=workflow_error,
+                        error_type=type(error).__name__ if error else None,
+                    ),
+                    name="worker_events",
+                )
+
         # Build final result for sending
         final_result = WorkflowFinalResult(
             job_id=dispatch.job_id,
             workflow_id=dispatch.workflow_id,
             workflow_name=progress.workflow_name,
             status=progress.status,
-            results=workflow_results if workflow_results else b'',
-            context_updates=context_updates if context_updates else b'',
+            results=workflow_results if workflow_results else b"",
+            context_updates=context_updates if context_updates else b"",
             error=workflow_error,
             worker_id=node_id_full,
             worker_available_cores=self._core_allocator.available_cores,
@@ -351,7 +438,8 @@ class WorkerWorkflowExecutor:
                 progress.elapsed_seconds = time.monotonic() - start_time
                 progress.rate_per_second = (
                     workflow_status_update.completed_count / progress.elapsed_seconds
-                    if progress.elapsed_seconds > 0 else 0.0
+                    if progress.elapsed_seconds > 0
+                    else 0.0
                 )
                 progress.timestamp = time.monotonic()
                 progress.collected_at = time.time()
@@ -392,7 +480,10 @@ class WorkerWorkflowExecutor:
                     total_work = max(dispatch.vus * 100, 1)
                     estimated_complete = min(
                         total_cores,
-                        int(total_cores * (workflow_status_update.completed_count / total_work))
+                        int(
+                            total_cores
+                            * (workflow_status_update.completed_count / total_work)
+                        ),
                     )
                     progress.cores_completed = estimated_complete
 
@@ -420,6 +511,6 @@ class WorkerWorkflowExecutor:
                             node_host=node_host,
                             node_port=node_port,
                             node_id=node_id_short,
-                            message=f'Update Error: {str(err)} for workflow: {workflow_name} id: {progress.workflow_id}'
+                            message=f"Update Error: {str(err)} for workflow: {workflow_name} id: {progress.workflow_id}",
                         )
                     )

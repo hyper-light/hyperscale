@@ -7,12 +7,14 @@ for timeouts, intervals, retry policies, and health monitoring.
 
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
 
 
 def _get_os_cpus() -> int:
     """Get OS CPU count."""
     try:
         import psutil
+
         return psutil.cpu_count(logical=False) or os.cpu_count() or 1
     except ImportError:
         return os.cpu_count() or 1
@@ -79,6 +81,9 @@ class WorkerConfig:
     registration_max_retries: int = 3
     registration_base_delay_seconds: float = 0.5
 
+    # Event log configuration (AD-47)
+    event_log_dir: Path | None = None
+
     @property
     def progress_update_interval(self) -> float:
         """Alias for progress_update_interval_seconds."""
@@ -111,7 +116,7 @@ class WorkerConfig:
         Returns:
             WorkerConfig instance
         """
-        total_cores = getattr(env, 'WORKER_MAX_CORES', None)
+        total_cores = getattr(env, "WORKER_MAX_CORES", None)
         if not total_cores:
             total_cores = _get_os_cpus()
 
@@ -121,21 +126,43 @@ class WorkerConfig:
             udp_port=udp_port,
             datacenter_id=datacenter_id,
             total_cores=total_cores,
-            tcp_timeout_short_seconds=getattr(env, 'WORKER_TCP_TIMEOUT_SHORT', 2.0),
-            tcp_timeout_standard_seconds=getattr(env, 'WORKER_TCP_TIMEOUT_STANDARD', 5.0),
-            dead_manager_reap_interval_seconds=getattr(env, 'WORKER_DEAD_MANAGER_REAP_INTERVAL', 60.0),
-            dead_manager_check_interval_seconds=getattr(env, 'WORKER_DEAD_MANAGER_CHECK_INTERVAL', 10.0),
-            progress_update_interval_seconds=getattr(env, 'WORKER_PROGRESS_UPDATE_INTERVAL', 1.0),
-            progress_flush_interval_seconds=getattr(env, 'WORKER_PROGRESS_FLUSH_INTERVAL', 0.5),
-            cancellation_poll_interval_seconds=getattr(env, 'WORKER_CANCELLATION_POLL_INTERVAL', 5.0),
-            orphan_grace_period_seconds=getattr(env, 'WORKER_ORPHAN_GRACE_PERIOD', 120.0),
-            orphan_check_interval_seconds=getattr(env, 'WORKER_ORPHAN_CHECK_INTERVAL', 10.0),
-            pending_transfer_ttl_seconds=getattr(env, 'WORKER_PENDING_TRANSFER_TTL', 60.0),
-            overload_poll_interval_seconds=getattr(env, 'WORKER_OVERLOAD_POLL_INTERVAL', 0.25),
-            throughput_interval_seconds=getattr(env, 'WORKER_THROUGHPUT_INTERVAL_SECONDS', 10.0),
-            recovery_jitter_min_seconds=getattr(env, 'RECOVERY_JITTER_MIN', 0.0),
-            recovery_jitter_max_seconds=getattr(env, 'RECOVERY_JITTER_MAX', 1.0),
-            recovery_semaphore_size=getattr(env, 'RECOVERY_SEMAPHORE_SIZE', 5),
+            tcp_timeout_short_seconds=getattr(env, "WORKER_TCP_TIMEOUT_SHORT", 2.0),
+            tcp_timeout_standard_seconds=getattr(
+                env, "WORKER_TCP_TIMEOUT_STANDARD", 5.0
+            ),
+            dead_manager_reap_interval_seconds=getattr(
+                env, "WORKER_DEAD_MANAGER_REAP_INTERVAL", 60.0
+            ),
+            dead_manager_check_interval_seconds=getattr(
+                env, "WORKER_DEAD_MANAGER_CHECK_INTERVAL", 10.0
+            ),
+            progress_update_interval_seconds=getattr(
+                env, "WORKER_PROGRESS_UPDATE_INTERVAL", 1.0
+            ),
+            progress_flush_interval_seconds=getattr(
+                env, "WORKER_PROGRESS_FLUSH_INTERVAL", 0.5
+            ),
+            cancellation_poll_interval_seconds=getattr(
+                env, "WORKER_CANCELLATION_POLL_INTERVAL", 5.0
+            ),
+            orphan_grace_period_seconds=getattr(
+                env, "WORKER_ORPHAN_GRACE_PERIOD", 120.0
+            ),
+            orphan_check_interval_seconds=getattr(
+                env, "WORKER_ORPHAN_CHECK_INTERVAL", 10.0
+            ),
+            pending_transfer_ttl_seconds=getattr(
+                env, "WORKER_PENDING_TRANSFER_TTL", 60.0
+            ),
+            overload_poll_interval_seconds=getattr(
+                env, "WORKER_OVERLOAD_POLL_INTERVAL", 0.25
+            ),
+            throughput_interval_seconds=getattr(
+                env, "WORKER_THROUGHPUT_INTERVAL_SECONDS", 10.0
+            ),
+            recovery_jitter_min_seconds=getattr(env, "RECOVERY_JITTER_MIN", 0.0),
+            recovery_jitter_max_seconds=getattr(env, "RECOVERY_JITTER_MAX", 1.0),
+            recovery_semaphore_size=getattr(env, "RECOVERY_SEMAPHORE_SIZE", 5),
         )
 
 
@@ -172,7 +199,9 @@ def create_worker_config_from_env(
         datacenter_id=datacenter_id,
         total_cores=total_cores,
         tcp_timeout_short_seconds=float(os.getenv("WORKER_TCP_TIMEOUT_SHORT", "2.0")),
-        tcp_timeout_standard_seconds=float(os.getenv("WORKER_TCP_TIMEOUT_STANDARD", "5.0")),
+        tcp_timeout_standard_seconds=float(
+            os.getenv("WORKER_TCP_TIMEOUT_STANDARD", "5.0")
+        ),
         dead_manager_reap_interval_seconds=float(
             os.getenv("WORKER_DEAD_MANAGER_REAP_INTERVAL", "60.0")
         ),

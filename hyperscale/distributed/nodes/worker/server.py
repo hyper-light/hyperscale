@@ -26,7 +26,15 @@ from hyperscale.distributed.protocol.version import (
     NegotiatedCapabilities,
 )
 from hyperscale.distributed.server import tcp
-from hyperscale.logging.hyperscale_logging_models import ServerInfo
+from hyperscale.logging import Logger
+from hyperscale.logging.config import DurabilityMode
+from hyperscale.logging.hyperscale_logging_models import (
+    ServerInfo,
+    WorkerExtensionRequested,
+    WorkerHealthcheckReceived,
+    WorkerStarted,
+    WorkerStopping,
+)
 
 from .config import WorkerConfig
 from .state import WorkerState
@@ -204,6 +212,9 @@ class WorkerServer(HealthAwareServer):
         # Debounced cores notification (AD-38 fix: single in-flight task, coalesced updates)
         self._pending_cores_notification: int | None = None
         self._cores_notification_task: asyncio.Task | None = None
+
+        # Event logger for crash forensics (AD-47)
+        self._event_logger: Logger | None = None
 
         # Create state embedder for SWIM
         state_embedder = WorkerStateEmbedder(
@@ -387,6 +398,36 @@ class WorkerServer(HealthAwareServer):
         # Start parent server
         await super().start()
 
+        if self._config.event_log_dir is not None:
+            self._event_logger = Logger()
+            self._event_logger.configure(
+                name="worker_events",
+                path=str(self._config.event_log_dir / "events.jsonl"),
+                durability=DurabilityMode.FLUSH,
+                log_format="json",
+                retention_policy={
+                    "max_size": "50MB",
+                    "max_age": "24h",
+                },
+            )
+            await self._event_logger.log(
+                WorkerStarted(
+                    message="Worker started",
+                    node_id=self._node_id.full,
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    manager_host=self._seed_managers[0][0]
+                    if self._seed_managers
+                    else None,
+                    manager_port=self._seed_managers[0][1]
+                    if self._seed_managers
+                    else None,
+                ),
+                name="worker_events",
+            )
+
+            self._workflow_executor.set_event_logger(self._event_logger)
+
         # Update node capabilities
         self._node_capabilities = self._lifecycle_manager.get_node_capabilities(
             self._node_id.full
@@ -452,6 +493,19 @@ class WorkerServer(HealthAwareServer):
     ) -> None:
         """Stop the worker server gracefully."""
         self._running = False
+
+        if self._event_logger is not None:
+            await self._event_logger.log(
+                WorkerStopping(
+                    message="Worker stopping",
+                    node_id=self._node_id.full,
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    reason="graceful_shutdown",
+                ),
+                name="worker_events",
+            )
+            await self._event_logger.close()
 
         # Stop background loops
         await self._stop_background_loops()
@@ -687,9 +741,23 @@ class WorkerServer(HealthAwareServer):
         self._worker_state._extension_completed_items = completed_items
         self._worker_state._extension_total_items = total_items
         self._worker_state._extension_estimated_completion = estimated_completion
-        self._worker_state._extension_active_workflow_count = len(
-            self._active_workflows
-        )
+        active_workflow_count = len(self._active_workflows)
+        self._worker_state._extension_active_workflow_count = active_workflow_count
+
+        if self._event_logger is not None:
+            self._task_runner.run(
+                self._event_logger.log,
+                WorkerExtensionRequested(
+                    message=f"Extension requested: {reason}",
+                    node_id=self._node_id.full,
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    reason=reason,
+                    estimated_completion_seconds=estimated_completion,
+                    active_workflow_count=active_workflow_count,
+                ),
+                "worker_events",
+            )
 
     def clear_extension_request(self) -> None:
         """
@@ -923,6 +991,19 @@ class WorkerServer(HealthAwareServer):
         self, heartbeat, source_addr: tuple[str, int]
     ) -> None:
         """Handle manager heartbeat from SWIM."""
+        if self._event_logger is not None:
+            await self._event_logger.log(
+                WorkerHealthcheckReceived(
+                    message=f"Healthcheck from {source_addr[0]}:{source_addr[1]}",
+                    node_id=self._node_id.full,
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    source_host=source_addr[0],
+                    source_port=source_addr[1],
+                ),
+                name="worker_events",
+            )
+
         self._heartbeat_handler.process_manager_heartbeat(
             heartbeat=heartbeat,
             source_addr=source_addr,
