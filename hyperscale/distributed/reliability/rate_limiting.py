@@ -587,44 +587,45 @@ class AdaptiveRateLimiter:
 
         return self._reject_request(state, wait_time, counter.available_slots)
 
-    def _get_or_create_operation_counter(
+    async def _get_or_create_operation_counter(
         self,
         client_id: str,
         operation: str,
     ) -> SlidingWindowCounter:
         """Get or create a counter for the client/operation combination."""
-        if client_id not in self._operation_counters:
-            self._operation_counters[client_id] = {}
+        async with self._counter_creation_lock:
+            if client_id not in self._operation_counters:
+                self._operation_counters[client_id] = {}
 
-        counters = self._operation_counters[client_id]
-        if operation not in counters:
-            max_requests, window_size = self._config.get_operation_limits(operation)
-            counters[operation] = SlidingWindowCounter(
-                window_size_seconds=window_size,
-                max_requests=max_requests,
-            )
+            counters = self._operation_counters[client_id]
+            if operation not in counters:
+                max_requests, window_size = self._config.get_operation_limits(operation)
+                counters[operation] = SlidingWindowCounter(
+                    window_size_seconds=window_size,
+                    max_requests=max_requests,
+                )
 
-        return counters[operation]
+            return counters[operation]
 
-    def _get_or_create_stress_counter(
+    async def _get_or_create_stress_counter(
         self,
         client_id: str,
         state: OverloadState,
     ) -> SlidingWindowCounter:
         """Get or create a stress counter for the client based on current state."""
-        if client_id not in self._client_stress_counters:
-            # Determine limit based on state
-            if state == OverloadState.STRESSED:
-                max_requests = self._config.stressed_requests_per_window
-            else:  # OVERLOADED
-                max_requests = self._config.overloaded_requests_per_window
+        async with self._counter_creation_lock:
+            if client_id not in self._client_stress_counters:
+                if state == OverloadState.STRESSED:
+                    max_requests = self._config.stressed_requests_per_window
+                else:
+                    max_requests = self._config.overloaded_requests_per_window
 
-            self._client_stress_counters[client_id] = SlidingWindowCounter(
-                window_size_seconds=self._config.window_size_seconds,
-                max_requests=max_requests,
-            )
+                self._client_stress_counters[client_id] = SlidingWindowCounter(
+                    window_size_seconds=self._config.window_size_seconds,
+                    max_requests=max_requests,
+                )
 
-        return self._client_stress_counters[client_id]
+            return self._client_stress_counters[client_id]
 
     def _reject_request(
         self,
