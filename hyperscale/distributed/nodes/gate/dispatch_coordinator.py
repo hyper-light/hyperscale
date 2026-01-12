@@ -191,7 +191,7 @@ class GateDispatchCoordinator:
         client_id = f"{addr[0]}:{addr[1]}"
 
         # Validate rate limit and load (AD-22, AD-24)
-        if rejection := self._check_rate_and_load(client_id, submission.job_id):
+        if rejection := await self._check_rate_and_load(client_id, submission.job_id):
             return rejection
 
         # Validate protocol version (AD-25)
