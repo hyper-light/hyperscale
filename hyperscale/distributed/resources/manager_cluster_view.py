@@ -2,6 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from time import monotonic
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from hyperscale.distributed.resources.manager_local_view import ManagerLocalView
 
 
 @dataclass(slots=True)
@@ -13,7 +17,7 @@ class ManagerClusterResourceView:
     manager_count: int = 0
     manager_aggregate_cpu_percent: float = 0.0
     manager_aggregate_memory_bytes: int = 0
-    manager_views: dict[str, "ManagerLocalView"] = field(default_factory=dict)
+    manager_views: dict[str, ManagerLocalView] = field(default_factory=dict)
     worker_count: int = 0
     worker_aggregate_cpu_percent: float = 0.0
     worker_aggregate_memory_bytes: int = 0
@@ -23,6 +27,3 @@ class ManagerClusterResourceView:
     memory_pressure: float = 0.0
     vector_clock: dict[str, int] = field(default_factory=dict)
     timestamp_monotonic: float = field(default_factory=monotonic)
-
-
-from hyperscale.distributed.resources.manager_local_view import ManagerLocalView
