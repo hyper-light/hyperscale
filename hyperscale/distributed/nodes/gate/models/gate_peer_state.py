@@ -74,20 +74,28 @@ class GatePeerState:
     # Health configuration for peer gates
     health_config: GateHealthConfig = field(default_factory=GateHealthConfig)
 
-    def get_or_create_peer_lock(self, peer_addr: tuple[str, int]) -> asyncio.Lock:
-        """Get or create a lock for the given peer address."""
-        return self.peer_locks.setdefault(peer_addr, asyncio.Lock())
+    # Lock for creating per-peer locks
+    _lock_creation_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
-    def increment_epoch(self, peer_addr: tuple[str, int]) -> int:
-        """Increment and return the epoch for a peer address."""
-        current_epoch = self.peer_epochs.get(peer_addr, 0)
-        new_epoch = current_epoch + 1
-        self.peer_epochs[peer_addr] = new_epoch
-        return new_epoch
+    # Lock for epoch operations
+    _epoch_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
-    def get_epoch(self, peer_addr: tuple[str, int]) -> int:
-        """Get the current epoch for a peer address."""
-        return self.peer_epochs.get(peer_addr, 0)
+    async def get_or_create_peer_lock(self, peer_addr: tuple[str, int]) -> asyncio.Lock:
+        async with self._lock_creation_lock:
+            if peer_addr not in self.peer_locks:
+                self.peer_locks[peer_addr] = asyncio.Lock()
+            return self.peer_locks[peer_addr]
+
+    async def increment_epoch(self, peer_addr: tuple[str, int]) -> int:
+        async with self._epoch_lock:
+            current_epoch = self.peer_epochs.get(peer_addr, 0)
+            new_epoch = current_epoch + 1
+            self.peer_epochs[peer_addr] = new_epoch
+            return new_epoch
+
+    async def get_epoch(self, peer_addr: tuple[str, int]) -> int:
+        async with self._epoch_lock:
+            return self.peer_epochs.get(peer_addr, 0)
 
     def remove_peer_lock(self, peer_addr: tuple[str, int]) -> None:
         """Remove lock and epoch when peer disconnects to prevent memory leak."""
