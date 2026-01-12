@@ -183,8 +183,8 @@ class GateJobHandler:
             submission = JobSubmission.load(data)
 
             client_version = ProtocolVersion(
-                major=getattr(submission, 'protocol_version_major', 1),
-                minor=getattr(submission, 'protocol_version_minor', 0),
+                major=getattr(submission, "protocol_version_major", 1),
+                minor=getattr(submission, "protocol_version_minor", 0),
             )
 
             if client_version.major != CURRENT_PROTOCOL_VERSION.major:
@@ -196,11 +196,13 @@ class GateJobHandler:
                     protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
                 ).dump()
 
-            client_caps_str = getattr(submission, 'capabilities', '')
-            client_features = set(client_caps_str.split(',')) if client_caps_str else set()
+            client_caps_str = getattr(submission, "capabilities", "")
+            client_features = (
+                set(client_caps_str.split(",")) if client_caps_str else set()
+            )
             our_features = get_features_for_version(CURRENT_PROTOCOL_VERSION)
             negotiated_features = client_features & our_features
-            negotiated_caps_str = ','.join(sorted(negotiated_features))
+            negotiated_caps_str = ",".join(sorted(negotiated_features))
 
             if self._quorum_circuit.circuit_state == CircuitState.OPEN:
                 self._job_lease_manager.release(submission.job_id)
@@ -219,10 +221,12 @@ class GateJobHandler:
                     required_quorum=self._quorum_size(),
                 )
 
-            primary_dcs, fallback_dcs, worst_health = self._select_datacenters_with_fallback(
-                submission.datacenter_count,
-                submission.datacenters if submission.datacenters else None,
-                job_id=submission.job_id,
+            primary_dcs, fallback_dcs, worst_health = (
+                self._select_datacenters_with_fallback(
+                    submission.datacenter_count,
+                    submission.datacenters if submission.datacenters else None,
+                    job_id=submission.job_id,
+                )
             )
 
             if worst_health == "initializing":
@@ -233,7 +237,7 @@ class GateJobHandler:
                         node_host=self._get_host(),
                         node_port=self._get_tcp_port(),
                         node_id=self._get_node_id().short,
-                    )
+                    ),
                 )
                 return JobAck(
                     job_id=submission.job_id,
@@ -260,15 +264,21 @@ class GateJobHandler:
             self._job_manager.set_target_dcs(submission.job_id, set(target_dcs))
 
             try:
-                workflows: list[tuple[str, list[str], object]] = cloudpickle.loads(submission.workflows)
+                workflows: list[tuple[str, list[str], object]] = cloudpickle.loads(
+                    submission.workflows
+                )
                 workflow_ids = {wf_id for wf_id, _, _ in workflows}
                 self._state._job_workflow_ids[submission.job_id] = workflow_ids
             except Exception:
                 self._state._job_workflow_ids[submission.job_id] = set()
 
             if submission.callback_addr:
-                self._job_manager.set_callback(submission.job_id, submission.callback_addr)
-                self._state._progress_callbacks[submission.job_id] = submission.callback_addr
+                self._job_manager.set_callback(
+                    submission.job_id, submission.callback_addr
+                )
+                self._state._progress_callbacks[submission.job_id] = (
+                    submission.callback_addr
+                )
 
             if submission.reporting_configs:
                 self._state._job_submissions[submission.job_id] = submission
@@ -278,7 +288,7 @@ class GateJobHandler:
                 metadata=len(target_dcs),
             )
 
-            self._state.increment_state_version()
+            await self._state.increment_state_version()
 
             await self._broadcast_job_leadership(
                 submission.job_id,
@@ -302,14 +312,14 @@ class GateJobHandler:
 
         except QuorumCircuitOpenError as error:
             return JobAck(
-                job_id=submission.job_id if 'submission' in dir() else "unknown",
+                job_id=submission.job_id if "submission" in dir() else "unknown",
                 accepted=False,
                 error=str(error),
             ).dump()
         except QuorumError as error:
             self._quorum_circuit.record_error()
             return JobAck(
-                job_id=submission.job_id if 'submission' in dir() else "unknown",
+                job_id=submission.job_id if "submission" in dir() else "unknown",
                 accepted=False,
                 error=str(error),
             ).dump()
@@ -356,7 +366,7 @@ class GateJobHandler:
                 ).dump()
 
             if self._should_shed_request("JobStatusRequest"):
-                return b''
+                return b""
 
             job_id = data.decode()
             status = await gather_job_status(job_id)
@@ -371,7 +381,7 @@ class GateJobHandler:
                     node_id=self._get_node_id().short,
                 )
             )
-            return b''
+            return b""
         finally:
             latency_ms = (time.monotonic() - start_time) * 1000
             self._record_request_latency(latency_ms)
@@ -421,11 +431,11 @@ class GateJobHandler:
                     self._logger.log,
                     ServerDebug(
                         message=f"Rejecting stale job progress for {progress.job_id}: "
-                                f"fence_token {progress.fence_token} < {current_fence}",
+                        f"fence_token {progress.fence_token} < {current_fence}",
                         node_host=self._get_host(),
                         node_port=self._get_tcp_port(),
                         node_id=self._get_node_id().short,
-                    )
+                    ),
                 )
                 return JobProgressAck(
                     gate_id=self._get_node_id().full,
@@ -462,15 +472,19 @@ class GateJobHandler:
                 )
 
                 completed_dcs = sum(
-                    1 for p in job.datacenters
+                    1
+                    for p in job.datacenters
                     if p.status in (JobStatus.COMPLETED.value, JobStatus.FAILED.value)
                 )
                 if completed_dcs == len(job.datacenters):
                     failed_dcs = sum(
-                        1 for p in job.datacenters
-                        if p.status == JobStatus.FAILED.value
+                        1 for p in job.datacenters if p.status == JobStatus.FAILED.value
                     )
-                    job.status = JobStatus.FAILED.value if failed_dcs > 0 else JobStatus.COMPLETED.value
+                    job.status = (
+                        JobStatus.FAILED.value
+                        if failed_dcs > 0
+                        else JobStatus.COMPLETED.value
+                    )
                     job.completed_datacenters = len(job.datacenters) - failed_dcs
                     job.failed_datacenters = failed_dcs
 
@@ -481,7 +495,7 @@ class GateJobHandler:
                     data,
                 )
 
-                self._state.increment_state_version()
+                await self._state.increment_state_version()
 
             return JobProgressAck(
                 gate_id=self._get_node_id().full,
@@ -498,7 +512,7 @@ class GateJobHandler:
                     node_id=self._get_node_id().short,
                 )
             )
-            return b'error'
+            return b"error"
         finally:
             latency_ms = (time.monotonic() - start_time) * 1000
             self._record_request_latency(latency_ms)

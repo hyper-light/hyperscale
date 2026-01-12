@@ -154,7 +154,7 @@ class WorkerWorkflowExecutor:
                 name="worker_events",
             )
 
-        increment_version()
+        await increment_version()
 
         # Create initial progress tracker
         progress = WorkflowProgress(
@@ -258,7 +258,7 @@ class WorkerWorkflowExecutor:
             context_dict = dispatch.load_context()
 
             progress.workflow_name = workflow.name
-            increment_version()
+            await increment_version()
 
             self._state._workflow_id_to_name[dispatch.workflow_id] = workflow.name
             self._state._workflow_cores_completed[dispatch.workflow_id] = set()
@@ -317,8 +317,7 @@ class WorkerWorkflowExecutor:
             # Free cores
             await self._core_allocator.free(dispatch.workflow_id)
 
-            # Update state version
-            increment_version()
+            await increment_version()
 
             # Clean up workflow state
             self._state.remove_active_workflow(dispatch.workflow_id)

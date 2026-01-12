@@ -665,9 +665,8 @@ class WorkerServer(HealthAwareServer):
             return WorkerStateEnum.DEGRADED
         return WorkerStateEnum.HEALTHY
 
-    def _increment_version(self) -> int:
-        """Increment and return the state version."""
-        return self._state_sync.increment_version()
+    async def _increment_version(self) -> int:
+        return await self._state_sync.increment_version()
 
     def _get_state_snapshot(self) -> WorkerStateSnapshot:
         """Get a complete state snapshot."""

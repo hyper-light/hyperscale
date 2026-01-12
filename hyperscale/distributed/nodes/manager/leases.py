@@ -111,7 +111,7 @@ class ManagerLeaseCoordinator:
                     node_host=self._config.host,
                     node_port=self._config.tcp_port,
                     node_id=self._node_id,
-                )
+                ),
             )
             return True
 
@@ -135,7 +135,7 @@ class ManagerLeaseCoordinator:
                     node_host=self._config.host,
                     node_port=self._config.tcp_port,
                     node_id=self._node_id,
-                )
+                ),
             )
 
     def transfer_job_leadership(
@@ -170,7 +170,7 @@ class ManagerLeaseCoordinator:
                 node_host=self._config.host,
                 node_port=self._config.tcp_port,
                 node_id=self._node_id,
-            )
+            ),
         )
         return True
 
@@ -186,20 +186,12 @@ class ManagerLeaseCoordinator:
         """
         return self._state._job_fencing_tokens.get(job_id, 0)
 
-    def increment_fence_token(self, job_id: str) -> int:
-        """
-        Increment and return fencing token for a job.
-
-        Args:
-            job_id: Job ID
-
-        Returns:
-            New fencing token value
-        """
-        current = self._state._job_fencing_tokens.get(job_id, 0)
-        new_value = current + 1
-        self._state._job_fencing_tokens[job_id] = new_value
-        return new_value
+    async def increment_fence_token(self, job_id: str) -> int:
+        async with self._state._get_counter_lock():
+            current = self._state._job_fencing_tokens.get(job_id, 0)
+            new_value = current + 1
+            self._state._job_fencing_tokens[job_id] = new_value
+            return new_value
 
     def validate_fence_token(self, job_id: str, token: int) -> bool:
         """
@@ -253,14 +245,8 @@ class ManagerLeaseCoordinator:
         """
         return self._state._fence_token
 
-    def increment_global_fence_token(self) -> int:
-        """
-        Increment and return the global fence token.
-
-        Returns:
-            New global fence token
-        """
-        return self._state.increment_fence_token()
+    async def increment_global_fence_token(self) -> int:
+        return await self._state.increment_fence_token()
 
     def get_led_job_ids(self) -> list[str]:
         """

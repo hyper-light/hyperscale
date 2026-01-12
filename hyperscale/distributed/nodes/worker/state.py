@@ -102,18 +102,21 @@ class WorkerState:
         self._throughput_last_value: float = 0.0
         self._completion_times: list[float] = []
 
-    # =========================================================================
-    # State Version Management
-    # =========================================================================
+    def initialize_locks(self) -> None:
+        self._version_lock = asyncio.Lock()
 
-    def increment_version(self) -> int:
-        """Increment and return the state version."""
-        self._state_version += 1
-        return self._state_version
+    def _get_version_lock(self) -> asyncio.Lock:
+        if self._version_lock is None:
+            self._version_lock = asyncio.Lock()
+        return self._version_lock
+
+    async def increment_version(self) -> int:
+        async with self._get_version_lock():
+            self._state_version += 1
+            return self._state_version
 
     @property
     def state_version(self) -> int:
-        """Get current state version."""
         return self._state_version
 
     # =========================================================================

@@ -152,7 +152,7 @@ class GatePeerCoordinator:
         """
         peer_lock = self._state.get_or_create_peer_lock(tcp_addr)
         async with peer_lock:
-            self._state.increment_peer_epoch(tcp_addr)
+            await self._state.increment_peer_epoch(tcp_addr)
             self._state.remove_active_peer(tcp_addr)
 
             peer_host, peer_port = tcp_addr

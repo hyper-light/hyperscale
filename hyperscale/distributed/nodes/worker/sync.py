@@ -5,6 +5,7 @@ Handles state snapshot generation and sync request handling
 for manager synchronization.
 """
 
+import asyncio
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -20,13 +21,18 @@ class WorkerStateSync:
     """
 
     def __init__(self) -> None:
-        """Initialize state sync manager."""
         self._state_version: int = 0
+        self._version_lock: asyncio.Lock | None = None
 
-    def increment_version(self) -> int:
-        """Increment and return state version."""
-        self._state_version += 1
-        return self._state_version
+    def _get_version_lock(self) -> asyncio.Lock:
+        if self._version_lock is None:
+            self._version_lock = asyncio.Lock()
+        return self._version_lock
+
+    async def increment_version(self) -> int:
+        async with self._get_version_lock():
+            self._state_version += 1
+            return self._state_version
 
     @property
     def state_version(self) -> int:
@@ -61,7 +67,9 @@ class WorkerStateSync:
                 "status": progress.status,
                 "completed_count": progress.completed_count,
                 "failed_count": progress.failed_count,
-                "assigned_cores": list(progress.assigned_cores) if progress.assigned_cores else [],
+                "assigned_cores": list(progress.assigned_cores)
+                if progress.assigned_cores
+                else [],
                 "job_leader": workflow_job_leaders.get(workflow_id),
             }
 

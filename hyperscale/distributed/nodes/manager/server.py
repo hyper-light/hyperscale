@@ -618,15 +618,12 @@ class ManagerServer(HealthAwareServer):
         # Initialize workflow lifecycle state machine (AD-33)
         self._workflow_lifecycle_states = WorkflowLifecycleStateMachine()
 
-        # Initialize workflow dispatcher
         self._workflow_dispatcher = WorkflowDispatcher(
             job_manager=self._job_manager,
             worker_pool=self._worker_pool,
             manager_id=self._node_id.full,
             datacenter=self._node_id.datacenter,
-            dispatch_semaphore=asyncio.Semaphore(100),
             send_dispatch=self._send_workflow_dispatch,
-            get_fence_token=lambda job_id: self._leases.increment_fence_token(job_id),
         )
 
         # Mark as started
@@ -1496,7 +1493,7 @@ class ManagerServer(HealthAwareServer):
                                 JobStatus.CANCELLED,
                             ):
                                 job.status = JobStatus.FAILED
-                                self._manager_state.increment_state_version()
+                                await self._manager_state.increment_state_version()
                     except Exception as check_error:
                         await self._udp_logger.log(
                             ServerError(
@@ -2492,7 +2489,7 @@ class ManagerServer(HealthAwareServer):
 
             # Update job status
             job.status = JobStatus.CANCELLED
-            self._manager_state.increment_state_version()
+            await self._manager_state.increment_state_version()
 
             # Build detailed response
             successfully_cancelled = pending_cancelled + running_cancelled
@@ -3289,7 +3286,7 @@ class ManagerServer(HealthAwareServer):
                     submission.origin_gate_addr
                 )
 
-            self._manager_state.increment_state_version()
+            await self._manager_state.increment_state_version()
 
             # Broadcast job leadership to peers
             workflow_names = [wf.name for _, _, wf in workflows]
@@ -3424,7 +3421,7 @@ class ManagerServer(HealthAwareServer):
         """Handle provision commit from leader."""
         try:
             ProvisionCommit.load(data)  # Validate message format
-            self._manager_state.increment_state_version()
+            await self._manager_state.increment_state_version()
             return b"ok"
 
         except Exception as error:
@@ -4013,7 +4010,7 @@ class ManagerServer(HealthAwareServer):
         job = self._job_manager.get_job(submission.job_id)
         if job:
             job.status = JobStatus.RUNNING.value
-            self._manager_state.increment_state_version()
+            await self._manager_state.increment_state_version()
 
     async def _register_with_discovered_worker(
         self,
@@ -4046,7 +4043,7 @@ class ManagerServer(HealthAwareServer):
 
         for key, value in updates.items():
             timestamp = timestamps.get(
-                key, self._manager_state.increment_context_lamport_clock()
+                key, await self._manager_state.increment_context_lamport_clock()
             )
             await context.update(
                 workflow_id,

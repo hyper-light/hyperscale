@@ -171,21 +171,29 @@ class ClientState:
         """
         return job_id in self._orphaned_jobs
 
-    def increment_gate_transfers(self) -> None:
-        """Increment gate transfer counter."""
-        self._gate_transfers_received += 1
+    def initialize_locks(self) -> None:
+        self._metrics_lock = asyncio.Lock()
 
-    def increment_manager_transfers(self) -> None:
-        """Increment manager transfer counter."""
-        self._manager_transfers_received += 1
+    def _get_metrics_lock(self) -> asyncio.Lock:
+        if self._metrics_lock is None:
+            self._metrics_lock = asyncio.Lock()
+        return self._metrics_lock
 
-    def increment_rerouted(self) -> None:
-        """Increment requests rerouted counter."""
-        self._requests_rerouted += 1
+    async def increment_gate_transfers(self) -> None:
+        async with self._get_metrics_lock():
+            self._gate_transfers_received += 1
 
-    def increment_failed_leadership_change(self) -> None:
-        """Increment failed leadership change counter."""
-        self._requests_failed_leadership_change += 1
+    async def increment_manager_transfers(self) -> None:
+        async with self._get_metrics_lock():
+            self._manager_transfers_received += 1
+
+    async def increment_rerouted(self) -> None:
+        async with self._get_metrics_lock():
+            self._requests_rerouted += 1
+
+    async def increment_failed_leadership_change(self) -> None:
+        async with self._get_metrics_lock():
+            self._requests_failed_leadership_change += 1
 
     def get_leadership_metrics(self) -> dict:
         """

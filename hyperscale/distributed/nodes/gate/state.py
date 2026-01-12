@@ -104,11 +104,16 @@ class GateRuntimeState:
     def initialize_locks(self) -> None:
         self._counter_lock = asyncio.Lock()
 
+    def _get_counter_lock(self) -> asyncio.Lock:
+        if self._counter_lock is None:
+            self._counter_lock = asyncio.Lock()
+        return self._counter_lock
+
     def get_or_create_peer_lock(self, peer_addr: tuple[str, int]) -> asyncio.Lock:
         return self._peer_state_locks.setdefault(peer_addr, asyncio.Lock())
 
     async def increment_peer_epoch(self, peer_addr: tuple[str, int]) -> int:
-        async with self._counter_lock:
+        async with self._get_counter_lock():
             current_epoch = self._peer_state_epoch.get(peer_addr, 0)
             new_epoch = current_epoch + 1
             self._peer_state_epoch[peer_addr] = new_epoch
@@ -187,7 +192,7 @@ class GateRuntimeState:
         self._leases.pop(key, None)
 
     async def next_fence_token(self) -> int:
-        async with self._counter_lock:
+        async with self._get_counter_lock():
             self._fence_token += 1
             return self._fence_token
 
@@ -244,7 +249,7 @@ class GateRuntimeState:
         self._cancellation_errors.pop(job_id, None)
 
     async def record_forward(self) -> None:
-        async with self._counter_lock:
+        async with self._get_counter_lock():
             self._forward_throughput_count += 1
 
     def calculate_throughput(self, now: float, interval_seconds: float) -> float:
@@ -260,7 +265,7 @@ class GateRuntimeState:
         return self._forward_throughput_last_value
 
     async def increment_state_version(self) -> int:
-        async with self._counter_lock:
+        async with self._get_counter_lock():
             self._state_version += 1
             return self._state_version
 

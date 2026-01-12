@@ -139,26 +139,33 @@ class WorkerCancellationHandler:
 
         # Update status
         if workflow_id in self._state._active_workflows:
-            self._state._active_workflows[workflow_id].status = WorkflowStatus.CANCELLED.value
+            self._state._active_workflows[
+                workflow_id
+            ].status = WorkflowStatus.CANCELLED.value
 
         # Cancel in RemoteGraphManager
         workflow_name = self._state._workflow_id_to_name.get(workflow_id)
         if workflow_name and self._remote_manager:
             run_id = hash(workflow_id) % (2**31)
             try:
-                success, remote_errors = await self._remote_manager.await_workflow_cancellation(
+                (
+                    success,
+                    remote_errors,
+                ) = await self._remote_manager.await_workflow_cancellation(
                     run_id,
                     workflow_name,
                     timeout=5.0,
                 )
                 if not success:
-                    errors.append(f"RemoteGraphManager cancellation timed out for {workflow_name}")
+                    errors.append(
+                        f"RemoteGraphManager cancellation timed out for {workflow_name}"
+                    )
                 if remote_errors:
                     errors.extend(remote_errors)
             except Exception as err:
                 errors.append(f"RemoteGraphManager error: {str(err)}")
 
-        increment_version()
+        await increment_version()
 
         return (True, errors)
 
@@ -209,7 +216,9 @@ class WorkerCancellationHandler:
                 # Poll for each active workflow
                 workflows_to_cancel: list[str] = []
 
-                for workflow_id, progress in list(self._state._active_workflows.items()):
+                for workflow_id, progress in list(
+                    self._state._active_workflows.items()
+                ):
                     query = WorkflowCancellationQuery(
                         job_id=progress.job_id,
                         workflow_id=workflow_id,
@@ -233,7 +242,9 @@ class WorkerCancellationHandler:
 
                 # Signal cancellation for workflows manager says are cancelled
                 for workflow_id in workflows_to_cancel:
-                    if cancel_event := self._state._workflow_cancel_events.get(workflow_id):
+                    if cancel_event := self._state._workflow_cancel_events.get(
+                        workflow_id
+                    ):
                         if not cancel_event.is_set():
                             cancel_event.set()
 
@@ -245,7 +256,7 @@ class WorkerCancellationHandler:
                                         node_host=node_host,
                                         node_port=node_port,
                                         node_id=node_id_short,
-                                    )
+                                    ),
                                 )
 
             except asyncio.CancelledError:

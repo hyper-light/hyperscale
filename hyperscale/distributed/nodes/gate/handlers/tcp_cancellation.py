@@ -173,18 +173,32 @@ class GateCancellationHandler:
 
             job = self._job_manager.get_job(job_id)
             if not job:
-                return self._build_cancel_response(use_ad20, job_id, success=False, error="Job not found")
+                return self._build_cancel_response(
+                    use_ad20, job_id, success=False, error="Job not found"
+                )
 
-            if fence_token > 0 and hasattr(job, 'fence_token') and job.fence_token != fence_token:
+            if (
+                fence_token > 0
+                and hasattr(job, "fence_token")
+                and job.fence_token != fence_token
+            ):
                 error_msg = f"Fence token mismatch: expected {job.fence_token}, got {fence_token}"
-                return self._build_cancel_response(use_ad20, job_id, success=False, error=error_msg)
+                return self._build_cancel_response(
+                    use_ad20, job_id, success=False, error=error_msg
+                )
 
             if job.status == JobStatus.CANCELLED.value:
-                return self._build_cancel_response(use_ad20, job_id, success=True, already_cancelled=True)
+                return self._build_cancel_response(
+                    use_ad20, job_id, success=True, already_cancelled=True
+                )
 
             if job.status == JobStatus.COMPLETED.value:
                 return self._build_cancel_response(
-                    use_ad20, job_id, success=False, already_completed=True, error="Job already completed"
+                    use_ad20,
+                    job_id,
+                    success=False,
+                    already_completed=True,
+                    error="Job already completed",
                 )
 
             retry_config = RetryConfig(
@@ -220,7 +234,9 @@ class GateCancellationHandler:
                             cancel_data = JobCancelRequest(
                                 job_id=job_id,
                                 requester_id=requester_id,
-                                timestamp=cancel_request.timestamp if 'cancel_request' in dir() else 0,
+                                timestamp=cancel_request.timestamp
+                                if "cancel_request" in dir()
+                                else 0,
                                 fence_token=fence_token,
                                 reason=reason,
                             ).dump()
@@ -248,7 +264,9 @@ class GateCancellationHandler:
                         if isinstance(response, bytes):
                             try:
                                 dc_response = JobCancelResponse.load(response)
-                                cancelled_workflows += dc_response.cancelled_workflow_count
+                                cancelled_workflows += (
+                                    dc_response.cancelled_workflow_count
+                                )
                                 dc_cancelled = True
                             except Exception:
                                 dc_ack = CancelAck.load(response)
@@ -259,17 +277,23 @@ class GateCancellationHandler:
                         continue
 
             job.status = JobStatus.CANCELLED.value
-            self._state.increment_state_version()
+            await self._state.increment_state_version()
 
             error_str = "; ".join(errors) if errors else None
             return self._build_cancel_response(
-                use_ad20, job_id, success=True, cancelled_count=cancelled_workflows, error=error_str
+                use_ad20,
+                job_id,
+                success=True,
+                cancelled_count=cancelled_workflows,
+                error=error_str,
             )
 
         except Exception as error:
             await handle_exception(error, "receive_cancel_job")
             is_ad20 = self._is_ad20_cancel_request(data)
-            return self._build_cancel_response(is_ad20, "unknown", success=False, error=str(error))
+            return self._build_cancel_response(
+                is_ad20, "unknown", success=False, error=str(error)
+            )
 
     async def handle_job_cancellation_complete(
         self,
@@ -298,7 +322,7 @@ class GateCancellationHandler:
             await self._logger.log(
                 ServerInfo(
                     message=f"Received job cancellation complete for {job_id[:8]}... "
-                            f"(success={completion.success}, errors={len(completion.errors)})",
+                    f"(success={completion.success}, errors={len(completion.errors)})",
                     node_host=self._get_host(),
                     node_port=self._get_tcp_port(),
                     node_id=self._get_node_id().short,
@@ -388,7 +412,7 @@ class GateCancellationHandler:
             await self._logger.log(
                 ServerInfo(
                     message=f"Received workflow cancellation request for {request.workflow_id[:8]}... "
-                            f"(job {request.job_id[:8]}...)",
+                    f"(job {request.job_id[:8]}...)",
                     node_host=self._get_host(),
                     node_port=self._get_tcp_port(),
                     node_id=self._get_node_id().short,
@@ -438,14 +462,33 @@ class GateCancellationHandler:
                         aggregated_dependents.extend(response.cancelled_dependents)
                         aggregated_errors.extend(response.errors)
 
-                        if response.status == WorkflowCancellationStatus.CANCELLED.value:
+                        if (
+                            response.status
+                            == WorkflowCancellationStatus.CANCELLED.value
+                        ):
                             final_status = WorkflowCancellationStatus.CANCELLED.value
-                        elif response.status == WorkflowCancellationStatus.PENDING_CANCELLED.value:
-                            if final_status == WorkflowCancellationStatus.NOT_FOUND.value:
-                                final_status = WorkflowCancellationStatus.PENDING_CANCELLED.value
-                        elif response.status == WorkflowCancellationStatus.ALREADY_CANCELLED.value:
-                            if final_status == WorkflowCancellationStatus.NOT_FOUND.value:
-                                final_status = WorkflowCancellationStatus.ALREADY_CANCELLED.value
+                        elif (
+                            response.status
+                            == WorkflowCancellationStatus.PENDING_CANCELLED.value
+                        ):
+                            if (
+                                final_status
+                                == WorkflowCancellationStatus.NOT_FOUND.value
+                            ):
+                                final_status = (
+                                    WorkflowCancellationStatus.PENDING_CANCELLED.value
+                                )
+                        elif (
+                            response.status
+                            == WorkflowCancellationStatus.ALREADY_CANCELLED.value
+                        ):
+                            if (
+                                final_status
+                                == WorkflowCancellationStatus.NOT_FOUND.value
+                            ):
+                                final_status = (
+                                    WorkflowCancellationStatus.ALREADY_CANCELLED.value
+                                )
 
                 except Exception as error:
                     aggregated_errors.append(f"DC {dc_name}: {error}")

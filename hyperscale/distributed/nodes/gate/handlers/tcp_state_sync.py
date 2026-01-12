@@ -267,7 +267,7 @@ class GateStateSyncHandler:
             if transfer.job_status:
                 self._job_manager.set_job(transfer.job_id, transfer.job_status)
 
-            self._state.increment_state_version()
+            await self._state.increment_state_version()
 
             self._task_runner.run(
                 self._logger.log,

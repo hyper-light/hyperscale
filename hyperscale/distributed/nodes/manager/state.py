@@ -150,49 +150,50 @@ class ManagerState:
         self._discovery_maintenance_task: asyncio.Task | None = None
 
     def initialize_locks(self) -> None:
-        """Initialize asyncio locks (must be called from async context)."""
         self._core_allocation_lock = asyncio.Lock()
         self._eager_dispatch_lock = asyncio.Lock()
+        self._counter_lock = asyncio.Lock()
+
+    def _get_counter_lock(self) -> asyncio.Lock:
+        if self._counter_lock is None:
+            self._counter_lock = asyncio.Lock()
+        return self._counter_lock
 
     def get_peer_state_lock(self, peer_addr: tuple[str, int]) -> asyncio.Lock:
-        """Get or create a lock for a specific peer address."""
         return self._peer_state_locks.setdefault(peer_addr, asyncio.Lock())
 
     def get_gate_state_lock(self, gate_id: str) -> asyncio.Lock:
-        """Get or create a lock for a specific gate node_id."""
         return self._gate_state_locks.setdefault(gate_id, asyncio.Lock())
 
     def get_workflow_cancellation_lock(self, workflow_id: str) -> asyncio.Lock:
-        """Get or create a lock for workflow cancellation."""
         return self._workflow_cancellation_locks.setdefault(workflow_id, asyncio.Lock())
 
     def get_dispatch_semaphore(
         self, worker_id: str, max_concurrent: int
     ) -> asyncio.Semaphore:
-        """Get or create a dispatch semaphore for a worker."""
         if worker_id not in self._dispatch_semaphores:
             self._dispatch_semaphores[worker_id] = asyncio.Semaphore(max_concurrent)
         return self._dispatch_semaphores[worker_id]
 
-    def increment_fence_token(self) -> int:
-        """Increment and return the fence token."""
-        self._fence_token += 1
-        return self._fence_token
+    async def increment_fence_token(self) -> int:
+        async with self._get_counter_lock():
+            self._fence_token += 1
+            return self._fence_token
 
-    def increment_state_version(self) -> int:
-        """Increment and return the state version."""
-        self._state_version += 1
-        return self._state_version
+    async def increment_state_version(self) -> int:
+        async with self._get_counter_lock():
+            self._state_version += 1
+            return self._state_version
 
-    def increment_external_incarnation(self) -> int:
-        """Increment and return the external incarnation."""
-        self._external_incarnation += 1
-        return self._external_incarnation
+    async def increment_external_incarnation(self) -> int:
+        async with self._get_counter_lock():
+            self._external_incarnation += 1
+            return self._external_incarnation
 
-    def increment_context_lamport_clock(self) -> int:
-        """Increment and return the context Lamport clock."""
-        self._context_lamport_clock += 1
-        return self._context_lamport_clock
+    async def increment_context_lamport_clock(self) -> int:
+        async with self._get_counter_lock():
+            self._context_lamport_clock += 1
+            return self._context_lamport_clock
 
     def get_active_peer_count(self) -> int:
         """Get count of active manager peers (including self)."""

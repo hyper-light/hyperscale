@@ -15,7 +15,11 @@ from hyperscale.distributed.models import (
     ProvisionConfirm,
     WorkerRegistration,
 )
-from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerDebug, ServerWarning
+from hyperscale.logging.hyperscale_logging_models import (
+    ServerInfo,
+    ServerDebug,
+    ServerWarning,
+)
 
 if TYPE_CHECKING:
     from hyperscale.distributed.nodes.manager.state import ManagerState
@@ -87,7 +91,7 @@ class ManagerDispatchCoordinator:
                     node_host=self._config.host,
                     node_port=self._config.tcp_port,
                     node_id=self._node_id,
-                )
+                ),
             )
             return None
 
@@ -100,8 +104,7 @@ class ManagerDispatchCoordinator:
         )
 
         async with semaphore:
-            # Increment fence token
-            fence_token = self._leases.increment_fence_token(job_id)
+            fence_token = await self._leases.increment_fence_token(job_id)
 
             # Build dispatch message
             dispatch = WorkflowDispatch(
@@ -133,7 +136,7 @@ class ManagerDispatchCoordinator:
                                 node_host=self._config.host,
                                 node_port=self._config.tcp_port,
                                 node_id=self._node_id,
-                            )
+                            ),
                         )
                         # Update throughput counter
                         self._state._dispatch_throughput_count += 1
@@ -147,7 +150,7 @@ class ManagerDispatchCoordinator:
                         node_host=self._config.host,
                         node_port=self._config.tcp_port,
                         node_id=self._node_id,
-                    )
+                    ),
                 )
                 # Record failure in circuit breaker
                 if circuit := self._state._worker_circuits.get(worker_id):
@@ -182,7 +185,7 @@ class ManagerDispatchCoordinator:
                     node_host=self._config.host,
                     node_port=self._config.tcp_port,
                     node_id=self._node_id,
-                )
+                ),
             )
         elif worker and worst_health == "busy":
             self._task_runner.run(
@@ -192,7 +195,7 @@ class ManagerDispatchCoordinator:
                     node_host=self._config.host,
                     node_port=self._config.tcp_port,
                     node_id=self._node_id,
-                )
+                ),
             )
 
         return worker
@@ -268,7 +271,10 @@ class ManagerDispatchCoordinator:
 
                 if response and not isinstance(response, Exception):
                     confirmation = ProvisionConfirm.load(response)
-                    if confirmation.confirmed and confirmation.workflow_id == workflow_id:
+                    if (
+                        confirmation.confirmed
+                        and confirmation.workflow_id == workflow_id
+                    ):
                         self._state._provision_confirmations[workflow_id].add(
                             confirmation.confirming_node
                         )
@@ -279,7 +285,7 @@ class ManagerDispatchCoordinator:
                                 node_host=self._config.host,
                                 node_port=self._config.tcp_port,
                                 node_id=self._node_id,
-                            )
+                            ),
                         )
 
             except Exception as provision_error:
@@ -290,7 +296,7 @@ class ManagerDispatchCoordinator:
                         node_host=self._config.host,
                         node_port=self._config.tcp_port,
                         node_id=self._node_id,
-                    )
+                    ),
                 )
 
         # Check quorum

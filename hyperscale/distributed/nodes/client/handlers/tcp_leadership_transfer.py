@@ -53,37 +53,54 @@ class GateLeaderTransferHandler:
         job_id = transfer.job_id
 
         if not self._leadership_manager:
-            return GateJobLeaderTransferAck(job_id=job_id, client_id=self._client_id(), accepted=True)
+            return GateJobLeaderTransferAck(
+                job_id=job_id, client_id=self._client_id(), accepted=True
+            )
 
         fence_valid, fence_reason = self._leadership_manager.validate_gate_fence_token(
             job_id, transfer.fence_token
         )
         if not fence_valid:
-            await self._logger.log(ServerInfo(
-                message=f"Rejected gate transfer for job {job_id[:8]}...: {fence_reason}",
-                node_host="client", node_port=0, node_id=self._short_id(),
-            ))
+            await self._logger.log(
+                ServerInfo(
+                    message=f"Rejected gate transfer for job {job_id[:8]}...: {fence_reason}",
+                    node_host="client",
+                    node_port=0,
+                    node_id=self._short_id(),
+                )
+            )
             return GateJobLeaderTransferAck(
-                job_id=job_id, client_id=self._client_id(),
-                accepted=False, rejection_reason=fence_reason,
+                job_id=job_id,
+                client_id=self._client_id(),
+                accepted=False,
+                rejection_reason=fence_reason,
             )
 
         self._leadership_manager.update_gate_leader(
-            job_id=job_id, gate_addr=transfer.new_gate_addr, fence_token=transfer.fence_token,
+            job_id=job_id,
+            gate_addr=transfer.new_gate_addr,
+            fence_token=transfer.fence_token,
         )
         self._state.mark_job_target(job_id, transfer.new_gate_addr)
 
-        await self._logger.log(ServerInfo(
-            message=f"Gate job leader transfer: job={job_id[:8]}..., "
-                    f"old={_addr_str(transfer.old_gate_addr)}, new={transfer.new_gate_addr}, "
-                    f"fence_token={transfer.fence_token}",
-            node_host="client", node_port=0, node_id=self._short_id(),
-        ))
-        return GateJobLeaderTransferAck(job_id=job_id, client_id=self._client_id(), accepted=True)
+        await self._logger.log(
+            ServerInfo(
+                message=f"Gate job leader transfer: job={job_id[:8]}..., "
+                f"old={_addr_str(transfer.old_gate_addr)}, new={transfer.new_gate_addr}, "
+                f"fence_token={transfer.fence_token}",
+                node_host="client",
+                node_port=0,
+                node_id=self._short_id(),
+            )
+        )
+        return GateJobLeaderTransferAck(
+            job_id=job_id, client_id=self._client_id(), accepted=True
+        )
 
-    async def handle(self, addr: tuple[str, int], data: bytes, clock_time: int) -> bytes:
-        """Process gate leadership transfer."""
-        self._state.increment_gate_transfers()
+    async def handle(
+        self, addr: tuple[str, int], data: bytes, clock_time: int
+    ) -> bytes:
+        await self._state.increment_gate_transfers()
 
         try:
             transfer = GateJobLeaderTransfer.load(data)
@@ -93,13 +110,19 @@ class GateLeaderTransferHandler:
             return ack.dump()
 
         except Exception as error:
-            await self._logger.log(ServerError(
-                message=f"Error processing gate transfer: {error}",
-                node_host="client", node_port=0, node_id=self._short_id(),
-            ))
+            await self._logger.log(
+                ServerError(
+                    message=f"Error processing gate transfer: {error}",
+                    node_host="client",
+                    node_port=0,
+                    node_id=self._short_id(),
+                )
+            )
             return GateJobLeaderTransferAck(
-                job_id="unknown", client_id=self._client_id(),
-                accepted=False, rejection_reason=str(error),
+                job_id="unknown",
+                client_id=self._client_id(),
+                accepted=False,
+                rejection_reason=str(error),
             ).dump()
 
 
@@ -138,42 +161,62 @@ class ManagerLeaderTransferHandler:
 
         if not self._leadership_manager:
             return ManagerJobLeaderTransferAck(
-                job_id=job_id, client_id=self._client_id(),
-                datacenter_id=datacenter_id, accepted=True,
+                job_id=job_id,
+                client_id=self._client_id(),
+                datacenter_id=datacenter_id,
+                accepted=True,
             )
 
-        fence_valid, fence_reason = self._leadership_manager.validate_manager_fence_token(
-            job_id, datacenter_id, transfer.fence_token
+        fence_valid, fence_reason = (
+            self._leadership_manager.validate_manager_fence_token(
+                job_id, datacenter_id, transfer.fence_token
+            )
         )
         if not fence_valid:
-            await self._logger.log(ServerInfo(
-                message=f"Rejected manager transfer for job {job_id[:8]}...: {fence_reason}",
-                node_host="client", node_port=0, node_id=self._short_id(),
-            ))
+            await self._logger.log(
+                ServerInfo(
+                    message=f"Rejected manager transfer for job {job_id[:8]}...: {fence_reason}",
+                    node_host="client",
+                    node_port=0,
+                    node_id=self._short_id(),
+                )
+            )
             return ManagerJobLeaderTransferAck(
-                job_id=job_id, client_id=self._client_id(),
-                datacenter_id=datacenter_id, accepted=False, rejection_reason=fence_reason,
+                job_id=job_id,
+                client_id=self._client_id(),
+                datacenter_id=datacenter_id,
+                accepted=False,
+                rejection_reason=fence_reason,
             )
 
         self._leadership_manager.update_manager_leader(
-            job_id=job_id, datacenter_id=datacenter_id,
-            manager_addr=transfer.new_manager_addr, fence_token=transfer.fence_token,
+            job_id=job_id,
+            datacenter_id=datacenter_id,
+            manager_addr=transfer.new_manager_addr,
+            fence_token=transfer.fence_token,
         )
 
-        await self._logger.log(ServerInfo(
-            message=f"Manager job leader transfer: job={job_id[:8]}..., dc={datacenter_id}, "
-                    f"old={_addr_str(transfer.old_manager_addr)}, new={transfer.new_manager_addr}, "
-                    f"fence_token={transfer.fence_token}",
-            node_host="client", node_port=0, node_id=self._short_id(),
-        ))
+        await self._logger.log(
+            ServerInfo(
+                message=f"Manager job leader transfer: job={job_id[:8]}..., dc={datacenter_id}, "
+                f"old={_addr_str(transfer.old_manager_addr)}, new={transfer.new_manager_addr}, "
+                f"fence_token={transfer.fence_token}",
+                node_host="client",
+                node_port=0,
+                node_id=self._short_id(),
+            )
+        )
         return ManagerJobLeaderTransferAck(
-            job_id=job_id, client_id=self._client_id(),
-            datacenter_id=datacenter_id, accepted=True,
+            job_id=job_id,
+            client_id=self._client_id(),
+            datacenter_id=datacenter_id,
+            accepted=True,
         )
 
-    async def handle(self, addr: tuple[str, int], data: bytes, clock_time: int) -> bytes:
-        """Process manager leadership transfer."""
-        self._state.increment_manager_transfers()
+    async def handle(
+        self, addr: tuple[str, int], data: bytes, clock_time: int
+    ) -> bytes:
+        await self._state.increment_manager_transfers()
 
         try:
             transfer = ManagerJobLeaderTransfer.load(data)
@@ -183,11 +226,18 @@ class ManagerLeaderTransferHandler:
             return ack.dump()
 
         except Exception as error:
-            await self._logger.log(ServerError(
-                message=f"Error processing manager transfer: {error}",
-                node_host="client", node_port=0, node_id=self._short_id(),
-            ))
+            await self._logger.log(
+                ServerError(
+                    message=f"Error processing manager transfer: {error}",
+                    node_host="client",
+                    node_port=0,
+                    node_id=self._short_id(),
+                )
+            )
             return ManagerJobLeaderTransferAck(
-                job_id="unknown", client_id=self._client_id(),
-                datacenter_id="", accepted=False, rejection_reason=str(error),
+                job_id="unknown",
+                client_id=self._client_id(),
+                datacenter_id="",
+                accepted=False,
+                rejection_reason=str(error),
             ).dump()
