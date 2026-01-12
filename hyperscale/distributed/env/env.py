@@ -1013,6 +1013,23 @@ class Env(BaseModel):
             backoff_multiplier=self.RATE_LIMIT_BACKOFF_MULTIPLIER,
         )
 
+    def get_reliability_config(self):
+        """Get retry budget and best-effort configuration (AD-44)."""
+        from hyperscale.distributed.reliability.reliability_config import (
+            ReliabilityConfig,
+        )
+
+        return ReliabilityConfig(
+            retry_budget_max=self.RETRY_BUDGET_MAX,
+            retry_budget_per_workflow_max=self.RETRY_BUDGET_PER_WORKFLOW_MAX,
+            retry_budget_default=self.RETRY_BUDGET_DEFAULT,
+            retry_budget_per_workflow_default=self.RETRY_BUDGET_PER_WORKFLOW_DEFAULT,
+            best_effort_deadline_max=self.BEST_EFFORT_DEADLINE_MAX,
+            best_effort_deadline_default=self.BEST_EFFORT_DEADLINE_DEFAULT,
+            best_effort_min_dcs_default=self.BEST_EFFORT_MIN_DCS_DEFAULT,
+            best_effort_deadline_check_interval=self.BEST_EFFORT_DEADLINE_CHECK_INTERVAL,
+        )
+
     def get_worker_health_manager_config(self):
         """
         Get worker health manager configuration (AD-26).
