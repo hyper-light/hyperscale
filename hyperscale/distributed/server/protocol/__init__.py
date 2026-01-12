@@ -23,7 +23,7 @@ from .drop_counter import (
     DropCounterSnapshot as DropCounterSnapshot,
 )
 from .in_flight_tracker import (
-    InFlightTracker as InFlightTracker,
+    ProtocolInFlightTracker as ProtocolInFlightTracker,
     MessagePriority as MessagePriority,
     PriorityLimits as PriorityLimits,
 )
