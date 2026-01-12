@@ -649,6 +649,22 @@ class WorkerServer(HealthAwareServer):
         )
         self._lifecycle_manager.add_background_task(self._overload_poll_task)
 
+        self._resource_sample_task = self._create_background_task(
+            self._run_resource_sample_loop(),
+            "resource_sample",
+        )
+        self._lifecycle_manager.add_background_task(self._resource_sample_task)
+
+    async def _run_resource_sample_loop(self) -> None:
+        while self._running:
+            try:
+                await self._resource_monitor.sample()
+                await asyncio.sleep(1.0)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                await asyncio.sleep(1.0)
+
     async def _stop_background_loops(self) -> None:
         """Stop all background loops."""
         await self._lifecycle_manager.cancel_background_tasks()
