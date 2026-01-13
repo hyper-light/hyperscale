@@ -650,7 +650,7 @@ class TestEdgeCases:
             task_runner=MockTaskRunner(),
             job_manager=job_manager,
             job_router=None,
-            check_rate_limit=lambda client_id, op: (True, 0),
+            check_rate_limit=make_async_rate_limiter(allowed=True, retry_after=0),
             should_shed_request=lambda req_type: False,
             has_quorum_available=lambda: True,
             quorum_size=lambda: 3,
@@ -683,7 +683,7 @@ class TestEdgeCases:
             task_runner=MockTaskRunner(),
             job_manager=job_manager,
             job_router=None,
-            check_rate_limit=lambda client_id, op: (True, 0),
+            check_rate_limit=make_async_rate_limiter(allowed=True, retry_after=0),
             should_shed_request=lambda req_type: False,
             has_quorum_available=lambda: True,
             quorum_size=lambda: 3,
@@ -702,7 +702,8 @@ class TestEdgeCases:
         assert ack.accepted is True
         assert len(job_manager.target_dcs.get("job-123", set())) == 50
 
-    def test_special_characters_in_client_id(self):
+    @pytest.mark.asyncio
+    async def test_special_characters_in_client_id(self):
         """Handles special characters in client ID."""
         state = GateRuntimeState()
 
@@ -712,7 +713,7 @@ class TestEdgeCases:
             task_runner=MockTaskRunner(),
             job_manager=MockGateJobManager(),
             job_router=None,
-            check_rate_limit=lambda client_id, op: (True, 0),
+            check_rate_limit=make_async_rate_limiter(allowed=True, retry_after=0),
             should_shed_request=lambda req_type: False,
             has_quorum_available=lambda: True,
             quorum_size=lambda: 3,
