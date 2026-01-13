@@ -158,14 +158,15 @@ class TestGatePeerMethods:
         peer_addr = ("10.0.0.1", 9000)
 
         await state.add_active_peer(peer_addr)
-        state.remove_active_peer(peer_addr)
+        await state.remove_active_peer(peer_addr)
 
         assert peer_addr not in state._active_gate_peers
 
-    def test_remove_nonexistent_peer_is_safe(self):
+    @pytest.mark.asyncio
+    async def test_remove_nonexistent_peer_is_safe(self):
         """Remove nonexistent peer doesn't raise."""
         state = GateRuntimeState()
-        state.remove_active_peer(("unknown", 9999))  # Should not raise
+        await state.remove_active_peer(("unknown", 9999))  # Should not raise
 
     @pytest.mark.asyncio
     async def test_is_peer_active(self):
@@ -178,7 +179,7 @@ class TestGatePeerMethods:
         await state.add_active_peer(peer_addr)
         assert state.is_peer_active(peer_addr) is True
 
-        state.remove_active_peer(peer_addr)
+        await state.remove_active_peer(peer_addr)
         assert state.is_peer_active(peer_addr) is False
 
     @pytest.mark.asyncio
@@ -194,7 +195,7 @@ class TestGatePeerMethods:
         await state.add_active_peer(("10.0.0.2", 9000))
         assert state.get_active_peer_count() == 2
 
-        state.remove_active_peer(("10.0.0.1", 9000))
+        await state.remove_active_peer(("10.0.0.1", 9000))
         assert state.get_active_peer_count() == 1
 
 
