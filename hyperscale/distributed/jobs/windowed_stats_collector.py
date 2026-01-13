@@ -417,14 +417,10 @@ class WindowedStatsCollector:
         return results
 
     async def record(self, worker_id: str, progress: WorkflowProgress) -> None:
-        """
-        Record a workflow progress update.
-
-        Convenience method that wraps add_progress() for use by manager
-        servers that have already resolved the worker_id from the connection.
-
-        Args:
-            worker_id: Unique identifier for the worker sending this update.
-            progress: The workflow progress update.
-        """
         await self.add_progress(worker_id, progress)
+
+    def get_metrics(self) -> WindowedStatsMetrics:
+        return self._metrics
+
+    def reset_metrics(self) -> None:
+        self._metrics = WindowedStatsMetrics()

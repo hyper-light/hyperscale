@@ -1052,6 +1052,41 @@ class GateServer(HealthAwareServer):
         )
 
     # =========================================================================
+    # UDP Cross-Cluster Overrides
+    # =========================================================================
+
+    async def _handle_xack_response(
+        self,
+        source_addr: tuple[str, int] | bytes,
+        ack_data: bytes,
+    ) -> None:
+        """
+        Handle a cross-cluster health acknowledgment (xack) from a DC leader.
+
+        Passes the ack to the FederatedHealthMonitor for processing,
+        which updates DC health state and invokes latency callbacks.
+
+        Args:
+            source_addr: The source UDP address of the ack (DC leader)
+            ack_data: The serialized CrossClusterAck message
+        """
+        try:
+            ack = CrossClusterAck.load(ack_data)
+            self._dc_health_monitor.handle_ack(ack)
+
+            # Update DC leader info if this is from a leader
+            if ack.is_leader and isinstance(source_addr, tuple):
+                self._dc_health_monitor.update_leader(
+                    datacenter=ack.datacenter,
+                    leader_udp_addr=source_addr,
+                    leader_node_id=ack.node_id,
+                    leader_term=ack.leader_term,
+                )
+
+        except Exception as error:
+            await self.handle_exception(error, "_handle_xack_response")
+
+    # =========================================================================
     # TCP Handlers - Delegating to Handler Classes
     # =========================================================================
 

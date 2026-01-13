@@ -164,7 +164,7 @@ class TestGatePeerStateConcurrency:
         execution_order = []
 
         async def task(task_id: int, delay: float):
-            lock = state.get_or_create_peer_lock(peer_addr)
+            lock = await state.get_or_create_peer_lock(peer_addr)
             async with lock:
                 execution_order.append(f"start-{task_id}")
                 await asyncio.sleep(delay)
@@ -175,7 +175,6 @@ class TestGatePeerStateConcurrency:
             task(2, 0.01),
         )
 
-        # Should be serialized - one starts and ends before next
         assert execution_order[1] == "end-1" or execution_order[1] == "end-2"
 
     @pytest.mark.asyncio
@@ -185,15 +184,14 @@ class TestGatePeerStateConcurrency:
         peer1 = ("10.0.0.1", 9001)
         peer2 = ("10.0.0.2", 9001)
 
-        lock1 = state.get_or_create_peer_lock(peer1)
-        lock2 = state.get_or_create_peer_lock(peer2)
+        lock1 = await state.get_or_create_peer_lock(peer1)
+        lock2 = await state.get_or_create_peer_lock(peer2)
 
         assert lock1 is not lock2
 
-        # Both can be acquired simultaneously
         async with lock1:
             async with lock2:
-                pass  # Both held at same time
+                pass
 
     @pytest.mark.asyncio
     async def test_rapid_epoch_increments(self):
@@ -204,15 +202,12 @@ class TestGatePeerStateConcurrency:
 
         async def increment():
             for _ in range(100):
-                epoch = state.increment_epoch(peer_addr)
+                epoch = await state.increment_epoch(peer_addr)
                 epochs.append(epoch)
 
         await asyncio.gather(increment(), increment())
 
-        # All epochs should be unique (no duplicates)
-        # Note: Without locking, there might be duplicates
-        # This tests the actual behavior
-        assert state.get_epoch(peer_addr) > 0
+        assert await state.get_epoch(peer_addr) > 0
 
 
 class TestGatePeerStateEdgeCases:
