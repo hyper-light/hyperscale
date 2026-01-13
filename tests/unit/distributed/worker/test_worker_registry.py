@@ -417,14 +417,14 @@ class TestWorkerRegistryCircuitBreakers:
 
         assert "error" in status
 
-    def test_get_circuit_status_summary(self):
-        """Test getting circuit status summary."""
+    @pytest.mark.asyncio
+    async def test_get_circuit_status_summary(self):
         logger = MagicMock()
         registry = WorkerRegistry(logger)
 
         registry.get_or_create_circuit("mgr-1")
         registry.get_or_create_circuit("mgr-2")
-        registry.mark_manager_healthy("mgr-1")
+        await registry.mark_manager_healthy("mgr-1")
 
         status = registry.get_circuit_status()
 
