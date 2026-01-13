@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     from hyperscale.distributed.jobs.timeout_strategy import TimeoutStrategy
     from hyperscale.distributed.workflow import WorkflowStateMachine
     from hyperscale.reporting.common.results_types import WorkflowStats
+    from hyperscale.distributed.slo import LatencyObservation
 
 
 class ManagerState:
@@ -351,7 +352,6 @@ class ManagerState:
 
     def get_workflow_latency_observation(self) -> "LatencyObservation | None":
         """Get aggregated workflow latency observation for SLO reporting."""
-        from hyperscale.distributed.slo import LatencyObservation
 
         return self._workflow_latency_digest.get_recent_observation(
             target_id="workflows"

@@ -2718,7 +2718,7 @@ class EagerWorkflowEntry:
     workflow_idx: int  # Index in job's workflow list
     workflow: Any  # The workflow instance
     vus: int  # Virtual users for this workflow
-    priority: "StagePriority"  # Workflow priority
+    priority: Any  # Workflow priority (StagePriority enum)
     is_test: bool  # Whether this is a test workflow
     dependencies: set[str]  # Set of workflow names this depends on
     completed_dependencies: set[str] = field(
