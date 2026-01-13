@@ -557,8 +557,112 @@ total = sum(item.value for item in items if item.active)
 ### Output
 
 - No nested conditionals beyond 2 levels
-- Cyclomatic complexity ≤ 6 per method
+- Cyclomatic complexity ≤ 4 per method
 - Minimal lines of code for each fix
+
+---
+
+## Phase 5.7: Post-Refactor Integrity Verification
+
+**Objective**: Catch broken code introduced during refactoring before it's committed.
+
+### The Problem
+
+Refactoring (especially method extraction) commonly introduces:
+
+1. **Orphaned variable references**: Variables from the original scope don't exist in extracted methods
+2. **Non-existent method calls**: Calling methods that were assumed to exist or were misnamed
+3. **Missing imports**: Types used in new method signatures not imported
+4. **Scope confusion**: Using `self.X` when X was a local variable, or vice versa
+
+```python
+# ORIGINAL (before refactor):
+async def _handle_completion(self, job_id: str):
+    job = self._job_manager.get_job(job_id)
+    if job:
+        await process(job)
+        await self._job_manager.remove_job(job.token)
+
+# BROKEN REFACTOR:
+async def _handle_completion(self, job_id: str):
+    job = self._job_manager.get_job(job_id)
+    if job:
+        await process(job)
+        await self._cleanup(job_id)
+
+async def _cleanup(self, job_id: str):
+    await self._job_manager.remove_job(job.token)  # BUG: 'job' not in scope!
+    await self._job_manager.remove_job_by_id(job_id)  # BUG: method doesn't exist!
+```
+
+### Step 5.7a: MANDATORY LSP Check After Every Refactor
+
+**After ANY method extraction or signature change:**
+
+```bash
+lsp_diagnostics(file="server.py", severity="error")
+```
+
+**This is NON-NEGOTIABLE.** Do not proceed until LSP returns zero errors for the modified file.
+
+### Step 5.7b: Variable Scope Audit
+
+When extracting a method, audit ALL variables used in the extracted code:
+
+| Variable | Source in Original | Available in Extracted? | Fix |
+|----------|-------------------|------------------------|-----|
+| `job` | Local variable | NO | Pass as parameter or re-fetch |
+| `job_id` | Parameter | YES (passed) | OK |
+| `self._manager` | Instance | YES | OK |
+
+**For each variable not available**: Either pass it as a parameter or re-acquire it in the new method.
+
+### Step 5.7c: Method Existence Verification
+
+For every method call in refactored code, verify the method exists:
+
+```bash
+# For each method call like self._foo.bar()
+grep -n "def bar" <component_file>.py
+```
+
+**Common mistakes:**
+- Assuming `remove_job_by_id` exists when only `remove_job(token)` exists
+- Calling `get_job(job_id)` when signature is `get_job(token)`
+- Using wrong component (`self._manager` vs `self._job_manager`)
+
+### Step 5.7d: Parameter Flow Tracing
+
+When a method is extracted, trace all data flow:
+
+```
+Original: _handle_completion(job_id) 
+  └─> job = get_job(job_id)
+  └─> uses job.token, job.status, job.workflows
+
+Extracted: _cleanup(job_id)
+  └─> needs to remove job
+  └─> HOW? job.token not available!
+  └─> FIX: create token from job_id, or pass job as parameter
+```
+
+### Step 5.7e: Integration Verification
+
+After refactoring, verify the calling code still works:
+
+1. **Check the call site** passes all required parameters
+2. **Check return values** are handled correctly
+3. **Check async/await** is preserved (async method must be awaited)
+
+### Refactor Checklist (MANDATORY before proceeding)
+
+- [ ] LSP diagnostics return ZERO errors on modified file
+- [ ] All variables in extracted methods are either parameters or instance attributes
+- [ ] All method calls reference methods that actually exist
+- [ ] All imports needed by new type hints are present
+- [ ] Calling code passes correct parameters to extracted methods
+
+**BLOCKING**: Do not commit refactored code until this checklist passes.
 
 ---
 
