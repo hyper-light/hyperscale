@@ -59,6 +59,8 @@ class WorkerState:
         self._workflow_fence_tokens: dict[str, int] = {}
         self._workflow_cores_completed: dict[str, set[int]] = {}
         self._pending_workflows: list = []
+        self._workflow_start_times: dict[str, float] = {}
+        self._workflow_timeout_seconds: dict[str, float] = {}
 
         # Progress buffering
         self._progress_buffer: dict[str, WorkflowProgress] = {}
