@@ -74,24 +74,26 @@ class TestWorkerStateInitialization:
 class TestWorkerStateVersionManagement:
     """Test state version management."""
 
-    def test_increment_version(self):
+    @pytest.mark.asyncio
+    async def test_increment_version(self):
         """Test version increment."""
         allocator = MockCoreAllocator()
         state = WorkerState(allocator)
 
         assert state.state_version == 0
 
-        new_version = state.increment_version()
+        new_version = await state.increment_version()
         assert new_version == 1
         assert state.state_version == 1
 
-    def test_multiple_version_increments(self):
+    @pytest.mark.asyncio
+    async def test_multiple_version_increments(self):
         """Test multiple version increments."""
         allocator = MockCoreAllocator()
         state = WorkerState(allocator)
 
         for i in range(10):
-            version = state.increment_version()
+            version = await state.increment_version()
             assert version == i + 1
 
 
@@ -739,9 +741,7 @@ class TestWorkerStateConcurrency:
             state.add_active_workflow(workflow_id, progress, ("h", 1))
             await asyncio.sleep(0.001)
 
-        await asyncio.gather(*[
-            add_workflow(f"wf-{i}") for i in range(10)
-        ])
+        await asyncio.gather(*[add_workflow(f"wf-{i}") for i in range(10)])
 
         assert len(state._active_workflows) == 10
 
