@@ -888,7 +888,7 @@ class ManagerServer(HealthAwareServer):
             return
 
         # Check if gate
-        gate_tcp_addr = self._manager_state._gate_udp_to_tcp.get(node_addr)
+        gate_tcp_addr = self._manager_state.get_gate_tcp_from_udp(node_addr)
         if gate_tcp_addr:
             self._task_runner.run(
                 self._handle_gate_peer_failure, node_addr, gate_tcp_addr
@@ -899,20 +899,21 @@ class ManagerServer(HealthAwareServer):
         # Check if worker
         worker_id = self._manager_state.get_worker_id_from_addr(node_addr)
         if worker_id:
-            self._manager_state._worker_unhealthy_since.pop(worker_id, None)
+            self._manager_state.clear_worker_unhealthy_since(worker_id)
             return
 
         # Check if manager peer
-        manager_tcp_addr = self._manager_state._manager_udp_to_tcp.get(node_addr)
+        manager_tcp_addr = self._manager_state.get_manager_tcp_from_udp(node_addr)
         if manager_tcp_addr:
-            self._manager_state._dead_managers.discard(manager_tcp_addr)
+            dead_managers = self._manager_state.get_dead_managers()
+            dead_managers.discard(manager_tcp_addr)
             self._task_runner.run(
                 self._handle_manager_peer_recovery, node_addr, manager_tcp_addr
             )
             return
 
         # Check if gate
-        gate_tcp_addr = self._manager_state._gate_udp_to_tcp.get(node_addr)
+        gate_tcp_addr = self._manager_state.get_gate_tcp_from_udp(node_addr)
         if gate_tcp_addr:
             self._task_runner.run(
                 self._handle_gate_peer_recovery, node_addr, gate_tcp_addr
