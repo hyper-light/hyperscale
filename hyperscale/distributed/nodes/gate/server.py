@@ -1854,7 +1854,7 @@ class GateServer(HealthAwareServer):
 
     def _get_peer_state_lock(self, peer_addr: tuple[str, int]) -> asyncio.Lock:
         """Get or create lock for a peer."""
-        return self._peer_state_locks.setdefault(peer_addr, asyncio.Lock())
+        return self._modular_state.get_or_create_peer_lock_sync(peer_addr)
 
     def _on_peer_confirmed(self, peer: tuple[str, int]) -> None:
         """Handle peer confirmation via SWIM (AD-29)."""
@@ -2237,12 +2237,12 @@ class GateServer(HealthAwareServer):
         """Check if quorum is available."""
         if self._gate_state != GateState.ACTIVE:
             return False
-        active_count = len(self._active_gate_peers) + 1
+        active_count = self._modular_state.get_active_peer_count() + 1
         return active_count >= self._quorum_size()
 
     def _quorum_size(self) -> int:
         """Calculate quorum size."""
-        total_gates = len(self._active_gate_peers) + 1
+        total_gates = self._modular_state.get_active_peer_count() + 1
         return (total_gates // 2) + 1
 
     def _get_healthy_gates(self) -> list[GateInfo]:
@@ -2260,10 +2260,10 @@ class GateServer(HealthAwareServer):
             )
         ]
 
-        for peer_addr in self._active_gate_peers:
-            for udp_addr, tcp_addr in self._gate_udp_to_tcp.items():
+        for peer_addr in self._modular_state.get_active_peers():
+            for udp_addr, tcp_addr in self._modular_state.iter_udp_to_tcp_mappings():
                 if tcp_addr == peer_addr:
-                    heartbeat = self._gate_peer_info.get(udp_addr)
+                    heartbeat = self._modular_state.get_gate_peer_heartbeat(udp_addr)
                     if heartbeat:
                         gates.append(
                             GateInfo(
