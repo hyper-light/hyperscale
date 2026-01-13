@@ -1905,6 +1905,189 @@ Add to Phase 3 scanner:
 2. Method reference = `self.X` where X is lowercase and NOT followed by `(`
 3. Verify all referenced methods exist on class or base classes
 
+### Step 3.5h.6: Nested/Chained Self Reference Validation (MANDATORY - CRITICAL)
+
+**STATUS: MANDATORY** - This step MUST be executed. Chained attribute/method access on self can fail at any level of the chain.
+
+**The Problem:**
+
+Scanners often check `self.attr` or `self.method()` but miss **chained access** patterns where intermediate or final attributes don't exist:
+
+```python
+# Pattern 1: Chained method call - method doesn't exist on component
+result = self._coordinator.get_active_peers()  # BUG: get_active_peers doesn't exist on coordinator
+
+# Pattern 2: Chained attribute access - intermediate attribute missing
+value = self._state._internal_cache.get(key)  # BUG: _internal_cache doesn't exist on state
+
+# Pattern 3: Chained callback reference (combines with 3.5h.5)
+handler.register(
+    callback=self._registry.on_peer_update,  # BUG: on_peer_update doesn't exist on registry
+)
+
+# Pattern 4: Deep chain with method call
+await self._health._monitor._detector.check()  # Any level could be missing
+
+# Pattern 5: Chained access in comprehension/lambda
+peers = [self._registry.get_peer_info(p) for p in ids]  # BUG if get_peer_info doesn't exist
+```
+
+**Why This Is Different from 3.5h.1 (Chained Attribute Access):**
+
+Phase 3.5h.1 checks chained access on **data attributes** (e.g., `job.status.value`).
+This phase checks chained access on **self** where intermediate objects are **components** whose methods/attributes need verification.
+
+**Detection Script:**
+
+```python
+import ast
+import re
+from pathlib import Path
+
+def find_chained_self_access(file_path: str) -> list[tuple[int, str, list[str]]]:
+    """
+    Find self._component.attr or self._component.method() patterns.
+    
+    Returns: [(line, full_chain, [chain_parts])]
+    """
+    with open(file_path) as f:
+        source = f.read()
+        tree = ast.parse(source)
+        lines = source.split('\n')
+    
+    chains = []
+    
+    class ChainVisitor(ast.NodeVisitor):
+        def visit_Attribute(self, node):
+            chain = []
+            current = node
+            
+            # Walk up the chain
+            while isinstance(current, ast.Attribute):
+                chain.insert(0, current.attr)
+                current = current.value
+            
+            # Check if chain starts with self
+            if isinstance(current, ast.Name) and current.id == 'self':
+                if len(chain) >= 2:  # self._x.y or deeper
+                    chains.append((node.lineno, chain))
+            
+            self.generic_visit(node)
+    
+    ChainVisitor().visit(tree)
+    
+    # Format results
+    results = []
+    for line_num, chain in chains:
+        full_chain = "self." + ".".join(chain)
+        context = lines[line_num - 1].strip()[:70]
+        results.append((line_num, full_chain, chain, context))
+    
+    return results
+
+def validate_chain(chain: list[str], component_registry: dict[str, set[str]]) -> str | None:
+    """
+    Validate each link in the chain exists.
+    
+    Args:
+        chain: ['_coordinator', 'get_active_peers'] 
+        component_registry: {'_coordinator': {'method1', 'method2', ...}}
+    
+    Returns: Error message if invalid, None if valid
+    """
+    if not chain:
+        return None
+    
+    component = chain[0]
+    if component not in component_registry:
+        return f"Unknown component: self.{component}"
+    
+    if len(chain) > 1:
+        attr_or_method = chain[1]
+        if attr_or_method not in component_registry[component]:
+            return f"self.{component}.{attr_or_method} does not exist"
+    
+    return None
+```
+
+**Quick Detection Command:**
+
+```bash
+# Find all self._component.something patterns
+grep -noE "self\._[a-z_]+\.[a-z_]+[(\[]?" server.py | head -50
+
+# Find method calls on components
+grep -nE "self\._[a-z_]+\.[a-z_]+\(" server.py | head -50
+
+# Find attribute access on components (not calls)
+grep -nE "self\._[a-z_]+\.[a-z_]+[^(]" server.py | grep -v "def \|#" | head -50
+```
+
+**Validation Process:**
+
+For each chained access `self._component.attr_or_method`:
+
+1. **Identify the component class**: What type is `self._component`?
+2. **Check the component class**: Does `attr_or_method` exist on that class?
+3. **If method call**: Verify method exists and signature matches usage
+4. **If attribute**: Verify attribute exists on component
+
+**Building the Component Registry:**
+
+```python
+# Build registry mapping component names to their classes
+component_types = {
+    '_state': WorkerState,
+    '_registry': WorkerRegistry,
+    '_executor': WorkerExecutor,
+    '_coordinator': WorkerCoordinator,
+    # ... etc
+}
+
+# Extract methods/attributes from each class
+component_registry = {}
+for comp_name, comp_class in component_types.items():
+    members = set(dir(comp_class))  # All attributes and methods
+    component_registry[comp_name] = members
+
+# Now validate chains
+for line, full_chain, chain, context in find_chained_self_access("server.py"):
+    if error := validate_chain(chain, component_registry):
+        print(f"Line {line}: {error} in: {context}")
+```
+
+**Example Violations:**
+
+```
+Line 234: self._registry.get_peer_info does not exist in: peers = [self._registry.get_peer_info(p) for p in ids]
+Line 567: self._state._internal_cache does not exist in: value = self._state._internal_cache.get(key)
+Line 891: self._coordinator.notify_peers does not exist in: callback=self._coordinator.notify_peers,
+```
+
+**Fix Patterns:**
+
+| Issue | Root Cause | Fix |
+|-------|------------|-----|
+| Method doesn't exist on component | Wrong method name | Fix to correct method name |
+| Attribute doesn't exist on component | Direct state access | Add accessor method to component |
+| Wrong component | Refactor confusion | Use correct component |
+| Method was moved/renamed | Incomplete refactor | Update all call sites |
+
+**Integration with INSTANCE_TYPE_MAPPINGS:**
+
+Use the same type mappings from Phase 3.5h.2 to resolve component types:
+
+```python
+INSTANCE_TYPE_MAPPINGS = {
+    '_state': 'WorkerState',
+    '_registry': 'WorkerRegistry', 
+    '_executor': 'WorkerExecutor',
+    # ... populated from __init__ analysis
+}
+```
+
+Then for each `self._component.X`, look up the component type and verify `X` exists on that class.
+
 ### Step 3.5i: Integration with CI/Build
 
 **Pre-commit Hook:**
