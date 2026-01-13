@@ -1387,7 +1387,9 @@ class ManagerServer(HealthAwareServer):
 
                         # Parse response and compare with our tracking
                         query_response = WorkflowQueryResponse.load(response)
-                        worker_workflow_ids = set(query_response.workflow_ids or [])
+                        worker_workflow_ids = {
+                            wf.workflow_id for wf in query_response.workflows
+                        }
 
                         manager_tracked_ids: set[str] = set()
                         for job in self._job_manager.iter_jobs():
@@ -1616,17 +1618,18 @@ class ManagerServer(HealthAwareServer):
                 jobs_cleaned = 0
 
                 for job in list(self._job_manager.iter_jobs()):
-                    if job.status in (
+                    is_terminal = job.status in (
                         JobStatus.COMPLETED.value,
                         JobStatus.FAILED.value,
                         JobStatus.CANCELLED.value,
-                    ):
-                        if (
-                            job.completed_at
-                            and (current_time - job.completed_at) > retention_seconds
-                        ):
-                            self._cleanup_job(job.job_id)
-                            jobs_cleaned += 1
+                    )
+                    # Use timestamp as proxy for completion time (updated when status changes)
+                    time_since_completion = (
+                        current_time - job.timestamp if job.timestamp > 0 else 0
+                    )
+                    if is_terminal and time_since_completion > retention_seconds:
+                        self._cleanup_job(job.job_id)
+                        jobs_cleaned += 1
 
                 if jobs_cleaned > 0:
                     await self._udp_logger.log(
