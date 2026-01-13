@@ -1318,40 +1318,42 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         Returns:
             The message with embedded state and piggyback removed.
         """
-        # Track boundaries to avoid repeated slicing until the end
-        # msg_end marks where the core message ends (before any piggyback)
         msg_end = len(message)
         vivaldi_piggyback: bytes | None = None
+        worker_state_piggyback: bytes | None = None
         health_piggyback: bytes | None = None
         membership_piggyback: bytes | None = None
 
-        # Step 1: Find Vivaldi coordinate piggyback (#|v...) - AD-35 Task 12.2.3
-        # Vivaldi is always appended last, so strip first
         vivaldi_idx = message.find(b"#|v")
         if vivaldi_idx > 0:
-            vivaldi_piggyback = message[vivaldi_idx + 3 :]  # Skip '#|v' separator
+            vivaldi_piggyback = message[vivaldi_idx + 3 :]
             msg_end = vivaldi_idx
 
-        # Step 2: Find health gossip piggyback (#|h...)
-        # Health is added second to last, strip second
+        worker_state_idx = message.find(self._WORKER_STATE_SEPARATOR, 0, msg_end)
+        if worker_state_idx > 0:
+            worker_state_piggyback = message[worker_state_idx:msg_end]
+            msg_end = worker_state_idx
+
         health_idx = message.find(self._HEALTH_SEPARATOR, 0, msg_end)
         if health_idx > 0:
-            health_piggyback = message[health_idx:]
+            health_piggyback = message[health_idx:msg_end]
             msg_end = health_idx
 
-        # Step 3: Find membership piggyback (#|m...) in the remaining portion
         membership_idx = message.find(self._MEMBERSHIP_SEPARATOR, 0, msg_end)
         if membership_idx > 0:
             membership_piggyback = message[membership_idx:msg_end]
             msg_end = membership_idx
 
-        # Step 4: Find message structure in core message only
-        # Format: msg_type>host:port#|sbase64_state
         addr_sep_idx = message.find(b">", 0, msg_end)
         if addr_sep_idx < 0:
-            # No address separator - process piggyback and return
             if vivaldi_piggyback:
                 self._process_vivaldi_piggyback(vivaldi_piggyback, source_addr)
+            if worker_state_piggyback:
+                self._task_runner.run(
+                    self._process_worker_state_piggyback,
+                    worker_state_piggyback,
+                    source_addr,
+                )
             if health_piggyback:
                 self._health_gossip_buffer.decode_and_process_piggyback(
                     health_piggyback
@@ -1360,12 +1362,16 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                 self._task_runner.run(self.process_piggyback_data, membership_piggyback)
             return message[:msg_end] if msg_end < len(message) else message
 
-        # Find state separator after '>' but before piggyback
         state_sep_idx = message.find(self._STATE_SEPARATOR, addr_sep_idx, msg_end)
 
-        # Process piggyback data (can happen in parallel with state processing)
         if vivaldi_piggyback:
             self._process_vivaldi_piggyback(vivaldi_piggyback, source_addr)
+        if worker_state_piggyback:
+            self._task_runner.run(
+                self._process_worker_state_piggyback,
+                worker_state_piggyback,
+                source_addr,
+            )
         if health_piggyback:
             self._health_gossip_buffer.decode_and_process_piggyback(health_piggyback)
         if membership_piggyback:
