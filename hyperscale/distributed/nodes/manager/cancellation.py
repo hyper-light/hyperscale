@@ -6,7 +6,7 @@ Handles AD-20 compliant job and workflow cancellation coordination.
 
 import asyncio
 import time
-from typing import TYPE_CHECKING
+from typing import Any, Callable, Coroutine, TYPE_CHECKING
 
 from hyperscale.distributed.models import (
     JobCancelRequest,
@@ -22,7 +22,11 @@ from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerWarni
 if TYPE_CHECKING:
     from hyperscale.distributed.nodes.manager.state import ManagerState
     from hyperscale.distributed.nodes.manager.config import ManagerConfig
+    from hyperscale.distributed.taskex import TaskRunner
     from hyperscale.logging import Logger
+
+# Type alias for send functions
+SendFunc = Callable[..., Coroutine[Any, Any, tuple[bytes, float] | None]]
 
 
 class ManagerCancellationCoordinator:
@@ -110,7 +114,7 @@ class ManagerCancellationCoordinator:
                 node_host=self._config.host,
                 node_port=self._config.tcp_port,
                 node_id=self._node_id,
-            )
+            ),
         )
 
         return JobCancelResponse(
@@ -177,7 +181,7 @@ class ManagerCancellationCoordinator:
                 node_host=self._config.host,
                 node_port=self._config.tcp_port,
                 node_id=self._node_id,
-            )
+            ),
         )
 
         # Check if all workflows are cancelled
@@ -223,7 +227,7 @@ class ManagerCancellationCoordinator:
                         node_host=self._config.host,
                         node_port=self._config.tcp_port,
                         node_id=self._node_id,
-                    )
+                    ),
                 )
 
         # Cleanup tracking
