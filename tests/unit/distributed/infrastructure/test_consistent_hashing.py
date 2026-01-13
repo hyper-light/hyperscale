@@ -4,10 +4,7 @@ Test: Consistent Hashing Ring
 This test validates the ConsistentHashRing implementation:
 1. Deterministic assignment: same key always maps to same node
 2. Minimal redistribution: node changes affect minimal keys
-3. Backup assignment: backup is different from primary
-4. Even distribution: keys are balanced across nodes
-
-Run with: pytest tests/unit/distributed/infrastructure/test_consistent_hashing.py
+3. Even distribution: keys are balanced across nodes
 """
 
 import asyncio
@@ -17,11 +14,10 @@ import string
 
 import pytest
 
-from hyperscale.distributed.routing import ConsistentHashRing
+from hyperscale.distributed.jobs.gates import ConsistentHashRing
 
 
 def generate_job_ids(count: int) -> list[str]:
-    """Generate random job IDs for testing."""
     return [
         f"job-{''.join(random.choices(string.hexdigits.lower(), k=16))}"
         for _ in range(count)
@@ -30,21 +26,22 @@ def generate_job_ids(count: int) -> list[str]:
 
 @pytest.mark.asyncio
 async def test_deterministic_assignment():
-    """Test that the same key always maps to the same node."""
-    ring = ConsistentHashRing(virtual_nodes=150)
-    await ring.add_node("gate-1:9000")
-    await ring.add_node("gate-2:9000")
-    await ring.add_node("gate-3:9000")
+    ring = ConsistentHashRing(replicas=150)
+    await ring.add_node("gate-1", "127.0.0.1", 9000)
+    await ring.add_node("gate-2", "127.0.0.1", 9001)
+    await ring.add_node("gate-3", "127.0.0.1", 9002)
 
     job_ids = generate_job_ids(100)
 
     first_assignments = {}
     for job_id in job_ids:
-        first_assignments[job_id] = await ring.get_node(job_id)
+        node = await ring.get_node(job_id)
+        first_assignments[job_id] = node.node_id if node else None
 
     for _ in range(10):
         for job_id in job_ids:
-            current = await ring.get_node(job_id)
+            node = await ring.get_node(job_id)
+            current = node.node_id if node else None
             assert current == first_assignments[job_id], (
                 f"Key {job_id} mapped to {current}, expected {first_assignments[job_id]}"
             )
@@ -52,23 +49,24 @@ async def test_deterministic_assignment():
 
 @pytest.mark.asyncio
 async def test_minimal_redistribution():
-    """Test that adding/removing nodes causes minimal key redistribution."""
-    ring = ConsistentHashRing(virtual_nodes=150)
-    await ring.add_node("gate-1:9000")
-    await ring.add_node("gate-2:9000")
-    await ring.add_node("gate-3:9000")
+    ring = ConsistentHashRing(replicas=150)
+    await ring.add_node("gate-1", "127.0.0.1", 9000)
+    await ring.add_node("gate-2", "127.0.0.1", 9001)
+    await ring.add_node("gate-3", "127.0.0.1", 9002)
 
     job_ids = generate_job_ids(1000)
 
     initial_assignments = {}
     for job_id in job_ids:
-        initial_assignments[job_id] = await ring.get_node(job_id)
+        node = await ring.get_node(job_id)
+        initial_assignments[job_id] = node.node_id if node else None
 
-    await ring.add_node("gate-4:9000")
+    await ring.add_node("gate-4", "127.0.0.1", 9003)
 
     redistributed = 0
     for job_id in job_ids:
-        current = await ring.get_node(job_id)
+        node = await ring.get_node(job_id)
+        current = node.node_id if node else None
         if current != initial_assignments[job_id]:
             redistributed += 1
 
@@ -78,11 +76,12 @@ async def test_minimal_redistribution():
         f"Redistribution {redistribution_pct:.1f}% outside expected range (10-40%)"
     )
 
-    await ring.remove_node("gate-4:9000")
+    await ring.remove_node("gate-4")
 
     restored = 0
     for job_id in job_ids:
-        current = await ring.get_node(job_id)
+        node = await ring.get_node(job_id)
+        current = node.node_id if node else None
         if current == initial_assignments[job_id]:
             restored += 1
 
@@ -90,43 +89,19 @@ async def test_minimal_redistribution():
 
 
 @pytest.mark.asyncio
-async def test_backup_assignment():
-    """Test that backup nodes are different from primary."""
-    ring = ConsistentHashRing(virtual_nodes=150)
-    await ring.add_node("gate-1:9000")
-    await ring.add_node("gate-2:9000")
-    await ring.add_node("gate-3:9000")
-
-    job_ids = generate_job_ids(100)
-
-    for job_id in job_ids:
-        primary = await ring.get_node(job_id)
-        backup = await ring.get_backup(job_id)
-
-        assert primary is not None, f"Primary is None for {job_id}"
-        assert backup is not None, f"Backup is None for {job_id}"
-        assert primary != backup, f"Primary {primary} == Backup {backup} for {job_id}"
-
-    single_ring = ConsistentHashRing(virtual_nodes=150)
-    await single_ring.add_node("gate-1:9000")
-
-    for job_id in job_ids[:10]:
-        primary = await single_ring.get_node(job_id)
-        backup = await single_ring.get_backup(job_id)
-        assert primary is not None, "Single node ring should have primary"
-        assert backup is None, "Single node ring should have no backup"
-
-
-@pytest.mark.asyncio
 async def test_even_distribution():
-    """Test that keys are evenly distributed across nodes."""
-    ring = ConsistentHashRing(virtual_nodes=150)
-    nodes = ["gate-1:9000", "gate-2:9000", "gate-3:9000", "gate-4:9000"]
-    for node in nodes:
-        await ring.add_node(node)
+    ring = ConsistentHashRing(replicas=150)
+    nodes = [
+        ("gate-1", "127.0.0.1", 9000),
+        ("gate-2", "127.0.0.1", 9001),
+        ("gate-3", "127.0.0.1", 9002),
+        ("gate-4", "127.0.0.1", 9003),
+    ]
+    for node_id, host, port in nodes:
+        await ring.add_node(node_id, host, port)
 
     job_ids = generate_job_ids(10000)
-    distribution = await ring.key_distribution(job_ids)
+    distribution = await ring.get_distribution(job_ids)
 
     counts = list(distribution.values())
     mean_count = statistics.mean(counts)
@@ -138,105 +113,95 @@ async def test_even_distribution():
 
 @pytest.mark.asyncio
 async def test_empty_ring():
-    """Test behavior with empty ring."""
-    ring = ConsistentHashRing(virtual_nodes=150)
+    ring = ConsistentHashRing(replicas=150)
 
     assert await ring.get_node("job-123") is None, "Empty ring should return None"
-    assert await ring.get_backup("job-123") is None, (
-        "Empty ring should return None for backup"
-    )
     assert await ring.node_count() == 0, "Empty ring should have length 0"
-    assert not await ring.contains("gate-1:9000"), (
-        "Empty ring should not contain any nodes"
-    )
+    assert not await ring.has_node("gate-1"), "Empty ring should not contain any nodes"
 
-    await ring.add_node("gate-1:9000")
-    assert await ring.get_node("job-123") == "gate-1:9000"
-    await ring.remove_node("gate-1:9000")
+    await ring.add_node("gate-1", "127.0.0.1", 9000)
+    node = await ring.get_node("job-123")
+    assert node is not None and node.node_id == "gate-1"
+    await ring.remove_node("gate-1")
     assert await ring.get_node("job-123") is None
 
 
 @pytest.mark.asyncio
 async def test_get_nodes_for_key():
-    """Test getting multiple nodes for replication."""
-    ring = ConsistentHashRing(virtual_nodes=150)
-    await ring.add_node("gate-1:9000")
-    await ring.add_node("gate-2:9000")
-    await ring.add_node("gate-3:9000")
-    await ring.add_node("gate-4:9000")
+    ring = ConsistentHashRing(replicas=150)
+    await ring.add_node("gate-1", "127.0.0.1", 9000)
+    await ring.add_node("gate-2", "127.0.0.1", 9001)
+    await ring.add_node("gate-3", "127.0.0.1", 9002)
+    await ring.add_node("gate-4", "127.0.0.1", 9003)
 
     job_ids = generate_job_ids(50)
 
     for job_id in job_ids:
-        nodes = await ring.get_nodes_for_key(job_id, count=3)
+        nodes = await ring.get_nodes(job_id, count=3)
         assert len(nodes) == 3, f"Expected 3 nodes, got {len(nodes)}"
-        assert len(set(nodes)) == 3, (
-            f"Expected 3 distinct nodes, got duplicates: {nodes}"
+        node_ids = [n.node_id for n in nodes]
+        assert len(set(node_ids)) == 3, (
+            f"Expected 3 distinct nodes, got duplicates: {node_ids}"
         )
 
-    nodes = await ring.get_nodes_for_key("job-test", count=10)
+    nodes = await ring.get_nodes("job-test", count=10)
     assert len(nodes) == 4, f"Expected 4 nodes (all available), got {len(nodes)}"
 
 
 @pytest.mark.asyncio
-async def test_node_iteration():
-    """Test iterating over nodes."""
-    ring = ConsistentHashRing(virtual_nodes=150)
-    expected_nodes = {"gate-1:9000", "gate-2:9000", "gate-3:9000"}
-    for node in expected_nodes:
-        await ring.add_node(node)
+async def test_node_operations():
+    ring = ConsistentHashRing(replicas=150)
+    expected_nodes = {"gate-1", "gate-2", "gate-3"}
+    for i, node_id in enumerate(expected_nodes):
+        await ring.add_node(node_id, "127.0.0.1", 9000 + i)
 
-    iterated_nodes = set(await ring.get_nodes_iter())
-    assert iterated_nodes == expected_nodes, f"Iteration mismatch: {iterated_nodes}"
-
-    all_nodes = set(await ring.get_all_nodes())
-    assert all_nodes == expected_nodes, f"get_all_nodes mismatch: {all_nodes}"
+    all_nodes = await ring.get_all_nodes()
+    all_node_ids = {n.node_id for n in all_nodes}
+    assert all_node_ids == expected_nodes, f"get_all_nodes mismatch: {all_node_ids}"
 
     assert await ring.node_count() == 3, (
         f"Expected length 3, got {await ring.node_count()}"
     )
 
-    assert await ring.contains("gate-1:9000")
-    assert not await ring.contains("gate-99:9000")
+    assert await ring.has_node("gate-1")
+    assert not await ring.has_node("gate-99")
 
 
 @pytest.mark.asyncio
 async def test_idempotent_operations():
-    """Test that add/remove are idempotent."""
-    ring = ConsistentHashRing(virtual_nodes=150)
+    ring = ConsistentHashRing(replicas=150)
 
-    await ring.add_node("gate-1:9000")
-    await ring.add_node("gate-1:9000")
-    await ring.add_node("gate-1:9000")
+    await ring.add_node("gate-1", "127.0.0.1", 9000)
+    await ring.add_node("gate-1", "127.0.0.1", 9000)
+    await ring.add_node("gate-1", "127.0.0.1", 9000)
     assert await ring.node_count() == 1, "Duplicate adds should not increase node count"
 
-    await ring.remove_node("gate-99:9000")
+    await ring.remove_node("gate-99")
     assert await ring.node_count() == 1, (
         "Removing non-existent node should not change ring"
     )
 
-    await ring.remove_node("gate-1:9000")
-    await ring.remove_node("gate-1:9000")
+    await ring.remove_node("gate-1")
+    await ring.remove_node("gate-1")
     assert await ring.node_count() == 0, "Ring should be empty after removal"
 
 
 @pytest.mark.asyncio
 async def test_concurrent_operations():
-    ring = ConsistentHashRing(virtual_nodes=100)
+    ring = ConsistentHashRing(replicas=100)
     iterations = 100
 
     async def add_remove_nodes(task_id: int):
         for i in range(iterations):
-            node_id = f"gate-{task_id}-{i % 10}:9000"
-            await ring.add_node(node_id)
+            node_id = f"gate-{task_id}-{i % 10}"
+            await ring.add_node(node_id, "127.0.0.1", 9000 + task_id)
             await ring.get_node(f"job-{task_id}-{i}")
             await ring.remove_node(node_id)
 
     async def lookup_keys(task_id: int):
         for i in range(iterations):
             await ring.get_node(f"job-{task_id}-{i}")
-            await ring.get_backup(f"job-{task_id}-{i}")
-            await ring.get_nodes_for_key(f"job-{task_id}-{i}", count=2)
+            await ring.get_nodes(f"job-{task_id}-{i}", count=2)
 
     tasks = []
     for i in range(4):
@@ -247,3 +212,21 @@ async def test_concurrent_operations():
 
     errors = [r for r in results if isinstance(r, Exception)]
     assert len(errors) == 0, f"{len(errors)} concurrency errors: {errors}"
+
+
+@pytest.mark.asyncio
+async def test_node_metadata():
+    ring = ConsistentHashRing(replicas=150)
+    await ring.add_node("gate-1", "10.0.0.1", 8080, weight=2)
+
+    node = await ring.get_node("some-job")
+    assert node is not None
+    assert node.node_id == "gate-1"
+    assert node.tcp_host == "10.0.0.1"
+    assert node.tcp_port == 8080
+    assert node.weight == 2
+
+    addr = await ring.get_node_addr(node)
+    assert addr == ("10.0.0.1", 8080)
+
+    assert await ring.get_node_addr(None) is None
