@@ -997,12 +997,10 @@ class WorkflowDispatcher:
         - Clears ready_events to unblock any waiters
         - Clears retry budget state (AD-44)
         """
-        # Stop the dispatch loop first
         await self.stop_job_dispatch(job_id)
 
         await self._retry_budget_manager.cleanup(job_id)
 
-        # Clear pending workflows
         async with self._pending_lock:
             keys_to_remove = [
                 key for key in self._pending if key.startswith(f"{job_id}:")
@@ -1010,8 +1008,9 @@ class WorkflowDispatcher:
             for key in keys_to_remove:
                 pending = self._pending.pop(key, None)
                 if pending:
-                    # Set the ready event to unblock any waiters, then clear
                     pending.ready_event.set()
+
+        self._cancelling_jobs.discard(job_id)
 
     async def cancel_pending_workflows(self, job_id: str) -> list[str]:
         """
