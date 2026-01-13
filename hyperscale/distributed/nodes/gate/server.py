@@ -2157,8 +2157,15 @@ class GateServer(HealthAwareServer):
         count: int,
         preferred: list[str] | None = None,
     ) -> tuple[list[str], list[str], str]:
-        """Legacy datacenter selection."""
         dc_health = self._get_all_datacenter_health()
+        if self._health_coordinator:
+            return self._health_coordinator.legacy_select_datacenters(
+                count,
+                dc_health,
+                len(self._datacenter_managers),
+                preferred,
+            )
+
         if not dc_health:
             if len(self._datacenter_managers) > 0:
                 return ([], [], "initializing")
