@@ -24,6 +24,7 @@ from hyperscale.distributed.reliability import BackpressureLevel
 @dataclass
 class MockLogger:
     """Mock logger for testing."""
+
     messages: list[str] = field(default_factory=list)
 
     async def log(self, *args, **kwargs):
@@ -33,6 +34,7 @@ class MockLogger:
 @dataclass
 class MockTaskRunner:
     """Mock task runner for testing."""
+
     tasks: list = field(default_factory=list)
 
     def run(self, coro, *args, **kwargs):
@@ -49,13 +51,14 @@ class MockTaskRunner:
 @dataclass
 class MockWindowedStatsCollector:
     """Mock windowed stats collector."""
+
     pending_jobs: list[str] = field(default_factory=list)
     stats_data: dict = field(default_factory=dict)
 
     def get_jobs_with_pending_stats(self) -> list[str]:
         return self.pending_jobs
 
-    def get_aggregated_stats(self, job_id: str):
+    async def get_aggregated_stats(self, job_id: str):
         if job_id in self.stats_data:
             return self.stats_data[job_id]
         return None
@@ -64,6 +67,7 @@ class MockWindowedStatsCollector:
 @dataclass
 class MockJobStatus:
     """Mock job status object."""
+
     status: str = JobStatus.RUNNING.value
     total_completed: int = 100
     total_failed: int = 5
@@ -92,7 +96,9 @@ class TestClassifyUpdateTierHappyPath:
             send_tcp=AsyncMock(),
         )
 
-        tier = coordinator.classify_update_tier("job-1", "running", JobStatus.COMPLETED.value)
+        tier = coordinator.classify_update_tier(
+            "job-1", "running", JobStatus.COMPLETED.value
+        )
         assert tier == UpdateTier.IMMEDIATE.value
 
     def test_failed_status_is_immediate(self):
@@ -108,7 +114,9 @@ class TestClassifyUpdateTierHappyPath:
             send_tcp=AsyncMock(),
         )
 
-        tier = coordinator.classify_update_tier("job-1", "running", JobStatus.FAILED.value)
+        tier = coordinator.classify_update_tier(
+            "job-1", "running", JobStatus.FAILED.value
+        )
         assert tier == UpdateTier.IMMEDIATE.value
 
     def test_cancelled_status_is_immediate(self):
@@ -124,7 +132,9 @@ class TestClassifyUpdateTierHappyPath:
             send_tcp=AsyncMock(),
         )
 
-        tier = coordinator.classify_update_tier("job-1", "running", JobStatus.CANCELLED.value)
+        tier = coordinator.classify_update_tier(
+            "job-1", "running", JobStatus.CANCELLED.value
+        )
         assert tier == UpdateTier.IMMEDIATE.value
 
     def test_first_running_is_immediate(self):
@@ -549,10 +559,12 @@ class TestConcurrency:
             send_tcp=send_tcp,
         )
 
-        await asyncio.gather(*[
-            coordinator.send_immediate_update(f"job-{i}", "status_change")
-            for i in range(100)
-        ])
+        await asyncio.gather(
+            *[
+                coordinator.send_immediate_update(f"job-{i}", "status_change")
+                for i in range(100)
+            ]
+        )
 
         assert call_count == 100
 
