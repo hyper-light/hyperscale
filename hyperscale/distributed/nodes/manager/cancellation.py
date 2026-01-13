@@ -46,17 +46,17 @@ class ManagerCancellationCoordinator:
         config: "ManagerConfig",
         logger: "Logger",
         node_id: str,
-        task_runner,
-        send_to_worker,  # Callable to send TCP to worker
-        send_to_client,  # Callable to send TCP to client
+        task_runner: "TaskRunner",
+        send_to_worker: SendFunc,
+        send_to_client: SendFunc,
     ) -> None:
-        self._state = state
-        self._config = config
-        self._logger = logger
-        self._node_id = node_id
-        self._task_runner = task_runner
-        self._send_to_worker = send_to_worker
-        self._send_to_client = send_to_client
+        self._state: "ManagerState" = state
+        self._config: "ManagerConfig" = config
+        self._logger: "Logger" = logger
+        self._node_id: str = node_id
+        self._task_runner: "TaskRunner" = task_runner
+        self._send_to_worker: SendFunc = send_to_worker
+        self._send_to_client: SendFunc = send_to_client
 
     async def cancel_job(
         self,
