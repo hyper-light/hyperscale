@@ -36,9 +36,11 @@ from .state import GateRuntimeState
 
 if TYPE_CHECKING:
     from hyperscale.distributed.swim.core import NodeId
-    from hyperscale.distributed.correlation import CrossDCCorrelationDetector
-    from hyperscale.distributed.versioning import VersionedClock
-    from hyperscale.distributed.dispatch import ManagerDispatcher
+    from hyperscale.distributed.datacenters.cross_dc_correlation import (
+        CrossDCCorrelationDetector,
+    )
+    from hyperscale.distributed.server.events.lamport_clock import VersionedStateClock
+    from hyperscale.distributed.datacenters.manager_dispatcher import ManagerDispatcher
     from taskex import TaskRunner
 
 

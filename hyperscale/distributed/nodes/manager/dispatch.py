@@ -268,12 +268,15 @@ class ManagerDispatchCoordinator:
         Returns:
             True if quorum achieved
         """
+        fence_token = await self._leases.increment_fence_token(job_id)
+        version = self._state._state_version
         request = ProvisionRequest(
             job_id=job_id,
             workflow_id=workflow_id,
-            worker_id=worker_id,
-            cores_requested=cores_required,
-            requesting_manager=self._node_id,
+            target_worker=worker_id,
+            cores_required=cores_required,
+            fence_token=fence_token,
+            version=version,
         )
 
         # Track pending provision
