@@ -1907,9 +1907,6 @@ class ManagerServer(HealthAwareServer):
                 ),
             )
 
-    def get_manager_health_state(self) -> str:
-        return self._manager_health_state
-
     def _log_peer_manager_health_transition(
         self,
         peer_id: str,
@@ -2148,10 +2145,6 @@ class ManagerServer(HealthAwareServer):
         """
         result = await self._rate_limiter.check_rate_limit(client_id, operation)
         return result.allowed, result.retry_after_seconds
-
-    def _get_rate_limit_metrics(self) -> dict:
-        """Get rate limiting metrics for monitoring."""
-        return self._rate_limiter.get_metrics()
 
     def _cleanup_inactive_rate_limit_clients(self) -> int:
         """
