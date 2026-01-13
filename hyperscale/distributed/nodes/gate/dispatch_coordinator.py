@@ -4,9 +4,8 @@ Gate job dispatch coordination module.
 Coordinates job submission and dispatch to datacenter managers.
 """
 
-import asyncio
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 import cloudpickle
 
@@ -15,24 +14,29 @@ from hyperscale.distributed.models import (
     JobAck,
     JobStatus,
     GlobalJobStatus,
-    RateLimitResponse,
 )
 from hyperscale.distributed.protocol.version import (
     ProtocolVersion,
     CURRENT_PROTOCOL_VERSION,
     get_features_for_version,
 )
-from hyperscale.distributed.swim.core import (
-    CircuitState,
-    QuorumCircuitOpenError,
-    QuorumUnavailableError,
+from hyperscale.distributed.swim.core import CircuitState
+from hyperscale.distributed.reliability import (
+    RetryExecutor,
+    RetryConfig,
+    JitterStrategy,
 )
-from hyperscale.logging.hyperscale_logging_models import ServerWarning
+from hyperscale.logging.hyperscale_logging_models import (
+    ServerWarning,
+    ServerInfo,
+    ServerError,
+)
 
 if TYPE_CHECKING:
     from hyperscale.distributed.nodes.gate.state import GateRuntimeState
-    from hyperscale.distributed.jobs.gates import GateJobManager
+    from hyperscale.distributed.jobs.gates import GateJobManager, GateJobTimeoutTracker
     from hyperscale.distributed.routing import GateJobRouter
+    from hyperscale.distributed.health import CircuitBreakerManager
     from hyperscale.logging import Logger
     from hyperscale.distributed.taskex import TaskRunner
 
@@ -55,21 +59,34 @@ class GateDispatchCoordinator:
         task_runner: "TaskRunner",
         job_manager: "GateJobManager",
         job_router: "GateJobRouter | None",
-        check_rate_limit: callable,
-        should_shed_request: callable,
-        has_quorum_available: callable,
-        quorum_size: callable,
+        job_timeout_tracker: "GateJobTimeoutTracker",
+        circuit_breaker_manager: "CircuitBreakerManager",
+        datacenter_managers: dict[str, list[tuple[str, int]]],
+        check_rate_limit: Callable,
+        should_shed_request: Callable,
+        has_quorum_available: Callable,
+        quorum_size: Callable,
         quorum_circuit,
-        select_datacenters: callable,
-        assume_leadership: callable,
-        broadcast_leadership: callable,
-        dispatch_to_dcs: callable,
+        select_datacenters: Callable,
+        assume_leadership: Callable,
+        broadcast_leadership: Callable,
+        send_tcp: Callable,
+        increment_version: Callable,
+        confirm_manager_for_dc: Callable,
+        suspect_manager_for_dc: Callable,
+        record_forward_throughput_event: Callable,
+        get_node_host: Callable[[], str],
+        get_node_port: Callable[[], int],
+        get_node_id_short: Callable[[], str],
     ) -> None:
         self._state = state
         self._logger = logger
         self._task_runner = task_runner
         self._job_manager = job_manager
         self._job_router = job_router
+        self._job_timeout_tracker = job_timeout_tracker
+        self._circuit_breaker_manager = circuit_breaker_manager
+        self._datacenter_managers = datacenter_managers
         self._check_rate_limit = check_rate_limit
         self._should_shed_request = should_shed_request
         self._has_quorum_available = has_quorum_available
@@ -78,7 +95,14 @@ class GateDispatchCoordinator:
         self._select_datacenters = select_datacenters
         self._assume_leadership = assume_leadership
         self._broadcast_leadership = broadcast_leadership
-        self._dispatch_to_dcs = dispatch_to_dcs
+        self._send_tcp = send_tcp
+        self._increment_version = increment_version
+        self._confirm_manager_for_dc = confirm_manager_for_dc
+        self._suspect_manager_for_dc = suspect_manager_for_dc
+        self._record_forward_throughput_event = record_forward_throughput_event
+        self._get_node_host = get_node_host
+        self._get_node_port = get_node_port
+        self._get_node_id_short = get_node_id_short
 
     async def _check_rate_and_load(
         self,
