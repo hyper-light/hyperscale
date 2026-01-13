@@ -1606,31 +1606,33 @@ class TestPartialFailureSplitBrain:
         assert "unhealthy" in composite.get_unhealthy_probes()
         assert "healthy" not in composite.get_unhealthy_probes()
 
-    def test_rate_limiter_client_isolation(self):
+    @pytest.mark.asyncio
+    async def test_rate_limiter_client_isolation(self):
         """Test rate limiting isolation between clients."""
         config = RateLimitConfig(default_bucket_size=5, default_refill_rate=0.1)
         limiter = ServerRateLimiter(config)
 
         # Exhaust client-1
         for _ in range(10):
-            limiter.check_rate_limit("client-1", "operation")
+            await limiter.check_rate_limit("client-1", "operation")
 
         # Exhaust client-2
         for _ in range(10):
-            limiter.check_rate_limit("client-2", "operation")
+            await limiter.check_rate_limit("client-2", "operation")
 
         # Both should be rate limited independently
-        result1 = limiter.check_rate_limit("client-1", "operation")
-        result2 = limiter.check_rate_limit("client-2", "operation")
+        result1 = await limiter.check_rate_limit("client-1", "operation")
+        result2 = await limiter.check_rate_limit("client-2", "operation")
 
         assert result1.allowed is False
         assert result2.allowed is False
 
         # But client-3 should be fine
-        result3 = limiter.check_rate_limit("client-3", "operation")
+        result3 = await limiter.check_rate_limit("client-3", "operation")
         assert result3.allowed is True
 
-    def test_load_shedder_independent_of_rate_limiter(self):
+    @pytest.mark.asyncio
+    async def test_load_shedder_independent_of_rate_limiter(self):
         """Test load shedder and rate limiter operate independently."""
         config = OverloadConfig(
             absolute_bounds=(100.0, 200.0, 500.0),
@@ -1650,13 +1652,14 @@ class TestPartialFailureSplitBrain:
 
         # Rate limiter exhausted
         for _ in range(10):
-            rate_limiter.check_rate_limit("client-1", "operation")
+            await rate_limiter.check_rate_limit("client-1", "operation")
 
         # Shedder should still accept (it doesn't know about rate limiter)
         assert shedder.should_shed("SubmitJob") is False
 
         # Rate limiter should still reject (it doesn't know about shedder)
-        assert rate_limiter.check_rate_limit("client-1", "operation").allowed is False
+        result = await rate_limiter.check_rate_limit("client-1", "operation")
+        assert result.allowed is False
 
     def test_extension_tracker_isolation_between_workers(self):
         """Test extension trackers are isolated between workers."""
