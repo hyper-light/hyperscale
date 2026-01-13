@@ -164,10 +164,98 @@ class DatacenterHealthManager:
         Returns:
             DatacenterStatus with health classification.
         """
-        # Get best manager heartbeat for this DC
         best_heartbeat, alive_count, total_count = self._get_best_manager_heartbeat(
             dc_id
         )
+
+        if self._get_configured_managers:
+            configured = self._get_configured_managers(dc_id)
+            total_count = max(total_count, len(configured))
+
+        if total_count == 0:
+            return self._build_unhealthy_status(dc_id, 0, 0)
+
+        if not best_heartbeat or best_heartbeat.worker_count == 0:
+            return self._build_unhealthy_status(dc_id, alive_count, 0)
+
+        signals = self._extract_overload_signals(
+            best_heartbeat, alive_count, total_count
+        )
+        overload_result = self._overload_classifier.classify(signals)
+
+        health = self._map_overload_state_to_health(overload_result.state)
+        healthy_workers = getattr(
+            best_heartbeat, "healthy_worker_count", best_heartbeat.worker_count
+        )
+
+        return DatacenterStatus(
+            dc_id=dc_id,
+            health=health.value,
+            available_capacity=best_heartbeat.available_cores,
+            queue_depth=getattr(best_heartbeat, "queue_depth", 0),
+            manager_count=alive_count,
+            worker_count=healthy_workers,
+            last_update=time.monotonic(),
+            overloaded_worker_count=getattr(
+                best_heartbeat, "overloaded_worker_count", 0
+            ),
+            stressed_worker_count=getattr(best_heartbeat, "stressed_worker_count", 0),
+            busy_worker_count=getattr(best_heartbeat, "busy_worker_count", 0),
+            worker_overload_ratio=overload_result.worker_overload_ratio,
+            health_severity_weight=overload_result.health_severity_weight,
+        )
+
+    def _build_unhealthy_status(
+        self,
+        dc_id: str,
+        manager_count: int,
+        worker_count: int,
+    ) -> DatacenterStatus:
+        return DatacenterStatus(
+            dc_id=dc_id,
+            health=DatacenterHealth.UNHEALTHY.value,
+            available_capacity=0,
+            queue_depth=0,
+            manager_count=manager_count,
+            worker_count=worker_count,
+            last_update=time.monotonic(),
+        )
+
+    def _extract_overload_signals(
+        self,
+        heartbeat: ManagerHeartbeat,
+        alive_managers: int,
+        total_managers: int,
+    ) -> DatacenterOverloadSignals:
+        return DatacenterOverloadSignals(
+            total_workers=heartbeat.worker_count,
+            healthy_workers=getattr(
+                heartbeat, "healthy_worker_count", heartbeat.worker_count
+            ),
+            overloaded_workers=getattr(heartbeat, "overloaded_worker_count", 0),
+            stressed_workers=getattr(heartbeat, "stressed_worker_count", 0),
+            busy_workers=getattr(heartbeat, "busy_worker_count", 0),
+            total_managers=total_managers,
+            alive_managers=alive_managers,
+            total_cores=heartbeat.total_cores,
+            available_cores=heartbeat.available_cores,
+        )
+
+    def _map_overload_state_to_health(
+        self,
+        state: DatacenterOverloadState,
+    ) -> DatacenterHealth:
+        mapping = {
+            DatacenterOverloadState.HEALTHY: DatacenterHealth.HEALTHY,
+            DatacenterOverloadState.BUSY: DatacenterHealth.BUSY,
+            DatacenterOverloadState.DEGRADED: DatacenterHealth.DEGRADED,
+            DatacenterOverloadState.UNHEALTHY: DatacenterHealth.UNHEALTHY,
+        }
+        return mapping.get(state, DatacenterHealth.DEGRADED)
+
+    def get_health_severity_weight(self, dc_id: str) -> float:
+        status = self.get_datacenter_health(dc_id)
+        return getattr(status, "health_severity_weight", 1.0)
 
         # Get configured manager count if available
         if self._get_configured_managers:
