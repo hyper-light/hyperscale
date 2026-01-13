@@ -34,6 +34,7 @@ from hyperscale.distributed.models import (
 @dataclass
 class MockLogger:
     """Mock logger for testing."""
+
     messages: list[str] = field(default_factory=list)
 
     async def log(self, *args, **kwargs):
@@ -43,6 +44,7 @@ class MockLogger:
 @dataclass
 class MockTaskRunner:
     """Mock task runner for testing."""
+
     tasks: list = field(default_factory=list)
 
     def run(self, coro, *args, **kwargs):
@@ -56,6 +58,7 @@ class MockTaskRunner:
 @dataclass
 class MockNodeId:
     """Mock node ID."""
+
     full: str = "gate-001"
     short: str = "001"
     datacenter: str = "global"
@@ -64,6 +67,7 @@ class MockNodeId:
 @dataclass
 class MockGateJobManager:
     """Mock gate job manager."""
+
     jobs: dict = field(default_factory=dict)
     target_dcs: dict = field(default_factory=dict)
     callbacks: dict = field(default_factory=dict)
@@ -104,6 +108,7 @@ class MockCircuitState(Enum):
 @dataclass
 class MockQuorumCircuit:
     """Mock quorum circuit breaker."""
+
     circuit_state: MockCircuitState = MockCircuitState.CLOSED
     half_open_after: float = 10.0
     error_count: int = 0
@@ -120,6 +125,7 @@ class MockQuorumCircuit:
 @dataclass
 class MockLoadShedder:
     """Mock load shedder."""
+
     shed_handlers: set = field(default_factory=set)
     current_state: str = "normal"
 
@@ -129,12 +135,14 @@ class MockLoadShedder:
     def get_current_state(self):
         class State:
             value = "normal"
+
         return State()
 
 
 @dataclass
 class MockJobLeadershipTracker:
     """Mock job leadership tracker."""
+
     leaders: dict = field(default_factory=dict)
 
     def assume_leadership(self, job_id: str, metadata: int):
@@ -144,6 +152,7 @@ class MockJobLeadershipTracker:
 @dataclass
 class MockGateInfo:
     """Mock gate info for healthy gates."""
+
     gate_id: str = "gate-002"
     addr: tuple[str, int] = field(default_factory=lambda: ("10.0.0.2", 9000))
 
@@ -163,6 +172,9 @@ def create_mock_handler(
     if select_dcs is None:
         select_dcs = ["dc-east", "dc-west"]
 
+    async def mock_check_rate_limit(client_id, op):
+        return (rate_limit_allowed, rate_limit_retry)
+
     return GateJobHandler(
         state=state,
         logger=MockLogger(),
@@ -173,15 +185,20 @@ def create_mock_handler(
         quorum_circuit=MockQuorumCircuit(circuit_state=circuit_state),
         load_shedder=MockLoadShedder(),
         job_lease_manager=MagicMock(),
+        idempotency_cache=None,
         get_node_id=lambda: MockNodeId(),
         get_host=lambda: "127.0.0.1",
         get_tcp_port=lambda: 9000,
         is_leader=lambda: True,
-        check_rate_limit=lambda client_id, op: (rate_limit_allowed, rate_limit_retry),
+        check_rate_limit=mock_check_rate_limit,
         should_shed_request=lambda req_type: should_shed,
         has_quorum_available=lambda: has_quorum,
         quorum_size=lambda: 3,
-        select_datacenters_with_fallback=lambda count, dcs, job_id: (select_dcs, [], "healthy"),
+        select_datacenters_with_fallback=lambda count, dcs, job_id: (
+            select_dcs,
+            [],
+            "healthy",
+        ),
         get_healthy_gates=lambda: [MockGateInfo()],
         broadcast_job_leadership=AsyncMock(),
         dispatch_job_to_datacenters=AsyncMock(),
@@ -244,7 +261,11 @@ class TestHandleSubmissionHappyPath:
             should_shed_request=lambda req_type: False,
             has_quorum_available=lambda: True,
             quorum_size=lambda: 3,
-            select_datacenters_with_fallback=lambda count, dcs, job_id: (["dc-1"], [], "healthy"),
+            select_datacenters_with_fallback=lambda count, dcs, job_id: (
+                ["dc-1"],
+                [],
+                "healthy",
+            ),
             get_healthy_gates=lambda: [],
             broadcast_job_leadership=AsyncMock(),
             dispatch_job_to_datacenters=AsyncMock(),
@@ -292,7 +313,11 @@ class TestHandleSubmissionHappyPath:
             should_shed_request=lambda req_type: False,
             has_quorum_available=lambda: True,
             quorum_size=lambda: 3,
-            select_datacenters_with_fallback=lambda count, dcs, job_id: (["dc-east", "dc-west"], [], "healthy"),
+            select_datacenters_with_fallback=lambda count, dcs, job_id: (
+                ["dc-east", "dc-west"],
+                [],
+                "healthy",
+            ),
             get_healthy_gates=lambda: [],
             broadcast_job_leadership=AsyncMock(),
             dispatch_job_to_datacenters=AsyncMock(),
@@ -377,7 +402,11 @@ class TestHandleSubmissionRateLimiting:
             should_shed_request=lambda req_type: False,
             has_quorum_available=lambda: True,
             quorum_size=lambda: 3,
-            select_datacenters_with_fallback=lambda count, dcs, job_id: (["dc-1"], [], "healthy"),
+            select_datacenters_with_fallback=lambda count, dcs, job_id: (
+                ["dc-1"],
+                [],
+                "healthy",
+            ),
             get_healthy_gates=lambda: [],
             broadcast_job_leadership=AsyncMock(),
             dispatch_job_to_datacenters=AsyncMock(),
@@ -630,7 +659,7 @@ class TestHandleStatusRequestNegativePath:
         )
 
         # Should return empty bytes when shedding
-        assert result == b''
+        assert result == b""
 
 
 # =============================================================================
@@ -646,12 +675,15 @@ class TestHandleProgressHappyPath:
         """Accepts valid progress update."""
         state = GateRuntimeState()
         job_manager = MockGateJobManager()
-        job_manager.set_job("job-123", GlobalJobStatus(
-            job_id="job-123",
-            status=JobStatus.RUNNING.value,
-            datacenters=[],
-            timestamp=1234567890.0,
-        ))
+        job_manager.set_job(
+            "job-123",
+            GlobalJobStatus(
+                job_id="job-123",
+                status=JobStatus.RUNNING.value,
+                datacenters=[],
+                timestamp=1234567890.0,
+            ),
+        )
 
         handler = GateJobHandler(
             state=state,
@@ -671,7 +703,11 @@ class TestHandleProgressHappyPath:
             should_shed_request=lambda req_type: False,
             has_quorum_available=lambda: True,
             quorum_size=lambda: 3,
-            select_datacenters_with_fallback=lambda count, dcs, job_id: (["dc-1"], [], "healthy"),
+            select_datacenters_with_fallback=lambda count, dcs, job_id: (
+                ["dc-1"],
+                [],
+                "healthy",
+            ),
             get_healthy_gates=lambda: [],
             broadcast_job_leadership=AsyncMock(),
             dispatch_job_to_datacenters=AsyncMock(),
@@ -707,12 +743,15 @@ class TestHandleProgressFencingTokens:
         """Rejects progress with stale fence token."""
         state = GateRuntimeState()
         job_manager = MockGateJobManager()
-        job_manager.set_job("job-123", GlobalJobStatus(
-            job_id="job-123",
-            status=JobStatus.RUNNING.value,
-            datacenters=[],
-            timestamp=1234567890.0,
-        ))
+        job_manager.set_job(
+            "job-123",
+            GlobalJobStatus(
+                job_id="job-123",
+                status=JobStatus.RUNNING.value,
+                datacenters=[],
+                timestamp=1234567890.0,
+            ),
+        )
         job_manager.set_fence_token("job-123", 10)  # Current token is 10
 
         handler = GateJobHandler(
@@ -733,7 +772,11 @@ class TestHandleProgressFencingTokens:
             should_shed_request=lambda req_type: False,
             has_quorum_available=lambda: True,
             quorum_size=lambda: 3,
-            select_datacenters_with_fallback=lambda count, dcs, job_id: (["dc-1"], [], "healthy"),
+            select_datacenters_with_fallback=lambda count, dcs, job_id: (
+                ["dc-1"],
+                [],
+                "healthy",
+            ),
             get_healthy_gates=lambda: [],
             broadcast_job_leadership=AsyncMock(),
             dispatch_job_to_datacenters=AsyncMock(),
@@ -766,12 +809,15 @@ class TestHandleProgressFencingTokens:
         """Updates fence token when receiving newer value."""
         state = GateRuntimeState()
         job_manager = MockGateJobManager()
-        job_manager.set_job("job-123", GlobalJobStatus(
-            job_id="job-123",
-            status=JobStatus.RUNNING.value,
-            datacenters=[],
-            timestamp=1234567890.0,
-        ))
+        job_manager.set_job(
+            "job-123",
+            GlobalJobStatus(
+                job_id="job-123",
+                status=JobStatus.RUNNING.value,
+                datacenters=[],
+                timestamp=1234567890.0,
+            ),
+        )
         job_manager.set_fence_token("job-123", 5)
 
         handler = GateJobHandler(
@@ -792,7 +838,11 @@ class TestHandleProgressFencingTokens:
             should_shed_request=lambda req_type: False,
             has_quorum_available=lambda: True,
             quorum_size=lambda: 3,
-            select_datacenters_with_fallback=lambda count, dcs, job_id: (["dc-1"], [], "healthy"),
+            select_datacenters_with_fallback=lambda count, dcs, job_id: (
+                ["dc-1"],
+                [],
+                "healthy",
+            ),
             get_healthy_gates=lambda: [],
             broadcast_job_leadership=AsyncMock(),
             dispatch_job_to_datacenters=AsyncMock(),
@@ -835,22 +885,26 @@ class TestConcurrency:
 
         submissions = []
         for i in range(10):
-            submissions.append(JobSubmission(
-                job_id=f"job-{i}",
-                workflows=b"test_workflows",
-                vus=10,
-                timeout_seconds=60.0,
-                datacenter_count=1,
-            ))
-
-        results = await asyncio.gather(*[
-            handler.handle_submission(
-                addr=(f"10.0.0.{i}", 8000),
-                data=sub.dump(),
-                active_gate_peer_count=0,
+            submissions.append(
+                JobSubmission(
+                    job_id=f"job-{i}",
+                    workflows=b"test_workflows",
+                    vus=10,
+                    timeout_seconds=60.0,
+                    datacenter_count=1,
+                )
             )
-            for i, sub in enumerate(submissions)
-        ])
+
+        results = await asyncio.gather(
+            *[
+                handler.handle_submission(
+                    addr=(f"10.0.0.{i}", 8000),
+                    data=sub.dump(),
+                    active_gate_peer_count=0,
+                )
+                for i, sub in enumerate(submissions)
+            ]
+        )
 
         assert len(results) == 10
         assert all(isinstance(r, bytes) for r in results)
@@ -869,14 +923,16 @@ class TestConcurrency:
                 timestamp=1234567890.0,
             )
 
-        results = await asyncio.gather(*[
-            handler.handle_status_request(
-                addr=("10.0.0.1", 8000),
-                data=f"job-{i}".encode(),
-                gather_job_status=mock_gather_status,
-            )
-            for i in range(100)
-        ])
+        results = await asyncio.gather(
+            *[
+                handler.handle_status_request(
+                    addr=("10.0.0.1", 8000),
+                    data=f"job-{i}".encode(),
+                    gather_job_status=mock_gather_status,
+                )
+                for i in range(100)
+            ]
+        )
 
         assert len(results) == 100
         assert all(isinstance(r, bytes) for r in results)
@@ -1034,7 +1090,7 @@ class TestFailureModes:
             data=b"invalid_data",
         )
 
-        assert result == b'error'
+        assert result == b"error"
 
     @pytest.mark.asyncio
     async def test_handles_exception_in_broadcast(self):
@@ -1059,7 +1115,11 @@ class TestFailureModes:
             should_shed_request=lambda req_type: False,
             has_quorum_available=lambda: True,
             quorum_size=lambda: 3,
-            select_datacenters_with_fallback=lambda count, dcs, job_id: (["dc-1"], [], "healthy"),
+            select_datacenters_with_fallback=lambda count, dcs, job_id: (
+                ["dc-1"],
+                [],
+                "healthy",
+            ),
             get_healthy_gates=lambda: [],
             broadcast_job_leadership=broadcast_mock,
             dispatch_job_to_datacenters=AsyncMock(),
