@@ -277,6 +277,9 @@ class ManagerHealthMonitor:
         """Get count of unhealthy workers."""
         return len(self._state._worker_unhealthy_since)
 
+    def get_worker_health_state_counts(self) -> dict[str, int]:
+        return self._registry.get_worker_health_state_counts()
+
     def is_worker_responsive(self, worker_id: str, job_id: str) -> bool:
         """
         Check if worker is responsive for a job (AD-30).
