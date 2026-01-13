@@ -1742,6 +1742,169 @@ Line 711: ManagerStateEnum.OFFLINE - does not exist on ManagerState!
 Add to Phase 7 verification checklist:
 - [ ] Re-run Phase 3.5h.4 scanner: **ZERO** enum member violations
 
+### Step 3.5h.5: Callback/Reference Attribute Validation (MANDATORY - CRITICAL)
+
+**STATUS: MANDATORY** - This step MUST be executed. Attribute references passed as callbacks cause `AttributeError` at runtime.
+
+**The Problem:**
+
+Standard method call scanners look for `self.method()` patterns (with parentheses). But attributes can also be **referenced without being called** - passed as callbacks, stored in variables, or used as function arguments:
+
+```python
+# Pattern 1: Callback passed as keyword argument (NO PARENTHESES)
+await registration_handler.register(
+    add_to_probe_scheduler=self.add_to_probe_scheduler,  # BUG: method doesn't exist!
+    on_success=self.handle_success,  # BUG if handle_success doesn't exist
+)
+
+# Pattern 2: Callback assigned to variable
+callback = self.on_workflow_complete  # BUG if method doesn't exist
+
+# Pattern 3: Callback in list/dict
+handlers = [self.on_start, self.on_stop, self.on_error]  # BUG if any don't exist
+
+# Pattern 4: Passed to constructor
+coordinator = Coordinator(
+    send_tcp=self.send_tcp,  # OK - method exists on base class
+    notify_peer=self.notify_peer,  # BUG if notify_peer doesn't exist
+)
+```
+
+**Why Standard Scanners Miss This:**
+
+1. No parentheses `()` → not detected as method call
+2. Looks like attribute access → but attribute scanners check for data attributes, not methods
+3. LSP may not catch it if the attribute is dynamically assigned elsewhere
+4. Only fails at **runtime** when the callback is actually invoked
+
+**Detection Script:**
+
+```python
+import ast
+import re
+from pathlib import Path
+
+def find_self_attribute_references(file_path: str, class_methods: set[str]) -> list[tuple[int, str, str]]:
+    """
+    Find self.X references that are NOT method calls and verify X exists.
+    
+    Args:
+        file_path: Path to the file to scan
+        class_methods: Set of method names that exist on the class
+    
+    Returns: [(line, context, missing_attr)]
+    """
+    with open(file_path) as f:
+        source = f.read()
+        lines = source.split('\n')
+    
+    violations = []
+    
+    # Pattern: self.something NOT followed by ( 
+    # But IS followed by , or ) or = or \n (indicates reference, not call)
+    # Excludes: self._private (data attributes typically start with _)
+    
+    # Match self.method_name used as reference (not called)
+    pattern = re.compile(
+        r'self\.([a-z][a-z0-9_]*)'  # self.method_name (lowercase = method convention)
+        r'(?!\s*\()'  # NOT followed by (
+        r'(?=\s*[,)=\]\n])'  # followed by , ) = ] or newline
+    )
+    
+    for i, line in enumerate(lines, 1):
+        # Skip comments and strings (rough heuristic)
+        stripped = line.split('#')[0]
+        
+        for match in pattern.finditer(stripped):
+            attr_name = match.group(1)
+            
+            # Skip private attributes (data, not methods)
+            if attr_name.startswith('_'):
+                continue
+            
+            # Check if this looks like a callback pattern
+            # (appears after = or in function call arguments)
+            context = stripped[max(0, match.start()-20):match.end()+10]
+            
+            # Verify the method exists
+            if attr_name not in class_methods:
+                violations.append((i, stripped.strip()[:70], attr_name))
+    
+    return violations
+
+def extract_class_methods(file_path: str, class_name: str) -> set[str]:
+    """Extract all method names from a class."""
+    with open(file_path) as f:
+        tree = ast.parse(f.read())
+    
+    methods = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef) and node.name == class_name:
+            for item in node.body:
+                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    methods.add(item.name)
+            # Also check base classes (would need more complex analysis)
+    
+    return methods
+
+# Usage
+class_methods = extract_class_methods("server.py", "WorkerServer")
+# Add inherited methods from base class
+base_methods = extract_class_methods("../../swim/health_aware_server.py", "HealthAwareServer")
+all_methods = class_methods | base_methods
+
+violations = find_self_attribute_references("server.py", all_methods)
+for line, context, attr in violations:
+    print(f"Line {line}: Missing method `{attr}` referenced in: {context}")
+```
+
+**Quick Detection Command:**
+
+```bash
+# Find self.X patterns that look like callback references (not calls)
+# and are NOT private attributes
+grep -nE "self\.[a-z][a-z0-9_]*\s*[,)=\]]" server.py | grep -v "self\._" | grep -v "()"
+```
+
+**Example Violations:**
+
+```
+Line 1377: Missing method `add_to_probe_scheduler` referenced in: add_to_probe_scheduler=self.add_to_probe_scheduler,
+Line 1397: Missing method `add_to_probe_scheduler` referenced in: add_to_probe_scheduler=self.add_to_probe_scheduler,
+```
+
+**Fix Patterns:**
+
+| Issue | Root Cause | Fix |
+|-------|------------|-----|
+| Method doesn't exist on class | Missing implementation | Add the method to the class |
+| Method exists on base class | Scanner didn't check inheritance | Verify base class has method (no fix needed) |
+| Method was renamed/removed | Incomplete refactor | Update reference to correct method name |
+| Method should be on component | Wrong owner | Use `self._component.method` instead |
+
+**Cross-Reference with Base Classes:**
+
+When scanning, must include methods from:
+1. The class itself
+2. All parent classes in MRO
+3. Mixins
+
+```python
+# Get full method set including inheritance
+import inspect
+
+def get_all_methods(cls) -> set[str]:
+    """Get all methods including inherited."""
+    return {name for name, _ in inspect.getmembers(cls, predicate=inspect.isfunction)}
+```
+
+**Integration with Phase 3:**
+
+Add to Phase 3 scanner:
+1. After extracting method calls, ALSO extract method references
+2. Method reference = `self.X` where X is lowercase and NOT followed by `(`
+3. Verify all referenced methods exist on class or base classes
+
 ### Step 3.5i: Integration with CI/Build
 
 **Pre-commit Hook:**
