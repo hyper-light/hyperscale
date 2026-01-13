@@ -1939,9 +1939,6 @@ class ManagerServer(HealthAwareServer):
                 ),
             )
 
-    def get_peer_manager_health_states(self) -> dict[str, str]:
-        return dict(self._manager_state._peer_manager_health_states)
-
     # =========================================================================
     # State Sync
     # =========================================================================
