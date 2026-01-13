@@ -872,6 +872,198 @@ def scan_server_file(self, server_path: Path) -> None:
 
 For these cases, fall back to LSP validation.
 
+### Step 3.5h.2: Chained Method Access Validation (CRITICAL)
+
+**The Problem:**
+
+The attribute scanner validates attribute accesses (`var.attr`) but misses **method calls** on objects (`self._state.get_method()`):
+
+```python
+# CAUGHT by attribute scanner:
+registration.manager_info  # ManagerPeerRegistration has no manager_info!
+
+# MISSED by attribute scanner (method call):
+known_peers = self._manager_state.get_known_manager_peers_list()
+# ManagerState has NO method get_known_manager_peers_list()!
+# Correct method: get_known_manager_peer_values()
+```
+
+Method access bugs are equally dangerous as attribute bugs - they cause `AttributeError` at runtime.
+
+**Solution: Method Existence Validation**
+
+Extend the scanner to:
+1. Track method signatures for all classes (not just attributes)
+2. Detect chained method calls on typed objects
+3. Validate method names exist on the target type
+
+**Extended ClassInfo (already present):**
+
+```python
+@dataclass
+class ClassInfo:
+    name: str
+    attributes: Set[str]
+    properties: Set[str]
+    methods: Set[str]  # <-- Already tracked, now validate against
+    attribute_types: Dict[str, str]
+    file_path: str = ""
+    line_number: int = 0
+```
+
+**Method Call Pattern Detection:**
+
+```python
+def _check_method_calls(
+    self,
+    line_num: int,
+    line: str,
+    instance_types: Dict[str, str],  # Maps self._x -> Type
+    file_path: str
+) -> None:
+    """Validate method calls like self._manager_state.get_method()."""
+    
+    # Pattern: self._instance.method_name(
+    for match in re.finditer(r'self\.(_\w+)\.(\w+)\s*\(', line):
+        instance_name, method_name = match.groups()
+        
+        # Skip if instance type unknown
+        if instance_name not in instance_types:
+            continue
+        
+        instance_type = instance_types[instance_name]
+        if instance_type not in self.classes:
+            continue
+        
+        class_info = self.classes[instance_type]
+        all_callables = class_info.methods | class_info.properties
+        
+        # Properties can be called if they return callables, but usually not
+        # Focus on methods
+        if method_name not in class_info.methods:
+            self.violations.append((
+                line_num,
+                f"self.{instance_name}.{method_name}()",
+                method_name,
+                instance_type,
+                file_path,
+                "method"  # New: violation type
+            ))
+```
+
+**Instance Type Mapping (Manual Configuration):**
+
+Since `self._manager_state` type isn't always inferrable from code, maintain explicit mappings:
+
+```python
+# Instance type mappings for server classes
+INSTANCE_TYPE_MAPPINGS = {
+    # Manager server
+    '_manager_state': 'ManagerState',
+    '_job_manager': 'JobManager',
+    '_worker_pool': 'WorkerPool',
+    '_windowed_stats': 'WindowedStatsCollector',
+    '_rate_limiter': 'ServerRateLimiter',
+    
+    # Gate server  
+    '_gate_state': 'GateState',
+    '_job_manager': 'JobManager',
+    '_dc_health_monitor': 'FederatedHealthMonitor',
+    '_modular_state': 'ModularGateState',
+}
+```
+
+**Extracting Methods from Non-Dataclass Classes:**
+
+```python
+def _extract_class_info(self, node: ast.ClassDef, file_path: str) -> ClassInfo:
+    methods = set()
+    
+    for item in node.body:
+        if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            # Include all public methods and common patterns
+            if not item.name.startswith('_') or item.name.startswith('__'):
+                methods.add(item.name)
+            # Also include "get_", "set_", "is_", "has_" private methods
+            # as these are common accessor patterns
+            elif any(item.name.startswith(f'_{p}') for p in ['get_', 'set_', 'is_', 'has_', 'iter_']):
+                # Store without leading underscore for matching
+                # Actually store with underscore since that's how it's called
+                pass
+            # Store ALL methods for validation
+            methods.add(item.name)
+    
+    return ClassInfo(name=node.name, methods=methods, ...)
+```
+
+**Example Detection:**
+
+```
+# Input code:
+known_peers = self._manager_state.get_known_manager_peers_list()
+
+# Scanner output:
+✗ Found 1 method access violation(s):
+
+| Line | Call | Invalid Method | On Type | File |
+|------|------|----------------|---------|------|
+| 2585 | `self._manager_state.get_known_manager_peers_list()` | `get_known_manager_peers_list` | `ManagerState` | server.py |
+
+### Available Methods on ManagerState:
+`get_known_manager_peer`, `get_known_manager_peer_values`, `get_worker`, `get_workers`, 
+`set_worker`, `remove_worker`, `get_job_leader`, `set_job_leader`, ...
+
+### Did you mean: `get_known_manager_peer_values()`?
+```
+
+**Fuzzy Matching for Suggestions:**
+
+```python
+def _suggest_similar_method(self, invalid_method: str, class_info: ClassInfo) -> str | None:
+    """Suggest similar method name using edit distance."""
+    from difflib import get_close_matches
+    
+    candidates = list(class_info.methods)
+    matches = get_close_matches(invalid_method, candidates, n=1, cutoff=0.6)
+    return matches[0] if matches else None
+```
+
+**Integration with Main Scanner:**
+
+```python
+def scan_server_file(self, server_path: Path) -> None:
+    with open(server_path) as f:
+        lines = f.readlines()
+    
+    var_types: Dict[str, str] = {}
+    
+    for line_num, line in enumerate(lines, 1):
+        self._update_var_types(line, var_types)
+        
+        # Attribute validation
+        self._check_attribute_accesses(line_num, line, var_types, str(server_path))
+        self._check_chained_accesses(line_num, line, var_types, str(server_path))
+        
+        # NEW: Method call validation
+        self._check_method_calls(line_num, line, INSTANCE_TYPE_MAPPINGS, str(server_path))
+```
+
+**NO SHORTCUTS Principle Applies:**
+
+When a method doesn't exist:
+- **DO NOT** add a proxy method that wraps direct state access
+- **DO NOT** change the call to use a "close enough" method with different semantics
+- **DO** find the correct method that provides the needed data
+- **DO** add the method to the class if it genuinely doesn't exist and is needed
+
+**Common Fixes:**
+
+| Invalid Call | Correct Call | Reason |
+|--------------|--------------|--------|
+| `get_known_manager_peers_list()` | `get_known_manager_peer_values()` | Typo - "peers" vs "peer" |
+| `get_job_status()` | `get_job().status` | Method doesn't exist, use attribute |
+| `iter_active_workers()` | `get_workers().values()` | Different iteration pattern |
+
 ### Step 3.5i: Integration with CI/Build
 
 **Pre-commit Hook:**
