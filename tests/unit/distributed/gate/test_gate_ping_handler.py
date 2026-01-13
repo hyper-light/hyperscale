@@ -471,7 +471,7 @@ class TestGatePingHandlerStateConsistency:
     async def test_state_changes_during_ping(self):
         """Handler handles state changes during ping processing."""
         state = GateRuntimeState()
-        state.add_active_peer(("10.0.0.1", 9000))
+        await state.add_active_peer(("10.0.0.1", 9000))
 
         handler = GatePingHandler(
             state=state,
@@ -490,8 +490,8 @@ class TestGatePingHandlerStateConsistency:
         # Modify state while processing
         async def modify_state():
             await asyncio.sleep(0.001)
-            state.add_active_peer(("10.0.0.2", 9000))
-            state.remove_active_peer(("10.0.0.1", 9000))
+            await state.add_active_peer(("10.0.0.2", 9000))
+            await state.remove_active_peer(("10.0.0.1", 9000))
 
         async def handle_ping():
             return await handler.handle_ping(
