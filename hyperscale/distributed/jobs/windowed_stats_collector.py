@@ -123,22 +123,26 @@ class WindowedStatsCollector:
         self,
         worker_id: str,
         progress: WorkflowProgress,
-    ) -> None:
-        """
-        Add a progress update to the appropriate time window.
-
-        The progress is bucketed by its collected_at timestamp.
-        Multiple updates from the same worker in the same window
-        will overwrite (latest wins).
-
-        Args:
-            worker_id: Unique identifier for the worker sending this update.
-            progress: The workflow progress update.
-        """
+    ) -> bool:
         bucket_num = self._get_bucket_number(progress.collected_at)
         key = (progress.job_id, progress.workflow_id, bucket_num)
+        dedup_key = (
+            worker_id,
+            progress.job_id,
+            progress.workflow_id,
+            progress.collected_at,
+        )
 
         async with self._lock:
+            now = time.time()
+            self._cleanup_seen_updates(now)
+
+            if dedup_key in self._seen_updates:
+                self._metrics.duplicates_detected += 1
+                return False
+
+            self._seen_updates[dedup_key] = now
+
             if key not in self._buckets:
                 window_start = bucket_num * self._window_size_ms / 1000
                 window_end = (bucket_num + 1) * self._window_size_ms / 1000
@@ -149,11 +153,18 @@ class WindowedStatsCollector:
                     workflow_id=progress.workflow_id,
                     workflow_name=progress.workflow_name,
                     worker_stats={},
-                    created_at=time.time(),
+                    created_at=now,
                 )
 
             self._buckets[key].worker_stats[worker_id] = progress
             self._metrics.stats_recorded += 1
+            return True
+
+    def _cleanup_seen_updates(self, now: float) -> None:
+        cutoff = now - self._dedup_window_seconds
+        expired_keys = [k for k, v in self._seen_updates.items() if v < cutoff]
+        for k in expired_keys:
+            del self._seen_updates[k]
 
     async def flush_closed_windows(
         self,
@@ -419,8 +430,8 @@ class WindowedStatsCollector:
 
         return results
 
-    async def record(self, worker_id: str, progress: WorkflowProgress) -> None:
-        await self.add_progress(worker_id, progress)
+    async def record(self, worker_id: str, progress: WorkflowProgress) -> bool:
+        return await self.add_progress(worker_id, progress)
 
     def get_metrics(self) -> WindowedStatsMetrics:
         return self._metrics
