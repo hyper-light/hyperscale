@@ -2366,7 +2366,7 @@ class ManagerServer(HealthAwareServer):
         )
 
         await self._handle_worker_failure(worker_id)
-        self._manager_state._worker_deadlines.pop(worker_id, None)
+        self._manager_state.clear_worker_deadline(worker_id)
 
         if self._worker_disseminator:
             await self._worker_disseminator.broadcast_worker_dead(worker_id, "evicted")
