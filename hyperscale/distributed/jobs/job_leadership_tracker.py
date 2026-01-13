@@ -31,7 +31,7 @@ from typing import Generic, TypeVar
 # Type variable for the metadata associated with each job's leadership
 # For managers: layer_version (int)
 # For gates: target_dc_count (int)
-T = TypeVar('T')
+T = TypeVar("T")
 
 
 @dataclass(slots=True)
@@ -44,6 +44,7 @@ class JobLeadership:
         leader_addr: TCP address (host, port) of the leader
         fencing_token: Monotonic token for consistency (higher = newer epoch)
     """
+
     leader_id: str
     leader_addr: tuple[str, int]
     fencing_token: int
@@ -63,6 +64,7 @@ class DCManagerLeadership:
         manager_addr: TCP address (host, port) of the manager
         fencing_token: Monotonic token for consistency (higher = newer epoch)
     """
+
     manager_id: str
     manager_addr: tuple[str, int]
     fencing_token: int
@@ -123,7 +125,9 @@ class JobLeadershipTracker(Generic[T]):
 
     # Per-DC manager tracking (for gates)
     # job_id -> {dc_id -> DCManagerLeadership}
-    _dc_managers: dict[str, dict[str, DCManagerLeadership]] = field(default_factory=dict)
+    _dc_managers: dict[str, dict[str, DCManagerLeadership]] = field(
+        default_factory=dict
+    )
 
     # Asyncio lock for concurrent access (initialized in __post_init__)
     _lock: asyncio.Lock = field(init=False, repr=False, compare=False)
@@ -131,7 +135,7 @@ class JobLeadershipTracker(Generic[T]):
     def __post_init__(self) -> None:
         """Initialize non-field attributes after dataclass init."""
         # Create lock as instance attribute (can't use default_factory with Lock)
-        object.__setattr__(self, '_lock', asyncio.Lock())
+        object.__setattr__(self, "_lock", asyncio.Lock())
 
     # =========================================================================
     # Async Methods (with lock for concurrent safety)
@@ -235,7 +239,9 @@ class JobLeadershipTracker(Generic[T]):
             True if update was accepted, False if rejected (stale token)
         """
         async with self._lock:
-            return self._update_dc_manager(job_id, dc_id, manager_id, manager_addr, fencing_token)
+            return self._update_dc_manager(
+                job_id, dc_id, manager_id, manager_addr, fencing_token
+            )
 
     def _update_dc_manager(
         self,
@@ -324,8 +330,7 @@ class JobLeadershipTracker(Generic[T]):
         """
         dc_managers = self._dc_managers.get(job_id, {})
         return {
-            dc_id: leadership.manager_addr
-            for dc_id, leadership in dc_managers.items()
+            dc_id: leadership.manager_addr for dc_id, leadership in dc_managers.items()
         }
 
     async def release_dc_managers_async(self, job_id: str) -> None:
@@ -509,8 +514,18 @@ class JobLeadershipTracker(Generic[T]):
         return result
 
     def get_all_jobs(self) -> list[str]:
-        """Get all job IDs we're tracking (led by us or others)."""
         return list(self._leaderships.keys())
+
+    def get_all_leaderships(self) -> list[tuple[str, str, tuple[str, int], int]]:
+        return [
+            (
+                job_id,
+                leadership.leader_id,
+                leadership.leader_addr,
+                leadership.fencing_token,
+            )
+            for job_id, leadership in self._leaderships.items()
+        ]
 
     def get_jobs_led_by(self, node_id: str) -> list[str]:
         """Get all job IDs led by a specific node."""
@@ -528,7 +543,9 @@ class JobLeadershipTracker(Generic[T]):
             if leadership.leader_addr == addr
         ]
 
-    def to_snapshot(self) -> tuple[
+    def to_snapshot(
+        self,
+    ) -> tuple[
         dict[str, str],  # job_leaders
         dict[str, tuple[str, int]],  # job_leader_addrs
         dict[str, int],  # job_fencing_tokens
