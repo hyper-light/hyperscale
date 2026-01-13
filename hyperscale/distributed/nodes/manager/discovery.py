@@ -36,19 +36,19 @@ class ManagerDiscoveryCoordinator:
         config: "ManagerConfig",
         logger: "Logger",
         node_id: str,
-        task_runner,
-        env,
+        task_runner: "TaskRunner",
+        env: "Env",
         worker_discovery: "DiscoveryService | None" = None,
         peer_discovery: "DiscoveryService | None" = None,
     ) -> None:
         from hyperscale.distributed.discovery import DiscoveryService
 
-        self._state = state
-        self._config = config
-        self._logger = logger
-        self._node_id = node_id
-        self._task_runner = task_runner
-        self._env = env
+        self._state: "ManagerState" = state
+        self._config: "ManagerConfig" = config
+        self._logger: "Logger" = logger
+        self._node_id: str = node_id
+        self._task_runner: "TaskRunner" = task_runner
+        self._env: "Env" = env
 
         # Initialize discovery services if not provided
         if worker_discovery is None:
