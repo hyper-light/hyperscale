@@ -580,9 +580,10 @@ class AdaptiveRateLimiter:
         client_id: str,
         operation: str,
     ) -> SlidingWindowCounter:
-        """Get or create a counter for the client/operation combination."""
         async with self._counter_creation_lock:
             if client_id not in self._operation_counters:
+                if len(self._operation_counters) >= self._config.max_tracked_clients:
+                    await self._evict_oldest_client()
                 self._operation_counters[client_id] = {}
 
             counters = self._operation_counters[client_id]
@@ -594,6 +595,19 @@ class AdaptiveRateLimiter:
                 )
 
             return counters[operation]
+
+    async def _evict_oldest_client(self) -> None:
+        if not self._client_last_activity:
+            return
+        oldest_client = min(
+            self._client_last_activity.keys(),
+            key=lambda client_id: self._client_last_activity.get(
+                client_id, float("inf")
+            ),
+        )
+        self._operation_counters.pop(oldest_client, None)
+        self._client_stress_counters.pop(oldest_client, None)
+        self._client_last_activity.pop(oldest_client, None)
 
     async def _get_or_create_stress_counter(
         self,
