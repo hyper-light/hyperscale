@@ -167,7 +167,7 @@ class TestWorkerCancellationHandlerCancelWorkflow:
 
         # Mock task runner cancel
         task_runner_cancel = AsyncMock()
-        increment_version = MagicMock()
+        increment_version = AsyncMock()
 
         success, errors = await handler.cancel_workflow(
             workflow_id="wf-1",
@@ -189,7 +189,7 @@ class TestWorkerCancellationHandlerCancelWorkflow:
 
         # No token set
         task_runner_cancel = AsyncMock()
-        increment_version = MagicMock()
+        increment_version = AsyncMock()
 
         success, errors = await handler.cancel_workflow(
             workflow_id="wf-unknown",
@@ -281,7 +281,7 @@ class TestWorkerCancellationHandlerWithRemoteManager:
         handler.set_remote_manager(remote_manager)
 
         task_runner_cancel = AsyncMock()
-        increment_version = MagicMock()
+        increment_version = AsyncMock()
 
         success, errors = await handler.cancel_workflow(
             workflow_id="wf-1",
@@ -310,7 +310,7 @@ class TestWorkerCancellationHandlerWithRemoteManager:
         handler.set_remote_manager(remote_manager)
 
         task_runner_cancel = AsyncMock()
-        increment_version = MagicMock()
+        increment_version = AsyncMock()
 
         success, errors = await handler.cancel_workflow(
             workflow_id="wf-1",
@@ -338,7 +338,7 @@ class TestWorkerCancellationHandlerWithRemoteManager:
         handler.set_remote_manager(remote_manager)
 
         task_runner_cancel = AsyncMock()
-        increment_version = MagicMock()
+        increment_version = AsyncMock()
 
         success, errors = await handler.cancel_workflow(
             workflow_id="wf-1",
@@ -571,7 +571,7 @@ class TestWorkerCancellationHandlerConcurrency:
             handler.create_cancel_event(f"wf-{i}")
 
         task_runner_cancel = AsyncMock()
-        increment_version = MagicMock()
+        increment_version = AsyncMock()
 
         async def cancel_one(workflow_id: str):
             return await handler.cancel_workflow(
@@ -634,7 +634,7 @@ class TestWorkerCancellationHandlerEdgeCases:
         handler.create_cancel_event("wf-1")
 
         task_runner_cancel = AsyncMock()
-        increment_version = MagicMock()
+        increment_version = AsyncMock()
 
         success, errors = await handler.cancel_workflow(
             workflow_id="wf-1",
@@ -687,7 +687,7 @@ class TestWorkerCancellationHandlerFailureModes:
 
         # Task runner that fails
         task_runner_cancel = AsyncMock(side_effect=RuntimeError("Task failed"))
-        increment_version = MagicMock()
+        increment_version = AsyncMock()
 
         success, errors = await handler.cancel_workflow(
             workflow_id="wf-1",
