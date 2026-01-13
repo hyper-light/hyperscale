@@ -69,6 +69,7 @@ class GatePeerCoordinator:
         get_udp_port: Callable[[], int],
         confirm_peer: Callable[[tuple[str, int]], None],
         handle_job_leader_failure: Callable[[tuple[str, int]], "asyncio.Task"],
+        is_leader: Callable[[], bool] | None = None,
     ) -> None:
         """
         Initialize the peer coordinator.
@@ -111,6 +112,7 @@ class GatePeerCoordinator:
         self._get_udp_port = get_udp_port
         self._confirm_peer = confirm_peer
         self._handle_job_leader_failure = handle_job_leader_failure
+        self._is_leader = is_leader or (lambda: False)
 
     async def on_peer_confirmed(self, peer: tuple[str, int]) -> None:
         """
