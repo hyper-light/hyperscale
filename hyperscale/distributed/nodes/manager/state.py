@@ -836,6 +836,11 @@ class ManagerState:
     def get_healthy_gate_ids(self) -> set[str]:
         return self._healthy_gate_ids
 
+    def get_first_healthy_gate_id(self) -> str | None:
+        for gate_id in self._healthy_gate_ids:
+            return gate_id
+        return None
+
     def add_healthy_gate_id(self, gate_id: str) -> None:
         self._healthy_gate_ids.add(gate_id)
 

@@ -1107,11 +1107,10 @@ class ManagerServer(HealthAwareServer):
         if gate_node_id:
             self._registry.mark_gate_unhealthy(gate_node_id)
 
-            if self._manager_state._primary_gate_id == gate_node_id:
-                self._manager_state._primary_gate_id = None
-                for healthy_id in self._manager_state._healthy_gate_ids:
-                    self._manager_state._primary_gate_id = healthy_id
-                    break
+            if self._manager_state.primary_gate_id == gate_node_id:
+                self._manager_state.set_primary_gate_id(
+                    self._manager_state.get_first_healthy_gate_id()
+                )
 
     async def _handle_gate_peer_recovery(
         self,
