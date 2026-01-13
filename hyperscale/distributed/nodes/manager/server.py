@@ -1102,7 +1102,7 @@ class ManagerServer(HealthAwareServer):
         """Handle gate peer failure."""
         # Find gate by address
         gate_node_id = None
-        for gate_id, gate_info in self._manager_state._known_gates.items():
+        for gate_id, gate_info in self._manager_state.iter_known_gates():
             if (gate_info.tcp_host, gate_info.tcp_port) == tcp_addr:
                 gate_node_id = gate_id
                 break
