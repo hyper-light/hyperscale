@@ -551,3 +551,123 @@ class WorkerProgressReporter:
 
         except Exception:
             pass
+
+    def _enqueue_pending_result(self, final_result: WorkflowFinalResult) -> None:
+        now = time.monotonic()
+        pending = PendingResult(
+            final_result=final_result,
+            enqueued_at=now,
+            retry_count=0,
+            next_retry_at=now + self.RESULT_RETRY_BASE_DELAY,
+        )
+        self._pending_results.append(pending)
+
+    async def retry_pending_results(
+        self,
+        send_tcp: callable,
+        node_host: str,
+        node_port: int,
+        node_id_short: str,
+        task_runner_run: callable,
+    ) -> int:
+        """
+        Retry sending pending results. Returns number of results removed (sent or expired).
+
+        Should be called periodically from a background loop.
+        """
+        now = time.monotonic()
+        sent_count = 0
+        expired_count = 0
+        still_pending: list[PendingResult] = []
+
+        while self._pending_results:
+            pending = self._pending_results.popleft()
+
+            age = now - pending.enqueued_at
+            if age > self.RESULT_TTL_SECONDS:
+                expired_count += 1
+                if self._logger:
+                    task_runner_run(
+                        self._logger.log,
+                        ServerError(
+                            message=f"Dropped expired result for {pending.final_result.workflow_id} after {age:.1f}s",
+                            node_host=node_host,
+                            node_port=node_port,
+                            node_id=node_id_short,
+                        ),
+                    )
+                continue
+
+            if pending.retry_count >= self.MAX_RESULT_RETRIES:
+                expired_count += 1
+                if self._logger:
+                    task_runner_run(
+                        self._logger.log,
+                        ServerError(
+                            message=f"Dropped result for {pending.final_result.workflow_id} after {pending.retry_count} retries",
+                            node_host=node_host,
+                            node_port=node_port,
+                            node_id=node_id_short,
+                        ),
+                    )
+                continue
+
+            if now < pending.next_retry_at:
+                still_pending.append(pending)
+                continue
+
+            sent = await self._try_send_pending_result(
+                pending.final_result,
+                send_tcp,
+                node_host,
+                node_port,
+                node_id_short,
+            )
+
+            if sent:
+                sent_count += 1
+            else:
+                pending.retry_count += 1
+                backoff = self.RESULT_RETRY_BASE_DELAY * (2**pending.retry_count)
+                pending.next_retry_at = now + min(backoff, 60.0)
+                still_pending.append(pending)
+
+        for item in still_pending:
+            self._pending_results.append(item)
+
+        return sent_count + expired_count
+
+    async def _try_send_pending_result(
+        self,
+        final_result: WorkflowFinalResult,
+        send_tcp: callable,
+        node_host: str,
+        node_port: int,
+        node_id_short: str,
+    ) -> bool:
+        for manager_id in list(self._registry._healthy_manager_ids):
+            if self._registry.is_circuit_open(manager_id):
+                continue
+
+            if not (manager := self._registry.get_manager(manager_id)):
+                continue
+
+            manager_addr = (manager.tcp_host, manager.tcp_port)
+            try:
+                response, _ = await send_tcp(
+                    manager_addr,
+                    "workflow_final_result",
+                    final_result.dump(),
+                    timeout=5.0,
+                )
+                if response and isinstance(response, bytes) and response != b"error":
+                    self._registry.get_or_create_circuit(manager_id).record_success()
+                    return True
+            except Exception:
+                self._registry.get_or_create_circuit(manager_id).record_error()
+                continue
+
+        return False
+
+    def get_pending_result_count(self) -> int:
+        return len(self._pending_results)
