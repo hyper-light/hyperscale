@@ -545,7 +545,7 @@ class ManagerServer(HealthAwareServer):
             get_state_version=lambda: self._manager_state._state_version,
             get_active_jobs=lambda: self._job_manager.job_count,
             get_active_workflows=self._get_active_workflow_count,
-            get_worker_count=lambda: len(self._manager_state._workers),
+            get_worker_count=self._manager_state.get_worker_count,
             get_healthy_worker_count=lambda: len(
                 self._registry.get_healthy_worker_ids()
             ),
@@ -1203,7 +1203,7 @@ class ManagerServer(HealthAwareServer):
         self._health_monitor.handle_worker_heartbeat(heartbeat, source_addr)
 
         worker_id = heartbeat.node_id
-        if worker_id in self._manager_state._workers:
+        if self._manager_state.has_worker(worker_id):
             await self._worker_pool.process_heartbeat(worker_id, heartbeat)
 
     async def _handle_manager_peer_heartbeat(
@@ -1365,7 +1365,7 @@ class ManagerServer(HealthAwareServer):
                 if not should_scan:
                     continue
 
-                for worker_id, worker in list(self._manager_state._workers.items()):
+                for worker_id, worker in self._manager_state.iter_workers():
                     try:
                         worker_addr = (worker.node.host, worker.node.tcp_port)
 
@@ -1948,7 +1948,7 @@ class ManagerServer(HealthAwareServer):
 
     async def _sync_state_from_workers(self) -> None:
         """Sync state from all workers."""
-        for worker_id, worker in self._manager_state._workers.items():
+        for worker_id, worker in self._manager_state.iter_workers():
             try:
                 request = StateSyncRequest(
                     requester_id=self._node_id.full,
@@ -1967,11 +1967,12 @@ class ManagerServer(HealthAwareServer):
                     sync_response = StateSyncResponse.load(response)
                     if sync_response.worker_state and sync_response.responder_ready:
                         worker_snapshot = sync_response.worker_state
-                        if worker_id in self._manager_state._workers:
-                            worker_reg = self._manager_state._workers[worker_id]
-                            worker_reg.node.available_cores = (
-                                worker_snapshot.available_cores
-                            )
+                        if self._manager_state.has_worker(worker_id):
+                            worker_reg = self._manager_state.get_worker(worker_id)
+                            if worker_reg:
+                                worker_reg.node.available_cores = (
+                                    worker_snapshot.available_cores
+                                )
 
             except Exception as error:
                 await self._udp_logger.log(
@@ -2079,7 +2080,9 @@ class ManagerServer(HealthAwareServer):
 
     def _get_total_cores(self) -> int:
         """Get total cores across all workers."""
-        return sum(w.total_cores for w in self._manager_state._workers.values())
+        return sum(
+            w.total_cores for w in self._manager_state.get_all_workers().values()
+        )
 
     def _get_job_worker_count(self, job_id: str) -> int:
         """Get number of unique workers assigned to a job's sub-workflows."""
