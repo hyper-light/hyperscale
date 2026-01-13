@@ -107,7 +107,7 @@ discovered during systematic tracing of SCENARIOS.md test scenarios through the 
 **Location**: `gate/server.py:1939, 2516`
 **Issue**: Only `record_failure()` called, never `record_success()`.
 **Impact**: Circuits get stuck OPEN forever, healthy managers excluded.
-**Status**: TODO
+**Status**: FIXED - `record_success(manager_addr)` called on manager heartbeat at line 2422
 
 #### C3: Missing Partition Callback Invocation (HIGH)
 **Location**: `datacenters/cross_dc_correlation.py`
