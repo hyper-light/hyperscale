@@ -660,7 +660,6 @@ class TestWorkerExecutorEdgeCases:
         state = MockWorkerState()
         executor = WorkerExecutor(allocator, logger, state)
 
-        executor.record_throughput_event(-1.0)
+        await executor.record_throughput_event(-1.0)
 
         assert len(state._completion_times) == 1
-        # Negative values are allowed (edge case)
