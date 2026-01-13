@@ -3664,13 +3664,12 @@ class ManagerServer(HealthAwareServer):
                     retry_after_seconds=rate_limit_result.retry_after_seconds,
                 ).dump()
 
-            # Load shedding check (AD-22)
             if self._load_shedder.should_shed("JobSubmission"):
-                overload_state = self._load_shedder.get_current_state()
+                overload_state = self._load_shedder.get_overload_state()
                 return JobAck(
                     job_id="",
                     accepted=False,
-                    error=f"System under load ({overload_state.value}), please retry later",
+                    error=f"System under load ({overload_state}), please retry later",
                     protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
                     protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
                 ).dump()
