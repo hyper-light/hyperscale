@@ -2187,8 +2187,8 @@ class ManagerServer(HealthAwareServer):
             node_id=self._node_id.full,
             datacenter=self._node_id.datacenter,
             is_leader=self.is_leader(),
-            state=self._manager_state._manager_state.value,
-            worker_count=len(self._manager_state._workers),
+            state=self._manager_state.manager_state_enum.value,
+            worker_count=self._manager_state.get_worker_count(),
             healthy_worker_count=len(self._registry.get_healthy_worker_ids()),
             available_cores=self._get_available_cores_for_healthy_workers(),
             total_cores=self._get_total_cores(),
@@ -3049,10 +3049,10 @@ class ManagerServer(HealthAwareServer):
             # Build state snapshot
             snapshot = ManagerStateSnapshot(
                 node_id=self._node_id.full,
-                state_version=self._manager_state._state_version,
-                manager_state=self._manager_state._manager_state.value,
+                state_version=self._manager_state.state_version,
+                manager_state=self._manager_state.manager_state_enum.value,
                 job_count=self._job_manager.job_count,
-                worker_count=len(self._manager_state._workers),
+                worker_count=self._manager_state.get_worker_count(),
             )
 
             return StateSyncResponse(
@@ -3243,15 +3243,15 @@ class ManagerServer(HealthAwareServer):
                     available_cores=worker.available_cores,
                     total_cores=worker.total_cores,
                 )
-                for worker_id, worker in self._manager_state._workers.items()
+                for worker_id, worker in self._manager_state.iter_workers()
             ]
 
             response = ManagerPingResponse(
                 manager_id=self._node_id.full,
                 is_leader=self.is_leader(),
-                state=self._manager_state._manager_state.value,
-                state_version=self._manager_state._state_version,
-                worker_count=len(self._manager_state._workers),
+                state=self._manager_state.manager_state_enum.value,
+                state_version=self._manager_state.state_version,
+                worker_count=self._manager_state.get_worker_count(),
                 healthy_worker_count=self._health_monitor.get_healthy_worker_count(),
                 active_job_count=self._job_manager.job_count,
                 workers=worker_statuses,
@@ -3387,7 +3387,7 @@ class ManagerServer(HealthAwareServer):
             worker_id = broadcast.worker_id
 
             # Skip if already registered
-            if worker_id in self._manager_state._workers:
+            if self._manager_state.has_worker(worker_id):
                 return b"ok"
 
             # Schedule direct registration with the worker
@@ -4501,7 +4501,7 @@ class ManagerServer(HealthAwareServer):
     ) -> None:
         """Register a discovered worker from peer manager gossip."""
         worker_id = worker_snapshot.node_id
-        if worker_id in self._manager_state._workers:
+        if self._manager_state.has_worker(worker_id):
             return
 
         node_info = NodeInfo(
