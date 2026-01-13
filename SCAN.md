@@ -1486,7 +1486,9 @@ grep "final_status = " callee_method.py
 
 If found, this is likely a semantic divergence bug.
 
-### Step 5.8e: Fix Patterns
+### Step 5.8e: Fix Patterns (NO SHORTCUTS)
+
+**NO SHORTCUTS**: Do not delete the computation and hope it wasn't needed. Do not add a comment saying "TODO: wire this up later". Fix the data flow correctly.
 
 | Issue | Fix |
 |-------|-----|
@@ -1502,9 +1504,11 @@ If found, this is likely a semantic divergence bug.
 
 ---
 
-## Phase 5.9: Cyclomatic Complexity Scanning and Validation
+## Phase 5.9: Cyclomatic Complexity Scanning and Validation (NO SHORTCUTS)
 
 **Objective**: Systematically scan ALL methods/functions for cyclomatic complexity violations and fix them.
+
+**NO SHORTCUTS**: Do not reduce complexity by deleting error handling, removing edge cases, or stubbing out logic. Extract to well-named helper methods that preserve all behavior.
 
 ### The Problem
 
