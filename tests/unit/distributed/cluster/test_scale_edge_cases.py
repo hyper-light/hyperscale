@@ -1763,17 +1763,18 @@ class TestBackpressurePropagation:
         # Should immediately recover
         assert shedder.should_shed("SubmitJob") is False
 
-    def test_rate_limit_backpressure_signal(self):
+    @pytest.mark.asyncio
+    async def test_rate_limit_backpressure_signal(self):
         """Test rate limit response provides useful backpressure signal."""
         config = RateLimitConfig(default_bucket_size=5, default_refill_rate=1.0)
         limiter = ServerRateLimiter(config)
 
         # Exhaust bucket
         for _ in range(5):
-            limiter.check_rate_limit("client-1", "operation")
+            await limiter.check_rate_limit("client-1", "operation")
 
         # Next request should provide retry_after
-        result = limiter.check_rate_limit("client-1", "operation")
+        result = await limiter.check_rate_limit("client-1", "operation")
         assert result.allowed is False
         assert result.retry_after_seconds > 0
 
@@ -1802,26 +1803,28 @@ class TestBackpressurePropagation:
 class TestMetricCardinalityExplosion:
     """Tests for metric cardinality explosion scenarios."""
 
-    def test_rate_limiter_many_unique_clients(self):
+    @pytest.mark.asyncio
+    async def test_rate_limiter_many_unique_clients(self):
         """Test rate limiter with many unique client IDs."""
         limiter = ServerRateLimiter(inactive_cleanup_seconds=60.0)
 
         # Create many unique clients (simulating high cardinality)
         for i in range(10000):
-            limiter.check_rate_limit(f"client-{i}", "operation")
+            await limiter.check_rate_limit(f"client-{i}", "operation")
 
         metrics = limiter.get_metrics()
         assert metrics["active_clients"] == 10000
 
         # Memory usage should be bounded per client
 
-    def test_rate_limiter_many_unique_operations(self):
+    @pytest.mark.asyncio
+    async def test_rate_limiter_many_unique_operations(self):
         """Test rate limiter with many unique operation types."""
         limiter = ServerRateLimiter()
 
         # Single client, many operations
         for i in range(1000):
-            limiter.check_rate_limit("client-1", f"operation-{i}")
+            await limiter.check_rate_limit("client-1", f"operation-{i}")
 
         # Check that client has many counters (via AdaptiveRateLimiter)
         client_counters = limiter._adaptive._operation_counters.get("client-1", {})
