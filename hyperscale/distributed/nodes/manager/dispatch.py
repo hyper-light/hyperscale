@@ -24,7 +24,10 @@ if TYPE_CHECKING:
     from hyperscale.distributed.nodes.manager.config import ManagerConfig
     from hyperscale.distributed.nodes.manager.registry import ManagerRegistry
     from hyperscale.distributed.nodes.manager.leases import ManagerLeaseCoordinator
+    from hyperscale.distributed.taskex import TaskRunner
     from hyperscale.logging import Logger
+
+SendFunc = Callable[..., Coroutine[Any, Any, tuple[bytes, float] | None]]
 
 
 class ManagerDispatchCoordinator:
