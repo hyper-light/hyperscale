@@ -118,7 +118,7 @@ class TestDatacenterHealthManager:
         assert status.health == DatacenterHealth.UNHEALTHY.value
 
     def test_datacenter_busy(self) -> None:
-        """Test busy classification when no available capacity."""
+        """Test busy classification when capacity utilization is 75%."""
         health_mgr = DatacenterHealthManager()
 
         heartbeat = ManagerHeartbeat(
@@ -131,8 +131,8 @@ class TestDatacenterHealthManager:
             active_workflows=100,
             worker_count=4,
             healthy_worker_count=4,
-            available_cores=0,  # No capacity
-            total_cores=40,
+            available_cores=25,
+            total_cores=100,
         )
 
         health_mgr.update_manager("dc-1", ("10.0.0.1", 8080), heartbeat)
@@ -535,11 +535,19 @@ class TestLeaseManager:
         lease = manager.acquire_lease("job-123", "dc-1")
 
         # Valid token
-        assert manager.validate_fence_token("job-123", "dc-1", lease.fence_token) is True
-        assert manager.validate_fence_token("job-123", "dc-1", lease.fence_token + 1) is True
+        assert (
+            manager.validate_fence_token("job-123", "dc-1", lease.fence_token) is True
+        )
+        assert (
+            manager.validate_fence_token("job-123", "dc-1", lease.fence_token + 1)
+            is True
+        )
 
         # Invalid (stale) token
-        assert manager.validate_fence_token("job-123", "dc-1", lease.fence_token - 1) is False
+        assert (
+            manager.validate_fence_token("job-123", "dc-1", lease.fence_token - 1)
+            is False
+        )
 
     def test_cleanup_expired(self) -> None:
         """Test cleaning up expired leases."""

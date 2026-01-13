@@ -551,19 +551,14 @@ class WorkerPool:
                                 0, worker.reserved_cores - cores
                             )
 
-                self._cores_available.clear()
-                should_wait = True
-
-            # Wait for cores to become available (outside lock)
-            if should_wait:
                 remaining = timeout - elapsed
                 try:
                     await asyncio.wait_for(
-                        self._cores_available.wait(),
-                        timeout=min(5.0, remaining),  # Check every 5s max
+                        self._cores_condition.wait(),
+                        timeout=min(5.0, remaining),
                     )
                 except asyncio.TimeoutError:
-                    pass  # Re-check availability
+                    pass
 
     def _select_workers_for_allocation(
         self,
