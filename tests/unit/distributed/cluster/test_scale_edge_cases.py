@@ -1517,14 +1517,15 @@ class TestDataStructureInvariants:
         shed_sum = sum(metrics["shed_by_priority"].values())
         assert shed_sum == metrics["shed_requests"]
 
-    def test_rate_limiter_metrics_consistency(self):
+    @pytest.mark.asyncio
+    async def test_rate_limiter_metrics_consistency(self):
         """Test rate limiter metrics are internally consistent."""
         config = RateLimitConfig(default_bucket_size=10, default_refill_rate=1.0)
         limiter = ServerRateLimiter(config)
 
         # Make many requests
         for i in range(100):
-            limiter.check_rate_limit(f"client-{i % 10}", "operation")
+            await limiter.check_rate_limit(f"client-{i % 10}", "operation")
 
         metrics = limiter.get_metrics()
 
