@@ -2476,10 +2476,9 @@ class GateServer(HealthAwareServer):
         )
 
     async def _update_dc_backpressure(self, dc_id: str) -> None:
-        async with self._modular_state._get_backpressure_lock():
-            self._modular_state._update_dc_backpressure_locked(
-                dc_id, self._datacenter_managers
-            )
+        await self._modular_state.recalculate_dc_backpressure(
+            dc_id, self._datacenter_managers
+        )
 
     async def _clear_manager_backpressure(self, manager_addr: tuple[str, int]) -> None:
         await self._modular_state.remove_manager_backpressure(manager_addr)

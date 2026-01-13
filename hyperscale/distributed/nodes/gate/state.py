@@ -335,6 +335,9 @@ class GateRuntimeState:
         self._cancellation_completion_events.pop(job_id, None)
         self._cancellation_errors.pop(job_id, None)
 
+    def pop_job_reporter_tasks(self, job_id: str) -> dict[str, asyncio.Task] | None:
+        return self._job_reporter_tasks.pop(job_id, None)
+
     async def record_forward(self) -> None:
         async with self._get_counter_lock():
             self._forward_throughput_count += 1
