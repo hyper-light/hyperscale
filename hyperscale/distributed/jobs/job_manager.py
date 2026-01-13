@@ -942,8 +942,9 @@ class JobManager:
             context_for_workflow: dict[str, Any] = {}
             for dependency_name in dependencies:
                 if dependency_name in job.context:
-                    dependency_context = job.context[dependency_name]
-                    context_for_workflow.update(dependency_context)
+                    workflow_context = job.context[dependency_name]
+                    for key, value in workflow_context.items():
+                        context_for_workflow[key] = value
             return context_for_workflow
 
     # =========================================================================
