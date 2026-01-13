@@ -1703,11 +1703,8 @@ class GateServer(HealthAwareServer):
                     accepted=False,
                 ).dump()
 
-            if transfer.job_id not in self._job_dc_managers:
-                self._job_dc_managers[transfer.job_id] = {}
-            self._job_dc_managers[transfer.job_id][transfer.datacenter_id] = (
-                transfer.new_manager_addr
-            )
+            job_dc_managers = self._job_dc_managers.setdefault(transfer.job_id, {})
+            job_dc_managers[transfer.datacenter_id] = transfer.new_manager_addr
 
             self._clear_orphaned_job(transfer.job_id, transfer.new_manager_addr)
 
