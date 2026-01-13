@@ -2287,12 +2287,13 @@ class TestDiagnosticsObservability:
         for field in required_fields:
             assert field in metrics, f"Missing field: {field}"
 
-    def test_rate_limiter_metrics_complete(self):
+    @pytest.mark.asyncio
+    async def test_rate_limiter_metrics_complete(self):
         """Test rate limiter metrics include all expected fields."""
         limiter = ServerRateLimiter()
 
         for i in range(10):
-            limiter.check_rate_limit(f"client-{i}", "operation")
+            await limiter.check_rate_limit(f"client-{i}", "operation")
 
         metrics = limiter.get_metrics()
 
