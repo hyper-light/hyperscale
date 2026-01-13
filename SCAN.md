@@ -201,9 +201,92 @@ For comprehensive coverage, check all domain model types used in server:
 
 3. Cross-reference with class definitions
 
+### Step 3.5g: Type-Traced Attribute Validation (Comprehensive)
+
+Phase 3.5a-f catches iteration-based bugs, but misses direct attribute access on returned objects.
+
+**The Expanded Problem:**
+
+```python
+# CAUGHT by 3.5a-f (iteration):
+for wf in job.workflows.values():
+    total += wf.completed_count  # WorkflowInfo has no completed_count
+
+# MISSED by 3.5a-f (direct access on return value):
+job = self._job_manager.get_job(job_id)
+if job.is_complete:  # JobInfo has no is_complete!
+```
+
+**Systematic Detection Approach:**
+
+1. **Extract all method calls that return domain objects:**
+   ```bash
+   grep -n "= self\._.*\.get_\|= self\._.*_manager\." server.py
+   ```
+
+2. **For each, identify the return type** from the method signature or component class:
+   ```bash
+   # In job_manager.py, find:
+   def get_job(...) -> JobInfo | None:
+   ```
+
+3. **Extract all attribute accesses on those variables:**
+   ```bash
+   # For variable 'job' returned from get_job()
+   grep -n "job\.[a-z_]*" server.py
+   ```
+
+4. **Cross-reference against the class definition:**
+
+   | Line | Variable | Access | Type | Attribute Exists? |
+   |------|----------|--------|------|-------------------|
+   | 2697 | `job` | `.is_complete` | `JobInfo` | **NO** ❌ |
+   | 2698 | `job` | `.workflows_total` | `JobInfo` | YES ✓ |
+
+**LSP-Assisted Validation (Recommended):**
+
+For each suspicious access, use LSP hover to verify:
+
+```bash
+lsp_hover(file="server.py", line=2697, character=45)
+# If attribute doesn't exist, LSP will show error or "Unknown"
+```
+
+**Common Patterns That Escape Detection:**
+
+| Pattern | Example | Why Missed |
+|---------|---------|------------|
+| Return value access | `get_job(id).status` | Not in a loop |
+| Conditional access | `if job and job.is_complete` | Walrus operator hides type |
+| Chained access | `job.token.workflow_id` | Multi-level navigation |
+| Optional access | `job.submission.origin` if submission nullable | Type narrowing complexity |
+
+**Automated Scan Script:**
+
+```python
+# Find all domain object variable assignments
+# Then find all attribute accesses on those variables
+# Cross-reference with class definitions
+
+import re
+
+# 1. Find assignments from manager/component methods
+assignments = re.findall(
+    r'(\w+)\s*=\s*self\._([\w_]+)\.(get_\w+|find_\w+)\([^)]*\)',
+    server_code
+)
+
+# 2. For each variable, find all .attribute accesses
+for var_name, component, method in assignments:
+    accesses = re.findall(rf'{var_name}\.(\w+)', server_code)
+    # 3. Verify each attribute exists on return type
+```
+
 ### Output
 
 - Zero attribute accesses on non-existent attributes
+- **Including** direct accesses on method return values
+- **Including** chained and conditional accesses
 - Data model navigation paths documented for complex aggregations
 
 ---
