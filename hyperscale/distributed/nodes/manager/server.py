@@ -2519,11 +2519,7 @@ class ManagerServer(HealthAwareServer):
                 )
 
             # Build response with known managers
-            healthy_managers = [
-                self._manager_state.get_known_manager_peer(peer_id)
-                for peer_id in self._manager_state.get_active_manager_peer_ids()
-                if self._manager_state.has_known_manager_peer(peer_id)
-            ]
+            healthy_managers = self._manager_state.get_active_known_manager_peers()
             healthy_managers.append(
                 ManagerInfo(
                     node_id=self._node_id.full,
@@ -4566,10 +4562,7 @@ class ManagerServer(HealthAwareServer):
             )
         ]
 
-        for peer_id in self._manager_state._active_manager_peer_ids:
-            peer_info = self._manager_state._known_manager_peers.get(peer_id)
-            if peer_info:
-                managers.append(peer_info)
+        managers.extend(self._manager_state.get_active_known_manager_peers())
 
         return managers
 
