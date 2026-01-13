@@ -1291,7 +1291,7 @@ class ManagerServer(HealthAwareServer):
                 )
                 workers_to_reap = [
                     worker_id
-                    for worker_id, unhealthy_since in self._manager_state._worker_unhealthy_since.items()
+                    for worker_id, unhealthy_since in self._manager_state.iter_worker_unhealthy_since()
                     if unhealthy_since < worker_reap_threshold
                 ]
                 for worker_id in workers_to_reap:
