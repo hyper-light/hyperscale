@@ -218,7 +218,9 @@ class WorkerServer(HealthAwareServer):
 
         # Negotiated capabilities (AD-25)
         self._negotiated_capabilities: NegotiatedCapabilities | None = None
-        self._node_capabilities = NodeCapabilities.current(node_version="")
+        self._node_capabilities: NodeCapabilities = NodeCapabilities.current(
+            node_version=""
+        )
 
         # Background tasks
         self._progress_flush_task: asyncio.Task | None = None
