@@ -2315,12 +2315,6 @@ class GateServer(HealthAwareServer):
         submission: JobSubmission,
         target_dcs: list[str],
     ) -> None:
-        """Dispatch job to datacenters."""
-        for datacenter_id in target_dcs:
-            self._dispatch_time_tracker.record_dispatch(
-                submission.job_id, datacenter_id
-            )
-
         if self._dispatch_coordinator:
             await self._dispatch_coordinator.dispatch_job(submission, target_dcs)
 
