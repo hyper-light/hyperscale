@@ -11,9 +11,11 @@ from typing import TYPE_CHECKING
 from hyperscale.logging.hyperscale_logging_models import ServerDebug, ServerWarning
 
 if TYPE_CHECKING:
+    from hyperscale.distributed.env import Env
     from hyperscale.distributed.nodes.manager.state import ManagerState
     from hyperscale.distributed.nodes.manager.config import ManagerConfig
     from hyperscale.distributed.discovery import DiscoveryService
+    from hyperscale.distributed.taskex import TaskRunner
     from hyperscale.logging import Logger
 
 
@@ -61,8 +63,7 @@ class ManagerDiscoveryCoordinator:
 
         if peer_discovery is None:
             peer_static_seeds = [
-                f"{host}:{port}"
-                for host, port in config.seed_managers
+                f"{host}:{port}" for host, port in config.seed_managers
             ]
             peer_config = env.get_discovery_config(
                 node_role="manager",
@@ -252,7 +253,7 @@ class ManagerDiscoveryCoordinator:
                         node_host=self._config.host,
                         node_port=self._config.tcp_port,
                         node_id=self._node_id,
-                    )
+                    ),
                 )
 
             except asyncio.CancelledError:
@@ -265,7 +266,7 @@ class ManagerDiscoveryCoordinator:
                         node_host=self._config.host,
                         node_port=self._config.tcp_port,
                         node_id=self._node_id,
-                    )
+                    ),
                 )
 
     def get_discovery_metrics(self) -> dict:
