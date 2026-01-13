@@ -39,10 +39,12 @@ class WorkerRegistry:
             recovery_jitter_max: Maximum jitter for recovery operations
             recovery_semaphore_size: Concurrent recovery limit
         """
-        self._logger = logger
-        self._recovery_jitter_min = recovery_jitter_min
-        self._recovery_jitter_max = recovery_jitter_max
-        self._recovery_semaphore = asyncio.Semaphore(recovery_semaphore_size)
+        self._logger: "Logger" = logger
+        self._recovery_jitter_min: float = recovery_jitter_min
+        self._recovery_jitter_max: float = recovery_jitter_max
+        self._recovery_semaphore: asyncio.Semaphore = asyncio.Semaphore(
+            recovery_semaphore_size
+        )
 
         # Manager tracking
         self._known_managers: dict[str, ManagerInfo] = {}
