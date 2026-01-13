@@ -1157,11 +1157,10 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
     # State embedding is handled via composition (StateEmbedder protocol).
     # Node types (Worker, Manager, Gate) inject their own embedder implementation.
 
-    # Piggyback separators - all use consistent #|x pattern
-    # This avoids conflicts since we search for the full 3-byte marker
-    _STATE_SEPARATOR = b"#|s"  # State piggyback: #|sbase64...
-    _MEMBERSHIP_SEPARATOR = b"#|m"  # Membership piggyback: #|mtype:inc:host:port...
-    _HEALTH_SEPARATOR = b"#|h"  # Health piggyback: #|hentry1;entry2...
+    _STATE_SEPARATOR = b"#|s"
+    _MEMBERSHIP_SEPARATOR = b"#|m"
+    _HEALTH_SEPARATOR = b"#|h"
+    _WORKER_STATE_SEPARATOR = b"#|w"
 
     def set_state_embedder(self, embedder: StateEmbedder) -> None:
         """
