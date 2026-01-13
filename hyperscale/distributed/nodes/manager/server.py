@@ -2128,7 +2128,7 @@ class ManagerServer(HealthAwareServer):
 
     def _get_known_gates_for_heartbeat(self) -> list[GateInfo]:
         """Get known gates for heartbeat embedding."""
-        return list(self._manager_state._known_gates.values())
+        return self._manager_state.get_known_gate_values()
 
     def _get_job_leaderships_for_heartbeat(self) -> list[str]:
         """Get job leaderships for heartbeat embedding."""
@@ -2205,10 +2205,11 @@ class ManagerServer(HealthAwareServer):
 
     def _get_healthy_gate_tcp_addrs(self) -> list[tuple[str, int]]:
         """Get TCP addresses of healthy gates."""
+        healthy_gate_ids = self._manager_state.get_healthy_gate_ids()
         return [
             (gate.tcp_host, gate.tcp_port)
-            for gate_id, gate in self._manager_state._known_gates.items()
-            if gate_id in self._manager_state._healthy_gate_ids
+            for gate_id, gate in self._manager_state.iter_known_gates()
+            if gate_id in healthy_gate_ids
         ]
 
     def _get_worker_state_piggyback(self, max_size: int) -> bytes:
