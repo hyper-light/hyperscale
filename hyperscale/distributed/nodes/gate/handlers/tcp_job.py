@@ -47,12 +47,12 @@ from hyperscale.logging.hyperscale_logging_models import (
 from ..state import GateRuntimeState
 
 if TYPE_CHECKING:
-    from hyperscale.distributed.swim.core import NodeId
+    from hyperscale.distributed.swim.core import NodeId, ErrorStats
     from hyperscale.distributed.jobs.gates import GateJobManager
     from hyperscale.distributed.jobs import JobLeadershipTracker
-    from hyperscale.distributed.reliability import ErrorStats, LoadShedder
+    from hyperscale.distributed.reliability import LoadShedder
     from hyperscale.distributed.routing import GateJobRouter
-    from hyperscale.distributed.health import GateInfo
+    from hyperscale.distributed.models import GateInfo
     from hyperscale.distributed.taskex import TaskRunner
 
 

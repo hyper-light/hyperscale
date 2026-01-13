@@ -127,7 +127,7 @@ discovered during systematic tracing of SCENARIOS.md test scenarios through the 
 #### C6: Missing Incarnation Tracking in Circuit Breaker (MEDIUM)
 **Location**: `health/circuit_breaker_manager.py`
 **Issue**: Circuit doesn't reset when manager restarts with new incarnation.
-**Status**: TODO
+**Status**: FIXED - `update_incarnation()` method (lines 121-132) resets circuit on new incarnation (line 130)
 
 ---
 
