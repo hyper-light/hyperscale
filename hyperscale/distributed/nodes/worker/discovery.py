@@ -35,10 +35,10 @@ class WorkerDiscoveryManager:
             logger: Logger instance for logging
             failure_decay_interval: Interval for decaying failure counts
         """
-        self._discovery_service = discovery_service
-        self._logger = logger
-        self._failure_decay_interval = failure_decay_interval
-        self._running = False
+        self._discovery_service: "DiscoveryService" = discovery_service
+        self._logger: "Logger" = logger
+        self._failure_decay_interval: float = failure_decay_interval
+        self._running: bool = False
 
     async def run_maintenance_loop(self) -> None:
         """
@@ -91,6 +91,7 @@ class WorkerDiscoveryManager:
         Returns:
             Tuple of (host, port) for the selected manager, or None if unavailable
         """
+
         def is_healthy(peer_id: str) -> bool:
             return peer_id in healthy_manager_ids
 

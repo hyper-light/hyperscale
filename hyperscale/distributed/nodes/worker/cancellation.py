@@ -45,10 +45,10 @@ class WorkerCancellationHandler:
             logger: Logger instance for logging
             poll_interval: Interval for polling cancellation requests
         """
-        self._state = state
-        self._logger = logger
-        self._poll_interval = poll_interval
-        self._running = False
+        self._state: "WorkerState" = state
+        self._logger: "Logger | None" = logger
+        self._poll_interval: float = poll_interval
+        self._running: bool = False
 
         # Remote graph manager (set later)
         self._remote_manager: "RemoteGraphManager | None" = None
