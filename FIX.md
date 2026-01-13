@@ -122,7 +122,7 @@ discovered during systematic tracing of SCENARIOS.md test scenarios through the 
 #### C5: Memory Leak in Extension Trackers (MEDIUM)
 **Location**: `swim/detection/hierarchical_failure_detector.py:191`
 **Issue**: `_extension_trackers` dict grows unbounded.
-**Status**: TODO
+**Status**: FIXED - Hard cap at `max_extension_trackers=10000` (line 88), checked before adding (line 366), cleanup on node removal (line 468)
 
 #### C6: Missing Incarnation Tracking in Circuit Breaker (MEDIUM)
 **Location**: `health/circuit_breaker_manager.py`
