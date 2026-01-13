@@ -300,6 +300,29 @@ class ManagerLeaseCoordinator:
             if leader_id == self._node_id
         ]
 
+    def initialize_job_context(self, job_id: str) -> None:
+        """
+        Initialize empty context for a new job.
+
+        Args:
+            job_id: Job ID to initialize context for
+        """
+        from hyperscale.core.state.context import Context
+
+        self._state._job_contexts[job_id] = Context()
+
+    def get_job_context(self, job_id: str):
+        """
+        Get context for a job.
+
+        Args:
+            job_id: Job ID
+
+        Returns:
+            Context object or None if not found
+        """
+        return self._state._job_contexts.get(job_id)
+
     def clear_job_leases(self, job_id: str) -> None:
         """
         Clear all lease-related state for a job.

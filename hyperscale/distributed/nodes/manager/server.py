@@ -3732,15 +3732,12 @@ class ManagerServer(HealthAwareServer):
                 timeout_strategy
             )
 
-            # Set job leadership
-            self._manager_state._job_leaders[submission.job_id] = self._node_id.full
-            self._manager_state._job_leader_addrs[submission.job_id] = (
-                self._host,
-                self._tcp_port,
+            # Set job leadership (initializes fence token, layer version, and context)
+            self._leases.claim_job_leadership(
+                job_id=submission.job_id,
+                tcp_addr=(self._host, self._tcp_port),
             )
-            self._manager_state._job_fencing_tokens[submission.job_id] = 1
-            self._manager_state._job_layer_version[submission.job_id] = 0
-            self._manager_state._job_contexts[submission.job_id] = Context()
+            self._leases.initialize_job_context(submission.job_id)
 
             # Store callbacks
             if submission.callback_addr:
