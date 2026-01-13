@@ -398,7 +398,7 @@ class GateDispatchCoordinator:
             await self._job_timeout_tracker.start_tracking_job(
                 job_id=submission.job_id,
                 timeout_seconds=submission.timeout_seconds,
-                target_datacenters=successful_dcs,
+                target_dcs=successful_dcs,
             )
 
         self._increment_version()
