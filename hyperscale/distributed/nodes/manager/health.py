@@ -610,17 +610,106 @@ class ManagerHealthMonitor:
         self._global_dead_workers.discard(worker_id)
 
     def clear_job_suspicions(self, job_id: str) -> None:
-        """
-        Clear all suspicions for a completed job.
-
-        Args:
-            job_id: Job ID to cleanup
-        """
         keys_to_remove = [key for key in self._job_suspicions if key[0] == job_id]
         for key in keys_to_remove:
             del self._job_suspicions[key]
 
         self._job_dead_workers.pop(job_id, None)
+
+    def get_peer_manager_health_counts(self) -> dict[str, int]:
+        counts = {"healthy": 0, "busy": 0, "stressed": 0, "overloaded": 0}
+
+        for health_state in self._state._peer_manager_health_states.values():
+            if health_state in counts:
+                counts[health_state] += 1
+            else:
+                counts["healthy"] += 1
+
+        return counts
+
+    def check_peer_manager_health_alerts(self) -> None:
+        counts = self.get_peer_manager_health_counts()
+        total_peers = sum(counts.values())
+
+        if total_peers == 0:
+            return
+
+        dc_leader_id = self._state._dc_leader_manager_id
+        if dc_leader_id and (
+            leader_state := self._state._peer_manager_health_states.get(dc_leader_id)
+        ):
+            if leader_state == "overloaded":
+                self._fire_leader_overload_alert(dc_leader_id)
+                return
+
+        overloaded_count = counts.get("overloaded", 0)
+        healthy_count = counts.get("healthy", 0)
+        non_healthy_count = total_peers - healthy_count
+
+        if healthy_count == 0:
+            self._fire_all_managers_unhealthy_alert(counts, total_peers)
+        elif overloaded_count / total_peers >= 0.5:
+            self._fire_majority_overloaded_alert(overloaded_count, total_peers)
+        elif non_healthy_count / total_peers >= 0.8:
+            self._fire_high_stress_alert(counts, total_peers)
+
+    def _fire_leader_overload_alert(self, leader_id: str) -> None:
+        self._task_runner.run(
+            self._logger.log,
+            ServerWarning(
+                message=f"ALERT: DC leader {leader_id[:8]}... overloaded - control plane saturated",
+                node_host=self._config.host,
+                node_port=self._config.tcp_port,
+                node_id=self._node_id,
+            ),
+        )
+
+    def _fire_all_managers_unhealthy_alert(
+        self,
+        counts: dict[str, int],
+        total_peers: int,
+    ) -> None:
+        self._task_runner.run(
+            self._logger.log,
+            ServerWarning(
+                message=f"CRITICAL: All {total_peers} DC managers non-healthy (overloaded={counts['overloaded']}, stressed={counts['stressed']}, busy={counts['busy']})",
+                node_host=self._config.host,
+                node_port=self._config.tcp_port,
+                node_id=self._node_id,
+            ),
+        )
+
+    def _fire_majority_overloaded_alert(
+        self,
+        overloaded_count: int,
+        total_peers: int,
+    ) -> None:
+        self._task_runner.run(
+            self._logger.log,
+            ServerWarning(
+                message=f"ALERT: Majority DC managers overloaded ({overloaded_count}/{total_peers})",
+                node_host=self._config.host,
+                node_port=self._config.tcp_port,
+                node_id=self._node_id,
+            ),
+        )
+
+    def _fire_high_stress_alert(
+        self,
+        counts: dict[str, int],
+        total_peers: int,
+    ) -> None:
+        non_healthy = total_peers - counts["healthy"]
+        ratio = non_healthy / total_peers
+        self._task_runner.run(
+            self._logger.log,
+            ServerWarning(
+                message=f"WARNING: DC control plane stressed ({ratio:.0%} non-healthy: overloaded={counts['overloaded']}, stressed={counts['stressed']}, busy={counts['busy']})",
+                node_host=self._config.host,
+                node_port=self._config.tcp_port,
+                node_id=self._node_id,
+            ),
+        )
 
     def get_manager_overload_state(
         self,

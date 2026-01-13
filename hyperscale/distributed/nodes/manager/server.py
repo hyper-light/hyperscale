@@ -1113,6 +1113,9 @@ class ManagerServer(HealthAwareServer):
             )
             self._registry.register_manager_peer(peer_info)
 
+        if heartbeat.is_leader:
+            self._manager_state._dc_leader_manager_id = peer_id
+
         peer_health_state = getattr(heartbeat, "health_overload_state", "healthy")
         previous_peer_state = self._manager_state._peer_manager_health_states.get(
             peer_id
@@ -1123,6 +1126,7 @@ class ManagerServer(HealthAwareServer):
             self._log_peer_manager_health_transition(
                 peer_id, previous_peer_state, peer_health_state
             )
+            self._health_monitor.check_peer_manager_health_alerts()
 
         self.confirm_peer(source_addr)
 
