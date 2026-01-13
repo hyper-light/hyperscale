@@ -1208,17 +1208,11 @@ class ManagerServer(HealthAwareServer):
         heartbeat: WorkerHeartbeat,
         source_addr: tuple[str, int],
     ) -> None:
-        """Handle embedded worker heartbeat from SWIM."""
         self._health_monitor.handle_worker_heartbeat(heartbeat, source_addr)
 
-        # Update worker pool if worker is registered
         worker_id = heartbeat.node_id
         if worker_id in self._manager_state._workers:
-            self._worker_pool.update_worker_capacity(
-                worker_id=worker_id,
-                available_cores=heartbeat.available_cores,
-                queue_depth=heartbeat.queue_depth,
-            )
+            await self._worker_pool.process_heartbeat(worker_id, heartbeat)
 
     async def _handle_manager_peer_heartbeat(
         self,
