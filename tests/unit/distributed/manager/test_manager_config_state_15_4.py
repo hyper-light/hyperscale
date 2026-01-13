@@ -280,27 +280,52 @@ class TestCreateManagerConfigFromEnv:
         mock_env = MagicMock()
         # Set all required attributes
         for attr in [
-            'MANAGER_DEAD_WORKER_REAP_INTERVAL', 'MANAGER_DEAD_PEER_REAP_INTERVAL',
-            'MANAGER_DEAD_GATE_REAP_INTERVAL', 'ORPHAN_SCAN_INTERVAL',
-            'ORPHAN_SCAN_WORKER_TIMEOUT', 'CANCELLED_WORKFLOW_TTL',
-            'CANCELLED_WORKFLOW_CLEANUP_INTERVAL', 'RECOVERY_MAX_CONCURRENT',
-            'RECOVERY_JITTER_MIN', 'RECOVERY_JITTER_MAX',
-            'DISPATCH_MAX_CONCURRENT_PER_WORKER', 'COMPLETED_JOB_MAX_AGE',
-            'FAILED_JOB_MAX_AGE', 'JOB_CLEANUP_INTERVAL',
-            'MANAGER_DEAD_NODE_CHECK_INTERVAL', 'MANAGER_RATE_LIMIT_CLEANUP_INTERVAL',
-            'MANAGER_TCP_TIMEOUT_SHORT', 'MANAGER_TCP_TIMEOUT_STANDARD',
-            'MANAGER_BATCH_PUSH_INTERVAL', 'JOB_RESPONSIVENESS_THRESHOLD',
-            'JOB_RESPONSIVENESS_CHECK_INTERVAL', 'DISCOVERY_FAILURE_DECAY_INTERVAL',
-            'STATS_WINDOW_SIZE_MS', 'STATS_DRIFT_TOLERANCE_MS', 'STATS_MAX_WINDOW_AGE_MS',
-            'MANAGER_STATS_HOT_MAX_ENTRIES', 'MANAGER_STATS_THROTTLE_THRESHOLD',
-            'MANAGER_STATS_BATCH_THRESHOLD', 'MANAGER_STATS_REJECT_THRESHOLD',
-            'STATS_PUSH_INTERVAL_MS', 'MANAGER_STATE_SYNC_RETRIES',
-            'MANAGER_STATE_SYNC_TIMEOUT', 'LEADER_ELECTION_JITTER_MAX',
-            'MANAGER_STARTUP_SYNC_DELAY', 'CLUSTER_STABILIZATION_TIMEOUT',
-            'CLUSTER_STABILIZATION_POLL_INTERVAL', 'MANAGER_HEARTBEAT_INTERVAL',
-            'MANAGER_PEER_SYNC_INTERVAL',
+            "MANAGER_DEAD_WORKER_REAP_INTERVAL",
+            "MANAGER_DEAD_PEER_REAP_INTERVAL",
+            "MANAGER_DEAD_GATE_REAP_INTERVAL",
+            "ORPHAN_SCAN_INTERVAL",
+            "ORPHAN_SCAN_WORKER_TIMEOUT",
+            "CANCELLED_WORKFLOW_TTL",
+            "CANCELLED_WORKFLOW_CLEANUP_INTERVAL",
+            "RECOVERY_MAX_CONCURRENT",
+            "RECOVERY_JITTER_MIN",
+            "RECOVERY_JITTER_MAX",
+            "DISPATCH_MAX_CONCURRENT_PER_WORKER",
+            "COMPLETED_JOB_MAX_AGE",
+            "FAILED_JOB_MAX_AGE",
+            "JOB_CLEANUP_INTERVAL",
+            "MANAGER_DEAD_NODE_CHECK_INTERVAL",
+            "MANAGER_RATE_LIMIT_CLEANUP_INTERVAL",
+            "MANAGER_TCP_TIMEOUT_SHORT",
+            "MANAGER_TCP_TIMEOUT_STANDARD",
+            "MANAGER_BATCH_PUSH_INTERVAL",
+            "JOB_RESPONSIVENESS_THRESHOLD",
+            "JOB_RESPONSIVENESS_CHECK_INTERVAL",
+            "DISCOVERY_FAILURE_DECAY_INTERVAL",
+            "STATS_WINDOW_SIZE_MS",
+            "STATS_DRIFT_TOLERANCE_MS",
+            "STATS_MAX_WINDOW_AGE_MS",
+            "MANAGER_STATS_HOT_MAX_ENTRIES",
+            "MANAGER_STATS_THROTTLE_THRESHOLD",
+            "MANAGER_STATS_BATCH_THRESHOLD",
+            "MANAGER_STATS_REJECT_THRESHOLD",
+            "STATS_PUSH_INTERVAL_MS",
+            "MANAGER_STATE_SYNC_RETRIES",
+            "MANAGER_STATE_SYNC_TIMEOUT",
+            "LEADER_ELECTION_JITTER_MAX",
+            "MANAGER_STARTUP_SYNC_DELAY",
+            "CLUSTER_STABILIZATION_TIMEOUT",
+            "CLUSTER_STABILIZATION_POLL_INTERVAL",
+            "MANAGER_HEARTBEAT_INTERVAL",
+            "MANAGER_PEER_SYNC_INTERVAL",
         ]:
-            setattr(mock_env, attr, 1.0 if 'INTERVAL' in attr or 'TIMEOUT' in attr or 'THRESHOLD' in attr else 1)
+            setattr(
+                mock_env,
+                attr,
+                1.0
+                if "INTERVAL" in attr or "TIMEOUT" in attr or "THRESHOLD" in attr
+                else 1,
+            )
         mock_env.get = MagicMock(side_effect=lambda k, d=None: d)
 
         gates = [("gate-1", 6000), ("gate-2", 6001)]
@@ -373,103 +398,111 @@ class TestManagerStateHappyPath:
 class TestManagerStateLockManagement:
     """Tests for lock management methods."""
 
-    def test_get_peer_state_lock_creates_new(self):
+    @pytest.mark.asyncio
+    async def test_get_peer_state_lock_creates_new(self):
         """get_peer_state_lock creates lock for new peer."""
         state = ManagerState()
         peer_addr = ("10.0.0.1", 8000)
 
-        lock = state.get_peer_state_lock(peer_addr)
+        lock = await state.get_peer_state_lock(peer_addr)
 
         assert isinstance(lock, asyncio.Lock)
         assert peer_addr in state._peer_state_locks
 
-    def test_get_peer_state_lock_returns_existing(self):
+    @pytest.mark.asyncio
+    async def test_get_peer_state_lock_returns_existing(self):
         """get_peer_state_lock returns existing lock."""
         state = ManagerState()
         peer_addr = ("10.0.0.1", 8000)
 
-        lock1 = state.get_peer_state_lock(peer_addr)
-        lock2 = state.get_peer_state_lock(peer_addr)
+        lock1 = await state.get_peer_state_lock(peer_addr)
+        lock2 = await state.get_peer_state_lock(peer_addr)
 
         assert lock1 is lock2
 
-    def test_get_gate_state_lock_creates_new(self):
+    @pytest.mark.asyncio
+    async def test_get_gate_state_lock_creates_new(self):
         """get_gate_state_lock creates lock for new gate."""
         state = ManagerState()
         gate_id = "gate-123"
 
-        lock = state.get_gate_state_lock(gate_id)
+        lock = await state.get_gate_state_lock(gate_id)
 
         assert isinstance(lock, asyncio.Lock)
         assert gate_id in state._gate_state_locks
 
-    def test_get_workflow_cancellation_lock(self):
+    @pytest.mark.asyncio
+    async def test_get_workflow_cancellation_lock(self):
         """get_workflow_cancellation_lock creates/returns lock."""
         state = ManagerState()
         workflow_id = "workflow-123"
 
-        lock1 = state.get_workflow_cancellation_lock(workflow_id)
-        lock2 = state.get_workflow_cancellation_lock(workflow_id)
+        lock1 = await state.get_workflow_cancellation_lock(workflow_id)
+        lock2 = await state.get_workflow_cancellation_lock(workflow_id)
 
         assert isinstance(lock1, asyncio.Lock)
         assert lock1 is lock2
 
-    def test_get_dispatch_semaphore(self):
+    @pytest.mark.asyncio
+    async def test_get_dispatch_semaphore(self):
         """get_dispatch_semaphore creates/returns semaphore."""
         state = ManagerState()
         worker_id = "worker-123"
 
-        sem1 = state.get_dispatch_semaphore(worker_id, max_concurrent=5)
-        sem2 = state.get_dispatch_semaphore(worker_id, max_concurrent=10)
+        sem1 = await state.get_dispatch_semaphore(worker_id, max_concurrent=5)
+        sem2 = await state.get_dispatch_semaphore(worker_id, max_concurrent=10)
 
         assert isinstance(sem1, asyncio.Semaphore)
-        # Same semaphore returned (max_concurrent only used on creation)
         assert sem1 is sem2
 
 
 class TestManagerStateVersioning:
     """Tests for state versioning methods."""
 
-    def test_increment_fence_token(self):
+    @pytest.mark.asyncio
+    async def test_increment_fence_token(self):
         """increment_fence_token increments and returns value."""
         state = ManagerState()
 
         assert state._fence_token == 0
 
-        result1 = state.increment_fence_token()
+        result1 = await state.increment_fence_token()
         assert result1 == 1
         assert state._fence_token == 1
 
-        result2 = state.increment_fence_token()
+        result2 = await state.increment_fence_token()
         assert result2 == 2
         assert state._fence_token == 2
 
-    def test_increment_state_version(self):
+    @pytest.mark.asyncio
+    async def test_increment_state_version(self):
         """increment_state_version increments and returns value."""
         state = ManagerState()
 
         assert state._state_version == 0
 
-        result = state.increment_state_version()
+        result = await state.increment_state_version()
         assert result == 1
         assert state._state_version == 1
 
-    def test_increment_external_incarnation(self):
+    @pytest.mark.asyncio
+    async def test_increment_external_incarnation(self):
         """increment_external_incarnation increments and returns value."""
         state = ManagerState()
 
         assert state._external_incarnation == 0
 
-        result = state.increment_external_incarnation()
+        result = await state.increment_external_incarnation()
         assert result == 1
 
-    def test_increment_context_lamport_clock(self):
+    @pytest.mark.asyncio
+    async def test_increment_context_lamport_clock(self):
         """increment_context_lamport_clock increments and returns value."""
         state = ManagerState()
 
         assert state._context_lamport_clock == 0
 
-        result = state.increment_context_lamport_clock()
+        result = await state.increment_context_lamport_clock()
         assert result == 1
 
 

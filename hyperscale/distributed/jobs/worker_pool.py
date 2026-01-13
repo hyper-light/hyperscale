@@ -521,16 +521,35 @@ class WorkerPool:
                 total_allocated = sum(cores for _, cores in allocations)
 
                 if total_allocated >= cores_needed:
-                    # Reserve the cores
+                    verified_allocations: list[tuple[str, int]] = []
+                    verified_total = 0
+
                     for node_id, cores in allocations:
                         worker = self._workers.get(node_id)
+                        if worker is None:
+                            continue
+
+                        actual_available = (
+                            worker.available_cores - worker.reserved_cores
+                        )
+                        if actual_available <= 0:
+                            continue
+
+                        actual_cores = min(cores, actual_available)
+                        worker.reserved_cores += actual_cores
+                        verified_allocations.append((node_id, actual_cores))
+                        verified_total += actual_cores
+
+                    if verified_total >= cores_needed:
+                        return verified_allocations
+
+                    for node_id, cores in verified_allocations:
+                        worker = self._workers.get(node_id)
                         if worker:
-                            worker.reserved_cores += cores
+                            worker.reserved_cores = max(
+                                0, worker.reserved_cores - cores
+                            )
 
-                    return allocations
-
-                # Not enough cores - prepare to wait
-                # Clear inside lock to avoid missing signals
                 self._cores_available.clear()
                 should_wait = True
 
