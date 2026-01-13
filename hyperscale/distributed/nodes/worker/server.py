@@ -194,15 +194,6 @@ class WorkerServer(HealthAwareServer):
         self._job_fence_tokens: dict[str, int] = self._worker_state._job_fence_tokens
         self._pending_transfers: dict = self._worker_state._pending_transfers
 
-        # Transfer metrics (delegate to state)
-        @property
-        def _transfer_metrics_received(self) -> int:
-            return self._worker_state._transfer_metrics_received
-
-        @property
-        def _transfer_metrics_accepted(self) -> int:
-            return self._worker_state._transfer_metrics_accepted
-
         # Negotiated capabilities (AD-25)
         self._negotiated_capabilities: NegotiatedCapabilities | None = None
         self._node_capabilities = NodeCapabilities.current(node_version="")

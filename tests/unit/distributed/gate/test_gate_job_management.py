@@ -612,7 +612,7 @@ class TestIntegrationScenarios:
         gate1_manager.set_target_dcs(test_job_id, {"dc-1"})
 
         # Gate-2 receives result (simulated as not owning the job)
-        owner = hash_ring.get_owner_id(test_job_id)
+        owner = await hash_ring.get_owner_id(test_job_id)
         assert owner == "gate-1"
 
         # Track forwarded data
@@ -643,20 +643,21 @@ class TestIntegrationScenarios:
         assert forward_result.forwarded is True
         assert len(forwarded_data) == 1
 
-    def test_hash_ring_with_job_manager(self) -> None:
+    @pytest.mark.asyncio
+    async def test_hash_ring_with_job_manager(self) -> None:
         """Test using hash ring to determine job ownership."""
         manager = GateJobManager()
         ring = ConsistentHashRing()
 
         # Setup 3 gates
-        ring.add_node("gate-1", "10.0.0.1", 8080)
-        ring.add_node("gate-2", "10.0.0.2", 8080)
-        ring.add_node("gate-3", "10.0.0.3", 8080)
+        await ring.add_node("gate-1", "10.0.0.1", 8080)
+        await ring.add_node("gate-2", "10.0.0.2", 8080)
+        await ring.add_node("gate-3", "10.0.0.3", 8080)
 
         # Simulate receiving jobs
         for i in range(100):
             job_id = f"job-{i}"
-            owner = ring.get_owner_id(job_id)
+            owner = await ring.get_owner_id(job_id)
 
             # Only store if we're the owner (simulating gate-1's perspective)
             if owner == "gate-1":
