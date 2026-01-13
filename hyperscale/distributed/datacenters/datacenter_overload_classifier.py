@@ -18,6 +18,10 @@ class DatacenterOverloadSignals:
     alive_managers: int
     total_cores: int
     available_cores: int
+    overloaded_managers: int = 0
+    stressed_managers: int = 0
+    busy_managers: int = 0
+    leader_health_state: str = "healthy"
 
 
 @dataclass(slots=True)
