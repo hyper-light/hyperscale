@@ -77,6 +77,8 @@ class MockServerForHandlers:
 
         self._worker_state = MagicMock()
         self._worker_state.increment_transfer_rejected_stale_token = AsyncMock()
+        self._worker_state.update_workflow_fence_token = AsyncMock(return_value=True)
+        self._worker_state.get_workflow_fence_token = AsyncMock(return_value=0)
 
     def _get_worker_state(self):
         return WorkerState.HEALTHY

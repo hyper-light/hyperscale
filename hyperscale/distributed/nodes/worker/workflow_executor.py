@@ -174,10 +174,11 @@ class WorkerWorkflowExecutor:
             worker_workflow_assigned_cores=cores_to_allocate,
         )
 
-        # Store workflow state
         self._state.add_active_workflow(workflow_id, progress, dispatching_addr)
 
-        # Create cancellation event
+        if dispatch.timeout_seconds > 0:
+            self._state.set_workflow_timeout(workflow_id, dispatch.timeout_seconds)
+
         cancel_event = asyncio.Event()
         self._state._workflow_cancel_events[workflow_id] = cancel_event
 
