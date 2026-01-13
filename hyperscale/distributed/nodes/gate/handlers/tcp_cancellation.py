@@ -39,7 +39,7 @@ from ..state import GateRuntimeState
 if TYPE_CHECKING:
     from hyperscale.distributed.swim.core import NodeId
     from hyperscale.distributed.jobs.gates import GateJobManager
-    from taskex import TaskRunner
+    from hyperscale.distributed.taskex import TaskRunner
 
 
 class GateCancellationHandler:

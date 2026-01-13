@@ -40,7 +40,7 @@ from ..state import GateRuntimeState
 if TYPE_CHECKING:
     from hyperscale.distributed.swim.core import NodeId
     from hyperscale.distributed.env import Env
-    from taskex import TaskRunner
+    from hyperscale.distributed.taskex import TaskRunner
 
 
 class GateManagerHandler:

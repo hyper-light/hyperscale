@@ -36,7 +36,7 @@ if TYPE_CHECKING:
     from hyperscale.distributed.jobs import JobLeadershipTracker
     from hyperscale.distributed.jobs.gates import GateJobManager
     from hyperscale.distributed.server.events.lamport_clock import VersionedStateClock
-    from taskex import TaskRunner
+    from hyperscale.distributed.taskex import TaskRunner
 
 
 class GateStateSyncHandler:

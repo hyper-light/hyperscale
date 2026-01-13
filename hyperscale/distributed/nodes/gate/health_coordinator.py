@@ -41,7 +41,7 @@ if TYPE_CHECKING:
     )
     from hyperscale.distributed.server.events.lamport_clock import VersionedStateClock
     from hyperscale.distributed.datacenters.manager_dispatcher import ManagerDispatcher
-    from taskex import TaskRunner
+    from hyperscale.distributed.taskex import TaskRunner
 
 
 class GateHealthCoordinator:
