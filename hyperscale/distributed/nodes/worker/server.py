@@ -278,25 +278,27 @@ class WorkerServer(HealthAwareServer):
         )
 
         # Initialize components that need discovery service
-        self._registration_handler = WorkerRegistrationHandler(
-            registry=self._registry,
-            discovery_service=self._discovery_service,
-            logger=self._udp_logger,
-            node_capabilities=self._node_capabilities,
+        self._registration_handler: WorkerRegistrationHandler = (
+            WorkerRegistrationHandler(
+                registry=self._registry,
+                discovery_service=self._discovery_service,
+                logger=self._udp_logger,
+                node_capabilities=self._node_capabilities,
+            )
         )
 
-        self._heartbeat_handler = WorkerHeartbeatHandler(
+        self._heartbeat_handler: WorkerHeartbeatHandler = WorkerHeartbeatHandler(
             registry=self._registry,
             logger=self._udp_logger,
         )
 
-        self._progress_reporter = WorkerProgressReporter(
+        self._progress_reporter: WorkerProgressReporter = WorkerProgressReporter(
             registry=self._registry,
             state=self._worker_state,
             logger=self._udp_logger,
         )
 
-        self._workflow_executor = WorkerWorkflowExecutor(
+        self._workflow_executor: WorkerWorkflowExecutor = WorkerWorkflowExecutor(
             core_allocator=self._core_allocator,
             state=self._worker_state,
             lifecycle=self._lifecycle_manager,
@@ -305,13 +307,15 @@ class WorkerServer(HealthAwareServer):
             logger=self._udp_logger,
         )
 
-        self._cancellation_handler_impl = WorkerCancellationHandler(
-            state=self._worker_state,
-            logger=self._udp_logger,
-            poll_interval=self._config.cancellation_poll_interval_seconds,
+        self._cancellation_handler_impl: WorkerCancellationHandler = (
+            WorkerCancellationHandler(
+                state=self._worker_state,
+                logger=self._udp_logger,
+                poll_interval=self._config.cancellation_poll_interval_seconds,
+            )
         )
 
-        self._background_loops = WorkerBackgroundLoops(
+        self._background_loops: WorkerBackgroundLoops = WorkerBackgroundLoops(
             registry=self._registry,
             state=self._worker_state,
             discovery_service=self._discovery_service,
