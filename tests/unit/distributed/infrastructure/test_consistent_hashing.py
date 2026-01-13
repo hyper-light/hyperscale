@@ -230,3 +230,50 @@ async def test_node_metadata():
     assert addr == ("10.0.0.1", 8080)
 
     assert await ring.get_node_addr(None) is None
+
+
+@pytest.mark.asyncio
+async def test_input_validation():
+    with pytest.raises(ValueError, match="replicas must be >= 1"):
+        ConsistentHashRing(replicas=0)
+
+    with pytest.raises(ValueError, match="replicas must be >= 1"):
+        ConsistentHashRing(replicas=-5)
+
+    ring = ConsistentHashRing(replicas=1)
+    assert ring is not None
+
+
+@pytest.mark.asyncio
+async def test_get_backup():
+    ring = ConsistentHashRing(replicas=150)
+    await ring.add_node("gate-1", "127.0.0.1", 9000)
+    await ring.add_node("gate-2", "127.0.0.1", 9001)
+    await ring.add_node("gate-3", "127.0.0.1", 9002)
+
+    job_ids = generate_job_ids(100)
+
+    for job_id in job_ids:
+        primary = await ring.get_node(job_id)
+        backup = await ring.get_backup(job_id)
+
+        assert primary is not None
+        assert backup is not None
+        assert primary.node_id != backup.node_id
+
+
+@pytest.mark.asyncio
+async def test_get_backup_single_node():
+    ring = ConsistentHashRing(replicas=150)
+    await ring.add_node("gate-1", "127.0.0.1", 9000)
+
+    backup = await ring.get_backup("some-job")
+    assert backup is None
+
+
+@pytest.mark.asyncio
+async def test_get_backup_empty_ring():
+    ring = ConsistentHashRing(replicas=150)
+
+    backup = await ring.get_backup("some-job")
+    assert backup is None
