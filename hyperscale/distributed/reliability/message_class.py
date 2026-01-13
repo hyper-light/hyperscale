@@ -48,83 +48,93 @@ MESSAGE_CLASS_TO_PRIORITY: dict[MessageClass, MessagePriority] = {
 
 # Handler names that belong to each message class
 # Used for automatic classification of incoming requests
-CONTROL_HANDLERS: frozenset[str] = frozenset({
-    # SWIM protocol
-    "ping",
-    "ping_req",
-    "ack",
-    "nack",
-    "indirect_ping",
-    "indirect_ack",
-    # Cancellation (AD-20)
-    "cancel_workflow",
-    "cancel_job",
-    "workflow_cancelled",
-    "job_cancellation_complete",
-    # Leadership transfer
-    "leadership_transfer",
-    "job_leader_transfer",
-    "receive_job_leader_transfer",
-    "job_leader_worker_transfer",
-    # Failure detection
-    "suspect",
-    "alive",
-    "dead",
-    "leave",
-})
+CONTROL_HANDLERS: frozenset[str] = frozenset(
+    {
+        # SWIM protocol
+        "ping",
+        "ping_req",
+        "ack",
+        "nack",
+        "indirect_ping",
+        "indirect_ack",
+        # Cancellation (AD-20)
+        "cancel_workflow",
+        "cancel_job",
+        "workflow_cancelled",
+        "job_cancellation_complete",
+        # Leadership transfer
+        "leadership_transfer",
+        "job_leader_transfer",
+        "receive_job_leader_transfer",
+        "job_leader_worker_transfer",
+        # Failure detection
+        "suspect",
+        "alive",
+        "dead",
+        "leave",
+    }
+)
 
-DISPATCH_HANDLERS: frozenset[str] = frozenset({
-    # Job dispatch
-    "submit_job",
-    "receive_submit_job",
-    "dispatch_workflow",
-    "receive_workflow_dispatch",
-    # State sync
-    "state_sync_request",
-    "state_sync_response",
-    "request_state_sync",
-    # Registration
-    "worker_register",
-    "receive_worker_register",
-    "manager_register",
-    "receive_manager_register",
-    # Workflow commands
-    "workflow_dispatch_ack",
-    "workflow_final_result",
-})
+DISPATCH_HANDLERS: frozenset[str] = frozenset(
+    {
+        # Job dispatch
+        "submit_job",
+        "receive_submit_job",
+        "dispatch_workflow",
+        "receive_workflow_dispatch",
+        # State sync
+        "state_sync_request",
+        "state_sync_response",
+        "request_state_sync",
+        # Registration
+        "worker_register",
+        "receive_worker_register",
+        "manager_register",
+        "receive_manager_register",
+        # Workflow commands
+        "workflow_dispatch_ack",
+        "workflow_final_result",
+    }
+)
 
-DATA_HANDLERS: frozenset[str] = frozenset({
-    # Progress updates
-    "workflow_progress",
-    "receive_workflow_progress",
-    "workflow_progress_ack",
-    # Stats updates
-    "receive_stats_update",
-    "send_stats_update",
-    # AD-34 timeout coordination
-    "receive_job_progress_report",
-    "receive_job_timeout_report",
-    "receive_job_global_timeout",
-    "receive_job_final_status",
-    # Heartbeats (non-SWIM)
-    "heartbeat",
-    "manager_heartbeat",
-    "worker_heartbeat",
-})
+DATA_HANDLERS: frozenset[str] = frozenset(
+    {
+        # Progress updates
+        "workflow_progress",
+        "receive_workflow_progress",
+        "workflow_progress_ack",
+        # Stats updates
+        "receive_stats_update",
+        "send_stats_update",
+        # AD-34 timeout coordination
+        "receive_job_progress_report",
+        "receive_job_timeout_report",
+        "receive_job_global_timeout",
+        "receive_job_final_status",
+        # Heartbeats (non-SWIM)
+        "heartbeat",
+        "manager_heartbeat",
+        "worker_heartbeat",
+        # Job progress (gate handlers)
+        "receive_job_progress",
+    }
+)
 
-TELEMETRY_HANDLERS: frozenset[str] = frozenset({
-    # Metrics
-    "metrics_report",
-    "debug_stats",
-    "trace_event",
-    # Health probes (non-critical)
-    "health_check",
-    "readiness_check",
-    "liveness_check",
-    # Federated health (best-effort)
-    "xprobe",
-    "xack",
-})
+TELEMETRY_HANDLERS: frozenset[str] = frozenset(
+    {
+        # Metrics
+        "metrics_report",
+        "debug_stats",
+        "trace_event",
+        # Health probes (non-critical)
+        "health_check",
+        "readiness_check",
+        "liveness_check",
+        # Federated health (best-effort)
+        "xprobe",
+        "xack",
+    }
+)
 
 
 def classify_handler(handler_name: str) -> MessageClass:
