@@ -2034,6 +2034,18 @@ class GateServer(HealthAwareServer):
                     ),
                 )
 
+                status = self._dc_health_manager.get_datacenter_health(dc_id)
+                if getattr(status, "leader_overloaded", False):
+                    self._task_runner.run(
+                        self._logger.log,
+                        ServerWarning(
+                            message=f"ALERT: DC {dc_id} leader manager is OVERLOADED - control plane saturated",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.full if self._node_id else "unknown",
+                        ),
+                    )
+
     def _get_available_datacenters(self) -> list[str]:
         """Get list of available datacenters."""
         healthy = []
