@@ -1383,7 +1383,6 @@ class ManagerServer(HealthAwareServer):
         orphaned_tokens: set[str],
         worker_id: str,
     ) -> None:
-        """Log and requeue orphaned workflows for retry."""
         for orphaned_token in orphaned_tokens:
             await self._udp_logger.log(
                 ServerWarning(
@@ -1396,13 +1395,17 @@ class ManagerServer(HealthAwareServer):
             if self._workflow_dispatcher:
                 await self._workflow_dispatcher.requeue_workflow(orphaned_token)
 
-    async def _scan_worker_for_orphans(self, worker_id: str, worker_addr: tuple[str, int]) -> None:
+    async def _scan_worker_for_orphans(
+        self, worker_id: str, worker_addr: tuple[str, int]
+    ) -> None:
         """Scan a single worker for orphaned workflows and requeue them."""
         worker_workflow_ids = await self._query_worker_active_workflows(worker_addr)
         if worker_workflow_ids is None:
             return
 
-        manager_tracked_ids = self._get_manager_tracked_workflow_ids_for_worker(worker_id)
+        manager_tracked_ids = self._get_manager_tracked_workflow_ids_for_worker(
+            worker_id
+        )
         orphaned_sub_workflows = manager_tracked_ids - worker_workflow_ids
         await self._handle_orphaned_workflows(orphaned_sub_workflows, worker_id)
 
