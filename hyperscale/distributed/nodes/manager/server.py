@@ -1691,14 +1691,13 @@ class ManagerServer(HealthAwareServer):
                                     node_id=self._node_id.short,
                                 )
                             )
-                            # Cancel the job due to timeout
                             job = self._job_manager.get_job(job_id)
                             if job and job.status not in (
-                                JobStatus.COMPLETED,
-                                JobStatus.FAILED,
-                                JobStatus.CANCELLED,
+                                JobStatus.COMPLETED.value,
+                                JobStatus.FAILED.value,
+                                JobStatus.CANCELLED.value,
                             ):
-                                job.status = JobStatus.FAILED
+                                job.status = JobStatus.FAILED.value
                                 await self._manager_state.increment_state_version()
                     except Exception as check_error:
                         await self._udp_logger.log(
