@@ -30,8 +30,7 @@ class NackHandler(BaseHandler):
         """Handle a nack message."""
         source_addr = context.source_addr
 
-        # AD-29: Confirm peer on successful communication (even NACK is communication)
-        self._server.confirm_peer(source_addr)
+        await self._server.confirm_peer(source_addr)
 
         nodes = self._server.read_nodes()
         if source_addr in nodes:
