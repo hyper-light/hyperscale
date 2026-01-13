@@ -16,7 +16,7 @@ discovered during systematic tracing of SCENARIOS.md test scenarios through the 
 | F5 | MEDIUM | Race Condition | crdt.py | FIXED |
 | F6 | MEDIUM | Race Condition | windowed_stats_collector.py | FIXED |
 | F7 | LOW | Blocking Call | tcp_windowed_stats.py | FIXED |
-| F8 | LOW | Observability | gate/server.py | TODO |
+| F8 | LOW | Observability | gate/server.py | FIXED |
 | F9 | LOW | Race Condition | gate/server.py | FIXED |
 
 ---

@@ -301,8 +301,17 @@ class GateJobHandler:
                 )
                 workflow_ids = {wf_id for wf_id, _, _ in workflows}
                 self._state._job_workflow_ids[submission.job_id] = workflow_ids
-            except Exception:
+            except Exception as workflow_parse_error:
                 self._state._job_workflow_ids[submission.job_id] = set()
+                self._task_runner.run(
+                    self._logger.log,
+                    ServerError(
+                        message=f"Failed to parse workflows for job {submission.job_id}: {workflow_parse_error}",
+                        node_host=self._get_host(),
+                        node_port=self._get_tcp_port(),
+                        node_id=self._get_node_id().short,
+                    ),
+                )
 
             if submission.callback_addr:
                 self._job_manager.set_callback(
