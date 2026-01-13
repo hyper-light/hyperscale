@@ -2009,8 +2009,15 @@ class ManagerServer(HealthAwareServer):
                 )
 
                 if response and not isinstance(response, Exception):
-                    # Process peer state
-                    pass
+                    sync_response = StateSyncResponse.load(response)
+                    if sync_response.manager_state and sync_response.responder_ready:
+                        peer_snapshot = sync_response.manager_state
+                        self._manager_state._job_leaders.update(
+                            peer_snapshot.job_leaders
+                        )
+                        self._manager_state._job_leader_addrs.update(
+                            peer_snapshot.job_leader_addrs
+                        )
 
             except Exception as error:
                 await self._udp_logger.log(

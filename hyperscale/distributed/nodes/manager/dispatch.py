@@ -106,18 +106,15 @@ class ManagerDispatchCoordinator:
         async with semaphore:
             fence_token = await self._leases.increment_fence_token(job_id)
 
-            # Build dispatch message
             dispatch = WorkflowDispatch(
                 job_id=job_id,
                 workflow_id=workflow_id,
-                workflow_data=workflow_data,
+                workflow=workflow_data,
                 fence_token=fence_token,
-                manager_id=self._node_id,
-                cores_required=cores_required,
+                cores=cores_required,
             )
 
-            # Send to worker
-            worker_addr = (worker.node.host, worker.node.tcp_port)
+            worker_addr = (worker.node.host, worker.node.port)
             try:
                 response = await self._send_to_worker(
                     worker_addr,
