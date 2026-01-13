@@ -2627,12 +2627,10 @@ class GateServer(HealthAwareServer):
 
             if is_test_workflow:
                 dc_aggregated_stats: WorkflowStats | None = None
-                if dc_push.results:
-                    if len(dc_push.results) > 1:
-                        aggregator = Results()
-                        dc_aggregated_stats = aggregator.merge_results(dc_push.results)
-                    else:
-                        dc_aggregated_stats = dc_push.results[0]
+                if len(dc_push.results) > 1:
+                    dc_aggregated_stats = Results().merge_results(dc_push.results)
+                elif dc_push.results:
+                    dc_aggregated_stats = dc_push.results[0]
 
                 per_dc_results.append(
                     WorkflowDCResult(
