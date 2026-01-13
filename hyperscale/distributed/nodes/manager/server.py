@@ -1681,6 +1681,85 @@ class ManagerServer(HealthAwareServer):
                     )
                 )
 
+    async def _resource_sample_loop(self) -> None:
+        """
+        Background loop for periodic CPU/memory sampling.
+
+        Samples manager's own resource usage and feeds to HybridOverloadDetector
+        for overload state classification. Runs at 1s cadence for responsive
+        detection while balancing overhead.
+        """
+        sample_interval = 1.0
+
+        while self._running:
+            try:
+                await asyncio.sleep(sample_interval)
+
+                metrics = await self._resource_monitor.sample()
+                self._last_resource_metrics = metrics
+
+                new_state = self._overload_detector.get_state(
+                    metrics.cpu_percent,
+                    metrics.memory_percent,
+                )
+                new_state_str = new_state.value
+
+                if new_state_str != self._manager_health_state:
+                    self._previous_manager_health_state = self._manager_health_state
+                    self._manager_health_state = new_state_str
+                    self._log_manager_health_transition(
+                        self._previous_manager_health_state,
+                        new_state_str,
+                    )
+
+            except asyncio.CancelledError:
+                break
+            except Exception as error:
+                await self._udp_logger.log(
+                    ServerWarning(
+                        message=f"Resource sampling error: {error}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+
+    def _log_manager_health_transition(
+        self,
+        previous_state: str,
+        new_state: str,
+    ) -> None:
+        """Log manager health state transitions."""
+        state_severity = {"healthy": 0, "busy": 1, "stressed": 2, "overloaded": 3}
+        previous_severity = state_severity.get(previous_state, 0)
+        new_severity = state_severity.get(new_state, 0)
+        is_degradation = new_severity > previous_severity
+
+        if is_degradation:
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerWarning(
+                    message=f"Manager health degraded: {previous_state} -> {new_state}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                ),
+            )
+        else:
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerDebug(
+                    message=f"Manager health improved: {previous_state} -> {new_state}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                ),
+            )
+
+    def get_manager_health_state(self) -> str:
+        """Get current manager health overload state."""
+        return self._manager_health_state
+
     # =========================================================================
     # State Sync
     # =========================================================================
