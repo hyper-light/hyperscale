@@ -289,6 +289,11 @@ class GateDispatchCoordinator:
         Sets origin_gate_addr so managers send results directly to this gate.
         Handles health-based routing: UNHEALTHY -> fail, DEGRADED/BUSY -> warn, HEALTHY -> proceed.
         """
+        for datacenter_id in target_dcs:
+            self._dispatch_time_tracker.record_dispatch(
+                submission.job_id, datacenter_id
+            )
+
         job = self._job_manager.get_job(submission.job_id)
         if not job:
             return
