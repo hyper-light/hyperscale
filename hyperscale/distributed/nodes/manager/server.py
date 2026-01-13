@@ -2091,11 +2091,10 @@ class ManagerServer(HealthAwareServer):
         current_time = time.monotonic()
         elapsed = current_time - self._manager_state._dispatch_throughput_interval_start
 
-        if elapsed >= self._config.throughput_interval_seconds:
-            if elapsed > 0:
-                self._manager_state._dispatch_throughput_last_value = (
-                    self._manager_state._dispatch_throughput_count / elapsed
-                )
+        if elapsed >= self._config.throughput_interval_seconds and elapsed > 0:
+            self._manager_state._dispatch_throughput_last_value = (
+                self._manager_state._dispatch_throughput_count / elapsed
+            )
             self._manager_state._dispatch_throughput_count = 0
             self._manager_state._dispatch_throughput_interval_start = current_time
             return self._manager_state._dispatch_throughput_last_value
