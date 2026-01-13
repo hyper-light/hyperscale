@@ -731,31 +731,35 @@ class TestRateLimitRecovery:
 class TestServerRateLimiterCheckEdgeCases:
     """Test edge cases for ServerRateLimiter.check() compatibility method."""
 
-    def test_check_with_port_zero(self) -> None:
+    @pytest.mark.asyncio
+    async def test_check_with_port_zero(self) -> None:
         """Test check() with port 0 (ephemeral port)."""
         limiter = ServerRateLimiter()
         addr = ("192.168.1.1", 0)
 
-        result = limiter.check(addr)
+        result = await limiter.check(addr)
         assert result is True
 
-    def test_check_with_high_port(self) -> None:
+    @pytest.mark.asyncio
+    async def test_check_with_high_port(self) -> None:
         """Test check() with maximum port number."""
         limiter = ServerRateLimiter()
         addr = ("192.168.1.1", 65535)
 
-        result = limiter.check(addr)
+        result = await limiter.check(addr)
         assert result is True
 
-    def test_check_with_empty_host(self) -> None:
+    @pytest.mark.asyncio
+    async def test_check_with_empty_host(self) -> None:
         """Test check() with empty host string."""
         limiter = ServerRateLimiter()
         addr = ("", 8080)
 
-        result = limiter.check(addr)
+        result = await limiter.check(addr)
         assert result is True
 
-    def test_check_rapid_fire_same_address(self) -> None:
+    @pytest.mark.asyncio
+    async def test_check_rapid_fire_same_address(self) -> None:
         """Test rapid-fire requests from same address."""
         config = RateLimitConfig(
             default_bucket_size=10,
@@ -766,12 +770,13 @@ class TestServerRateLimiterCheckEdgeCases:
 
         allowed_count = 0
         for _ in range(20):
-            if limiter.check(addr):
+            if await limiter.check(addr):
                 allowed_count += 1
 
         assert allowed_count == 10
 
-    def test_check_recovery_after_time(self) -> None:
+    @pytest.mark.asyncio
+    async def test_check_recovery_after_time(self) -> None:
         """Test that check() allows requests again after time passes."""
         config = RateLimitConfig(
             default_bucket_size=2,
@@ -780,28 +785,30 @@ class TestServerRateLimiterCheckEdgeCases:
         limiter = ServerRateLimiter(config=config)
         addr = ("192.168.1.1", 8080)
 
-        limiter.check(addr)
-        limiter.check(addr)
-        assert limiter.check(addr) is False
+        await limiter.check(addr)
+        await limiter.check(addr)
+        assert await limiter.check(addr) is False
 
         # Window size is max(0.05, 2/100) = 0.05s
         # With sliding window, we need: total_count * (1 - progress) + 1 <= 2
         # So: 2 * (1 - progress) <= 1, meaning progress >= 0.5
         # That's 0.5 * 0.05 = 0.025s into the new window, plus the remaining
         # time in current window. Total wait ~0.05 + 0.025 = 0.075s
-        time.sleep(0.08)
+        await asyncio.sleep(0.08)
 
-        assert limiter.check(addr) is True
+        assert await limiter.check(addr) is True
 
-    def test_check_with_special_characters_in_host(self) -> None:
+    @pytest.mark.asyncio
+    async def test_check_with_special_characters_in_host(self) -> None:
         """Test check() with hostname containing dots and dashes."""
         limiter = ServerRateLimiter()
         addr = ("my-server.example-domain.com", 8080)
 
-        result = limiter.check(addr)
+        result = await limiter.check(addr)
         assert result is True
 
-    def test_check_does_not_interfere_with_other_operations(self) -> None:
+    @pytest.mark.asyncio
+    async def test_check_does_not_interfere_with_other_operations(self) -> None:
         """Test that check() using 'default' doesn't affect other operations."""
         config = RateLimitConfig(
             default_bucket_size=2,
@@ -812,30 +819,32 @@ class TestServerRateLimiterCheckEdgeCases:
         addr = ("192.168.1.1", 8080)
         client_id = "192.168.1.1:8080"
 
-        limiter.check(addr)
-        limiter.check(addr)
-        assert limiter.check(addr) is False
+        await limiter.check(addr)
+        await limiter.check(addr)
+        assert await limiter.check(addr) is False
 
-        result = limiter.check_rate_limit(client_id, "custom_op")
+        result = await limiter.check_rate_limit(client_id, "custom_op")
         assert result.allowed is True
 
-    def test_check_cleanup_affects_check_clients(self) -> None:
+    @pytest.mark.asyncio
+    async def test_check_cleanup_affects_check_clients(self) -> None:
         """Test that cleanup_inactive_clients() cleans up clients created via check()."""
         limiter = ServerRateLimiter(inactive_cleanup_seconds=0.05)
 
         for i in range(5):
             addr = (f"192.168.1.{i}", 8080)
-            limiter.check(addr)
+            await limiter.check(addr)
 
         assert limiter.get_metrics()["active_clients"] == 5
 
-        time.sleep(0.1)
+        await asyncio.sleep(0.1)
 
-        cleaned = limiter.cleanup_inactive_clients()
+        cleaned = await limiter.cleanup_inactive_clients()
         assert cleaned == 5
         assert limiter.get_metrics()["active_clients"] == 0
 
-    def test_check_reset_client_affects_check_counter(self) -> None:
+    @pytest.mark.asyncio
+    async def test_check_reset_client_affects_check_counter(self) -> None:
         """Test that reset_client() restores capacity for clients created via check()."""
         config = RateLimitConfig(
             default_bucket_size=3,
@@ -845,16 +854,17 @@ class TestServerRateLimiterCheckEdgeCases:
         addr = ("192.168.1.1", 8080)
         client_id = "192.168.1.1:8080"
 
-        limiter.check(addr)
-        limiter.check(addr)
-        limiter.check(addr)
-        assert limiter.check(addr) is False
+        await limiter.check(addr)
+        await limiter.check(addr)
+        await limiter.check(addr)
+        assert await limiter.check(addr) is False
 
         limiter.reset_client(client_id)
 
-        assert limiter.check(addr) is True
+        assert await limiter.check(addr) is True
 
-    def test_check_exception_message_format(self) -> None:
+    @pytest.mark.asyncio
+    async def test_check_exception_message_format(self) -> None:
         """Test that RateLimitExceeded exception has correct message format."""
         from hyperscale.core.jobs.protocols.rate_limiter import RateLimitExceeded
 
@@ -865,16 +875,17 @@ class TestServerRateLimiterCheckEdgeCases:
         limiter = ServerRateLimiter(config=config)
         addr = ("10.20.30.40", 12345)
 
-        limiter.check(addr)
+        await limiter.check(addr)
 
         try:
-            limiter.check(addr, raise_on_limit=True)
+            await limiter.check(addr, raise_on_limit=True)
             assert False, "Should have raised"
         except RateLimitExceeded as exc:
             assert "10.20.30.40" in str(exc)
             assert "12345" in str(exc)
 
-    def test_check_multiple_concurrent_addresses(self) -> None:
+    @pytest.mark.asyncio
+    async def test_check_multiple_concurrent_addresses(self) -> None:
         """Test check() with many different addresses concurrently."""
         config = RateLimitConfig(
             default_bucket_size=5,
@@ -884,11 +895,12 @@ class TestServerRateLimiterCheckEdgeCases:
 
         for i in range(100):
             addr = (f"10.0.0.{i}", 8080 + i)
-            assert limiter.check(addr) is True
+            assert await limiter.check(addr) is True
 
         assert limiter.get_metrics()["active_clients"] == 100
 
-    def test_check_returns_false_not_none(self) -> None:
+    @pytest.mark.asyncio
+    async def test_check_returns_false_not_none(self) -> None:
         """Test that check() returns False (not None) when rate limited."""
         config = RateLimitConfig(
             default_bucket_size=1,
@@ -897,8 +909,8 @@ class TestServerRateLimiterCheckEdgeCases:
         limiter = ServerRateLimiter(config=config)
         addr = ("192.168.1.1", 8080)
 
-        limiter.check(addr)
-        result = limiter.check(addr)
+        await limiter.check(addr)
+        result = await limiter.check(addr)
 
         assert result is False
         assert result is not None
@@ -925,12 +937,13 @@ class TestHealthGatedEdgeCases:
         state = detector.get_state()
         assert state in (OverloadState.HEALTHY, OverloadState.BUSY)
 
-    def test_graceful_handling_no_detector(self) -> None:
+    @pytest.mark.asyncio
+    async def test_graceful_handling_no_detector(self) -> None:
         """Test that limiter works without explicit detector."""
         limiter = ServerRateLimiter()
 
         # Should work with internal detector
-        result = limiter.check_rate_limit("client-1", "test")
+        result = await limiter.check_rate_limit("client-1", "test")
         assert result.allowed is True
 
         # Should be able to access detector
