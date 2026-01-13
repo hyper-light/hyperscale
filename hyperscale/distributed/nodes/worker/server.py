@@ -952,19 +952,10 @@ class WorkerServer(HealthAwareServer):
         """Handle manager failure - mark workflows as orphaned."""
         await self._registry.mark_manager_unhealthy(manager_id)
 
-        # Select new primary if needed
         if self._primary_manager_id == manager_id:
             await self._registry.select_new_primary_manager()
 
-        # Mark affected workflows as orphaned
-        manager_info = self._registry.get_manager(manager_id)
-        if not manager_info:
-            return
-
-        manager_addr = (manager_info.tcp_host, manager_info.tcp_port)
-        for workflow_id, leader_addr in list(self._workflow_job_leader.items()):
-            if leader_addr == manager_addr:
-                self._worker_state.mark_workflow_orphaned(workflow_id)
+        self._mark_manager_workflows_orphaned(manager_id)
 
         await self._udp_logger.log(
             ServerInfo(
@@ -974,6 +965,16 @@ class WorkerServer(HealthAwareServer):
                 node_id=self._node_id.short,
             )
         )
+
+    def _mark_manager_workflows_orphaned(self, manager_id: str) -> None:
+        manager_info = self._registry.get_manager(manager_id)
+        if not manager_info:
+            return
+
+        manager_addr = (manager_info.tcp_host, manager_info.tcp_port)
+        for workflow_id, leader_addr in list(self._workflow_job_leader.items()):
+            if leader_addr == manager_addr:
+                self._worker_state.mark_workflow_orphaned(workflow_id)
 
     async def _handle_manager_recovery_async(self, manager_id: str) -> None:
         """Handle manager recovery - mark as healthy."""
