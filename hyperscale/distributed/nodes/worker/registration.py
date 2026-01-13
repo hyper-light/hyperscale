@@ -21,9 +21,17 @@ from hyperscale.distributed.protocol.version import (
     NodeCapabilities,
     ProtocolVersion,
 )
-from hyperscale.distributed.reliability import RetryConfig, RetryExecutor, JitterStrategy
+from hyperscale.distributed.reliability import (
+    RetryConfig,
+    RetryExecutor,
+    JitterStrategy,
+)
 from hyperscale.distributed.swim.core import CircuitState
-from hyperscale.logging.hyperscale_logging_models import ServerDebug, ServerError, ServerInfo
+from hyperscale.logging.hyperscale_logging_models import (
+    ServerDebug,
+    ServerError,
+    ServerInfo,
+)
 
 if TYPE_CHECKING:
     from hyperscale.logging import Logger
@@ -55,10 +63,12 @@ class WorkerRegistrationHandler:
             logger: Logger instance
             node_capabilities: Node capabilities for protocol negotiation
         """
-        self._registry = registry
-        self._discovery_service = discovery_service
-        self._logger = logger
-        self._node_capabilities = node_capabilities or NodeCapabilities.current(node_version="")
+        self._registry: "WorkerRegistry" = registry
+        self._discovery_service: "DiscoveryService" = discovery_service
+        self._logger: "Logger | None" = logger
+        self._node_capabilities: NodeCapabilities = (
+            node_capabilities or NodeCapabilities.current(node_version="")
+        )
 
         # Negotiated capabilities (AD-25)
         self._negotiated_capabilities: NegotiatedCapabilities | None = None
@@ -116,7 +126,9 @@ class WorkerRegistrationHandler:
                         message=f"Cannot register with {manager_addr}: circuit breaker is OPEN",
                         node_host=node_info.host,
                         node_port=node_info.port,
-                        node_id=node_info.node_id[:8] if node_info.node_id else "unknown",
+                        node_id=node_info.node_id[:8]
+                        if node_info.node_id
+                        else "unknown",
                     )
                 )
             return False
@@ -139,7 +151,7 @@ class WorkerRegistrationHandler:
         retry_config = RetryConfig(
             max_attempts=max_retries + 1,
             base_delay=base_delay,
-            max_delay=base_delay * (2 ** max_retries),
+            max_delay=base_delay * (2**max_retries),
             jitter=JitterStrategy.FULL,
         )
         executor = RetryExecutor(retry_config)
@@ -163,7 +175,9 @@ class WorkerRegistrationHandler:
                         message=f"Failed to register with manager {manager_addr} after {max_retries + 1} attempts: {error}",
                         node_host=node_info.host,
                         node_port=node_info.port,
-                        node_id=node_info.node_id[:8] if node_info.node_id else "unknown",
+                        node_id=node_info.node_id[:8]
+                        if node_info.node_id
+                        else "unknown",
                     )
                 )
             return False
@@ -222,7 +236,9 @@ class WorkerRegistrationHandler:
             )
 
             negotiated_features = (
-                set(response.capabilities.split(",")) if response.capabilities else set()
+                set(response.capabilities.split(","))
+                if response.capabilities
+                else set()
             )
             negotiated_features.discard("")
 
