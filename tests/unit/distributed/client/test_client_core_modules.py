@@ -482,14 +482,15 @@ class TestClientLeadershipTracker:
 
         assert result is None
 
-    def test_get_leadership_metrics(self):
+    @pytest.mark.asyncio
+    async def test_get_leadership_metrics(self):
         """Test leadership metrics retrieval."""
         state = ClientState()
         logger = make_mock_logger()
         tracker = ClientLeadershipTracker(state, logger)
 
-        state.increment_gate_transfers()
-        state.increment_manager_transfers()
+        await state.increment_gate_transfers()
+        await state.increment_manager_transfers()
         tracker.mark_job_orphaned(
             "job1",
             last_known_gate=None,

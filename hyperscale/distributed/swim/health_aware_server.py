@@ -69,6 +69,7 @@ from .health.peer_health_awareness import PeerHealthAwareness, PeerHealthAwarene
 
 # Failure detection
 from .detection.incarnation_tracker import IncarnationTracker, MessageFreshness
+from .detection.incarnation_store import IncarnationStore
 from .detection.suspicion_state import SuspicionState
 
 # SuspicionManager replaced by HierarchicalFailureDetector (AD-30)
@@ -147,6 +148,9 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         # Refutation rate limiting - prevents incarnation exhaustion attacks
         refutation_rate_limit_tokens: int = 5,  # Max refutations per window
         refutation_rate_limit_window: float = 10.0,  # Window duration in seconds
+        # Incarnation persistence settings
+        incarnation_storage_dir: str
+        | None = None,  # Directory for incarnation persistence
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -169,6 +173,9 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         self._local_health = LocalHealthMultiplier()
         self._incarnation_tracker = IncarnationTracker()
         self._indirect_probe_manager = IndirectProbeManager()
+
+        self._incarnation_storage_dir = incarnation_storage_dir
+        self._incarnation_store: IncarnationStore | None = None
 
         # Direct probe ACK tracking - key is target addr, value is Future set when ACK received
         self._pending_probe_acks: dict[tuple[str, int], asyncio.Future[bool]] = {}
@@ -1009,8 +1016,55 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
 
     def _setup_task_runner_integration(self) -> None:
         """Integrate TaskRunner with SWIM components."""
-        # Hierarchical detector manages its own tasks via asyncio
         pass
+
+    async def initialize_incarnation_store(self) -> int:
+        """
+        Initialize the incarnation store and return the starting incarnation.
+
+        Must be called after the server has started and the UDP port is known.
+        If incarnation_storage_dir was provided, this creates and initializes
+        the IncarnationStore for persistent incarnation tracking.
+
+        Returns:
+            The initial incarnation number to use.
+        """
+        if self._incarnation_storage_dir is None:
+            return 0
+
+        from pathlib import Path
+
+        node_address = f"{self._host}:{self._udp_port}"
+        self._incarnation_store = IncarnationStore(
+            storage_directory=Path(self._incarnation_storage_dir),
+            node_address=node_address,
+        )
+
+        if self._udp_logger:
+            self._incarnation_store.set_logger(
+                self._udp_logger,
+                self._host,
+                self._udp_port,
+            )
+
+        initial_incarnation = await self._incarnation_store.initialize()
+        self._incarnation_tracker.self_incarnation = initial_incarnation
+
+        return initial_incarnation
+
+    async def persist_incarnation(self, incarnation: int) -> bool:
+        """
+        Persist an incarnation number to disk.
+
+        Called after incrementing incarnation (e.g., during refutation)
+        to ensure the new value survives restarts.
+
+        Returns:
+            True if persisted successfully, False otherwise.
+        """
+        if self._incarnation_store is None:
+            return False
+        return await self._incarnation_store.update_incarnation(incarnation)
 
     def _setup_health_monitor(self) -> None:
         """Set up event loop health monitor with LHM integration."""
@@ -2657,7 +2711,9 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
 
     async def increment_incarnation(self) -> int:
         """Increment and return this node's incarnation number (for refutation)."""
-        return await self._incarnation_tracker.increment_self_incarnation()
+        new_incarnation = await self._incarnation_tracker.increment_self_incarnation()
+        await self.persist_incarnation(new_incarnation)
+        return new_incarnation
 
     def encode_message_with_incarnation(
         self,

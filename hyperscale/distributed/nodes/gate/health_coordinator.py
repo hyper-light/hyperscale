@@ -69,26 +69,9 @@ class GateHealthCoordinator:
         get_host: Callable[[], str],
         get_tcp_port: Callable[[], int],
         confirm_manager_for_dc: Callable[[str, tuple[str, int]], "asyncio.Task"],
+        on_partition_healed: Callable[[list[str]], None] | None = None,
+        on_partition_detected: Callable[[list[str]], None] | None = None,
     ) -> None:
-        """
-        Initialize the health coordinator.
-
-        Args:
-            state: Runtime state container
-            logger: Async logger instance
-            task_runner: Background task executor
-            dc_health_manager: Datacenter health manager for TCP heartbeats
-            dc_health_monitor: Federated health monitor for UDP probes
-            cross_dc_correlation: Cross-DC correlation detector
-            dc_manager_discovery: Per-DC discovery services
-            versioned_clock: Version tracking for stale update rejection
-            manager_dispatcher: Manager dispatch service
-            manager_health_config: Configuration for manager health states
-            get_node_id: Callback to get this gate's node ID
-            get_host: Callback to get this gate's host
-            get_tcp_port: Callback to get this gate's TCP port
-            confirm_manager_for_dc: Callback to confirm manager for DC in hierarchical detector
-        """
         self._state = state
         self._logger = logger
         self._task_runner = task_runner
@@ -103,6 +86,15 @@ class GateHealthCoordinator:
         self._get_host = get_host
         self._get_tcp_port = get_tcp_port
         self._confirm_manager_for_dc = confirm_manager_for_dc
+        self._on_partition_healed = on_partition_healed
+        self._on_partition_detected = on_partition_detected
+
+        self._cross_dc_correlation.register_partition_healed_callback(
+            self._handle_partition_healed
+        )
+        self._cross_dc_correlation.register_partition_detected_callback(
+            self._handle_partition_detected
+        )
 
     async def handle_embedded_manager_heartbeat(
         self,
@@ -440,3 +432,54 @@ class GateHealthCoordinator:
                         dc_id,
                     )
         return result
+
+    def _handle_partition_healed(
+        self,
+        healed_datacenters: list[str],
+        timestamp: float,
+    ) -> None:
+        self._task_runner.run(
+            self._logger.log,
+            ServerInfo(
+                message=f"Partition healed for datacenters: {healed_datacenters}",
+                node_host=self._get_host(),
+                node_port=self._get_tcp_port(),
+                node_id=self._get_node_id().full,
+            ),
+        )
+
+        if self._on_partition_healed:
+            try:
+                self._on_partition_healed(healed_datacenters)
+            except Exception:
+                pass
+
+    def _handle_partition_detected(
+        self,
+        affected_datacenters: list[str],
+        timestamp: float,
+    ) -> None:
+        self._task_runner.run(
+            self._logger.log,
+            ServerInfo(
+                message=f"Partition detected affecting datacenters: {affected_datacenters}",
+                node_host=self._get_host(),
+                node_port=self._get_tcp_port(),
+                node_id=self._get_node_id().full,
+            ),
+        )
+
+        if self._on_partition_detected:
+            try:
+                self._on_partition_detected(affected_datacenters)
+            except Exception:
+                pass
+
+    def check_and_notify_partition_healed(self) -> bool:
+        return self._cross_dc_correlation.check_partition_healed()
+
+    def is_in_partition(self) -> bool:
+        return self._cross_dc_correlation.is_in_partition()
+
+    def get_time_since_partition_healed(self) -> float | None:
+        return self._cross_dc_correlation.get_time_since_partition_healed()
