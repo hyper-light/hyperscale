@@ -2872,13 +2872,14 @@ class ManagerServer(HealthAwareServer):
                                 wf_response = WorkflowCancelResponse.load(response)
                                 if wf_response.success:
                                     running_cancelled.append(workflow_id)
-                                    self._manager_state._cancelled_workflows[
-                                        workflow_id
-                                    ] = CancelledWorkflowInfo(
-                                        workflow_id=workflow_id,
-                                        job_id=job_id,
-                                        cancelled_at=timestamp,
-                                        reason=reason,
+                                    self._manager_state.set_cancelled_workflow(
+                                        workflow_id,
+                                        CancelledWorkflowInfo(
+                                            workflow_id=workflow_id,
+                                            job_id=job_id,
+                                            cancelled_at=timestamp,
+                                            reason=reason,
+                                        ),
                                     )
                                 else:
                                     error_msg = (
@@ -4005,8 +4006,8 @@ class ManagerServer(HealthAwareServer):
                 ).dump()
 
             # Check if already cancelled
-            if request.workflow_id in self._manager_state._cancelled_workflows:
-                existing = self._manager_state._cancelled_workflows[request.workflow_id]
+            existing = self._manager_state.get_cancelled_workflow(request.workflow_id)
+            if existing:
                 return SingleWorkflowCancelResponse(
                     job_id=request.job_id,
                     workflow_id=request.workflow_id,
@@ -4028,14 +4029,15 @@ class ManagerServer(HealthAwareServer):
                 ).dump()
 
             # Add to cancelled workflows
-            self._manager_state._cancelled_workflows[request.workflow_id] = (
+            self._manager_state.set_cancelled_workflow(
+                request.workflow_id,
                 CancelledWorkflowInfo(
                     job_id=request.job_id,
                     workflow_id=request.workflow_id,
                     cancelled_at=time.monotonic(),
                     request_id=request.request_id,
                     dependents=[],
-                )
+                ),
             )
 
             return SingleWorkflowCancelResponse(
