@@ -374,18 +374,32 @@ class BackpressureSignal:
         return self.suggested_delay_ms
 
     @classmethod
-    def from_level(cls, level: BackpressureLevel) -> "BackpressureSignal":
-        """Create signal from backpressure level."""
+    def from_level(
+        cls,
+        level: BackpressureLevel,
+        throttle_delay_ms: int = 100,
+        batch_delay_ms: int = 500,
+        reject_delay_ms: int = 1000,
+    ) -> "BackpressureSignal":
+        """
+        Create signal from backpressure level.
+
+        Args:
+            level: The backpressure level to signal.
+            throttle_delay_ms: Suggested delay for THROTTLE level (default: 100ms).
+            batch_delay_ms: Suggested delay for BATCH level (default: 500ms).
+            reject_delay_ms: Suggested delay for REJECT level (default: 1000ms).
+        """
         if level == BackpressureLevel.NONE:
             return cls(level=level)
         elif level == BackpressureLevel.THROTTLE:
-            return cls(level=level, suggested_delay_ms=100)
+            return cls(level=level, suggested_delay_ms=throttle_delay_ms)
         elif level == BackpressureLevel.BATCH:
-            return cls(level=level, suggested_delay_ms=500, batch_only=True)
+            return cls(level=level, suggested_delay_ms=batch_delay_ms, batch_only=True)
         else:  # REJECT
             return cls(
                 level=level,
-                suggested_delay_ms=1000,
+                suggested_delay_ms=reject_delay_ms,
                 batch_only=True,
                 drop_non_critical=True,
             )

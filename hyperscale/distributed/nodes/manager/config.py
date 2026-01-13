@@ -99,6 +99,12 @@ class ManagerConfig:
     stats_throttle_threshold: float = 0.7
     stats_batch_threshold: float = 0.85
     stats_reject_threshold: float = 0.95
+    stats_buffer_high_watermark: int = 1000
+    stats_buffer_critical_watermark: int = 5000
+    stats_buffer_reject_watermark: int = 10000
+    progress_normal_ratio: float = 0.8
+    progress_slow_ratio: float = 0.5
+    progress_degraded_ratio: float = 0.2
 
     # Stats push interval (from env)
     stats_push_interval_ms: int = 1000
@@ -226,6 +232,12 @@ def create_manager_config_from_env(
         stats_throttle_threshold=env.MANAGER_STATS_THROTTLE_THRESHOLD,
         stats_batch_threshold=env.MANAGER_STATS_BATCH_THRESHOLD,
         stats_reject_threshold=env.MANAGER_STATS_REJECT_THRESHOLD,
+        stats_buffer_high_watermark=env.MANAGER_STATS_BUFFER_HIGH_WATERMARK,
+        stats_buffer_critical_watermark=env.MANAGER_STATS_BUFFER_CRITICAL_WATERMARK,
+        stats_buffer_reject_watermark=env.MANAGER_STATS_BUFFER_REJECT_WATERMARK,
+        progress_normal_ratio=env.MANAGER_PROGRESS_NORMAL_RATIO,
+        progress_slow_ratio=env.MANAGER_PROGRESS_SLOW_RATIO,
+        progress_degraded_ratio=env.MANAGER_PROGRESS_DEGRADED_RATIO,
         stats_push_interval_ms=env.STATS_PUSH_INTERVAL_MS,
         cluster_id=env.get("CLUSTER_ID", "hyperscale"),
         environment_id=env.get("ENVIRONMENT_ID", "default"),

@@ -115,6 +115,9 @@ class WorkerServer(HealthAwareServer):
             state=self._worker_state,
             logger=None,
             registry=self._registry,
+            throttle_delay_ms=env.WORKER_BACKPRESSURE_THROTTLE_DELAY_MS,
+            batch_delay_ms=env.WORKER_BACKPRESSURE_BATCH_DELAY_MS,
+            reject_delay_ms=env.WORKER_BACKPRESSURE_REJECT_DELAY_MS,
         )
 
         self._executor = WorkerExecutor(

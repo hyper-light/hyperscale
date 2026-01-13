@@ -40,22 +40,21 @@ class WorkerBackpressureManager:
         logger: "Logger | None" = None,
         registry: "WorkerRegistry | None" = None,
         poll_interval: float = 0.25,
+        throttle_delay_ms: int = 500,
+        batch_delay_ms: int = 1000,
+        reject_delay_ms: int = 2000,
     ) -> None:
-        """
-        Initialize backpressure manager.
-
-        Args:
-            state: WorkerState for backpressure tracking (single source of truth)
-            logger: Logger instance for logging
-            registry: WorkerRegistry for manager tracking
-            poll_interval: Polling interval for resource sampling (default 250ms)
-        """
         self._state = state
         self._logger = logger
         self._registry = registry
         self._overload_detector = HybridOverloadDetector()
         self._poll_interval = poll_interval
         self._running = False
+
+        # Configurable backpressure delay defaults (AD-37)
+        self._throttle_delay_ms = throttle_delay_ms
+        self._batch_delay_ms = batch_delay_ms
+        self._reject_delay_ms = reject_delay_ms
 
         # Resource getters (set by server)
         self._get_cpu_percent: callable = lambda: 0.0
@@ -213,14 +212,11 @@ class WorkerBackpressureManager:
         if level == BackpressureLevel.NONE:
             return 0.0
         elif level == BackpressureLevel.THROTTLE:
-            # Use suggested delay or default 500ms
-            return max(delay_ms, 500) / 1000.0
+            return max(delay_ms, self._throttle_delay_ms) / 1000.0
         elif level == BackpressureLevel.BATCH:
-            # Double the delay for batch mode
-            return max(delay_ms * 2, 1000) / 1000.0
+            return max(delay_ms * 2, self._batch_delay_ms) / 1000.0
         else:
-            # REJECT: maximum delay
-            return max(delay_ms * 4, 2000) / 1000.0
+            return max(delay_ms * 4, self._reject_delay_ms) / 1000.0
 
     def get_backpressure_state_name(self) -> str:
         """

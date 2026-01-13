@@ -139,6 +139,11 @@ class Env(BaseModel):
         5.0  # Seconds between cancellation poll requests
     )
 
+    # Worker Backpressure Delay Settings (AD-37)
+    WORKER_BACKPRESSURE_THROTTLE_DELAY_MS: StrictInt = 500  # Default THROTTLE delay
+    WORKER_BACKPRESSURE_BATCH_DELAY_MS: StrictInt = 1000  # Default BATCH delay
+    WORKER_BACKPRESSURE_REJECT_DELAY_MS: StrictInt = 2000  # Default REJECT delay
+
     # Worker TCP Timeout Settings
     WORKER_TCP_TIMEOUT_SHORT: StrictFloat = 2.0  # Short timeout for quick operations
     WORKER_TCP_TIMEOUT_STANDARD: StrictFloat = (
@@ -457,6 +462,12 @@ class Env(BaseModel):
     MANAGER_STATS_REJECT_THRESHOLD: StrictFloat = (
         0.95  # Reject non-critical at 95% fill
     )
+    MANAGER_STATS_BUFFER_HIGH_WATERMARK: StrictInt = 1000  # THROTTLE trigger
+    MANAGER_STATS_BUFFER_CRITICAL_WATERMARK: StrictInt = 5000  # BATCH trigger
+    MANAGER_STATS_BUFFER_REJECT_WATERMARK: StrictInt = 10000  # REJECT trigger
+    MANAGER_PROGRESS_NORMAL_RATIO: StrictFloat = 0.8  # >= 80% throughput = NORMAL
+    MANAGER_PROGRESS_SLOW_RATIO: StrictFloat = 0.5  # >= 50% throughput = SLOW
+    MANAGER_PROGRESS_DEGRADED_RATIO: StrictFloat = 0.2  # >= 20% throughput = DEGRADED
 
     # ==========================================================================
     # Cross-DC Correlation Settings (Phase 7)
@@ -680,6 +691,10 @@ class Env(BaseModel):
             "WORKER_DEAD_MANAGER_CHECK_INTERVAL": float,
             # Worker cancellation polling settings
             "WORKER_CANCELLATION_POLL_INTERVAL": float,
+            # Worker backpressure delay settings (AD-37)
+            "WORKER_BACKPRESSURE_THROTTLE_DELAY_MS": int,
+            "WORKER_BACKPRESSURE_BATCH_DELAY_MS": int,
+            "WORKER_BACKPRESSURE_REJECT_DELAY_MS": int,
             # Worker TCP timeout settings
             "WORKER_TCP_TIMEOUT_SHORT": float,
             "WORKER_TCP_TIMEOUT_STANDARD": float,
@@ -805,6 +820,12 @@ class Env(BaseModel):
             "MANAGER_STATS_THROTTLE_THRESHOLD": float,
             "MANAGER_STATS_BATCH_THRESHOLD": float,
             "MANAGER_STATS_REJECT_THRESHOLD": float,
+            "MANAGER_STATS_BUFFER_HIGH_WATERMARK": int,
+            "MANAGER_STATS_BUFFER_CRITICAL_WATERMARK": int,
+            "MANAGER_STATS_BUFFER_REJECT_WATERMARK": int,
+            "MANAGER_PROGRESS_NORMAL_RATIO": float,
+            "MANAGER_PROGRESS_SLOW_RATIO": float,
+            "MANAGER_PROGRESS_DEGRADED_RATIO": float,
             # Cluster and environment isolation (AD-28 Issue 2)
             "CLUSTER_ID": str,
             "ENVIRONMENT_ID": str,

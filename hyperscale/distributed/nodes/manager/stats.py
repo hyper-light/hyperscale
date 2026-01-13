@@ -74,9 +74,11 @@ class ManagerStatsCoordinator:
 
         # AD-23: Stats buffer tracking for backpressure
         self._stats_buffer_count: int = 0
-        self._stats_buffer_high_watermark: int = 1000
-        self._stats_buffer_critical_watermark: int = 5000
-        self._stats_buffer_reject_watermark: int = 10000
+        self._stats_buffer_high_watermark: int = config.stats_buffer_high_watermark
+        self._stats_buffer_critical_watermark: int = (
+            config.stats_buffer_critical_watermark
+        )
+        self._stats_buffer_reject_watermark: int = config.stats_buffer_reject_watermark
 
     def record_dispatch(self) -> None:
         """Record a workflow dispatch for throughput tracking."""
@@ -119,7 +121,9 @@ class ManagerStatsCoordinator:
         """
         # Simple calculation based on healthy worker count
         # Full implementation would consider actual capacity
-        healthy_count = len(self._state._workers) - len(self._state._worker_unhealthy_since)
+        healthy_count = len(self._state._workers) - len(
+            self._state._worker_unhealthy_since
+        )
         # Return 0.0 if no workers (system is idle, not stuck)
         return float(healthy_count)
 
@@ -145,11 +149,11 @@ class ManagerStatsCoordinator:
         ratio = actual / expected
         now = time.monotonic()
 
-        if ratio >= 0.8:
+        if ratio >= self._config.progress_normal_ratio:
             new_state = ProgressState.NORMAL
-        elif ratio >= 0.5:
+        elif ratio >= self._config.progress_slow_ratio:
             new_state = ProgressState.SLOW
-        elif ratio >= 0.2:
+        elif ratio >= self._config.progress_degraded_ratio:
             new_state = ProgressState.DEGRADED
         else:
             new_state = ProgressState.STUCK
@@ -163,7 +167,7 @@ class ManagerStatsCoordinator:
                     node_host=self._config.host,
                     node_port=self._config.tcp_port,
                     node_id=self._node_id,
-                )
+                ),
             )
             self._progress_state = new_state
             self._progress_state_since = now
@@ -233,7 +237,7 @@ class ManagerStatsCoordinator:
                 node_host=self._config.host,
                 node_port=self._config.tcp_port,
                 node_id=self._node_id,
-            )
+            ),
         )
 
     async def push_batch_stats(self) -> None:
@@ -253,7 +257,7 @@ class ManagerStatsCoordinator:
                 node_host=self._config.host,
                 node_port=self._config.tcp_port,
                 node_id=self._node_id,
-            )
+            ),
         )
 
     def get_stats_metrics(self) -> dict:
