@@ -54,11 +54,14 @@ class WindowedStatsPushHandler:
 
             push: WindowedStatsPush = cloudpickle.loads(data)
 
-            # Call user callback if registered
             callback = self._state._progress_callbacks.get(push.job_id)
             if callback:
                 try:
-                    callback(push)
+                    if asyncio.iscoroutinefunction(callback):
+                        await callback(push)
+                    else:
+                        loop = asyncio.get_running_loop()
+                        await loop.run_in_executor(None, callback, push)
                 except Exception as callback_error:
                     if self._logger:
                         await self._logger.log(

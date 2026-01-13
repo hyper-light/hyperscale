@@ -58,10 +58,13 @@ class TestGateJobManager:
 
         assert manager.has_job("job-123") is False
 
-        manager.set_job("job-123", GlobalJobStatus(
-            job_id="job-123",
-            status=JobStatus.SUBMITTED.value,
-        ))
+        manager.set_job(
+            "job-123",
+            GlobalJobStatus(
+                job_id="job-123",
+                status=JobStatus.SUBMITTED.value,
+            ),
+        )
 
         assert manager.has_job("job-123") is True
         assert manager.has_job("job-456") is False
@@ -71,10 +74,13 @@ class TestGateJobManager:
         manager = GateJobManager()
 
         # Set up job with all associated data
-        manager.set_job("job-123", GlobalJobStatus(
-            job_id="job-123",
-            status=JobStatus.RUNNING.value,
-        ))
+        manager.set_job(
+            "job-123",
+            GlobalJobStatus(
+                job_id="job-123",
+                status=JobStatus.RUNNING.value,
+            ),
+        )
         manager.set_target_dcs("job-123", {"dc-1", "dc-2"})
         manager.set_callback("job-123", ("10.0.0.1", 8080))
         manager.set_fence_token("job-123", 5)
@@ -138,7 +144,8 @@ class TestGateJobManager:
         assert removed == ("10.0.0.1", 8080)
         assert manager.has_callback("job-123") is False
 
-    def test_fence_token_management(self) -> None:
+    @pytest.mark.asyncio
+    async def test_fence_token_management(self) -> None:
         """Test fence token tracking."""
         manager = GateJobManager()
 
@@ -147,22 +154,24 @@ class TestGateJobManager:
         manager.set_fence_token("job-123", 5)
         assert manager.get_fence_token("job-123") == 5
 
-        # Update only if higher
-        assert manager.update_fence_token_if_higher("job-123", 3) is False
+        assert await manager.update_fence_token_if_higher("job-123", 3) is False
         assert manager.get_fence_token("job-123") == 5
 
-        assert manager.update_fence_token_if_higher("job-123", 10) is True
+        assert await manager.update_fence_token_if_higher("job-123", 10) is True
         assert manager.get_fence_token("job-123") == 10
 
     @pytest.mark.asyncio
     async def test_job_locking(self) -> None:
         """Test per-job locking for concurrent safety."""
         manager = GateJobManager()
-        manager.set_job("job-123", GlobalJobStatus(
-            job_id="job-123",
-            status=JobStatus.SUBMITTED.value,
-            total_completed=0,
-        ))
+        manager.set_job(
+            "job-123",
+            GlobalJobStatus(
+                job_id="job-123",
+                status=JobStatus.SUBMITTED.value,
+                total_completed=0,
+            ),
+        )
 
         results: list[int] = []
 
@@ -193,19 +202,26 @@ class TestGateJobManager:
         manager = GateJobManager()
 
         # Add old completed job
-        manager.set_job("job-old", GlobalJobStatus(
-            job_id="job-old",
-            status=JobStatus.COMPLETED.value,
-            timestamp=0.0,  # Very old
-        ))
+        manager.set_job(
+            "job-old",
+            GlobalJobStatus(
+                job_id="job-old",
+                status=JobStatus.COMPLETED.value,
+                timestamp=0.0,  # Very old
+            ),
+        )
 
         # Add recent running job
         import time
-        manager.set_job("job-new", GlobalJobStatus(
-            job_id="job-new",
-            status=JobStatus.RUNNING.value,
-            timestamp=time.monotonic(),
-        ))
+
+        manager.set_job(
+            "job-new",
+            GlobalJobStatus(
+                job_id="job-new",
+                status=JobStatus.RUNNING.value,
+                timestamp=time.monotonic(),
+            ),
+        )
 
         # Cleanup with 1 second max age
         removed = manager.cleanup_old_jobs(max_age_seconds=1.0)
@@ -358,6 +374,7 @@ class TestJobForwardingTracker:
     def test_cleanup_stale_peers(self) -> None:
         """Test cleaning up stale peers."""
         import time as time_module
+
         tracker = JobForwardingTracker(local_gate_id="gate-1")
 
         # Register peer with old last_seen
@@ -631,10 +648,13 @@ class TestIntegrationScenarios:
 
             # Only store if we're the owner (simulating gate-1's perspective)
             if owner == "gate-1":
-                manager.set_job(job_id, GlobalJobStatus(
-                    job_id=job_id,
-                    status=JobStatus.RUNNING.value,
-                ))
+                manager.set_job(
+                    job_id,
+                    GlobalJobStatus(
+                        job_id=job_id,
+                        status=JobStatus.RUNNING.value,
+                    ),
+                )
 
         # Should have roughly 1/3 of jobs
         assert 20 < manager.job_count() < 50
