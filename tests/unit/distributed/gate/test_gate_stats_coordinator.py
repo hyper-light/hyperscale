@@ -510,7 +510,7 @@ class TestPushWindowedStats:
                 return b"stats_data"
 
         windowed_stats = MockWindowedStatsCollector()
-        windowed_stats.stats_data["job-1"] = MockStats()
+        windowed_stats.stats_data["job-1"] = [MockStats()]
 
         send_tcp = AsyncMock(side_effect=Exception("Network error"))
 
