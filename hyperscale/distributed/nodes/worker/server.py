@@ -938,8 +938,8 @@ class WorkerServer(HealthAwareServer):
             available_cores=self._core_allocator.available_cores,
             memory_mb=self._get_memory_mb(),
             available_memory_mb=self._get_available_memory_mb(),
-            cluster_id=self._env.MERCURY_SYNC_CLUSTER_ID,
-            environment_id=self._env.MERCURY_SYNC_ENVIRONMENT_ID,
+            cluster_id=self._env.CLUSTER_ID,
+            environment_id=self._env.ENVIRONMENT_ID,
             send_func=self._send_registration,
         )
 
