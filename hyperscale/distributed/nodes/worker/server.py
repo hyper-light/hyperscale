@@ -918,21 +918,15 @@ class WorkerServer(HealthAwareServer):
 
     def _get_memory_mb(self) -> int:
         """Get total memory in MB."""
-        try:
-            import psutil
-
-            return int(psutil.virtual_memory().total / (1024 * 1024))
-        except ImportError:
+        if not HAS_PSUTIL:
             return 0
+        return int(psutil.virtual_memory().total / (1024 * 1024))
 
     def _get_available_memory_mb(self) -> int:
         """Get available memory in MB."""
-        try:
-            import psutil
-
-            return int(psutil.virtual_memory().available / (1024 * 1024))
-        except ImportError:
+        if not HAS_PSUTIL:
             return 0
+        return int(psutil.virtual_memory().available / (1024 * 1024))
 
     # =========================================================================
     # Callbacks
