@@ -17,7 +17,6 @@ from .candidate_filter import (
     ExclusionReason,
     ManagerCandidate,
 )
-from .consistent_hash import ConsistentHashRing
 from .fallback_chain import FallbackChain, FallbackChainBuilder
 from .gate_job_router import GateJobRouter, GateJobRouterConfig, RoutingDecision
 from .hysteresis import HysteresisConfig, HysteresisManager, HysteresisResult
@@ -74,6 +73,4 @@ __all__ = [
     "RoutingStateManager",
     "JobRoutingState",
     "RoutingDecisionReason",
-    # Legacy consistent hashing
-    "ConsistentHashRing",
 ]
