@@ -2237,9 +2237,9 @@ class ManagerServer(HealthAwareServer):
         errors: list[str],
     ) -> None:
         """Push cancellation complete notification to origin gate/client."""
-        callback_addr = self._manager_state._job_callbacks.get(job_id)
+        callback_addr = self._manager_state.get_job_callback(job_id)
         if not callback_addr:
-            callback_addr = self._manager_state._client_callbacks.get(job_id)
+            callback_addr = self._manager_state.get_client_callback(job_id)
 
         if callback_addr:
             try:
@@ -3758,11 +3758,11 @@ class ManagerServer(HealthAwareServer):
 
             # Store callbacks
             if submission.callback_addr:
-                self._manager_state._job_callbacks[submission.job_id] = (
-                    submission.callback_addr
+                self._manager_state.set_job_callback(
+                    submission.job_id, submission.callback_addr
                 )
-                self._manager_state._progress_callbacks[submission.job_id] = (
-                    submission.callback_addr
+                self._manager_state.set_progress_callback(
+                    submission.job_id, submission.callback_addr
                 )
 
             if submission.origin_gate_addr:
@@ -4294,8 +4294,8 @@ class ManagerServer(HealthAwareServer):
                 ).dump()
 
             # Register callback
-            self._manager_state._job_callbacks[job_id] = request.callback_addr
-            self._manager_state._progress_callbacks[job_id] = request.callback_addr
+            self._manager_state.set_job_callback(job_id, request.callback_addr)
+            self._manager_state.set_progress_callback(job_id, request.callback_addr)
 
             # Calculate elapsed time
             elapsed = time.monotonic() - job.timestamp if job.timestamp > 0 else 0.0
