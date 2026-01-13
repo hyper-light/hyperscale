@@ -112,12 +112,12 @@ discovered during systematic tracing of SCENARIOS.md test scenarios through the 
 #### C3: Missing Partition Callback Invocation (HIGH)
 **Location**: `datacenters/cross_dc_correlation.py`
 **Issue**: Callbacks registered but never invoked from detector.
-**Status**: TODO
+**Status**: FIXED - `_on_partition_detected` callback invoked in health_coordinator.py lines 427-431
 
 #### C4: Circuit Breaker Race Condition (MEDIUM)
 **Location**: `health/circuit_breaker_manager.py:50-81`
 **Issue**: No synchronization between `get_circuit()` and `is_circuit_open()`.
-**Status**: TODO
+**Status**: FIXED - Both methods use `async with self._lock` (lines 49 and 59)
 
 #### C5: Memory Leak in Extension Trackers (MEDIUM)
 **Location**: `swim/detection/hierarchical_failure_detector.py:191`
