@@ -393,169 +393,181 @@ class TestJobForwardingTracker:
 class TestConsistentHashRing:
     """Test ConsistentHashRing operations."""
 
-    def test_create_ring(self) -> None:
+    @pytest.mark.asyncio
+    async def test_create_ring(self) -> None:
         """Test creating an empty ring."""
         ring = ConsistentHashRing()
 
-        assert ring.node_count() == 0
-        assert ring.get_node("any-key") is None
+        assert await ring.node_count() == 0
+        assert await ring.get_node("any-key") is None
 
-    def test_add_node(self) -> None:
+    @pytest.mark.asyncio
+    async def test_add_node(self) -> None:
         """Test adding a node to the ring."""
         ring = ConsistentHashRing()
 
-        ring.add_node("gate-1", "10.0.0.1", 8080)
+        await ring.add_node("gate-1", "10.0.0.1", 8080)
 
-        assert ring.node_count() == 1
-        assert ring.has_node("gate-1") is True
+        assert await ring.node_count() == 1
+        assert await ring.has_node("gate-1") is True
 
-        node = ring.get_node_by_id("gate-1")
+        node = await ring.get_node_by_id("gate-1")
         assert node is not None
         assert node.tcp_host == "10.0.0.1"
         assert node.tcp_port == 8080
 
-    def test_remove_node(self) -> None:
+    @pytest.mark.asyncio
+    async def test_remove_node(self) -> None:
         """Test removing a node from the ring."""
         ring = ConsistentHashRing()
 
-        ring.add_node("gate-1", "10.0.0.1", 8080)
-        removed = ring.remove_node("gate-1")
+        await ring.add_node("gate-1", "10.0.0.1", 8080)
+        removed = await ring.remove_node("gate-1")
 
         assert removed is not None
         assert removed.node_id == "gate-1"
-        assert ring.has_node("gate-1") is False
-        assert ring.node_count() == 0
+        assert await ring.has_node("gate-1") is False
+        assert await ring.node_count() == 0
 
-    def test_get_node_for_key(self) -> None:
+    @pytest.mark.asyncio
+    async def test_get_node_for_key(self) -> None:
         """Test getting the responsible node for a key."""
         ring = ConsistentHashRing()
 
-        ring.add_node("gate-1", "10.0.0.1", 8080)
+        await ring.add_node("gate-1", "10.0.0.1", 8080)
 
         # With only one node, all keys map to it
-        owner = ring.get_node("job-123")
+        owner = await ring.get_node("job-123")
         assert owner is not None
         assert owner.node_id == "gate-1"
 
-    def test_consistent_mapping(self) -> None:
+    @pytest.mark.asyncio
+    async def test_consistent_mapping(self) -> None:
         """Test that same key always maps to same node."""
         ring = ConsistentHashRing()
 
-        ring.add_node("gate-1", "10.0.0.1", 8080)
-        ring.add_node("gate-2", "10.0.0.2", 8080)
-        ring.add_node("gate-3", "10.0.0.3", 8080)
+        await ring.add_node("gate-1", "10.0.0.1", 8080)
+        await ring.add_node("gate-2", "10.0.0.2", 8080)
+        await ring.add_node("gate-3", "10.0.0.3", 8080)
 
         # Same key should always map to same node
-        owner1 = ring.get_owner_id("job-12345")
-        owner2 = ring.get_owner_id("job-12345")
-        owner3 = ring.get_owner_id("job-12345")
+        owner1 = await ring.get_owner_id("job-12345")
+        owner2 = await ring.get_owner_id("job-12345")
+        owner3 = await ring.get_owner_id("job-12345")
 
         assert owner1 == owner2 == owner3
 
-    def test_is_owner(self) -> None:
+    @pytest.mark.asyncio
+    async def test_is_owner(self) -> None:
         """Test ownership checking."""
         ring = ConsistentHashRing()
 
-        ring.add_node("gate-1", "10.0.0.1", 8080)
+        await ring.add_node("gate-1", "10.0.0.1", 8080)
 
-        assert ring.is_owner("any-job", "gate-1") is True
-        assert ring.is_owner("any-job", "gate-2") is False
+        assert await ring.is_owner("any-job", "gate-1") is True
+        assert await ring.is_owner("any-job", "gate-2") is False
 
-    def test_get_multiple_nodes(self) -> None:
+    @pytest.mark.asyncio
+    async def test_get_multiple_nodes(self) -> None:
         """Test getting multiple nodes for replication."""
         ring = ConsistentHashRing()
 
-        ring.add_node("gate-1", "10.0.0.1", 8080)
-        ring.add_node("gate-2", "10.0.0.2", 8080)
-        ring.add_node("gate-3", "10.0.0.3", 8080)
+        await ring.add_node("gate-1", "10.0.0.1", 8080)
+        await ring.add_node("gate-2", "10.0.0.2", 8080)
+        await ring.add_node("gate-3", "10.0.0.3", 8080)
 
-        nodes = ring.get_nodes("job-123", count=2)
+        nodes = await ring.get_nodes("job-123", count=2)
 
         assert len(nodes) == 2
         # All returned nodes should be distinct
         node_ids = [n.node_id for n in nodes]
         assert len(set(node_ids)) == 2
 
-    def test_distribution_balance(self) -> None:
+    @pytest.mark.asyncio
+    async def test_distribution_balance(self) -> None:
         """Test that keys are reasonably balanced across nodes."""
         ring = ConsistentHashRing(replicas=150)
 
-        ring.add_node("gate-1", "10.0.0.1", 8080)
-        ring.add_node("gate-2", "10.0.0.2", 8080)
-        ring.add_node("gate-3", "10.0.0.3", 8080)
+        await ring.add_node("gate-1", "10.0.0.1", 8080)
+        await ring.add_node("gate-2", "10.0.0.2", 8080)
+        await ring.add_node("gate-3", "10.0.0.3", 8080)
 
         # Generate sample keys
         sample_keys = [f"job-{i}" for i in range(1000)]
-        distribution = ring.get_distribution(sample_keys)
+        distribution = await ring.get_distribution(sample_keys)
 
         # Each node should have roughly 333 keys (1000/3)
         # Allow 20% deviation
         for count in distribution.values():
             assert 200 < count < 466, f"Distribution unbalanced: {distribution}"
 
-    def test_minimal_remapping_on_add(self) -> None:
+    @pytest.mark.asyncio
+    async def test_minimal_remapping_on_add(self) -> None:
         """Test that adding a node only remaps ~1/N keys."""
         ring = ConsistentHashRing(replicas=150)
 
-        ring.add_node("gate-1", "10.0.0.1", 8080)
-        ring.add_node("gate-2", "10.0.0.2", 8080)
+        await ring.add_node("gate-1", "10.0.0.1", 8080)
+        await ring.add_node("gate-2", "10.0.0.2", 8080)
 
         # Record owners before adding third node
         sample_keys = [f"job-{i}" for i in range(1000)]
-        owners_before = {key: ring.get_owner_id(key) for key in sample_keys}
+        owners_before = {key: await ring.get_owner_id(key) for key in sample_keys}
 
         # Add third node
-        ring.add_node("gate-3", "10.0.0.3", 8080)
+        await ring.add_node("gate-3", "10.0.0.3", 8080)
 
         # Count remapped keys
         remapped = 0
         for key in sample_keys:
-            if ring.get_owner_id(key) != owners_before[key]:
+            if await ring.get_owner_id(key) != owners_before[key]:
                 remapped += 1
 
         # Should remap roughly 1/3 of keys (now 3 nodes instead of 2)
         # Allow generous margin
         assert remapped < 500, f"Too many keys remapped: {remapped}"
 
-    def test_ring_info(self) -> None:
+    @pytest.mark.asyncio
+    async def test_ring_info(self) -> None:
         """Test getting ring information."""
         ring = ConsistentHashRing(replicas=100)
 
-        ring.add_node("gate-1", "10.0.0.1", 8080)
-        ring.add_node("gate-2", "10.0.0.2", 8080, weight=2)
+        await ring.add_node("gate-1", "10.0.0.1", 8080)
+        await ring.add_node("gate-2", "10.0.0.2", 8080, weight=2)
 
-        info = ring.get_ring_info()
+        info = await ring.get_ring_info()
 
         assert info["node_count"] == 2
         assert info["replicas_per_node"] == 100
         # gate-2 has weight 2, so more virtual nodes
         assert info["virtual_node_count"] == 300  # 100 + 200
 
-    def test_weighted_nodes(self) -> None:
+    @pytest.mark.asyncio
+    async def test_weighted_nodes(self) -> None:
         """Test that weighted nodes get proportionally more keys."""
         ring = ConsistentHashRing(replicas=150)
 
-        ring.add_node("gate-1", "10.0.0.1", 8080, weight=1)
-        ring.add_node("gate-2", "10.0.0.2", 8080, weight=2)
+        await ring.add_node("gate-1", "10.0.0.1", 8080, weight=1)
+        await ring.add_node("gate-2", "10.0.0.2", 8080, weight=2)
 
         sample_keys = [f"job-{i}" for i in range(1000)]
-        distribution = ring.get_distribution(sample_keys)
+        distribution = await ring.get_distribution(sample_keys)
 
         # gate-2 should have roughly 2x the keys of gate-1
         # Allow significant margin due to hashing variance
         assert distribution["gate-2"] > distribution["gate-1"]
 
-    def test_clear_ring(self) -> None:
+    @pytest.mark.asyncio
+    async def test_clear_ring(self) -> None:
         """Test clearing all nodes from the ring."""
         ring = ConsistentHashRing()
 
-        ring.add_node("gate-1", "10.0.0.1", 8080)
-        ring.add_node("gate-2", "10.0.0.2", 8080)
+        await ring.add_node("gate-1", "10.0.0.1", 8080)
+        await ring.add_node("gate-2", "10.0.0.2", 8080)
 
-        ring.clear()
+        await ring.clear()
 
-        assert ring.node_count() == 0
-        assert ring.get_node("any-key") is None
+        assert await ring.node_count() == 0
+        assert await ring.get_node("any-key") is None
 
 
 class TestIntegrationScenarios:
