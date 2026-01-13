@@ -66,7 +66,7 @@ For EACH component:
 
 ## Phase 4: Check Direct State Access
 
-**Objective**: Find abstraction violations where server bypasses components.
+**Objective**: Find and FIX abstraction violations where server bypasses components.
 
 **Steps**:
 1. Identify the state object(s): `grep "self\._.*state" server.py`
@@ -74,11 +74,59 @@ For EACH component:
    ```bash
    grep "self\._<state>\._[a-z]" server.py
    ```
-3. For each violation, document:
-   | Line | Direct Access | Should Use |
-   |------|---------------|------------|
+3. For each violation, build fix plan:
+   | Line | Direct Access | Required Method | Target Class |
+   |------|---------------|-----------------|--------------|
 
-**Output**: List of abstraction violations to fix.
+**MANDATORY: Fix ALL violations.** Do not document for later - fix now.
+
+### Step 4a: Group Violations by Field
+
+Group all direct accesses by the internal field being accessed:
+
+```
+_workers: 16 accesses across lines [...]
+_state_version: 9 accesses across lines [...]
+```
+
+### Step 4b: Create Accessor Methods
+
+For each field with direct access, create proper accessor method(s) in the state class:
+
+```python
+# In state.py - add for each violated field:
+def get_worker(self, worker_id: str) -> WorkerRegistration | None:
+    return self._workers.get(worker_id)
+
+def iter_workers(self) -> Iterator[tuple[str, WorkerRegistration]]:
+    return iter(self._workers.items())
+
+def add_worker(self, worker_id: str, worker: WorkerRegistration) -> None:
+    self._workers[worker_id] = worker
+```
+
+### Step 4c: Update All Call Sites
+
+Replace every direct access with the new method:
+
+```python
+# Before:
+worker = self._manager_state._workers.get(worker_id)
+
+# After:
+worker = self._manager_state.get_worker(worker_id)
+```
+
+### Step 4d: Verify Zero Violations Remain
+
+After fixing, re-run:
+```bash
+grep "self\._<state>\._[a-z]" server.py
+```
+
+**This MUST return zero matches** before proceeding to Phase 5.
+
+**Output**: Zero direct state access violations.
 
 ---
 
@@ -279,11 +327,13 @@ For each issue found:
 
 **Checklist**:
 - [ ] Re-run Phase 3 matrix: all methods now exist
-- [ ] Re-run Phase 4: no direct state access
+- [ ] Re-run Phase 4: **ZERO** direct state access violations
 - [ ] LSP diagnostics clean on ALL modified files
 - [ ] No duplicate method implementations across modular classes
 - [ ] No orphaned/dead methods in modular classes
 - [ ] All call sites reference correct component and method
+
+**BLOCKING**: Phase 7 cannot pass with ANY direct state access violations. Return to Phase 4 and fix them.
 
 ---
 
