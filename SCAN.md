@@ -3778,17 +3778,18 @@ grep -n "while True:" "$FILE"
 | 4 | **Phase 3.5h.2 method call validation** | Method existence scanner | **ZERO** violations |
 | 5 | **Phase 3.5k.1 parameter type hints** | Untyped param scanner | **ZERO** untyped parameters |
 | 6 | **Phase 3.5k.1b class attribute type hints** | Class attr scanner | **ZERO** untyped class attributes |
-| 7 | Phase 4 direct state access | `grep "self._state._"` | **ZERO** matches |
-| 8 | Phase 5.9 cyclomatic complexity | CC scanner | **ZERO** methods with CC > 4 |
-| 9 | Phase 6.5 runtime correctness | Race/leak/error scanners | **ZERO** violations |
-| 10 | LSP diagnostics | `lsp_diagnostics` | Clean on ALL modified files |
-| 11 | Duplicate methods | Manual review | None across modular classes |
-| 12 | Dead methods | Reference search | None in modular classes |
-| 13 | Call site correctness | Manual review | All use correct component/method |
-| 14 | No workarounds | `grep "proxy\|workaround\|TODO"` | No shortcut comments |
-| 15 | No Any/object escape hatches | `grep ": Any\|: object"` | **ZERO** matches (or justified) |
+| 7 | **Phase 3.5k.1d incomplete generic types** | Generic param scanner | **ZERO** bare `dict`/`list`/`set`/etc. |
+| 8 | Phase 4 direct state access | `grep "self._state._"` | **ZERO** matches |
+| 9 | Phase 5.9 cyclomatic complexity | CC scanner | **ZERO** methods with CC > 4 |
+| 10 | Phase 6.5 runtime correctness | Race/leak/error scanners | **ZERO** violations |
+| 11 | LSP diagnostics | `lsp_diagnostics` | Clean on ALL modified files |
+| 12 | Duplicate methods | Manual review | None across modular classes |
+| 13 | Dead methods | Reference search | None in modular classes |
+| 14 | Call site correctness | Manual review | All use correct component/method |
+| 15 | No workarounds | `grep "proxy\|workaround\|TODO"` | No shortcut comments |
+| 16 | No Any/object escape hatches | `grep ": Any\|: object"` | **ZERO** matches (or justified) |
 
-**Execution Order**: Run checks 1-9 in order. If ANY fails, return to that phase and fix before proceeding.
+**Execution Order**: Run checks 1-10 in order. If ANY fails, return to that phase and fix before proceeding.
 
 **BLOCKING**: Phase 7 cannot pass with ANY violations. If ANY check fails, return to the appropriate phase and fix properly - no shortcuts. "Mostly done" is NOT done.
 
