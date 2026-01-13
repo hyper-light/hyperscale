@@ -441,6 +441,9 @@ class ManagerState:
     ) -> list[tuple[str, "TimeoutStrategy"]]:
         return list(self._job_timeout_strategies.items())
 
+    def remove_job_timeout_strategy(self, job_id: str) -> "TimeoutStrategy | None":
+        return self._job_timeout_strategies.pop(job_id, None)
+
     # =========================================================================
     # Job Contexts Accessors (7 direct accesses)
     # =========================================================================
