@@ -1088,7 +1088,8 @@ class TestLongRunningStability:
         assert metrics["total_requests"] == expected_total
         assert metrics["shed_requests"] == expected_shed
 
-    def test_rate_limiter_long_running_cleanup(self):
+    @pytest.mark.asyncio
+    async def test_rate_limiter_long_running_cleanup(self):
         """Test rate limiter cleanup over long running period."""
         limiter = ServerRateLimiter(inactive_cleanup_seconds=0.05)
 
@@ -1096,10 +1097,10 @@ class TestLongRunningStability:
         for batch in range(10):
             # Create 100 clients
             for i in range(100):
-                limiter.check_rate_limit(f"batch-{batch}-client-{i}", "op")
+                await limiter.check_rate_limit(f"batch-{batch}-client-{i}", "op")
 
             # Wait for cleanup threshold
-            time.sleep(0.06)
+            await asyncio.sleep(0.06)
 
             # Run cleanup
             cleaned = limiter.cleanup_inactive_clients()
@@ -1109,7 +1110,7 @@ class TestLongRunningStability:
                 assert cleaned > 0
 
         # Final cleanup
-        time.sleep(0.06)
+        await asyncio.sleep(0.06)
         final_cleaned = limiter.cleanup_inactive_clients()
         assert limiter.get_metrics()["active_clients"] == 0
 
@@ -1284,7 +1285,7 @@ class TestConcurrentAccessSafety:
         async def check_limits():
             results = []
             for _ in range(100):
-                result = limiter.check_rate_limit("client-1", "op")
+                result = await limiter.check_rate_limit("client-1", "op")
                 results.append(result.allowed)
                 await asyncio.sleep(0)
             return results
