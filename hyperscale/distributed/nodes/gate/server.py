@@ -2011,12 +2011,28 @@ class GateServer(HealthAwareServer):
         self._forward_throughput_count += 1
 
     def _classify_datacenter_health(self, dc_id: str) -> DatacenterStatus:
-        """Classify datacenter health."""
-        return self._dc_health_manager.classify_health(dc_id)
+        status = self._dc_health_manager.get_datacenter_health(dc_id)
+        self._log_health_transitions()
+        return status
 
     def _get_all_datacenter_health(self) -> dict[str, DatacenterStatus]:
-        """Get health status for all datacenters."""
-        return self._dc_health_manager.get_all_health()
+        result = self._dc_health_manager.get_all_datacenter_health()
+        self._log_health_transitions()
+        return result
+
+    def _log_health_transitions(self) -> None:
+        transitions = self._dc_health_manager.get_and_clear_health_transitions()
+        for dc_id, previous_health, new_health in transitions:
+            if new_health in ("degraded", "unhealthy"):
+                self._task_runner.run(
+                    self._logger.log,
+                    ServerWarning(
+                        message=f"DC {dc_id} health changed: {previous_health} -> {new_health}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.full if self._node_id else "unknown",
+                    ),
+                )
 
     def _get_available_datacenters(self) -> list[str]:
         """Get list of available datacenters."""
