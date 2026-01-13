@@ -151,10 +151,11 @@ class WorkerPool:
             addr = (registration.node.host, registration.node.port)
             self._addr_to_worker[addr] = node_id
 
-            # Signal that cores may be available
-            self._cores_available.set()
+        # Signal outside registration lock to avoid nested lock acquisition
+        async with self._cores_condition:
+            self._cores_condition.notify_all()
 
-            return worker
+        return worker
 
     async def deregister_worker(self, node_id: str) -> bool:
         """
