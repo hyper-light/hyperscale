@@ -730,7 +730,7 @@ class TestConcurrency:
 
         async def increment():
             for _ in range(50):
-                token = state.next_fence_token()
+                token = await state.next_fence_token()
                 tokens.append(token)
 
         await asyncio.gather(increment(), increment())
