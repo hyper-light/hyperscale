@@ -1041,7 +1041,7 @@ class ManagerServer(HealthAwareServer):
             await asyncio.sleep(jitter)
 
             async with peer_lock:
-                current_epoch = self._manager_state._peer_state_epoch.get(tcp_addr, 0)
+                current_epoch = self._manager_state.get_peer_state_epoch(tcp_addr)
                 if current_epoch != initial_epoch:
                     return
 
@@ -1058,13 +1058,12 @@ class ManagerServer(HealthAwareServer):
                 return
 
             async with peer_lock:
-                current_epoch = self._manager_state._peer_state_epoch.get(tcp_addr, 0)
+                current_epoch = self._manager_state.get_peer_state_epoch(tcp_addr)
                 if current_epoch != initial_epoch:
                     return
 
-                self._manager_state._active_manager_peers.add(tcp_addr)
-                self._manager_state._dead_managers.discard(tcp_addr)
-                self._manager_state._dead_manager_timestamps.pop(tcp_addr, None)
+                self._manager_state.add_active_manager_peer(tcp_addr)
+                self._manager_state.remove_dead_manager(tcp_addr)
 
         await self._udp_logger.log(
             ServerInfo(
