@@ -752,3 +752,198 @@ Commit message should note:
 - LSP clean
 
 **Phase 8**: Committed with explanation of fence token consolidation.
+
+---
+
+## Phase 12: Architecture Decision (AD) Compliance Scan
+
+**Objective**: Verify implementation matches architectural decisions AD-9 through AD-50 (skipping AD-27).
+
+### The Problem
+
+Architecture Decision documents (ADs) specify required behaviors, message types, data structures, and control flows. Over time, implementation can drift from design:
+
+- **Missing implementations**: AD specifies feature, code doesn't implement it
+- **Partial implementations**: Some scenarios handled, others not
+- **Divergent implementations**: Code does something different than AD specifies
+- **Orphaned code**: Implementation exists but AD was superseded
+
+### AD Compliance Matrix
+
+**Scope**: AD-9 through AD-50, excluding AD-27
+
+| AD | Name | Primary Node | Key Artifacts to Verify |
+|----|------|--------------|------------------------|
+| AD-9 | Gate State Embedding | Gate | `GateStateEmbedder`, SWIM piggyback |
+| AD-10 | Versioned State Clock | All | `VersionedStateClock`, stale update rejection |
+| AD-11 | Job Ledger | Gate | `JobLedger`, distributed state |
+| AD-12 | Consistent Hash Ring | Gate | `ConsistentHashRing`, job routing |
+| AD-13 | Job Forwarding | Gate | `JobForwardingTracker`, cross-gate routing |
+| AD-14 | Stats CRDT | Gate/Manager | `JobStatsCRDT`, merge semantics |
+| AD-15 | Windowed Stats | Gate/Manager | `WindowedStatsCollector`, time windows |
+| AD-16 | DC Health Classification | Gate | `DatacenterHealth` enum, 4-state model |
+| AD-17 | Worker Selection | Manager | Health bucket selection (HEALTHY > BUSY > DEGRADED) |
+| AD-18 | Hybrid Overload Detection | All | `HybridOverloadDetector`, state transitions |
+| AD-19 | Manager Health State | Gate | `ManagerHealthState`, liveness/readiness probes |
+| AD-20 | Gate Health State | Gate | `GateHealthState`, peer health tracking |
+| AD-21 | Circuit Breaker | All | `CircuitBreakerManager`, error thresholds |
+| AD-22 | Load Shedding | All | `LoadShedder`, priority-based rejection |
+| AD-23 | Backpressure (Worker) | Worker | Progress buffer, flush rate adjustment |
+| AD-24 | Rate Limiting | Gate | `ServerRateLimiter`, per-client limits |
+| AD-25 | Protocol Negotiation | All | `NodeCapabilities`, version negotiation |
+| AD-26 | Healthcheck Extensions | Worker | Extension requests, grace periods |
+| AD-28 | Role Validation | All | `RoleValidator`, mTLS claims |
+| AD-29 | Discovery Service | All | `DiscoveryService`, peer registration |
+| AD-30 | Hierarchical Failure Detector | Manager | Global vs job-level death detection |
+| AD-31 | Orphan Job Handling | Gate/Manager | Grace period, takeover protocol |
+| AD-32 | Lease Management | Gate | `JobLeaseManager`, fence tokens |
+| AD-33 | Workflow State Machine | Manager/Worker | State transitions, completion events |
+| AD-34 | Adaptive Job Timeout | Gate/Manager | `TimeoutStrategy`, multi-DC coordination |
+| AD-35 | Job Leadership Tracking | Gate | `JobLeadershipTracker`, transfer protocol |
+| AD-36 | Vivaldi Routing | Gate | `GateJobRouter`, coordinate-based selection |
+| AD-37 | Backpressure Propagation | All | `BackpressureSignal`, level propagation |
+| AD-38 | Capacity Aggregation | Gate | `DatacenterCapacityAggregator` |
+| AD-39 | Spillover Evaluation | Gate | `SpilloverEvaluator`, cross-DC routing |
+| AD-40 | Idempotency | Gate | `GateIdempotencyCache`, duplicate detection |
+| AD-41 | Dispatch Coordination | Gate | `GateDispatchCoordinator` |
+| AD-42 | Stats Coordination | Gate | `GateStatsCoordinator` |
+| AD-43 | Cancellation Coordination | Gate | `GateCancellationCoordinator` |
+| AD-44 | Leadership Coordination | Gate | `GateLeadershipCoordinator` |
+| AD-45 | Route Learning | Gate | `DispatchTimeTracker`, `ObservedLatencyTracker` |
+| AD-46 | Blended Latency | Gate | `BlendedLatencyScorer` |
+| AD-47 | Event Logging | All | Structured log events |
+| AD-48 | Cross-DC Correlation | Gate | `CrossDCCorrelationDetector` |
+| AD-49 | Federated Health Monitor | Gate | `FederatedHealthMonitor`, DC probes |
+| AD-50 | Manager Dispatcher | Gate | `ManagerDispatcher`, leader routing |
+
+### Step 12a: Extract AD Requirements
+
+For each AD, extract verifiable requirements:
+
+```markdown
+## AD-34 Requirements Checklist
+
+### Data Structures
+- [ ] `TimeoutTrackingState` dataclass exists with all fields
+- [ ] `GateJobTrackingInfo` dataclass exists with all fields
+
+### Message Types
+- [ ] `JobProgressReport` message defined and handled
+- [ ] `JobTimeoutReport` message defined and handled
+- [ ] `JobGlobalTimeout` message defined and handled
+
+### Behaviors
+- [ ] Auto-detection: gate_addr presence selects strategy
+- [ ] Local authority: manager directly times out (single-DC)
+- [ ] Gate coordinated: manager reports to gate (multi-DC)
+- [ ] Progress reports sent every 10s (multi-DC)
+- [ ] Timeout checks run every 30s
+- [ ] 5-minute fallback if gate unresponsive
+- [ ] Fence token validation on global timeout receipt
+- [ ] State recovery via resume_tracking() after leader transfer
+
+### Integration Points
+- [ ] Integrates with AD-26 (extension-aware timeout)
+- [ ] Integrates with AD-33 (progress from state machine)
+```
+
+### Step 12b: Trace AD to Code
+
+For each requirement, find the implementing code:
+
+```bash
+# Find data structure
+grep -rn "class TimeoutTrackingState" hyperscale/distributed/
+
+# Find message handler
+grep -rn "JobProgressReport.load\|handle.*job.*progress.*report" hyperscale/distributed/nodes/
+
+# Find behavior implementation
+grep -rn "gate_addr.*strategy\|LocalAuthority\|GateCoordinated" hyperscale/distributed/
+```
+
+### Step 12c: Classification
+
+| Status | Meaning | Action |
+|--------|---------|--------|
+| **COMPLIANT** | Code matches AD specification | Document, no action |
+| **PARTIAL** | Some requirements met, others missing | Create TODO for missing |
+| **DIVERGENT** | Code does something different | Investigate: update AD or fix code |
+| **MISSING** | No implementation found | Critical: implement or mark AD as deferred |
+| **SUPERSEDED** | Newer AD replaces this | Update AD status, verify no orphaned code |
+
+### Step 12d: Generate Compliance Report
+
+```markdown
+# AD Compliance Report - Gate Module
+
+## Summary
+- Total ADs scanned: 41 (AD-9 to AD-50, excluding AD-27)
+- COMPLIANT: 35
+- PARTIAL: 4
+- DIVERGENT: 1
+- MISSING: 1
+
+## Issues Found
+
+### AD-34: Adaptive Job Timeout (PARTIAL)
+**Missing**:
+- [ ] 5-minute fallback timeout not implemented
+- [ ] Progress reports not sent every 10s (currently 30s)
+
+**Location**: `gate_job_timeout_tracker.py`
+
+### AD-XX: ... (DIVERGENT)
+**Divergence**:
+- AD specifies X, code does Y
+- Root cause: [reason]
+
+**Recommendation**: [update AD | fix code]
+```
+
+### Step 12e: Resolve Issues
+
+**For PARTIAL implementations:**
+1. Add missing functionality to existing code
+2. Update tests to cover new cases
+3. Note completion in AD compliance report
+
+**For DIVERGENT implementations:**
+1. Determine correct behavior (consult original AD author if possible)
+2. Either update AD to match code (if code is correct)
+3. Or fix code to match AD (if AD is correct)
+4. Document decision
+
+**For MISSING implementations:**
+1. If critical: implement immediately
+2. If non-critical: create tracking issue with AD reference
+3. If deliberately deferred: update AD with "Deferred" status and reason
+
+### Step 12f: Cross-Reference with SCENARIOS.md
+
+Every AD behavior should have corresponding scenario coverage:
+
+```bash
+# For AD-34, check SCENARIOS.md covers:
+grep -n "timeout\|JobGlobalTimeout\|TimeoutReport" SCENARIOS.md
+```
+
+**If scenario missing**: Add to SCENARIOS.md before marking AD compliant.
+
+### Step 12g: Commit Compliance Report
+
+Store compliance report in `docs/architecture/compliance/`:
+
+```
+docs/architecture/compliance/
+├── gate_compliance_2026_01_13.md
+├── manager_compliance_2026_01_13.md
+└── worker_compliance_2026_01_13.md
+```
+
+Include:
+- Date of scan
+- Commit hash scanned
+- Summary statistics
+- Detailed findings
+- Action items with owners
