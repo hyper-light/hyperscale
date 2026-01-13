@@ -630,8 +630,15 @@ grep -l "ImportName" handlers/*.py coordinators/*.py state.py
 |----------|--------|
 | Handler/Coordinator (imported there) | Remove from server - it's properly imported where used |
 | Handler/Coordinator (NOT imported) | Bug - handler needs the import, add it there |
-| Nowhere in gate module | Remove from server - truly dead |
+| Nowhere in gate module | **INVESTIGATE** - potentially unimplemented behavior; check if feature is missing |
 | Only in TYPE_CHECKING block | Keep if used in type hints, remove otherwise |
+
+**CRITICAL**: An import that exists nowhere in the module is a red flag. Before removing:
+1. Check git history - was this recently used and accidentally deleted?
+2. Check related modules - is there a handler/coordinator that SHOULD use this?
+3. Check the model's purpose - does the server need to handle this message type?
+
+If the import represents a message type (e.g., `JobCancelRequest`), the server likely needs a handler for it. Missing handler = missing feature, not dead import.
 
 ### Step 11d: Remove Dead Imports
 
