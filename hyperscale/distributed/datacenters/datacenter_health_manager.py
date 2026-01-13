@@ -38,7 +38,7 @@ from hyperscale.distributed.datacenters.datacenter_overload_classifier import (
 
 
 @dataclass(slots=True)
-class CachedCachedManagerInfo:
+class CachedManagerInfo:
     """Cached information about a manager for health tracking."""
 
     heartbeat: ManagerHeartbeat

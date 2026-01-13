@@ -5,7 +5,8 @@ Coordinates job submission and dispatch to datacenter managers.
 """
 
 import time
-from typing import TYPE_CHECKING, Callable
+from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 import cloudpickle
 
