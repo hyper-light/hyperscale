@@ -1074,7 +1074,6 @@ class GateServer(HealthAwareServer):
             ack = CrossClusterAck.load(ack_data)
             self._dc_health_monitor.handle_ack(ack)
 
-            # Update DC leader info if this is from a leader
             if ack.is_leader and isinstance(source_addr, tuple):
                 self._dc_health_monitor.update_leader(
                     datacenter=ack.datacenter,

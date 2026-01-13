@@ -73,6 +73,7 @@ class WindowedStatsMetrics:
     windows_dropped_late: int = 0
     stats_recorded: int = 0
     stats_dropped_late: int = 0
+    duplicates_detected: int = 0
 
 
 class WindowedStatsCollector:
