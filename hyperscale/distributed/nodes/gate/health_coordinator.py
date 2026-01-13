@@ -346,21 +346,20 @@ class GateHealthCoordinator:
 
     def count_active_datacenters(self) -> int:
         """
-        Count datacenters with at least one fresh manager heartbeat.
+        Count datacenters that are not in UNHEALTHY state.
 
-        A datacenter is active if any manager has sent a heartbeat in the last 60s.
+        Uses the health classification system which incorporates heartbeat
+        freshness, manager availability, and other health signals.
 
         Returns:
-            Number of active datacenters
+            Number of active (healthy or degraded) datacenters
         """
-        now = time.monotonic()
-        active_count = 0
-        for datacenter_id in self._state._datacenter_manager_status:
-            for manager_addr in self._state._datacenter_manager_status[datacenter_id]:
-                if now - self._state._manager_last_status.get(manager_addr, 0) < 60.0:
-                    active_count += 1
-                    break
-        return active_count
+        count = 0
+        for datacenter_id in self._datacenter_managers:
+            status = self._dc_health_manager.get_datacenter_health(datacenter_id)
+            if status.health != DatacenterHealth.UNHEALTHY.value:
+                count += 1
+        return count
 
     def get_known_managers_for_piggyback(
         self,
