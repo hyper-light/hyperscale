@@ -397,11 +397,11 @@ class WorkerProgressReporter:
                         )
                     )
 
-        # All managers failed
+        self._enqueue_pending_result(final_result)
         if self._logger:
             await self._logger.log(
-                ServerError(
-                    message=f"Failed to send final result for {final_result.workflow_id} to any manager",
+                ServerWarning(
+                    message=f"Queued final result for {final_result.workflow_id} for background retry ({len(self._pending_results)} pending)",
                     node_host=node_host,
                     node_port=node_port,
                     node_id=node_id_short,
