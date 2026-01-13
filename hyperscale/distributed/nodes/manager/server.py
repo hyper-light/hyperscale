@@ -1156,19 +1156,19 @@ class ManagerServer(HealthAwareServer):
         has_quorum = self._leadership.has_quorum()
 
         if has_quorum:
-            self._manager_state._consecutive_quorum_failures = 0
+            self._manager_state.reset_quorum_failures()
             return
 
-        self._manager_state._consecutive_quorum_failures += 1
+        failure_count = self._manager_state.increment_quorum_failures()
 
         if not self.is_leader():
             return
 
         max_quorum_failures = 3
-        if self._manager_state._consecutive_quorum_failures >= max_quorum_failures:
+        if failure_count >= max_quorum_failures:
             await self._udp_logger.log(
                 ServerWarning(
-                    message=f"Lost quorum for {self._manager_state._consecutive_quorum_failures} consecutive checks, stepping down",
+                    message=f"Lost quorum for {failure_count} consecutive checks, stepping down",
                     node_host=self._host,
                     node_port=self._tcp_port,
                     node_id=self._node_id.short,
