@@ -1,280 +1,351 @@
-# Issues Identified from Scenario Tracing
+# Hyperscale Distributed System - Code Analysis & Required Fixes
 
-This document tracks bugs, missing implementations, race conditions, and other issues
-discovered during systematic tracing of SCENARIOS.md test scenarios through the codebase.
+This document catalogs all identified issues across the distributed node implementations, including duplicate code, stub methods, incorrect attribute references, and half-implemented functionality.
 
 ---
 
-## Session 1 Fixes (COMPLETED)
+## Table of Contents
+
+1. [Critical Issues (Must Fix - Runtime Errors)](#1-critical-issues-must-fix---runtime-errors)
+2. [High Priority Issues](#2-high-priority-issues)
+3. [Medium Priority Issues](#3-medium-priority-issues)
+4. [Low Priority Issues](#4-low-priority-issues)
+5. [Duplicate Class Definitions](#5-duplicate-class-definitions)
+6. [Stub Methods Requiring Implementation](#6-stub-methods-requiring-implementation)
+7. [Dead Code to Remove](#7-dead-code-to-remove)
+8. [Previous Session Fixes (Completed)](#8-previous-session-fixes-completed)
+
+---
+
+## 1. Critical Issues (Must Fix - Runtime Errors)
+
+These will cause runtime `AttributeError` or similar crashes.
+
+### 1.1 Gate Server - Wrong Attribute Names
+
+| File | Line | Issue | Fix |
+|------|------|-------|-----|
+| `nodes/gate/server.py` | 2105, 2117 | `self._logger` undefined | Change to `self._udp_logger` |
+| `nodes/gate/server.py` | 3034 | `self._state` undefined | Change to `self._modular_state` |
+| `nodes/gate/server.py` | 984 | `self._coordinate_tracker` may not be initialized | Verify parent class init completes first |
+
+### 1.2 Manager Server - Wrong Attribute Name
+
+| File | Line | Issue | Fix |
+|------|------|-------|-----|
+| `nodes/manager/server.py` | 1164 | `self._leadership_coordinator` doesn't exist | Replace with correct attribute from parent class |
+
+### 1.3 Worker Server - Properties Defined Inside `__init__`
+
+| File | Lines | Issue | Fix |
+|------|-------|-------|-----|
+| `nodes/worker/server.py` | 199-204 | Two `@property` decorators inside `__init__` method | Move to class level after line 357 |
+
+**Details:** The properties `_transfer_metrics_received` and `_transfer_metrics_accepted` are defined as nested functions inside `__init__`, making them inaccessible as class properties. This is a Python syntax error.
+
+```python
+# WRONG (current - inside __init__):
+def __init__(self, ...):
+    ...
+    @property
+    def _transfer_metrics_received(self) -> int:
+        return self._worker_state._transfer_metrics_received
+
+# CORRECT (should be at class level):
+class WorkerServer:
+    ...
+    @property
+    def _transfer_metrics_received(self) -> int:
+        return self._worker_state._transfer_metrics_received
+```
+
+### 1.4 Gate Handler - Method Name Mismatch
+
+| File | Line | Issue | Fix |
+|------|------|-------|-----|
+| `nodes/gate/handlers/tcp_cancellation.py` | 298 | Method named `handle_job_cancellation_complete()` | Rename to `handle_cancellation_complete()` |
+| `nodes/gate/server.py` | 1220 | Server calls `handle_cancellation_complete()` | Or update server to call correct name |
+
+**Impact:** `AttributeError` when cancellation completion is received from workers.
+
+---
+
+## 2. High Priority Issues
+
+### 2.1 Manager Server - Duplicate Method Definition
+
+| File | Lines | Issue | Fix |
+|------|-------|-------|-----|
+| `nodes/manager/server.py` | 2295-2311 | First `_select_timeout_strategy()` definition | **Remove** (duplicate) |
+| `nodes/manager/server.py` | 4459-4473 | Second `_select_timeout_strategy()` definition | **Keep** this one |
+
+**Impact:** Confusing code, first definition is dead code.
+
+### 2.2 Manager Server - Missing Attribute Initialization
+
+| File | Line | Issue | Fix |
+|------|------|-------|-----|
+| `nodes/manager/server.py` | 775 | `_resource_sample_task` assigned but not declared | Add `self._resource_sample_task: asyncio.Task | None = None` to `_init_modules()` around line 500 |
+
+### 2.3 Gate Server - Stub Method
+
+| File | Lines | Issue | Fix |
+|------|-------|-------|-----|
+| `nodes/gate/server.py` | 2352-2354 | `_record_dc_job_stats()` is stub (just `pass`) | Implement stats recording logic |
+
+**Current code:**
+```python
+def _record_dc_job_stats(self, dc_id: str, job_id: str, stats: dict) -> None:
+    """Record DC job stats."""
+    pass
+```
+
+---
+
+## 3. Medium Priority Issues
+
+### 3.1 Manager Server - Incomplete Job Completion Handler
+
+| File | Lines | Issue |
+|------|-------|-------|
+| `nodes/manager/server.py` | 4625-4640 | `_handle_job_completion()` missing notification to origin gate/client |
+
+**Missing functionality:**
+- Push completion notification to origin gate/client
+- Clean up reporter tasks
+- Handle workflow result aggregation
+- Update job status to COMPLETED
+
+### 3.2 Manager Server - Duplicate Heartbeat Processing
+
+| File | Lines | Issue |
+|------|-------|-------|
+| `nodes/manager/server.py` | 1203-1218 | Worker heartbeat via SWIM embedding |
+| `nodes/manager/server.py` | 3424-3425 | Worker heartbeat via TCP handler |
+
+**Risk:** Duplicate processing, race conditions, capacity updates applied twice.
+
+### 3.3 Gate Server - Duplicate Health Classification Logic
+
+| File | Lines | Issue |
+|------|-------|-------|
+| `nodes/gate/server.py` | 2090-2093 | `_classify_datacenter_health()` calls `_log_health_transitions()` |
+| `nodes/gate/server.py` | 2095-2098 | `_get_all_datacenter_health()` also calls `_log_health_transitions()` |
+
+**Risk:** Health transitions logged multiple times per call.
+
+### 3.4 Gate Server - Duplicate Datacenter Selection Logic
+
+| File | Lines | Issue |
+|------|-------|-------|
+| `nodes/gate/server.py` | 2135-2164 | `_select_datacenters_with_fallback()` |
+| `nodes/gate/server.py` | 2166-2207 | `_legacy_select_datacenters()` |
+
+**Risk:** Similar logic duplicated, maintenance burden.
+
+### 3.5 Client - Stub Orphan Check Loop
+
+| File | Lines | Issue |
+|------|-------|-------|
+| `nodes/client/leadership.py` | 235-259 | `orphan_check_loop()` is stub (just `pass`) |
+
+**Missing functionality:**
+- Loop with `asyncio.sleep(check_interval_seconds)`
+- Check leader `last_updated` timestamps
+- Mark jobs as orphaned if grace_period exceeded
+- Log orphan detections
+
+### 3.6 Gate Handler - Unused Method
+
+| File | Lines | Issue |
+|------|-------|-------|
+| `nodes/gate/handlers/tcp_state_sync.py` | 153-217 | `handle_state_sync_response()` defined but never called |
+
+**Action:** Either remove as dead code OR add missing server endpoint.
+
+---
+
+## 4. Low Priority Issues
+
+### 4.1 Manager Server - Inconsistent Status Comparison
+
+| File | Line | Issue |
+|------|------|-------|
+| `nodes/manager/server.py` | 3966 | Uses `JobStatus.CANCELLED.value` inconsistently |
+
+**Fix:** Standardize to either always use `.value` or always use enum directly.
+
+### 4.2 Gate Server - Unused Job Ledger
+
+| File | Lines | Issue |
+|------|-------|-------|
+| `nodes/gate/server.py` | 892-901 | Job ledger created but never used |
+
+**Action:** Either implement ledger usage or remove initialization.
+
+### 4.3 Gate Server - Unnecessary Conditional Check
+
+| File | Lines | Issue |
+|------|-------|-------|
+| `nodes/gate/server.py` | 998-1002 | `if self._orphan_job_coordinator:` always True |
+
+### 4.4 Gate Handlers - Unnecessary Defensive Checks
+
+| File | Lines | Issue |
+|------|-------|-------|
+| `nodes/gate/handlers/tcp_job.py` | 361, 366, 375, 380, 401 | `"submission" in dir()` checks unnecessary |
+| `nodes/gate/handlers/tcp_cancellation.py` | 237-239 | `"cancel_request" in dir()` check unnecessary |
+
+**Note:** These work but are code smell and reduce readability.
+
+---
+
+## 5. Duplicate Class Definitions
+
+These duplicate class names create confusion and potential import conflicts.
+
+### 5.1 Critical Duplicates (Should Consolidate)
+
+| Class | File 1 | File 2 | Recommendation |
+|-------|--------|--------|----------------|
+| `LeaseManager` | `leases/job_lease.py:57` | `datacenters/lease_manager.py:39` | Rename to `JobLeaseManager` and `DatacenterLeaseManager` |
+| `NodeRole` | `discovery/security/role_validator.py:16` | `models/distributed.py:27` | Consolidate to models |
+| `Env` | `taskex/env.py:9` | `env/env.py:10` | Remove `taskex/env.py`, use main Env |
+| `ManagerInfo` | `models/distributed.py:189` | `datacenters/datacenter_health_manager.py:41` | Rename datacenter version to `DatacenterManagerInfo` |
+| `OverloadState` | `nodes/manager/load_shedding.py:32` (class) | `reliability/overload.py:20` (Enum) | Consolidate to single Enum |
+
+### 5.2 Other Duplicates (Lower Priority)
+
+| Class | Count | Notes |
+|-------|-------|-------|
+| `BackpressureLevel` | 2 | Different contexts |
+| `ClientState` | 2 | Different contexts |
+| `DCHealthState` | 2 | Different contexts |
+| `ExtensionTracker` | 2 | Different contexts |
+| `GatePeerState` | 2 | Different contexts |
+| `HealthPiggyback` | 2 | Different contexts |
+| `HealthSignals` | 2 | Different contexts |
+| `JobSuspicion` | 2 | Different contexts |
+| `ManagerState` | 2 | Different contexts |
+| `NodeHealthTracker` | 2 | Different contexts |
+| `NodeStatus` | 2 | Different contexts |
+| `ProgressState` | 2 | Different contexts |
+| `QueueFullError` | 2 | Different contexts |
+| `RetryDecision` | 2 | Different contexts |
+
+---
+
+## 6. Stub Methods Requiring Implementation
+
+Based on grep for `pass$` at end of methods (excluding exception handlers).
+
+### 6.1 High Priority Stubs
+
+| File | Line | Method |
+|------|------|--------|
+| `nodes/gate/server.py` | 2354 | `_record_dc_job_stats()` |
+| `nodes/client/leadership.py` | 259 | `orphan_check_loop()` |
+
+### 6.2 Timeout Strategy Stubs
+
+| File | Lines | Methods |
+|------|-------|---------|
+| `jobs/timeout_strategy.py` | 58, 73, 88, 108, 127, 149, 163, 177 | Multiple timeout strategy methods |
+
+### 6.3 Acceptable `pass` Statements
+
+Many `pass` statements are in exception handlers where silently ignoring errors is intentional:
+- Connection cleanup during shutdown
+- Non-critical logging failures
+- Timeout handling
+- Resource cleanup
+
+---
+
+## 7. Dead Code to Remove
+
+### 7.1 Confirmed Dead Code
+
+| File | Lines | Description |
+|------|-------|-------------|
+| `nodes/manager/server.py` | 2295-2311 | First `_select_timeout_strategy()` (duplicate) |
+| `nodes/gate/handlers/tcp_state_sync.py` | 153-217 | `handle_state_sync_response()` (never called) |
+| `nodes/gate/server.py` | 892-901 | Job ledger initialization (never used) |
+
+### 7.2 Recently Removed
+
+| File | Description |
+|------|-------------|
+| `routing/consistent_hash.py` | **DELETED** - was buggy duplicate of `jobs/gates/consistent_hash_ring.py` |
+
+---
+
+## 8. Previous Session Fixes (Completed)
+
+### Session 1 Fixes (All Completed)
 
 | ID | Severity | Category | Location | Status |
 |----|----------|----------|----------|--------|
-| F1 | CRITICAL | Missing Method | windowed_stats_collector.py | FIXED |
-| F2 | CRITICAL | Missing Method | windowed_stats_collector.py | FIXED |
-| F3 | CRITICAL | Missing Method | windowed_stats_collector.py | FIXED |
-| F4 | MEDIUM | Race Condition | stats_coordinator.py | FIXED |
-| F5 | MEDIUM | Race Condition | crdt.py | FIXED |
-| F6 | MEDIUM | Race Condition | windowed_stats_collector.py | FIXED |
-| F7 | LOW | Blocking Call | tcp_windowed_stats.py | FIXED |
-| F8 | LOW | Observability | gate/server.py | FIXED |
-| F9 | LOW | Race Condition | gate/server.py | FIXED |
+| F1 | CRITICAL | Missing Method | windowed_stats_collector.py | ✅ FIXED |
+| F2 | CRITICAL | Missing Method | windowed_stats_collector.py | ✅ FIXED |
+| F3 | CRITICAL | Missing Method | windowed_stats_collector.py | ✅ FIXED |
+| F4 | MEDIUM | Race Condition | stats_coordinator.py | ✅ FIXED |
+| F5 | MEDIUM | Race Condition | crdt.py | ✅ FIXED |
+| F6 | MEDIUM | Race Condition | windowed_stats_collector.py | ✅ FIXED |
+| F7 | LOW | Blocking Call | tcp_windowed_stats.py | ✅ FIXED |
+| F8 | LOW | Observability | gate/server.py | ✅ FIXED |
+| F9 | LOW | Race Condition | gate/server.py | ✅ FIXED |
+
+### Session 2: Comprehensive Scenario Tracing (All Completed)
+
+All 35+ issues from Categories A-F have been fixed:
+- **A: Manager Registration & Discovery** - 3 issues ✅
+- **B: Job Dispatch & Routing** - 7 issues ✅
+- **C: Health Detection & Circuit Breaker** - 6 issues ✅
+- **D: Overload & Backpressure** - 6 issues ✅
+- **E: Worker Registration & Core Allocation** - 6 issues ✅
+- **F: Workflow Dispatch & Execution** - 6 issues ✅
+
+### Session 3: Import Path Fixes (All Completed)
+
+| Issue | Files | Status |
+|-------|-------|--------|
+| Phantom `hyperscale.distributed.hash_ring` | `peer_coordinator.py`, `orphan_job_coordinator.py` | ✅ Fixed → `jobs.gates.consistent_hash_ring` |
+| Phantom `from taskex import` | 7 gate files | ✅ Fixed → `hyperscale.distributed.taskex` |
+| Wrong `ErrorStats` path | `tcp_job.py` | ✅ Fixed → `swim.core` |
+| Wrong `GateInfo` path | `tcp_job.py` | ✅ Fixed → `models` |
+
+### Session 3: ConsistentHashRing Improvements (Completed)
+
+| Improvement | Status |
+|-------------|--------|
+| Made async with `asyncio.Lock` | ✅ |
+| Added input validation (`replicas >= 1`) | ✅ |
+| Added `get_backup()` method | ✅ |
+| Optimized `remove_node()` from O(n×replicas) to O(n) | ✅ |
+| Deleted redundant `routing/consistent_hash.py` | ✅ |
 
 ---
 
-## Session 2: Comprehensive Scenario Tracing (40+ Scenarios)
+## Summary
 
-### CATEGORY A: Manager Registration & Discovery Issues
-
-#### A1: No Stale Manager Cleanup (CRITICAL - Memory Leak)
-**Location**: `gate/server.py:3058-3072` (`_discovery_maintenance_loop`)
-**Issue**: Loop only decays discovery failures but never removes stale managers from:
-- `_datacenter_manager_status`
-- `_manager_last_status`
-- `_manager_health`
-- `_manager_negotiated_caps`
-- `_manager_backpressure`
-
-**Impact**: Dictionaries grow unbounded with dead manager entries.
-**Status**: FIXED - `_discovery_maintenance_loop` now cleans up all stale manager state (300s threshold) from all relevant dicts
-
-#### A2: Concurrent Manager Registration Race (CRITICAL)
-**Location**: `gate/handlers/tcp_manager.py:131-134`
-**Issue**: Manager status updates have no synchronization with cleanup loop.
-**Impact**: Data corruption, incorrect health states.
-**Status**: FIXED - `update_manager_status()` uses `_manager_state_lock` for synchronization (state.py line 181)
-
-#### A3: Synthetic Heartbeat Not Cleaned (MEDIUM)
-**Location**: `gate/handlers/tcp_manager.py:444-459`
-**Issue**: Synthetic heartbeats from peer broadcasts never cleaned if real heartbeat never arrives.
-**Status**: FIXED - Synthetic heartbeats update `_manager_last_status` (line 486) and are cleaned by discovery_maintenance_loop via stale threshold
+| Severity | Count | Status |
+|----------|-------|--------|
+| **Critical (runtime errors)** | 5 | 🔴 Needs Fix |
+| **High Priority** | 3 | 🔴 Needs Fix |
+| **Medium Priority** | 6 | 🟡 Should Fix |
+| **Low Priority** | 4 | 🟢 Can Wait |
+| **Duplicate Classes** | 15+ | 🟡 Should Consolidate |
+| **Stub Methods** | 10+ | 🟡 Needs Implementation |
+| **Dead Code** | 3 | 🟢 Should Remove |
 
 ---
 
-### CATEGORY B: Job Dispatch & Routing Issues
+## Recommended Fix Order
 
-#### B1: DispatchTimeTracker Memory Leak (CRITICAL)
-**Location**: `routing/dispatch_time_tracker.py:15-42`
-**Issue**: `_dispatch_times` dict has no cleanup. Failed/timed-out jobs leave entries forever.
-**Impact**: Unbounded memory growth.
-**Status**: FIXED - Added `cleanup_stale_entries()` method with 600s threshold, called from discovery_maintenance_loop
-
-#### B2: ObservedLatencyTracker Memory Leak (CRITICAL)
-**Location**: `routing/observed_latency_tracker.py:24`
-**Issue**: `_latencies` dict accumulates state for every DC ever seen, no cleanup.
-**Status**: FIXED - Added `cleanup_stale_entries()` method with 600s threshold, called from discovery_maintenance_loop
-
-#### B3: DispatchTimeTracker Race Condition (HIGH)
-**Location**: `routing/dispatch_time_tracker.py`
-**Issue**: No asyncio.Lock protecting `_dispatch_times` dict from concurrent access.
-**Status**: FIXED - asyncio.Lock added at line 18, used in all methods
-
-#### B4: ObservedLatencyTracker Race Condition (HIGH)
-**Location**: `routing/observed_latency_tracker.py`
-**Issue**: No asyncio.Lock protecting `_latencies` dict.
-**Status**: FIXED - asyncio.Lock added at line 26, used in all methods
-
-#### B5: Missing Cleanup Calls in GateServer (HIGH)
-**Location**: `gate/server.py:450-458, 3007-3008`
-**Issue**: Cleanup methods exist but never called:
-- `_job_forwarding_tracker.cleanup_stale_peers()`
-- `_state_manager.cleanup_stale_states()`
-- Periodic cleanup of dispatch/latency trackers
-**Status**: PARTIAL - Dispatch/latency tracker cleanup IS called in discovery_maintenance_loop (lines 3132-3133). Job forwarding tracker peers are unregistered on death. Minor: `cleanup_stale_peers()` could be called periodically for resilience.
-
-#### B6: Silent Exception in Dispatch Coordinator (MEDIUM)
-**Location**: `gate/dispatch_coordinator.py:164`
-**Issue**: Exception silently swallowed, sets empty workflow set.
-**Status**: FIXED - Exception now logged via ServerWarning (lines 167-175), empty set is reasonable fallback
-
-#### B7: Incomplete GateJobTimeoutTracker.stop() (MEDIUM)
-**Location**: `jobs/gates/gate_job_timeout_tracker.py:142`
-**Issue**: `_tracked_jobs` dict never cleared on shutdown.
-**Status**: FIXED - `_tracked_jobs.clear()` called in stop() (lines 144-145)
-
----
-
-### CATEGORY C: Health Detection & Circuit Breaker Issues
-
-#### C1: Missing xack Handler in GateServer (CRITICAL)
-**Location**: `gate/server.py` (missing override of `_handle_xack_response`)
-**Issue**: GateServer never processes xack responses, so:
-- `_on_dc_latency()` callback never triggered
-- Cross-DC correlation detector never receives latency signals
-- Partition detection broken
-**Status**: FIXED - `_handle_xack_response` implemented at line 1057-1085, passes ack to FederatedHealthMonitor which invokes `_on_dc_latency` callback
-
-#### C2: No Circuit Breaker Success Recording (CRITICAL)
-**Location**: `gate/server.py:1939, 2516`
-**Issue**: Only `record_failure()` called, never `record_success()`.
-**Impact**: Circuits get stuck OPEN forever, healthy managers excluded.
-**Status**: FIXED - `record_success(manager_addr)` called on manager heartbeat at line 2422
-
-#### C3: Missing Partition Callback Invocation (HIGH)
-**Location**: `datacenters/cross_dc_correlation.py`
-**Issue**: Callbacks registered but never invoked from detector.
-**Status**: FIXED - `_on_partition_detected` callback invoked in health_coordinator.py lines 427-431
-
-#### C4: Circuit Breaker Race Condition (MEDIUM)
-**Location**: `health/circuit_breaker_manager.py:50-81`
-**Issue**: No synchronization between `get_circuit()` and `is_circuit_open()`.
-**Status**: FIXED - Both methods use `async with self._lock` (lines 49 and 59)
-
-#### C5: Memory Leak in Extension Trackers (MEDIUM)
-**Location**: `swim/detection/hierarchical_failure_detector.py:191`
-**Issue**: `_extension_trackers` dict grows unbounded.
-**Status**: FIXED - Hard cap at `max_extension_trackers=10000` (line 88), checked before adding (line 366), cleanup on node removal (line 468)
-
-#### C6: Missing Incarnation Tracking in Circuit Breaker (MEDIUM)
-**Location**: `health/circuit_breaker_manager.py`
-**Issue**: Circuit doesn't reset when manager restarts with new incarnation.
-**Status**: FIXED - `update_incarnation()` method (lines 121-132) resets circuit on new incarnation (line 130)
-
----
-
-### CATEGORY D: Overload & Backpressure Issues
-
-#### D1: Rate Limiter Cleanup Race Condition (CRITICAL)
-**Location**: `reliability/rate_limiting.py:634-655`
-**Issue**: `cleanup_inactive_clients()` not thread-safe, can race with request handling.
-**Status**: FIXED - Uses `async with self._async_lock` (line 652) for thread-safety
-
-#### D2: Rate Limiter Memory Leak (HIGH)
-**Location**: `reliability/rate_limiting.py:419, 641-653`
-**Issue**: `max_tracked_clients` config exists but not enforced.
-**Impact**: Ephemeral clients accumulate unbounded.
-**Status**: FIXED - Cap enforced with LRU eviction via `_evict_oldest_client()` (lines 585-586)
-
-#### D3: Backpressure Propagation Race (HIGH)
-**Location**: `gate/server.py:2401-2427`
-**Issue**: `_manager_backpressure` dict updated without lock.
-**Status**: FIXED - All backpressure methods use `_get_backpressure_lock()` (state.py lines 232, 245, 250)
-
-#### D4: Invalid Threshold Handling (MEDIUM)
-**Location**: `reliability/overload.py:283-298`
-**Issue**: No validation that thresholds are in ascending order.
-**Status**: FIXED - `__post_init__` validates all thresholds via `_validate_ascending()` (lines 94-98)
-
-#### D5: Capacity Aggregator Unbounded Growth (MEDIUM)
-**Location**: `capacity/capacity_aggregator.py:56-66`
-**Issue**: `_manager_heartbeats` dict has no size limit.
-**Status**: FIXED - `max_managers=10000` cap (line 20), enforced with LRU eviction (lines 28-43)
-
-#### D6: Hysteresis State Not Reset (LOW)
-**Location**: `reliability/overload.py:444-454`
-**Issue**: `_pending_state_count` not reset in `reset()`.
-**Status**: FIXED - `_pending_state_count = 0` in reset() method (line 476)
-
----
-
-### CATEGORY E: Worker Registration & Core Allocation Issues
-
-#### E1: Missing _worker_job_last_progress Cleanup (CRITICAL - Memory Leak)
-**Location**: `manager/registry.py:81-98`
-**Issue**: `unregister_worker()` doesn't clean `_worker_job_last_progress`.
-**Impact**: O(workers × jobs) entries never freed.
-**Status**: FIXED - `unregister_worker()` now cleans up all worker job progress entries (lines 101-105)
-
-#### E2: Missing _worker_latency_samples Cleanup (HIGH)
-**Location**: `manager/registry.py:81-98`
-**Issue**: `_worker_latency_samples` not cleaned on unregister.
-**Impact**: 1000-entry deque per worker never freed.
-**Status**: FIXED - `unregister_worker()` now cleans up worker latency samples (line 99)
-
-#### E3: TOCTOU Race in Core Allocation (CRITICAL)
-**Location**: `jobs/worker_pool.py:487-546`
-**Issue**: Worker can die between selection and reservation, causing silent dispatch failures.
-**Status**: FIXED - Uses `asyncio.Condition` with lock, re-verifies worker availability inside lock (lines 521-548), rollback on failure
-
-#### E4: Event Race in wait_for_cores() (HIGH - Deadlock Risk)
-**Location**: `jobs/worker_pool.py:674-704`
-**Issue**: Event race can cause 30s timeout even when cores available.
-**Status**: FIXED - Uses `asyncio.Condition.wait()` with timeout (line 552-555), notified on core availability changes
-
-#### E5: Missing _worker_health_states Dict (HIGH - Runtime Crash)
-**Location**: `manager/registry.py:147`
-**Issue**: Code references `_worker_health_states` but it's never initialized.
-**Impact**: AttributeError at runtime.
-**Status**: FIXED - Dict initialized at ManagerState line 89, cleanup in unregister_worker and remove_worker_state
-
-#### E6: Dispatch Semaphore Cleanup Issue (MEDIUM)
-**Location**: `manager/registry.py:96`
-**Issue**: Semaphore deleted while dispatch may be in progress.
-**Status**: FIXED - Added `_dispatch_semaphores.pop()` to `unregister_worker()` and `remove_worker_state()`
-
----
-
-### CATEGORY F: Workflow Dispatch & Execution Issues
-
-#### F10: Missing Dispatch Failure Cleanup (CRITICAL)
-**Location**: `manager/dispatch.py:121-159`
-**Issue**: No cleanup of allocated resources if dispatch fails.
-**Impact**: Workflows silently lost, fence tokens leak.
-**Status**: FIXED - Added `_dispatch_failure_count` to ManagerState, logging for all failure paths, circuit breaker error recording
-
-#### F11: Dispatch vs Cancellation Race (CRITICAL)
-**Location**: `jobs/workflow_dispatcher.py:528-694`
-**Issue**: TOCTOU race - workflow can be dispatched after cancellation.
-**Status**: FIXED - Added `_cancelling_jobs` set, cancellation checks at multiple points in dispatch flow
-
-#### F12: Active Workflows Memory Leak (HIGH)
-**Location**: `worker/workflow_executor.py:310-327`
-**Issue**: Incomplete cleanup - `_workflow_cancel_events`, `_workflow_tokens`, `_workflow_id_to_name`, `_workflow_cores_completed` never removed.
-**Impact**: ~4KB leaked per workflow.
-**Status**: FIXED - Added cleanup of all workflow state in `remove_active_workflow()`
-
-#### F13: Fence Token TOCTOU Race (HIGH)
-**Location**: `worker/handlers/tcp_dispatch.py:80-89`
-**Issue**: Fence token check-and-update not atomic.
-**Impact**: At-most-once guarantee broken.
-**Status**: FIXED - Added atomic `update_workflow_fence_token()` method with lock in WorkerState
-
-#### F14: Result Sending No Fallback (HIGH)
-**Location**: `worker/progress.py:283-393`
-**Issue**: If all managers unavailable, result silently dropped, no retry.
-**Status**: FIXED - Added `PendingResult` with bounded deque (max 1000), exponential backoff retry (5s base, max 60s, 10 retries, 300s TTL)
-
-#### F15: Orphan Detection Incomplete (MEDIUM)
-**Location**: `worker/background_loops.py:164-226`
-**Issue**: Only handles grace period expiry, no timeout for stuck RUNNING workflows.
-**Status**: FIXED - Added `get_stuck_workflows()` method, timeout tracking, integrated into orphan check loop
-
----
-
-## Priority Order for Fixes
-
-### Immediate (Will cause crashes or data loss):
-1. E5: Missing _worker_health_states dict (AttributeError)
-2. C1: Missing xack handler (partition detection broken)
-3. C2: No circuit breaker success recording (managers locked out)
-
-### Critical (Memory leaks, will cause OOM):
-4. A1: No stale manager cleanup
-5. B1: DispatchTimeTracker memory leak
-6. B2: ObservedLatencyTracker memory leak
-7. E1: Missing _worker_job_last_progress cleanup
-8. F12: Active workflows memory leak
-
-### High (Race conditions, silent failures):
-9. E3: TOCTOU in core allocation
-10. E4: Event race in wait_for_cores
-11. F10: Missing dispatch failure cleanup
-12. F11: Dispatch vs cancellation race
-13. D1: Rate limiter cleanup race
-14. B3/B4: Tracker race conditions
-
-### Medium (Should fix but not urgent):
-15. All remaining items
-
----
-
-## Total Issues Found: 35+
-
-| Category | Critical | High | Medium | Low |
-|----------|----------|------|--------|-----|
-| Manager Registration (A) | 2 | 0 | 1 | 0 |
-| Job Dispatch/Routing (B) | 2 | 3 | 2 | 0 |
-| Health/Circuit Breaker (C) | 2 | 1 | 3 | 0 |
-| Overload/Backpressure (D) | 1 | 2 | 2 | 1 |
-| Worker/Core Allocation (E) | 2 | 3 | 1 | 0 |
-| Workflow Dispatch (F) | 2 | 4 | 1 | 0 |
-| **Total** | **11** | **13** | **10** | **1** |
+1. **Fix all Critical issues first** (Section 1) - these cause runtime crashes
+2. **Fix High Priority issues** (Section 2) - duplicate methods, missing initializations
+3. **Address Medium Priority issues** (Section 3) - incomplete functionality
+4. **Clean up Low Priority issues and dead code** (Sections 4, 7)
+5. **Consolidate duplicate class definitions** (Section 5) - can be done incrementally
+6. **Implement stub methods** (Section 6) - as needed for features
