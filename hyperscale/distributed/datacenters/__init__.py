@@ -6,6 +6,7 @@ This module provides datacenter-level abstractions:
 - ManagerDispatcher: Manager selection and routing within a DC
 - LeaseManager: At-most-once delivery via leases and fence tokens
 - CrossDCCorrelationDetector: Cross-DC correlation for eviction decisions (Phase 7)
+- DatacenterOverloadClassifier: Threshold-based DC health classification
 """
 
 from hyperscale.distributed.datacenters.datacenter_health_manager import (
@@ -31,4 +32,14 @@ from hyperscale.distributed.datacenters.cross_dc_correlation import (
     DCStateInfo as DCStateInfo,
     LatencySample as LatencySample,
     ExtensionRecord as ExtensionRecord,
+)
+from hyperscale.distributed.datacenters.datacenter_overload_config import (
+    DatacenterOverloadConfig as DatacenterOverloadConfig,
+    DatacenterOverloadState as DatacenterOverloadState,
+    OVERLOAD_STATE_ORDER as OVERLOAD_STATE_ORDER,
+)
+from hyperscale.distributed.datacenters.datacenter_overload_classifier import (
+    DatacenterOverloadClassifier as DatacenterOverloadClassifier,
+    DatacenterOverloadSignals as DatacenterOverloadSignals,
+    DatacenterOverloadResult as DatacenterOverloadResult,
 )
