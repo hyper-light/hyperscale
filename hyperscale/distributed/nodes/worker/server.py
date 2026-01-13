@@ -1076,15 +1076,21 @@ class WorkerServer(HealthAwareServer):
 
     def _on_cores_available(self, available_cores: int) -> None:
         """Handle cores becoming available - notify manager (debounced)."""
-        if not self._running or available_cores <= 0:
+        if not self._should_notify_cores_available(available_cores):
             return
 
         self._pending_cores_notification = available_cores
+        self._ensure_cores_notification_task_running()
 
-        if (
+    def _should_notify_cores_available(self, available_cores: int) -> bool:
+        return self._running and available_cores > 0
+
+    def _ensure_cores_notification_task_running(self) -> None:
+        task_not_running = (
             self._cores_notification_task is None
             or self._cores_notification_task.done()
-        ):
+        )
+        if task_not_running:
             self._cores_notification_task = self._create_background_task(
                 self._flush_cores_notification(), "cores_notification"
             )
