@@ -272,60 +272,64 @@ class TestAdaptiveRateLimiterEdgeCases:
 class TestServerRateLimiterFailurePaths:
     """Test failure paths in ServerRateLimiter."""
 
-    def test_unknown_client_creates_counter(self) -> None:
+    @pytest.mark.asyncio
+    async def test_unknown_client_creates_counter(self) -> None:
         """Test that unknown client gets new counter."""
         limiter = ServerRateLimiter()
 
-        result = limiter.check_rate_limit("unknown-client", "job_submit")
+        result = await limiter.check_rate_limit("unknown-client", "job_submit")
 
         assert result.allowed is True
 
-    def test_many_clients_memory_growth(self) -> None:
+    @pytest.mark.asyncio
+    async def test_many_clients_memory_growth(self) -> None:
         """Test memory behavior with many clients."""
         limiter = ServerRateLimiter(inactive_cleanup_seconds=0.1)
 
         # Create many clients
         for i in range(1000):
-            limiter.check_rate_limit(f"client-{i}", "job_submit")
+            await limiter.check_rate_limit(f"client-{i}", "job_submit")
 
         metrics = limiter.get_metrics()
         assert metrics["active_clients"] == 1000
 
         # Wait for cleanup threshold
-        time.sleep(0.2)
+        await asyncio.sleep(0.2)
 
         # Cleanup should remove all
-        cleaned = limiter.cleanup_inactive_clients()
+        cleaned = await limiter.cleanup_inactive_clients()
         assert cleaned == 1000
 
         metrics = limiter.get_metrics()
         assert metrics["active_clients"] == 0
 
-    def test_cleanup_preserves_active_clients(self) -> None:
+    @pytest.mark.asyncio
+    async def test_cleanup_preserves_active_clients(self) -> None:
         """Test cleanup preserves recently active clients."""
         limiter = ServerRateLimiter(inactive_cleanup_seconds=1.0)
 
-        limiter.check_rate_limit("active-client", "job_submit")
-        limiter.check_rate_limit("inactive-client", "job_submit")
+        await limiter.check_rate_limit("active-client", "job_submit")
+        await limiter.check_rate_limit("inactive-client", "job_submit")
 
-        time.sleep(0.5)
-        limiter.check_rate_limit("active-client", "heartbeat")
+        await asyncio.sleep(0.5)
+        await limiter.check_rate_limit("active-client", "heartbeat")
 
-        time.sleep(0.6)
-        cleaned = limiter.cleanup_inactive_clients()
+        await asyncio.sleep(0.6)
+        cleaned = await limiter.cleanup_inactive_clients()
 
         assert cleaned == 1
         metrics = limiter.get_metrics()
         assert metrics["active_clients"] == 1
 
-    def test_rapid_requests_from_single_client(self) -> None:
+    @pytest.mark.asyncio
+    async def test_rapid_requests_from_single_client(self) -> None:
         """Test rapid requests exhaust counter."""
         config = RateLimitConfig(operation_limits={"test": (10, 1.0)})
         limiter = ServerRateLimiter(config=config)
 
         allowed_count = 0
         for _ in range(20):
-            result = limiter.check_rate_limit("rapid-client", "test")
+            result = await limiter.check_rate_limit("rapid-client", "test")
             if result.allowed:
                 allowed_count += 1
 
@@ -333,23 +337,24 @@ class TestServerRateLimiterFailurePaths:
         metrics = limiter.get_metrics()
         assert metrics["rate_limited_requests"] == 10
 
-    def test_reset_client_restores_capacity(self) -> None:
+    @pytest.mark.asyncio
+    async def test_reset_client_restores_capacity(self) -> None:
         """Test reset_client restores capacity."""
         config = RateLimitConfig(operation_limits={"test": (5, 1.0)})
         limiter = ServerRateLimiter(config=config)
 
         # Exhaust
         for _ in range(5):
-            limiter.check_rate_limit("reset-client", "test")
+            await limiter.check_rate_limit("reset-client", "test")
 
-        result = limiter.check_rate_limit("reset-client", "test")
+        result = await limiter.check_rate_limit("reset-client", "test")
         assert result.allowed is False
 
         # Reset
         limiter.reset_client("reset-client")
 
         # Should work again
-        result = limiter.check_rate_limit("reset-client", "test")
+        result = await limiter.check_rate_limit("reset-client", "test")
         assert result.allowed is True
 
     def test_reset_nonexistent_client(self) -> None:
