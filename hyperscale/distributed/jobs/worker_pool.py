@@ -255,8 +255,58 @@ class WorkerPool:
         return False
 
     def get_healthy_worker_ids(self) -> list[str]:
-        """Get list of all healthy worker node IDs."""
         return [node_id for node_id in self._workers if self.is_worker_healthy(node_id)]
+
+    def get_worker_health_bucket(self, node_id: str) -> str:
+        worker = self._workers.get(node_id)
+        if not worker:
+            return "UNHEALTHY"
+
+        if not self.is_worker_healthy(node_id):
+            return "UNHEALTHY"
+
+        overload_state = worker.overload_state
+
+        if overload_state == "healthy":
+            return "HEALTHY"
+        elif overload_state == "busy":
+            return "BUSY"
+        elif overload_state == "stressed":
+            return "DEGRADED"
+        elif overload_state == "overloaded":
+            return "UNHEALTHY"
+
+        return "HEALTHY"
+
+    def get_worker_health_state_counts(self) -> dict[str, int]:
+        counts = {"healthy": 0, "busy": 0, "stressed": 0, "overloaded": 0}
+
+        for node_id, worker in self._workers.items():
+            if not self.is_worker_healthy(node_id):
+                continue
+
+            overload_state = worker.overload_state
+            if overload_state in counts:
+                counts[overload_state] += 1
+            else:
+                counts["healthy"] += 1
+
+        return counts
+
+    def get_workers_by_health_bucket(self) -> dict[str, list[str]]:
+        buckets: dict[str, list[str]] = {
+            "HEALTHY": [],
+            "BUSY": [],
+            "DEGRADED": [],
+            "UNHEALTHY": [],
+        }
+
+        for node_id in self._workers:
+            bucket = self.get_worker_health_bucket(node_id)
+            if bucket in buckets:
+                buckets[bucket].append(node_id)
+
+        return buckets
 
     # =========================================================================
     # Three-Signal Health Model (AD-19)
