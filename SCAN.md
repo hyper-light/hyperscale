@@ -49,6 +49,232 @@ Before marking ANY phase complete, verify:
 
 **If ANY check fails, the phase is NOT complete.**
 
+---
+
+## Phase 0: Import Alias Resolution (FOUNDATIONAL - MANDATORY)
+
+**Objective**: Build comprehensive mapping of all import aliases before ANY scanning begins.
+
+**Why This Is Critical:**
+
+Import aliases hide the actual types being used, causing scanners to miss violations:
+
+```python
+# In imports:
+from hyperscale.distributed.models import (
+    ManagerState as ManagerStateEnum,      # Alias!
+    WorkflowInfo as WfInfo,                 # Alias!
+    JobSubmission as JobSub,                # Alias!
+)
+
+# In code - scanners looking for "ManagerState" will MISS these:
+self._state.set_enum(ManagerStateEnum.OFFLINE)  # Uses alias
+for wf in WfInfo.load(data).workflows:          # Uses alias
+job = JobSub.create(...)                         # Uses alias
+```
+
+**ALL subsequent phases MUST use alias-aware scanning.**
+
+### Step 0a: Extract All Import Aliases
+
+```python
+import ast
+from pathlib import Path
+from typing import Dict, Set, Tuple
+
+def extract_all_imports(file_path: str) -> Dict[str, Tuple[str, str]]:
+    """
+    Extract all imports with full resolution.
+    
+    Returns: {used_name: (original_name, module_path)}
+    
+    Examples:
+        'ManagerStateEnum' -> ('ManagerState', 'hyperscale.distributed.models')
+        'JobInfo' -> ('JobInfo', 'hyperscale.distributed.models')
+        'Path' -> ('Path', 'pathlib')
+    """
+    with open(file_path) as f:
+        tree = ast.parse(f.read())
+    
+    imports = {}
+    
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            module = node.module or ''
+            for alias in node.names:
+                used_name = alias.asname if alias.asname else alias.name
+                original_name = alias.name
+                imports[used_name] = (original_name, module)
+        
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                used_name = alias.asname if alias.asname else alias.name
+                original_name = alias.name
+                imports[used_name] = (original_name, '')
+    
+    return imports
+
+def build_alias_mappings(server_path: str) -> Dict[str, str]:
+    """
+    Build mapping from aliases to original names.
+    
+    Returns: {alias: original_name}
+    
+    Example:
+        {'ManagerStateEnum': 'ManagerState', 'WfInfo': 'WorkflowInfo'}
+    """
+    imports = extract_all_imports(server_path)
+    return {
+        used: original 
+        for used, (original, _) in imports.items() 
+        if used != original  # Only actual aliases
+    }
+
+def get_canonical_name(used_name: str, alias_map: Dict[str, str]) -> str:
+    """Resolve alias to canonical name, or return as-is if not aliased."""
+    return alias_map.get(used_name, used_name)
+```
+
+### Step 0b: Build Type Resolution Database
+
+Combine alias resolution with class/enum definitions:
+
+```python
+class TypeResolver:
+    """Resolves type names accounting for import aliases."""
+    
+    def __init__(self, server_path: str, models_dirs: list[str]):
+        self.alias_map = build_alias_mappings(server_path)
+        self.reverse_alias_map = {v: k for k, v in self.alias_map.items()}
+        
+        # Collect all classes, enums from models
+        self.classes: Dict[str, ClassInfo] = {}
+        self.enums: Dict[str, Set[str]] = {}
+        
+        for models_dir in models_dirs:
+            for py_file in Path(models_dir).glob("**/*.py"):
+                self._extract_types(str(py_file))
+    
+    def _extract_types(self, file_path: str) -> None:
+        """Extract class and enum definitions from file."""
+        with open(file_path) as f:
+            tree = ast.parse(f.read())
+        
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef):
+                # Check if enum
+                is_enum = any(
+                    (isinstance(b, ast.Name) and b.id == 'Enum') or
+                    (isinstance(b, ast.Attribute) and b.attr == 'Enum')
+                    for b in node.bases
+                )
+                
+                if is_enum:
+                    members = {
+                        t.id for item in node.body
+                        if isinstance(item, ast.Assign)
+                        for t in item.targets
+                        if isinstance(t, ast.Name)
+                    }
+                    self.enums[node.name] = members
+                else:
+                    # Regular class - extract attributes and methods
+                    self.classes[node.name] = self._extract_class_info(node, file_path)
+    
+    def resolve_type(self, used_name: str) -> str:
+        """Resolve alias to canonical type name."""
+        return self.alias_map.get(used_name, used_name)
+    
+    def get_alias_for(self, canonical_name: str) -> str | None:
+        """Get the alias used in code for a canonical name."""
+        return self.reverse_alias_map.get(canonical_name)
+    
+    def get_class_info(self, used_name: str) -> ClassInfo | None:
+        """Get class info by used name (resolves aliases)."""
+        canonical = self.resolve_type(used_name)
+        return self.classes.get(canonical)
+    
+    def get_enum_members(self, used_name: str) -> Set[str] | None:
+        """Get enum members by used name (resolves aliases)."""
+        canonical = self.resolve_type(used_name)
+        return self.enums.get(canonical)
+    
+    def iter_type_names_in_code(self, canonical_name: str) -> list[str]:
+        """
+        Get all names that might be used in code for a type.
+        
+        Returns both canonical name and any aliases.
+        """
+        names = [canonical_name]
+        if alias := self.get_alias_for(canonical_name):
+            names.append(alias)
+        return names
+```
+
+### Step 0c: Integration with All Scanners
+
+**MANDATORY**: Every scanner in Phase 3+ MUST:
+
+1. **Initialize TypeResolver FIRST**:
+   ```python
+   resolver = TypeResolver(
+       server_path="hyperscale/distributed/nodes/manager/server.py",
+       models_dirs=["hyperscale/distributed/models"]
+   )
+   ```
+
+2. **Use resolver for all type lookups**:
+   ```python
+   # WRONG - misses aliases:
+   if type_name in self.classes:
+       ...
+   
+   # RIGHT - resolves aliases:
+   if class_info := resolver.get_class_info(type_name):
+       ...
+   ```
+
+3. **Search for all name variants**:
+   ```python
+   # WRONG - misses aliased usages:
+   pattern = rf'\b{canonical_name}\.'
+   
+   # RIGHT - searches for all variants:
+   for name in resolver.iter_type_names_in_code(canonical_name):
+       pattern = rf'\b{re.escape(name)}\.'
+       # search...
+   ```
+
+### Step 0d: Alias Map Output (MANDATORY)
+
+Before proceeding to Phase 1, generate and review the alias map:
+
+```bash
+python3 << 'EOF'
+# Generate alias report for server file
+imports = extract_all_imports("hyperscale/distributed/nodes/manager/server.py")
+aliases = [(used, orig) for used, (orig, _) in imports.items() if used != orig]
+
+print("Import Aliases Found:")
+print("| Used In Code | Original Name | Module |")
+print("|--------------|---------------|--------|")
+for used, (orig, mod) in imports.items():
+    if used != orig:
+        print(f"| `{used}` | `{orig}` | `{mod}` |")
+EOF
+```
+
+**Example Output:**
+
+| Used In Code | Original Name | Module |
+|--------------|---------------|--------|
+| `ManagerStateEnum` | `ManagerState` | `hyperscale.distributed.models` |
+| `WfInfo` | `WorkflowInfo` | `hyperscale.distributed.models` |
+
+**BLOCKING**: Do not proceed to Phase 1 until alias map is generated and reviewed.
+
+---
+
 ## Phase 1: Extract All Component Calls
 
 **Objective**: Build complete inventory of every method call on every component.
