@@ -250,6 +250,12 @@ class GateRuntimeState:
         async with self._get_backpressure_lock():
             self._manager_backpressure.pop(manager_addr, None)
 
+    async def recalculate_dc_backpressure(
+        self, datacenter_id: str, datacenter_managers: dict[str, list[tuple[str, int]]]
+    ) -> None:
+        async with self._get_backpressure_lock():
+            self._update_dc_backpressure_locked(datacenter_id, datacenter_managers)
+
     # Lease methods
     def get_lease_key(self, job_id: str, datacenter_id: str) -> str:
         """Get the lease key for a job-DC pair."""
