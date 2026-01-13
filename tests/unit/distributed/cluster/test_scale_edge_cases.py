@@ -2413,7 +2413,8 @@ class TestGracefulDegradation:
 
         assert critical_accepted == 10000
 
-    def test_rate_limiter_graceful_under_burst(self):
+    @pytest.mark.asyncio
+    async def test_rate_limiter_graceful_under_burst(self):
         """Test rate limiter degrades gracefully under burst."""
         config = RateLimitConfig(default_bucket_size=100, default_refill_rate=10.0)
         limiter = ServerRateLimiter(config)
@@ -2421,7 +2422,7 @@ class TestGracefulDegradation:
         # Large burst
         results = []
         for _ in range(1000):
-            result = limiter.check_rate_limit("client-1", "operation")
+            result = await limiter.check_rate_limit("client-1", "operation")
             results.append(result)
 
         # First batch should be allowed
