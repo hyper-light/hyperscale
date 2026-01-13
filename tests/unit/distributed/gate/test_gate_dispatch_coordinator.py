@@ -607,7 +607,7 @@ class TestConcurrency:
             task_runner=MockTaskRunner(),
             job_manager=job_manager,
             job_router=None,
-            check_rate_limit=lambda client_id, op: (True, 0),
+            check_rate_limit=make_async_rate_limiter(allowed=True, retry_after=0),
             should_shed_request=lambda req_type: False,
             has_quorum_available=lambda: True,
             quorum_size=lambda: 3,
@@ -626,7 +626,6 @@ class TestConcurrency:
             *[coordinator.submit_job(("10.0.0.1", 8000), sub) for sub in submissions]
         )
 
-        # All should be accepted
         assert all(ack.accepted for ack in acks)
         assert len(job_manager.jobs) == 10
 
