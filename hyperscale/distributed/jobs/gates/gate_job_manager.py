@@ -131,7 +131,6 @@ class GateJobManager:
         return self._jobs.items()
 
     def get_running_jobs(self) -> list[tuple[str, GlobalJobStatus]]:
-        """Get all jobs currently in RUNNING state."""
         return [
             (job_id, job)
             for job_id, job in self._jobs.items()
