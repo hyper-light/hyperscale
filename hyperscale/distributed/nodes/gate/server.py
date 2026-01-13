@@ -712,6 +712,7 @@ class GateServer(HealthAwareServer):
             job_manager=self._job_manager,
             job_router=self._job_router,
             job_timeout_tracker=self._job_timeout_tracker,
+            dispatch_time_tracker=self._dispatch_time_tracker,
             circuit_breaker_manager=self._circuit_breaker_manager,
             datacenter_managers=self._datacenter_managers,
             check_rate_limit=self._check_rate_limit_for_operation,
