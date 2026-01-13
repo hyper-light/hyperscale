@@ -2679,15 +2679,17 @@ class ManagerServer(HealthAwareServer):
             if result_recorded and parent_complete:
                 sub_token = TrackingToken.parse(result.workflow_id)
                 parent_workflow_token = sub_token.workflow_token
-                if parent_workflow_token:
-                    if result.status == WorkflowStatus.COMPLETED.value:
-                        await self._job_manager.mark_workflow_completed(
-                            parent_workflow_token
-                        )
-                    elif result.error:
-                        await self._job_manager.mark_workflow_failed(
-                            parent_workflow_token, result.error
-                        )
+                if (
+                    parent_workflow_token
+                    and result.status == WorkflowStatus.COMPLETED.value
+                ):
+                    await self._job_manager.mark_workflow_completed(
+                        parent_workflow_token
+                    )
+                elif parent_workflow_token and result.error:
+                    await self._job_manager.mark_workflow_failed(
+                        parent_workflow_token, result.error
+                    )
 
             if (job := self._job_manager.get_job(result.job_id)) and job.is_complete:
                 await self._handle_job_completion(result.job_id)
