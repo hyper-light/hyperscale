@@ -1791,9 +1791,7 @@ class ManagerServer(HealthAwareServer):
                         leader_id=self._node_id.full,
                         job_id=job_id,
                         status=job.status,
-                        fencing_token=self._manager_state._job_fencing_tokens.get(
-                            job_id, 0
-                        ),
+                        fencing_token=self._leases.get_fence_token(job_id),
                         workflows_total=job.workflows_total,
                         workflows_completed=job.workflows_completed,
                         workflows_failed=job.workflows_failed,
@@ -2772,7 +2770,7 @@ class ManagerServer(HealthAwareServer):
                 )
 
             # Check fence token if provided (prevents cancelling restarted jobs)
-            stored_fence = self._manager_state._job_fencing_tokens.get(job_id, 0)
+            stored_fence = self._leases.get_fence_token(job_id)
             if fence_token > 0 and stored_fence != fence_token:
                 error_msg = (
                     f"Fence token mismatch: expected {stored_fence}, got {fence_token}"
