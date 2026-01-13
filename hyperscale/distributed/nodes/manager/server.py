@@ -1769,6 +1769,50 @@ class ManagerServer(HealthAwareServer):
                     )
                 )
 
+    def _build_job_state_sync_message(
+        self, job_id: str, job: JobInfo
+    ) -> JobStateSyncMessage:
+        elapsed_seconds = time.monotonic() - job.started_at if job.started_at else 0.0
+        origin_gate_addr = job.submission.origin_gate_addr if job.submission else None
+        return JobStateSyncMessage(
+            leader_id=self._node_id.full,
+            job_id=job_id,
+            status=job.status,
+            fencing_token=self._leases.get_fence_token(job_id),
+            workflows_total=job.workflows_total,
+            workflows_completed=job.workflows_completed,
+            workflows_failed=job.workflows_failed,
+            workflow_statuses={
+                wf_id: wf.status.value for wf_id, wf in job.workflows.items()
+            },
+            elapsed_seconds=elapsed_seconds,
+            timestamp=time.monotonic(),
+            origin_gate_addr=origin_gate_addr,
+            context_snapshot=job.context.dict(),
+            layer_version=job.layer_version,
+        )
+
+    async def _sync_job_state_to_peers(self, job_id: str, job: JobInfo) -> None:
+        sync_msg = self._build_job_state_sync_message(job_id, job)
+
+        for peer_addr in self._manager_state.get_active_manager_peers():
+            try:
+                await self._send_to_peer(
+                    peer_addr,
+                    "job_state_sync",
+                    sync_msg.dump(),
+                    timeout=2.0,
+                )
+            except Exception as sync_error:
+                await self._udp_logger.log(
+                    ServerDebug(
+                        message=f"Peer job state sync to {peer_addr} failed: {sync_error}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+
     async def _peer_job_state_sync_loop(self) -> None:
         """
         Background loop for periodic job state sync to peer managers.
@@ -1792,47 +1836,7 @@ class ManagerServer(HealthAwareServer):
                 for job_id in led_jobs:
                     if (job := self._job_manager.get_job_by_id(job_id)) is None:
                         continue
-
-                    sync_msg = JobStateSyncMessage(
-                        leader_id=self._node_id.full,
-                        job_id=job_id,
-                        status=job.status,
-                        fencing_token=self._leases.get_fence_token(job_id),
-                        workflows_total=job.workflows_total,
-                        workflows_completed=job.workflows_completed,
-                        workflows_failed=job.workflows_failed,
-                        workflow_statuses={
-                            wf_id: wf.status.value
-                            for wf_id, wf in job.workflows.items()
-                        },
-                        elapsed_seconds=time.monotonic() - job.started_at
-                        if job.started_at
-                        else 0.0,
-                        timestamp=time.monotonic(),
-                        origin_gate_addr=job.submission.origin_gate_addr
-                        if job.submission
-                        else None,
-                        context_snapshot=job.context.dict(),
-                        layer_version=job.layer_version,
-                    )
-
-                    for peer_addr in self._manager_state.get_active_manager_peers():
-                        try:
-                            await self._send_to_peer(
-                                peer_addr,
-                                "job_state_sync",
-                                sync_msg.dump(),
-                                timeout=2.0,
-                            )
-                        except Exception as sync_error:
-                            await self._udp_logger.log(
-                                ServerDebug(
-                                    message=f"Peer job state sync to {peer_addr} failed: {sync_error}",
-                                    node_host=self._host,
-                                    node_port=self._tcp_port,
-                                    node_id=self._node_id.short,
-                                )
-                            )
+                    await self._sync_job_state_to_peers(job_id, job)
 
             except asyncio.CancelledError:
                 break
