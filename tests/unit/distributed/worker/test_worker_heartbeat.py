@@ -363,8 +363,7 @@ class TestWorkerHeartbeatHandlerPeerConfirmation:
             task_runner_run=task_runner_run,
         )
 
-        # Manager should be marked healthy
-        assert registry.is_manager_healthy("mgr-1")
+        task_runner_run.assert_any_call(registry.mark_manager_healthy, "mgr-1")
 
     def test_on_peer_confirmed_unknown_peer(self) -> None:
         """Test peer confirmation for unknown peer."""
