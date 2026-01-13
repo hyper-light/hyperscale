@@ -1465,8 +1465,7 @@ class ManagerServer(HealthAwareServer):
                 expired = self._health_monitor.check_job_suspicion_expiry()
 
                 for job_id, worker_id in expired:
-                    # Trigger workflow reschedule for expired suspicions
-                    pass
+                    self._on_worker_dead_for_job(job_id, worker_id)
 
             except asyncio.CancelledError:
                 break
