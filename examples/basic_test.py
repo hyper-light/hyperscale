@@ -22,10 +22,6 @@ class TestTwo(Workflow):
     vus = 3000
     duration = "53m"
 
-    @state('Test')
-    def consume(self, value: str | None = None) -> Use[str]:
-        return value
-
     @step()
     async def get_httpbin(
         self,
@@ -36,17 +32,12 @@ class TestTwo(Workflow):
 
 @depends('Test', 'TestTwo')
 class TestThree(Workflow):
-    vus = 3000
-    duration = "53m"
 
     @state('Test')
     def consume(self, value: str | None = None) -> Use[str]:
         return value
 
     @step()
-    async def get_httpbin(
-        self,
-        url: URL = 'https://httpbin.org/get',
-    ) -> str:
-        return 'hello'
+    async def return_string(self, value: str | None = None) -> str:
+        return f'hello {value}'
         
