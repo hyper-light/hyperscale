@@ -457,7 +457,7 @@ class WorkerPool:
             )
 
             if worker.available_cores > old_available:
-                self._cores_available.set()
+                self._cores_condition.notify_all()
 
             health_state = self._worker_health.get(node_id)
             if health_state:
@@ -698,7 +698,7 @@ class WorkerPool:
         """
         try:
             async with asyncio.timeout(timeout):
-                async with self._cores_available_condition:
+                async with self._cores_condition:
                     while True:
                         total_available = sum(
                             worker.available_cores - worker.reserved_cores
@@ -708,13 +708,13 @@ class WorkerPool:
                         if total_available > 0:
                             return True
 
-                        await self._cores_available_condition.wait()
+                        await self._cores_condition.wait()
         except asyncio.TimeoutError:
             return False
 
-    def signal_cores_available(self) -> None:
-        """Signal that cores have become available."""
-        self._cores_available.set()
+    async def notify_cores_available(self) -> None:
+        async with self._cores_condition:
+            self._cores_condition.notify_all()
 
     # =========================================================================
     # Logging Helpers
