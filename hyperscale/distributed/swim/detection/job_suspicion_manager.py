@@ -13,6 +13,7 @@ Key features:
 """
 
 import asyncio
+import math
 import time
 from dataclasses import dataclass, field
 from typing import Callable
@@ -28,6 +29,7 @@ JobId = str
 @dataclass
 class JobSuspicionConfig:
     """Configuration for job-layer suspicion management."""
+
     # Adaptive polling intervals (ms)
     poll_interval_far_ms: int = 1000  # > 5s remaining
     poll_interval_medium_ms: int = 250  # 1-5s remaining
@@ -52,6 +54,7 @@ class JobSuspicion:
 
     Tracks the suspicion independently of global node status.
     """
+
     job_id: JobId
     node: NodeAddress
     incarnation: int
@@ -86,8 +89,6 @@ class JobSuspicion:
 
         timeout = max(min, max - (max - min) * log(C+1) / log(N+1))
         """
-        import math
-
         c = self.confirmation_count
         n = max(1, n_members)
 
@@ -231,7 +232,9 @@ class JobSuspicionManager:
                 else:
                     # Higher incarnation, replace
                     existing.cancel()
-                    self._per_job_counts[job_id] = self._per_job_counts.get(job_id, 1) - 1
+                    self._per_job_counts[job_id] = (
+                        self._per_job_counts.get(job_id, 1) - 1
+                    )
             else:
                 # Check limits
                 job_count = self._per_job_counts.get(job_id, 0)
@@ -256,9 +259,7 @@ class JobSuspicionManager:
             self._started_count += 1
 
             # Start adaptive polling timer
-            suspicion._poll_task = asyncio.create_task(
-                self._poll_suspicion(suspicion)
-            )
+            suspicion._poll_task = asyncio.create_task(self._poll_suspicion(suspicion))
 
             return suspicion
 
@@ -320,7 +321,9 @@ class JobSuspicionManager:
         # Call callback outside lock
         if self._on_expired:
             try:
-                self._on_expired(suspicion.job_id, suspicion.node, suspicion.incarnation)
+                self._on_expired(
+                    suspicion.job_id, suspicion.node, suspicion.incarnation
+                )
             except Exception:
                 pass  # Don't let callback errors propagate
 
@@ -414,17 +417,11 @@ class JobSuspicionManager:
 
     def get_suspected_nodes(self, job_id: JobId) -> list[NodeAddress]:
         """Get all suspected nodes for a job."""
-        return [
-            key[1] for key in self._suspicions.keys()
-            if key[0] == job_id
-        ]
+        return [key[1] for key in self._suspicions.keys() if key[0] == job_id]
 
     def get_jobs_suspecting(self, node: NodeAddress) -> list[JobId]:
         """Get all jobs that have this node suspected."""
-        return [
-            key[0] for key in self._suspicions.keys()
-            if key[1] == node
-        ]
+        return [key[0] for key in self._suspicions.keys() if key[1] == node]
 
     async def shutdown(self) -> None:
         """Shutdown the manager and cancel all timers."""
@@ -435,7 +432,9 @@ class JobSuspicionManager:
         """Get manager statistics."""
         return {
             "active_suspicions": len(self._suspicions),
-            "jobs_with_suspicions": len([c for c in self._per_job_counts.values() if c > 0]),
+            "jobs_with_suspicions": len(
+                [c for c in self._per_job_counts.values() if c > 0]
+            ),
             "started_count": self._started_count,
             "expired_count": self._expired_count,
             "refuted_count": self._refuted_count,
