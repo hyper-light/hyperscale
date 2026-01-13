@@ -2430,6 +2430,11 @@ class DatacenterStatus(Message):
     busy_worker_count: int = 0
     worker_overload_ratio: float = 0.0
     health_severity_weight: float = 1.0
+    overloaded_manager_count: int = 0
+    stressed_manager_count: int = 0
+    busy_manager_count: int = 0
+    manager_overload_ratio: float = 0.0
+    leader_overloaded: bool = False
 
 
 # =============================================================================

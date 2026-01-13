@@ -206,6 +206,11 @@ class DatacenterHealthManager:
             busy_worker_count=getattr(best_heartbeat, "busy_worker_count", 0),
             worker_overload_ratio=overload_result.worker_overload_ratio,
             health_severity_weight=overload_result.health_severity_weight,
+            overloaded_manager_count=signals.overloaded_managers,
+            stressed_manager_count=signals.stressed_managers,
+            busy_manager_count=signals.busy_managers,
+            manager_overload_ratio=overload_result.manager_overload_ratio,
+            leader_overloaded=overload_result.leader_overloaded,
         )
 
     def _build_unhealthy_status(
