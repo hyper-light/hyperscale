@@ -298,27 +298,27 @@ class TestWorkerExecutorThroughput:
         expected = executor.get_expected_throughput()
         assert expected == 0.0
 
-    def test_get_expected_throughput_with_samples(self):
-        """Test expected throughput calculation."""
+    @pytest.mark.asyncio
+    async def test_get_expected_throughput_with_samples(self):
         allocator = MockCoreAllocator()
         logger = MagicMock()
         state = MockWorkerState()
         executor = WorkerExecutor(allocator, logger, state)
 
         for _ in range(10):
-            executor.record_throughput_event(2.0)
+            await executor.record_throughput_event(2.0)
 
         expected = executor.get_expected_throughput()
-        assert expected == 0.5  # 1 / 2.0
+        assert expected == 0.5
 
-    def test_get_expected_throughput_zero_time(self):
-        """Test expected throughput with zero completion time."""
+    @pytest.mark.asyncio
+    async def test_get_expected_throughput_zero_time(self):
         allocator = MockCoreAllocator()
         logger = MagicMock()
         state = MockWorkerState()
         executor = WorkerExecutor(allocator, logger, state)
 
-        executor.record_throughput_event(0.0)
+        await executor.record_throughput_event(0.0)
 
         expected = executor.get_expected_throughput()
         assert expected == 0.0
