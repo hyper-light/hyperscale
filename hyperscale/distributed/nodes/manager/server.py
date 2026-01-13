@@ -2621,8 +2621,8 @@ class ManagerServer(HealthAwareServer):
                 failed_count=progress.failed_count,
             )
 
-            # Record in windowed stats
-            self._windowed_stats.record(progress)
+            stats_worker_id = worker_id or f"{addr[0]}:{addr[1]}"
+            await self._windowed_stats.record(stats_worker_id, progress)
 
             # Get backpressure signal
             backpressure = self._stats_buffer.get_backpressure_signal()
