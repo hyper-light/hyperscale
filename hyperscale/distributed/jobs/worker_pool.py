@@ -97,11 +97,8 @@ class WorkerPool:
         # Lock for core allocation (separate from registration)
         self._allocation_lock = asyncio.Lock()
 
-        # Condition signaled when cores become available (uses allocation lock)
-        self._cores_available_condition = asyncio.Condition(self._allocation_lock)
-
-        # Legacy event for backward compatibility (signal_cores_available)
-        self._cores_available = asyncio.Event()
+        # Condition for waiting on cores (uses allocation lock for atomic wait)
+        self._cores_condition = asyncio.Condition(self._allocation_lock)
 
     # =========================================================================
     # Worker Registration
