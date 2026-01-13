@@ -128,9 +128,23 @@ grep -rn "<key_operation_or_variable>" <node_directory>/*.py
 
 ### Step 5c: Implement the Fix
 
+**CRITICAL: De-duplication Rule**
+
+Before implementing ANY fix, ask:
+1. Does similar functionality already exist?
+   - If YES: Do NOT add new method. Update call site to use existing method.
+   - If NO: Implement new method.
+
+2. If naming differs but behavior is identical:
+   - Choose the more descriptive/accurate name as canonical
+   - Update ALL call sites to use canonical name
+   - Do NOT create aliases or duplicates
+
+3. Never add aliases for convenience - aliases are tech debt that obscures the single source of truth.
+
 **For naming mismatch:**
-- Update call site to use correct name
-- OR add method alias if multiple names are valid
+- Update call site to use the existing correct method name
+- Do NOT add aliases
 
 **For wrong component:**
 - Update call site to use correct component
