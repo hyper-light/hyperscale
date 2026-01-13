@@ -348,59 +348,64 @@ class TestClientState:
         state.mark_job_orphaned(job_id, orphan_info)
         assert state.is_job_orphaned(job_id) is True
 
-    def test_increment_gate_transfers(self):
+    @pytest.mark.asyncio
+    async def test_increment_gate_transfers(self):
         """Test gate transfer counter."""
         state = ClientState()
 
         assert state._gate_transfers_received == 0
 
-        state.increment_gate_transfers()
-        state.increment_gate_transfers()
+        await state.increment_gate_transfers()
+        await state.increment_gate_transfers()
 
         assert state._gate_transfers_received == 2
 
-    def test_increment_manager_transfers(self):
+    @pytest.mark.asyncio
+    async def test_increment_manager_transfers(self):
         """Test manager transfer counter."""
         state = ClientState()
 
         assert state._manager_transfers_received == 0
 
-        state.increment_manager_transfers()
-        state.increment_manager_transfers()
-        state.increment_manager_transfers()
+        await state.increment_manager_transfers()
+        await state.increment_manager_transfers()
+        await state.increment_manager_transfers()
 
         assert state._manager_transfers_received == 3
 
-    def test_increment_rerouted(self):
+    @pytest.mark.asyncio
+    async def test_increment_rerouted(self):
         """Test rerouted requests counter."""
         state = ClientState()
 
         assert state._requests_rerouted == 0
 
-        state.increment_rerouted()
+        await state.increment_rerouted()
 
         assert state._requests_rerouted == 1
 
-    def test_increment_failed_leadership_change(self):
+    @pytest.mark.asyncio
+    async def test_increment_failed_leadership_change(self):
         """Test failed leadership change counter."""
         state = ClientState()
 
         assert state._requests_failed_leadership_change == 0
 
-        state.increment_failed_leadership_change()
-        state.increment_failed_leadership_change()
+        await state.increment_failed_leadership_change()
+        await state.increment_failed_leadership_change()
 
         assert state._requests_failed_leadership_change == 2
 
-    def test_get_leadership_metrics(self):
+    @pytest.mark.asyncio
+    async def test_get_leadership_metrics(self):
         """Test leadership metrics retrieval."""
         state = ClientState()
 
-        state.increment_gate_transfers()
-        state.increment_gate_transfers()
-        state.increment_manager_transfers()
-        state.increment_rerouted()
-        state.increment_failed_leadership_change()
+        await state.increment_gate_transfers()
+        await state.increment_gate_transfers()
+        await state.increment_manager_transfers()
+        await state.increment_rerouted()
+        await state.increment_failed_leadership_change()
 
         metrics = state.get_leadership_metrics()
 
@@ -464,9 +469,7 @@ class TestClientState:
             state._gate_job_leaders[job_id] = leader_info
             await asyncio.sleep(0.001)
 
-        await asyncio.gather(*[
-            update_gate_leader(i) for i in range(10)
-        ])
+        await asyncio.gather(*[update_gate_leader(i) for i in range(10)])
 
         # Final state should have latest update
         assert job_id in state._gate_job_leaders

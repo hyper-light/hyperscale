@@ -73,10 +73,7 @@ class TestOverloadDetectorConcurrency:
                     await asyncio.sleep(0)
 
         # Run concurrent recorders
-        tasks = [
-            record_samples(50.0 + j * 10)
-            for j in range(num_coroutines)
-        ]
+        tasks = [record_samples(50.0 + j * 10) for j in range(num_coroutines)]
         await asyncio.gather(*tasks)
 
         # Verify state consistency
@@ -145,7 +142,9 @@ class TestOverloadDetectorConcurrency:
                 # Check internal consistency
                 if diag["baseline"] > 0 and diag["slow_baseline"] > 0:
                     # Drift should match calculation
-                    expected_drift = (diag["baseline"] - diag["slow_baseline"]) / diag["slow_baseline"]
+                    expected_drift = (diag["baseline"] - diag["slow_baseline"]) / diag[
+                        "slow_baseline"
+                    ]
                     actual_drift = diag["baseline_drift"]
                     if abs(expected_drift - actual_drift) > 0.001:
                         inconsistencies.append((expected_drift, actual_drift))
@@ -163,7 +162,9 @@ class TestOverloadDetectorConcurrency:
         )
 
         # No inconsistencies should be found
-        assert len(inconsistencies) == 0, f"Found {len(inconsistencies)} inconsistencies"
+        assert len(inconsistencies) == 0, (
+            f"Found {len(inconsistencies)} inconsistencies"
+        )
 
 
 # =============================================================================
@@ -209,7 +210,9 @@ class TestLoadShedderConcurrency:
             elif state == OverloadState.OVERLOADED:
                 # Only CRITICAL survives overload
                 if priority != RequestPriority.CRITICAL:
-                    assert should_shed, f"Didn't shed {message_type} ({priority}) when OVERLOADED"
+                    assert should_shed, (
+                        f"Didn't shed {message_type} ({priority}) when OVERLOADED"
+                    )
 
 
 # =============================================================================
@@ -241,7 +244,9 @@ class TestSlidingWindowCounterConcurrency:
         tasks = [try_acquire() for _ in range(20)]
         await asyncio.gather(*tasks)
 
-        assert acquired_count <= 100, f"Acquired {acquired_count} slots from 100-slot counter"
+        assert acquired_count <= 100, (
+            f"Acquired {acquired_count} slots from 100-slot counter"
+        )
 
     @pytest.mark.asyncio
     async def test_acquire_async_serializes_access(self):
@@ -274,12 +279,10 @@ class TestSlidingWindowCounterConcurrency:
         await asyncio.gather(*tasks)
 
         # Exactly 2 should succeed (10 slots / 5 per request = 2)
-        assert success_count == 2, \
-            f"Expected exactly 2 successes, got {success_count}"
+        assert success_count == 2, f"Expected exactly 2 successes, got {success_count}"
 
         # Remaining 3 should have failed
-        assert failure_count == 3, \
-            f"Expected exactly 3 failures, got {failure_count}"
+        assert failure_count == 3, f"Expected exactly 3 failures, got {failure_count}"
 
     @pytest.mark.asyncio
     async def test_acquire_async_serializes_waiters(self):
@@ -336,8 +339,9 @@ class TestSlidingWindowCounterConcurrency:
 
         # After window rotation, count should decay over time
         # All readings should be less than original 100
-        assert all(r < 100 for r in readings), \
+        assert all(r < 100 for r in readings), (
             f"Expected all readings < 100 after rotation, got {readings}"
+        )
 
 
 # =============================================================================
@@ -369,7 +373,9 @@ class TestTokenBucketConcurrency:
         tasks = [try_acquire() for _ in range(20)]
         await asyncio.gather(*tasks)
 
-        assert acquired_count <= 100, f"Acquired {acquired_count} tokens from 100-token bucket"
+        assert acquired_count <= 100, (
+            f"Acquired {acquired_count} tokens from 100-token bucket"
+        )
 
     @pytest.mark.asyncio
     async def test_acquire_async_serializes_waiters(self):
@@ -426,8 +432,9 @@ class TestTokenBucketConcurrency:
         # Readings should be monotonically non-decreasing (refill continues)
         # Allow small variance due to timing
         for i in range(1, len(readings)):
-            assert readings[i] >= readings[i - 1] - 1, \
-                f"Token count decreased unexpectedly: {readings[i-1]} -> {readings[i]}"
+            assert readings[i] >= readings[i - 1] - 1, (
+                f"Token count decreased unexpectedly: {readings[i - 1]} -> {readings[i]}"
+            )
 
 
 # =============================================================================
@@ -465,8 +472,9 @@ class TestServerRateLimiterConcurrency:
         # Each client should have had ~10 allowed (bucket size)
         for client_id, results in results_by_client.items():
             allowed_count = sum(1 for r in results if r)
-            assert 8 <= allowed_count <= 12, \
+            assert 8 <= allowed_count <= 12, (
                 f"{client_id} had {allowed_count} allowed, expected ~10"
+            )
 
     @pytest.mark.asyncio
     async def test_cleanup_under_concurrent_access(self):
@@ -565,7 +573,7 @@ class TestServerRateLimiterConcurrency:
                 results_by_addr[key] = []
 
             for _ in range(10):
-                allowed = limiter.check(addr)
+                allowed = await limiter.check(addr)
                 async with lock:
                     results_by_addr[key].append(allowed)
                 await asyncio.sleep(0)
@@ -580,8 +588,9 @@ class TestServerRateLimiterConcurrency:
         # Each address should have exactly 5 allowed (bucket size) out of 10 attempts
         for addr_key, results in results_by_addr.items():
             allowed_count = sum(1 for r in results if r)
-            assert allowed_count == 5, \
+            assert allowed_count == 5, (
                 f"{addr_key} had {allowed_count} allowed, expected 5"
+            )
 
 
 # =============================================================================
@@ -637,7 +646,9 @@ class TestStatsBufferConcurrency:
 
         # Buffer should still be functional
         hot_stats = buffer.get_hot_stats()
-        assert hot_stats is not None or len(buffer._hot) == 0  # May be empty if all promoted
+        assert (
+            hot_stats is not None or len(buffer._hot) == 0
+        )  # May be empty if all promoted
 
     @pytest.mark.asyncio
     async def test_backpressure_level_consistency_under_load(self):
@@ -733,7 +744,9 @@ class TestNodeHealthTrackerConcurrency:
                 worker_id = f"worker_{i % 10}"
                 state = WorkerHealthState(
                     worker_id=worker_id,
-                    consecutive_liveness_failures=3 if i % 2 == 0 else 0,  # Toggle unhealthy
+                    consecutive_liveness_failures=3
+                    if i % 2 == 0
+                    else 0,  # Toggle unhealthy
                     accepting_work=True,
                     available_capacity=100,
                 )
@@ -774,9 +787,11 @@ class TestExtensionTrackerConcurrency:
         async def request_extension(progress: float):
             nonlocal granted_count
             # request_extension returns (granted, extension_seconds, denial_reason, is_warning)
-            granted, _extension_seconds, _denial_reason, _is_warning = tracker.request_extension(
-                reason="test",
-                current_progress=progress,
+            granted, _extension_seconds, _denial_reason, _is_warning = (
+                tracker.request_extension(
+                    reason="test",
+                    current_progress=progress,
+                )
             )
             if granted:
                 async with lock:
@@ -788,8 +803,7 @@ class TestExtensionTrackerConcurrency:
         await asyncio.gather(*tasks)
 
         # Should not exceed max_extensions
-        assert granted_count <= 5, \
-            f"Granted {granted_count} extensions, max is 5"
+        assert granted_count <= 5, f"Granted {granted_count} extensions, max is 5"
 
 
 # =============================================================================
@@ -820,23 +834,25 @@ class TestWorkerHealthManagerConcurrency:
                     estimated_completion=time.time() + 10,
                     active_workflow_count=5,
                 )
-                response = manager.handle_extension_request(request, current_deadline=time.time() + 30)
+                response = manager.handle_extension_request(
+                    request, current_deadline=time.time() + 30
+                )
                 async with lock:
                     results[worker_id].append(response.granted)
                 await asyncio.sleep(0)
 
         # Handle extensions for multiple workers concurrently
-        await asyncio.gather(*[
-            handle_worker_extensions(f"worker_{j}")
-            for j in range(5)
-        ])
+        await asyncio.gather(
+            *[handle_worker_extensions(f"worker_{j}") for j in range(5)]
+        )
 
         # Each worker should have independent extension tracking
         for worker_id, grants in results.items():
             # First few should be granted (up to max_extensions)
             granted_count = sum(1 for g in grants if g)
-            assert granted_count <= 5, \
+            assert granted_count <= 5, (
                 f"{worker_id} had {granted_count} grants, max is 5"
+            )
 
     @pytest.mark.asyncio
     async def test_concurrent_eviction_checks(self):
@@ -857,10 +873,7 @@ class TestWorkerHealthManagerConcurrency:
                     eviction_decisions.append((worker_id, should_evict, reason))
                 await asyncio.sleep(0)
 
-        await asyncio.gather(*[
-            check_eviction(f"worker_{j}")
-            for j in range(5)
-        ])
+        await asyncio.gather(*[check_eviction(f"worker_{j}") for j in range(5)])
 
         # All decisions should have valid reasons (or None)
         for worker_id, should_evict, reason in eviction_decisions:
@@ -956,7 +969,7 @@ class TestCrossComponentConcurrency:
                         consecutive_liveness_failures=0,
                         accepting_work=True,
                         available_capacity=100,
-                    )
+                    ),
                 )
 
             except Exception as e:
@@ -972,4 +985,6 @@ class TestCrossComponentConcurrency:
         ]
         await asyncio.gather(*tasks)
 
-        assert len(errors) == 0, f"Errors in full stack: {errors[:5]}..."  # Show first 5
+        assert len(errors) == 0, (
+            f"Errors in full stack: {errors[:5]}..."
+        )  # Show first 5
