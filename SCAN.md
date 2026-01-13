@@ -1798,9 +1798,11 @@ lsp_hover(file="server.py", line=1625, character=<column_of_completed_at>)
 
 **STATUS: MANDATORY** - This step MUST be executed. Missing or incorrect type hints cause runtime surprises, make code harder to understand, and prevent static analysis tools from catching bugs.
 
+**Scope: This phase applies to ALL modular classes** - server, state, coordinators, handlers, and any helper classes. Not just the main server file.
+
 **The Problem:**
 
-Functions and methods without type hints (or with incorrect hints) create multiple issues:
+Functions, methods, AND class attributes without type hints create multiple issues:
 
 ```python
 # PROBLEM 1: Missing parameter type hint
@@ -1818,6 +1820,20 @@ def calculate_progress(self, count: int) -> float:  # Actually returns int!
 # PROBLEM 4: Any/object escape hatches
 def handle_message(self, msg: Any) -> Any:  # Type system defeated
     return process(msg)
+
+# PROBLEM 5: Untyped class attributes (public AND private)
+class WorkerState:
+    def __init__(self):
+        self._workers = {}  # What's in here? dict[str, ???]
+        self._pending_jobs = []  # list of what?
+        self.config = None  # None or what type?
+
+# PROBLEM 6: Untyped instance attributes assigned in __init__
+class JobManager:
+    def __init__(self, config):
+        self._config = config  # What type is config?
+        self._cache = {}  # dict[?, ?]
+        self._lock = None  # Should be asyncio.Lock | None
 ```
 
 **Why This Matters:**
@@ -1827,6 +1843,7 @@ def handle_message(self, msg: Any) -> Any:  # Type system defeated
 3. **IDE support broken**: No autocomplete, no inline errors
 4. **Static analysis defeated**: LSP and type checkers can't help
 5. **Refactoring hazard**: Can't safely rename/change types
+6. **Hidden state bugs**: Untyped class attributes hide what data the class manages
 
 **Codebase Rule (from AGENTS.md):**
 > "Type hints required, but we prefer to infer return types."
