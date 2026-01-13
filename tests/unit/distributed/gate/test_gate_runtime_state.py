@@ -76,80 +76,88 @@ class TestGateRuntimeStateInitialization:
 class TestGatePeerMethods:
     """Tests for gate peer tracking methods."""
 
-    def test_get_or_create_peer_lock_creates_lock(self):
+    @pytest.mark.asyncio
+    async def test_get_or_create_peer_lock_creates_lock(self):
         """Get or create peer lock creates new lock."""
         state = GateRuntimeState()
         peer_addr = ("10.0.0.1", 9001)
 
-        lock = state.get_or_create_peer_lock(peer_addr)
+        lock = await state.get_or_create_peer_lock(peer_addr)
 
         assert isinstance(lock, asyncio.Lock)
         assert peer_addr in state._peer_state_locks
 
-    def test_get_or_create_peer_lock_returns_same_lock(self):
+    @pytest.mark.asyncio
+    async def test_get_or_create_peer_lock_returns_same_lock(self):
         """Get or create peer lock returns same lock for same peer."""
         state = GateRuntimeState()
         peer_addr = ("10.0.0.1", 9001)
 
-        lock1 = state.get_or_create_peer_lock(peer_addr)
-        lock2 = state.get_or_create_peer_lock(peer_addr)
+        lock1 = await state.get_or_create_peer_lock(peer_addr)
+        lock2 = await state.get_or_create_peer_lock(peer_addr)
 
         assert lock1 is lock2
 
-    def test_different_peers_get_different_locks(self):
+    @pytest.mark.asyncio
+    async def test_different_peers_get_different_locks(self):
         """Different peers get different locks."""
         state = GateRuntimeState()
         peer1 = ("10.0.0.1", 9001)
         peer2 = ("10.0.0.2", 9001)
 
-        lock1 = state.get_or_create_peer_lock(peer1)
-        lock2 = state.get_or_create_peer_lock(peer2)
+        lock1 = await state.get_or_create_peer_lock(peer1)
+        lock2 = await state.get_or_create_peer_lock(peer2)
 
         assert lock1 is not lock2
 
-    def test_increment_peer_epoch(self):
+    @pytest.mark.asyncio
+    async def test_increment_peer_epoch(self):
         """Increment peer epoch increments and returns value."""
         state = GateRuntimeState()
         peer_addr = ("10.0.0.1", 9001)
 
-        epoch1 = state.increment_peer_epoch(peer_addr)
-        epoch2 = state.increment_peer_epoch(peer_addr)
-        epoch3 = state.increment_peer_epoch(peer_addr)
+        epoch1 = await state.increment_peer_epoch(peer_addr)
+        epoch2 = await state.increment_peer_epoch(peer_addr)
+        epoch3 = await state.increment_peer_epoch(peer_addr)
 
         assert epoch1 == 1
         assert epoch2 == 2
         assert epoch3 == 3
 
-    def test_get_peer_epoch_unknown_peer(self):
+    @pytest.mark.asyncio
+    async def test_get_peer_epoch_unknown_peer(self):
         """Get peer epoch for unknown peer returns 0."""
         state = GateRuntimeState()
-        assert state.get_peer_epoch(("unknown", 9999)) == 0
+        assert await state.get_peer_epoch(("unknown", 9999)) == 0
 
-    def test_get_peer_epoch_after_increment(self):
+    @pytest.mark.asyncio
+    async def test_get_peer_epoch_after_increment(self):
         """Get peer epoch returns incremented value."""
         state = GateRuntimeState()
         peer_addr = ("10.0.0.1", 9001)
 
-        state.increment_peer_epoch(peer_addr)
-        state.increment_peer_epoch(peer_addr)
+        await state.increment_peer_epoch(peer_addr)
+        await state.increment_peer_epoch(peer_addr)
 
-        assert state.get_peer_epoch(peer_addr) == 2
+        assert await state.get_peer_epoch(peer_addr) == 2
 
-    def test_add_active_peer(self):
+    @pytest.mark.asyncio
+    async def test_add_active_peer(self):
         """Add active peer adds to set."""
         state = GateRuntimeState()
         peer_addr = ("10.0.0.1", 9000)
 
-        state.add_active_peer(peer_addr)
+        await state.add_active_peer(peer_addr)
 
         assert peer_addr in state._active_gate_peers
 
-    def test_remove_active_peer(self):
+    @pytest.mark.asyncio
+    async def test_remove_active_peer(self):
         """Remove active peer removes from set."""
         state = GateRuntimeState()
         peer_addr = ("10.0.0.1", 9000)
 
-        state.add_active_peer(peer_addr)
+        await state.add_active_peer(peer_addr)
         state.remove_active_peer(peer_addr)
 
         assert peer_addr not in state._active_gate_peers
@@ -159,29 +167,31 @@ class TestGatePeerMethods:
         state = GateRuntimeState()
         state.remove_active_peer(("unknown", 9999))  # Should not raise
 
-    def test_is_peer_active(self):
+    @pytest.mark.asyncio
+    async def test_is_peer_active(self):
         """Is peer active returns correct status."""
         state = GateRuntimeState()
         peer_addr = ("10.0.0.1", 9000)
 
         assert state.is_peer_active(peer_addr) is False
 
-        state.add_active_peer(peer_addr)
+        await state.add_active_peer(peer_addr)
         assert state.is_peer_active(peer_addr) is True
 
         state.remove_active_peer(peer_addr)
         assert state.is_peer_active(peer_addr) is False
 
-    def test_get_active_peer_count(self):
+    @pytest.mark.asyncio
+    async def test_get_active_peer_count(self):
         """Get active peer count returns correct count."""
         state = GateRuntimeState()
 
         assert state.get_active_peer_count() == 0
 
-        state.add_active_peer(("10.0.0.1", 9000))
+        await state.add_active_peer(("10.0.0.1", 9000))
         assert state.get_active_peer_count() == 1
 
-        state.add_active_peer(("10.0.0.2", 9000))
+        await state.add_active_peer(("10.0.0.2", 9000))
         assert state.get_active_peer_count() == 2
 
         state.remove_active_peer(("10.0.0.1", 9000))
@@ -348,13 +358,14 @@ class TestLeaseMethods:
         state = GateRuntimeState()
         state.remove_lease("unknown", "unknown")  # Should not raise
 
-    def test_next_fence_token(self):
+    @pytest.mark.asyncio
+    async def test_next_fence_token(self):
         """Next fence token increments monotonically."""
         state = GateRuntimeState()
 
-        token1 = state.next_fence_token()
-        token2 = state.next_fence_token()
-        token3 = state.next_fence_token()
+        token1 = await state.next_fence_token()
+        token2 = await state.next_fence_token()
+        token3 = await state.next_fence_token()
 
         assert token1 == 1
         assert token2 == 2
