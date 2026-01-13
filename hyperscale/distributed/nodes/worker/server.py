@@ -509,57 +509,12 @@ class WorkerServer(HealthAwareServer):
         """Stop the worker server gracefully."""
         self._running = False
 
-        if self._event_logger is not None:
-            await self._event_logger.log(
-                WorkerStopping(
-                    message="Worker stopping",
-                    node_id=self._node_id.full,
-                    node_host=self._host,
-                    node_port=self._tcp_port,
-                    reason="graceful_shutdown",
-                ),
-                name="worker_events",
-            )
-            await self._event_logger.close()
-
-        # Stop background loops
+        await self._log_worker_stopping()
         await self._stop_background_loops()
-
-        if self._cores_notification_task and not self._cores_notification_task.done():
-            self._cores_notification_task.cancel()
-            try:
-                await self._cores_notification_task
-            except asyncio.CancelledError:
-                pass
-
-        # Stop modules
-        self._backpressure_manager.stop()
-        self._executor.stop()
-        if self._cancellation_handler_impl:
-            self._cancellation_handler_impl.stop()
-        if self._background_loops:
-            self._background_loops.stop()
-
-        # Cancel all active workflows via TaskRunner
-        for workflow_id in list(self._workflow_tokens.keys()):
-            await self._cancel_workflow(workflow_id, "server_shutdown")
-
-        # Shutdown remote manager and workers
-        await self._lifecycle_manager.shutdown_remote_manager()
-
-        # Stop monitors
-        await self._lifecycle_manager.stop_monitors(
-            self._node_id.datacenter,
-            self._node_id.full,
-        )
-
-        # Shutdown server pool
-        await self._lifecycle_manager.shutdown_server_pool()
-
-        # Kill child processes
-        await self._lifecycle_manager.kill_child_processes()
-
-        # Stop parent server
+        await self._cancel_cores_notification_task()
+        self._stop_modules()
+        await self._cancel_all_active_workflows()
+        await self._shutdown_lifecycle_components()
         await super().stop(drain_timeout, broadcast_leave)
 
         await self._udp_logger.log(
@@ -570,6 +525,56 @@ class WorkerServer(HealthAwareServer):
                 node_id=self._node_id.short,
             )
         )
+
+    async def _log_worker_stopping(self) -> None:
+        """Log worker stopping event if event logger is available."""
+        if self._event_logger is None:
+            return
+        await self._event_logger.log(
+            WorkerStopping(
+                message="Worker stopping",
+                node_id=self._node_id.full,
+                node_host=self._host,
+                node_port=self._tcp_port,
+                reason="graceful_shutdown",
+            ),
+            name="worker_events",
+        )
+        await self._event_logger.close()
+
+    async def _cancel_cores_notification_task(self) -> None:
+        """Cancel the cores notification task if running."""
+        if not self._cores_notification_task or self._cores_notification_task.done():
+            return
+        self._cores_notification_task.cancel()
+        try:
+            await self._cores_notification_task
+        except asyncio.CancelledError:
+            pass
+
+    def _stop_modules(self) -> None:
+        """Stop all worker modules."""
+        self._backpressure_manager.stop()
+        self._executor.stop()
+        if self._cancellation_handler_impl:
+            self._cancellation_handler_impl.stop()
+        if self._background_loops:
+            self._background_loops.stop()
+
+    async def _cancel_all_active_workflows(self) -> None:
+        """Cancel all active workflows during shutdown."""
+        for workflow_id in list(self._workflow_tokens.keys()):
+            await self._cancel_workflow(workflow_id, "server_shutdown")
+
+    async def _shutdown_lifecycle_components(self) -> None:
+        """Shutdown lifecycle-managed components."""
+        await self._lifecycle_manager.shutdown_remote_manager()
+        await self._lifecycle_manager.stop_monitors(
+            self._node_id.datacenter,
+            self._node_id.full,
+        )
+        await self._lifecycle_manager.shutdown_server_pool()
+        await self._lifecycle_manager.kill_child_processes()
 
     def abort(self):
         """Abort the worker server immediately."""
