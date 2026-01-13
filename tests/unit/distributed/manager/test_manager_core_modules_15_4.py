@@ -337,10 +337,8 @@ class TestManagerRegistryHealthBuckets:
             task_runner=mock_task_runner,
         )
 
-        # Track health states for mocking
         health_states: dict[str, str] = {}
 
-        # Create workers with different health states
         for worker_id, health_state in [
             ("worker-healthy-1", "healthy"),
             ("worker-healthy-2", "healthy"),
@@ -360,18 +358,18 @@ class TestManagerRegistryHealthBuckets:
             registry.register_worker(reg)
             health_states[worker_id] = health_state
 
-        # Mock get_worker_health_state to return our configured states
         original_get_health = registry.get_worker_health_state
-        registry.get_worker_health_state = lambda wid: health_states.get(wid, "healthy")
+        registry.get_worker_health_state = lambda worker_id: health_states.get(
+            worker_id, "healthy"
+        )
 
         buckets = registry.get_workers_by_health_bucket(cores_required=1)
 
-        # Restore original method
         registry.get_worker_health_state = original_get_health
 
         assert len(buckets["healthy"]) == 2
         assert len(buckets["busy"]) == 1
-        assert len(buckets["degraded"]) == 1  # "stressed" goes to degraded
+        assert len(buckets["degraded"]) == 1
 
 
 # =============================================================================
@@ -1151,7 +1149,7 @@ class TestCoreModulesConcurrency:
 
         async def increment_many():
             for _ in range(100):
-                leases.increment_fence_token("job-fence")
+                await leases.increment_fence_token("job-fence")
                 await asyncio.sleep(0)
 
         await asyncio.gather(
@@ -1160,5 +1158,4 @@ class TestCoreModulesConcurrency:
             increment_many(),
         )
 
-        # All increments counted (initial 1 + 300 increments)
         assert leases.get_fence_token("job-fence") == 301
