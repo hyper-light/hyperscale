@@ -4640,7 +4640,18 @@ class ManagerServer(HealthAwareServer):
 
         return stats, completed, failed
 
+    async def _send_job_completion_to_gate(
+        self,
+        job_id: str,
+        workflow_results: list[WorkflowResult],
+        errors: list[str],
+        total_completed: int,
+        total_failed: int,
+        elapsed_seconds: float,
+    ) -> None:
+        final_status = JobStatus.FAILED.value if errors else JobStatus.COMPLETED.value
         origin_gate_addr = self._manager_state._job_origin_gates.get(job_id)
+
         if origin_gate_addr:
             final_result = JobFinalResult(
                 job_id=job_id,
