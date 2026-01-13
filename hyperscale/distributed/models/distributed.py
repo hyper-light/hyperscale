@@ -2461,11 +2461,12 @@ class WorkerStatus(Message):
     queue_depth: int = 0  # Pending workflows
     cpu_percent: float = 0.0  # CPU utilization
     memory_percent: float = 0.0  # Memory utilization
-    # Manager-internal tracking fields (not used in wire protocol)
-    registration: "WorkerRegistration | None" = None  # Full registration info
-    heartbeat: "WorkerHeartbeat | None" = None  # Last heartbeat received
-    last_seen: float = 0.0  # Monotonic time of last contact
-    reserved_cores: int = 0  # Cores reserved but not confirmed
+    registration: "WorkerRegistration | None" = None
+    heartbeat: "WorkerHeartbeat | None" = None
+    last_seen: float = 0.0
+    reserved_cores: int = 0
+    is_remote: bool = False
+    owner_manager_id: str = ""
 
     @property
     def node_id(self) -> str:
