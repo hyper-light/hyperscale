@@ -159,7 +159,7 @@ class WorkerHeartbeatHandler:
                         node_host=node_host,
                         node_port=node_port,
                         node_id=node_id_short,
-                    )
+                    ),
                 )
 
     def _register_new_manager(
@@ -195,7 +195,7 @@ class WorkerHeartbeatHandler:
                     node_host=node_host,
                     node_port=node_port,
                     node_id=node_id_short,
-                )
+                ),
             )
 
         # Trigger callback for new manager registration
@@ -275,7 +275,7 @@ class WorkerHeartbeatHandler:
         if not manager_id:
             return
 
-        self._registry.mark_manager_healthy(manager_id)
+        task_runner_run(self._registry.mark_manager_healthy, manager_id)
 
         if self._logger:
             task_runner_run(
@@ -285,5 +285,5 @@ class WorkerHeartbeatHandler:
                     node_host=node_host,
                     node_port=node_port,
                     node_id=node_id_short,
-                )
+                ),
             )
