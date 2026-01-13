@@ -588,11 +588,14 @@ class WorkflowDispatcher:
             )
 
             if not allocations:
-                # No cores available - apply backoff and allow retry
                 self._apply_backoff(pending)
                 return False
 
-            # Allocation succeeded - NOW mark as dispatched
+            if pending.job_id in self._cancelling_jobs:
+                for worker_id, worker_cores in allocations:
+                    await self._worker_pool.release_cores(worker_id, worker_cores)
+                return False
+
             pending.dispatched = True
             pending.dispatched_at = time.monotonic()
             pending.cores_allocated = cores_needed
