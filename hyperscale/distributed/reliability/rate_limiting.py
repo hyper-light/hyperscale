@@ -631,26 +631,21 @@ class AdaptiveRateLimiter:
             tokens_remaining=tokens_remaining,
         )
 
-    def cleanup_inactive_clients(self) -> int:
-        """
-        Remove counters for clients that have been inactive.
-
-        Returns:
-            Number of clients cleaned up
-        """
+    async def cleanup_inactive_clients(self) -> int:
         now = time.monotonic()
         cutoff = now - self._config.inactive_cleanup_seconds
 
-        inactive_clients = [
-            client_id
-            for client_id, last_activity in self._client_last_activity.items()
-            if last_activity < cutoff
-        ]
+        async with self._async_lock:
+            inactive_clients = [
+                client_id
+                for client_id, last_activity in self._client_last_activity.items()
+                if last_activity < cutoff
+            ]
 
-        for client_id in inactive_clients:
-            self._operation_counters.pop(client_id, None)
-            self._client_stress_counters.pop(client_id, None)
-            self._client_last_activity.pop(client_id, None)
+            for client_id in inactive_clients:
+                self._operation_counters.pop(client_id, None)
+                self._client_stress_counters.pop(client_id, None)
+                self._client_last_activity.pop(client_id, None)
 
         return len(inactive_clients)
 

@@ -703,18 +703,17 @@ class TestManagerStateConcurrency:
         results = []
 
         async def access_peer_lock(peer_addr: tuple[str, int]):
-            lock = state.get_peer_state_lock(peer_addr)
+            lock = await state.get_peer_state_lock(peer_addr)
             async with lock:
                 results.append(f"peer-{peer_addr}")
                 await asyncio.sleep(0.01)
 
         async def access_gate_lock(gate_id: str):
-            lock = state.get_gate_state_lock(gate_id)
+            lock = await state.get_gate_state_lock(gate_id)
             async with lock:
                 results.append(f"gate-{gate_id}")
                 await asyncio.sleep(0.01)
 
-        # Run concurrently - different locks should not block each other
         await asyncio.gather(
             access_peer_lock(("10.0.0.1", 8000)),
             access_gate_lock("gate-1"),
@@ -733,20 +732,18 @@ class TestManagerStateConcurrency:
         execution_order = []
 
         async def accessor(accessor_id: int, delay: float):
-            lock = state.get_peer_state_lock(peer_addr)
+            lock = await state.get_peer_state_lock(peer_addr)
             async with lock:
                 execution_order.append(("start", accessor_id))
                 await asyncio.sleep(delay)
                 execution_order.append(("end", accessor_id))
 
-        # Start two concurrent accessors for same lock
         task1 = asyncio.create_task(accessor(1, 0.05))
         await asyncio.sleep(0.01)
         task2 = asyncio.create_task(accessor(2, 0.02))
 
         await asyncio.gather(task1, task2)
 
-        # Task 1 should complete before task 2 starts
         assert execution_order[0] == ("start", 1)
         assert execution_order[1] == ("end", 1)
         assert execution_order[2] == ("start", 2)
@@ -759,17 +756,15 @@ class TestManagerStateConcurrency:
 
         async def increment_many():
             for _ in range(100):
-                state.increment_fence_token()
-                await asyncio.sleep(0)  # Yield to other tasks
+                await state.increment_fence_token()
+                await asyncio.sleep(0)
 
-        # Run multiple incrementers
         await asyncio.gather(
             increment_many(),
             increment_many(),
             increment_many(),
         )
 
-        # All increments should be counted
         assert state._fence_token == 300
 
 
