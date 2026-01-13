@@ -106,11 +106,9 @@ class MockProbeScheduler:
 
 @dataclass
 class MockIncarnationTracker:
-    """Mock incarnation tracker."""
-
     _nodes: dict = field(default_factory=dict)
 
-    def update_node(
+    async def update_node(
         self,
         node: tuple[str, int],
         status: bytes,
@@ -496,11 +494,10 @@ class MockServerInterface:
     async def context_with_value(self, target: tuple[str, int]) -> "MockContextManager":
         return MockContextManager()
 
-    def write_context(self, key: Any, value: Any) -> None:
+    async def write_context(self, key: Any, value: Any) -> None:
         if key == "nodes":
-            pass  # Nodes written
+            pass
         elif isinstance(key, tuple):
-            # Writing node status
             if key not in self._nodes:
                 self._nodes[key] = asyncio.Queue()
 
