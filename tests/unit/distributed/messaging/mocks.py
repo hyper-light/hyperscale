@@ -238,14 +238,16 @@ class MockServerInterface:
 
     # === Node State ===
 
-    def update_node_state(
+    async def update_node_state(
         self,
         node: tuple[str, int],
         status: bytes,
         incarnation: int,
         timestamp: float,
     ) -> None:
-        self._incarnation_tracker.update_node(node, status, incarnation, timestamp)
+        await self._incarnation_tracker.update_node(
+            node, status, incarnation, timestamp
+        )
 
     def is_message_fresh(
         self,

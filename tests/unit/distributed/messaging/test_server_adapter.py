@@ -232,17 +232,15 @@ class MockHealthAwareServer:
 
 @pytest.fixture
 def mock_health_aware_server() -> MockHealthAwareServer:
-    """Create a mock HealthAwareServer for testing."""
     server = MockHealthAwareServer()
     server._context = MagicMock()
-    server._context.read = MagicMock(return_value={})
-    server._context.with_value = MagicMock(return_value=AsyncContextManager())
+    server._context.read = AsyncMock(return_value={})
+    server._context.with_value = AsyncMock(return_value=AsyncContextManager())
+    server._context.write = AsyncMock(return_value=None)
     return server
 
 
 class AsyncContextManager:
-    """Mock async context manager."""
-
     async def __aenter__(self):
         return self
 
