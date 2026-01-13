@@ -318,7 +318,3 @@ class ManagerRegistry:
             for peer_id, peer in self._state._known_manager_peers.items()
             if peer_id in self._state._active_manager_peer_ids
         ]
-
-    def get_active_peer_count(self) -> int:
-        """Get count of active peers (including self)."""
-        return len(self._state._active_manager_peers) + 1
