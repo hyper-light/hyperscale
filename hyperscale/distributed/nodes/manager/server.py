@@ -1220,7 +1220,7 @@ class ManagerServer(HealthAwareServer):
             self._registry.register_manager_peer(peer_info)
 
         if heartbeat.is_leader:
-            self._manager_state._dc_leader_manager_id = peer_id
+            self._manager_state.set_dc_leader_manager_id(peer_id)
 
         peer_health_state = getattr(heartbeat, "health_overload_state", "healthy")
         previous_peer_state = self._manager_state.get_peer_manager_health_state(peer_id)
@@ -1296,7 +1296,7 @@ class ManagerServer(HealthAwareServer):
                 peer_reap_threshold = now - self._config.dead_peer_reap_interval_seconds
                 peers_to_reap = [
                     peer_id
-                    for peer_id, unhealthy_since in self._manager_state._manager_peer_unhealthy_since.items()
+                    for peer_id, unhealthy_since in self._manager_state.iter_manager_peer_unhealthy_since()
                     if unhealthy_since < peer_reap_threshold
                 ]
                 for peer_id in peers_to_reap:
@@ -1306,7 +1306,7 @@ class ManagerServer(HealthAwareServer):
                 gate_reap_threshold = now - self._config.dead_gate_reap_interval_seconds
                 gates_to_reap = [
                     gate_id
-                    for gate_id, unhealthy_since in self._manager_state._gate_unhealthy_since.items()
+                    for gate_id, unhealthy_since in self._manager_state.iter_gate_unhealthy_since()
                     if unhealthy_since < gate_reap_threshold
                 ]
                 for gate_id in gates_to_reap:
@@ -1318,12 +1318,12 @@ class ManagerServer(HealthAwareServer):
                 )
                 dead_managers_to_cleanup = [
                     tcp_addr
-                    for tcp_addr, dead_since in self._manager_state._dead_manager_timestamps.items()
+                    for tcp_addr, dead_since in self._manager_state.iter_dead_manager_timestamps()
                     if dead_since < dead_manager_cleanup_threshold
                 ]
                 for tcp_addr in dead_managers_to_cleanup:
-                    self._manager_state._dead_managers.discard(tcp_addr)
-                    self._manager_state._dead_manager_timestamps.pop(tcp_addr, None)
+                    self._manager_state.remove_dead_manager(tcp_addr)
+                    self._manager_state.clear_dead_manager_timestamp(tcp_addr)
                     self._manager_state.remove_peer_lock(tcp_addr)
 
             except asyncio.CancelledError:
