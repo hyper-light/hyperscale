@@ -399,3 +399,78 @@ class GateRuntimeState:
 
     def get_dead_peer_timestamps(self) -> dict[tuple[str, int], float]:
         return dict(self._dead_gate_timestamps)
+
+    # Gate UDP/TCP mapping methods
+    def set_udp_to_tcp_mapping(
+        self, udp_addr: tuple[str, int], tcp_addr: tuple[str, int]
+    ) -> None:
+        """Set UDP to TCP address mapping for a gate peer."""
+        self._gate_udp_to_tcp[udp_addr] = tcp_addr
+
+    def get_tcp_addr_for_udp(self, udp_addr: tuple[str, int]) -> tuple[str, int] | None:
+        """Get TCP address for a UDP address."""
+        return self._gate_udp_to_tcp.get(udp_addr)
+
+    def get_all_udp_to_tcp_mappings(self) -> dict[tuple[str, int], tuple[str, int]]:
+        """Get all UDP to TCP mappings."""
+        return dict(self._gate_udp_to_tcp)
+
+    def iter_udp_to_tcp_mappings(self):
+        """Iterate over UDP to TCP mappings."""
+        return self._gate_udp_to_tcp.items()
+
+    # Active peer methods (additional)
+    def get_active_peers(self) -> set[tuple[str, int]]:
+        """Get the set of active peers (reference, not copy)."""
+        return self._active_gate_peers
+
+    def get_active_peers_list(self) -> list[tuple[str, int]]:
+        """Get list of active peers."""
+        return list(self._active_gate_peers)
+
+    def has_active_peers(self) -> bool:
+        """Check if there are any active peers."""
+        return len(self._active_gate_peers) > 0
+
+    def iter_active_peers(self):
+        """Iterate over active peers."""
+        return iter(self._active_gate_peers)
+
+    # Peer lock methods (synchronous alternative for setdefault pattern)
+    def get_or_create_peer_lock_sync(self, peer_addr: tuple[str, int]) -> asyncio.Lock:
+        """Get or create peer lock synchronously (for use in sync contexts)."""
+        return self._peer_state_locks.setdefault(peer_addr, asyncio.Lock())
+
+    # Gate peer info methods
+    def set_gate_peer_heartbeat(
+        self, udp_addr: tuple[str, int], heartbeat: GateHeartbeat
+    ) -> None:
+        """Store heartbeat from a gate peer."""
+        self._gate_peer_info[udp_addr] = heartbeat
+
+    def get_gate_peer_heartbeat(
+        self, udp_addr: tuple[str, int]
+    ) -> GateHeartbeat | None:
+        """Get the last heartbeat from a gate peer."""
+        return self._gate_peer_info.get(udp_addr)
+
+    # Known gates methods
+    def add_known_gate(self, gate_id: str, gate_info: GateInfo) -> None:
+        """Add or update a known gate."""
+        self._known_gates[gate_id] = gate_info
+
+    def remove_known_gate(self, gate_id: str) -> GateInfo | None:
+        """Remove a known gate."""
+        return self._known_gates.pop(gate_id, None)
+
+    def get_known_gate(self, gate_id: str) -> GateInfo | None:
+        """Get info for a known gate."""
+        return self._known_gates.get(gate_id)
+
+    def get_all_known_gates(self) -> list[GateInfo]:
+        """Get all known gates."""
+        return list(self._known_gates.values())
+
+    def iter_known_gates(self):
+        """Iterate over known gates as (gate_id, gate_info) pairs."""
+        return self._known_gates.items()
