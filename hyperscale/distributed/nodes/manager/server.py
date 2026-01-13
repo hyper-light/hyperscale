@@ -1262,13 +1262,13 @@ class ManagerServer(HealthAwareServer):
 
         # Update gate leader tracking
         if heartbeat.is_leader:
-            self._manager_state._current_gate_leader_id = gate_id
             gate_info = self._manager_state.get_known_gate(gate_id)
             if gate_info:
-                self._manager_state._current_gate_leader_addr = (
-                    gate_info.tcp_host,
-                    gate_info.tcp_port,
+                self._manager_state.set_current_gate_leader(
+                    gate_id, (gate_info.tcp_host, gate_info.tcp_port)
                 )
+            else:
+                self._manager_state.set_current_gate_leader(gate_id, None)
 
         # Confirm peer
         self.confirm_peer(source_addr)
