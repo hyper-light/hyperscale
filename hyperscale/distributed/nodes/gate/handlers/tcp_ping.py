@@ -124,7 +124,8 @@ class GatePingHandler:
 
             return response.dump()
 
-        except Exception:
+        except Exception as error:
+            await handle_exception(error, "handle_ping")
             return b"error"
 
 
