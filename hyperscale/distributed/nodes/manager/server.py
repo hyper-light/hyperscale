@@ -4194,8 +4194,8 @@ class ManagerServer(HealthAwareServer):
             )
 
             if sync_msg.origin_gate_addr:
-                self._manager_state._job_origin_gates[sync_msg.job_id] = (
-                    sync_msg.origin_gate_addr
+                self._manager_state.set_job_origin_gate(
+                    sync_msg.job_id, sync_msg.origin_gate_addr
                 )
 
             return JobStateSyncAck(
@@ -4234,8 +4234,8 @@ class ManagerServer(HealthAwareServer):
                     accepted=False,
                 ).dump()
 
-            self._manager_state._job_origin_gates[transfer.job_id] = (
-                transfer.new_gate_addr
+            self._manager_state.set_job_origin_gate(
+                transfer.job_id, transfer.new_gate_addr
             )
 
             self._leases.update_fence_token_if_higher(
@@ -4695,7 +4695,7 @@ class ManagerServer(HealthAwareServer):
         errors: list[str],
         elapsed_seconds: float,
     ) -> None:
-        origin_gate_addr = self._manager_state._job_origin_gates.get(job_id)
+        origin_gate_addr = self._manager_state.get_job_origin_gate(job_id)
         if not origin_gate_addr:
             return
 
