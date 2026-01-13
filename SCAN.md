@@ -990,9 +990,11 @@ grep "self\._<state>\._[a-z]" server.py
 
 ---
 
-## Phase 5: Reconcile Each Missing Method
+## Phase 5: Reconcile Each Missing Method (NO SHORTCUTS)
 
 **Objective**: For EACH missing method, find or create the correct implementation.
+
+**NO SHORTCUTS**: Do not stub methods, add pass-through wrappers, or suppress errors. Every fix must provide real, correct functionality.
 
 **For each missing method from Phase 3:**
 
