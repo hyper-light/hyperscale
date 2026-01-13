@@ -451,6 +451,117 @@ For each issue found:
 
 ---
 
+## Phase 5.6: Cyclomatic Complexity Reduction
+
+**Objective**: Minimize nested conditionals and reduce lines of code in all fixes.
+
+### The Problem
+
+Correct fixes can still introduce unnecessary complexity:
+
+```python
+# WRONG: Nested ifs increase cyclomatic complexity
+if sub_wf_info := job.sub_workflows.get(token):
+    if sub_wf_info.progress:
+        total += sub_wf_info.progress.completed_count
+
+# RIGHT: Combined conditions, walrus for clarity
+sub_wf_info = job.sub_workflows.get(token)
+if sub_wf_info and (progress := sub_wf_info.progress):
+    total += progress.completed_count
+```
+
+### Step 5.6a: Scan for Nested Conditionals
+
+After any fix, check for nested `if` statements:
+
+```bash
+# Find nested ifs (indentation pattern)
+grep -n "^\s*if.*:\s*$" server.py | while read line; do
+    linenum=$(echo $line | cut -d: -f1)
+    nextline=$((linenum + 1))
+    sed -n "${nextline}p" server.py | grep -q "^\s*if" && echo "Nested if at line $linenum"
+done
+```
+
+### Step 5.6b: Reduction Patterns
+
+| Anti-Pattern | Refactored Pattern |
+|--------------|-------------------|
+| `if x:` then `if y:` | `if x and y:` |
+| `if x := get():` then `if x.attr:` | `x = get()` then `if x and (attr := x.attr):` |
+| `if x:` then `if y:` then `if z:` | `if x and y and z:` or extract to method |
+| Multiple returns in conditionals | Guard clauses (early returns) |
+
+### Step 5.6c: Walrus Operator Usage
+
+Use walrus (`:=`) to combine assignment with condition when the assigned value is used immediately:
+
+```python
+# WRONG: Separate assignment and check
+result = expensive_call()
+if result:
+    use(result)
+
+# RIGHT: Walrus when result used in same block
+if result := expensive_call():
+    use(result)
+
+# WRONG: Walrus when value used in else or after
+if result := expensive_call():
+    use(result)
+else:
+    log(result)  # Confusing - result came from walrus
+
+# RIGHT: Explicit assignment when value used broadly
+result = expensive_call()
+if result:
+    use(result)
+else:
+    log(result)
+```
+
+### Step 5.6d: Cyclomatic Complexity Limits
+
+| Complexity | Action |
+|------------|--------|
+| 1-3 | Acceptable |
+| 4-6 | Review for simplification |
+| 7+ | Must refactor - extract methods or restructure |
+
+Count complexity by adding 1 for:
+- Each `if`, `elif`, `else`
+- Each `for`, `while`
+- Each `and`, `or` in conditions
+- Each `except` clause
+- Each `case` in match statements
+
+### Step 5.6e: Line Count Awareness
+
+Every fix should aim to minimize total lines. Before committing, ask:
+- Can two statements become one?
+- Can a multi-line conditional be a single line?
+- Is there a comprehension that replaces a loop?
+
+```python
+# VERBOSE (4 lines):
+total = 0
+for item in items:
+    if item.active:
+        total += item.value
+
+# CONCISE (1 line):
+total = sum(item.value for item in items if item.active)
+```
+
+### Output
+
+- No nested conditionals beyond 2 levels
+- Cyclomatic complexity ≤ 6 per method
+- Minimal lines of code for each fix
+
+---
+
 ## Phase 6: Clean Up Dead Code
 
 **Objective**: Remove orphaned implementations.
