@@ -115,5 +115,18 @@ class CircuitBreakerManager:
             self._circuits.pop(manager_addr, None)
 
     def clear_all(self) -> None:
-        """Clear all circuit breakers."""
         self._circuits.clear()
+        self._incarnations.clear()
+
+    async def update_incarnation(
+        self, manager_addr: tuple[str, int], incarnation: int
+    ) -> bool:
+        async with self._lock:
+            current_incarnation = self._incarnations.get(manager_addr, 0)
+            if incarnation > current_incarnation:
+                self._incarnations[manager_addr] = incarnation
+                circuit = self._circuits.get(manager_addr)
+                if circuit:
+                    circuit.reset()
+                return True
+            return False
