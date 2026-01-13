@@ -3670,6 +3670,8 @@ class ManagerServer(HealthAwareServer):
                 ).dump()
 
             if self._load_shedder.should_shed("JobSubmission"):
+                # get_current_state() returns the same state should_shed() just computed
+                # (both use same default args and HybridOverloadDetector tracks _current_state)
                 overload_state = self._load_shedder.get_current_state()
                 return JobAck(
                     job_id="",
