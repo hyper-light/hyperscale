@@ -265,7 +265,7 @@ class GateDispatchCoordinator:
         self._quorum_circuit.record_success()
 
         # Dispatch in background
-        self._task_runner.run(self._dispatch_to_dcs, submission, primary_dcs)
+        self._task_runner.run(self.dispatch_job, submission, primary_dcs)
 
         return JobAck(
             job_id=submission.job_id,
@@ -275,6 +275,283 @@ class GateDispatchCoordinator:
             protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
             capabilities=negotiated,
         )
+
+    async def dispatch_job(
+        self,
+        submission: JobSubmission,
+        target_dcs: list[str],
+    ) -> None:
+        """
+        Dispatch job to all target datacenters with fallback support.
+
+        Sets origin_gate_addr so managers send results directly to this gate.
+        Handles health-based routing: UNHEALTHY -> fail, DEGRADED/BUSY -> warn, HEALTHY -> proceed.
+        """
+        job = self._job_manager.get_job(submission.job_id)
+        if not job:
+            return
+
+        submission.origin_gate_addr = (self._get_node_host(), self._get_node_port())
+        job.status = JobStatus.DISPATCHING.value
+        self._job_manager.set_job(submission.job_id, job)
+        self._increment_version()
+
+        primary_dcs, fallback_dcs, worst_health = self._select_datacenters(
+            len(target_dcs),
+            target_dcs if target_dcs else None,
+            job_id=submission.job_id,
+        )
+
+        if worst_health == "initializing":
+            job.status = JobStatus.PENDING.value
+            self._task_runner.run(
+                self._logger.log,
+                ServerWarning(
+                    message=f"Job {submission.job_id}: DCs became initializing after acceptance - waiting",
+                    node_host=self._get_node_host(),
+                    node_port=self._get_node_port(),
+                    node_id=self._get_node_id_short(),
+                ),
+            )
+            return
+
+        if worst_health == "unhealthy":
+            job.status = JobStatus.FAILED.value
+            job.failed_datacenters = len(target_dcs)
+            self._quorum_circuit.record_error()
+            self._task_runner.run(
+                self._logger.log,
+                ServerError(
+                    message=f"Job {submission.job_id}: All datacenters are UNHEALTHY - job failed",
+                    node_host=self._get_node_host(),
+                    node_port=self._get_node_port(),
+                    node_id=self._get_node_id_short(),
+                ),
+            )
+            self._increment_version()
+            return
+
+        if worst_health == "degraded":
+            self._task_runner.run(
+                self._logger.log,
+                ServerWarning(
+                    message=f"Job {submission.job_id}: No HEALTHY or BUSY DCs available, routing to DEGRADED: {primary_dcs}",
+                    node_host=self._get_node_host(),
+                    node_port=self._get_node_port(),
+                    node_id=self._get_node_id_short(),
+                ),
+            )
+        elif worst_health == "busy":
+            self._task_runner.run(
+                self._logger.log,
+                ServerInfo(
+                    message=f"Job {submission.job_id}: No HEALTHY DCs available, routing to BUSY: {primary_dcs}",
+                    node_host=self._get_node_host(),
+                    node_port=self._get_node_port(),
+                    node_id=self._get_node_id_short(),
+                ),
+            )
+
+        successful_dcs, failed_dcs = await self._dispatch_job_with_fallback(
+            submission,
+            primary_dcs,
+            fallback_dcs,
+        )
+
+        if not successful_dcs:
+            self._quorum_circuit.record_error()
+            job.status = JobStatus.FAILED.value
+            job.failed_datacenters = len(failed_dcs)
+            self._task_runner.run(
+                self._logger.log,
+                ServerError(
+                    message=f"Job {submission.job_id}: Failed to dispatch to any datacenter",
+                    node_host=self._get_node_host(),
+                    node_port=self._get_node_port(),
+                    node_id=self._get_node_id_short(),
+                ),
+            )
+        else:
+            self._quorum_circuit.record_success()
+            job.status = JobStatus.RUNNING.value
+            job.completed_datacenters = 0
+            job.failed_datacenters = len(failed_dcs)
+
+            if failed_dcs:
+                self._task_runner.run(
+                    self._logger.log,
+                    ServerInfo(
+                        message=f"Job {submission.job_id}: Dispatched to {len(successful_dcs)} DCs, {len(failed_dcs)} failed",
+                        node_host=self._get_node_host(),
+                        node_port=self._get_node_port(),
+                        node_id=self._get_node_id_short(),
+                    ),
+                )
+
+            await self._job_timeout_tracker.start_tracking_job(
+                job_id=submission.job_id,
+                timeout_seconds=submission.timeout_seconds,
+                target_datacenters=successful_dcs,
+            )
+
+        self._increment_version()
+
+    async def _dispatch_job_with_fallback(
+        self,
+        submission: JobSubmission,
+        primary_dcs: list[str],
+        fallback_dcs: list[str],
+    ) -> tuple[list[str], list[str]]:
+        """Dispatch to primary DCs with automatic fallback on failure."""
+        successful: list[str] = []
+        failed: list[str] = []
+        fallback_queue = list(fallback_dcs)
+        job_id = submission.job_id
+
+        for datacenter in primary_dcs:
+            success, _, accepting_manager = await self._try_dispatch_to_dc(
+                job_id, datacenter, submission
+            )
+
+            if success:
+                successful.append(datacenter)
+                self._record_dc_manager_for_job(job_id, datacenter, accepting_manager)
+                continue
+
+            fallback_dc, fallback_manager = await self._try_fallback_dispatch(
+                job_id, datacenter, submission, fallback_queue
+            )
+
+            if fallback_dc:
+                successful.append(fallback_dc)
+                self._record_dc_manager_for_job(job_id, fallback_dc, fallback_manager)
+            else:
+                failed.append(datacenter)
+
+        return (successful, failed)
+
+    async def _try_dispatch_to_dc(
+        self,
+        job_id: str,
+        datacenter: str,
+        submission: JobSubmission,
+    ) -> tuple[bool, str | None, tuple[str, int] | None]:
+        """Try to dispatch job to a single datacenter, iterating through managers."""
+        managers = self._datacenter_managers.get(datacenter, [])
+
+        for manager_addr in managers:
+            success, error = await self._try_dispatch_to_manager(
+                manager_addr, submission
+            )
+            if success:
+                self._task_runner.run(
+                    self._confirm_manager_for_dc, datacenter, manager_addr
+                )
+                self._record_forward_throughput_event()
+                return (True, None, manager_addr)
+            else:
+                self._task_runner.run(
+                    self._suspect_manager_for_dc, datacenter, manager_addr
+                )
+
+        if self._job_router:
+            self._job_router.record_dispatch_failure(job_id, datacenter)
+        return (False, f"All managers in {datacenter} failed to accept job", None)
+
+    async def _try_fallback_dispatch(
+        self,
+        job_id: str,
+        failed_dc: str,
+        submission: JobSubmission,
+        fallback_queue: list[str],
+    ) -> tuple[str | None, tuple[str, int] | None]:
+        """Try fallback DCs when primary fails."""
+        while fallback_queue:
+            fallback_dc = fallback_queue.pop(0)
+            success, _, accepting_manager = await self._try_dispatch_to_dc(
+                job_id, fallback_dc, submission
+            )
+            if success:
+                self._task_runner.run(
+                    self._logger.log,
+                    ServerInfo(
+                        message=f"Job {job_id}: Fallback from {failed_dc} to {fallback_dc}",
+                        node_host=self._get_node_host(),
+                        node_port=self._get_node_port(),
+                        node_id=self._get_node_id_short(),
+                    ),
+                )
+                return (fallback_dc, accepting_manager)
+        return (None, None)
+
+    async def _try_dispatch_to_manager(
+        self,
+        manager_addr: tuple[str, int],
+        submission: JobSubmission,
+        max_retries: int = 2,
+        base_delay: float = 0.3,
+    ) -> tuple[bool, str | None]:
+        """Try to dispatch job to a single manager with retries and circuit breaker."""
+        if self._circuit_breaker_manager.is_open(manager_addr):
+            return (False, "Circuit breaker is OPEN")
+
+        circuit = self._circuit_breaker_manager.get_or_create(manager_addr)
+        retry_config = RetryConfig(
+            max_attempts=max_retries + 1,
+            base_delay=base_delay,
+            max_delay=5.0,
+            jitter=JitterStrategy.FULL,
+        )
+        executor = RetryExecutor(retry_config)
+
+        async def dispatch_operation() -> tuple[bool, str | None]:
+            response = await self._send_tcp(
+                manager_addr,
+                "job_submission",
+                submission.dump(),
+                timeout=5.0,
+            )
+
+            if isinstance(response, bytes):
+                ack = JobAck.load(response)
+                return self._process_dispatch_ack(ack, manager_addr, circuit)
+
+            raise ConnectionError("No valid response from manager")
+
+        try:
+            return await executor.execute(
+                dispatch_operation,
+                operation_name=f"dispatch_to_manager_{manager_addr}",
+            )
+        except Exception as exception:
+            circuit.record_failure()
+            return (False, str(exception))
+
+    def _process_dispatch_ack(
+        self,
+        ack: JobAck,
+        manager_addr: tuple[str, int],
+        circuit,
+    ) -> tuple[bool, str | None]:
+        """Process dispatch acknowledgment from manager."""
+        if ack.accepted:
+            circuit.record_success()
+            return (True, None)
+
+        circuit.record_failure()
+        return (False, ack.error)
+
+    def _record_dc_manager_for_job(
+        self,
+        job_id: str,
+        datacenter: str,
+        manager_addr: tuple[str, int] | None,
+    ) -> None:
+        """Record the accepting manager as job leader for a DC."""
+        if manager_addr:
+            if job_id not in self._state._job_dc_managers:
+                self._state._job_dc_managers[job_id] = {}
+            self._state._job_dc_managers[job_id][datacenter] = manager_addr
 
 
 __all__ = ["GateDispatchCoordinator"]
