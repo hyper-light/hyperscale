@@ -2535,16 +2535,18 @@ class GateServer(HealthAwareServer):
                 )
 
     def _get_state_snapshot(self) -> GateStateSnapshot:
-        """Get gate state snapshot."""
+        job_leaders, job_leader_addrs, job_fencing_tokens = (
+            self._job_leadership_tracker.to_snapshot()
+        )
         return GateStateSnapshot(
             node_id=self._node_id.full,
             version=self._state_version,
             jobs={job_id: job for job_id, job in self._job_manager.items()},
             datacenter_managers=dict(self._datacenter_managers),
             datacenter_manager_udp=dict(self._datacenter_manager_udp),
-            job_leaders=self._job_leadership_tracker.get_all_leaders(),
-            job_leader_addrs=self._job_leadership_tracker.get_all_leader_addrs(),
-            job_fencing_tokens=self._job_leadership_tracker.get_all_fence_tokens(),
+            job_leaders=job_leaders,
+            job_leader_addrs=job_leader_addrs,
+            job_fencing_tokens=job_fencing_tokens,
             job_dc_managers=dict(self._job_dc_managers),
         )
 
