@@ -2582,7 +2582,7 @@ class ManagerServer(HealthAwareServer):
                 manager_id=self._node_id.full,
                 is_leader=self.is_leader(),
                 term=self._leader_election.state.current_term,
-                known_peers=self._get_known_manager_peers(),
+                known_peers=self._manager_state.get_known_manager_peers_list(),
             )
 
             return response.dump()
