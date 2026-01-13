@@ -44,6 +44,9 @@ class GateRuntimeState:
         # Lock creation lock (protects creation of per-resource locks)
         self._lock_creation_lock: asyncio.Lock | None = None
 
+        # Manager state lock (protects manager status dictionaries)
+        self._manager_state_lock: asyncio.Lock | None = None
+
         # Gate peer state
         self._gate_udp_to_tcp: dict[tuple[str, int], tuple[str, int]] = {}
         self._active_gate_peers: set[tuple[str, int]] = set()
