@@ -430,3 +430,46 @@ class GateHealthCoordinator:
 
     def get_time_since_partition_healed(self) -> float | None:
         return self._cross_dc_correlation.get_time_since_partition_healed()
+
+    def legacy_select_datacenters(
+        self,
+        count: int,
+        dc_health: dict[str, DatacenterStatus],
+        datacenter_manager_count: int,
+        preferred: list[str] | None = None,
+    ) -> tuple[list[str], list[str], str]:
+        if not dc_health:
+            if datacenter_manager_count > 0:
+                return ([], [], "initializing")
+            return ([], [], "unhealthy")
+
+        healthy = [
+            dc
+            for dc, status in dc_health.items()
+            if status.health == DatacenterHealth.HEALTHY.value
+        ]
+        busy = [
+            dc
+            for dc, status in dc_health.items()
+            if status.health == DatacenterHealth.BUSY.value
+        ]
+        degraded = [
+            dc
+            for dc, status in dc_health.items()
+            if status.health == DatacenterHealth.DEGRADED.value
+        ]
+
+        if healthy:
+            worst_health = "healthy"
+        elif busy:
+            worst_health = "busy"
+        elif degraded:
+            worst_health = "degraded"
+        else:
+            return ([], [], "unhealthy")
+
+        all_usable = healthy + busy + degraded
+        primary = all_usable[:count]
+        fallback = all_usable[count:]
+
+        return (primary, fallback, worst_health)
