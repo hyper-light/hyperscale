@@ -459,7 +459,7 @@ class TestServerRateLimiterConcurrency:
 
         async def check_rate_limit(client_id: str):
             for _ in range(20):
-                result = limiter.check_rate_limit(client_id, "test_op")
+                result = await limiter.check_rate_limit(client_id, "test_op")
                 async with lock:
                     results_by_client[client_id].append(result.allowed)
                 await asyncio.sleep(0)
@@ -491,7 +491,7 @@ class TestServerRateLimiterConcurrency:
         async def access_client(client_id: str):
             for _ in range(50):
                 try:
-                    limiter.check_rate_limit(client_id, "test_op")
+                    await limiter.check_rate_limit(client_id, "test_op")
                 except Exception as e:
                     errors.append(e)
                 await asyncio.sleep(0.01)
