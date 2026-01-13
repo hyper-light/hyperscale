@@ -383,17 +383,15 @@ class TestManagerRateLimitingCoordinatorConcurrency:
         results = []
 
         async def check_limit(client_id: str):
-            result = rate_limiting_coordinator.check_rate_limit(
+            result = await rate_limiting_coordinator.check_rate_limit(
                 client_id=client_id,
                 operation="heartbeat",
             )
             results.append((client_id, result.allowed))
 
-        # Run concurrent checks for different clients
         await asyncio.gather(*[check_limit(f"client-{idx}") for idx in range(20)])
 
         assert len(results) == 20
-        # All should be allowed (different clients, first request each)
         assert all(allowed for _, allowed in results)
 
     @pytest.mark.asyncio
