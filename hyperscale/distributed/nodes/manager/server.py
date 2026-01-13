@@ -2509,8 +2509,8 @@ class ManagerServer(HealthAwareServer):
 
             # Add to SWIM
             worker_udp_addr = (registration.node.host, registration.node.udp_port)
-            self._manager_state._worker_addr_to_id[worker_udp_addr] = (
-                registration.node.node_id
+            self._manager_state.set_worker_addr_mapping(
+                worker_udp_addr, registration.node.node_id
             )
             self._probe_scheduler.add_member(worker_udp_addr)
 
@@ -2606,7 +2606,7 @@ class ManagerServer(HealthAwareServer):
             progress = WorkflowProgress.load(data)
 
             # Record job progress for AD-30 responsiveness tracking
-            worker_id = self._manager_state._worker_addr_to_id.get(addr)
+            worker_id = self._manager_state.get_worker_id_from_addr(addr)
             if worker_id:
                 self._health_monitor.record_job_progress(progress.job_id, worker_id)
 
@@ -3105,7 +3105,7 @@ class ManagerServer(HealthAwareServer):
             # Check if worker is registered
             worker_id = request.worker_id
             if not worker_id:
-                worker_id = self._manager_state._worker_addr_to_id.get(addr)
+                worker_id = self._manager_state.get_worker_id_from_addr(addr)
 
             if not worker_id:
                 return HealthcheckExtensionResponse(
