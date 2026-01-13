@@ -3295,16 +3295,18 @@ grep -n "while True:" "$FILE"
 | 2 | Phase 3.5g attribute access | Automated scanner | **ZERO** violations |
 | 3 | Phase 3.5h.1 chained attribute access | Chained access scanner | **ZERO** violations |
 | 4 | **Phase 3.5h.2 method call validation** | Method existence scanner | **ZERO** violations |
-| 5 | Phase 4 direct state access | `grep "self._state._"` | **ZERO** matches |
-| 6 | Phase 5.9 cyclomatic complexity | CC scanner | **ZERO** methods with CC > 4 |
-| 7 | Phase 6.5 runtime correctness | Race/leak/error scanners | **ZERO** violations |
-| 8 | LSP diagnostics | `lsp_diagnostics` | Clean on ALL modified files |
-| 9 | Duplicate methods | Manual review | None across modular classes |
-| 10 | Dead methods | Reference search | None in modular classes |
-| 11 | Call site correctness | Manual review | All use correct component/method |
-| 12 | No workarounds | `grep "proxy\|workaround\|TODO"` | No shortcut comments |
+| 5 | **Phase 3.5k type hint validation** | Untyped param scanner | **ZERO** untyped parameters |
+| 6 | Phase 4 direct state access | `grep "self._state._"` | **ZERO** matches |
+| 7 | Phase 5.9 cyclomatic complexity | CC scanner | **ZERO** methods with CC > 4 |
+| 8 | Phase 6.5 runtime correctness | Race/leak/error scanners | **ZERO** violations |
+| 9 | LSP diagnostics | `lsp_diagnostics` | Clean on ALL modified files |
+| 10 | Duplicate methods | Manual review | None across modular classes |
+| 11 | Dead methods | Reference search | None in modular classes |
+| 12 | Call site correctness | Manual review | All use correct component/method |
+| 13 | No workarounds | `grep "proxy\|workaround\|TODO"` | No shortcut comments |
+| 14 | No Any/object escape hatches | `grep ": Any\|: object"` | **ZERO** matches (or justified) |
 
-**Execution Order**: Run checks 1-7 in order. If ANY fails, return to that phase and fix before proceeding.
+**Execution Order**: Run checks 1-8 in order. If ANY fails, return to that phase and fix before proceeding.
 
 **BLOCKING**: Phase 7 cannot pass with ANY violations. If ANY check fails, return to the appropriate phase and fix properly - no shortcuts. "Mostly done" is NOT done.
 
