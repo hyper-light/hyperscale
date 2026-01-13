@@ -319,11 +319,13 @@ class WorkerWorkflowExecutor:
 
             await increment_version()
 
-            # Clean up workflow state
             self._state.remove_active_workflow(dispatch.workflow_id)
             self._state._workflow_fence_tokens.pop(dispatch.workflow_id, None)
+            self._state._workflow_cancel_events.pop(dispatch.workflow_id, None)
+            self._state._workflow_tokens.pop(dispatch.workflow_id, None)
+            self._state._workflow_id_to_name.pop(dispatch.workflow_id, None)
+            self._state._workflow_cores_completed.pop(dispatch.workflow_id, None)
 
-            # Trigger server cleanup
             self._lifecycle.start_server_cleanup()
 
         elapsed_seconds = time.monotonic() - start_time
