@@ -586,6 +586,235 @@ if walrus_match:
         var_types[var_name] = class_name
 ```
 
+### Step 3.5h.1: Chained Attribute Access Validation (CRITICAL)
+
+**The Problem:**
+
+The base scanner validates single-level accesses (`var.attr`) but misses chained accesses (`var.attr1.attr2`):
+
+```python
+# CAUGHT by base scanner:
+registration = ManagerPeerRegistration.load(data)
+registration.manager_info  # ManagerPeerRegistration has no manager_info!
+
+# MISSED by base scanner (chained access):
+peer_udp_addr = (
+    registration.manager_info.udp_host,  # MISSED - both levels invalid!
+    registration.manager_info.udp_port,
+)
+```
+
+Even when the first-level access is caught, the scanner doesn't validate the second level. This is problematic because:
+1. The intended attribute might exist with a different name (e.g., `node` instead of `manager_info`)
+2. Even if `manager_info` existed, we need to validate that `udp_host` exists on its type
+
+**Solution: Type-Aware Attribute Resolution**
+
+Extend the scanner to:
+1. Track the **type** of each attribute, not just existence
+2. Resolve chained accesses by following the type chain
+3. Validate each level of the chain
+
+**Extended ClassInfo with Attribute Types:**
+
+```python
+@dataclass
+class ClassInfo:
+    name: str
+    attributes: Set[str]
+    properties: Set[str]
+    methods: Set[str]
+    # NEW: Map attribute name -> type name
+    attribute_types: Dict[str, str] = field(default_factory=dict)
+    file_path: str = ""
+    line_number: int = 0
+```
+
+**Extracting Attribute Types from Type Hints:**
+
+```python
+def _extract_class_info(self, node: ast.ClassDef, file_path: str) -> ClassInfo:
+    attributes = set()
+    attribute_types = {}
+    
+    for item in node.body:
+        if isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name):
+            attr_name = item.target.id
+            attributes.add(attr_name)
+            
+            # Extract type from annotation
+            type_name = self._extract_type_name(item.annotation)
+            if type_name:
+                attribute_types[attr_name] = type_name
+    
+    return ClassInfo(
+        name=node.name,
+        attributes=attributes,
+        attribute_types=attribute_types,
+        # ... other fields
+    )
+
+def _extract_type_name(self, annotation: ast.expr) -> str | None:
+    """Extract simple type name from annotation AST."""
+    if isinstance(annotation, ast.Name):
+        return annotation.id
+    elif isinstance(annotation, ast.Subscript):
+        # Handle Optional[X], list[X], etc.
+        if isinstance(annotation.value, ast.Name):
+            if annotation.value.id in ('Optional', 'list', 'List'):
+                return self._extract_type_name(annotation.slice)
+    elif isinstance(annotation, ast.BinOp):
+        # Handle X | None union types
+        if isinstance(annotation.op, ast.BitOr):
+            left_type = self._extract_type_name(annotation.left)
+            if left_type and left_type != 'None':
+                return left_type
+            return self._extract_type_name(annotation.right)
+    elif isinstance(annotation, ast.Constant):
+        # Handle string annotations like "ManagerInfo"
+        if isinstance(annotation.value, str):
+            return annotation.value
+    return None
+```
+
+**Chained Access Validation:**
+
+```python
+def _check_chained_accesses(
+    self,
+    line_num: int,
+    line: str,
+    var_types: Dict[str, str],
+    file_path: str
+) -> None:
+    """Validate chained attribute accesses like var.attr1.attr2."""
+    
+    # Match chains of 2+ attributes: var.attr1.attr2[.attr3...]
+    for match in re.finditer(r'\b(\w+)((?:\.\w+)+)', line):
+        var_name = match.group(1)
+        chain = match.group(2)  # ".attr1.attr2.attr3"
+        
+        if var_name in ('self', 'cls', 'os', 'sys', 'time', 'asyncio'):
+            continue
+        
+        if var_name not in var_types:
+            continue
+        
+        # Parse chain into list of attributes
+        attrs = [a for a in chain.split('.') if a]
+        if len(attrs) < 2:
+            continue  # Single-level handled by base scanner
+        
+        # Walk the chain, validating each level
+        current_type = var_types[var_name]
+        for i, attr in enumerate(attrs):
+            if current_type not in self.classes:
+                break  # Unknown type, can't validate further
+            
+            class_info = self.classes[current_type]
+            all_attrs = class_info.attributes | class_info.properties
+            
+            if attr not in all_attrs:
+                # Build chain string for error message
+                accessed_chain = f"{var_name}." + ".".join(attrs[:i+1])
+                self.violations.append((
+                    line_num,
+                    accessed_chain,
+                    attr,
+                    current_type,
+                    file_path
+                ))
+                break  # Can't continue chain after invalid access
+            
+            # Get type of this attribute for next iteration
+            if attr in class_info.attribute_types:
+                current_type = class_info.attribute_types[attr]
+            else:
+                break  # Unknown type, can't validate further
+```
+
+**Example Detection:**
+
+```
+# Input code:
+registration = ManagerPeerRegistration.load(data)
+peer_udp_addr = (
+    registration.manager_info.udp_host,
+    registration.manager_info.udp_port,
+)
+
+# Scanner output:
+✗ Found 2 chained attribute access violation(s):
+
+| Line | Access Chain | Invalid Attr | On Type | File |
+|------|--------------|--------------|---------|------|
+| 2564 | `registration.manager_info` | `manager_info` | `ManagerPeerRegistration` | server.py |
+| 2565 | `registration.manager_info` | `manager_info` | `ManagerPeerRegistration` | server.py |
+
+### Available Attributes for ManagerPeerRegistration:
+`capabilities`, `is_leader`, `node`, `protocol_version_major`, `protocol_version_minor`, `term`
+
+### Note: Did you mean `node` instead of `manager_info`?
+`node` is type `ManagerInfo` which has: `datacenter`, `is_leader`, `node_id`, `tcp_host`, `tcp_port`, `udp_host`, `udp_port`
+```
+
+**Integration with Base Scanner:**
+
+```python
+def scan_server_file(self, server_path: Path) -> None:
+    with open(server_path) as f:
+        lines = f.readlines()
+    
+    var_types: Dict[str, str] = {}
+    
+    for line_num, line in enumerate(lines, 1):
+        self._update_var_types(line, var_types)
+        
+        # Base single-level validation
+        self._check_attribute_accesses(line_num, line, var_types, str(server_path))
+        
+        # NEW: Chained access validation
+        self._check_chained_accesses(line_num, line, var_types, str(server_path))
+```
+
+**Attribute Type Database Example:**
+
+```python
+# After scanning models, attribute_types contains:
+{
+    'ManagerPeerRegistration': {
+        'node': 'ManagerInfo',
+        'term': 'int',
+        'is_leader': 'bool',
+    },
+    'ManagerInfo': {
+        'node_id': 'str',
+        'tcp_host': 'str',
+        'tcp_port': 'int',
+        'udp_host': 'str',
+        'udp_port': 'int',
+        'datacenter': 'str',
+        'is_leader': 'bool',
+    },
+    'JobInfo': {
+        'token': 'TrackingToken',
+        'submission': 'JobSubmission',
+        'timeout_tracking': 'TimeoutTrackingState',
+        'workflows': 'dict',  # Can't resolve generic params
+        # ...
+    }
+}
+```
+
+**Limitations:**
+
+1. Generic types (`dict[str, WorkflowInfo]`) don't carry element type info in AST
+2. Conditional types (`X | None`) are reduced to non-None type
+3. Forward references (string annotations) require careful handling
+4. Runtime-computed attributes not detectable
+
+For these cases, fall back to LSP validation.
+
 ### Step 3.5i: Integration with CI/Build
 
 **Pre-commit Hook:**
