@@ -182,52 +182,19 @@ class GateHealthCoordinator:
             self._versioned_clock.update_entity, dc_key, heartbeat.version
         )
 
-    def handle_manager_backpressure_signal(
+    async def handle_manager_backpressure_signal(
         self,
         manager_addr: tuple[str, int],
         datacenter_id: str,
         signal: BackpressureSignal,
     ) -> None:
-        """
-        Handle backpressure signal from a manager (AD-37).
-
-        Updates per-manager and per-DC backpressure tracking.
-
-        Args:
-            manager_addr: Manager TCP address
-            datacenter_id: Datacenter ID
-            signal: Backpressure signal from manager
-        """
-        self._state._manager_backpressure[manager_addr] = signal.level
-
-        if signal.suggested_delay_ms > self._state._backpressure_delay_ms:
-            self._state._backpressure_delay_ms = signal.suggested_delay_ms
-
-        self._update_dc_backpressure(datacenter_id)
-
-    def _update_dc_backpressure(self, datacenter_id: str) -> None:
-        """
-        Update the aggregated backpressure level for a datacenter.
-
-        Takes the maximum backpressure level across all managers in the DC.
-
-        Args:
-            datacenter_id: Datacenter to update
-        """
-        dc_managers = self._state._datacenter_manager_status.get(datacenter_id, {})
-        if not dc_managers:
-            self._state._dc_backpressure[datacenter_id] = BackpressureLevel.NONE
-            return
-
-        max_level = BackpressureLevel.NONE
-        for manager_addr in dc_managers.keys():
-            level = self._state._manager_backpressure.get(
-                manager_addr, BackpressureLevel.NONE
-            )
-            if level.value > max_level.value:
-                max_level = level
-
-        self._state._dc_backpressure[datacenter_id] = max_level
+        await self._state.update_backpressure(
+            manager_addr,
+            datacenter_id,
+            signal.level,
+            signal.suggested_delay_ms,
+            self._datacenter_managers,
+        )
 
     def classify_datacenter_health(self, datacenter_id: str) -> DatacenterStatus:
         """
