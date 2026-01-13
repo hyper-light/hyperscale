@@ -19,17 +19,11 @@ from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerDebug
 if TYPE_CHECKING:
     from hyperscale.distributed.nodes.manager.state import ManagerState
     from hyperscale.distributed.nodes.manager.config import ManagerConfig
+    from hyperscale.distributed.jobs.worker_pool import WorkerPool
     from hyperscale.logging import Logger
 
 
 class ManagerRegistry:
-    """
-    Manages registration and tracking of workers, gates, and peer managers.
-
-    Centralizes all registration logic and provides accessor methods
-    for retrieving healthy/active nodes.
-    """
-
     def __init__(
         self,
         state: "ManagerState",
@@ -43,6 +37,10 @@ class ManagerRegistry:
         self._logger = logger
         self._node_id = node_id
         self._task_runner = task_runner
+        self._worker_pool: "WorkerPool | None" = None
+
+    def set_worker_pool(self, worker_pool: "WorkerPool") -> None:
+        self._worker_pool = worker_pool
 
     def register_worker(
         self,
