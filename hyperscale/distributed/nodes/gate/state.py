@@ -114,6 +114,7 @@ class GateRuntimeState:
     def initialize_locks(self) -> None:
         self._counter_lock = asyncio.Lock()
         self._lock_creation_lock = asyncio.Lock()
+        self._manager_state_lock = asyncio.Lock()
 
     def _get_counter_lock(self) -> asyncio.Lock:
         if self._counter_lock is None:
