@@ -11,6 +11,7 @@ from enum import Enum
 
 class ExclusionReason(str, Enum):
     """Reason a candidate was excluded."""
+
     UNHEALTHY_STATUS = "unhealthy_status"
     NO_REGISTERED_MANAGERS = "no_registered_managers"
     ALL_MANAGERS_CIRCUIT_OPEN = "all_managers_circuit_open"
@@ -20,37 +21,37 @@ class ExclusionReason(str, Enum):
 
 class DemotionReason(str, Enum):
     """Reason a candidate was demoted (not excluded)."""
+
     STALE_HEALTH = "stale_health"
     MISSING_COORDINATES = "missing_coordinates"
 
 
 @dataclass(slots=True)
 class DatacenterCandidate:
-    """A datacenter candidate for job routing."""
-
     datacenter_id: str
-    health_bucket: str  # HEALTHY, BUSY, DEGRADED, UNHEALTHY
+    health_bucket: str
     available_cores: int
     total_cores: int
     queue_depth: int
     lhm_multiplier: float
-    circuit_breaker_pressure: float  # Fraction of managers with open circuits
+    circuit_breaker_pressure: float
 
-    # Vivaldi coordinate data
     has_coordinate: bool = False
-    rtt_ucb_ms: float = 100.0  # Default conservative RTT
+    rtt_ucb_ms: float = 100.0
     coordinate_quality: float = 0.0
 
-    # Manager count
     total_managers: int = 0
     healthy_managers: int = 0
 
-    # Exclusion/demotion tracking
     excluded: bool = False
     exclusion_reason: ExclusionReason | None = None
     demoted: bool = False
     demotion_reason: DemotionReason | None = None
-    original_bucket: str | None = None  # If demoted, the original bucket
+    original_bucket: str | None = None
+
+    health_severity_weight: float = 1.0
+    worker_overload_ratio: float = 0.0
+    overloaded_worker_count: int = 0
 
 
 @dataclass(slots=True)
