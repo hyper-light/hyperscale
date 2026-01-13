@@ -940,6 +940,9 @@ class ManagerState:
     def clear_gate_unhealthy_since(self, gate_id: str) -> None:
         self._gate_unhealthy_since.pop(gate_id, None)
 
+    def iter_gate_unhealthy_since(self) -> list[tuple[str, float]]:
+        return list(self._gate_unhealthy_since.items())
+
     def get_gate_negotiated_caps(self, gate_id: str) -> NegotiatedCapabilities | None:
         return self._gate_negotiated_caps.get(gate_id)
 
