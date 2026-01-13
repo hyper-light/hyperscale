@@ -639,6 +639,18 @@ class ManagerServer(HealthAwareServer):
             env=self.env,
         )
 
+        self._worker_disseminator = WorkerDisseminator(
+            state=self._manager_state,
+            config=self._config,
+            worker_pool=self._worker_pool,
+            logger=self._udp_logger,
+            node_id=self._node_id.full,
+            datacenter=self._node_id.datacenter,
+            task_runner=self._task_runner,
+            send_tcp=self._send_to_peer,
+            gossip_buffer=WorkerStateGossipBuffer(),
+        )
+
         # Mark as started
         self._started = True
         self._manager_state._manager_state = ManagerStateEnum.ACTIVE
@@ -648,6 +660,10 @@ class ManagerServer(HealthAwareServer):
 
         # Join SWIM clusters
         await self._join_swim_clusters()
+
+        # Request worker lists from peer managers (AD-48)
+        if self._worker_disseminator:
+            await self._worker_disseminator.request_worker_list_from_peers()
 
         # Start SWIM probe cycle
         self._task_runner.run(self.start_probe_cycle)
