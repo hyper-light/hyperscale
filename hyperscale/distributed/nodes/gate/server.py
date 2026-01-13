@@ -40,7 +40,7 @@ from typing import TYPE_CHECKING
 import cloudpickle
 
 from hyperscale.distributed.server import tcp
-from hyperscale.distributed.leases import LeaseManager as JobLeaseManager
+from hyperscale.distributed.leases import JobLeaseManager
 from hyperscale.reporting.results import Results
 from hyperscale.reporting.common.results_types import WorkflowStats
 from hyperscale.distributed.server.events import VersionedStateClock

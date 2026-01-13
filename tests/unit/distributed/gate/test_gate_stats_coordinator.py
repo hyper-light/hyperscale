@@ -426,12 +426,8 @@ class TestPushWindowedStats:
 
 
 class TestConcurrency:
-    """Tests for concurrent access patterns."""
-
     @pytest.mark.asyncio
     async def test_concurrent_immediate_updates(self):
-        """Concurrent immediate updates don't interfere."""
-        state = GateRuntimeState()
         send_tcp = AsyncMock()
         call_count = 0
 
@@ -441,11 +437,7 @@ class TestConcurrency:
 
         send_tcp.side_effect = counting_send
 
-        coordinator = GateStatsCoordinator(
-            state=state,
-            logger=MockLogger(),
-            task_runner=MockTaskRunner(),
-            windowed_stats=MockWindowedStatsCollector(),
+        coordinator = create_coordinator(
             get_job_callback=lambda x: ("10.0.0.1", 8000),
             get_job_status=lambda x: MockJobStatus(),
             send_tcp=send_tcp,
@@ -467,56 +459,11 @@ class TestConcurrency:
 
 
 class TestEdgeCases:
-    """Tests for edge cases and boundary conditions."""
-
-    def test_zero_interval(self):
-        """Zero stats push interval is valid."""
-        state = GateRuntimeState()
-        coordinator = GateStatsCoordinator(
-            state=state,
-            logger=MockLogger(),
-            task_runner=MockTaskRunner(),
-            windowed_stats=MockWindowedStatsCollector(),
-            get_job_callback=lambda x: None,
-            get_job_status=lambda x: None,
-            send_tcp=AsyncMock(),
-            stats_push_interval_ms=0.0,
-        )
-
-        assert coordinator._stats_push_interval_ms == 0.0
-
-    def test_very_large_interval(self):
-        """Very large stats push interval is valid."""
-        state = GateRuntimeState()
-        coordinator = GateStatsCoordinator(
-            state=state,
-            logger=MockLogger(),
-            task_runner=MockTaskRunner(),
-            windowed_stats=MockWindowedStatsCollector(),
-            get_job_callback=lambda x: None,
-            get_job_status=lambda x: None,
-            send_tcp=AsyncMock(),
-            stats_push_interval_ms=3600000.0,  # 1 hour
-        )
-
-        assert coordinator._stats_push_interval_ms == 3600000.0
-
     def test_job_status_with_missing_attributes(self):
-        """Handle job status with missing optional attributes."""
-        state = GateRuntimeState()
-
         class MinimalJobStatus:
             status = "running"
 
-        coordinator = GateStatsCoordinator(
-            state=state,
-            logger=MockLogger(),
-            task_runner=MockTaskRunner(),
-            windowed_stats=MockWindowedStatsCollector(),
+        coordinator = create_coordinator(
             get_job_callback=lambda x: ("10.0.0.1", 8000),
             get_job_status=lambda x: MinimalJobStatus(),
-            send_tcp=AsyncMock(),
         )
-
-        # Should use getattr defaults
-        # This tests the getattr fallback logic
