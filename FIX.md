@@ -79,7 +79,7 @@ discovered during systematic tracing of SCENARIOS.md test scenarios through the 
 - `_job_forwarding_tracker.cleanup_stale_peers()`
 - `_state_manager.cleanup_stale_states()`
 - Periodic cleanup of dispatch/latency trackers
-**Status**: TODO
+**Status**: PARTIAL - Dispatch/latency tracker cleanup IS called in discovery_maintenance_loop (lines 3132-3133). Job forwarding tracker peers are unregistered on death. Minor: `cleanup_stale_peers()` could be called periodically for resilience.
 
 #### B6: Silent Exception in Dispatch Coordinator (MEDIUM)
 **Location**: `gate/dispatch_coordinator.py:164`

@@ -38,7 +38,7 @@ if TYPE_CHECKING:
         JobForwardingTracker,
     )
     from hyperscale.distributed.server.events.lamport_clock import VersionedStateClock
-    from taskex import TaskRunner
+    from hyperscale.distributed.taskex import TaskRunner
 
 
 class GatePeerCoordinator:

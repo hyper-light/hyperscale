@@ -39,7 +39,7 @@ if TYPE_CHECKING:
     from hyperscale.distributed.jobs import JobLeadershipTracker
     from hyperscale.distributed.jobs.gates import GateJobManager
     from hyperscale.distributed.leases import JobLease
-    from taskex import TaskRunner
+    from hyperscale.distributed.taskex import TaskRunner
 
 
 class GateOrphanJobCoordinator:

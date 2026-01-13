@@ -53,7 +53,7 @@ if TYPE_CHECKING:
     from hyperscale.distributed.reliability import ErrorStats, LoadShedder
     from hyperscale.distributed.routing import GateJobRouter
     from hyperscale.distributed.health import GateInfo
-    from taskex import TaskRunner
+    from hyperscale.distributed.taskex import TaskRunner
 
 
 class GateJobHandler:
