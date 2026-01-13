@@ -2883,8 +2883,7 @@ class ManagerServer(HealthAwareServer):
             if strategy:
                 await strategy.stop_tracking(job_id, "cancelled")
 
-            # Update job status
-            job.status = JobStatus.CANCELLED
+            job.status = JobStatus.CANCELLED.value
             await self._manager_state.increment_state_version()
 
             # Build detailed response
