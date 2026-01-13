@@ -23,11 +23,15 @@ from hyperscale.distributed.models import (
     NodeInfo,
     NodeRole,
     ManagerInfo,
+    ManagerHeartbeat,
+    PendingTransfer,
     WorkerState as WorkerStateEnum,
     WorkerStateSnapshot,
+    WorkflowDispatch,
     WorkflowProgress,
     WorkerHeartbeat,
 )
+from hyperscale.distributed.jobs import AllocationResult
 from hyperscale.distributed.jobs import CoreAllocator
 from hyperscale.distributed.resources import ProcessResourceMonitor
 from hyperscale.distributed.protocol.version import (
@@ -858,13 +862,13 @@ class WorkerServer(HealthAwareServer):
         await self._apply_pending_transfer(job_id, workflow_id, pending)
         self._cleanup_pending_transfer_if_complete(job_id, workflow_id, pending)
 
-    def _is_pending_transfer_expired(self, pending) -> bool:
+    def _is_pending_transfer_expired(self, pending: PendingTransfer) -> bool:
         current_time = time.monotonic()
         pending_transfer_ttl = self._config.pending_transfer_ttl_seconds
         return current_time - pending.received_at > pending_transfer_ttl
 
     async def _apply_pending_transfer(
-        self, job_id: str, workflow_id: str, pending
+        self, job_id: str, workflow_id: str, pending: PendingTransfer
     ) -> None:
         job_lock = await self._get_job_transfer_lock(job_id)
         async with job_lock:
@@ -1137,10 +1141,7 @@ class WorkerServer(HealthAwareServer):
     # =========================================================================
 
     async def _handle_dispatch_execution(
-        self, 
-        dispatch, 
-        addr: tuple[str, int], 
-        allocation_result
+        self, dispatch, addr: tuple[str, int], allocation_result
     ) -> bytes:
         """Handle the execution phase of a workflow dispatch."""
         result = await self._workflow_executor.handle_dispatch_execution(
