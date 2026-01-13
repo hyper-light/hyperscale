@@ -76,6 +76,10 @@ class MockServerForHandlers:
         # Fence tokens
         self._job_fence_tokens = {}
 
+        # Worker state mock
+        self._worker_state = MagicMock()
+        self._worker_state.increment_transfer_rejected_stale_token = AsyncMock()
+
     def _get_worker_state(self):
         return WorkerState.HEALTHY
 
