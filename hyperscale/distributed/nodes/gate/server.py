@@ -2099,6 +2099,38 @@ class GateServer(HealthAwareServer):
 
         return self._legacy_select_datacenters(count, preferred)
 
+    def _categorize_datacenters_by_health(
+        self,
+        dc_health: dict,
+    ) -> tuple[list[str], list[str], list[str]]:
+        healthy = [
+            dc
+            for dc, status in dc_health.items()
+            if status.health == DatacenterHealth.HEALTHY.value
+        ]
+        busy = [
+            dc
+            for dc, status in dc_health.items()
+            if status.health == DatacenterHealth.BUSY.value
+        ]
+        degraded = [
+            dc
+            for dc, status in dc_health.items()
+            if status.health == DatacenterHealth.DEGRADED.value
+        ]
+        return healthy, busy, degraded
+
+    def _determine_worst_health(
+        self, healthy: list[str], busy: list[str], degraded: list[str]
+    ) -> str | None:
+        if healthy:
+            return "healthy"
+        if busy:
+            return "busy"
+        if degraded:
+            return "degraded"
+        return None
+
     def _legacy_select_datacenters(
         self,
         count: int,
@@ -2118,29 +2150,9 @@ class GateServer(HealthAwareServer):
         if not dc_health:
             return ([], [], "unhealthy")
 
-        healthy = [
-            dc
-            for dc, status in dc_health.items()
-            if status.health == DatacenterHealth.HEALTHY.value
-        ]
-        busy = [
-            dc
-            for dc, status in dc_health.items()
-            if status.health == DatacenterHealth.BUSY.value
-        ]
-        degraded = [
-            dc
-            for dc, status in dc_health.items()
-            if status.health == DatacenterHealth.DEGRADED.value
-        ]
-
-        if healthy:
-            worst_health = "healthy"
-        elif busy:
-            worst_health = "busy"
-        elif degraded:
-            worst_health = "degraded"
-        else:
+        healthy, busy, degraded = self._categorize_datacenters_by_health(dc_health)
+        worst_health = self._determine_worst_health(healthy, busy, degraded)
+        if worst_health is None:
             return ([], [], "unhealthy")
 
         all_usable = healthy + busy + degraded
