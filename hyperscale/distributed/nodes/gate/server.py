@@ -140,13 +140,9 @@ from hyperscale.distributed.protocol.version import (
 from hyperscale.distributed.discovery import DiscoveryService
 from hyperscale.distributed.discovery.security.role_validator import (
     RoleValidator,
-    CertificateClaims,
-    NodeRole as SecurityNodeRole,
 )
 from hyperscale.distributed.routing import (
     GateJobRouter,
-    GateJobRouterConfig,
-    RoutingDecision as VivaldiRoutingDecision,
     DatacenterCandidate,
     DispatchTimeTracker,
     ObservedLatencyTracker,
