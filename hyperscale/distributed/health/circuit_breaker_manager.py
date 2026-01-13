@@ -101,34 +101,17 @@ class CircuitBreakerManager:
         }
 
     def record_success(self, manager_addr: tuple[str, int]) -> None:
-        """
-        Record a successful operation to a manager.
-
-        Args:
-            manager_addr: (host, port) tuple for the manager.
-        """
         circuit = self._circuits.get(manager_addr)
         if circuit:
             circuit.record_success()
 
-    def record_failure(self, manager_addr: tuple[str, int]) -> None:
-        """
-        Record a failed operation to a manager.
-
-        Args:
-            manager_addr: (host, port) tuple for the manager.
-        """
-        circuit = self.get_circuit(manager_addr)
+    async def record_failure(self, manager_addr: tuple[str, int]) -> None:
+        circuit = await self.get_circuit(manager_addr)
         circuit.record_failure()
 
-    def remove_circuit(self, manager_addr: tuple[str, int]) -> None:
-        """
-        Remove a circuit breaker for a manager (e.g., when manager is removed).
-
-        Args:
-            manager_addr: (host, port) tuple for the manager.
-        """
-        self._circuits.pop(manager_addr, None)
+    async def remove_circuit(self, manager_addr: tuple[str, int]) -> None:
+        async with self._lock:
+            self._circuits.pop(manager_addr, None)
 
     def clear_all(self) -> None:
         """Clear all circuit breakers."""
