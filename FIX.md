@@ -61,17 +61,17 @@ discovered during systematic tracing of SCENARIOS.md test scenarios through the 
 #### B2: ObservedLatencyTracker Memory Leak (CRITICAL)
 **Location**: `routing/observed_latency_tracker.py:24`
 **Issue**: `_latencies` dict accumulates state for every DC ever seen, no cleanup.
-**Status**: TODO
+**Status**: FIXED - Added `cleanup_stale_entries()` method with 600s threshold, called from discovery_maintenance_loop
 
 #### B3: DispatchTimeTracker Race Condition (HIGH)
 **Location**: `routing/dispatch_time_tracker.py`
 **Issue**: No asyncio.Lock protecting `_dispatch_times` dict from concurrent access.
-**Status**: TODO
+**Status**: FIXED - asyncio.Lock added at line 18, used in all methods
 
 #### B4: ObservedLatencyTracker Race Condition (HIGH)
 **Location**: `routing/observed_latency_tracker.py`
 **Issue**: No asyncio.Lock protecting `_latencies` dict.
-**Status**: TODO
+**Status**: FIXED - asyncio.Lock added at line 26, used in all methods
 
 #### B5: Missing Cleanup Calls in GateServer (HIGH)
 **Location**: `gate/server.py:450-458, 3007-3008`
