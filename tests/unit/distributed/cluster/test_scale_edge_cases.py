@@ -87,31 +87,33 @@ class TestMemoryLeakPrevention:
         # Delta history should be bounded
         assert len(detector._delta_history) == 20
 
-    def test_rate_limiter_client_cleanup(self):
+    @pytest.mark.asyncio
+    async def test_rate_limiter_client_cleanup(self):
         """Verify inactive clients are cleaned up."""
         limiter = ServerRateLimiter(inactive_cleanup_seconds=0.1)
 
         # Create many clients
         for i in range(1000):
-            limiter.check_rate_limit(f"client-{i}", "operation")
+            await limiter.check_rate_limit(f"client-{i}", "operation")
 
         assert limiter.get_metrics()["active_clients"] == 1000
 
         # Wait for cleanup threshold
-        time.sleep(0.15)
+        await asyncio.sleep(0.15)
 
         # Cleanup should remove all
         cleaned = limiter.cleanup_inactive_clients()
         assert cleaned == 1000
         assert limiter.get_metrics()["active_clients"] == 0
 
-    def test_rate_limiter_client_buckets_per_operation(self):
+    @pytest.mark.asyncio
+    async def test_rate_limiter_client_buckets_per_operation(self):
         """Verify per-operation counters don't grow unboundedly."""
         limiter = ServerRateLimiter()
 
         # Single client, many different operations
         for i in range(100):
-            limiter.check_rate_limit("client-1", f"operation-{i}")
+            await limiter.check_rate_limit("client-1", f"operation-{i}")
 
         # Each operation creates a counter for the client (via AdaptiveRateLimiter)
         client_counters = limiter._adaptive._operation_counters.get("client-1", {})
@@ -122,9 +124,7 @@ class TestMemoryLeakPrevention:
 
     def test_extension_tracker_no_unbounded_growth(self):
         """Verify extension tracker doesn't grow unboundedly."""
-        manager = WorkerHealthManager(
-            WorkerHealthManagerConfig(max_extensions=5)
-        )
+        manager = WorkerHealthManager(WorkerHealthManagerConfig(max_extensions=5))
 
         # Create trackers for many workers
         for i in range(1000):
@@ -437,7 +437,7 @@ class TestStateCorruptionRecovery:
         detector.record_latency(100.0)
 
         # NaN (shouldn't crash)
-        detector.record_latency(float('nan'))
+        detector.record_latency(float("nan"))
 
         # Should still function
         state = detector.get_state()
@@ -449,7 +449,7 @@ class TestStateCorruptionRecovery:
         detector = HybridOverloadDetector()
 
         detector.record_latency(100.0)
-        detector.record_latency(float('inf'))
+        detector.record_latency(float("inf"))
 
         # Should trigger overloaded
         state = detector.get_state()
@@ -460,7 +460,7 @@ class TestStateCorruptionRecovery:
         detector = HybridOverloadDetector()
 
         detector.record_latency(100.0)
-        detector.record_latency(float('-inf'))
+        detector.record_latency(float("-inf"))
 
         # Shouldn't crash
         state = detector.get_state()
@@ -1406,7 +1406,9 @@ class TestClockSkewTimeBased:
 
     def test_token_bucket_very_slow_refill(self):
         """Test token bucket with extremely slow refill rate."""
-        bucket = TokenBucket(bucket_size=100, refill_rate=0.0001)  # 1 token per 10000 sec
+        bucket = TokenBucket(
+            bucket_size=100, refill_rate=0.0001
+        )  # 1 token per 10000 sec
 
         # Deplete
         for _ in range(100):
@@ -1989,7 +1991,9 @@ class TestErrorMessageQuality:
     def test_worker_eviction_reason_descriptive(self):
         """Test worker eviction reason is descriptive."""
         manager = WorkerHealthManager(
-            WorkerHealthManagerConfig(max_extensions=2, eviction_threshold=1, grace_period=0.0)
+            WorkerHealthManagerConfig(
+                max_extensions=2, eviction_threshold=1, grace_period=0.0
+            )
         )
 
         from hyperscale.distributed.models import HealthcheckExtensionRequest
@@ -2177,7 +2181,14 @@ class TestPriorityStateTransitionEdges:
             (600.0, OverloadState.OVERLOADED, False, True, True, True),
         ]
 
-        for latency, expected_state, crit_shed, high_shed, norm_shed, low_shed in test_cases:
+        for (
+            latency,
+            expected_state,
+            crit_shed,
+            high_shed,
+            norm_shed,
+            low_shed,
+        ) in test_cases:
             # Create fresh detector/shedder for each case to avoid
             # delta detection interference from baseline drift
             detector = HybridOverloadDetector(config)
@@ -2500,7 +2511,11 @@ class TestDetectorWarmup:
         """During warmup, delta detection should not trigger - only absolute bounds."""
         config = OverloadConfig(
             absolute_bounds=(100.0, 200.0, 500.0),
-            delta_thresholds=(0.01, 0.02, 0.03),  # Very sensitive - would trigger easily
+            delta_thresholds=(
+                0.01,
+                0.02,
+                0.03,
+            ),  # Very sensitive - would trigger easily
             warmup_samples=10,
             hysteresis_samples=1,
             min_samples=1,
