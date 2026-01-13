@@ -957,7 +957,8 @@ class TestExecuteWithRateLimitRetry:
 class TestHealthGatedBehavior:
     """Test health-gated behavior under various conditions."""
 
-    def test_burst_traffic_allowed_when_healthy(self) -> None:
+    @pytest.mark.asyncio
+    async def test_burst_traffic_allowed_when_healthy(self) -> None:
         """Test that burst traffic is allowed when system is healthy."""
         limiter = ServerRateLimiter()
 
@@ -965,7 +966,7 @@ class TestHealthGatedBehavior:
         results = []
         for burst in range(10):
             for client in range(5):
-                result = limiter.check_rate_limit(
+                result = await limiter.check_rate_limit(
                     f"client-{client}",
                     "stats_update",
                     tokens=10,
@@ -975,7 +976,8 @@ class TestHealthGatedBehavior:
         # All should pass when healthy
         assert all(results), "All burst requests should pass when healthy"
 
-    def test_graceful_degradation_under_stress(self) -> None:
+    @pytest.mark.asyncio
+    async def test_graceful_degradation_under_stress(self) -> None:
         """Test graceful degradation when system becomes stressed."""
         config = OverloadConfig(
             absolute_bounds=(50.0, 100.0, 200.0),
@@ -986,7 +988,7 @@ class TestHealthGatedBehavior:
 
         # Initially healthy - all pass
         for _ in range(5):
-            result = limiter.check_rate_limit_with_priority(
+            result = await limiter.check_rate_limit_with_priority(
                 "client-1", "default", RequestPriority.LOW
             )
             assert result.allowed is True
@@ -996,17 +998,18 @@ class TestHealthGatedBehavior:
             detector.record_latency(120.0)
 
         # Now should shed low priority
-        result = limiter.check_rate_limit_with_priority(
+        result = await limiter.check_rate_limit_with_priority(
             "client-1", "default", RequestPriority.LOW
         )
         # May or may not be shed depending on state
         # But critical should always pass
-        result_critical = limiter.check_rate_limit_with_priority(
+        result_critical = await limiter.check_rate_limit_with_priority(
             "client-1", "default", RequestPriority.CRITICAL
         )
         assert result_critical.allowed is True
 
-    def test_recovery_after_stress(self) -> None:
+    @pytest.mark.asyncio
+    async def test_recovery_after_stress(self) -> None:
         """Test that system recovers after stress subsides."""
         config = OverloadConfig(
             absolute_bounds=(50.0, 100.0, 200.0),
@@ -1025,7 +1028,7 @@ class TestHealthGatedBehavior:
             detector.record_latency(20.0)
 
         # Should be healthy again
-        result = limiter.check_rate_limit_with_priority(
+        result = await limiter.check_rate_limit_with_priority(
             "client-1", "default", RequestPriority.LOW
         )
         # After recovery, low priority should pass again

@@ -201,6 +201,55 @@ class GateRuntimeState:
             return BackpressureLevel.NONE
         return max(self._dc_backpressure.values(), key=lambda x: x.value)
 
+    def _get_backpressure_lock(self) -> asyncio.Lock:
+        if self._backpressure_lock is None:
+            self._backpressure_lock = asyncio.Lock()
+        return self._backpressure_lock
+
+    def _update_dc_backpressure_locked(
+        self, datacenter_id: str, datacenter_managers: dict[str, list[tuple[str, int]]]
+    ) -> None:
+        manager_addrs = datacenter_managers.get(datacenter_id, [])
+        if not manager_addrs:
+            return
+
+        max_level = BackpressureLevel.NONE
+        for manager_addr in manager_addrs:
+            level = self._manager_backpressure.get(manager_addr, BackpressureLevel.NONE)
+            if level > max_level:
+                max_level = level
+
+        self._dc_backpressure[datacenter_id] = max_level
+
+    async def update_backpressure(
+        self,
+        manager_addr: tuple[str, int],
+        datacenter_id: str,
+        level: BackpressureLevel,
+        suggested_delay_ms: int,
+        datacenter_managers: dict[str, list[tuple[str, int]]],
+    ) -> None:
+        async with self._get_backpressure_lock():
+            self._manager_backpressure[manager_addr] = level
+            self._backpressure_delay_ms = max(
+                self._backpressure_delay_ms, suggested_delay_ms
+            )
+            self._update_dc_backpressure_locked(datacenter_id, datacenter_managers)
+
+    async def clear_manager_backpressure(
+        self,
+        manager_addr: tuple[str, int],
+        datacenter_id: str,
+        datacenter_managers: dict[str, list[tuple[str, int]]],
+    ) -> None:
+        async with self._get_backpressure_lock():
+            self._manager_backpressure[manager_addr] = BackpressureLevel.NONE
+            self._update_dc_backpressure_locked(datacenter_id, datacenter_managers)
+
+    async def remove_manager_backpressure(self, manager_addr: tuple[str, int]) -> None:
+        async with self._get_backpressure_lock():
+            self._manager_backpressure.pop(manager_addr, None)
+
     # Lease methods
     def get_lease_key(self, job_id: str, datacenter_id: str) -> str:
         """Get the lease key for a job-DC pair."""
