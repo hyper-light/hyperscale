@@ -3771,8 +3771,8 @@ class ManagerServer(HealthAwareServer):
                 )
 
             if submission.origin_gate_addr:
-                self._manager_state._job_origin_gates[submission.job_id] = (
-                    submission.origin_gate_addr
+                self._manager_state.set_job_origin_gate(
+                    submission.job_id, submission.origin_gate_addr
                 )
 
             await self._manager_state.increment_state_version()
