@@ -5,6 +5,8 @@ Provides time-bounded ownership semantics to prevent split-brain
 scenarios during node failures and network partitions.
 """
 
-from .job_lease import JobLease, LeaseManager, LeaseState
+from .job_lease import JobLease, JobLeaseManager, LeaseState
 
-__all__ = ["JobLease", "LeaseManager", "LeaseState"]
+LeaseManager = JobLeaseManager
+
+__all__ = ["JobLease", "JobLeaseManager", "LeaseManager", "LeaseState"]

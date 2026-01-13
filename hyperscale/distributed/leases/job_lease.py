@@ -54,7 +54,7 @@ class LeaseAcquisitionResult:
     expires_in: float = 0.0
 
 
-class LeaseManager:
+class JobLeaseManager:
     __slots__ = (
         "_node_id",
         "_leases",

@@ -336,11 +336,8 @@ class TestBackpressureLevelState:
 
 
 class TestPushWindowedStats:
-    """Tests for _push_windowed_stats method."""
-
     @pytest.mark.asyncio
     async def test_pushes_stats_with_callback(self):
-        """Pushes stats when callback and stats exist."""
         state = GateRuntimeState()
         state._progress_callbacks["job-1"] = ("10.0.0.1", 8000)
 
@@ -354,13 +351,9 @@ class TestPushWindowedStats:
 
         send_tcp = AsyncMock()
 
-        coordinator = GateStatsCoordinator(
+        coordinator = create_coordinator(
             state=state,
-            logger=MockLogger(),
-            task_runner=MockTaskRunner(),
             windowed_stats=windowed_stats,
-            get_job_callback=lambda x: None,
-            get_job_status=lambda x: None,
             send_tcp=send_tcp,
         )
 
@@ -373,19 +366,11 @@ class TestPushWindowedStats:
 
     @pytest.mark.asyncio
     async def test_no_op_without_callback(self):
-        """No-op when no callback registered."""
         state = GateRuntimeState()
-        # No callback registered
-
         send_tcp = AsyncMock()
 
-        coordinator = GateStatsCoordinator(
+        coordinator = create_coordinator(
             state=state,
-            logger=MockLogger(),
-            task_runner=MockTaskRunner(),
-            windowed_stats=MockWindowedStatsCollector(),
-            get_job_callback=lambda x: None,
-            get_job_status=lambda x: None,
             send_tcp=send_tcp,
         )
 
@@ -395,22 +380,15 @@ class TestPushWindowedStats:
 
     @pytest.mark.asyncio
     async def test_no_op_without_stats(self):
-        """No-op when no stats available."""
         state = GateRuntimeState()
         state._progress_callbacks["job-1"] = ("10.0.0.1", 8000)
 
         windowed_stats = MockWindowedStatsCollector()
-        # No stats for job-1
-
         send_tcp = AsyncMock()
 
-        coordinator = GateStatsCoordinator(
+        coordinator = create_coordinator(
             state=state,
-            logger=MockLogger(),
-            task_runner=MockTaskRunner(),
             windowed_stats=windowed_stats,
-            get_job_callback=lambda x: None,
-            get_job_status=lambda x: None,
             send_tcp=send_tcp,
         )
 
@@ -420,7 +398,6 @@ class TestPushWindowedStats:
 
     @pytest.mark.asyncio
     async def test_handles_send_exception(self):
-        """Handles exception during send gracefully."""
         state = GateRuntimeState()
         state._progress_callbacks["job-1"] = ("10.0.0.1", 8000)
 
@@ -434,17 +411,12 @@ class TestPushWindowedStats:
 
         send_tcp = AsyncMock(side_effect=Exception("Network error"))
 
-        coordinator = GateStatsCoordinator(
+        coordinator = create_coordinator(
             state=state,
-            logger=MockLogger(),
-            task_runner=MockTaskRunner(),
             windowed_stats=windowed_stats,
-            get_job_callback=lambda x: None,
-            get_job_status=lambda x: None,
             send_tcp=send_tcp,
         )
 
-        # Should not raise
         await coordinator._push_windowed_stats("job-1")
 
 
