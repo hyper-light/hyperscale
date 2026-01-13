@@ -209,34 +209,34 @@ discovered during systematic tracing of SCENARIOS.md test scenarios through the 
 **Location**: `manager/dispatch.py:121-159`
 **Issue**: No cleanup of allocated resources if dispatch fails.
 **Impact**: Workflows silently lost, fence tokens leak.
-**Status**: TODO
+**Status**: FIXED - Added `_dispatch_failure_count` to ManagerState, logging for all failure paths, circuit breaker error recording
 
 #### F11: Dispatch vs Cancellation Race (CRITICAL)
 **Location**: `jobs/workflow_dispatcher.py:528-694`
 **Issue**: TOCTOU race - workflow can be dispatched after cancellation.
-**Status**: TODO
+**Status**: FIXED - Added `_cancelling_jobs` set, cancellation checks at multiple points in dispatch flow
 
 #### F12: Active Workflows Memory Leak (HIGH)
 **Location**: `worker/workflow_executor.py:310-327`
 **Issue**: Incomplete cleanup - `_workflow_cancel_events`, `_workflow_tokens`, `_workflow_id_to_name`, `_workflow_cores_completed` never removed.
 **Impact**: ~4KB leaked per workflow.
-**Status**: TODO
+**Status**: FIXED - Added cleanup of all workflow state in `remove_active_workflow()`
 
 #### F13: Fence Token TOCTOU Race (HIGH)
 **Location**: `worker/handlers/tcp_dispatch.py:80-89`
 **Issue**: Fence token check-and-update not atomic.
 **Impact**: At-most-once guarantee broken.
-**Status**: TODO
+**Status**: FIXED - Added atomic `update_workflow_fence_token()` method with lock in WorkerState
 
 #### F14: Result Sending No Fallback (HIGH)
 **Location**: `worker/progress.py:283-393`
 **Issue**: If all managers unavailable, result silently dropped, no retry.
-**Status**: TODO
+**Status**: FIXED - Added `PendingResult` with bounded deque (max 1000), exponential backoff retry (5s base, max 60s, 10 retries, 300s TTL)
 
 #### F15: Orphan Detection Incomplete (MEDIUM)
 **Location**: `worker/background_loops.py:164-226`
 **Issue**: Only handles grace period expiry, no timeout for stuck RUNNING workflows.
-**Status**: TODO
+**Status**: FIXED - Added `get_stuck_workflows()` method, timeout tracking, integrated into orphan check loop
 
 ---
 
