@@ -221,7 +221,7 @@ class ManagerRateLimitingCoordinator:
         """Reset rate limit state for a client."""
         self._server_limiter.reset_client(client_id)
 
-    def cleanup_inactive_clients(self) -> int:
+    async def cleanup_inactive_clients(self) -> int:
         """
         Remove rate limit state for inactive clients.
 
