@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     from hyperscale.distributed.nodes.manager.state import ManagerState
     from hyperscale.distributed.nodes.manager.config import ManagerConfig
     from hyperscale.distributed.nodes.manager.registry import ManagerRegistry
+    from hyperscale.distributed.taskex import TaskRunner
     from hyperscale.logging import Logger
 
 
