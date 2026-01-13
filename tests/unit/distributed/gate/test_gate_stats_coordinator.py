@@ -212,25 +212,16 @@ class TestSendImmediateUpdateHappyPath:
 
 
 class TestSendImmediateUpdateFailureMode:
-    """Tests for send_immediate_update failure modes."""
-
     @pytest.mark.asyncio
     async def test_handles_send_exception(self):
-        """Handles exception during send gracefully."""
-        state = GateRuntimeState()
         send_tcp = AsyncMock(side_effect=Exception("Network error"))
 
-        coordinator = GateStatsCoordinator(
-            state=state,
-            logger=MockLogger(),
-            task_runner=MockTaskRunner(),
-            windowed_stats=MockWindowedStatsCollector(),
+        coordinator = create_coordinator(
             get_job_callback=lambda x: ("10.0.0.1", 8000),
             get_job_status=lambda x: MockJobStatus(),
             send_tcp=send_tcp,
         )
 
-        # Should not raise
         await coordinator.send_immediate_update("job-1", "status_change")
 
 
