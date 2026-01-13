@@ -3094,6 +3094,7 @@ class GateServer(HealthAwareServer):
 
     async def _discovery_maintenance_loop(self) -> None:
         """Discovery maintenance loop (AD-28)."""
+        stale_manager_threshold = 300.0
         while self._running:
             try:
                 await asyncio.sleep(self._discovery_failure_decay_interval)
@@ -3102,6 +3103,30 @@ class GateServer(HealthAwareServer):
                     dc_discovery.decay_failures()
 
                 self._peer_discovery.decay_failures()
+
+                now = time.monotonic()
+                stale_cutoff = now - stale_manager_threshold
+                stale_manager_addrs = [
+                    manager_addr
+                    for manager_addr, last_status in self._manager_last_status.items()
+                    if last_status < stale_cutoff
+                ]
+
+                for manager_addr in stale_manager_addrs:
+                    self._manager_last_status.pop(manager_addr, None)
+                    self._manager_backpressure.pop(manager_addr, None)
+                    self._manager_negotiated_caps.pop(manager_addr, None)
+
+                    for dc_id in list(self._datacenter_manager_status.keys()):
+                        dc_managers = self._datacenter_manager_status.get(dc_id)
+                        if dc_managers and manager_addr in dc_managers:
+                            dc_managers.pop(manager_addr, None)
+
+                    health_keys_to_remove = [
+                        key for key in self._manager_health if key[1] == manager_addr
+                    ]
+                    for key in health_keys_to_remove:
+                        self._manager_health.pop(key, None)
 
             except asyncio.CancelledError:
                 break
