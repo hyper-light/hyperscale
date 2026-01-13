@@ -2805,6 +2805,34 @@ class ManagerServer(HealthAwareServer):
         except Exception as send_error:
             return False, f"Failed to send cancellation to worker: {send_error}"
 
+    def _get_running_workflows_to_cancel(
+        self,
+        job: JobInfo,
+        pending_cancelled: list[str],
+    ) -> list[tuple[str, str, tuple[str, int]]]:
+        """Get list of (workflow_id, worker_id, worker_addr) for running workflows to cancel."""
+        workflows_to_cancel: list[tuple[str, str, tuple[str, int]]] = []
+
+        for workflow_id, workflow_info in job.workflows.items():
+            if workflow_id in pending_cancelled:
+                continue
+            if workflow_info.status != WorkflowStatus.RUNNING:
+                continue
+
+            for sub_workflow_token in workflow_info.sub_workflow_tokens:
+                sub_workflow = job.sub_workflows.get(sub_workflow_token)
+                if not (sub_workflow and sub_workflow.token.worker_id):
+                    continue
+
+                worker = self._manager_state.get_worker(sub_workflow.token.worker_id)
+                if worker:
+                    worker_addr = (worker.node.host, worker.node.tcp_port)
+                    workflows_to_cancel.append(
+                        (workflow_id, sub_workflow.token.worker_id, worker_addr)
+                    )
+
+        return workflows_to_cancel
+
     async def _cancel_running_workflows(
         self,
         job: JobInfo,
@@ -2817,39 +2845,24 @@ class ManagerServer(HealthAwareServer):
         running_cancelled: list[str] = []
         workflow_errors: dict[str, str] = {}
 
-        for workflow_id, workflow_info in job.workflows.items():
-            if (
-                workflow_id in pending_cancelled
-                or workflow_info.status != WorkflowStatus.RUNNING
-            ):
-                continue
+        workflows_to_cancel = self._get_running_workflows_to_cancel(
+            job, pending_cancelled
+        )
 
-            for sub_workflow_token in workflow_info.sub_workflow_tokens:
-                sub_workflow = job.sub_workflows.get(sub_workflow_token)
-                if not (sub_workflow and sub_workflow.token.worker_id):
-                    continue
+        for workflow_id, worker_id, worker_addr in workflows_to_cancel:
+            success, error_msg = await self._cancel_running_workflow_on_worker(
+                job.job_id,
+                workflow_id,
+                worker_addr,
+                requester_id,
+                timestamp,
+                reason,
+            )
 
-                worker = self._manager_state.get_worker(sub_workflow.token.worker_id)
-                if not worker:
-                    workflow_errors[workflow_id] = (
-                        f"Worker {sub_workflow.token.worker_id} not found"
-                    )
-                    continue
-
-                worker_addr = (worker.node.host, worker.node.tcp_port)
-                success, error_msg = await self._cancel_running_workflow_on_worker(
-                    job.job_id,
-                    workflow_id,
-                    worker_addr,
-                    requester_id,
-                    timestamp,
-                    reason,
-                )
-
-                if success:
-                    running_cancelled.append(workflow_id)
-                elif error_msg:
-                    workflow_errors[workflow_id] = error_msg
+            if success:
+                running_cancelled.append(workflow_id)
+            elif error_msg:
+                workflow_errors[workflow_id] = error_msg
 
         return running_cancelled, workflow_errors
 
