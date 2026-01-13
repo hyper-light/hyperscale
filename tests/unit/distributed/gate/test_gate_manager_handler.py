@@ -211,8 +211,9 @@ class TestHandleStatusUpdateHappyPath:
             get_tcp_port=lambda: 9000,
             get_healthy_gates=lambda: [],
             record_manager_heartbeat=record_heartbeat,
-            handle_manager_backpressure_signal=lambda signal: None,
-            update_dc_backpressure=lambda dc_id: None,
+            handle_manager_backpressure_signal=AsyncMock(),
+            update_dc_backpressure=AsyncMock(),
+            set_manager_backpressure_none=AsyncMock(),
             broadcast_manager_discovery=AsyncMock(),
         )
 
@@ -279,8 +280,9 @@ class TestHandleStatusUpdateBackpressure:
             get_tcp_port=lambda: 9000,
             get_healthy_gates=lambda: [],
             record_manager_heartbeat=lambda dc, addr, manager_id, workers: None,
-            handle_manager_backpressure_signal=lambda signal: None,
+            handle_manager_backpressure_signal=AsyncMock(),
             update_dc_backpressure=lambda dc_id: updated_dcs.append(dc_id),
+            set_manager_backpressure_none=AsyncMock(),
             broadcast_manager_discovery=AsyncMock(),
         )
 
