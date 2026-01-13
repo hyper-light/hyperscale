@@ -157,12 +157,12 @@ discovered during systematic tracing of SCENARIOS.md test scenarios through the 
 #### D5: Capacity Aggregator Unbounded Growth (MEDIUM)
 **Location**: `capacity/capacity_aggregator.py:56-66`
 **Issue**: `_manager_heartbeats` dict has no size limit.
-**Status**: TODO
+**Status**: FIXED - `max_managers=10000` cap (line 20), enforced with LRU eviction (lines 28-43)
 
 #### D6: Hysteresis State Not Reset (LOW)
 **Location**: `reliability/overload.py:444-454`
 **Issue**: `_pending_state_count` not reset in `reset()`.
-**Status**: TODO
+**Status**: FIXED - `_pending_state_count = 0` in reset() method (line 476)
 
 ---
 
