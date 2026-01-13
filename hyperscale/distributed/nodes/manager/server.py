@@ -2694,7 +2694,13 @@ class ManagerServer(HealthAwareServer):
                         parent_workflow_token, result.error
                     )
 
-            if (job := self._job_manager.get_job(result.job_id)) and job.is_complete:
+            job = self._job_manager.get_job(result.job_id)
+            job_is_complete = (
+                job
+                and job.workflows_completed + job.workflows_failed
+                >= job.workflows_total
+            )
+            if job_is_complete:
                 await self._handle_job_completion(result.job_id)
 
             return b"ok"
