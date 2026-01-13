@@ -125,11 +125,13 @@ class WorkerHealthManager:
 
         # Attempt to grant extension
         # AD-26 Issue 4: Pass absolute metrics to prioritize over relative progress
-        granted, extension_seconds, denial_reason, is_warning = tracker.request_extension(
-            reason=request.reason,
-            current_progress=request.current_progress,
-            completed_items=request.completed_items,
-            total_items=request.total_items,
+        granted, extension_seconds, denial_reason, is_warning = (
+            tracker.request_extension(
+                reason=request.reason,
+                current_progress=request.current_progress,
+                completed_items=request.completed_items,
+                total_items=request.total_items,
+            )
         )
 
         if granted:
@@ -285,8 +287,11 @@ class WorkerHealthManager:
         }
 
     @property
+    def base_deadline(self) -> float:
+        return self._config.base_deadline
+
+    @property
     def tracked_worker_count(self) -> int:
-        """Get the number of workers with active extension trackers."""
         return len(self._trackers)
 
     @property
@@ -299,6 +304,5 @@ class WorkerHealthManager:
         not necessarily unhealthy.
         """
         return sum(
-            1 for tracker in self._trackers.values()
-            if tracker.extension_count > 0
+            1 for tracker in self._trackers.values() if tracker.extension_count > 0
         )

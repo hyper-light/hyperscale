@@ -1736,7 +1736,7 @@ class ManagerServer(HealthAwareServer):
                 await asyncio.sleep(check_interval)
 
                 current_time = time.monotonic()
-                grace_period = self._worker_health_manager._config.base_deadline
+                grace_period = self._worker_health_manager.base_deadline
 
                 deadlines_snapshot = list(self._manager_state._worker_deadlines.items())
 
