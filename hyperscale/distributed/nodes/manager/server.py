@@ -2051,8 +2051,9 @@ class ManagerServer(HealthAwareServer):
     async def _resume_timeout_tracking_for_all_jobs(self) -> None:
         """Resume timeout tracking for all jobs as new leader."""
         for job_id in self._leases.get_led_job_ids():
-            # Re-initialize timeout strategy if needed
-            pass
+            strategy = self._manager_state._job_timeout_strategies.get(job_id)
+            if strategy:
+                await strategy.resume_tracking(job_id)
 
     # =========================================================================
     # Helper Methods

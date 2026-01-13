@@ -142,7 +142,7 @@ class ManagerDispatchCoordinator:
                         self._task_runner.run(
                             self._logger.log,
                             ServerWarning(
-                                message=f"Worker {worker_id[:8]}... rejected dispatch for workflow {workflow_id[:8]}...: {ack.rejection_reason}",
+                                message=f"Worker {worker_id[:8]}... rejected dispatch for workflow {workflow_id[:8]}...: {ack.error}",
                                 node_host=self._config.host,
                                 node_port=self._config.tcp_port,
                                 node_id=self._node_id,

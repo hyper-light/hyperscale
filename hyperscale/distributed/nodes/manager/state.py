@@ -154,6 +154,7 @@ class ManagerState:
         self._dispatch_throughput_count: int = 0
         self._dispatch_throughput_interval_start: float = 0.0
         self._dispatch_throughput_last_value: float = 0.0
+        self._dispatch_failure_count: int = 0
 
         self._workflow_latency_digest = TimeWindowedTDigest()
 
