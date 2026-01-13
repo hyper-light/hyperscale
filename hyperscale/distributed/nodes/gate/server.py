@@ -2102,7 +2102,7 @@ class GateServer(HealthAwareServer):
         for dc_id, previous_health, new_health in transitions:
             if new_health in ("degraded", "unhealthy"):
                 self._task_runner.run(
-                    self._logger.log,
+                    self._udp_logger.log,
                     ServerWarning(
                         message=f"DC {dc_id} health changed: {previous_health} -> {new_health}",
                         node_host=self._host,
@@ -2114,7 +2114,7 @@ class GateServer(HealthAwareServer):
                 status = self._dc_health_manager.get_datacenter_health(dc_id)
                 if getattr(status, "leader_overloaded", False):
                     self._task_runner.run(
-                        self._logger.log,
+                        self._udp_logger.log,
                         ServerWarning(
                             message=f"ALERT: DC {dc_id} leader manager is OVERLOADED - control plane saturated",
                             node_host=self._host,
