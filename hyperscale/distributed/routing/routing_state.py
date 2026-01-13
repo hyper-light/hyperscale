@@ -11,6 +11,7 @@ from enum import Enum
 
 class RoutingDecisionReason(str, Enum):
     """Reason for a routing decision."""
+
     INITIAL_SELECTION = "initial_selection"
     HOLD_DOWN_RETAINED = "hold_down_retained"
     IMPROVEMENT_THRESHOLD_MET = "improvement_threshold_met"
@@ -22,15 +23,14 @@ class RoutingDecisionReason(str, Enum):
 
 @dataclass(slots=True)
 class DatacenterRoutingScore:
-    """Scoring components for a datacenter candidate."""
-
     datacenter_id: str
-    health_bucket: str  # HEALTHY, BUSY, DEGRADED
+    health_bucket: str
     rtt_ucb_ms: float
     load_factor: float
     quality_penalty: float
     final_score: float
     is_preferred: bool = False
+    health_severity_weight: float = 1.0
 
     @classmethod
     def calculate(
@@ -43,7 +43,8 @@ class DatacenterRoutingScore:
         circuit_breaker_pressure: float,
         coordinate_quality: float,
         is_preferred: bool = False,
-        preference_multiplier: float = 0.9,  # Lower = better
+        preference_multiplier: float = 0.9,
+        health_severity_weight: float = 1.0,
     ) -> "DatacenterRoutingScore":
         """
         Calculate routing score for a datacenter (AD-36 Part 4).
@@ -51,20 +52,18 @@ class DatacenterRoutingScore:
         Formula:
             load_factor = 1.0 + A_UTIL*util + A_QUEUE*queue + A_CB*cb
             quality_penalty = 1.0 + A_QUALITY*(1.0 - quality)
-            score = rtt_ucb * load_factor * quality_penalty * preference_mult
+            score = rtt_ucb * load_factor * quality_penalty * preference_mult * health_severity_weight
 
         Lower scores are better.
         """
-        # Constants from AD-36 spec
-        a_util = 0.5  # Utilization weight
-        a_queue = 0.3  # Queue depth weight
-        a_cb = 0.2  # Circuit breaker weight
-        a_quality = 0.5  # Quality weight
+        a_util = 0.5
+        a_queue = 0.3
+        a_cb = 0.2
+        a_quality = 0.5
         queue_smoothing = 10.0
         load_factor_max = 5.0
         quality_penalty_max = 2.0
 
-        # Step 2: Load factor
         queue_normalized = queue_depth / (queue_depth + queue_smoothing)
         load_factor = (
             1.0
@@ -74,14 +73,13 @@ class DatacenterRoutingScore:
         )
         load_factor = min(load_factor, load_factor_max)
 
-        # Step 3: Quality penalty
         quality_penalty = 1.0 + a_quality * (1.0 - coordinate_quality)
         quality_penalty = min(quality_penalty, quality_penalty_max)
 
-        # Final score
-        final_score = rtt_ucb_ms * load_factor * quality_penalty
+        final_score = (
+            rtt_ucb_ms * load_factor * quality_penalty * health_severity_weight
+        )
 
-        # Apply preference multiplier within primary bucket
         if is_preferred:
             final_score *= preference_multiplier
 
@@ -93,6 +91,7 @@ class DatacenterRoutingScore:
             quality_penalty=quality_penalty,
             final_score=final_score,
             is_preferred=is_preferred,
+            health_severity_weight=health_severity_weight,
         )
 
 
@@ -193,10 +192,7 @@ class JobRoutingState:
     def cleanup_expired_cooldowns(self) -> None:
         """Remove expired cooldowns."""
         now = time.monotonic()
-        expired = [
-            dc for dc, until in self.failed_datacenters.items()
-            if now >= until
-        ]
+        expired = [dc for dc, until in self.failed_datacenters.items() if now >= until]
         for dc in expired:
             del self.failed_datacenters[dc]
 
