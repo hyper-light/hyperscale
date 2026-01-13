@@ -358,7 +358,9 @@ class TestLoadShedderEdgeCases:
         assert state == OverloadState.BUSY
 
         # Should not shed when threshold is missing (returns None from .get())
-        should_shed = shedder.should_shed_priority(RequestPriority.LOW, cpu_percent=75.0)
+        should_shed = shedder.should_shed_priority(
+            RequestPriority.LOW, cpu_percent=75.0
+        )
         assert should_shed is False
 
 
@@ -527,9 +529,21 @@ class TestDefaultMessagePriorities:
         shedder = LoadShedder(detector)
 
         critical_messages = [
-            "Ping", "Ack", "Nack", "PingReq", "Suspect", "Alive", "Dead",
-            "Join", "JoinAck", "Leave", "JobCancelRequest", "JobCancelResponse",
-            "JobFinalResult", "Heartbeat", "HealthCheck"
+            "Ping",
+            "Ack",
+            "Nack",
+            "PingReq",
+            "Suspect",
+            "Alive",
+            "Dead",
+            "Join",
+            "JoinAck",
+            "Leave",
+            "JobCancelRequest",
+            "JobCancelResponse",
+            "JobFinalResult",
+            "Heartbeat",
+            "HealthCheck",
         ]
 
         for msg in critical_messages:
@@ -542,10 +556,18 @@ class TestDefaultMessagePriorities:
         shedder = LoadShedder(detector)
 
         high_messages = [
-            "SubmitJob", "SubmitJobResponse", "JobAssignment", "WorkflowDispatch",
-            "WorkflowComplete", "StateSync", "StateSyncRequest", "StateSyncResponse",
-            "AntiEntropyRequest", "AntiEntropyResponse", "JobLeaderGateTransfer",
-            "JobLeaderGateTransferAck"
+            "SubmitJob",
+            "SubmitJobResponse",
+            "JobAssignment",
+            "WorkflowDispatch",
+            "WorkflowComplete",
+            "StateSync",
+            "StateSyncRequest",
+            "StateSyncResponse",
+            "AntiEntropyRequest",
+            "AntiEntropyResponse",
+            "JobLeaderGateTransfer",
+            "JobLeaderGateTransferAck",
         ]
 
         for msg in high_messages:
@@ -558,8 +580,14 @@ class TestDefaultMessagePriorities:
         shedder = LoadShedder(detector)
 
         normal_messages = [
-            "JobProgress", "JobStatusRequest", "JobStatusResponse", "JobStatusPush",
-            "RegisterCallback", "RegisterCallbackResponse", "StatsUpdate", "StatsQuery"
+            "JobProgress",
+            "JobStatusRequest",
+            "JobStatusResponse",
+            "JobStatusPush",
+            "RegisterCallback",
+            "RegisterCallbackResponse",
+            "StatsUpdate",
+            "StatsQuery",
         ]
 
         for msg in normal_messages:
@@ -572,9 +600,12 @@ class TestDefaultMessagePriorities:
         shedder = LoadShedder(detector)
 
         low_messages = [
-            "DetailedStatsRequest", "DetailedStatsResponse",
-            "DebugRequest", "DebugResponse",
-            "DiagnosticsRequest", "DiagnosticsResponse"
+            "DetailedStatsRequest",
+            "DetailedStatsResponse",
+            "DebugRequest",
+            "DebugResponse",
+            "DiagnosticsRequest",
+            "DiagnosticsResponse",
         ]
 
         for msg in low_messages:
@@ -640,21 +671,13 @@ class TestOverloadConfigEdgeCases:
         assert state == OverloadState.OVERLOADED
 
     def test_inverted_threshold_order(self):
-        """Test with thresholds in inverted order."""
-        config = OverloadConfig(
-            delta_thresholds=(1.0, 0.5, 0.2),  # Inverted (overloaded < stressed < busy)
-        )
-        detector = HybridOverloadDetector(config)
-
-        # Establish baseline
-        for _ in range(5):
-            detector.record_latency(100.0)
-
-        # With inverted thresholds, behavior may be unexpected
-        # but should not crash
-        detector.record_latency(150.0)  # 50% increase
-        state = detector.get_state()
-        assert state in list(OverloadState)
+        """Test that inverted thresholds are rejected during validation."""
+        with pytest.raises(
+            ValueError, match="delta_thresholds must be in ascending order"
+        ):
+            OverloadConfig(
+                delta_thresholds=(1.0, 0.5, 0.2),
+            )
 
 
 class TestConcurrentLoadSheddingDecisions:
@@ -729,7 +752,9 @@ class TestNonePriorityHandling:
             detector.record_latency(50.0)
 
         # None values should be handled gracefully
-        result = shedder.should_shed("JobProgress", cpu_percent=None, memory_percent=None)
+        result = shedder.should_shed(
+            "JobProgress", cpu_percent=None, memory_percent=None
+        )
         assert isinstance(result, bool)
 
     def test_priority_comparison_with_all_values(self):
