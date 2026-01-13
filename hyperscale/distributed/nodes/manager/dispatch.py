@@ -49,19 +49,19 @@ class ManagerDispatchCoordinator:
         leases: "ManagerLeaseCoordinator",
         logger: "Logger",
         node_id: str,
-        task_runner,
-        send_to_worker,  # Callable to send TCP to worker
-        send_to_peer,  # Callable to send TCP to peer manager
+        task_runner: "TaskRunner",
+        send_to_worker: SendFunc,
+        send_to_peer: SendFunc,
     ) -> None:
-        self._state = state
-        self._config = config
-        self._registry = registry
-        self._leases = leases
-        self._logger = logger
-        self._node_id = node_id
-        self._task_runner = task_runner
-        self._send_to_worker = send_to_worker
-        self._send_to_peer = send_to_peer
+        self._state: "ManagerState" = state
+        self._config: "ManagerConfig" = config
+        self._registry: "ManagerRegistry" = registry
+        self._leases: "ManagerLeaseCoordinator" = leases
+        self._logger: "Logger" = logger
+        self._node_id: str = node_id
+        self._task_runner: "TaskRunner" = task_runner
+        self._send_to_worker: SendFunc = send_to_worker
+        self._send_to_peer: SendFunc = send_to_peer
 
     async def dispatch_workflow(
         self,
