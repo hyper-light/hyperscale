@@ -97,6 +97,7 @@ class ManagerRegistry:
         self._state._worker_unhealthy_since.pop(worker_id, None)
         self._state._worker_health_states.pop(worker_id, None)
         self._state._worker_latency_samples.pop(worker_id, None)
+        self._state._dispatch_semaphores.pop(worker_id, None)
 
         progress_keys_to_remove = [
             key for key in self._state._worker_job_last_progress if key[0] == worker_id
