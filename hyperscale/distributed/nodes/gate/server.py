@@ -879,6 +879,7 @@ class GateServer(HealthAwareServer):
 
         Initializes coordinators, wires handlers, and starts background tasks.
         """
+        self._modular_state.initialize_locks()
         await self.start_server(init_context=self.env.get_swim_init_context())
 
         # Set node_id on trackers
