@@ -104,7 +104,7 @@ class WorkerLifecycleManager:
 
     async def initialize_remote_manager(
         self,
-        updates_controller,
+        updates_controller: InterfaceUpdatesController,
         status_update_poll_interval: float,
     ) -> RemoteGraphManager:
         """
