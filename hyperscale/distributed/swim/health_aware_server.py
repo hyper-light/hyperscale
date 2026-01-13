@@ -1480,10 +1480,15 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
 
         message_with_health = message_with_membership + health_gossip
 
-        # AD-35 Task 12.2.5: Add Vivaldi coordinates (format: #|v{json})
-        # Only add if there's room - coordinates are ~80-150 bytes
         remaining_after_health = MAX_UDP_PAYLOAD - len(message_with_health)
-        if remaining_after_health >= 150:
+
+        worker_state_piggyback = self._get_worker_state_piggyback(
+            remaining_after_health
+        )
+        message_with_worker_state = message_with_health + worker_state_piggyback
+
+        remaining_after_worker = MAX_UDP_PAYLOAD - len(message_with_worker_state)
+        if remaining_after_worker >= 150:
             import json
 
             coord = self._coordinate_tracker.get_coordinate()
@@ -1491,10 +1496,13 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             coord_json = json.dumps(coord_dict, separators=(",", ":")).encode()
             vivaldi_piggyback = b"#|v" + coord_json
 
-            if len(message_with_health) + len(vivaldi_piggyback) <= MAX_UDP_PAYLOAD:
-                return message_with_health + vivaldi_piggyback
+            if (
+                len(message_with_worker_state) + len(vivaldi_piggyback)
+                <= MAX_UDP_PAYLOAD
+            ):
+                return message_with_worker_state + vivaldi_piggyback
 
-        return message_with_health
+        return message_with_worker_state
 
     def _check_message_size(self, message: bytes) -> bool:
         """
