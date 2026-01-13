@@ -64,8 +64,13 @@ class GateManagerHandler:
         get_tcp_port: Callable[[], int],
         get_healthy_gates: Callable[[], list[GateInfo]],
         record_manager_heartbeat: Callable[[str, tuple[str, int], str, int], None],
-        handle_manager_backpressure_signal: Callable,
-        update_dc_backpressure: Callable[[str], None],
+        handle_manager_backpressure_signal: Callable[
+            [tuple[str, int], str, BackpressureSignal], Awaitable[None]
+        ],
+        update_dc_backpressure: Callable[[str], Awaitable[None]],
+        set_manager_backpressure_none: Callable[
+            [tuple[str, int], str], Awaitable[None]
+        ],
         broadcast_manager_discovery: Callable,
     ) -> None:
         """
