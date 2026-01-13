@@ -253,30 +253,28 @@ class TestWorkerExecutorCoreAllocation:
 
 
 class TestWorkerExecutorThroughput:
-    """Test throughput tracking (AD-19)."""
-
-    def test_record_throughput_event(self):
-        """Test recording throughput event."""
+    @pytest.mark.asyncio
+    async def test_record_throughput_event(self):
         allocator = MockCoreAllocator()
         logger = MagicMock()
         state = MockWorkerState()
         executor = WorkerExecutor(allocator, logger, state)
 
-        executor.record_throughput_event(1.5)
+        await executor.record_throughput_event(1.5)
 
         assert state._throughput_completions == 1
         assert len(state._completion_times) == 1
         assert state._completion_times[0] == 1.5
 
-    def test_record_throughput_max_samples(self):
-        """Test throughput max samples limit."""
+    @pytest.mark.asyncio
+    async def test_record_throughput_max_samples(self):
         allocator = MockCoreAllocator()
         logger = MagicMock()
         state = MockWorkerState()
         executor = WorkerExecutor(allocator, logger, state)
 
         for i in range(60):
-            executor.record_throughput_event(float(i))
+            await executor.record_throughput_event(float(i))
 
         assert len(state._completion_times) == 50
 
@@ -595,9 +593,7 @@ class TestWorkerExecutorConcurrency:
             progress = MagicMock(spec=WorkflowProgress)
             await executor.buffer_progress_update(workflow_id, progress)
 
-        await asyncio.gather(*[
-            buffer_progress(f"wf-{i}") for i in range(10)
-        ])
+        await asyncio.gather(*[buffer_progress(f"wf-{i}") for i in range(10)])
 
         assert len(state._progress_buffer) == 10
 
@@ -614,9 +610,7 @@ class TestWorkerExecutorConcurrency:
             await asyncio.sleep(0.01)
             await executor.free_cores(workflow_id)
 
-        await asyncio.gather(*[
-            allocate_and_free(f"wf-{i}") for i in range(4)
-        ])
+        await asyncio.gather(*[allocate_and_free(f"wf-{i}") for i in range(4)])
 
         assert executor.available_cores == 16
 
