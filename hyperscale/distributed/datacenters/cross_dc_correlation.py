@@ -821,10 +821,14 @@ class CrossDCCorrelationDetector:
                 "Delay eviction until load subsides."
             )
 
+        affected = confirmed_failing_dcs + flapping_dcs
+        if severity in (CorrelationSeverity.MEDIUM, CorrelationSeverity.HIGH):
+            self.mark_partition_detected(affected)
+
         return CorrelationDecision(
             severity=severity,
             reason=reason,
-            affected_datacenters=confirmed_failing_dcs + flapping_dcs,
+            affected_datacenters=affected,
             recommendation=recommendation,
             flapping_datacenters=flapping_dcs,
             latency_correlated=latency_metrics["correlated"],
