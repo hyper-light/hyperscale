@@ -16,6 +16,7 @@ Key responsibilities:
 import asyncio
 import time
 import traceback
+import zlib
 from typing import Any, Callable, Coroutine
 
 import cloudpickle
