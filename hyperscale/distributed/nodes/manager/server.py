@@ -1786,7 +1786,8 @@ class ManagerServer(HealthAwareServer):
                         workflows_completed=job.workflows_completed,
                         workflows_failed=job.workflows_failed,
                         workflow_statuses={
-                            wf_id: wf.status for wf_id, wf in job.workflows.items()
+                            wf_id: wf.status.value
+                            for wf_id, wf in job.workflows.items()
                         },
                         elapsed_seconds=time.monotonic() - job.started_at
                         if job.started_at
