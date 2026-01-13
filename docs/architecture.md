@@ -22324,7 +22324,7 @@ from hyperscale.logging import Logger
 from hyperscale.logging.models import Entry, LogLevel
 
 if TYPE_CHECKING:
-    from hyperscale.taskex import TaskRunner
+    from hyperscale.distributed.taskex import TaskRunner
 
 
 @dataclass
@@ -22570,7 +22570,7 @@ from hyperscale.logging import Logger
 from hyperscale.logging.models import Entry, LogLevel
 
 if TYPE_CHECKING:
-    from hyperscale.taskex import TaskRunner
+    from hyperscale.distributed.taskex import TaskRunner
 
 
 class AckWindowState(Enum):

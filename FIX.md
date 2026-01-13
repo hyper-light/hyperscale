@@ -35,7 +35,7 @@ discovered during systematic tracing of SCENARIOS.md test scenarios through the 
 - `_manager_backpressure`
 
 **Impact**: Dictionaries grow unbounded with dead manager entries.
-**Status**: TODO
+**Status**: FIXED - `_discovery_maintenance_loop` now cleans up all stale manager state (300s threshold) from all relevant dicts
 
 #### A2: Concurrent Manager Registration Race (CRITICAL)
 **Location**: `gate/handlers/tcp_manager.py:131-134`
@@ -56,7 +56,7 @@ discovered during systematic tracing of SCENARIOS.md test scenarios through the 
 **Location**: `routing/dispatch_time_tracker.py:15-42`
 **Issue**: `_dispatch_times` dict has no cleanup. Failed/timed-out jobs leave entries forever.
 **Impact**: Unbounded memory growth.
-**Status**: TODO
+**Status**: FIXED - Added `cleanup_stale_entries()` method with 600s threshold, called from discovery_maintenance_loop
 
 #### B2: ObservedLatencyTracker Memory Leak (CRITICAL)
 **Location**: `routing/observed_latency_tracker.py:24`

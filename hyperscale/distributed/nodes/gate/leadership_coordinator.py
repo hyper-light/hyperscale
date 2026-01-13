@@ -18,7 +18,7 @@ if TYPE_CHECKING:
     from hyperscale.distributed.nodes.gate.state import GateRuntimeState
     from hyperscale.distributed.jobs import JobLeadershipTracker
     from hyperscale.logging import Logger
-    from hyperscale.taskex import TaskRunner
+    from hyperscale.distributed.taskex import TaskRunner
 
 
 class GateLeadershipCoordinator:
