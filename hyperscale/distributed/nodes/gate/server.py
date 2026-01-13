@@ -2113,9 +2113,9 @@ class GateServer(HealthAwareServer):
                 preferred,
             )
 
+        if not dc_health and len(self._datacenter_managers) > 0:
+            return ([], [], "initializing")
         if not dc_health:
-            if len(self._datacenter_managers) > 0:
-                return ([], [], "initializing")
             return ([], [], "unhealthy")
 
         healthy = [
