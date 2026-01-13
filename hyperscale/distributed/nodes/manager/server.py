@@ -1693,6 +1693,7 @@ class ManagerServer(HealthAwareServer):
                                 JobStatus.CANCELLED.value,
                             ):
                                 job.status = JobStatus.FAILED.value
+                                job.completed_at = time.monotonic()
                                 await self._manager_state.increment_state_version()
                     except Exception as check_error:
                         await self._udp_logger.log(
@@ -2901,6 +2902,7 @@ class ManagerServer(HealthAwareServer):
                 await strategy.stop_tracking(job_id, "cancelled")
 
             job.status = JobStatus.CANCELLED.value
+            job.completed_at = time.monotonic()
             await self._manager_state.increment_state_version()
 
             # Build detailed response
@@ -4590,6 +4592,7 @@ class ManagerServer(HealthAwareServer):
 
         async with job.lock:
             job.status = JobStatus.COMPLETED.value
+            job.completed_at = time.monotonic()
             elapsed_seconds = job.elapsed_seconds()
             final_status = self._determine_final_job_status(job)
             workflow_results, errors, total_completed, total_failed = (
