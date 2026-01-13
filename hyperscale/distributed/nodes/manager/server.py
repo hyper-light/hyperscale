@@ -2379,21 +2379,8 @@ class ManagerServer(HealthAwareServer):
                 job_id,
             )
 
-        workflow_ids_to_remove = [
-            wf_id
-            for wf_id in self._manager_state._workflow_retries
-            if wf_id.startswith(f"{job_id}:")
-        ]
-        for wf_id in workflow_ids_to_remove:
-            self._manager_state._workflow_retries.pop(wf_id, None)
-
-        workflow_ids_to_remove = [
-            wf_id
-            for wf_id in self._manager_state._workflow_completion_events
-            if wf_id.startswith(f"{job_id}:")
-        ]
-        for wf_id in workflow_ids_to_remove:
-            self._manager_state._workflow_completion_events.pop(wf_id, None)
+        self._manager_state.remove_workflow_retries_for_job(job_id)
+        self._manager_state.remove_workflow_completion_events_for_job(job_id)
 
     # =========================================================================
     # TCP Send Helpers
@@ -3428,9 +3415,7 @@ class ManagerServer(HealthAwareServer):
 
             # Trigger dispatch for active jobs
             if self._workflow_dispatcher:
-                for job_id, submission in list(
-                    self._manager_state._job_submissions.items()
-                ):
+                for job_id, submission in self._manager_state.iter_job_submissions():
                     await self._workflow_dispatcher.try_dispatch(job_id, submission)
 
             return b"ok"
@@ -3728,7 +3713,7 @@ class ManagerServer(HealthAwareServer):
             job_info.fencing_token = 1
 
             # Store submission for dispatch
-            self._manager_state._job_submissions[submission.job_id] = submission
+            self._manager_state.set_job_submission(submission.job_id, submission)
 
             # Start timeout tracking (AD-34)
             timeout_strategy = self._select_timeout_strategy(submission)
