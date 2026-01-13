@@ -57,7 +57,8 @@ __all__ = [
     # AD-22 Load Shedding with Priority Queues
     "ManagerLoadShedder",
     "RequestPriority",
-    "OverloadState",
+    "OverloadState",  # Backwards compatibility alias
+    "OverloadStateTracker",
     # AD-23 Backpressure
     "BackpressureLevel",
     # AD-26 Adaptive Healthcheck Extensions
