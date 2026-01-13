@@ -48,6 +48,9 @@ class ConsistentHashRing:
     )
 
     def __init__(self, replicas: int = 150):
+        if replicas < 1:
+            raise ValueError("replicas must be >= 1")
+
         self._replicas = replicas
         self._ring_positions: list[int] = []
         self._position_to_node: dict[int, str] = {}
@@ -89,17 +92,17 @@ class ConsistentHashRing:
         if not node:
             return None
 
+        positions_to_remove: set[int] = set()
         replica_count = self._replicas * node.weight
         for replica_index in range(replica_count):
             key = f"{node_id}:{replica_index}"
             hash_value = self._hash(key)
-
-            try:
-                self._ring_positions.remove(hash_value)
-            except ValueError:
-                pass
-
+            positions_to_remove.add(hash_value)
             self._position_to_node.pop(hash_value, None)
+
+        self._ring_positions = [
+            pos for pos in self._ring_positions if pos not in positions_to_remove
+        ]
 
         return node
 
@@ -121,6 +124,30 @@ class ConsistentHashRing:
         node_id = self._position_to_node[position]
 
         return self._nodes.get(node_id)
+
+    async def get_backup(self, key: str) -> HashRingNode | None:
+        async with self._lock:
+            if len(self._nodes) < 2:
+                return None
+
+            primary = self._get_node_unlocked(key)
+            if primary is None:
+                return None
+
+            hash_value = self._hash(key)
+            index = bisect.bisect_left(self._ring_positions, hash_value)
+
+            if index >= len(self._ring_positions):
+                index = 0
+
+            ring_size = len(self._ring_positions)
+            for offset in range(1, ring_size):
+                check_index = (index + offset) % ring_size
+                candidate_id = self._position_to_node[self._ring_positions[check_index]]
+                if candidate_id != primary.node_id:
+                    return self._nodes.get(candidate_id)
+
+            return None
 
     async def get_nodes(self, key: str, count: int = 1) -> list[HashRingNode]:
         async with self._lock:
