@@ -500,16 +500,16 @@ class ManagerServer(HealthAwareServer):
         # Gate UDP to TCP mapping
         for idx, tcp_addr in enumerate(self._seed_gates):
             if idx < len(self._gate_udp_addrs):
-                self._manager_state._gate_udp_to_tcp[self._gate_udp_addrs[idx]] = (
-                    tcp_addr
+                self._manager_state.set_gate_udp_to_tcp_mapping(
+                    self._gate_udp_addrs[idx], tcp_addr
                 )
 
         # Manager UDP to TCP mapping
         for idx, tcp_addr in enumerate(self._seed_managers):
             if idx < len(self._manager_udp_peers):
-                self._manager_state._manager_udp_to_tcp[
-                    self._manager_udp_peers[idx]
-                ] = tcp_addr
+                self._manager_state.set_manager_udp_to_tcp_mapping(
+                    self._manager_udp_peers[idx], tcp_addr
+                )
 
     def _register_callbacks(self) -> None:
         """Register SWIM and leadership callbacks."""
@@ -874,13 +874,13 @@ class ManagerServer(HealthAwareServer):
         """Handle node death detected by SWIM."""
         worker_id = self._manager_state.get_worker_id_from_addr(node_addr)
         if worker_id:
-            self._manager_state._worker_unhealthy_since.setdefault(
+            self._manager_state.setdefault_worker_unhealthy_since(
                 worker_id, time.monotonic()
             )
             self._task_runner.run(self._handle_worker_failure, worker_id)
             return
 
-        manager_tcp_addr = self._manager_state._manager_udp_to_tcp.get(node_addr)
+        manager_tcp_addr = self._manager_state.get_manager_tcp_from_udp(node_addr)
         if manager_tcp_addr:
             self._task_runner.run(
                 self._handle_manager_peer_failure, node_addr, manager_tcp_addr
