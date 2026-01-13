@@ -927,7 +927,8 @@ class TestManagerVersionSkewHandlerEdgeCases:
 class TestRateLimitingAndVersionSkewIntegration:
     """Integration tests combining rate limiting and version skew."""
 
-    def test_both_coordinators_share_state(
+    @pytest.mark.asyncio
+    async def test_both_coordinators_share_state(
         self, manager_state, manager_config, mock_logger, mock_task_runner
     ):
         """Both coordinators can use the same state."""
@@ -950,14 +951,11 @@ class TestRateLimitingAndVersionSkewIntegration:
             task_runner=mock_task_runner,
         )
 
-        # Rate limiter should work
-        result = rate_limiter.check_rate_limit("client-1", "job_submit")
+        result = await rate_limiter.check_rate_limit("client-1", "job_submit")
         assert result.allowed is True
 
-        # Version handler should also work
         caps = NodeCapabilities.current()
         negotiated = version_handler.negotiate_with_gate("gate-1", caps)
         assert negotiated.compatible is True
 
-        # Both affect state
         assert "gate-1" in manager_state._gate_negotiated_caps
