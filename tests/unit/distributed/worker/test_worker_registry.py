@@ -233,7 +233,6 @@ class TestWorkerRegistryPrimaryManager:
 
     @pytest.mark.asyncio
     async def test_select_new_primary_manager_leader(self):
-        """Test selecting new primary manager (leader preferred)."""
         logger = MagicMock()
         registry = WorkerRegistry(logger)
 
@@ -245,16 +244,15 @@ class TestWorkerRegistryPrimaryManager:
 
         registry.add_manager("mgr-1", mgr1)
         registry.add_manager("mgr-2", mgr2)
-        registry.mark_manager_healthy("mgr-1")
-        registry.mark_manager_healthy("mgr-2")
+        await registry.mark_manager_healthy("mgr-1")
+        await registry.mark_manager_healthy("mgr-2")
 
         selected = await registry.select_new_primary_manager()
 
-        assert selected == "mgr-2"  # Leader preferred
+        assert selected == "mgr-2"
 
     @pytest.mark.asyncio
     async def test_select_new_primary_manager_no_leader(self):
-        """Test selecting new primary when no leader."""
         logger = MagicMock()
         registry = WorkerRegistry(logger)
 
@@ -262,7 +260,7 @@ class TestWorkerRegistryPrimaryManager:
         mgr1.is_leader = False
 
         registry.add_manager("mgr-1", mgr1)
-        registry.mark_manager_healthy("mgr-1")
+        await registry.mark_manager_healthy("mgr-1")
 
         selected = await registry.select_new_primary_manager()
 
