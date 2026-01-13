@@ -2004,10 +2004,10 @@ class ManagerServer(HealthAwareServer):
                     sync_response = StateSyncResponse.load(response)
                     if sync_response.manager_state and sync_response.responder_ready:
                         peer_snapshot = sync_response.manager_state
-                        self._manager_state._job_leaders.update(
+                        self._manager_state.update_job_leaders(
                             peer_snapshot.job_leaders
                         )
-                        self._manager_state._job_leader_addrs.update(
+                        self._manager_state.update_job_leader_addrs(
                             peer_snapshot.job_leader_addrs
                         )
 
@@ -3626,8 +3626,8 @@ class ManagerServer(HealthAwareServer):
             self._manager_state._job_layer_version[sync.job_id] = sync.layer_version
 
             # Update job leader if not set
-            if sync.job_id not in self._manager_state._job_leaders:
-                self._manager_state._job_leaders[sync.job_id] = sync.source_node_id
+            if not self._manager_state.has_job_leader(sync.job_id):
+                self._manager_state.set_job_leader(sync.job_id, sync.source_node_id)
 
             return ContextLayerSyncAck(
                 job_id=sync.job_id,

@@ -543,6 +543,12 @@ class ManagerState:
     def iter_job_leaders(self) -> list[tuple[str, str]]:
         return list(self._job_leaders.items())
 
+    def update_job_leaders(self, leaders: dict[str, str]) -> None:
+        self._job_leaders.update(leaders)
+
+    def update_job_leader_addrs(self, addrs: dict[str, tuple[str, int]]) -> None:
+        self._job_leader_addrs.update(addrs)
+
     # =========================================================================
     # Worker Health Accessors (5 direct accesses each)
     # =========================================================================
