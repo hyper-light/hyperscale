@@ -505,17 +505,15 @@ class TestWorkerExecutorProgressFlushLoop:
 
 
 class TestWorkerExecutorMetrics:
-    """Test execution metrics."""
-
-    def test_get_execution_metrics(self):
-        """Test getting execution metrics."""
+    @pytest.mark.asyncio
+    async def test_get_execution_metrics(self):
         allocator = MockCoreAllocator(total_cores=16)
         logger = MagicMock()
         state = MockWorkerState()
         executor = WorkerExecutor(allocator, logger, state)
 
-        executor.record_throughput_event(1.0)
-        executor.record_throughput_event(2.0)
+        await executor.record_throughput_event(1.0)
+        await executor.record_throughput_event(2.0)
 
         metrics = executor.get_execution_metrics()
 
