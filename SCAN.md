@@ -2,6 +2,26 @@
 
 Complete workflow for verifying and fixing modular architecture integrity in node server files.
 
+## FUNDAMENTAL PRINCIPLE: NO SHORTCUTS
+
+**Every fix in this workflow must address the root cause, not paper over symptoms.**
+
+A shortcut is any fix that:
+- Uses a "proxy" field instead of the correct field
+- Adds comments explaining why wrong data is being used
+- Suppresses errors instead of fixing them
+- Uses type casts (`as any`, `# type: ignore`) to silence warnings
+- Computes values from unrelated data because the right data isn't available
+
+**If the correct attribute doesn't exist, the fix is one of:**
+1. Add the attribute to the model (if it belongs there)
+2. Find where the attribute actually lives and navigate to it
+3. Understand why the code expects this attribute and fix the design
+
+**NEVER**: Use a different field as a "proxy" and add a comment explaining the workaround.
+
+This principle applies to EVERY phase below.
+
 ## Phase 1: Extract All Component Calls
 
 **Objective**: Build complete inventory of every method call on every component.
@@ -143,13 +163,49 @@ For each attribute access, verify the attribute exists on the expected type:
 | `WorkflowInfo` | `completed_count` | **NO** | `SubWorkflowInfo.progress.completed_count` |
 | `WorkflowInfo` | `failed_count` | **NO** | `SubWorkflowInfo.progress.failed_count` |
 
-### Step 3.5d: Fix Invalid Accesses
+### Step 3.5d: Fix Invalid Accesses (NO SHORTCUTS)
+
+**CRITICAL: Every fix must address the root cause. No proxies, no workarounds.**
 
 For each invalid attribute access:
 
 1. **Trace the correct path**: Find where the attribute actually lives
 2. **Understand the data model**: Why is it there and not here?
 3. **Fix the access pattern**: Update code to navigate to correct location
+4. **If attribute doesn't exist anywhere**: Add it to the correct model, don't fake it
+
+**FORBIDDEN fixes (these are shortcuts):**
+```python
+# FORBIDDEN: Using a "proxy" field
+# job.completed_at doesn't exist, so use timestamp as proxy
+time_since_completion = current_time - job.timestamp  # WRONG - this is a shortcut!
+
+# FORBIDDEN: Adding comments to explain workarounds
+# Use timestamp as proxy for completion time (updated when status changes)
+if job.timestamp > 0:  # WRONG - commenting the shortcut doesn't make it right
+
+# FORBIDDEN: Suppressing type errors
+job.completed_at  # type: ignore  # WRONG
+```
+
+**REQUIRED fixes (these address root cause):**
+```python
+# CORRECT: Add the attribute if it belongs on the model
+# In models/jobs.py, add: completed_at: float = 0.0
+# Then set it when job completes
+
+# CORRECT: Navigate to where data actually lives
+# If completion time is tracked in timeout_tracking:
+if job.timeout_tracking and job.timeout_tracking.completed_at:
+    time_since_completion = current_time - job.timeout_tracking.completed_at
+
+# CORRECT: Compute from authoritative source
+# If completion is tracked per-workflow, aggregate properly:
+latest_completion = max(
+    (wf.completed_at for wf in job.workflows.values() if wf.completed_at),
+    default=0.0
+)
+```
 
 Common patterns:
 
@@ -158,6 +214,7 @@ Common patterns:
 | Accessing child attribute on parent | Navigate through relationship |
 | Accessing aggregated value that doesn't exist | Compute aggregation from children |
 | Accessing attribute from wrong type in union | Add type guard |
+| Attribute doesn't exist on any model | **Add it to the correct model** |
 
 **Example fix** (WorkflowInfo.completed_count bug):
 
