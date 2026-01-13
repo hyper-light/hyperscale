@@ -2564,7 +2564,6 @@ class ManagerServer(HealthAwareServer):
         try:
             registration = ManagerPeerRegistration.load(data)
 
-            # Register peer using the node field (which is ManagerInfo)
             self._registry.register_manager_peer(registration.node)
 
             # Add to SWIM
