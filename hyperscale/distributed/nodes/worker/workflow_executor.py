@@ -234,7 +234,7 @@ class WorkerWorkflowExecutor:
         run_id = hash(dispatch.workflow_id) % (2**31)
         error: Exception | None = None
         workflow_error: str | None = None
-        workflow_results: dict = {}
+        workflow_results: Any = {}
         context_updates: bytes = b""
         progress_token = None
 
