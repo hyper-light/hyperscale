@@ -32,7 +32,7 @@ class CircuitBreakerManager:
     manager don't affect dispatch to other managers.
     """
 
-    __slots__ = ("_circuits", "_config", "_lock")
+    __slots__ = ("_circuits", "_config", "_lock", "_incarnations")
 
     def __init__(self, env: Env):
         cb_config = env.get_circuit_breaker_config()
@@ -42,6 +42,7 @@ class CircuitBreakerManager:
             half_open_after=cb_config["half_open_after"],
         )
         self._circuits: dict[tuple[str, int], ErrorStats] = {}
+        self._incarnations: dict[tuple[str, int], int] = {}
         self._lock = asyncio.Lock()
 
     async def get_circuit(self, manager_addr: tuple[str, int]) -> ErrorStats:
