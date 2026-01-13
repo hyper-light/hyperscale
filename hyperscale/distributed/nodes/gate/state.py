@@ -169,19 +169,18 @@ class GateRuntimeState:
         """Get the number of active peers."""
         return len(self._active_gate_peers)
 
-    # Datacenter/manager methods
-    def update_manager_status(
+    async def update_manager_status(
         self,
         datacenter_id: str,
         manager_addr: tuple[str, int],
         heartbeat: ManagerHeartbeat,
         timestamp: float,
     ) -> None:
-        """Update manager status with new heartbeat."""
-        if datacenter_id not in self._datacenter_manager_status:
-            self._datacenter_manager_status[datacenter_id] = {}
-        self._datacenter_manager_status[datacenter_id][manager_addr] = heartbeat
-        self._manager_last_status[manager_addr] = timestamp
+        async with self._get_manager_state_lock():
+            if datacenter_id not in self._datacenter_manager_status:
+                self._datacenter_manager_status[datacenter_id] = {}
+            self._datacenter_manager_status[datacenter_id][manager_addr] = heartbeat
+            self._manager_last_status[manager_addr] = timestamp
 
     def get_manager_status(
         self, datacenter_id: str, manager_addr: tuple[str, int]
