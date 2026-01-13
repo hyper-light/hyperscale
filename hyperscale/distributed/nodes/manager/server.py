@@ -4534,9 +4534,35 @@ class ManagerServer(HealthAwareServer):
         self,
         worker_snapshot: WorkerStateSnapshot,
     ) -> None:
-        """Register with a discovered worker."""
-        # Implementation: Contact worker directly to complete registration
-        pass
+        """Register a discovered worker from peer manager gossip."""
+        worker_id = worker_snapshot.node_id
+        if worker_id in self._manager_state._workers:
+            return
+
+        node_info = NodeInfo(
+            node_id=worker_id,
+            host=worker_snapshot.host,
+            tcp_port=worker_snapshot.tcp_port,
+            udp_port=worker_snapshot.udp_port,
+            role=NodeRole.WORKER,
+        )
+
+        registration = WorkerRegistration(
+            node=node_info,
+            total_cores=worker_snapshot.total_cores,
+            available_cores=worker_snapshot.available_cores,
+            memory_mb=0,
+        )
+
+        self._registry.register_worker(registration)
+
+        self._worker_pool.register_worker(
+            worker_id=worker_id,
+            total_cores=worker_snapshot.total_cores,
+            available_cores=worker_snapshot.available_cores,
+            tcp_addr=(worker_snapshot.host, worker_snapshot.tcp_port),
+            is_remote=True,
+        )
 
     def _is_job_leader(self, job_id: str) -> bool:
         """Check if this manager is the leader for a job."""

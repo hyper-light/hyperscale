@@ -5,7 +5,6 @@ Handles worker allocation, quorum coordination, and dispatch tracking.
 Implements AD-17 smart dispatch with health bucket selection.
 """
 
-import asyncio
 from typing import TYPE_CHECKING
 
 from hyperscale.distributed.models import (
@@ -16,7 +15,6 @@ from hyperscale.distributed.models import (
     WorkerRegistration,
 )
 from hyperscale.logging.hyperscale_logging_models import (
-    ServerInfo,
     ServerDebug,
     ServerWarning,
 )

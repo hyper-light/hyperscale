@@ -64,7 +64,7 @@ class GateHealthCoordinator:
         dc_health_monitor: FederatedHealthMonitor,
         cross_dc_correlation: "CrossDCCorrelationDetector",
         dc_manager_discovery: dict[str, DiscoveryService],
-        versioned_clock: "VersionedClock",
+        versioned_clock: "VersionedStateClock",
         manager_dispatcher: "ManagerDispatcher",
         manager_health_config: dict,
         get_node_id: Callable[[], "NodeId"],
