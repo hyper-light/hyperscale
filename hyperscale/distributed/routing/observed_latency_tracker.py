@@ -113,3 +113,21 @@ class ObservedLatencyTracker:
         if self.max_staleness_seconds <= 0.0:
             return 0.0
         return max(0.0, 1.0 - (staleness_seconds / self.max_staleness_seconds))
+
+    async def cleanup_stale_entries(
+        self, cleanup_threshold_seconds: float = 600.0
+    ) -> int:
+        current_time = monotonic()
+        async with self._lock:
+            stale_dc_ids = [
+                dc_id
+                for dc_id, state in self._latencies.items()
+                if (current_time - state.last_update) > cleanup_threshold_seconds
+            ]
+            for dc_id in stale_dc_ids:
+                self._latencies.pop(dc_id, None)
+        return len(stale_dc_ids)
+
+    async def remove_datacenter(self, datacenter_id: str) -> None:
+        async with self._lock:
+            self._latencies.pop(datacenter_id, None)
