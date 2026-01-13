@@ -674,7 +674,11 @@ class WorkerServer(HealthAwareServer):
                 await asyncio.sleep(1.0)
             except asyncio.CancelledError:
                 break
-            except Exception:
+            except Exception as exc:
+                await self._logger.log(
+                    f"Resource sampling failed: {exc}",
+                    level="debug",
+                )
                 await asyncio.sleep(1.0)
 
     async def _stop_background_loops(self) -> None:
