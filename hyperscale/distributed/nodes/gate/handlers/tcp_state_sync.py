@@ -54,7 +54,7 @@ class GateStateSyncHandler:
         task_runner: "TaskRunner",
         job_manager: "GateJobManager",
         job_leadership_tracker: "JobLeadershipTracker",
-        versioned_clock: "VersionedClock",
+        versioned_clock: "VersionedStateClock",
         get_node_id: Callable[[], "NodeId"],
         get_host: Callable[[], str],
         get_tcp_port: Callable[[], int],
