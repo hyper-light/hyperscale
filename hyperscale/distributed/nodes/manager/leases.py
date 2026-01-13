@@ -107,7 +107,7 @@ class ManagerLeaseCoordinator:
 
             if job_id not in self._state._job_fencing_tokens:
                 self._state._job_fencing_tokens[job_id] = 1
-                self._state._job_layer_version[job_id] = 1
+                self._state._job_layer_version[job_id] = 0
             elif force_takeover:
                 self._state._job_fencing_tokens[job_id] += 1
 
