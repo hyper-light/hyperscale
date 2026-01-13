@@ -2,7 +2,9 @@
 
 Complete workflow for verifying and fixing modular architecture integrity in node server files.
 
-## FUNDAMENTAL PRINCIPLE: NO SHORTCUTS
+## FUNDAMENTAL PRINCIPLES
+
+### NO SHORTCUTS
 
 **Every fix in this workflow must address the root cause, not paper over symptoms.**
 
@@ -21,6 +23,31 @@ A shortcut is any fix that:
 **NEVER**: Use a different field as a "proxy" and add a comment explaining the workaround.
 
 This principle applies to EVERY phase below.
+
+### ALL PHASES ARE MANDATORY
+
+**Every phase in this workflow MUST be executed. No skipping. No deferral.**
+
+| Rule | Enforcement |
+|------|-------------|
+| **No phase skipping** | Each phase must be completed before proceeding to the next |
+| **No "optional" steps** | Every step within a phase is required, not optional |
+| **No deferral** | "We'll do this later" is not acceptable - do it now |
+| **No partial completion** | A phase is not done until ALL its outputs are achieved |
+| **No complexity exemptions** | Large refactors are still required - size is not an excuse |
+
+**BLOCKING**: Workflow cannot proceed to Phase N+1 until Phase N is fully complete with zero violations.
+
+### Phase Execution Checklist
+
+Before marking ANY phase complete, verify:
+- [ ] All detection scans run (not just "spot checks")
+- [ ] All violations identified and documented
+- [ ] All violations FIXED (not just documented)
+- [ ] Verification scan shows ZERO remaining violations
+- [ ] LSP diagnostics clean on all modified files
+
+**If ANY check fails, the phase is NOT complete.**
 
 ## Phase 1: Extract All Component Calls
 
@@ -872,7 +899,9 @@ def scan_server_file(self, server_path: Path) -> None:
 
 For these cases, fall back to LSP validation.
 
-### Step 3.5h.2: Chained Method Access Validation (CRITICAL)
+### Step 3.5h.2: Chained Method Access Validation (MANDATORY - CRITICAL)
+
+**STATUS: MANDATORY** - This step MUST be executed. Method call validation is equally important as attribute validation.
 
 **The Problem:**
 
