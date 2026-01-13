@@ -93,6 +93,8 @@ from hyperscale.distributed.models import (
     RateLimitResponse,
     TrackingToken,
     restricted_loads,
+    JobInfo,
+    WorkflowInfo,
 )
 from hyperscale.distributed.models.worker_state import (
     WorkerStateUpdate,
@@ -121,6 +123,7 @@ from hyperscale.distributed.jobs import (
     WorkflowDispatcher,
     WindowedStatsCollector,
 )
+from hyperscale.distributed.models.jobs import JobInfo, WorkflowInfo
 from hyperscale.distributed.ledger.wal import NodeWAL
 from hyperscale.logging.lsn import HybridLamportClock
 from hyperscale.distributed.jobs.timeout_strategy import (
