@@ -44,38 +44,22 @@ class CircuitBreakerManager:
         self._circuits: dict[tuple[str, int], ErrorStats] = {}
         self._lock = asyncio.Lock()
 
-    def get_circuit(self, manager_addr: tuple[str, int]) -> ErrorStats:
-        """
-        Get or create a circuit breaker for a specific manager.
+    async def get_circuit(self, manager_addr: tuple[str, int]) -> ErrorStats:
+        async with self._lock:
+            if manager_addr not in self._circuits:
+                self._circuits[manager_addr] = ErrorStats(
+                    max_errors=self._config.max_errors,
+                    window_seconds=self._config.window_seconds,
+                    half_open_after=self._config.half_open_after,
+                )
+            return self._circuits[manager_addr]
 
-        Args:
-            manager_addr: (host, port) tuple for the manager.
-
-        Returns:
-            ErrorStats circuit breaker for this manager.
-        """
-        if manager_addr not in self._circuits:
-            self._circuits[manager_addr] = ErrorStats(
-                max_errors=self._config.max_errors,
-                window_seconds=self._config.window_seconds,
-                half_open_after=self._config.half_open_after,
-            )
-        return self._circuits[manager_addr]
-
-    def is_circuit_open(self, manager_addr: tuple[str, int]) -> bool:
-        """
-        Check if a manager's circuit breaker is open.
-
-        Args:
-            manager_addr: (host, port) tuple for the manager.
-
-        Returns:
-            True if the circuit is open (manager should not be contacted).
-        """
-        circuit = self._circuits.get(manager_addr)
-        if not circuit:
-            return False
-        return circuit.circuit_state == CircuitState.OPEN
+    async def is_circuit_open(self, manager_addr: tuple[str, int]) -> bool:
+        async with self._lock:
+            circuit = self._circuits.get(manager_addr)
+            if not circuit:
+                return False
+            return circuit.circuit_state == CircuitState.OPEN
 
     def get_circuit_status(self, manager_addr: tuple[str, int]) -> dict | None:
         """
