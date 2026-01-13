@@ -157,6 +157,13 @@ class MockGateInfo:
     addr: tuple[str, int] = field(default_factory=lambda: ("10.0.0.2", 9000))
 
 
+def make_async_rate_limiter(allowed: bool = True, retry_after: float = 0.0):
+    async def check_rate_limit(client_id: str, op: str) -> tuple[bool, float]:
+        return (allowed, retry_after)
+
+    return check_rate_limit
+
+
 def create_mock_handler(
     state: GateRuntimeState = None,
     rate_limit_allowed: bool = True,

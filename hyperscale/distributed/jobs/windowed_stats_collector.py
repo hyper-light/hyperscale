@@ -379,3 +379,68 @@ class WindowedStatsCollector:
     def get_pending_windows_for_job(self, job_id: str) -> int:
         """Get the number of pending windows for a specific job."""
         return sum(1 for key in self._buckets.keys() if key[0] == job_id)
+
+    def get_jobs_with_pending_stats(self) -> list[str]:
+        """
+        Get list of job IDs that have pending stats windows.
+
+        Used by stats coordinators to determine which jobs need
+        stats pushed to clients/gates.
+
+        Returns:
+            List of unique job IDs with pending windows.
+        """
+        job_ids: set[str] = set()
+        for job_id, _, _ in self._buckets.keys():
+            job_ids.add(job_id)
+        return list(job_ids)
+
+    async def get_aggregated_stats(self, job_id: str) -> list[WindowedStatsPush]:
+        """
+        Get aggregated stats for a job's closed windows.
+
+        Flushes closed windows for the specified job and returns them
+        as aggregated WindowedStatsPush messages. Windows that are not
+        yet closed (within drift tolerance) are left in place.
+
+        This is the primary method used by GateStatsCoordinator to
+        push periodic stats to clients.
+
+        Args:
+            job_id: The job identifier.
+
+        Returns:
+            List of WindowedStatsPush for closed windows belonging to this job.
+        """
+        now = time.time()
+        results: list[WindowedStatsPush] = []
+        keys_to_remove: list[tuple[str, str, int]] = []
+
+        async with self._lock:
+            for key, bucket in self._buckets.items():
+                if key[0] != job_id:
+                    continue
+
+                _, _, bucket_num = key
+                if self._is_window_closed(bucket_num, now):
+                    push = self._aggregate_bucket(bucket)
+                    results.append(push)
+                    keys_to_remove.append(key)
+
+            for key in keys_to_remove:
+                del self._buckets[key]
+
+        return results
+
+    async def record(self, worker_id: str, progress: WorkflowProgress) -> None:
+        """
+        Record a workflow progress update.
+
+        Convenience method that wraps add_progress() for use by manager
+        servers that have already resolved the worker_id from the connection.
+
+        Args:
+            worker_id: Unique identifier for the worker sending this update.
+            progress: The workflow progress update.
+        """
+        await self.add_progress(worker_id, progress)
