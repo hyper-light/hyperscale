@@ -2690,12 +2690,28 @@ class ManagerServer(HealthAwareServer):
                     context_updates_bytes=result.context_updates,
                 )
 
-            self._job_manager.complete_workflow(
-                job_id=result.job_id,
-                workflow_id=result.workflow_id,
-                success=result.status == WorkflowStatus.COMPLETED.value,
-                results=result.results,
+            # Record sub-workflow result and check if parent workflow is complete
+            (
+                result_recorded,
+                parent_complete,
+            ) = await self._job_manager.record_sub_workflow_result(
+                sub_workflow_token=result.workflow_id,
+                result=result,
             )
+
+            # If all sub-workflows are complete, mark parent workflow as completed/failed
+            if result_recorded and parent_complete:
+                sub_token = TrackingToken.parse(result.workflow_id)
+                parent_workflow_token = sub_token.workflow_token
+                if parent_workflow_token:
+                    if result.status == WorkflowStatus.COMPLETED.value:
+                        await self._job_manager.mark_workflow_completed(
+                            parent_workflow_token
+                        )
+                    elif result.error:
+                        await self._job_manager.mark_workflow_failed(
+                            parent_workflow_token, result.error
+                        )
 
             if (job := self._job_manager.get_job(result.job_id)) and job.is_complete:
                 await self._handle_job_completion(result.job_id)
