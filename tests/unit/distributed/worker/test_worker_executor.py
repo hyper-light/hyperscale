@@ -69,8 +69,7 @@ class MockWorkerState:
         self._progress_buffer_lock = asyncio.Lock()
         self._throughput_last_value: float = 0.0
 
-    def record_completion(self, duration_seconds: float) -> None:
-        """Record a workflow completion for throughput tracking."""
+    async def record_completion(self, duration_seconds: float) -> None:
         self._throughput_completions += 1
         self._completion_times.append(duration_seconds)
         if len(self._completion_times) > 50:
