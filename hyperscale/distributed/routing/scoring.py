@@ -62,7 +62,6 @@ class RoutingScorer:
         Returns:
             DatacenterRoutingScore with all components
         """
-        # Calculate utilization
         if candidate.total_cores > 0:
             utilization = 1.0 - (candidate.available_cores / candidate.total_cores)
         else:
@@ -78,6 +77,7 @@ class RoutingScorer:
             coordinate_quality=candidate.coordinate_quality,
             is_preferred=is_preferred,
             preference_multiplier=self._config.preference_multiplier,
+            health_severity_weight=candidate.health_severity_weight,
         )
 
     def score_datacenters(
@@ -97,8 +97,7 @@ class RoutingScorer:
         """
         preferred = preferred_datacenters or set()
         scores = [
-            self.score_datacenter(c, c.datacenter_id in preferred)
-            for c in candidates
+            self.score_datacenter(c, c.datacenter_id in preferred) for c in candidates
         ]
         return sorted(scores, key=lambda s: s.final_score)
 
@@ -143,7 +142,9 @@ class RoutingScorer:
         load_factor = min(load_factor, self._config.load_factor_max)
 
         # Quality penalty
-        quality_penalty = 1.0 + self._config.a_quality * (1.0 - candidate.coordinate_quality)
+        quality_penalty = 1.0 + self._config.a_quality * (
+            1.0 - candidate.coordinate_quality
+        )
         quality_penalty = min(quality_penalty, self._config.quality_penalty_max)
 
         return candidate.rtt_ucb_ms * load_factor * quality_penalty
