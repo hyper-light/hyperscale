@@ -10,7 +10,7 @@ single source of truth (no duplicate state).
 """
 
 import asyncio
-from typing import TYPE_CHECKING
+from typing import Callable, TYPE_CHECKING
 
 from hyperscale.distributed.reliability import (
     BackpressureLevel,
