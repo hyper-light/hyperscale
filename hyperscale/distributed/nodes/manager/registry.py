@@ -93,7 +93,7 @@ class ManagerRegistry:
             self._state._worker_addr_to_id.pop(udp_addr, None)
 
         self._state._worker_circuits.pop(worker_id, None)
-        self._state._dispatch_semaphores.pop(worker_id, None)
+        # Note: semaphore kept to avoid race with in-progress dispatches
         self._state._worker_deadlines.pop(worker_id, None)
         self._state._worker_unhealthy_since.pop(worker_id, None)
         self._state._worker_health_states.pop(worker_id, None)
