@@ -1806,8 +1806,15 @@ class ManagerServer(HealthAwareServer):
                                 sync_msg.dump(),
                                 timeout=2.0,
                             )
-                        except Exception:
-                            pass
+                        except Exception as sync_error:
+                            await self._udp_logger.log(
+                                ServerDebug(
+                                    message=f"Peer job state sync to {peer_addr} failed: {sync_error}",
+                                    node_host=self._host,
+                                    node_port=self._tcp_port,
+                                    node_id=self._node_id.short,
+                                )
+                            )
 
             except asyncio.CancelledError:
                 break
