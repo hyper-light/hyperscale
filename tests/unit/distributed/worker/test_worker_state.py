@@ -324,35 +324,38 @@ class TestWorkerStateWorkflowTracking:
 
         assert state._workflow_job_leader["wf-1"] == ("new", 2)
 
-    def test_update_workflow_fence_token_success(self):
+    @pytest.mark.asyncio
+    async def test_update_workflow_fence_token_success(self):
         """Test updating fence token with newer value."""
         allocator = MockCoreAllocator()
         state = WorkerState(allocator)
 
-        result = state.update_workflow_fence_token("wf-1", 5)
+        result = await state.update_workflow_fence_token("wf-1", 5)
         assert result is True
         assert state._workflow_fence_tokens["wf-1"] == 5
 
-    def test_update_workflow_fence_token_stale(self):
+    @pytest.mark.asyncio
+    async def test_update_workflow_fence_token_stale(self):
         """Test rejecting stale fence token."""
         allocator = MockCoreAllocator()
         state = WorkerState(allocator)
 
-        state.update_workflow_fence_token("wf-1", 10)
-        result = state.update_workflow_fence_token("wf-1", 5)
+        await state.update_workflow_fence_token("wf-1", 10)
+        result = await state.update_workflow_fence_token("wf-1", 5)
 
         assert result is False
         assert state._workflow_fence_tokens["wf-1"] == 10
 
-    def test_get_workflow_fence_token(self):
+    @pytest.mark.asyncio
+    async def test_get_workflow_fence_token(self):
         """Test getting workflow fence token."""
         allocator = MockCoreAllocator()
         state = WorkerState(allocator)
 
-        assert state.get_workflow_fence_token("wf-1") == -1
+        assert await state.get_workflow_fence_token("wf-1") == -1
 
-        state.update_workflow_fence_token("wf-1", 42)
-        assert state.get_workflow_fence_token("wf-1") == 42
+        await state.update_workflow_fence_token("wf-1", 42)
+        assert await state.get_workflow_fence_token("wf-1") == 42
 
 
 class TestWorkerStateOrphanTracking:
