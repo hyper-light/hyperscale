@@ -46,8 +46,9 @@ class AckHandler(BaseHandler):
         nodes = self._server.read_nodes()
 
         if source_addr in nodes:
-            # Update node state - triggers recovery callbacks if was DEAD
-            self._server.update_node_state(source_addr, b"OK", 0, time.monotonic())
+            await self._server.update_node_state(
+                source_addr, b"OK", 0, time.monotonic()
+            )
             await self._server.decrease_failure_detector("successful_probe")
 
         if target:
