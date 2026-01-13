@@ -235,10 +235,13 @@ class TestGatePingHandlerFailureMode:
             get_datacenter_managers=lambda: {},
         )
 
+        async def mock_handle_exception(error, context):
+            pass
+
         result = await handler.handle_ping(
             addr=("10.0.0.1", 8000),
             data=b"request_data",
-            clock_time=12345,
+            handle_exception=mock_handle_exception,
         )
 
         # Should return error response
@@ -446,13 +449,16 @@ class TestGatePingHandlerConcurrency:
             get_datacenter_managers=lambda: {"dc-1": []},
         )
 
+        async def mock_handle_exception(error, context):
+            pass
+
         # Send many concurrent pings
         results = await asyncio.gather(
             *[
                 handler.handle_ping(
                     addr=(f"10.0.0.{i}", 8000),
                     data=b"ping_data",
-                    clock_time=12345 + i,
+                    handle_exception=mock_handle_exception,
                 )
                 for i in range(100)
             ]
