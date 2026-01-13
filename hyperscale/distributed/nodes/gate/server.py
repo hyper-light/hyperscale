@@ -216,6 +216,7 @@ from .dispatch_coordinator import GateDispatchCoordinator
 from .leadership_coordinator import GateLeadershipCoordinator
 from .peer_coordinator import GatePeerCoordinator
 from .health_coordinator import GateHealthCoordinator
+from .orphan_job_coordinator import GateOrphanJobCoordinator
 from .config import GateConfig, create_gate_config
 from .state import GateRuntimeState
 from .handlers import (
