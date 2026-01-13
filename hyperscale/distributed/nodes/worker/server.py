@@ -1233,21 +1233,24 @@ class WorkerServer(HealthAwareServer):
         if not updates:
             return updates
 
+        by_job = self._group_progress_updates_by_job(updates)
+        return self._select_best_progress_per_job(by_job)
+
+    def _group_progress_updates_by_job(
+        self, updates: dict[str, WorkflowProgress]
+    ) -> dict[str, list[WorkflowProgress]]:
         by_job: dict[str, list[WorkflowProgress]] = {}
-        for workflow_id, progress in updates.items():
-            job_id = progress.job_id
-            if job_id not in by_job:
-                by_job[job_id] = []
-            by_job[job_id].append(progress)
+        for progress in updates.values():
+            by_job.setdefault(progress.job_id, []).append(progress)
+        return by_job
 
+    def _select_best_progress_per_job(
+        self, by_job: dict[str, list[WorkflowProgress]]
+    ) -> dict[str, WorkflowProgress]:
         aggregated: dict[str, WorkflowProgress] = {}
-        for job_id, job_updates in by_job.items():
-            if len(job_updates) == 1:
-                aggregated[job_updates[0].workflow_id] = job_updates[0]
-            else:
-                best_update = max(job_updates, key=lambda p: p.completed_count)
-                aggregated[best_update.workflow_id] = best_update
-
+        for job_updates in by_job.values():
+            best_update = max(job_updates, key=lambda p: p.completed_count)
+            aggregated[best_update.workflow_id] = best_update
         return aggregated
 
     async def _report_active_workflows_to_managers(self) -> None:
