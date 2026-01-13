@@ -2781,14 +2781,12 @@ class ManagerServer(HealthAwareServer):
                     job_id, success=False, error=error_msg
                 )
 
-            # Check if already cancelled (idempotency)
-            if job.status == JobStatus.CANCELLED:
+            if job.status == JobStatus.CANCELLED.value:
                 return self._build_cancel_response(
                     job_id, success=True, already_cancelled=True
                 )
 
-            # Check if already completed (cannot cancel)
-            if job.status == JobStatus.COMPLETED:
+            if job.status == JobStatus.COMPLETED.value:
                 return self._build_cancel_response(
                     job_id,
                     success=False,
