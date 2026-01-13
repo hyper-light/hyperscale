@@ -161,9 +161,6 @@ from hyperscale.distributed.swim.gossip.worker_state_gossip_buffer import (
     WorkerStateGossipBuffer,
 )
 
-if TYPE_CHECKING:
-    from hyperscale.logging import Logger
-
 
 class ManagerServer(HealthAwareServer):
     """
