@@ -506,28 +506,23 @@ class AsyncSafeJobStatsCRDT:
     def get_dc_status(self, dc_id: str) -> str | None:
         return self._crdt.get_dc_status(dc_id)
 
-    async def merge_in_place(
-        self, other: JobStatsCRDT | ThreadSafeJobStatsCRDT
-    ) -> None:
-        """Thread-safe merge with asyncio.Lock protection."""
-        other_crdt = other._crdt if isinstance(other, ThreadSafeJobStatsCRDT) else other
+    async def merge_in_place(self, other: JobStatsCRDT | AsyncSafeJobStatsCRDT) -> None:
+        other_crdt = other._crdt if isinstance(other, AsyncSafeJobStatsCRDT) else other
         async with self._lock:
             self._crdt.merge_in_place(other_crdt)
 
-    def merge(self, other: JobStatsCRDT | ThreadSafeJobStatsCRDT) -> JobStatsCRDT:
-        """Immutable merge returns a new JobStatsCRDT (no lock needed)."""
-        other_crdt = other._crdt if isinstance(other, ThreadSafeJobStatsCRDT) else other
+    def merge(self, other: JobStatsCRDT | AsyncSafeJobStatsCRDT) -> JobStatsCRDT:
+        other_crdt = other._crdt if isinstance(other, AsyncSafeJobStatsCRDT) else other
         return self._crdt.merge(other_crdt)
 
     def to_dict(self) -> dict[str, Any]:
         return self._crdt.to_dict()
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> ThreadSafeJobStatsCRDT:
+    def from_dict(cls, data: dict[str, Any]) -> AsyncSafeJobStatsCRDT:
         instance = cls(job_id=data["job_id"])
         instance._crdt = JobStatsCRDT.from_dict(data)
         return instance
 
     def get_inner(self) -> JobStatsCRDT:
-        """Get the underlying JobStatsCRDT (for serialization or read-only access)."""
         return self._crdt
