@@ -125,9 +125,6 @@ class GateJobManager:
     def job_count(self) -> int:
         return len(self._jobs)
 
-    def count_active_jobs(self) -> int:
-        return len(self._jobs)
-
     def items(self):
         """Iterate over job_id, job pairs."""
         return self._jobs.items()
