@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from hyperscale.distributed.models import (
     WorkflowProgress,
     StepStats,
+    Message,
 )
 
 

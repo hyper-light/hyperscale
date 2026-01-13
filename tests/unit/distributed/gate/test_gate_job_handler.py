@@ -780,7 +780,7 @@ class TestHandleProgressFencingTokens:
             get_host=lambda: "127.0.0.1",
             get_tcp_port=lambda: 9000,
             is_leader=lambda: True,
-            check_rate_limit=lambda client_id, op: (True, 0),
+            check_rate_limit=make_async_rate_limiter(allowed=True, retry_after=0),
             should_shed_request=lambda req_type: False,
             has_quorum_available=lambda: True,
             quorum_size=lambda: 3,
@@ -805,7 +805,7 @@ class TestHandleProgressFencingTokens:
             total_completed=50,
             total_failed=0,
             overall_rate=10.0,
-            fence_token=5,  # Stale token (< 10)
+            fence_token=5,
         )
 
         result = await handler.handle_progress(
@@ -813,7 +813,6 @@ class TestHandleProgressFencingTokens:
             data=progress.dump(),
         )
 
-        # Should still return ack (but log warning)
         assert isinstance(result, bytes)
 
     @pytest.mark.asyncio
@@ -842,11 +841,12 @@ class TestHandleProgressFencingTokens:
             quorum_circuit=MockQuorumCircuit(),
             load_shedder=MockLoadShedder(),
             job_lease_manager=MagicMock(),
+            idempotency_cache=None,
             get_node_id=lambda: MockNodeId(),
             get_host=lambda: "127.0.0.1",
             get_tcp_port=lambda: 9000,
             is_leader=lambda: True,
-            check_rate_limit=lambda client_id, op: (True, 0),
+            check_rate_limit=make_async_rate_limiter(allowed=True, retry_after=0),
             should_shed_request=lambda req_type: False,
             has_quorum_available=lambda: True,
             quorum_size=lambda: 3,
