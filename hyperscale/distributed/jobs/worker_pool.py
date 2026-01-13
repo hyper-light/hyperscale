@@ -394,27 +394,25 @@ class WorkerPool:
             worker.heartbeat = heartbeat
             worker.last_seen = time.monotonic()
 
-            # Update cores from heartbeat (authoritative source)
             old_available = worker.available_cores
             worker.available_cores = heartbeat.available_cores
             worker.total_cores = heartbeat.available_cores + len(
                 heartbeat.active_workflows
             )
 
-            # Clear any reservations that are now confirmed
             worker.reserved_cores = 0
 
-            # Signal if cores became available
+            worker.overload_state = getattr(
+                heartbeat, "health_overload_state", "healthy"
+            )
+
             if worker.available_cores > old_available:
                 self._cores_available.set()
 
-            # Update three-signal health state (AD-19)
             health_state = self._worker_health.get(node_id)
             if health_state:
-                # Heartbeat received = liveness success
                 health_state.update_liveness(success=True)
 
-                # Update readiness from heartbeat data
                 health_state.update_readiness(
                     accepting=worker.available_cores > 0,
                     capacity=worker.available_cores,
