@@ -123,7 +123,9 @@ class GateJobManager:
         return dict(self._jobs)
 
     def job_count(self) -> int:
-        """Get the number of tracked jobs."""
+        return len(self._jobs)
+
+    def count_active_jobs(self) -> int:
         return len(self._jobs)
 
     def items(self):
