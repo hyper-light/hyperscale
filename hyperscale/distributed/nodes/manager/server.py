@@ -2274,7 +2274,12 @@ class ManagerServer(HealthAwareServer):
         """Notify timeout strategies of worker extension (AD-34 Part 10.4.7)."""
         # Find jobs with workflows on this worker
         for job in self._job_manager.iter_jobs():
-            if worker_id in job.workers:
+            job_worker_ids = {
+                sub_wf.worker_id
+                for sub_wf in job.sub_workflows.values()
+                if sub_wf.worker_id
+            }
+            if worker_id in job_worker_ids:
                 strategy = self._manager_state._job_timeout_strategies.get(job.job_id)
                 if strategy and hasattr(strategy, "record_extension"):
                     await strategy.record_extension(
@@ -2498,7 +2503,7 @@ class ManagerServer(HealthAwareServer):
                 worker_id=registration.node.node_id,
                 total_cores=registration.total_cores,
                 available_cores=registration.available_cores,
-                tcp_addr=(registration.node.host, registration.node.tcp_port),
+                tcp_addr=(registration.node.host, registration.node.port),
             )
 
             # Add to SWIM
