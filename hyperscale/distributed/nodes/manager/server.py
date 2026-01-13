@@ -2050,7 +2050,7 @@ class ManagerServer(HealthAwareServer):
 
     def _get_swim_status_for_worker(self, worker_id: str) -> str:
         """Get SWIM status for a worker."""
-        if worker_id in self._manager_state._worker_unhealthy_since:
+        if self._manager_state.has_worker_unhealthy_since(worker_id):
             return "unhealthy"
         return "healthy"
 
@@ -2319,7 +2319,7 @@ class ManagerServer(HealthAwareServer):
         """
         worker = self._manager_state.get_worker(worker_id)
         if worker is None:
-            self._manager_state._worker_deadlines.pop(worker_id, None)
+            self._manager_state.clear_worker_deadline(worker_id)
             return
 
         hierarchical_detector = self.get_hierarchical_detector()
