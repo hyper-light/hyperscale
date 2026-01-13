@@ -1917,25 +1917,26 @@ class ManagerServer(HealthAwareServer):
         ]
 
     def _get_worker_state_piggyback(self, max_size: int) -> bytes:
-        """
-        Get worker state piggyback for gossip dissemination (AD-48).
-
-        Overrides base HealthAwareServer method to return actual worker
-        state updates from the WorkerDisseminator's gossip buffer.
-
-        Args:
-            max_size: Maximum size in bytes for the piggyback data.
-
-        Returns:
-            Encoded worker state piggyback bytes, or empty bytes if
-            disseminator is not initialized.
-        """
         if self._worker_disseminator is None:
             return b""
         return self._worker_disseminator.get_gossip_buffer().encode_piggyback(
             max_count=5,
             max_size=max_size,
         )
+
+    async def _process_worker_state_piggyback(
+        self,
+        piggyback_data: bytes,
+        source_addr: tuple[str, int],
+    ) -> None:
+        if self._worker_disseminator is None:
+            return
+
+        updates = WorkerStateGossipBuffer.decode_piggyback(piggyback_data)
+        for update in updates:
+            await self._worker_disseminator.handle_worker_state_update(
+                update, source_addr
+            )
 
     async def _push_cancellation_complete_to_origin(
         self,

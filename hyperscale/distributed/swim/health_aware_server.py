@@ -1206,6 +1206,13 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
     def _get_worker_state_piggyback(self, max_size: int) -> bytes:
         return b""
 
+    async def _process_worker_state_piggyback(
+        self,
+        piggyback_data: bytes,
+        source_addr: tuple[str, int],
+    ) -> None:
+        pass
+
     async def _build_xprobe_response(
         self,
         source_addr: tuple[str, int] | bytes,
