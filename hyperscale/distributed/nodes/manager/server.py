@@ -1098,10 +1098,8 @@ class ManagerServer(HealthAwareServer):
         heartbeat: ManagerHeartbeat,
         source_addr: tuple[str, int],
     ) -> None:
-        """Handle embedded manager heartbeat from SWIM."""
         peer_id = heartbeat.node_id
 
-        # Register peer if not known
         if peer_id not in self._manager_state._known_manager_peers:
             peer_info = ManagerInfo(
                 node_id=peer_id,
@@ -1114,7 +1112,17 @@ class ManagerServer(HealthAwareServer):
             )
             self._registry.register_manager_peer(peer_info)
 
-        # Confirm peer
+        peer_health_state = getattr(heartbeat, "health_overload_state", "healthy")
+        previous_peer_state = self._manager_state._peer_manager_health_states.get(
+            peer_id
+        )
+        self._manager_state._peer_manager_health_states[peer_id] = peer_health_state
+
+        if previous_peer_state and previous_peer_state != peer_health_state:
+            self._log_peer_manager_health_transition(
+                peer_id, previous_peer_state, peer_health_state
+            )
+
         self.confirm_peer(source_addr)
 
     async def _handle_gate_heartbeat(
