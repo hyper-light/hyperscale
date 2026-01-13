@@ -237,20 +237,21 @@ class TestManagerRateLimitingCoordinatorHappyPath:
 class TestManagerRateLimitingCoordinatorNegativePath:
     """Negative path tests for ManagerRateLimitingCoordinator."""
 
-    def test_check_rate_limit_rejects_when_exhausted(self, rate_limiting_coordinator):
+    @pytest.mark.asyncio
+    async def test_check_rate_limit_rejects_when_exhausted(
+        self, rate_limiting_coordinator
+    ):
         """Rate limit rejects requests when limit exhausted."""
         client_id = "flood-client"
 
-        # Exhaust the rate limit for job_submit (50 per 10s window)
         for idx in range(60):
-            rate_limiting_coordinator.check_rate_limit(
+            await rate_limiting_coordinator.check_rate_limit(
                 client_id=client_id,
                 operation="job_submit",
                 priority=RequestPriority.NORMAL,
             )
 
-        # Next request should be rejected
-        result = rate_limiting_coordinator.check_rate_limit(
+        result = await rate_limiting_coordinator.check_rate_limit(
             client_id=client_id,
             operation="job_submit",
             priority=RequestPriority.NORMAL,
