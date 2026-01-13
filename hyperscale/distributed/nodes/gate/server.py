@@ -678,8 +678,8 @@ class GateServer(HealthAwareServer):
             windowed_stats=self._windowed_stats,
             get_job_callback=self._job_manager.get_callback,
             get_job_status=self._job_manager.get_job,
+            get_all_running_jobs=self._job_manager.get_running_jobs,
             send_tcp=self._send_tcp,
-            stats_push_interval_ms=self._stats_push_interval_ms,
         )
 
         self._cancellation_coordinator = GateCancellationCoordinator(

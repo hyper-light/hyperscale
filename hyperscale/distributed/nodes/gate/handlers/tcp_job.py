@@ -170,6 +170,9 @@ class GateJobHandler:
         Returns:
             Serialized JobAck response
         """
+        submission: JobSubmission | None = None
+        idempotency_key: IdempotencyKey | None = None
+
         try:
             client_id = f"{addr[0]}:{addr[1]}"
             allowed, retry_after = await self._check_rate_limit(client_id, "job_submit")
