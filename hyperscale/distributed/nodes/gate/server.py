@@ -2972,7 +2972,7 @@ class GateServer(HealthAwareServer):
                         state=self._gate_state.value,
                         cluster_id=self.env.CLUSTER_ID,
                         environment_id=self.env.ENVIRONMENT_ID,
-                        active_jobs=self._job_manager.count_active_jobs(),
+                        active_jobs=self._job_manager.job_count(),
                         manager_count=sum(
                             len(addrs) for addrs in self._datacenter_managers.values()
                         ),

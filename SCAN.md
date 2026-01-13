@@ -128,19 +128,36 @@ grep -rn "<key_operation_or_variable>" <node_directory>/*.py
 
 ### Step 5c: Implement the Fix
 
-**CRITICAL: De-duplication Rule**
+**CRITICAL: The Robustness Principle**
 
-Before implementing ANY fix, ask:
-1. Does similar functionality already exist?
-   - If YES: Do NOT add new method. Update call site to use existing method.
-   - If NO: Implement new method.
+**Never optimize for ease of fix. Always optimize for correctness of architecture.**
 
-2. If naming differs but behavior is identical:
-   - Choose the more descriptive/accurate name as canonical
-   - Update ALL call sites to use canonical name
-   - Do NOT create aliases or duplicates
+When faced with a problem, there are typically multiple solutions:
+- **Shortcut**: Add alias, wrapper, shim, adapter, or duplicate to make the call site work
+- **Correct**: Fix the root cause - update call sites, consolidate implementations, remove duplication
 
-3. Never add aliases for convenience - aliases are tech debt that obscures the single source of truth.
+**Always choose the solution that:**
+1. **Reduces total code** - fewer lines = fewer bugs, less maintenance
+2. **Has single source of truth** - one implementation per behavior
+3. **Makes the codebase more consistent** - same pattern everywhere
+4. **Removes ambiguity** - one name for one concept
+5. **Fixes the root cause** - not the symptom
+
+**Before implementing ANY fix, ask:**
+1. Am I adding code or removing/consolidating code?
+2. Will there be two ways to do the same thing after this fix?
+3. Am I papering over an inconsistency or resolving it?
+4. Would a future developer be confused by this?
+5. Is this how the codebase SHOULD have been written from the start?
+
+**If the fix adds complexity, duplication, or ambiguity - it's wrong.** Find the solution that leaves the codebase cleaner than you found it.
+
+This applies to:
+- Method names (don't add aliases)
+- Implementations (don't add wrappers)
+- Abstractions (don't add adapter layers)
+- Data structures (don't add translation code)
+- Error handling (don't add catch-and-rethrow)
 
 **For naming mismatch:**
 - Update call site to use the existing correct method name
