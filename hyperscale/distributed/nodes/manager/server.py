@@ -3408,33 +3408,6 @@ class ManagerServer(HealthAwareServer):
             return b"error"
 
     @tcp.receive()
-    async def receive_worker_status_update(
-        self,
-        addr: tuple[str, int],
-        data: bytes,
-        clock_time: int,
-    ) -> bytes:
-        """Handle worker status update via TCP."""
-        try:
-            heartbeat = WorkerHeartbeat.load(data)
-
-            # Process heartbeat via WorkerPool
-            await self._worker_pool.process_heartbeat(heartbeat.node_id, heartbeat)
-
-            return b"ok"
-
-        except Exception as error:
-            await self._udp_logger.log(
-                ServerError(
-                    message=f"Worker status update error: {error}",
-                    node_host=self._host,
-                    node_port=self._tcp_port,
-                    node_id=self._node_id.short,
-                )
-            )
-            return b"error"
-
-    @tcp.receive()
     async def worker_heartbeat(
         self,
         addr: tuple[str, int],
