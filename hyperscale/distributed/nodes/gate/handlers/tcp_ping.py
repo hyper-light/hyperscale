@@ -4,7 +4,7 @@ TCP handler for ping/health check requests.
 Handles PingRequest messages from clients and returns gate status.
 """
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable, Awaitable
 
 from hyperscale.distributed.models import (
     PingRequest,
@@ -31,15 +31,15 @@ class GatePingHandler:
         self,
         state: "GateRuntimeState",
         logger: "Logger",
-        get_node_id: callable,
-        get_host: callable,
-        get_tcp_port: callable,
-        is_leader: callable,
-        get_current_term: callable,
-        classify_dc_health: callable,
-        count_active_dcs: callable,
-        get_all_job_ids: callable,
-        get_datacenter_managers: callable,
+        get_node_id: Callable,
+        get_host: Callable,
+        get_tcp_port: Callable,
+        is_leader: Callable,
+        get_current_term: Callable,
+        classify_dc_health: Callable,
+        count_active_dcs: Callable,
+        get_all_job_ids: Callable,
+        get_datacenter_managers: Callable,
     ) -> None:
         self._state = state
         self._logger = logger
