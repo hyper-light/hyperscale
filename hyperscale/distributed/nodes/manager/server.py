@@ -2644,6 +2644,41 @@ class ManagerServer(HealthAwareServer):
                 error=str(error),
             ).dump()
 
+    def _record_workflow_latency_from_results(self, results: list[dict]) -> None:
+        for stats in results:
+            if not (stats and isinstance(stats, dict) and "elapsed" in stats):
+                continue
+            elapsed_seconds = stats.get("elapsed", 0)
+            if isinstance(elapsed_seconds, (int, float)) and elapsed_seconds > 0:
+                self._manager_state.record_workflow_latency(elapsed_seconds * 1000.0)
+
+    async def _handle_parent_workflow_completion(
+        self,
+        result: WorkflowFinalResult,
+        result_recorded: bool,
+        parent_complete: bool,
+    ) -> None:
+        if not (result_recorded and parent_complete):
+            return
+
+        sub_token = TrackingToken.parse(result.workflow_id)
+        parent_workflow_token = sub_token.workflow_token
+        if not parent_workflow_token:
+            return
+
+        if result.status == WorkflowStatus.COMPLETED.value:
+            await self._job_manager.mark_workflow_completed(parent_workflow_token)
+        elif result.error:
+            await self._job_manager.mark_workflow_failed(
+                parent_workflow_token, result.error
+            )
+
+    def _is_job_complete(self, job_id: str) -> bool:
+        job = self._job_manager.get_job(job_id)
+        if not job:
+            return False
+        return job.workflows_completed + job.workflows_failed >= job.workflows_total
+
     @tcp.receive()
     async def workflow_final_result(
         self,
@@ -2654,16 +2689,7 @@ class ManagerServer(HealthAwareServer):
         try:
             result = WorkflowFinalResult.load(data)
 
-            for stats in result.results:
-                if stats and isinstance(stats, dict) and "elapsed" in stats:
-                    elapsed_seconds = stats.get("elapsed", 0)
-                    if (
-                        isinstance(elapsed_seconds, (int, float))
-                        and elapsed_seconds > 0
-                    ):
-                        self._manager_state.record_workflow_latency(
-                            elapsed_seconds * 1000.0
-                        )
+            self._record_workflow_latency_from_results(result.results)
 
             if result.context_updates:
                 await self._job_manager.apply_workflow_context(
@@ -2680,28 +2706,11 @@ class ManagerServer(HealthAwareServer):
                 result=result,
             )
 
-            if result_recorded and parent_complete:
-                sub_token = TrackingToken.parse(result.workflow_id)
-                parent_workflow_token = sub_token.workflow_token
-                if (
-                    parent_workflow_token
-                    and result.status == WorkflowStatus.COMPLETED.value
-                ):
-                    await self._job_manager.mark_workflow_completed(
-                        parent_workflow_token
-                    )
-                elif parent_workflow_token and result.error:
-                    await self._job_manager.mark_workflow_failed(
-                        parent_workflow_token, result.error
-                    )
-
-            job = self._job_manager.get_job(result.job_id)
-            job_is_complete = (
-                job
-                and job.workflows_completed + job.workflows_failed
-                >= job.workflows_total
+            await self._handle_parent_workflow_completion(
+                result, result_recorded, parent_complete
             )
-            if job_is_complete:
+
+            if self._is_job_complete(result.job_id):
                 await self._handle_job_completion(result.job_id)
 
             return b"ok"
