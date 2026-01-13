@@ -527,7 +527,6 @@ class WorkerServer(HealthAwareServer):
         )
 
     async def _log_worker_stopping(self) -> None:
-        """Log worker stopping event if event logger is available."""
         if self._event_logger is None:
             return
         await self._event_logger.log(
@@ -543,7 +542,6 @@ class WorkerServer(HealthAwareServer):
         await self._event_logger.close()
 
     async def _cancel_cores_notification_task(self) -> None:
-        """Cancel the cores notification task if running."""
         if not self._cores_notification_task or self._cores_notification_task.done():
             return
         self._cores_notification_task.cancel()
@@ -553,7 +551,6 @@ class WorkerServer(HealthAwareServer):
             pass
 
     def _stop_modules(self) -> None:
-        """Stop all worker modules."""
         self._backpressure_manager.stop()
         self._executor.stop()
         if self._cancellation_handler_impl:
@@ -562,12 +559,10 @@ class WorkerServer(HealthAwareServer):
             self._background_loops.stop()
 
     async def _cancel_all_active_workflows(self) -> None:
-        """Cancel all active workflows during shutdown."""
         for workflow_id in list(self._workflow_tokens.keys()):
             await self._cancel_workflow(workflow_id, "server_shutdown")
 
     async def _shutdown_lifecycle_components(self) -> None:
-        """Shutdown lifecycle-managed components."""
         await self._lifecycle_manager.shutdown_remote_manager()
         await self._lifecycle_manager.stop_monitors(
             self._node_id.datacenter,
