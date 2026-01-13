@@ -188,6 +188,8 @@ class DatacenterHealthManager:
             best_heartbeat, "healthy_worker_count", best_heartbeat.worker_count
         )
 
+        self._record_health_transition(dc_id, health.value)
+
         return DatacenterStatus(
             dc_id=dc_id,
             health=health.value,
