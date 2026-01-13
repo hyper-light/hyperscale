@@ -2951,29 +2951,32 @@ class ManagerServer(HealthAwareServer):
             )
 
             # Track this workflow as complete
-            pending = self._manager_state._cancellation_pending_workflows.get(
-                job_id, set()
-            )
+            pending = self._manager_state.get_cancellation_pending_workflows(job_id)
             if workflow_id in pending:
-                pending.discard(workflow_id)
+                self._manager_state.remove_cancellation_pending_workflow(
+                    job_id, workflow_id
+                )
 
                 # Collect any errors
                 if not completion.success and completion.errors:
                     for error in completion.errors:
-                        self._manager_state._cancellation_errors[job_id].append(
-                            f"Workflow {workflow_id[:8]}...: {error}"
+                        self._manager_state.add_cancellation_error(
+                            job_id, f"Workflow {workflow_id[:8]}...: {error}"
                         )
 
                 # Check if all workflows for this job have reported
-                if not pending:
+                remaining_pending = (
+                    self._manager_state.get_cancellation_pending_workflows(job_id)
+                )
+                if not remaining_pending:
                     # All workflows cancelled - fire completion event and push to origin
-                    event = self._manager_state._cancellation_completion_events.get(
+                    event = self._manager_state.get_cancellation_completion_event(
                         job_id
                     )
                     if event:
                         event.set()
 
-                    errors = self._manager_state._cancellation_errors.get(job_id, [])
+                    errors = self._manager_state.get_cancellation_errors(job_id)
                     success = len(errors) == 0
 
                     # Push completion notification to origin gate/client
@@ -2985,13 +2988,9 @@ class ManagerServer(HealthAwareServer):
                     )
 
                     # Cleanup tracking structures
-                    self._manager_state._cancellation_pending_workflows.pop(
-                        job_id, None
-                    )
-                    self._manager_state._cancellation_completion_events.pop(
-                        job_id, None
-                    )
-                    self._manager_state._cancellation_initiated_at.pop(job_id, None)
+                    self._manager_state.clear_cancellation_pending_workflows(job_id)
+                    self._manager_state.clear_cancellation_completion_events(job_id)
+                    self._manager_state.clear_cancellation_initiated_at(job_id)
 
             # Also delegate to cancellation coordinator for additional handling
             await self._cancellation.handle_workflow_cancelled(completion)
@@ -3317,14 +3316,18 @@ class ManagerServer(HealthAwareServer):
             # Track gate addresses
             gate_tcp_addr = (registration.tcp_host, registration.tcp_port)
             gate_udp_addr = (registration.udp_host, registration.udp_port)
-            self._manager_state._gate_udp_to_tcp[gate_udp_addr] = gate_tcp_addr
+            self._manager_state.set_gate_udp_to_tcp_mapping(
+                gate_udp_addr, gate_tcp_addr
+            )
 
             # Add to SWIM probing
             self.add_unconfirmed_peer(gate_udp_addr)
             self._probe_scheduler.add_member(gate_udp_addr)
 
             # Store negotiated capabilities
-            self._manager_state._gate_negotiated_caps[registration.node_id] = negotiated
+            self._manager_state.set_gate_negotiated_caps(
+                registration.node_id, negotiated
+            )
 
             negotiated_caps_str = ",".join(sorted(negotiated.common_features))
             return GateRegistrationResponse(
