@@ -2481,12 +2481,11 @@ class GateServer(HealthAwareServer):
                 self._job_manager.set_job(job_id, job_status)
 
         for dc, manager_addrs in snapshot.datacenter_managers.items():
-            if dc not in self._datacenter_managers:
-                self._datacenter_managers[dc] = []
+            dc_managers = self._datacenter_managers.setdefault(dc, [])
             for addr in manager_addrs:
                 addr_tuple = tuple(addr) if isinstance(addr, list) else addr
-                if addr_tuple not in self._datacenter_managers[dc]:
-                    self._datacenter_managers[dc].append(addr_tuple)
+                if addr_tuple not in dc_managers:
+                    dc_managers.append(addr_tuple)
 
         self._job_leadership_tracker.merge_from_snapshot(
             job_leaders=snapshot.job_leaders,
