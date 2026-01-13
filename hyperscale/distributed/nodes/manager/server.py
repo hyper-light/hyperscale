@@ -1973,8 +1973,14 @@ class ManagerServer(HealthAwareServer):
                 )
 
                 if response and not isinstance(response, Exception):
-                    # Process worker state
-                    pass
+                    sync_response = StateSyncResponse.load(response)
+                    if sync_response.worker_state and sync_response.responder_ready:
+                        worker_snapshot = sync_response.worker_state
+                        if worker_id in self._manager_state._workers:
+                            worker_reg = self._manager_state._workers[worker_id]
+                            worker_reg.node.available_cores = (
+                                worker_snapshot.available_cores
+                            )
 
             except Exception as error:
                 await self._udp_logger.log(
