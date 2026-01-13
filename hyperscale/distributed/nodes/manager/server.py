@@ -97,6 +97,11 @@ from hyperscale.distributed.models import (
     TrackingToken,
     restricted_loads,
 )
+from hyperscale.distributed.models.worker_state import (
+    WorkerStateUpdate,
+    WorkerListResponse,
+    WorkerListRequest,
+)
 from hyperscale.distributed.reliability import (
     HybridOverloadDetector,
     ServerRateLimiter,
