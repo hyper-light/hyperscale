@@ -272,7 +272,7 @@ class TestAdaptiveRateLimiter:
         await asyncio.sleep(0.15)
 
         # Cleanup
-        cleaned = limiter.cleanup_inactive_clients()
+        cleaned = await limiter.cleanup_inactive_clients()
 
         assert cleaned == 2
         metrics = limiter.get_metrics()
@@ -548,7 +548,7 @@ class TestServerRateLimiter:
         await asyncio.sleep(0.15)
 
         # Cleanup
-        cleaned = limiter.cleanup_inactive_clients()
+        cleaned = await limiter.cleanup_inactive_clients()
 
         assert cleaned == 2
         metrics = limiter.get_metrics()
