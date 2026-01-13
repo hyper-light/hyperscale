@@ -141,6 +141,8 @@ class GateJobTimeoutTracker:
             except asyncio.CancelledError:
                 pass
             self._check_task = None
+        async with self._lock:
+            self._tracked_jobs.clear()
 
     async def start_tracking_job(
         self,
@@ -191,7 +193,9 @@ class GateJobTimeoutTracker:
             info.dc_fence_tokens[report.datacenter] = report.fence_token
 
             # Update extension tracking (AD-26 integration)
-            info.dc_total_extensions[report.datacenter] = report.total_extensions_granted
+            info.dc_total_extensions[report.datacenter] = (
+                report.total_extensions_granted
+            )
             info.dc_max_extension[report.datacenter] = report.max_worker_extension
             info.dc_workers_with_extensions[report.datacenter] = (
                 report.workers_with_extensions
@@ -270,7 +274,13 @@ class GateJobTimeoutTracker:
             info.dc_status[report.datacenter] = report.status
 
             # Check if all DCs have terminal status
-            terminal_statuses = {"completed", "failed", "cancelled", "timed_out", "timeout"}
+            terminal_statuses = {
+                "completed",
+                "failed",
+                "cancelled",
+                "timed_out",
+                "timeout",
+            }
             all_terminal = all(
                 info.dc_status.get(dc) in terminal_statuses
                 for dc in info.target_datacenters
@@ -366,8 +376,7 @@ class GateJobTimeoutTracker:
 
         if all_stuck and running_dcs:
             oldest_progress = min(
-                info.dc_last_progress.get(dc, info.submitted_at)
-                for dc in running_dcs
+                info.dc_last_progress.get(dc, info.submitted_at) for dc in running_dcs
             )
             stuck_duration = now - oldest_progress
             return True, (
