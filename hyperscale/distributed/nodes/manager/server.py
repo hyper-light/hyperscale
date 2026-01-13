@@ -2547,9 +2547,8 @@ class ManagerServer(HealthAwareServer):
                 registration.node.udp_host,
                 registration.node.udp_port,
             )
-            self._manager_state._manager_udp_to_tcp[peer_udp_addr] = (
-                registration.node.tcp_host,
-                registration.node.tcp_port,
+            self._manager_state.set_manager_udp_to_tcp_mapping(
+                peer_udp_addr, (registration.node.tcp_host, registration.node.tcp_port)
             )
             self._probe_scheduler.add_member(peer_udp_addr)
 
