@@ -6,7 +6,7 @@ Handles manager registration, health tracking, and peer management.
 
 import asyncio
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from hyperscale.distributed.models import ManagerInfo
 from hyperscale.distributed.swim.core import ErrorStats, CircuitState

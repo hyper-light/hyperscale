@@ -104,7 +104,7 @@ class WorkerHealthIntegration:
         """
         return not self._backpressure_manager.is_overloaded()
 
-    def get_health_status(self) -> dict:
+    def get_health_status(self) -> dict[str, Any]:
         """
         Get comprehensive health status.
 
