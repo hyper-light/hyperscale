@@ -33,9 +33,10 @@ class NackHandler(BaseHandler):
         # AD-29: Confirm peer on successful communication (even NACK is communication)
         self._server.confirm_peer(source_addr)
 
-        # The sender is alive since it responded
         nodes = self._server.read_nodes()
         if source_addr in nodes:
-            self._server.update_node_state(source_addr, b"OK", 0, time.monotonic())
+            await self._server.update_node_state(
+                source_addr, b"OK", 0, time.monotonic()
+            )
 
         return self._ack()
