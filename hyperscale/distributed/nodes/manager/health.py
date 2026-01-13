@@ -154,9 +154,14 @@ class ManagerHealthMonitor:
         if hasattr(heartbeat, "deadline") and heartbeat.deadline:
             self._state._worker_deadlines[worker_id] = heartbeat.deadline
 
-        # AD-17/AD-18: Update worker health state from heartbeat for smart dispatch
         worker_health_state = getattr(heartbeat, "health_overload_state", "healthy")
-        self._registry.update_worker_health_state(worker_id, worker_health_state)
+        previous_state, new_state = self._registry.update_worker_health_state(
+            worker_id, worker_health_state
+        )
+
+        if previous_state and previous_state != new_state:
+            self._log_worker_health_transition(worker_id, previous_state, new_state)
+            self._check_aggregate_health_alerts()
 
         self._task_runner.run(
             self._logger.log,
