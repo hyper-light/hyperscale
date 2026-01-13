@@ -388,10 +388,10 @@ class GateServer(HealthAwareServer):
         # Consistent hash ring
         self._job_hash_ring = ConsistentHashRing(replicas=150)
 
-        # Workflow results tracking
         self._workflow_dc_results: dict[
             str, dict[str, dict[str, WorkflowResultPush]]
         ] = {}
+        self._workflow_dc_results_lock = asyncio.Lock()
         self._job_workflow_ids: dict[str, set[str]] = {}
 
         # Per-job leadership tracking
