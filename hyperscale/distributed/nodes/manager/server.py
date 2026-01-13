@@ -118,6 +118,7 @@ from hyperscale.distributed.protocol.version import (
     get_features_for_version,
 )
 from hyperscale.distributed.discovery.security.role_validator import RoleValidator
+from hyperscale.distributed.nodes.manager.health import NodeStatus
 from hyperscale.distributed.jobs import (
     JobManager,
     WorkerPool,
