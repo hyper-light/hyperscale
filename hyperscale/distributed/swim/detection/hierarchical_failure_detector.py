@@ -238,8 +238,8 @@ class HierarchicalFailureDetector:
         await self._global_wheel.stop()
         await self._job_manager.shutdown()
 
-        self._extension_trackers.clear()
         self._extension_trackers_cleaned += len(self._extension_trackers)
+        self._extension_trackers.clear()
 
     # =========================================================================
     # Global Layer Operations

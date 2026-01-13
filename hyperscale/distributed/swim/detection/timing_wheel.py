@@ -30,6 +30,7 @@ class WheelEntry(Generic[T]):
 
     Tracks the suspicion state and its absolute expiration time.
     """
+
     node: NodeAddress
     state: T
     expiration_time: float
@@ -40,6 +41,7 @@ class WheelEntry(Generic[T]):
 @dataclass
 class TimingWheelConfig:
     """Configuration for the timing wheel."""
+
     # Coarse wheel: handles longer timeouts (seconds)
     coarse_tick_ms: int = 1000  # 1 second per tick
     coarse_wheel_size: int = 64  # 64 seconds max before wrap
@@ -59,6 +61,7 @@ class TimingWheelBucket:
     Contains entries expiring within the bucket's time range.
     Thread-safe for asyncio via lock.
     """
+
     __slots__ = ("entries", "_lock")
 
     def __init__(self) -> None:
@@ -278,11 +281,15 @@ class TimingWheel:
 
             # Determine new location
             if self._should_use_fine_wheel(new_expiration_time):
-                new_bucket_idx = self._calculate_bucket_index(new_expiration_time, "fine")
+                new_bucket_idx = self._calculate_bucket_index(
+                    new_expiration_time, "fine"
+                )
                 await self._fine_wheel[new_bucket_idx].add(entry)
                 self._node_locations[node] = ("fine", new_bucket_idx, entry.epoch)
             else:
-                new_bucket_idx = self._calculate_bucket_index(new_expiration_time, "coarse")
+                new_bucket_idx = self._calculate_bucket_index(
+                    new_expiration_time, "coarse"
+                )
                 await self._coarse_wheel[new_bucket_idx].add(entry)
                 self._node_locations[node] = ("coarse", new_bucket_idx, entry.epoch)
 
@@ -327,7 +334,9 @@ class TimingWheel:
         Returns entries that need to be cascaded to the fine wheel.
         """
         entries = await self._coarse_wheel[self._coarse_position].pop_all()
-        self._coarse_position = (self._coarse_position + 1) % self._config.coarse_wheel_size
+        self._coarse_position = (
+            self._coarse_position + 1
+        ) % self._config.coarse_wheel_size
         return entries
 
     async def _cascade_to_fine_wheel(
@@ -416,7 +425,6 @@ class TimingWheel:
     def start(self) -> None:
         """Start the timing wheel advancement loop."""
         if self._running:
-            print("[DEBUG TimingWheel] start() called but already running")
             return
 
         self._running = True
