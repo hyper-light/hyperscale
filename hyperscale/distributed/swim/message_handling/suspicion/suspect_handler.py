@@ -41,8 +41,7 @@ class SuspectHandler(BaseHandler):
             message, source_addr
         )
 
-        # AD-29: Confirm the sender
-        self._server.confirm_peer(source_addr)
+        await self._server.confirm_peer(source_addr)
 
         if target:
             # If suspicion is about self, refute it
@@ -51,9 +50,7 @@ class SuspectHandler(BaseHandler):
 
             # Start suspicion for target if message is fresh
             if self._server.is_message_fresh(target, msg_incarnation, b"SUSPECT"):
-                await self._server.start_suspicion(
-                    target, msg_incarnation, source_addr
-                )
+                await self._server.start_suspicion(target, msg_incarnation, source_addr)
 
                 # Check if we should regossip this suspicion
                 detector = self._server.hierarchical_detector
