@@ -514,6 +514,13 @@ class ManagerState:
     def get_known_manager_peer_count(self) -> int:
         return len(self._known_manager_peers)
 
+    def get_active_known_manager_peers(self) -> list[ManagerInfo]:
+        return [
+            info
+            for peer_id in self._active_manager_peer_ids
+            if (info := self._known_manager_peers.get(peer_id)) is not None
+        ]
+
     # =========================================================================
     # Known Gates Accessors (6 direct accesses)
     # =========================================================================
