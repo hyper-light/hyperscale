@@ -14,7 +14,9 @@ import inspect
 from dataclasses import dataclass, field
 from unittest.mock import AsyncMock, MagicMock
 
-from hyperscale.distributed.nodes.gate.handlers.tcp_cancellation import GateCancellationHandler
+from hyperscale.distributed.nodes.gate.handlers.tcp_cancellation import (
+    GateCancellationHandler,
+)
 from hyperscale.distributed.nodes.gate.state import GateRuntimeState
 from hyperscale.distributed.models import (
     CancelJob,
@@ -36,6 +38,7 @@ from hyperscale.distributed.models import (
 @dataclass
 class MockLogger:
     """Mock logger for testing."""
+
     messages: list[str] = field(default_factory=list)
 
     async def log(self, *args, **kwargs):
@@ -45,6 +48,7 @@ class MockLogger:
 @dataclass
 class MockTaskRunner:
     """Mock task runner for testing."""
+
     tasks: list = field(default_factory=list)
 
     def run(self, coro, *args, **kwargs):
@@ -58,6 +62,7 @@ class MockTaskRunner:
 @dataclass
 class MockNodeId:
     """Mock node ID."""
+
     full: str = "gate-001"
     short: str = "001"
     datacenter: str = "global"
@@ -66,6 +71,7 @@ class MockNodeId:
 @dataclass
 class MockGateJobManager:
     """Mock gate job manager."""
+
     jobs: dict = field(default_factory=dict)
     callbacks: dict = field(default_factory=dict)
 
@@ -111,6 +117,9 @@ def create_mock_handler(
         )
         return (ack.dump(), None)
 
+    async def mock_check_rate_limit(client_id, op):
+        return (rate_limit_allowed, rate_limit_retry)
+
     return GateCancellationHandler(
         state=state,
         logger=MockLogger(),
@@ -120,7 +129,7 @@ def create_mock_handler(
         get_node_id=lambda: MockNodeId(),
         get_host=lambda: "127.0.0.1",
         get_tcp_port=lambda: 9000,
-        check_rate_limit=lambda client_id, op: (rate_limit_allowed, rate_limit_retry),
+        check_rate_limit=mock_check_rate_limit,
         send_tcp=mock_send_tcp,
         get_available_datacenters=lambda: available_dcs,
     )
@@ -474,7 +483,7 @@ class TestHandleJobCancellationComplete:
             handle_exception=mock_handle_exception,
         )
 
-        assert result == b'OK'
+        assert result == b"OK"
 
     @pytest.mark.asyncio
     async def test_handles_invalid_data(self):
@@ -492,7 +501,7 @@ class TestHandleJobCancellationComplete:
             handle_exception=mock_handle_exception,
         )
 
-        assert result == b'ERROR'
+        assert result == b"ERROR"
 
 
 # =============================================================================
@@ -517,22 +526,21 @@ class TestConcurrency:
 
         handler = create_mock_handler(job_manager=job_manager)
 
-        requests = [
-            CancelJob(job_id=f"job-{i}", reason="test")
-            for i in range(10)
-        ]
+        requests = [CancelJob(job_id=f"job-{i}", reason="test") for i in range(10)]
 
         async def mock_handle_exception(error, context):
             pass
 
-        results = await asyncio.gather(*[
-            handler.handle_cancel_job(
-                addr=("10.0.0.1", 8000),
-                data=req.dump(),
-                handle_exception=mock_handle_exception,
-            )
-            for req in requests
-        ])
+        results = await asyncio.gather(
+            *[
+                handler.handle_cancel_job(
+                    addr=("10.0.0.1", 8000),
+                    data=req.dump(),
+                    handle_exception=mock_handle_exception,
+                )
+                for req in requests
+            ]
+        )
 
         assert len(results) == 10
         assert all(isinstance(r, bytes) for r in results)
