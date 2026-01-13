@@ -8,6 +8,14 @@ All business logic is delegated to specialized modules.
 import asyncio
 import time
 
+try:
+    import psutil
+
+    HAS_PSUTIL = True
+except ImportError:
+    psutil = None
+    HAS_PSUTIL = False
+
 from hyperscale.distributed.swim import HealthAwareServer, WorkerStateEmbedder
 from hyperscale.distributed.env import Env
 from hyperscale.distributed.discovery import DiscoveryService
@@ -832,14 +840,11 @@ class WorkerServer(HealthAwareServer):
         Called after a workflow is dispatched to see if a leadership transfer
         arrived before the workflow did.
         """
-        import time as time_module
-
         pending = self._pending_transfers.get(job_id)
         if pending is None:
             return
 
-        # Check if the transfer has expired
-        current_time = time_module.monotonic()
+        current_time = time.monotonic()
         pending_transfer_ttl = self._config.pending_transfer_ttl_seconds
         if current_time - pending.received_at > pending_transfer_ttl:
             # Transfer expired, remove it
