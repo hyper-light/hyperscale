@@ -1808,7 +1808,7 @@ class GateServer(HealthAwareServer):
         """Handle peer confirmation via SWIM (AD-29)."""
         tcp_addr = self._modular_state.get_tcp_addr_for_udp(peer)
         if tcp_addr:
-            self._modular_state._active_gate_peers.add(tcp_addr)
+            self._task_runner.run(self._modular_state.add_active_peer, tcp_addr)
 
     def _on_node_dead(self, node_addr: tuple[str, int]) -> None:
         """Handle node death via SWIM."""
@@ -1835,7 +1835,7 @@ class GateServer(HealthAwareServer):
         if self._peer_coordinator:
             await self._peer_coordinator.handle_peer_failure(udp_addr, tcp_addr)
         else:
-            self._modular_state._active_gate_peers.discard(tcp_addr)
+            await self._modular_state.remove_active_peer(tcp_addr)
 
     async def _handle_gate_peer_recovery(
         self,
@@ -1846,7 +1846,7 @@ class GateServer(HealthAwareServer):
         if self._peer_coordinator:
             await self._peer_coordinator.handle_peer_recovery(udp_addr, tcp_addr)
         else:
-            self._modular_state._active_gate_peers.add(tcp_addr)
+            await self._modular_state.add_active_peer(tcp_addr)
 
     async def _handle_job_leader_failure(self, tcp_addr: tuple[str, int]) -> None:
         if self._orphan_job_coordinator:
