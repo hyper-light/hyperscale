@@ -2260,8 +2260,6 @@ class ManagerServer(HealthAwareServer):
 
         if callback_addr:
             try:
-                from hyperscale.distributed.models import JobCancellationComplete
-
                 notification = JobCancellationComplete(
                     job_id=job_id,
                     success=success,
@@ -2344,8 +2342,6 @@ class ManagerServer(HealthAwareServer):
 
         worker_addr = (worker.node.host, worker.node.udp_port)
         current_status = await hierarchical_detector.get_node_status(worker_addr)
-
-        from hyperscale.distributed.nodes.manager.health import NodeStatus
 
         if current_status in (NodeStatus.SUSPECTED_GLOBAL, NodeStatus.DEAD_GLOBAL):
             return
