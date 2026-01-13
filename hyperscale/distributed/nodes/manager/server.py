@@ -1130,9 +1130,7 @@ class ManagerServer(HealthAwareServer):
 
         jobs_to_takeover = [
             job_id
-            for job_id, leader_addr in list(
-                self._manager_state._job_leader_addrs.items()
-            )
+            for job_id, leader_addr in self._manager_state.iter_job_leader_addrs()
             if leader_addr == failed_addr
         ]
 
@@ -1225,10 +1223,8 @@ class ManagerServer(HealthAwareServer):
             self._manager_state._dc_leader_manager_id = peer_id
 
         peer_health_state = getattr(heartbeat, "health_overload_state", "healthy")
-        previous_peer_state = self._manager_state._peer_manager_health_states.get(
-            peer_id
-        )
-        self._manager_state._peer_manager_health_states[peer_id] = peer_health_state
+        previous_peer_state = self._manager_state.get_peer_manager_health_state(peer_id)
+        self._manager_state.set_peer_manager_health_state(peer_id, peer_health_state)
 
         if previous_peer_state and previous_peer_state != peer_health_state:
             self._log_peer_manager_health_transition(
@@ -2019,8 +2015,8 @@ class ManagerServer(HealthAwareServer):
 
     async def _scan_for_orphaned_jobs(self) -> None:
         """Scan for orphaned jobs from dead managers."""
-        dead_managers_snapshot = list(self._manager_state._dead_managers)
-        job_leader_addrs_snapshot = list(self._manager_state._job_leader_addrs.items())
+        dead_managers_snapshot = self._manager_state.get_dead_managers()
+        job_leader_addrs_snapshot = self._manager_state.iter_job_leader_addrs()
 
         for dead_addr in dead_managers_snapshot:
             jobs_to_takeover = [
