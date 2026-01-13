@@ -359,11 +359,13 @@ class WorkerServer(HealthAwareServer):
         )
 
         # Initialize handlers
-        self._dispatch_handler = WorkflowDispatchHandler(self)
-        self._cancel_handler = WorkflowCancelHandler(self)
-        self._transfer_handler = JobLeaderTransferHandler(self)
-        self._progress_handler = WorkflowProgressHandler(self)
-        self._sync_handler = StateSyncHandler(self)
+        self._dispatch_handler: WorkflowDispatchHandler = WorkflowDispatchHandler(self)
+        self._cancel_handler: WorkflowCancelHandler = WorkflowCancelHandler(self)
+        self._transfer_handler: JobLeaderTransferHandler = JobLeaderTransferHandler(
+            self
+        )
+        self._progress_handler: WorkflowProgressHandler = WorkflowProgressHandler(self)
+        self._sync_handler: StateSyncHandler = StateSyncHandler(self)
 
     def _wire_logger_to_modules(self) -> None:
         """Wire logger to all modules after parent init."""
