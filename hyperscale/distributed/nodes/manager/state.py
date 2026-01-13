@@ -457,6 +457,14 @@ class ManagerState:
     def has_job_context(self, job_id: str) -> bool:
         return job_id in self._job_contexts
 
+    def get_or_create_job_context(self, job_id: str) -> "Context":
+        """Get existing job context or create a new one if it doesn't exist."""
+        context = self._job_contexts.get(job_id)
+        if context is None:
+            context = Context()
+            self._job_contexts[job_id] = context
+        return context
+
     # =========================================================================
     # Cancelled Workflows Accessors (7 direct accesses)
     # =========================================================================
