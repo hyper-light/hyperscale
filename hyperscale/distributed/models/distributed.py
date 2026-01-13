@@ -2418,13 +2418,18 @@ class DatacenterStatus(Message):
     See AD-16 in docs/architecture.md for design rationale.
     """
 
-    dc_id: str  # Datacenter identifier
-    health: str  # DatacenterHealth value
-    available_capacity: int = 0  # Estimated available cores
-    queue_depth: int = 0  # Jobs waiting
-    manager_count: int = 0  # Responding managers (via SWIM)
-    worker_count: int = 0  # Available workers
-    last_update: float = 0.0  # Timestamp of last status update
+    dc_id: str
+    health: str
+    available_capacity: int = 0
+    queue_depth: int = 0
+    manager_count: int = 0
+    worker_count: int = 0
+    last_update: float = 0.0
+    overloaded_worker_count: int = 0
+    stressed_worker_count: int = 0
+    busy_worker_count: int = 0
+    worker_overload_ratio: float = 0.0
+    health_severity_weight: float = 1.0
 
 
 # =============================================================================
