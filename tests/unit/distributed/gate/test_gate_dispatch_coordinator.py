@@ -525,7 +525,8 @@ class TestSubmitJobNegativePath:
 class TestSetupJobTrackingHappyPath:
     """Tests for _setup_job_tracking happy path."""
 
-    def test_sets_up_job_state(self):
+    @pytest.mark.asyncio
+    async def test_sets_up_job_state(self):
         """Sets up job tracking state."""
         state = GateRuntimeState()
         job_manager = MockGateJobManager()
@@ -557,7 +558,8 @@ class TestSetupJobTrackingHappyPath:
         assert job_manager.callbacks["job-123"] == ("10.0.0.1", 8000)
         assert state._progress_callbacks["job-123"] == ("10.0.0.1", 8000)
 
-    def test_stores_submission_with_reporting(self):
+    @pytest.mark.asyncio
+    async def test_stores_submission_with_reporting(self):
         """Stores submission when reporting configs present."""
         state = GateRuntimeState()
         job_manager = MockGateJobManager()

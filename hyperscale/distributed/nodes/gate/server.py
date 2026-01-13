@@ -2088,14 +2088,10 @@ class GateServer(HealthAwareServer):
         self._forward_throughput_count += 1
 
     def _classify_datacenter_health(self, dc_id: str) -> DatacenterStatus:
-        status = self._dc_health_manager.get_datacenter_health(dc_id)
-        self._log_health_transitions()
-        return status
+        return self._dc_health_manager.get_datacenter_health(dc_id)
 
     def _get_all_datacenter_health(self) -> dict[str, DatacenterStatus]:
-        result = self._dc_health_manager.get_all_datacenter_health()
-        self._log_health_transitions()
-        return result
+        return self._dc_health_manager.get_all_datacenter_health()
 
     def _log_health_transitions(self) -> None:
         transitions = self._dc_health_manager.get_and_clear_health_transitions()
