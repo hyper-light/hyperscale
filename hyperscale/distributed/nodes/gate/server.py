@@ -124,8 +124,6 @@ from hyperscale.distributed.jobs import (
 from hyperscale.distributed.ledger import JobLedger
 from hyperscale.distributed.idempotency import (
     GateIdempotencyCache,
-    IdempotencyKey,
-    IdempotencyStatus,
     create_idempotency_config_from_env,
 )
 from hyperscale.distributed.datacenters import (
@@ -133,15 +131,11 @@ from hyperscale.distributed.datacenters import (
     ManagerDispatcher,
     LeaseManager as DatacenterLeaseManager,
     CrossDCCorrelationDetector,
-    CorrelationSeverity,
 )
 from hyperscale.distributed.protocol.version import (
-    ProtocolVersion,
     NodeCapabilities,
     NegotiatedCapabilities,
-    negotiate_capabilities,
     CURRENT_PROTOCOL_VERSION,
-    get_features_for_version,
 )
 from hyperscale.distributed.discovery import DiscoveryService
 from hyperscale.distributed.discovery.security.role_validator import (
