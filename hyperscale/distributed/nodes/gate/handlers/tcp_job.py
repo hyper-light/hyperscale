@@ -48,7 +48,8 @@ from ..state import GateRuntimeState
 
 if TYPE_CHECKING:
     from hyperscale.distributed.swim.core import NodeId
-    from hyperscale.distributed.tracking import GateJobManager, JobLeadershipTracker
+    from hyperscale.distributed.jobs.gates import GateJobManager
+    from hyperscale.distributed.jobs import JobLeadershipTracker
     from hyperscale.distributed.reliability import ErrorStats, LoadShedder
     from hyperscale.distributed.routing import GateJobRouter
     from hyperscale.distributed.health import GateInfo
