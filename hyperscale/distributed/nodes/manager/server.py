@@ -4567,10 +4567,6 @@ class ManagerServer(HealthAwareServer):
         if job:
             async with job.lock:
                 job.status = JobStatus.COMPLETED.value
-                total_completed = sum(
-                    wf.completed_count for wf in job.workflows.values()
-                )
-                total_failed = sum(wf.failed_count for wf in job.workflows.values())
                 elapsed_seconds = job.elapsed_seconds()
 
                 if job.workflows_failed > 0:
@@ -4581,20 +4577,28 @@ class ManagerServer(HealthAwareServer):
                     )
 
                 for workflow_token, workflow_info in job.workflows.items():
+                    # Aggregate stats from sub-workflows
+                    workflow_stats: list[WorkflowStats] = []
+                    for sub_wf_token in workflow_info.sub_workflow_tokens:
+                        sub_wf = job.sub_workflows.get(sub_wf_token)
+                        if sub_wf and sub_wf.result:
+                            workflow_stats.extend(sub_wf.result.results)
+                            if sub_wf.progress:
+                                total_completed += sub_wf.progress.completed_count
+                                total_failed += sub_wf.progress.failed_count
+
                     workflow_results.append(
                         WorkflowResult(
-                            job_id=job_id,
-                            workflow_name=workflow_info.workflow_name,
-                            status=workflow_info.status,
-                            completed_count=workflow_info.completed_count,
-                            failed_count=workflow_info.failed_count,
+                            workflow_id=workflow_info.token.workflow_id
+                            or workflow_token,
+                            workflow_name=workflow_info.name,
+                            status=workflow_info.status.value,
+                            results=workflow_stats,
                             error=workflow_info.error,
                         )
                     )
                     if workflow_info.error:
-                        errors.append(
-                            f"{workflow_info.workflow_name}: {workflow_info.error}"
-                        )
+                        errors.append(f"{workflow_info.name}: {workflow_info.error}")
 
         origin_gate_addr = self._manager_state._job_origin_gates.get(job_id)
         if origin_gate_addr:
