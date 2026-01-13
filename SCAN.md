@@ -4123,20 +4123,21 @@ grep -n "while True:" "$FILE"
 | 3 | Phase 3.5h.1 chained attribute access | Chained access scanner | **ZERO** violations |
 | 4 | **Phase 3.5h.2 method call validation** | Method existence scanner | **ZERO** violations |
 | 5 | **Phase 3.5h.5 callback reference validation** | Callback reference scanner | **ZERO** missing method references |
-| 6 | **Phase 3.5k.1 parameter type hints** | Untyped param scanner | **ZERO** untyped parameters |
-| 7 | **Phase 3.5k.1b class attribute type hints** | Class attr scanner | **ZERO** untyped class attributes |
-| 8 | **Phase 3.5k.1d incomplete generic types** | Generic param scanner | **ZERO** bare `dict`/`list`/`set`/etc. |
-| 9 | Phase 4 direct state access | `grep "self._state._"` | **ZERO** matches |
-| 10 | Phase 5.9 cyclomatic complexity | CC scanner | **ZERO** methods with CC > 4 |
-| 11 | Phase 6.5 runtime correctness | Race/leak/error scanners | **ZERO** violations |
-| 12 | LSP diagnostics | `lsp_diagnostics` | Clean on ALL modified files |
-| 13 | Duplicate methods | Manual review | None across modular classes |
-| 14 | Dead methods | Reference search | None in modular classes |
-| 15 | Call site correctness | Manual review | All use correct component/method |
-| 16 | No workarounds | `grep "proxy\|workaround\|TODO"` | No shortcut comments |
-| 17 | No Any/object escape hatches | `grep ": Any\|: object"` | **ZERO** matches (or justified) |
+| 6 | **Phase 3.5h.6 nested self chain validation** | Chained self scanner | **ZERO** invalid component chains |
+| 7 | **Phase 3.5k.1 parameter type hints** | Untyped param scanner | **ZERO** untyped parameters |
+| 8 | **Phase 3.5k.1b class attribute type hints** | Class attr scanner | **ZERO** untyped class attributes |
+| 9 | **Phase 3.5k.1d incomplete generic types** | Generic param scanner | **ZERO** bare `dict`/`list`/`set`/etc. |
+| 10 | Phase 4 direct state access | `grep "self._state._"` | **ZERO** matches |
+| 11 | Phase 5.9 cyclomatic complexity | CC scanner | **ZERO** methods with CC > 4 |
+| 12 | Phase 6.5 runtime correctness | Race/leak/error scanners | **ZERO** violations |
+| 13 | LSP diagnostics | `lsp_diagnostics` | Clean on ALL modified files |
+| 14 | Duplicate methods | Manual review | None across modular classes |
+| 15 | Dead methods | Reference search | None in modular classes |
+| 16 | Call site correctness | Manual review | All use correct component/method |
+| 17 | No workarounds | `grep "proxy\|workaround\|TODO"` | No shortcut comments |
+| 18 | No Any/object escape hatches | `grep ": Any\|: object"` | **ZERO** matches (or justified) |
 
-**Execution Order**: Run checks 1-11 in order. If ANY fails, return to that phase and fix before proceeding.
+**Execution Order**: Run checks 1-12 in order. If ANY fails, return to that phase and fix before proceeding.
 
 **BLOCKING**: Phase 7 cannot pass with ANY violations. If ANY check fails, return to the appropriate phase and fix properly - no shortcuts. "Mostly done" is NOT done.
 
