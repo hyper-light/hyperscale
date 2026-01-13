@@ -118,23 +118,25 @@ class WorkerServer(HealthAwareServer):
         self._resource_monitor: ProcessResourceMonitor = ProcessResourceMonitor()
 
         # Initialize modules (will be fully wired after super().__init__)
-        self._registry = WorkerRegistry(
+        self._registry: WorkerRegistry = WorkerRegistry(
             logger=None,
             recovery_jitter_min=env.RECOVERY_JITTER_MIN,
             recovery_jitter_max=env.RECOVERY_JITTER_MAX,
             recovery_semaphore_size=env.RECOVERY_SEMAPHORE_SIZE,
         )
 
-        self._backpressure_manager = WorkerBackpressureManager(
-            state=self._worker_state,
-            logger=None,
-            registry=self._registry,
-            throttle_delay_ms=env.WORKER_BACKPRESSURE_THROTTLE_DELAY_MS,
-            batch_delay_ms=env.WORKER_BACKPRESSURE_BATCH_DELAY_MS,
-            reject_delay_ms=env.WORKER_BACKPRESSURE_REJECT_DELAY_MS,
+        self._backpressure_manager: WorkerBackpressureManager = (
+            WorkerBackpressureManager(
+                state=self._worker_state,
+                logger=None,
+                registry=self._registry,
+                throttle_delay_ms=env.WORKER_BACKPRESSURE_THROTTLE_DELAY_MS,
+                batch_delay_ms=env.WORKER_BACKPRESSURE_BATCH_DELAY_MS,
+                reject_delay_ms=env.WORKER_BACKPRESSURE_REJECT_DELAY_MS,
+            )
         )
 
-        self._executor = WorkerExecutor(
+        self._executor: WorkerExecutor = WorkerExecutor(
             core_allocator=self._core_allocator,
             logger=None,
             state=self._worker_state,
@@ -143,9 +145,9 @@ class WorkerServer(HealthAwareServer):
             backpressure_manager=self._backpressure_manager,
         )
 
-        self._state_sync = WorkerStateSync()
+        self._state_sync: WorkerStateSync = WorkerStateSync()
 
-        self._health_integration = WorkerHealthIntegration(
+        self._health_integration: WorkerHealthIntegration = WorkerHealthIntegration(
             registry=self._registry,
             backpressure_manager=self._backpressure_manager,
             logger=None,
