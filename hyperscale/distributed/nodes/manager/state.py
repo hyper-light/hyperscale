@@ -568,6 +568,17 @@ class ManagerState:
     def clear_worker_unhealthy_since(self, worker_id: str) -> None:
         self._worker_unhealthy_since.pop(worker_id, None)
 
+    def setdefault_worker_unhealthy_since(
+        self, worker_id: str, timestamp: float
+    ) -> float:
+        return self._worker_unhealthy_since.setdefault(worker_id, timestamp)
+
+    def iter_worker_unhealthy_since(self) -> list[tuple[str, float]]:
+        return list(self._worker_unhealthy_since.items())
+
+    def has_worker_unhealthy_since(self, worker_id: str) -> bool:
+        return worker_id in self._worker_unhealthy_since
+
     def get_worker_deadline(self, worker_id: str) -> float | None:
         return self._worker_deadlines.get(worker_id)
 
