@@ -102,7 +102,7 @@ class TestMemoryLeakPrevention:
         await asyncio.sleep(0.15)
 
         # Cleanup should remove all
-        cleaned = limiter.cleanup_inactive_clients()
+        cleaned = await limiter.cleanup_inactive_clients()
         assert cleaned == 1000
         assert limiter.get_metrics()["active_clients"] == 0
 
@@ -1103,7 +1103,7 @@ class TestLongRunningStability:
             await asyncio.sleep(0.06)
 
             # Run cleanup
-            cleaned = limiter.cleanup_inactive_clients()
+            cleaned = await limiter.cleanup_inactive_clients()
 
             # Previous batch should be cleaned
             if batch > 0:
@@ -1111,7 +1111,7 @@ class TestLongRunningStability:
 
         # Final cleanup
         await asyncio.sleep(0.06)
-        final_cleaned = limiter.cleanup_inactive_clients()
+        final_cleaned = await limiter.cleanup_inactive_clients()
         assert limiter.get_metrics()["active_clients"] == 0
 
 

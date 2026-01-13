@@ -97,7 +97,10 @@ class WorkerPool:
         # Lock for core allocation (separate from registration)
         self._allocation_lock = asyncio.Lock()
 
-        # Event signaled when cores become available
+        # Condition signaled when cores become available (uses allocation lock)
+        self._cores_available_condition = asyncio.Condition(self._allocation_lock)
+
+        # Legacy event for backward compatibility (signal_cores_available)
         self._cores_available = asyncio.Event()
 
     # =========================================================================
@@ -695,30 +698,20 @@ class WorkerPool:
         Wait for cores to become available.
 
         Returns True if cores became available, False on timeout.
-
-        Note: This method clears the event inside the allocation lock
-        to prevent race conditions where a signal could be missed.
         """
-        async with self._allocation_lock:
-            # Check if any cores are already available
-            total_available = sum(
-                worker.available_cores - worker.reserved_cores
-                for worker in self._workers.values()
-                if self.is_worker_healthy(worker.node_id)
-            )
-            if total_available > 0:
-                return True
-
-            # Clear inside lock to avoid missing signals
-            self._cores_available.clear()
-
-        # Wait outside lock
         try:
-            await asyncio.wait_for(
-                self._cores_available.wait(),
-                timeout=timeout,
-            )
-            return True
+            async with asyncio.timeout(timeout):
+                async with self._cores_available_condition:
+                    while True:
+                        total_available = sum(
+                            worker.available_cores - worker.reserved_cores
+                            for worker in self._workers.values()
+                            if self.is_worker_healthy(worker.node_id)
+                        )
+                        if total_available > 0:
+                            return True
+
+                        await self._cores_available_condition.wait()
         except asyncio.TimeoutError:
             return False
 
