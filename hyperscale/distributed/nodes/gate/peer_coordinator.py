@@ -349,14 +349,6 @@ class GatePeerCoordinator:
         )
 
     def get_healthy_gates(self) -> list[GateInfo]:
-        """
-        Build list of all known healthy gates for manager discovery.
-
-        Includes self and all active peer gates.
-
-        Returns:
-            List of GateInfo for healthy gates
-        """
         gates: list[GateInfo] = []
 
         node_id = self._get_node_id()
@@ -368,13 +360,13 @@ class GatePeerCoordinator:
                 udp_host=self._get_host(),
                 udp_port=self._get_udp_port(),
                 datacenter=node_id.datacenter,
-                is_leader=False,
+                is_leader=self._is_leader(),
             )
         )
 
-        for tcp_addr in list(self._state._active_gate_peers):
+        for tcp_addr in list(self._state.get_active_peers()):
             udp_addr: tuple[str, int] | None = None
-            for udp, tcp in list(self._state._gate_udp_to_tcp.items()):
+            for udp, tcp in list(self._state.iter_udp_to_tcp_mappings()):
                 if tcp == tcp_addr:
                     udp_addr = udp
                     break
@@ -382,7 +374,7 @@ class GatePeerCoordinator:
             if udp_addr is None:
                 udp_addr = tcp_addr
 
-            peer_heartbeat = self._state._gate_peer_info.get(udp_addr)
+            peer_heartbeat = self._state.get_gate_peer_heartbeat(udp_addr)
 
             if peer_heartbeat:
                 gates.append(
