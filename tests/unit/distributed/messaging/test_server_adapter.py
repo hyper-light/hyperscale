@@ -316,13 +316,13 @@ class TestServerAdapterStateAccess:
 class TestServerAdapterPeerConfirmation:
     """Tests for ServerAdapter peer confirmation methods."""
 
-    def test_confirm_peer(
+    @pytest.mark.asyncio
+    async def test_confirm_peer(
         self, mock_health_aware_server: MockHealthAwareServer
     ) -> None:
-        """Adapter delegates confirm_peer to server."""
         adapter = ServerAdapter(mock_health_aware_server)
 
-        result = adapter.confirm_peer(("192.168.1.1", 8000))
+        result = await adapter.confirm_peer(("192.168.1.1", 8000))
 
         assert result is True
         assert ("192.168.1.1", 8000) in mock_health_aware_server._confirmed_peers
