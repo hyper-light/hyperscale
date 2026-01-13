@@ -510,10 +510,8 @@ class TestWorkerRegistryConcurrency:
 
 
 class TestWorkerRegistryEdgeCases:
-    """Test edge cases for WorkerRegistry."""
-
-    def test_many_managers(self):
-        """Test with many managers."""
+    @pytest.mark.asyncio
+    async def test_many_managers(self):
         logger = MagicMock()
         registry = WorkerRegistry(logger)
 
@@ -525,7 +523,7 @@ class TestWorkerRegistryEdgeCases:
             mgr.udp_port = mgr.tcp_port + 1
             mgr.is_leader = i == 0
             registry.add_manager(f"mgr-{i}", mgr)
-            registry.mark_manager_healthy(f"mgr-{i}")
+            await registry.mark_manager_healthy(f"mgr-{i}")
 
         assert len(registry._known_managers) == 100
         assert len(registry._healthy_manager_ids) == 100
