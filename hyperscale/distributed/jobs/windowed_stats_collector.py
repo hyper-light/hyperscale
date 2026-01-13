@@ -105,6 +105,8 @@ class WindowedStatsCollector:
         self._buckets: dict[tuple[str, str, int], WindowBucket] = {}
         self._lock = asyncio.Lock()
         self._metrics = WindowedStatsMetrics()
+        self._seen_updates: dict[tuple[str, str, str, float], float] = {}
+        self._dedup_window_seconds = max_window_age_ms / 1000.0
 
     def _get_bucket_number(self, collected_at: float) -> int:
         """Convert Unix timestamp to window bucket number."""
