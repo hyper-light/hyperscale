@@ -81,10 +81,6 @@ class ManagerState:
         self._worker_deadlines: dict[str, float] = {}
         self._worker_job_last_progress: dict[tuple[str, str], float] = {}
         self._dispatch_semaphores: dict[str, asyncio.Semaphore] = {}
-        # AD-17: Worker health states from heartbeats for smart dispatch
-        self._worker_health_states: dict[
-            str, str
-        ] = {}  # worker_id -> "healthy"|"busy"|"stressed"|"overloaded"
 
         # Versioned state clock
         self._versioned_clock: VersionedStateClock = VersionedStateClock()

@@ -137,20 +137,7 @@ class ManagerRegistry:
         if self._worker_pool:
             return self._worker_pool.get_worker_health_state_counts()
 
-        counts = {"healthy": 0, "busy": 0, "stressed": 0, "overloaded": 0}
-        unhealthy_ids = set(self._state._worker_unhealthy_since.keys())
-
-        for worker_id in self._state._workers:
-            if worker_id in unhealthy_ids:
-                continue
-
-            health_state = self._state._worker_health_states.get(worker_id, "healthy")
-            if health_state in counts:
-                counts[health_state] += 1
-            else:
-                counts["healthy"] += 1
-
-        return counts
+        return {"healthy": 0, "busy": 0, "stressed": 0, "overloaded": 0}
 
     def get_workers_by_health_bucket(
         self,
@@ -192,8 +179,7 @@ class ManagerRegistry:
             if worker.node.total_cores < cores_required:
                 continue
 
-            # Get health state and bucket
-            health_state = self._state._worker_health_states.get(worker_id, "healthy")
+            health_state = self.get_worker_health_state(worker_id)
 
             if health_state == "healthy":
                 buckets["healthy"].append(worker)
