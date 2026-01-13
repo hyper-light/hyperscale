@@ -194,7 +194,7 @@ discovered during systematic tracing of SCENARIOS.md test scenarios through the 
 **Location**: `manager/registry.py:147`
 **Issue**: Code references `_worker_health_states` but it's never initialized.
 **Impact**: AttributeError at runtime.
-**Status**: TODO
+**Status**: FIXED - Dict initialized at ManagerState line 89, cleanup in unregister_worker and remove_worker_state
 
 #### E6: Dispatch Semaphore Cleanup Issue (MEDIUM)
 **Location**: `manager/registry.py:96`
