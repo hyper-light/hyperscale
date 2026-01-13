@@ -91,7 +91,7 @@ class IncarnationTracker:
     _logger: LoggerProtocol | None = None
     _node_host: str = ""
     _node_port: int = 0
-    _node_id: int = 0
+    _node_id: str = ""
 
     def __post_init__(self):
         self._lock = asyncio.Lock()
@@ -106,7 +106,7 @@ class IncarnationTracker:
         logger: LoggerProtocol,
         node_host: str,
         node_port: int,
-        node_id: int,
+        node_id: str,
     ) -> None:
         """Set logger for structured logging."""
         self._logger = logger
