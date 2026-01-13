@@ -422,17 +422,19 @@ class TestManagerRateLimitingCoordinatorConcurrency:
 class TestManagerRateLimitingCoordinatorEdgeCases:
     """Edge case tests for ManagerRateLimitingCoordinator."""
 
-    def test_empty_client_id(self, rate_limiting_coordinator):
+    @pytest.mark.asyncio
+    async def test_empty_client_id(self, rate_limiting_coordinator):
         """Empty client ID is handled."""
-        result = rate_limiting_coordinator.check_rate_limit(
+        result = await rate_limiting_coordinator.check_rate_limit(
             client_id="",
             operation="job_submit",
         )
         assert isinstance(result, RateLimitResult)
 
-    def test_unknown_operation(self, rate_limiting_coordinator):
+    @pytest.mark.asyncio
+    async def test_unknown_operation(self, rate_limiting_coordinator):
         """Unknown operations use default limits."""
-        result = rate_limiting_coordinator.check_rate_limit(
+        result = await rate_limiting_coordinator.check_rate_limit(
             client_id="client-1",
             operation="unknown_operation_xyz",
         )
