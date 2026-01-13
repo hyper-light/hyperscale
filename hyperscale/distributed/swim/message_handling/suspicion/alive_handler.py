@@ -35,8 +35,7 @@ class AliveHandler(BaseHandler):
             message, source_addr
         )
 
-        # AD-29: Confirm the sender
-        self._server.confirm_peer(source_addr)
+        await self._server.confirm_peer(source_addr)
 
         # Complete any pending probe Future for this address
         # 'alive' is sent as a response when a node is probed about itself
