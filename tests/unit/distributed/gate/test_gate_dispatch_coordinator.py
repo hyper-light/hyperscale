@@ -348,10 +348,11 @@ class TestCheckCircuitAndQuorumNegativePath:
         assert result.accepted is False
         assert "Circuit" in result.error
 
-    def test_rejects_when_no_quorum(self):
+    @pytest.mark.asyncio
+    async def test_rejects_when_no_quorum(self):
         """Rejects request when quorum unavailable."""
         state = GateRuntimeState()
-        state.add_active_peer(("10.0.0.1", 9000))  # Has peers
+        await state.add_active_peer(("10.0.0.1", 9000))
 
         coordinator = GateDispatchCoordinator(
             state=state,
@@ -359,9 +360,9 @@ class TestCheckCircuitAndQuorumNegativePath:
             task_runner=MockTaskRunner(),
             job_manager=MockGateJobManager(),
             job_router=None,
-            check_rate_limit=lambda client_id, op: (True, 0),
+            check_rate_limit=make_async_rate_limiter(allowed=True, retry_after=0),
             should_shed_request=lambda req_type: False,
-            has_quorum_available=lambda: False,  # No quorum
+            has_quorum_available=lambda: False,
             quorum_size=lambda: 3,
             quorum_circuit=MockQuorumCircuit(circuit_state=CircuitState.CLOSED),
             select_datacenters=lambda count, dcs, job_id: (["dc-1"], [], "healthy"),
