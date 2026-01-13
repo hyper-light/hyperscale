@@ -547,7 +547,8 @@ class TestManagerLeaseCoordinatorEdgeCases:
         assert "job-2" in led_jobs
         assert "job-3" not in led_jobs
 
-    def test_clear_job_leases(
+    @pytest.mark.asyncio
+    async def test_clear_job_leases(
         self, manager_state, manager_config, mock_logger, mock_task_runner
     ):
         """Can clear all lease state for a job."""
@@ -560,7 +561,7 @@ class TestManagerLeaseCoordinatorEdgeCases:
         )
 
         leases.claim_job_leadership("job-123", ("127.0.0.1", 8000))
-        leases.increment_fence_token("job-123")
+        await leases.increment_fence_token("job-123")
         leases.increment_layer_version("job-123")
 
         leases.clear_job_leases("job-123")
