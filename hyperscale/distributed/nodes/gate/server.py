@@ -362,6 +362,7 @@ class GateServer(HealthAwareServer):
         self._manager_backpressure: dict[tuple[str, int], BackpressureLevel] = {}
         self._backpressure_delay_ms: int = 0
         self._dc_backpressure: dict[str, BackpressureLevel] = {}
+        self._backpressure_lock = asyncio.Lock()
 
         # Throughput tracking
         self._forward_throughput_count: int = 0
