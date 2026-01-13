@@ -2597,23 +2597,53 @@ class GateServer(HealthAwareServer):
 
         return False
 
-    async def _aggregate_and_forward_workflow_result(
-        self,
-        job_id: str,
-        workflow_id: str,
-    ) -> None:
+    async def _pop_workflow_results(
+        self, job_id: str, workflow_id: str
+    ) -> dict[str, WorkflowResultPush]:
         async with self._workflow_dc_results_lock:
             job_results = self._workflow_dc_results.get(job_id, {})
             workflow_results = job_results.pop(workflow_id, {})
             if not job_results and job_id in self._workflow_dc_results:
                 del self._workflow_dc_results[job_id]
+        return workflow_results
 
-        if not workflow_results:
-            return
+    def _build_per_dc_result(
+        self,
+        datacenter: str,
+        dc_push: WorkflowResultPush,
+        is_test_workflow: bool,
+    ) -> WorkflowDCResult:
+        if is_test_workflow:
+            dc_aggregated_stats: WorkflowStats | None = None
+            if len(dc_push.results) > 1:
+                dc_aggregated_stats = Results().merge_results(dc_push.results)
+            elif dc_push.results:
+                dc_aggregated_stats = dc_push.results[0]
 
-        first_dc_push = next(iter(workflow_results.values()))
-        is_test_workflow = first_dc_push.is_test
+            return WorkflowDCResult(
+                datacenter=datacenter,
+                status=dc_push.status,
+                stats=dc_aggregated_stats,
+                error=dc_push.error,
+                elapsed_seconds=dc_push.elapsed_seconds,
+            )
 
+        return WorkflowDCResult(
+            datacenter=datacenter,
+            status=dc_push.status,
+            stats=None,
+            error=dc_push.error,
+            elapsed_seconds=dc_push.elapsed_seconds,
+            raw_results=dc_push.results,
+        )
+
+    def _aggregate_workflow_results(
+        self,
+        workflow_results: dict[str, WorkflowResultPush],
+        is_test_workflow: bool,
+    ) -> tuple[
+        list[WorkflowStats], list[WorkflowDCResult], str, bool, list[str], float
+    ]:
         all_workflow_stats: list[WorkflowStats] = []
         per_dc_results: list[WorkflowDCResult] = []
         workflow_name = ""
@@ -2625,33 +2655,9 @@ class GateServer(HealthAwareServer):
             workflow_name = dc_push.workflow_name
             all_workflow_stats.extend(dc_push.results)
 
-            if is_test_workflow:
-                dc_aggregated_stats: WorkflowStats | None = None
-                if len(dc_push.results) > 1:
-                    dc_aggregated_stats = Results().merge_results(dc_push.results)
-                elif dc_push.results:
-                    dc_aggregated_stats = dc_push.results[0]
-
-                per_dc_results.append(
-                    WorkflowDCResult(
-                        datacenter=datacenter,
-                        status=dc_push.status,
-                        stats=dc_aggregated_stats,
-                        error=dc_push.error,
-                        elapsed_seconds=dc_push.elapsed_seconds,
-                    )
-                )
-            else:
-                per_dc_results.append(
-                    WorkflowDCResult(
-                        datacenter=datacenter,
-                        status=dc_push.status,
-                        stats=None,
-                        error=dc_push.error,
-                        elapsed_seconds=dc_push.elapsed_seconds,
-                        raw_results=dc_push.results,
-                    )
-                )
+            per_dc_results.append(
+                self._build_per_dc_result(datacenter, dc_push, is_test_workflow)
+            )
 
             if dc_push.status == "FAILED":
                 has_failure = True
@@ -2661,21 +2667,54 @@ class GateServer(HealthAwareServer):
             if dc_push.elapsed_seconds > max_elapsed:
                 max_elapsed = dc_push.elapsed_seconds
 
+        return (
+            all_workflow_stats,
+            per_dc_results,
+            workflow_name,
+            has_failure,
+            error_messages,
+            max_elapsed,
+        )
+
+    def _prepare_final_results(
+        self, all_workflow_stats: list[WorkflowStats], is_test_workflow: bool
+    ) -> list[WorkflowStats]:
+        if is_test_workflow:
+            aggregator = Results()
+            if len(all_workflow_stats) > 1:
+                return [aggregator.merge_results(all_workflow_stats)]
+            return [all_workflow_stats[0]]
+        return all_workflow_stats
+
+    async def _aggregate_and_forward_workflow_result(
+        self,
+        job_id: str,
+        workflow_id: str,
+    ) -> None:
+        workflow_results = await self._pop_workflow_results(job_id, workflow_id)
+        if not workflow_results:
+            return
+
+        first_dc_push = next(iter(workflow_results.values()))
+        is_test_workflow = first_dc_push.is_test
+
+        (
+            all_workflow_stats,
+            per_dc_results,
+            workflow_name,
+            has_failure,
+            error_messages,
+            max_elapsed,
+        ) = self._aggregate_workflow_results(workflow_results, is_test_workflow)
+
         if not all_workflow_stats:
             return
 
         status = "FAILED" if has_failure else "COMPLETED"
         error = "; ".join(error_messages) if error_messages else None
-
-        if is_test_workflow:
-            aggregator = Results()
-            if len(all_workflow_stats) > 1:
-                aggregated = aggregator.merge_results(all_workflow_stats)
-            else:
-                aggregated = all_workflow_stats[0]
-            results_to_send = [aggregated]
-        else:
-            results_to_send = all_workflow_stats
+        results_to_send = self._prepare_final_results(
+            all_workflow_stats, is_test_workflow
+        )
 
         client_push = WorkflowResultPush(
             job_id=job_id,
@@ -2700,11 +2739,11 @@ class GateServer(HealthAwareServer):
                     client_push.dump(),
                     timeout=5.0,
                 )
-            except Exception as error:
+            except Exception as send_error:
                 self._task_runner.run(
                     self._udp_logger.log,
                     ServerWarning(
-                        message=f"Failed to send workflow result to client {callback}: {error}",
+                        message=f"Failed to send workflow result to client {callback}: {send_error}",
                         node_host=self._host,
                         node_port=self._tcp_port,
                         node_id=self._node_id.short,
