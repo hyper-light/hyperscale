@@ -5,6 +5,9 @@ Handles sending workflow progress updates and final results to managers.
 Implements job leader routing and backpressure-aware delivery.
 """
 
+import time
+from collections import deque
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from hyperscale.distributed.models import (
@@ -33,6 +36,14 @@ if TYPE_CHECKING:
     from .state import WorkerState
 
 
+@dataclass
+class PendingResult:
+    final_result: WorkflowFinalResult
+    enqueued_at: float
+    retry_count: int = 0
+    next_retry_at: float = 0.0
+
+
 class WorkerProgressReporter:
     """
     Handles progress reporting to managers.
@@ -41,23 +52,23 @@ class WorkerProgressReporter:
     and processes acknowledgments. Respects AD-23 backpressure signals.
     """
 
+    MAX_PENDING_RESULTS = 1000
+    RESULT_TTL_SECONDS = 300.0
+    MAX_RESULT_RETRIES = 10
+    RESULT_RETRY_BASE_DELAY = 5.0
+
     def __init__(
         self,
         registry: "WorkerRegistry",
         state: "WorkerState",
         logger: "Logger | None" = None,
     ) -> None:
-        """
-        Initialize progress reporter.
-
-        Args:
-            registry: WorkerRegistry for manager tracking
-            state: WorkerState for workflow tracking
-            logger: Logger instance
-        """
         self._registry = registry
         self._state = state
         self._logger = logger
+        self._pending_results: deque[PendingResult] = deque(
+            maxlen=self.MAX_PENDING_RESULTS
+        )
 
     async def send_progress_direct(
         self,
