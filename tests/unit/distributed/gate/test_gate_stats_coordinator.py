@@ -12,12 +12,7 @@ from unittest.mock import AsyncMock
 
 from hyperscale.distributed.nodes.gate.stats_coordinator import GateStatsCoordinator
 from hyperscale.distributed.nodes.gate.state import GateRuntimeState
-from hyperscale.distributed.models import (
-    JobStatus,
-    UpdateTier,
-    GlobalJobStatus,
-    DCJobProgress,
-)
+from hyperscale.distributed.models import JobStatus, UpdateTier
 from hyperscale.distributed.reliability import BackpressureLevel
 
 
@@ -226,88 +221,112 @@ class TestSendImmediateUpdateFailureMode:
 
 
 # =============================================================================
-# Batch Stats Loop Tests
+# Batch Stats Update Tests
 # =============================================================================
 
 
-class TestBatchStatsLoopHappyPath:
-    """Tests for batch stats loop happy path."""
+@dataclass
+class MockDCProgress:
+    datacenter: str = "dc-1"
+    status: str = "running"
+    total_completed: int = 50
+    total_failed: int = 2
+    overall_rate: float = 25.0
+    step_stats: list = field(default_factory=list)
+
+
+class TestBatchStatsUpdateHappyPath:
+    @pytest.mark.asyncio
+    async def test_pushes_batch_to_running_jobs_with_callbacks(self):
+        send_tcp = AsyncMock()
+        job_status = MockJobStatus(datacenters=[MockDCProgress()])
+
+        coordinator = create_coordinator(
+            get_job_callback=lambda x: ("10.0.0.1", 8000) if x == "job-1" else None,
+            get_all_running_jobs=lambda: [("job-1", job_status)],
+            send_tcp=send_tcp,
+        )
+
+        await coordinator.batch_stats_update()
+
+        send_tcp.assert_called_once()
+        call_args = send_tcp.call_args
+        assert call_args[0][0] == ("10.0.0.1", 8000)
+        assert call_args[0][1] == "job_batch_push"
 
     @pytest.mark.asyncio
-    async def test_start_creates_task(self):
-        """Start batch stats loop creates background task."""
-        state = GateRuntimeState()
-        task_runner = MockTaskRunner()
+    async def test_no_op_when_no_running_jobs(self):
+        send_tcp = AsyncMock()
 
-        coordinator = GateStatsCoordinator(
-            state=state,
-            logger=MockLogger(),
-            task_runner=task_runner,
-            windowed_stats=MockWindowedStatsCollector(),
+        coordinator = create_coordinator(
+            get_all_running_jobs=lambda: [],
+            send_tcp=send_tcp,
+        )
+
+        await coordinator.batch_stats_update()
+
+        send_tcp.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_no_op_when_no_callbacks(self):
+        send_tcp = AsyncMock()
+        job_status = MockJobStatus()
+
+        coordinator = create_coordinator(
             get_job_callback=lambda x: None,
-            get_job_status=lambda x: None,
-            send_tcp=AsyncMock(),
+            get_all_running_jobs=lambda: [("job-1", job_status)],
+            send_tcp=send_tcp,
         )
 
-        await coordinator.start_batch_stats_loop()
+        await coordinator.batch_stats_update()
 
-        assert len(task_runner.tasks) == 1
+        send_tcp.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_stop_cancels_task(self):
-        """Stop batch stats loop cancels task."""
-        state = GateRuntimeState()
+    async def test_aggregates_step_stats_from_all_dcs(self):
+        send_tcp = AsyncMock()
+        dc1 = MockDCProgress(datacenter="dc-1", step_stats=["step1"])
+        dc2 = MockDCProgress(datacenter="dc-2", step_stats=["step2", "step3"])
+        job_status = MockJobStatus(datacenters=[dc1, dc2])
 
-        coordinator = GateStatsCoordinator(
-            state=state,
-            logger=MockLogger(),
-            task_runner=MockTaskRunner(),
-            windowed_stats=MockWindowedStatsCollector(),
-            get_job_callback=lambda x: None,
-            get_job_status=lambda x: None,
-            send_tcp=AsyncMock(),
-            stats_push_interval_ms=10.0,  # Very short for testing
+        coordinator = create_coordinator(
+            get_job_callback=lambda x: ("10.0.0.1", 8000),
+            get_all_running_jobs=lambda: [("job-1", job_status)],
+            send_tcp=send_tcp,
         )
 
-        # Create a real task for the loop
-        coordinator._batch_stats_task = asyncio.create_task(
-            coordinator._batch_stats_loop()
-        )
+        await coordinator.batch_stats_update()
 
-        await asyncio.sleep(0.01)  # Let it start
-
-        await coordinator.stop_batch_stats_loop()
-
-        assert coordinator._batch_stats_task.done()
-
-
-class TestBatchStatsLoopBackpressure:
-    """Tests for batch stats loop backpressure handling (AD-37)."""
+        send_tcp.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_throttle_doubles_interval(self):
-        """THROTTLE backpressure doubles interval."""
+    async def test_handles_send_exception_gracefully(self):
+        send_tcp = AsyncMock(side_effect=Exception("Network error"))
+        job_status = MockJobStatus(datacenters=[MockDCProgress()])
+
+        coordinator = create_coordinator(
+            get_job_callback=lambda x: ("10.0.0.1", 8000),
+            get_all_running_jobs=lambda: [("job-1", job_status)],
+            send_tcp=send_tcp,
+        )
+
+        await coordinator.batch_stats_update()
+
+
+class TestBackpressureLevelState:
+    def test_throttle_level_detected(self):
         state = GateRuntimeState()
         state._dc_backpressure["dc-1"] = BackpressureLevel.THROTTLE
-
-        # We can't directly test interval timing easily, but we can verify
-        # the backpressure level is read correctly
         assert state.get_max_backpressure_level() == BackpressureLevel.THROTTLE
 
-    @pytest.mark.asyncio
-    async def test_batch_quadruples_interval(self):
-        """BATCH backpressure quadruples interval."""
+    def test_batch_level_detected(self):
         state = GateRuntimeState()
         state._dc_backpressure["dc-1"] = BackpressureLevel.BATCH
-
         assert state.get_max_backpressure_level() == BackpressureLevel.BATCH
 
-    @pytest.mark.asyncio
-    async def test_reject_skips_push(self):
-        """REJECT backpressure skips push entirely."""
+    def test_reject_level_detected(self):
         state = GateRuntimeState()
         state._dc_backpressure["dc-1"] = BackpressureLevel.REJECT
-
         assert state.get_max_backpressure_level() == BackpressureLevel.REJECT
 
 
