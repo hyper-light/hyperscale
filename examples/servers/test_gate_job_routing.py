@@ -17,10 +17,13 @@ import sys
 import os
 
 # Add project root to path
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+sys.path.insert(
+    0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+)
 
 # Initialize logging config before importing other hyperscale modules
 from hyperscale.logging.config import LoggingConfig
+
 LoggingConfig().update(log_directory=os.getcwd(), log_level="info")
 
 from hyperscale.graph import Workflow, step
@@ -29,7 +32,7 @@ from hyperscale.distributed.nodes.gate import GateServer
 from hyperscale.distributed.nodes.manager import ManagerServer
 from hyperscale.distributed.nodes.worker import WorkerServer
 from hyperscale.distributed.env.env import Env
-from hyperscale.distributed.routing import ConsistentHashRing
+from hyperscale.distributed.jobs.gates import ConsistentHashRing
 from hyperscale.distributed.models import (
     JobSubmission,
     JobAck,
@@ -39,6 +42,7 @@ from hyperscale.distributed.models import (
 # Test Workflow
 # ==========================================================================
 
+
 class TestWorkflow(Workflow):
     vus = 1
     duration = "5s"
@@ -46,7 +50,7 @@ class TestWorkflow(Workflow):
     @step()
     async def get_test(
         self,
-        url: URL = 'https://httpbin.org/get',
+        url: URL = "https://httpbin.org/get",
     ) -> HTTPResponse:
         return await self.client.http.get(url)
 
@@ -84,57 +88,53 @@ WORKER_REGISTRATION_TIME = 8  # seconds for workers to register
 def get_gate_peer_tcp_addrs(exclude_port: int) -> list[tuple[str, int]]:
     """Get TCP addresses of all gates except the one with exclude_port."""
     return [
-        ('127.0.0.1', cfg['tcp'])
-        for cfg in GATE_CONFIGS
-        if cfg['tcp'] != exclude_port
+        ("127.0.0.1", cfg["tcp"]) for cfg in GATE_CONFIGS if cfg["tcp"] != exclude_port
     ]
 
 
 def get_gate_peer_udp_addrs(exclude_port: int) -> list[tuple[str, int]]:
     """Get UDP addresses of all gates except the one with exclude_port."""
     return [
-        ('127.0.0.1', cfg['udp'])
-        for cfg in GATE_CONFIGS
-        if cfg['udp'] != exclude_port
+        ("127.0.0.1", cfg["udp"]) for cfg in GATE_CONFIGS if cfg["udp"] != exclude_port
     ]
 
 
 def get_all_gate_tcp_addrs() -> list[tuple[str, int]]:
     """Get TCP addresses of all gates."""
-    return [('127.0.0.1', cfg['tcp']) for cfg in GATE_CONFIGS]
+    return [("127.0.0.1", cfg["tcp"]) for cfg in GATE_CONFIGS]
 
 
 def get_all_gate_udp_addrs() -> list[tuple[str, int]]:
     """Get UDP addresses of all gates."""
-    return [('127.0.0.1', cfg['udp']) for cfg in GATE_CONFIGS]
+    return [("127.0.0.1", cfg["udp"]) for cfg in GATE_CONFIGS]
 
 
 def get_manager_peer_tcp_addrs(exclude_port: int) -> list[tuple[str, int]]:
     """Get TCP addresses of all managers except the one with exclude_port."""
     return [
-        ('127.0.0.1', cfg['tcp'])
+        ("127.0.0.1", cfg["tcp"])
         for cfg in MANAGER_CONFIGS
-        if cfg['tcp'] != exclude_port
+        if cfg["tcp"] != exclude_port
     ]
 
 
 def get_manager_peer_udp_addrs(exclude_port: int) -> list[tuple[str, int]]:
     """Get UDP addresses of all managers except the one with exclude_port."""
     return [
-        ('127.0.0.1', cfg['udp'])
+        ("127.0.0.1", cfg["udp"])
         for cfg in MANAGER_CONFIGS
-        if cfg['udp'] != exclude_port
+        if cfg["udp"] != exclude_port
     ]
 
 
 def get_all_manager_tcp_addrs() -> list[tuple[str, int]]:
     """Get TCP addresses of all managers."""
-    return [('127.0.0.1', cfg['tcp']) for cfg in MANAGER_CONFIGS]
+    return [("127.0.0.1", cfg["tcp"]) for cfg in MANAGER_CONFIGS]
 
 
 def get_all_manager_udp_addrs() -> list[tuple[str, int]]:
     """Get UDP addresses of all managers."""
-    return [('127.0.0.1', cfg['udp']) for cfg in MANAGER_CONFIGS]
+    return [("127.0.0.1", cfg["udp"]) for cfg in MANAGER_CONFIGS]
 
 
 async def run_test():
@@ -153,7 +153,7 @@ async def run_test():
         print("-" * 50)
 
         env = Env(
-            MERCURY_SYNC_REQUEST_TIMEOUT='2s',
+            MERCURY_SYNC_REQUEST_TIMEOUT="2s",
             # Use shorter lease for testing
             JOB_LEASE_DURATION=10.0,
             JOB_LEASE_CLEANUP_INTERVAL=2.0,
@@ -164,7 +164,7 @@ async def run_test():
 
         for config in GATE_CONFIGS:
             gate = GateServer(
-                host='127.0.0.1',
+                host="127.0.0.1",
                 tcp_port=config["tcp"],
                 udp_port=config["udp"],
                 env=env,
@@ -181,7 +181,9 @@ async def run_test():
 
         for i, gate in enumerate(gates):
             config = GATE_CONFIGS[i]
-            print(f"  [OK] {config['name']} started (TCP:{config['tcp']}) - Ring ID: {gate._my_ring_id}")
+            print(
+                f"  [OK] {config['name']} started (TCP:{config['tcp']}) - Ring ID: {gate._my_ring_id}"
+            )
 
         print()
 
@@ -193,7 +195,7 @@ async def run_test():
 
         for config in MANAGER_CONFIGS:
             manager = ManagerServer(
-                host='127.0.0.1',
+                host="127.0.0.1",
                 tcp_port=config["tcp"],
                 udp_port=config["udp"],
                 env=env,
@@ -224,7 +226,7 @@ async def run_test():
 
         for config in WORKER_CONFIGS:
             worker = WorkerServer(
-                host='127.0.0.1',
+                host="127.0.0.1",
                 tcp_port=config["tcp"],
                 udp_port=config["udp"],
                 env=env,
@@ -246,7 +248,9 @@ async def run_test():
         # ==============================================================
         # STEP 4: Wait for cluster stabilization
         # ==============================================================
-        print(f"[4/8] Waiting for clusters to stabilize ({CLUSTER_STABILIZATION_TIME}s)...")
+        print(
+            f"[4/8] Waiting for clusters to stabilize ({CLUSTER_STABILIZATION_TIME}s)..."
+        )
         print("-" * 50)
         await asyncio.sleep(CLUSTER_STABILIZATION_TIME)
 
@@ -255,9 +259,13 @@ async def run_test():
             ring_nodes = gate._job_hash_ring.get_all_nodes()
             expected_nodes = len(GATE_CONFIGS)
             if len(ring_nodes) == expected_nodes:
-                print(f"  [OK] {GATE_CONFIGS[i]['name']}: hash ring has {len(ring_nodes)} nodes")
+                print(
+                    f"  [OK] {GATE_CONFIGS[i]['name']}: hash ring has {len(ring_nodes)} nodes"
+                )
             else:
-                print(f"  [FAIL] {GATE_CONFIGS[i]['name']}: hash ring has {len(ring_nodes)}/{expected_nodes} nodes")
+                print(
+                    f"  [FAIL] {GATE_CONFIGS[i]['name']}: hash ring has {len(ring_nodes)}/{expected_nodes} nodes"
+                )
                 test_passed = False
 
         # Verify manager leader elected
@@ -305,7 +313,7 @@ async def run_test():
                 job_distribution[owner].append(job_id)
 
         print(f"  Job distribution across {len(GATE_CONFIGS)} gates:")
-        min_jobs = float('inf')
+        min_jobs = float("inf")
         max_jobs = 0
         for node_id, jobs in job_distribution.items():
             min_jobs = min(min_jobs, len(jobs))
@@ -349,6 +357,7 @@ async def run_test():
 
             # Create a job submission with pickled workflow
             import cloudpickle
+
             submission = JobSubmission(
                 job_id=test_job_id,
                 workflows=cloudpickle.dumps([TestWorkflow]),
@@ -359,7 +368,7 @@ async def run_test():
 
             # Submit directly via the gate's internal job_submission handler
             response = await owner_gate.job_submission(
-                addr=('127.0.0.1', 9999),  # Dummy client address
+                addr=("127.0.0.1", 9999),  # Dummy client address
                 data=submission.dump(),
                 clock_time=0,
             )
@@ -371,7 +380,9 @@ async def run_test():
                 # Verify lease was acquired
                 if owner_gate._job_lease_manager.is_owner(test_job_id):
                     lease = owner_gate._job_lease_manager.get_lease(test_job_id)
-                    print(f"  [OK] Lease acquired (fence_token={lease.fence_token}, expires in {lease.remaining_seconds():.1f}s)")
+                    print(
+                        f"  [OK] Lease acquired (fence_token={lease.fence_token}, expires in {lease.remaining_seconds():.1f}s)"
+                    )
                 else:
                     print(f"  [FAIL] Lease not acquired")
                     test_passed = False
@@ -411,9 +422,12 @@ async def run_test():
         if not non_owner_gate:
             print(f"  [SKIP] All gates are owners (single-node scenario)")
         else:
-            print(f"  Submitting job to non-owner: {GATE_CONFIGS[non_owner_idx]['name']}...")
+            print(
+                f"  Submitting job to non-owner: {GATE_CONFIGS[non_owner_idx]['name']}..."
+            )
 
             import cloudpickle
+
             submission = JobSubmission(
                 job_id=test_job_id_2,
                 workflows=cloudpickle.dumps([TestWorkflow]),
@@ -423,7 +437,7 @@ async def run_test():
             )
 
             response = await non_owner_gate.job_submission(
-                addr=('127.0.0.1', 9999),
+                addr=("127.0.0.1", 9999),
                 data=submission.dump(),
                 clock_time=0,
             )
@@ -435,7 +449,9 @@ async def run_test():
                 if redirect_addr == expected_owner_2:
                     print(f"  [OK] Correctly redirected to owner: {redirect_addr}")
                 else:
-                    print(f"  [FAIL] Redirected to wrong gate: {redirect_addr} (expected {expected_owner_2})")
+                    print(
+                        f"  [FAIL] Redirected to wrong gate: {redirect_addr} (expected {expected_owner_2})"
+                    )
                     test_passed = False
             elif ack.accepted:
                 print(f"  [FAIL] Job should have been rejected (not owner)")
@@ -468,6 +484,7 @@ async def run_test():
         if owner_gate_3 and other_gate:
             # First, owner acquires the job
             import cloudpickle
+
             submission = JobSubmission(
                 job_id=test_job_id_3,
                 workflows=cloudpickle.dumps([TestWorkflow]),
@@ -477,7 +494,7 @@ async def run_test():
             )
 
             response = await owner_gate_3.job_submission(
-                addr=('127.0.0.1', 9999),
+                addr=("127.0.0.1", 9999),
                 data=submission.dump(),
                 clock_time=0,
             )
@@ -489,20 +506,23 @@ async def run_test():
                 # Export lease state to other gate (simulating state sync)
                 leases = owner_gate_3._job_lease_manager.export_leases()
                 for lease_data in leases:
-                    if lease_data['job_id'] == test_job_id_3:
+                    if lease_data["job_id"] == test_job_id_3:
                         import time
+
                         other_gate._job_lease_manager.import_lease(
-                            job_id=lease_data['job_id'],
-                            owner_node=lease_data['owner_node'],
-                            fence_token=lease_data['fence_token'],
-                            expires_at=time.monotonic() + lease_data['expires_in'],
+                            job_id=lease_data["job_id"],
+                            owner_node=lease_data["owner_node"],
+                            fence_token=lease_data["fence_token"],
+                            expires_at=time.monotonic() + lease_data["expires_in"],
                         )
                         print(f"  [OK] Lease synced to other gate")
 
                 # Now try to acquire from other gate (should fail without force flag)
                 result = other_gate._job_lease_manager.acquire(test_job_id_3)
                 if not result.success:
-                    print(f"  [OK] Other gate correctly blocked from acquiring (owner: {result.current_owner})")
+                    print(
+                        f"  [OK] Other gate correctly blocked from acquiring (owner: {result.current_owner})"
+                    )
                 else:
                     print(f"  [FAIL] Other gate acquired lease it shouldn't have")
                     test_passed = False
@@ -538,6 +558,7 @@ async def run_test():
 
     except Exception as e:
         import traceback
+
         print(f"\n[FAIL] Test failed with exception: {e}")
         traceback.print_exc()
         return False
@@ -583,7 +604,9 @@ def main():
     print("=" * 70)
     print("GATE PER-JOB ROUTING INTEGRATION TEST")
     print("=" * 70)
-    print(f"Testing with {len(GATE_CONFIGS)} gates + {len(MANAGER_CONFIGS)} managers + {len(WORKER_CONFIGS)} workers")
+    print(
+        f"Testing with {len(GATE_CONFIGS)} gates + {len(MANAGER_CONFIGS)} managers + {len(WORKER_CONFIGS)} workers"
+    )
     print(f"Datacenter: {DC_ID}")
     print("Validates: ConsistentHashRing + LeaseManager integration")
     print()
