@@ -822,3 +822,432 @@ Manager <-> Worker Scenarios (Comprehensive)
 - Mark worker unhealthy - After repeated failures
 - Escalate to gate - Report failure for job-level handling
 ---
+
+High-Throughput Load Test Scenarios
+---
+
+21. Stats Update Storm (Workers → Manager)
+21.1 Burst Stats Traffic
+- 1000 VUs generating stats - Each VU completes ~100 req/s; verify manager handles 100K stats/s ingest
+- Stats batching under load - Verify WindowedStatsBatch aggregates before send
+- Stats queue overflow - Stats arrive faster than processing; verify bounded queue, oldest dropped
+- Stats memory pressure - Large stats payloads accumulate; verify memory limits enforced
+- Stats flush backpressure - Manager signals BATCH level; verify workers reduce flush rate
+
+21.2 Stats Ordering and Deduplication
+- Out-of-order stats batches - Network reordering delivers batch 5 before batch 4
+- Duplicate stats batch - Worker retry sends same batch twice; verify deduplication
+- Stats from dead worker - Worker dies, stats arrive after death detection; verify discarded
+- Stats version conflict - Concurrent updates from same workflow; verify CRDT merge
+
+21.3 Stats Aggregation Under Load
+- Parallel stats merging - Multiple workers send concurrently; verify thread-safe aggregation
+- Partial aggregation windows - Some workers report, others delayed; verify window handling
+- Stats window boundary - Stats span window boundary; verify correct bucketing
+- Stats compression - Large stats payloads; verify compression reduces network load
+
+21.4 Stats Pipeline Backpressure
+- Manager overloaded - Can't process stats fast enough; verify backpressure to workers
+- Gate overloaded - Can't forward stats; verify backpressure to manager
+- Client callback slow - Stats backing up; verify bounded buffer, oldest dropped
+- End-to-end latency spike - Stats delayed > 5s; verify staleness detection
+---
+
+22. Results Flood (Workers → Manager → Gate)
+22.1 High-Volume Result Handling
+- 10K workflows complete simultaneously - Burst of WorkflowFinalResult messages
+- Result serialization bottleneck - Large result payloads serialize slowly
+- Result queue depth - Results queue faster than forward rate
+- Result memory accumulation - Results buffered waiting for aggregation
+
+22.2 Result Ordering Edge Cases
+- Results arrive before dispatch ACK - Worker fast, network slow
+- Results from workflow not in tracking - Race with dispatch registration
+- Duplicate results - Network retry delivers twice; verify idempotent
+- Partial result set - 9/10 workflows complete, 1 times out; verify partial aggregation
+
+22.3 Cross-DC Result Aggregation
+- DC latency asymmetry - DC-west reports in 10ms, DC-asia in 300ms
+- DC result conflict - Same workflow, different results from different DCs
+- DC result timeout - One DC never reports; verify timeout and partial completion
+- Result aggregation race - Gate aggregating while new results arrive
+---
+
+23. Progress Update Avalanche
+23.1 High-Frequency Progress
+- Sub-second progress updates - VUs report progress every 100ms
+- Progress batching efficiency - Verify batch size vs network overhead tradeoff
+- Progress ordering - Updates reordered by network; verify monotonic progress
+- Progress memory churn - Rapid progress creates garbage; verify GC pressure acceptable
+
+23.2 Progress Fan-Out
+- Multi-DC progress merge - Progress from 5 DCs for same job; verify merge correctness
+- Progress to multiple callbacks - Job has 3 progress callbacks; verify all receive
+- Progress callback latency - Slow callback; verify doesn't block other jobs
+- Progress callback failure - Callback unreachable; verify retry then give up
+
+23.3 Progress Under Partition
+- DC becomes unreachable - Progress from 4/5 DCs; verify partial progress shown
+- DC reconnects - Backlog of progress arrives; verify catch-up handling
+- Progress gap detection - Missing progress sequence numbers; verify gap handling
+---
+
+Global Distribution Scenarios
+---
+
+24. Cross-Region Latency Challenges
+24.1 Latency Asymmetry
+- US-to-Europe dispatch - 100ms RTT; verify timeouts account for latency
+- US-to-Asia dispatch - 200ms RTT; verify Vivaldi coordinates accurate
+- Latency spike - Transient 500ms spike; verify not mistaken for failure
+- Latency variance - 50-200ms jitter; verify median vs P99 handling
+
+24.2 Clock Skew
+- DC clocks differ by 100ms - Verify versioned clocks handle skew
+- Clock jump - NTP correction jumps clock 500ms; verify no message rejection
+- Clock drift - Slow drift over hours; verify periodic sync
+- Timestamp comparison - Events from different DCs; verify logical ordering
+
+24.3 Continent-Scale Partitions
+- Trans-Atlantic partition - US and Europe isolated; verify both sides handle gracefully
+- Trans-Pacific partition - US and Asia isolated; verify partition detection
+- Partial partition - US can reach Europe, Europe can't reach US; verify asymmetric handling
+- Partition heals - Connectivity restored; verify state reconciliation
+
+24.4 Regional Failure Cascades
+- US-West region fails - 3 DCs in region go dark; verify not mistaken for partition
+- Gradual regional degradation - DCs fail one by one; verify correct correlation
+- Regional recovery - Region comes back online; verify reintegration
+---
+
+25. Multi-Region Consistency
+25.1 Job State Consistency
+- Job created in US, dispatched to Asia - Verify state propagates before dispatch arrives
+- Job cancelled in Europe, running in US - Verify cancellation reaches running workers
+- Job completes in Asia, gate in US - Verify result reaches correct gate
+
+25.2 Membership Consistency
+- New gate joins in Europe - Verify US gates learn about it via gossip
+- Worker joins in Asia - Verify US gate includes in routing decisions
+- Manager dies in US - Verify Europe gates detect and update routing
+
+25.3 Configuration Consistency
+- Rate limit change - New limit deployed; verify all regions converge
+- DC capacity update - Capacity increased; verify routing adjusts
+- Feature flag change - Verify all regions see change consistently
+---
+
+26. Federated Health Across Regions
+26.1 Cross-Region Health Probes
+- Health probe latency - 200ms probe to Asia; verify timeout > RTT
+- Probe packet loss - 5% packet loss; verify doesn't trigger false failure
+- Probe batching - Multiple probes to same DC; verify efficient batching
+- Probe prioritization - Probe critical DCs more frequently
+
+26.2 Health State Propagation
+- DC health change - Asia DC becomes unhealthy; verify US gates learn within 5s
+- Health flapping - DC oscillates healthy/unhealthy; verify damping
+- Health disagreement - US says Asia healthy, Europe says unhealthy; verify resolution
+- Health state cache - Verify health state cached to reduce probe frequency
+
+26.3 Regional Health Aggregation
+- Region health rollup - 3 DCs in region; verify region-level health state
+- Regional load balancing - Route away from degraded region
+- Regional failover - Primary region fails; verify secondary takes over
+---
+
+27. Globally Distributed Job Routing
+27.1 Latency-Aware Routing
+- Route to nearest DC - Job from Europe routes to Europe DC
+- Route with capacity constraint - Nearest DC full; verify spillover to next nearest
+- Route with SLO constraint - Job requires <100ms; verify only low-latency DCs considered
+- Route preference override - Client specifies DC; verify honored if healthy
+
+27.2 Load Distribution
+- Global load balancing - Distribute jobs across regions proportionally
+- Hotspot detection - One DC receiving disproportionate load
+- Load shedding by region - Overloaded region sheds to others
+- Capacity-aware distribution - Route more to higher-capacity regions
+
+27.3 Routing During Failures
+- Primary DC fails - Verify automatic failover to secondary
+- All DCs in region fail - Verify cross-region failover
+- Partial DC failure - DC degraded but not dead; verify reduced routing
+- Routing oscillation - Avoid rapid routing changes (hysteresis)
+---
+
+Race Conditions Under Load
+---
+
+28. Dispatch Race Conditions
+28.1 Concurrent Dispatch to Same Worker
+- Two dispatches hit same worker - Only one should succeed for capacity
+- Dispatch + failure simultaneous - Dispatch in flight when worker dies
+- Dispatch + cancellation race - Cancellation sent while dispatch pending
+- Dispatch + completion race - Workflow completes before dispatch ACK
+
+28.2 Leadership Race Conditions
+- Two gates claim job leadership - Fencing token must resolve
+- Leadership transfer during dispatch - Transfer arrives mid-dispatch
+- Leadership + cancellation race - Transfer and cancel arrive together
+- Leadership timeout race - Grace period expires as transfer arrives
+
+28.3 State Update Race Conditions
+- Concurrent health state updates - Two sources update same manager health
+- Concurrent stats merge - Two DCs send stats simultaneously
+- Concurrent result submission - Same workflow result from retry
+- Concurrent cleanup - Job cleanup races with late result
+---
+
+29. High-Load Memory and Resource Scenarios
+29.1 Memory Pressure
+- Stats buffer growth - 10K jobs, each buffering stats
+- Result accumulation - Slow aggregation causes result buildup
+- Progress callback backlog - Slow callbacks cause progress accumulation
+- Hash ring memory - Large cluster with 1000 nodes
+
+29.2 Connection Exhaustion
+- TCP connection storm - 1000 workers connect simultaneously
+- Connection per manager - Many managers exhaust file descriptors
+- UDP socket buffer overflow - High probe rate fills buffer
+- Connection leak detection - Verify all connections eventually cleaned
+
+29.3 CPU Pressure
+- Stats aggregation CPU - CRDT merge is CPU intensive
+- Serialization CPU - Large payloads serialize slowly
+- Routing calculation CPU - Complex routing decisions
+- Event loop saturation - Too many concurrent operations
+---
+
+30. Failure During High Load
+30.1 Component Failure Under Load
+- Manager dies with 1000 active workflows - Verify all rescheduled
+- Gate dies with 500 jobs in progress - Verify peer takeover
+- Worker dies with 100 VUs running - Verify stats not lost
+- Network partition during burst - Verify recovery after partition heals
+
+30.2 Cascading Failures
+- One manager fails, others overloaded - Load redistribution causes cascade
+- Worker death spiral - Deaths trigger rescheduling, triggering more deaths
+- Gate quorum loss under load - Jobs in flight during quorum loss
+- Circuit breaker cascade - One circuit opens, others follow
+
+30.3 Recovery Under Load
+- Manager recovers during high load - Verify gradual reintegration
+- Worker recovers with pending results - Verify results delivered
+- Gate recovers with jobs in flight - Verify state sync under load
+- Network heals with message backlog - Verify backlog processed correctly
+---
+
+31. Timeout and Deadline Scenarios Under Load
+31.1 Timeout Racing
+- Response arrives as timeout fires - Verify no duplicate handling
+- Multiple timeouts fire together - Verify serialized handling
+- Timeout + success race - Success arrives just after timeout
+- Cascading timeouts - One timeout triggers others
+
+31.2 Deadline Pressure
+- Job approaching deadline - 90% of deadline elapsed
+- Worker extension request - Worker needs more time
+- Extension denied under load - System too loaded to grant extension
+- Deadline during partition - Deadline expires while partitioned
+
+31.3 Timeout Configuration
+- Aggressive timeouts - Short timeouts cause false failures under load
+- Conservative timeouts - Long timeouts delay failure detection
+- Adaptive timeouts - Timeouts adjust based on load
+- Timeout jitter - Prevent thundering herd on timeout
+---
+
+32. Idempotency Under Extreme Conditions
+32.1 Retry Storm
+- Network hiccup causes mass retry - 1000 retries hit simultaneously
+- Idempotency cache pressure - Cache size exceeded
+- Idempotency key collision - Hash collision in high volume
+- Idempotency expiry during retry - Key expires between retries
+
+32.2 Duplicate Detection
+- Near-simultaneous duplicates - Two requests 1ms apart
+- Cross-gate duplicates - Same request to different gates
+- Duplicate with different payload - Same key, different data
+- Duplicate after completion - Retry after job finished
+---
+
+33. Split-Brain Scenarios During Load Test
+33.1 Gate Cluster Split
+- 3/5 gates partitioned - Minority and majority partitions
+- Jobs in both partitions - Same job owned by different gates
+- Partition heals - Verify state reconciliation
+- Fencing token resolution - Higher token wins
+
+33.2 Manager Cluster Split
+- Manager cluster splits - Verify quorum prevents dual writes
+- Worker dispatches to wrong partition - Verify rejection
+- Partition detection - Verify correlation detector identifies
+- Partition recovery - Verify gradual reintegration
+
+33.3 DC Isolation
+- Entire DC isolated - DC can't reach any other DC
+- Isolated DC continues running - Jobs in DC continue
+- Isolation detected - Gates mark DC unreachable
+- Isolation ends - DC reintegrates, state reconciled
+---
+
+34. Stats-Specific Edge Cases for Load Tests
+34.1 Action Timing Stats
+- Sub-millisecond actions - HTTP requests completing in <1ms
+- Very long actions - Actions taking >30s
+- Action timeout stats - Timed-out actions still counted
+- Action retry stats - Retried actions counted once or multiple?
+
+34.2 VU Lifecycle Stats
+- VU ramp-up stats - Stats during VU scaling up
+- VU ramp-down stats - Stats during VU scaling down
+- VU iteration stats - Stats per VU iteration
+- VU error rate - Errors per VU tracked
+
+34.3 Workflow-Level Stats
+- Workflow duration histogram - Distribution of workflow durations
+- Workflow throughput - Workflows per second
+- Workflow failure rate - Failed workflows percentage
+- Workflow retry rate - Retried workflows
+
+34.4 Stats Accuracy
+- Floating point precision - Stats aggregation precision
+- Counter overflow - Stats counter exceeds int64
+- Rate calculation accuracy - Throughput calculation over time
+- Percentile accuracy - P99 with limited samples
+---
+
+35. Reporter Integration Under Load
+35.1 Reporter Throughput
+- High-volume reporter - Reporter receives 10K events/s
+- Reporter batching - Events batched for efficiency
+- Reporter backlog - Reporter slower than event rate
+- Reporter memory - Event buffer memory pressure
+
+35.2 Multiple Reporter Types
+- Concurrent reporters - JSON, Prometheus, Datadog simultaneously
+- Reporter priority - Critical reporters get priority
+- Reporter failure isolation - One reporter fail doesn't affect others
+- Reporter resource limits - Per-reporter resource quotas
+
+35.3 Reporter During Failure
+- Reporter unreachable - Events buffered or dropped
+- Reporter reconnection - Buffer replayed on reconnect
+- Reporter timeout - Slow reporter times out
+- Reporter crash recovery - Reporter restarts mid-test
+---
+
+36. End-to-End Load Test Scenarios
+36.1 Realistic Load Profile
+- Ramp-up pattern - 0 → 10K VUs over 5 minutes
+- Steady state - 10K VUs for 30 minutes
+- Spike pattern - 10K → 50K → 10K over 1 minute
+- Ramp-down pattern - 10K → 0 VUs over 5 minutes
+
+36.2 Multi-Region Load Test
+- Load from US - 5K VUs targeting US endpoints
+- Load from Europe - 3K VUs targeting Europe endpoints
+- Load from Asia - 2K VUs targeting Asia endpoints
+- Cross-region load - US VUs targeting Asia endpoints
+
+36.3 Mixed Workflow Types
+- HTTP workflows - Simple HTTP request workflows
+- GraphQL workflows - GraphQL query workflows
+- Playwright workflows - Browser automation workflows
+- Mixed workload - All workflow types simultaneously
+
+36.4 Failure Injection During Load
+- Kill random worker - During steady state
+- Kill random manager - During steady state
+- Network partition - During ramp-up
+- DC failure - During spike
+
+36.5 Resource Monitoring During Load
+- Memory growth - Memory usage over time
+- CPU utilization - CPU usage over time
+- Network throughput - Bytes sent/received over time
+- Connection count - Open connections over time
+- Goroutine/task count - Concurrent operations over time
+---
+
+37. Zombie and Stale State Under Load
+37.1 Zombie Detection Under Load
+- Node restart under load - Node restarts, rejoins during high load
+- Incarnation validation - Verify incarnation checked despite load
+- Stale message rejection - Old messages rejected
+- Death record cleanup - Verify cleanup happens under load
+
+37.2 Stale State Cleanup
+- Completed job cleanup - 10K jobs complete; verify timely cleanup
+- Orphaned workflow cleanup - Worker dies; verify orphans detected
+- Dead peer cleanup - Peer dies; verify state cleaned
+- Result cache cleanup - Old results cleaned
+
+37.3 State Accumulation
+- Long-running test - 24-hour load test
+- State growth monitoring - Verify bounded state growth
+- Memory leak detection - No memory leaks over time
+- File descriptor monitoring - No FD leaks
+---
+
+38. Protocol Edge Cases Under Load
+38.1 Message Size Limits
+- Large workflow payload - Workflow near size limit
+- Large result payload - Result near size limit
+- Large stats batch - Stats batch near size limit
+- Size limit exceeded - Verify graceful rejection
+
+38.2 Message Fragmentation
+- Fragmented TCP messages - Message split across packets
+- Reassembly under load - Correct reassembly despite high load
+- Incomplete messages - Connection closed mid-message
+- Message corruption detection - CRC or checksum validation
+
+38.3 Protocol Version Negotiation
+- Mixed version cluster - Old and new nodes
+- Feature degradation - Graceful degradation for old nodes
+- Version upgrade during test - Rolling upgrade
+- Version rollback - Rollback during test
+---
+
+39. Observability Under Load
+39.1 Logging Under Load
+- Log volume - High log rate during load
+- Log sampling - Sample logs during overload
+- Structured logging - JSON logging performance
+- Log buffer overflow - Log buffer exceeded
+
+39.2 Metrics Under Load
+- Metrics cardinality - Many labels under load
+- Metrics sampling - Sample metrics during overload
+- Metrics push latency - Delay in metrics push
+- Metrics memory - Memory for metrics buffers
+
+39.3 Tracing Under Load
+- Trace sampling rate - Appropriate sampling under load
+- Trace propagation - Context propagated correctly
+- Trace storage - Traces stored correctly
+- Trace analysis - Traces analyzable post-test
+---
+
+40. Graceful Shutdown Under Load
+40.1 Gate Shutdown
+- Gate shutdown with jobs - Jobs in progress during shutdown
+- Leadership transfer during shutdown - Transfer leadership before exit
+- Stats flush on shutdown - Final stats sent
+- Connection draining - Existing connections complete
+
+40.2 Manager Shutdown
+- Manager shutdown with workflows - Workflows rescheduled
+- Worker notification - Workers notified of shutdown
+- Result forwarding - Pending results forwarded
+- State handoff - State transferred to peers
+
+40.3 Worker Shutdown
+- Worker shutdown mid-workflow - Graceful workflow completion
+- Core release on shutdown - Cores released
+- Result submission - Final results sent
+- Health state update - Marked unhealthy before shutdown
+---
