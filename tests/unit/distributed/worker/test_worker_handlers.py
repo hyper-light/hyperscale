@@ -79,7 +79,7 @@ class MockServerForHandlers:
     def _get_worker_state(self):
         return WorkerState.HEALTHY
 
-    def _get_job_transfer_lock(self, job_id):
+    async def _get_job_transfer_lock(self, job_id):
         if job_id not in self._job_transfer_locks:
             self._job_transfer_locks[job_id] = asyncio.Lock()
         return self._job_transfer_locks[job_id]
