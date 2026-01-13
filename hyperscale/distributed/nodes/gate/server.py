@@ -2436,22 +2436,23 @@ class GateServer(HealthAwareServer):
         dc_state = self._dc_registration_states[dc_id]
         dc_state.record_heartbeat(manager_addr, node_id, generation, now)
 
-    def _handle_manager_backpressure_signal(
+    async def _handle_manager_backpressure_signal(
         self,
         manager_addr: tuple[str, int],
         dc_id: str,
         signal: BackpressureSignal,
     ) -> None:
         """Handle backpressure signal from manager."""
-        self._manager_backpressure[manager_addr] = signal.level
-        self._backpressure_delay_ms = max(
-            self._backpressure_delay_ms,
-            signal.suggested_delay_ms,
-        )
-        self._update_dc_backpressure(dc_id)
+        async with self._backpressure_lock:
+            self._manager_backpressure[manager_addr] = signal.level
+            self._backpressure_delay_ms = max(
+                self._backpressure_delay_ms,
+                signal.suggested_delay_ms,
+            )
+            self._update_dc_backpressure_locked(dc_id)
 
-    def _update_dc_backpressure(self, dc_id: str) -> None:
-        """Update DC backpressure level."""
+    def _update_dc_backpressure_locked(self, dc_id: str) -> None:
+        """Update DC backpressure level. Must be called with _backpressure_lock held."""
         manager_addrs = self._datacenter_managers.get(dc_id, [])
         if not manager_addrs:
             return
