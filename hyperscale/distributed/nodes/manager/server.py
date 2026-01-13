@@ -3744,7 +3744,9 @@ class ManagerServer(HealthAwareServer):
             await timeout_strategy.start_tracking(
                 job_id=submission.job_id,
                 timeout_seconds=submission.timeout_seconds,
-                gate_addr=tuple(submission.gate_addr) if submission.gate_addr else None,
+                gate_addr=tuple(submission.origin_gate_addr)
+                if submission.origin_gate_addr
+                else None,
             )
             self._manager_state._job_timeout_strategies[submission.job_id] = (
                 timeout_strategy
