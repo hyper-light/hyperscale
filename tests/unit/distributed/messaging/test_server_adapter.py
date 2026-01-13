@@ -58,7 +58,7 @@ class MockHealthAwareServer:
     def get_other_nodes(self, exclude: tuple[str, int] | None = None) -> list:
         return []
 
-    def confirm_peer(self, peer: tuple[str, int]) -> bool:
+    async def confirm_peer(self, peer: tuple[str, int]) -> bool:
         if peer in self._confirmed_peers:
             return False
         self._confirmed_peers.add(peer)
@@ -67,7 +67,7 @@ class MockHealthAwareServer:
     def is_peer_confirmed(self, peer: tuple[str, int]) -> bool:
         return peer in self._confirmed_peers
 
-    def update_node_state(
+    async def update_node_state(
         self,
         node: tuple[str, int],
         status: bytes,
