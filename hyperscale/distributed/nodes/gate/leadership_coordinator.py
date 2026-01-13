@@ -287,6 +287,7 @@ class GateLeadershipCoordinator:
             job_id: Job identifier
         """
         import time
+
         self._state.mark_job_orphaned(job_id, time.monotonic())
 
     def clear_orphaned_job(self, job_id: str) -> None:
@@ -297,6 +298,17 @@ class GateLeadershipCoordinator:
             job_id: Job identifier
         """
         self._state.clear_orphaned_job(job_id)
+
+    def get_quorum_size(self) -> int:
+        active_peer_count = self._state.get_active_peer_count()
+        total_gates = active_peer_count + 1
+        return (total_gates // 2) + 1
+
+    def has_quorum(self, gate_state_value: str) -> bool:
+        if gate_state_value != "active":
+            return False
+        active_count = self._state.get_active_peer_count() + 1
+        return active_count >= self.get_quorum_size()
 
 
 __all__ = ["GateLeadershipCoordinator"]
