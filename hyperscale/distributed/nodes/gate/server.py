@@ -2081,13 +2081,9 @@ class GateServer(HealthAwareServer):
         return dict(self._job_dc_managers)
 
     def _count_active_datacenters(self) -> int:
-        """Count active datacenters."""
-        count = 0
-        for dc_id in self._datacenter_managers.keys():
-            status = self._classify_datacenter_health(dc_id)
-            if status.health != DatacenterHealth.UNHEALTHY.value:
-                count += 1
-        return count
+        if self._health_coordinator:
+            return self._health_coordinator.count_active_datacenters()
+        return 0
 
     def _get_forward_throughput(self) -> float:
         """Get current forward throughput."""
