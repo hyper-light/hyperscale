@@ -2699,6 +2699,160 @@ class ManagerServer(HealthAwareServer):
             )
             return b"error"
 
+    def _parse_cancel_request(
+        self,
+        data: bytes,
+        addr: tuple[str, int],
+    ) -> tuple[str, int, str, float, str]:
+        """Parse cancel request from either JobCancelRequest or legacy CancelJob format."""
+        try:
+            cancel_request = JobCancelRequest.load(data)
+            return (
+                cancel_request.job_id,
+                cancel_request.fence_token,
+                cancel_request.requester_id,
+                cancel_request.timestamp,
+                cancel_request.reason,
+            )
+        except Exception:
+            # Normalize legacy CancelJob format to AD-20 fields
+            cancel = CancelJob.load(data)
+            return (
+                cancel.job_id,
+                cancel.fence_token,
+                f"{addr[0]}:{addr[1]}",
+                time.monotonic(),
+                "Legacy cancel request",
+            )
+
+    async def _cancel_pending_workflows(
+        self,
+        job_id: str,
+        timestamp: float,
+        reason: str,
+    ) -> list[str]:
+        """Cancel and remove all pending workflows from the dispatch queue."""
+        if not self._workflow_dispatcher:
+            return []
+
+        removed_pending = await self._workflow_dispatcher.cancel_pending_workflows(
+            job_id
+        )
+
+        for workflow_id in removed_pending:
+            self._manager_state.set_cancelled_workflow(
+                workflow_id,
+                CancelledWorkflowInfo(
+                    workflow_id=workflow_id,
+                    job_id=job_id,
+                    cancelled_at=timestamp,
+                    reason=reason,
+                ),
+            )
+
+        return removed_pending
+
+    async def _cancel_running_workflow_on_worker(
+        self,
+        job_id: str,
+        workflow_id: str,
+        worker_addr: tuple[str, int],
+        requester_id: str,
+        timestamp: float,
+        reason: str,
+    ) -> tuple[bool, str | None]:
+        """Cancel a single running workflow on a worker. Returns (success, error_msg)."""
+        try:
+            cancel_data = WorkflowCancelRequest(
+                job_id=job_id,
+                workflow_id=workflow_id,
+                requester_id=requester_id,
+                timestamp=timestamp,
+            ).dump()
+
+            response = await self._send_to_worker(
+                worker_addr,
+                "cancel_workflow",
+                cancel_data,
+                timeout=5.0,
+            )
+
+            if not isinstance(response, bytes):
+                return False, "No response from worker"
+
+            try:
+                workflow_response = WorkflowCancelResponse.load(response)
+                if workflow_response.success:
+                    self._manager_state.set_cancelled_workflow(
+                        workflow_id,
+                        CancelledWorkflowInfo(
+                            workflow_id=workflow_id,
+                            job_id=job_id,
+                            cancelled_at=timestamp,
+                            reason=reason,
+                        ),
+                    )
+                    return True, None
+
+                error_msg = (
+                    workflow_response.error or "Worker reported cancellation failure"
+                )
+                return False, error_msg
+
+            except Exception as parse_error:
+                return False, f"Failed to parse worker response: {parse_error}"
+
+        except Exception as send_error:
+            return False, f"Failed to send cancellation to worker: {send_error}"
+
+    async def _cancel_running_workflows(
+        self,
+        job: JobInfo,
+        pending_cancelled: list[str],
+        requester_id: str,
+        timestamp: float,
+        reason: str,
+    ) -> tuple[list[str], dict[str, str]]:
+        """Cancel all running workflows on workers. Returns (cancelled_list, errors_dict)."""
+        running_cancelled: list[str] = []
+        workflow_errors: dict[str, str] = {}
+
+        for workflow_id, workflow_info in job.workflows.items():
+            if (
+                workflow_id in pending_cancelled
+                or workflow_info.status != WorkflowStatus.RUNNING
+            ):
+                continue
+
+            for sub_workflow_token in workflow_info.sub_workflow_tokens:
+                sub_workflow = job.sub_workflows.get(sub_workflow_token)
+                if not (sub_workflow and sub_workflow.token.worker_id):
+                    continue
+
+                worker = self._manager_state.get_worker(sub_workflow.token.worker_id)
+                if not worker:
+                    workflow_errors[workflow_id] = (
+                        f"Worker {sub_workflow.token.worker_id} not found"
+                    )
+                    continue
+
+                worker_addr = (worker.node.host, worker.node.tcp_port)
+                success, error_msg = await self._cancel_running_workflow_on_worker(
+                    job.job_id,
+                    workflow_id,
+                    worker_addr,
+                    requester_id,
+                    timestamp,
+                    reason,
+                )
+
+                if success:
+                    running_cancelled.append(workflow_id)
+                elif error_msg:
+                    workflow_errors[workflow_id] = error_msg
+
+        return running_cancelled, workflow_errors
+
     @tcp.receive()
     async def job_cancel(
         self,
