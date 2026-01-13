@@ -2001,14 +2001,18 @@ After EVERY complexity-reducing refactor:
 lsp_diagnostics && echo "Diagnostics clean" || echo "ERRORS FOUND"
 ```
 
-### Step 5.9f: Complexity Limits
+### Step 5.9f: Complexity Limits (MANDATORY - NO EXCEPTIONS)
+
+**ALL methods above CC=4 MUST be refactored. No exceptions. No deferrals.**
 
 | Complexity | Action Required |
 |------------|-----------------|
 | 1-3 | Acceptable, no action |
 | 4 | Maximum allowed - document why if borderline |
-| 5-6 | **MUST refactor** - extract helper methods |
-| 7+ | **CRITICAL** - requires significant decomposition |
+| 5-9 | **MUST refactor NOW** - extract helper methods (not "later", not "if time permits") |
+| 10+ | **CRITICAL BLOCKER** - requires immediate significant decomposition |
+
+**BLOCKING**: Phase 5.9 is not complete until ZERO methods have CC > 4. This is not negotiable.
 
 ### Step 5.9g: Documentation Requirements
 
