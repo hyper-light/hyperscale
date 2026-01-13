@@ -42,14 +42,19 @@ class DatacenterOverloadClassifier:
     def classify(self, signals: DatacenterOverloadSignals) -> DatacenterOverloadResult:
         worker_overload_ratio = self._calculate_worker_overload_ratio(signals)
         manager_unhealthy_ratio = self._calculate_manager_unhealthy_ratio(signals)
+        manager_overload_ratio = self._calculate_manager_overload_ratio(signals)
         capacity_utilization = self._calculate_capacity_utilization(signals)
+        leader_overloaded = signals.leader_health_state == "overloaded"
 
         worker_state = self._classify_by_worker_overload(worker_overload_ratio)
         manager_state = self._classify_by_manager_health(manager_unhealthy_ratio)
+        manager_overload_state = self._classify_by_manager_overload(
+            manager_overload_ratio, leader_overloaded
+        )
         capacity_state = self._classify_by_capacity(capacity_utilization)
 
         final_state = self._get_worst_state(
-            [worker_state, manager_state, capacity_state]
+            [worker_state, manager_state, manager_overload_state, capacity_state]
         )
 
         if signals.total_managers == 0 or signals.total_workers == 0:
@@ -61,8 +66,10 @@ class DatacenterOverloadClassifier:
             state=final_state,
             worker_overload_ratio=worker_overload_ratio,
             manager_unhealthy_ratio=manager_unhealthy_ratio,
+            manager_overload_ratio=manager_overload_ratio,
             capacity_utilization=capacity_utilization,
             health_severity_weight=health_severity_weight,
+            leader_overloaded=leader_overloaded,
         )
 
     def _calculate_worker_overload_ratio(
@@ -79,6 +86,13 @@ class DatacenterOverloadClassifier:
             return 1.0
         unhealthy_managers = signals.total_managers - signals.alive_managers
         return unhealthy_managers / signals.total_managers
+
+    def _calculate_manager_overload_ratio(
+        self, signals: DatacenterOverloadSignals
+    ) -> float:
+        if signals.alive_managers == 0:
+            return 0.0
+        return signals.overloaded_managers / signals.alive_managers
 
     def _calculate_capacity_utilization(
         self, signals: DatacenterOverloadSignals
