@@ -136,65 +136,76 @@ class GateStatsCoordinator:
         except Exception:
             pass  # Best effort - don't fail on push errors
 
-    async def start_batch_stats_loop(self) -> None:
-        """Start the background batch stats aggregation loop."""
-        if self._batch_stats_task is None or self._batch_stats_task.done():
-            self._batch_stats_task = self._task_runner.run(self._batch_stats_loop)
-
-    async def stop_batch_stats_loop(self) -> None:
-        """Stop the background batch stats loop."""
-        if self._batch_stats_task and not self._batch_stats_task.done():
-            self._batch_stats_task.cancel()
-            try:
-                await self._batch_stats_task
-            except asyncio.CancelledError:
-                pass
-
-    async def _batch_stats_loop(self) -> None:
+    async def batch_stats_update(self) -> None:
         """
-        Background loop for periodic stats aggregation and push.
+        Process a batch of Tier 2 (Periodic) updates per AD-15.
 
-        Implements AD-37 explicit backpressure handling by adjusting
-        flush interval based on system backpressure level:
-        - NONE: Normal interval
-        - THROTTLE: 2x interval (reduce update frequency)
-        - BATCH: 4x interval (accept only batched updates)
-        - REJECT: 8x interval (aggressive slowdown, drop non-critical)
+        Aggregates pending progress updates and pushes JobBatchPush messages
+        to clients that have registered callbacks. This is more efficient than
+        sending each update individually.
         """
-        from hyperscale.distributed.reliability import BackpressureLevel
+        running_jobs = self._get_all_running_jobs()
+        jobs_with_callbacks: list[tuple[str, GlobalJobStatus, tuple[str, int]]] = []
 
-        base_interval_seconds = self._stats_push_interval_ms / 1000.0
+        for job_id, job in running_jobs:
+            if callback := self._get_job_callback(job_id):
+                jobs_with_callbacks.append((job_id, job, callback))
 
-        while True:
+        if not jobs_with_callbacks:
+            return
+
+        for job_id, job, callback in jobs_with_callbacks:
+            all_step_stats: list = []
+            for datacenter_progress in job.datacenters:
+                if (
+                    hasattr(datacenter_progress, "step_stats")
+                    and datacenter_progress.step_stats
+                ):
+                    all_step_stats.extend(datacenter_progress.step_stats)
+
+            per_dc_stats = [
+                DCStats(
+                    datacenter=datacenter_progress.datacenter,
+                    status=datacenter_progress.status,
+                    completed=datacenter_progress.total_completed,
+                    failed=datacenter_progress.total_failed,
+                    rate=datacenter_progress.overall_rate,
+                )
+                for datacenter_progress in job.datacenters
+            ]
+
+            batch_push = JobBatchPush(
+                job_id=job_id,
+                status=job.status,
+                step_stats=all_step_stats,
+                total_completed=job.total_completed,
+                total_failed=job.total_failed,
+                overall_rate=job.overall_rate,
+                elapsed_seconds=job.elapsed_seconds,
+                per_dc_stats=per_dc_stats,
+            )
+
             try:
-                # AD-37: Check backpressure level and adjust interval
-                backpressure_level = self._state.get_max_backpressure_level()
-
-                if backpressure_level == BackpressureLevel.THROTTLE:
-                    interval_seconds = base_interval_seconds * 2.0
-                elif backpressure_level == BackpressureLevel.BATCH:
-                    interval_seconds = base_interval_seconds * 4.0
-                elif backpressure_level == BackpressureLevel.REJECT:
-                    interval_seconds = base_interval_seconds * 8.0
-                else:
-                    interval_seconds = base_interval_seconds
-
-                await asyncio.sleep(interval_seconds)
-
-                current_backpressure_level = self._state.get_max_backpressure_level()
-                if current_backpressure_level == BackpressureLevel.REJECT:
-                    continue
-
-                pending_jobs = self._windowed_stats.get_jobs_with_pending_stats()
-
-                for job_id in pending_jobs:
-                    await self._push_windowed_stats(job_id)
-
-            except asyncio.CancelledError:
-                break
+                await self._send_tcp(
+                    callback,
+                    "job_batch_push",
+                    batch_push.dump(),
+                    timeout=2.0,
+                )
             except Exception:
-                # Log and continue
-                await asyncio.sleep(1.0)
+                pass  # Client unreachable - continue with others
+
+    async def push_windowed_stats(self) -> None:
+        """
+        Push windowed stats for all jobs with pending aggregated data.
+
+        Iterates over jobs that have accumulated windowed stats and pushes
+        them to their registered callback addresses.
+        """
+        pending_jobs = self._windowed_stats.get_jobs_with_pending_stats()
+
+        for job_id in pending_jobs:
+            await self._push_windowed_stats(job_id)
 
     async def _push_windowed_stats(self, job_id: str) -> None:
         """
