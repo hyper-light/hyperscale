@@ -1338,6 +1338,74 @@ class ManagerServer(HealthAwareServer):
                     )
                 )
 
+    def _get_manager_tracked_workflow_ids_for_worker(self, worker_id: str) -> set[str]:
+        """Get workflow tokens that the manager thinks are running on a specific worker."""
+        tracked_ids: set[str] = set()
+
+        for job in self._job_manager.iter_jobs():
+            for sub_workflow_token, sub_workflow in job.sub_workflows.items():
+                if sub_workflow.worker_id != worker_id:
+                    continue
+
+                parent_workflow = job.workflows.get(
+                    sub_workflow.parent_token.workflow_token or ""
+                )
+                if parent_workflow and parent_workflow.status == WorkflowStatus.RUNNING:
+                    tracked_ids.add(sub_workflow_token)
+
+        return tracked_ids
+
+    async def _query_worker_active_workflows(
+        self,
+        worker_addr: tuple[str, int],
+    ) -> set[str] | None:
+        """Query a worker for its active workflow IDs. Returns None on failure."""
+        request = WorkflowQueryRequest(
+            requester_id=self._node_id.full,
+            query_type="active",
+        )
+
+        response = await self._send_to_worker(
+            worker_addr,
+            "workflow_query",
+            request.dump(),
+            timeout=self._config.orphan_scan_worker_timeout_seconds,
+        )
+
+        if not response or isinstance(response, Exception):
+            return None
+
+        query_response = WorkflowQueryResponse.load(response)
+        return {workflow.workflow_id for workflow in query_response.workflows}
+
+    async def _handle_orphaned_workflows(
+        self,
+        orphaned_tokens: set[str],
+        worker_id: str,
+    ) -> None:
+        """Log and requeue orphaned workflows for retry."""
+        for orphaned_token in orphaned_tokens:
+            await self._udp_logger.log(
+                ServerWarning(
+                    message=f"Orphaned sub-workflow {orphaned_token[:8]}... detected on worker {worker_id[:8]}..., scheduling retry",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            if self._workflow_dispatcher:
+                await self._workflow_dispatcher.requeue_workflow(orphaned_token)
+
+    async def _scan_worker_for_orphans(self, worker_id: str, worker_addr: tuple[str, int]) -> None:
+        """Scan a single worker for orphaned workflows and requeue them."""
+        worker_workflow_ids = await self._query_worker_active_workflows(worker_addr)
+        if worker_workflow_ids is None:
+            return
+
+        manager_tracked_ids = self._get_manager_tracked_workflow_ids_for_worker(worker_id)
+        orphaned_sub_workflows = manager_tracked_ids - worker_workflow_ids
+        await self._handle_orphaned_workflows(orphaned_sub_workflows, worker_id)
+
     async def _orphan_scan_loop(self) -> None:
         """
         Periodically scan for orphaned workflows.
@@ -1360,59 +1428,7 @@ class ManagerServer(HealthAwareServer):
                 for worker_id, worker in self._manager_state.iter_workers():
                     try:
                         worker_addr = (worker.node.host, worker.node.tcp_port)
-
-                        # Request workflow query from worker
-                        request = WorkflowQueryRequest(
-                            requester_id=self._node_id.full,
-                            query_type="active",
-                        )
-
-                        response = await self._send_to_worker(
-                            worker_addr,
-                            "workflow_query",
-                            request.dump(),
-                            timeout=self._config.orphan_scan_worker_timeout_seconds,
-                        )
-
-                        if not response or isinstance(response, Exception):
-                            continue
-
-                        # Parse response and compare with our tracking
-                        query_response = WorkflowQueryResponse.load(response)
-                        worker_workflow_ids = {
-                            wf.workflow_id for wf in query_response.workflows
-                        }
-
-                        manager_tracked_ids: set[str] = set()
-                        for job in self._job_manager.iter_jobs():
-                            for sub_wf_token, sub_wf in job.sub_workflows.items():
-                                if sub_wf.worker_id == worker_id:
-                                    parent_wf = job.workflows.get(
-                                        sub_wf.parent_token.workflow_token or ""
-                                    )
-                                    if (
-                                        parent_wf
-                                        and parent_wf.status == WorkflowStatus.RUNNING
-                                    ):
-                                        manager_tracked_ids.add(sub_wf_token)
-
-                        orphaned_sub_workflows = (
-                            manager_tracked_ids - worker_workflow_ids
-                        )
-
-                        for orphaned_token in orphaned_sub_workflows:
-                            await self._udp_logger.log(
-                                ServerWarning(
-                                    message=f"Orphaned sub-workflow {orphaned_token[:8]}... detected on worker {worker_id[:8]}..., scheduling retry",
-                                    node_host=self._host,
-                                    node_port=self._tcp_port,
-                                    node_id=self._node_id.short,
-                                )
-                            )
-                            if self._workflow_dispatcher:
-                                await self._workflow_dispatcher.requeue_workflow(
-                                    orphaned_token
-                                )
+                        await self._scan_worker_for_orphans(worker_id, worker_addr)
 
                     except Exception as worker_error:
                         await self._udp_logger.log(
