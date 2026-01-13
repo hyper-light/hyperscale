@@ -28,9 +28,6 @@ if TYPE_CHECKING:
 # Re-export RequestPriority for backwards compatibility
 __all__ = ["RequestPriority", "OverloadStateTracker", "ManagerLoadShedder"]
 
-# Backwards compatibility alias
-OverloadState = "OverloadStateTracker"
-
 
 class OverloadStateTracker:
     """
