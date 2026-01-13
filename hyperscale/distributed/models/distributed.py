@@ -87,6 +87,7 @@ class ManagerState(str, Enum):
     SYNCING = "syncing"  # Joined cluster, syncing state (not in quorum)
     ACTIVE = "active"  # Fully operational (counted in quorum)
     DRAINING = "draining"  # Not accepting new work, draining existing
+    OFFLINE = "offline"  # Not responding (aborted or crashed)
 
 
 class GateState(str, Enum):
