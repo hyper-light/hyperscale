@@ -3825,9 +3825,7 @@ class ManagerServer(HealthAwareServer):
         try:
             timeout_msg = JobGlobalTimeout.load(data)
 
-            strategy = self._manager_state._job_timeout_strategies.get(
-                timeout_msg.job_id
-            )
+            strategy = self._manager_state.get_job_timeout_strategy(timeout_msg.job_id)
             if not strategy:
                 return b""
 
@@ -3838,9 +3836,7 @@ class ManagerServer(HealthAwareServer):
             )
 
             if accepted:
-                self._manager_state._job_timeout_strategies.pop(
-                    timeout_msg.job_id, None
-                )
+                self._manager_state.remove_job_timeout_strategy(timeout_msg.job_id)
                 await self._udp_logger.log(
                     ServerInfo(
                         message=f"Job {timeout_msg.job_id} globally timed out: {timeout_msg.reason}",
