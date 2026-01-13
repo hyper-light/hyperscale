@@ -52,41 +52,41 @@ class WorkerLifecycleManager:
             env: Environment configuration
             logger: Logger instance
         """
-        self._host = host
-        self._tcp_port = tcp_port
-        self._udp_port = udp_port
-        self._total_cores = total_cores
-        self._env = env
-        self._logger = logger
+        self._host: str = host
+        self._tcp_port: int = tcp_port
+        self._udp_port: int = udp_port
+        self._total_cores: int = total_cores
+        self._env: "Env" = env
+        self._logger: "Logger | None" = logger
 
         # Compute derived ports
-        self._local_udp_port = udp_port + (total_cores**2)
+        self._local_udp_port: int = udp_port + (total_cores**2)
 
         # Initialize monitors
-        self._cpu_monitor = CPUMonitor(env)
-        self._memory_monitor = MemoryMonitor(env)
+        self._cpu_monitor: CPUMonitor = CPUMonitor(env)
+        self._memory_monitor: MemoryMonitor = MemoryMonitor(env)
 
         # Initialize server pool and remote manager
-        self._server_pool = LocalServerPool(total_cores)
+        self._server_pool: LocalServerPool = LocalServerPool(total_cores)
         self._remote_manager: RemoteGraphManager | None = None
 
         # Logging configuration
         self._logging_config: LoggingConfig | None = None
 
         # Connection timeout
-        self._connect_timeout = TimeParser(env.MERCURY_SYNC_CONNECT_SECONDS).time
+        self._connect_timeout: float = TimeParser(env.MERCURY_SYNC_CONNECT_SECONDS).time
 
         # Local env for worker processes
-        self._local_env = LocalEnv(
+        self._local_env: LocalEnv = LocalEnv(
             MERCURY_SYNC_AUTH_SECRET=env.MERCURY_SYNC_AUTH_SECRET
         )
 
         # Background task references
-        self._background_tasks: list[asyncio.Task] = []
+        self._background_tasks: list[asyncio.Task[None]] = []
 
         # State flags
-        self._started = False
-        self._running = False
+        self._started: bool = False
+        self._running: bool = False
 
     def get_worker_ips(self) -> list[tuple[str, int]]:
         """Get list of worker IP/port tuples for local processes."""
