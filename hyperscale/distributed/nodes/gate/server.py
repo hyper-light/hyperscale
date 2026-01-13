@@ -2882,7 +2882,7 @@ class GateServer(HealthAwareServer):
 
         leader_addr = self.get_current_leader()
         if leader_addr:
-            leader_tcp_addr = self._gate_udp_to_tcp.get(leader_addr)
+            leader_tcp_addr = self._modular_state.get_tcp_addr_for_udp(leader_addr)
             if leader_tcp_addr:
                 await self._sync_state_from_peer(leader_tcp_addr)
 
