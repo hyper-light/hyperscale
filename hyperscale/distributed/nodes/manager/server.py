@@ -2504,7 +2504,6 @@ class ManagerServer(HealthAwareServer):
         data: bytes,
         clock_time: int,
     ) -> bytes:
-        """Handle workflow final result from worker."""
         try:
             result = WorkflowFinalResult.load(data)
 
@@ -2519,6 +2518,13 @@ class ManagerServer(HealthAwareServer):
                             elapsed_seconds * 1000.0
                         )
 
+            if result.context_updates:
+                await self._job_manager.apply_workflow_context(
+                    job_id=result.job_id,
+                    workflow_name=result.workflow_name,
+                    context_updates_bytes=result.context_updates,
+                )
+
             self._job_manager.complete_workflow(
                 job_id=result.job_id,
                 workflow_id=result.workflow_id,
@@ -2526,8 +2532,7 @@ class ManagerServer(HealthAwareServer):
                 results=result.results,
             )
 
-            job = self._job_manager.get_job(result.job_id)
-            if job and job.is_complete:
+            if (job := self._job_manager.get_job(result.job_id)) and job.is_complete:
                 await self._handle_job_completion(result.job_id)
 
             return b"ok"

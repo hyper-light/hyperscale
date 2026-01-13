@@ -638,17 +638,19 @@ class WorkflowDispatcher:
                     context_version=layer_version,
                 )
 
-                # Send dispatch FIRST, only register sub-workflow on success
                 try:
                     success = await self._send_dispatch(worker_id, dispatch)
                     if success:
-                        # Register sub-workflow AFTER successful dispatch
-                        # This prevents orphaned sub-workflow registrations
                         await self._job_manager.register_sub_workflow(
                             job_id=pending.job_id,
                             workflow_id=pending.workflow_id,
                             worker_id=worker_id,
                             cores_allocated=worker_cores,
+                        )
+                        await self._job_manager.set_sub_workflow_dispatched_context(
+                            sub_workflow_token=str(sub_token),
+                            context_bytes=context_bytes,
+                            layer_version=layer_version,
                         )
                         await self._worker_pool.confirm_allocation(
                             worker_id, worker_cores
@@ -657,9 +659,9 @@ class WorkflowDispatcher:
                     else:
                         await self._worker_pool.release_cores(worker_id, worker_cores)
                         failed_dispatches.append((worker_id, worker_cores))
-                except Exception as e:
+                except Exception as dispatch_error:
                     await self._log_warning(
-                        f"Exception dispatching to worker {worker_id} for workflow {pending.workflow_id}: {e}",
+                        f"Exception dispatching to worker {worker_id} for workflow {pending.workflow_id}: {dispatch_error}",
                         job_id=pending.job_id,
                         workflow_id=pending.workflow_id,
                     )
@@ -1177,8 +1179,28 @@ class WorkflowDispatcher:
                 workflow_id=workflow_id,
             )
 
-        # Signal dispatch trigger to wake up dispatch loop
         self.signal_dispatch()
+
+    async def requeue_workflow(self, sub_workflow_token: str) -> bool:
+        token_parts = sub_workflow_token.split(":")
+        if len(token_parts) < 4:
+            return False
+
+        job_id = token_parts[2]
+        workflow_id = token_parts[3]
+        key = f"{job_id}:{workflow_id}"
+
+        async with self._pending_lock:
+            if pending := self._pending.get(key):
+                pending.dispatched = False
+                pending.dispatch_in_progress = False
+                pending.dispatched_at = 0.0
+                pending.dispatch_attempts = 0
+                pending.next_retry_delay = self.INITIAL_RETRY_DELAY
+                pending.check_and_signal_ready()
+                self.signal_dispatch()
+                return True
+            return False
 
     # =========================================================================
     # Logging Helpers

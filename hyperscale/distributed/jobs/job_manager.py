@@ -947,6 +947,41 @@ class JobManager:
                         context_for_workflow[key] = value
             return context_for_workflow
 
+    async def apply_workflow_context(
+        self,
+        job_id: str,
+        workflow_name: str,
+        context_updates_bytes: bytes,
+    ) -> bool:
+        if (job := self.get_job_by_id(job_id)) is None:
+            return False
+
+        context_updates = cloudpickle.loads(context_updates_bytes)
+
+        async with job.lock:
+            workflow_context = job.context[workflow_name]
+            for key, value in context_updates.items():
+                await workflow_context.set(key, value)
+            job.layer_version += 1
+            return True
+
+    async def set_sub_workflow_dispatched_context(
+        self,
+        sub_workflow_token: str | TrackingToken,
+        context_bytes: bytes,
+        layer_version: int,
+    ) -> bool:
+        token_str = str(sub_workflow_token)
+        if (job := self.get_job_for_sub_workflow(token_str)) is None:
+            return False
+
+        async with job.lock:
+            if sub_wf := job.sub_workflows.get(token_str):
+                sub_wf.dispatched_context = context_bytes
+                sub_wf.dispatched_version = layer_version
+                return True
+            return False
+
     # =========================================================================
     # Iteration Helpers
     # =========================================================================
