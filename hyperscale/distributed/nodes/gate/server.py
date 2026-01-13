@@ -2322,10 +2322,9 @@ class GateServer(HealthAwareServer):
         self,
         progress: JobProgress,
     ) -> bool:
-        """Forward job progress to peer gates."""
-        owner = self._job_hash_ring.get_node(progress.job_id)
-        if owner and owner != self._node_id.full:
-            owner_addr = self._job_hash_ring.get_node_addr(owner)
+        owner = await self._job_hash_ring.get_node(progress.job_id)
+        if owner and owner.node_id != self._node_id.full:
+            owner_addr = await self._job_hash_ring.get_node_addr(owner)
             if owner_addr:
                 try:
                     await self.send_tcp(
@@ -2606,8 +2605,7 @@ class GateServer(HealthAwareServer):
         )
 
     async def _forward_workflow_result_to_peers(self, push: WorkflowResultPush) -> bool:
-        """Forward workflow result to the job owner gate using consistent hashing."""
-        candidates = self._job_hash_ring.get_nodes(push.job_id, count=3)
+        candidates = await self._job_hash_ring.get_nodes(push.job_id, count=3)
 
         for candidate in candidates:
             if candidate.node_id == self._node_id.full:

@@ -57,7 +57,7 @@ class GatePingHandler:
         self,
         addr: tuple[str, int],
         data: bytes,
-        clock_time: int,
+        handle_exception: callable,
     ) -> bytes:
         """
         Process ping request.
@@ -65,7 +65,7 @@ class GatePingHandler:
         Args:
             addr: Source address (client)
             data: Serialized PingRequest message
-            clock_time: Logical clock time
+            handle_exception: Callback for exception handling
 
         Returns:
             Serialized GatePingResponse
@@ -88,14 +88,16 @@ class GatePingHandler:
                         leader_addr = (heartbeat.tcp_host, heartbeat.tcp_port)
                         break
 
-                datacenters.append(DatacenterInfo(
-                    dc_id=dc_id,
-                    health=status.health,
-                    leader_addr=leader_addr,
-                    available_cores=status.available_capacity,
-                    manager_count=status.manager_count,
-                    worker_count=status.worker_count,
-                ))
+                datacenters.append(
+                    DatacenterInfo(
+                        dc_id=dc_id,
+                        health=status.health,
+                        leader_addr=leader_addr,
+                        available_cores=status.available_capacity,
+                        manager_count=status.manager_count,
+                        worker_count=status.worker_count,
+                    )
+                )
 
             # Get active job IDs
             active_job_ids = self._get_all_job_ids()
@@ -123,7 +125,7 @@ class GatePingHandler:
             return response.dump()
 
         except Exception:
-            return b'error'
+            return b"error"
 
 
 __all__ = ["GatePingHandler"]
