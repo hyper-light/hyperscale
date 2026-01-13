@@ -32,6 +32,7 @@ from hyperscale.distributed.protocol.version import NodeCapabilities
 @dataclass
 class MockLogger:
     """Mock logger for testing."""
+
     messages: list[str] = field(default_factory=list)
 
     async def log(self, *args, **kwargs):
@@ -41,6 +42,7 @@ class MockLogger:
 @dataclass
 class MockTaskRunner:
     """Mock task runner for testing."""
+
     tasks: list = field(default_factory=list)
 
     def run(self, coro, *args, **kwargs):
@@ -54,6 +56,7 @@ class MockTaskRunner:
 @dataclass
 class MockNodeId:
     """Mock node ID."""
+
     full: str = "gate-001"
     short: str = "001"
     datacenter: str = "global"
@@ -62,6 +65,7 @@ class MockNodeId:
 @dataclass
 class MockEnv:
     """Mock environment configuration."""
+
     tls_enabled: bool = False
 
 
@@ -74,6 +78,7 @@ class MockNodeRole(Enum):
 @dataclass
 class MockRoleValidator:
     """Mock role validator."""
+
     valid_roles: set = field(default_factory=lambda: {MockNodeRole.MANAGER})
     _validate_result: bool = True
 
@@ -84,6 +89,7 @@ class MockRoleValidator:
 @dataclass
 class MockGateInfo:
     """Mock gate info for healthy gates."""
+
     gate_id: str = "gate-001"
     addr: tuple[str, int] = field(default_factory=lambda: ("127.0.0.1", 9000))
 
@@ -91,6 +97,7 @@ class MockGateInfo:
 @dataclass
 class MockTransport:
     """Mock asyncio transport."""
+
     peer_cert: bytes | None = None
 
     def get_extra_info(self, name: str, default=None):
@@ -127,8 +134,9 @@ def create_mock_handler(
         get_tcp_port=lambda: 9000,
         get_healthy_gates=lambda: [MockGateInfo()],
         record_manager_heartbeat=lambda dc, addr, manager_id, workers: None,
-        handle_manager_backpressure_signal=lambda signal: None,
-        update_dc_backpressure=lambda dc_id: None,
+        handle_manager_backpressure_signal=AsyncMock(),
+        update_dc_backpressure=AsyncMock(),
+        set_manager_backpressure_none=AsyncMock(),
         broadcast_manager_discovery=AsyncMock(),
     )
 
@@ -172,7 +180,7 @@ class TestHandleStatusUpdateHappyPath:
             handle_exception=mock_handle_exception,
         )
 
-        assert result == b'ok'
+        assert result == b"ok"
 
     @pytest.mark.asyncio
     async def test_records_heartbeat(self):
@@ -181,12 +189,14 @@ class TestHandleStatusUpdateHappyPath:
         recorded_heartbeats = []
 
         def record_heartbeat(dc, addr, manager_id, workers):
-            recorded_heartbeats.append({
-                "dc": dc,
-                "addr": addr,
-                "manager_id": manager_id,
-                "workers": workers,
-            })
+            recorded_heartbeats.append(
+                {
+                    "dc": dc,
+                    "addr": addr,
+                    "manager_id": manager_id,
+                    "workers": workers,
+                }
+            )
 
         handler = GateManagerHandler(
             state=state,
@@ -326,7 +336,7 @@ class TestHandleStatusUpdateNegativePath:
             handle_exception=mock_handle_exception,
         )
 
-        assert result == b'error'
+        assert result == b"error"
         assert len(errors_handled) == 1
 
 
@@ -497,7 +507,7 @@ class TestHandleDiscoveryHappyPath:
             handle_exception=mock_handle_exception,
         )
 
-        assert result == b'ok'
+        assert result == b"ok"
 
     @pytest.mark.asyncio
     async def test_updates_datacenter_managers(self):
@@ -529,7 +539,10 @@ class TestHandleDiscoveryHappyPath:
         )
 
         # Should have added dc-east to tracking
-        assert "dc-east" in datacenter_manager_udp or "dc-east" in state._datacenter_manager_status
+        assert (
+            "dc-east" in datacenter_manager_udp
+            or "dc-east" in state._datacenter_manager_status
+        )
 
 
 # =============================================================================
@@ -557,7 +570,7 @@ class TestHandleDiscoveryNegativePath:
             handle_exception=mock_handle_exception,
         )
 
-        assert result == b'error'
+        assert result == b"error"
 
 
 # =============================================================================
@@ -576,36 +589,40 @@ class TestConcurrency:
 
         heartbeats = []
         for i in range(10):
-            heartbeats.append(ManagerHeartbeat(
-                node_id=f"manager-{i:03d}",
-                datacenter=f"dc-{i % 3}",
-                is_leader=(i == 0),
-                term=1,
-                version=1,
-                active_jobs=0,
-                active_workflows=10,
-                worker_count=5,
-                healthy_worker_count=5,
-                available_cores=40,
-                total_cores=60,
-                tcp_host=f"10.0.0.{i}",
-                tcp_port=8000,
-            ))
+            heartbeats.append(
+                ManagerHeartbeat(
+                    node_id=f"manager-{i:03d}",
+                    datacenter=f"dc-{i % 3}",
+                    is_leader=(i == 0),
+                    term=1,
+                    version=1,
+                    active_jobs=0,
+                    active_workflows=10,
+                    worker_count=5,
+                    healthy_worker_count=5,
+                    available_cores=40,
+                    total_cores=60,
+                    tcp_host=f"10.0.0.{i}",
+                    tcp_port=8000,
+                )
+            )
 
         async def mock_handle_exception(error, context):
             pass
 
-        results = await asyncio.gather(*[
-            handler.handle_status_update(
-                addr=(f"10.0.0.{i}", 8000),
-                data=hb.dump(),
-                handle_exception=mock_handle_exception,
-            )
-            for i, hb in enumerate(heartbeats)
-        ])
+        results = await asyncio.gather(
+            *[
+                handler.handle_status_update(
+                    addr=(f"10.0.0.{i}", 8000),
+                    data=hb.dump(),
+                    handle_exception=mock_handle_exception,
+                )
+                for i, hb in enumerate(heartbeats)
+            ]
+        )
 
         assert len(results) == 10
-        assert all(r == b'ok' for r in results)
+        assert all(r == b"ok" for r in results)
 
     @pytest.mark.asyncio
     async def test_concurrent_registrations(self):
@@ -615,36 +632,40 @@ class TestConcurrency:
 
         heartbeats = []
         for i in range(10):
-            heartbeats.append(ManagerHeartbeat(
-                node_id=f"manager-{i:03d}",
-                datacenter=f"dc-{i % 3}",
-                is_leader=(i == 0),
-                term=1,
-                version=1,
-                active_jobs=0,
-                active_workflows=0,
-                worker_count=5,
-                healthy_worker_count=5,
-                available_cores=40,
-                total_cores=60,
-                tcp_host=f"10.0.0.{i}",
-                tcp_port=8000,
-            ))
+            heartbeats.append(
+                ManagerHeartbeat(
+                    node_id=f"manager-{i:03d}",
+                    datacenter=f"dc-{i % 3}",
+                    is_leader=(i == 0),
+                    term=1,
+                    version=1,
+                    active_jobs=0,
+                    active_workflows=0,
+                    worker_count=5,
+                    healthy_worker_count=5,
+                    available_cores=40,
+                    total_cores=60,
+                    tcp_host=f"10.0.0.{i}",
+                    tcp_port=8000,
+                )
+            )
 
         async def mock_handle_exception(error, context):
             pass
 
         transport = MockTransport()
 
-        results = await asyncio.gather(*[
-            handler.handle_register(
-                addr=(f"10.0.0.{i}", 8000),
-                data=hb.dump(),
-                transport=transport,
-                handle_exception=mock_handle_exception,
-            )
-            for i, hb in enumerate(heartbeats)
-        ])
+        results = await asyncio.gather(
+            *[
+                handler.handle_register(
+                    addr=(f"10.0.0.{i}", 8000),
+                    data=hb.dump(),
+                    transport=transport,
+                    handle_exception=mock_handle_exception,
+                )
+                for i, hb in enumerate(heartbeats)
+            ]
+        )
 
         assert len(results) == 10
         assert all(isinstance(r, bytes) for r in results)
@@ -688,7 +709,7 @@ class TestEdgeCases:
             handle_exception=mock_handle_exception,
         )
 
-        assert result == b'ok'
+        assert result == b"ok"
 
     @pytest.mark.asyncio
     async def test_zero_workers(self):
@@ -720,7 +741,7 @@ class TestEdgeCases:
             handle_exception=mock_handle_exception,
         )
 
-        assert result == b'ok'
+        assert result == b"ok"
 
     @pytest.mark.asyncio
     async def test_very_large_worker_count(self):
@@ -752,7 +773,7 @@ class TestEdgeCases:
             handle_exception=mock_handle_exception,
         )
 
-        assert result == b'ok'
+        assert result == b"ok"
 
     @pytest.mark.asyncio
     async def test_special_characters_in_datacenter(self):
@@ -792,7 +813,7 @@ class TestEdgeCases:
                 handle_exception=mock_handle_exception,
             )
 
-            assert result == b'ok'
+            assert result == b"ok"
 
     @pytest.mark.asyncio
     async def test_many_active_jobs(self):
@@ -826,7 +847,7 @@ class TestEdgeCases:
             handle_exception=mock_handle_exception,
         )
 
-        assert result == b'ok'
+        assert result == b"ok"
 
 
 # =============================================================================
@@ -889,7 +910,7 @@ class TestFailureModes:
             handle_exception=mock_handle_exception,
         )
 
-        assert result == b'error'
+        assert result == b"error"
         assert len(errors_handled) == 1
 
     @pytest.mark.asyncio
