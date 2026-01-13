@@ -900,8 +900,7 @@ class GateServer(HealthAwareServer):
                 logger=self._udp_logger,
             )
 
-        # Add this gate to hash ring
-        self._job_hash_ring.add_node(
+        await self._job_hash_ring.add_node(
             node_id=self._node_id.full,
             tcp_host=self._host,
             tcp_port=self._tcp_port,
