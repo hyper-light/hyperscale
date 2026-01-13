@@ -327,7 +327,7 @@ class TestJobLeaderTransferHandler:
 
         ack = JobLeaderWorkerTransferAck.load(result)
         assert ack.accepted is False
-        assert mock_server._transfer_metrics_rejected_stale_token == 1
+        mock_server._worker_state.increment_transfer_rejected_stale_token.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_transfer_unknown_manager(self, mock_server):
