@@ -22,6 +22,7 @@ from hyperscale.distributed.models import (
     WorkerState,
     WorkerStatus,
 )
+from hyperscale.distributed.models.worker_state import WorkerStateUpdate
 from hyperscale.distributed.health import (
     WorkerHealthState,
     WorkerHealthConfig,
@@ -84,7 +85,11 @@ class WorkerPool:
         self._health_config = WorkerHealthConfig()
 
         # Quick lookup by address
-        self._addr_to_worker: dict[tuple[str, int], str] = {}  # (host, port) -> node_id
+        self._addr_to_worker: dict[tuple[str, int], str] = {}
+
+        # Remote worker tracking (AD-48)
+        self._remote_workers: dict[str, WorkerStatus] = {}
+        self._remote_addr_to_worker: dict[tuple[str, int], str] = {}
 
         # Lock for worker registration/deregistration
         self._registration_lock = asyncio.Lock()
@@ -226,12 +231,14 @@ class WorkerPool:
 
         # Check SWIM status if callback provided
         if self._get_swim_status and worker.registration:
-            addr = (worker.registration.node.host,
-                    worker.registration.node.udp_port or worker.registration.node.port)
+            addr = (
+                worker.registration.node.host,
+                worker.registration.node.udp_port or worker.registration.node.port,
+            )
             swim_status = self._get_swim_status(addr)
-            if swim_status == 'OK':
+            if swim_status == "OK":
                 return True
-            if swim_status in ('SUSPECT', 'DEAD'):
+            if swim_status in ("SUSPECT", "DEAD"):
                 return False
 
         # Check explicit health status
@@ -249,10 +256,7 @@ class WorkerPool:
 
     def get_healthy_worker_ids(self) -> list[str]:
         """Get list of all healthy worker node IDs."""
-        return [
-            node_id for node_id in self._workers
-            if self.is_worker_healthy(node_id)
-        ]
+        return [node_id for node_id in self._workers if self.is_worker_healthy(node_id)]
 
     # =========================================================================
     # Three-Signal Health Model (AD-19)
@@ -393,7 +397,9 @@ class WorkerPool:
             # Update cores from heartbeat (authoritative source)
             old_available = worker.available_cores
             worker.available_cores = heartbeat.available_cores
-            worker.total_cores = heartbeat.available_cores + len(heartbeat.active_workflows)
+            worker.total_cores = heartbeat.available_cores + len(
+                heartbeat.active_workflows
+            )
 
             # Clear any reservations that are now confirmed
             worker.reserved_cores = 0
@@ -670,24 +676,36 @@ class WorkerPool:
 
     async def _log_trace(self, message: str) -> None:
         """Log a trace-level message."""
-        await self._logger.log(WorkerPoolTrace(message=message, **self._get_log_context()))
+        await self._logger.log(
+            WorkerPoolTrace(message=message, **self._get_log_context())
+        )
 
     async def _log_debug(self, message: str) -> None:
         """Log a debug-level message."""
-        await self._logger.log(WorkerPoolDebug(message=message, **self._get_log_context()))
+        await self._logger.log(
+            WorkerPoolDebug(message=message, **self._get_log_context())
+        )
 
     async def _log_info(self, message: str) -> None:
         """Log an info-level message."""
-        await self._logger.log(WorkerPoolInfo(message=message, **self._get_log_context()))
+        await self._logger.log(
+            WorkerPoolInfo(message=message, **self._get_log_context())
+        )
 
     async def _log_warning(self, message: str) -> None:
         """Log a warning-level message."""
-        await self._logger.log(WorkerPoolWarning(message=message, **self._get_log_context()))
+        await self._logger.log(
+            WorkerPoolWarning(message=message, **self._get_log_context())
+        )
 
     async def _log_error(self, message: str) -> None:
         """Log an error-level message."""
-        await self._logger.log(WorkerPoolError(message=message, **self._get_log_context()))
+        await self._logger.log(
+            WorkerPoolError(message=message, **self._get_log_context())
+        )
 
     async def _log_critical(self, message: str) -> None:
         """Log a critical-level message."""
-        await self._logger.log(WorkerPoolCritical(message=message, **self._get_log_context()))
+        await self._logger.log(
+            WorkerPoolCritical(message=message, **self._get_log_context())
+        )
