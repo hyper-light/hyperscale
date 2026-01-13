@@ -2874,7 +2874,6 @@ class ManagerServer(HealthAwareServer):
         boundary, but normalizes to AD-20 internally.
         """
         try:
-            # Rate limit check (AD-24)
             client_id = f"{addr[0]}:{addr[1]}"
             allowed, retry_after = await self._check_rate_limit_for_operation(
                 client_id, "cancel"
@@ -2885,31 +2884,16 @@ class ManagerServer(HealthAwareServer):
                     retry_after_seconds=retry_after,
                 ).dump()
 
-            # Parse request - accept both formats at boundary, normalize to AD-20 internally
-            try:
-                cancel_request = JobCancelRequest.load(data)
-                job_id = cancel_request.job_id
-                fence_token = cancel_request.fence_token
-                requester_id = cancel_request.requester_id
-                timestamp = cancel_request.timestamp
-                reason = cancel_request.reason
-            except Exception:
-                # Normalize legacy CancelJob format to AD-20 fields
-                cancel = CancelJob.load(data)
-                job_id = cancel.job_id
-                fence_token = cancel.fence_token
-                requester_id = f"{addr[0]}:{addr[1]}"
-                timestamp = time.monotonic()
-                reason = "Legacy cancel request"
+            job_id, fence_token, requester_id, timestamp, reason = (
+                self._parse_cancel_request(data, addr)
+            )
 
-            # Step 1: Verify job exists
             job = self._job_manager.get_job(job_id)
             if not job:
                 return self._build_cancel_response(
                     job_id, success=False, error="Job not found"
                 )
 
-            # Check fence token if provided (prevents cancelling restarted jobs)
             stored_fence = self._leases.get_fence_token(job_id)
             if fence_token > 0 and stored_fence != fence_token:
                 error_msg = (
@@ -2932,100 +2916,14 @@ class ManagerServer(HealthAwareServer):
                     error="Job already completed",
                 )
 
-            # Track results
-            pending_cancelled: list[str] = []
-            running_cancelled: list[str] = []
-            workflow_errors: dict[str, str] = {}
+            pending_cancelled = await self._cancel_pending_workflows(
+                job_id, timestamp, reason
+            )
 
-            # Step 2: Remove ALL pending workflows from dispatch queue FIRST
-            if self._workflow_dispatcher:
-                removed_pending = (
-                    await self._workflow_dispatcher.cancel_pending_workflows(job_id)
-                )
-                pending_cancelled.extend(removed_pending)
+            running_cancelled, workflow_errors = await self._cancel_running_workflows(
+                job, pending_cancelled, requester_id, timestamp, reason
+            )
 
-                # Mark pending workflows as cancelled
-                for workflow_id in removed_pending:
-                    self._manager_state.set_cancelled_workflow(
-                        workflow_id,
-                        CancelledWorkflowInfo(
-                            workflow_id=workflow_id,
-                            job_id=job_id,
-                            cancelled_at=timestamp,
-                            reason=reason,
-                        ),
-                    )
-
-            # Step 3: Cancel ALL running sub-workflows on workers
-            for workflow_id, workflow_info in job.workflows.items():
-                if (
-                    workflow_id in pending_cancelled
-                    or workflow_info.status != WorkflowStatus.RUNNING
-                ):
-                    continue
-
-                for sub_wf_token in workflow_info.sub_workflow_tokens:
-                    sub_wf = job.sub_workflows.get(sub_wf_token)
-                    if not (sub_wf and sub_wf.token.worker_id):
-                        continue
-
-                    worker = self._manager_state.get_worker(sub_wf.token.worker_id)
-                    if not worker:
-                        workflow_errors[workflow_id] = (
-                            f"Worker {sub_wf.token.worker_id} not found"
-                        )
-                        continue
-
-                    worker_addr = (worker.node.host, worker.node.tcp_port)
-
-                    try:
-                        cancel_data = WorkflowCancelRequest(
-                            job_id=job_id,
-                            workflow_id=workflow_id,
-                            requester_id=requester_id,
-                            timestamp=timestamp,
-                        ).dump()
-
-                        response = await self._send_to_worker(
-                            worker_addr,
-                            "cancel_workflow",
-                            cancel_data,
-                            timeout=5.0,
-                        )
-
-                        if isinstance(response, bytes):
-                            try:
-                                wf_response = WorkflowCancelResponse.load(response)
-                                if wf_response.success:
-                                    running_cancelled.append(workflow_id)
-                                    self._manager_state.set_cancelled_workflow(
-                                        workflow_id,
-                                        CancelledWorkflowInfo(
-                                            workflow_id=workflow_id,
-                                            job_id=job_id,
-                                            cancelled_at=timestamp,
-                                            reason=reason,
-                                        ),
-                                    )
-                                else:
-                                    error_msg = (
-                                        wf_response.error
-                                        or "Worker reported cancellation failure"
-                                    )
-                                    workflow_errors[workflow_id] = error_msg
-                            except Exception as parse_error:
-                                workflow_errors[workflow_id] = (
-                                    f"Failed to parse worker response: {parse_error}"
-                                )
-                        else:
-                            workflow_errors[workflow_id] = "No response from worker"
-
-                    except Exception as send_error:
-                        workflow_errors[workflow_id] = (
-                            f"Failed to send cancellation to worker: {send_error}"
-                        )
-
-            # Stop timeout tracking (AD-34 Part 10.4.9)
             strategy = self._manager_state.get_job_timeout_strategy(job_id)
             if strategy:
                 await strategy.stop_tracking(job_id, "cancelled")
@@ -3034,17 +2932,15 @@ class ManagerServer(HealthAwareServer):
             job.completed_at = time.monotonic()
             await self._manager_state.increment_state_version()
 
-            # Build detailed response
-            successfully_cancelled = pending_cancelled + running_cancelled
-            total_cancelled = len(successfully_cancelled)
+            total_cancelled = len(pending_cancelled) + len(running_cancelled)
             total_errors = len(workflow_errors)
-
             overall_success = total_errors == 0
 
             error_str = None
             if workflow_errors:
                 error_details = [
-                    f"{wf_id[:8]}...: {err}" for wf_id, err in workflow_errors.items()
+                    f"{workflow_id[:8]}...: {err}"
+                    for workflow_id, err in workflow_errors.items()
                 ]
                 error_str = (
                     f"{total_errors} workflow(s) failed: {'; '.join(error_details)}"
