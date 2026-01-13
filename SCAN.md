@@ -2302,15 +2302,70 @@ async def _route_job(
     """
 ```
 
+### Step 3.5k.8: Scan All Modular Classes (MANDATORY)
+
+**This phase applies to ALL files in the node module, not just the server file.**
+
+For each node (worker, manager, gate), scan:
+
+| File Category | Example Files | Must Scan? |
+|---------------|---------------|------------|
+| Server | `server.py` | **YES** |
+| State | `state.py`, `*_state.py` | **YES** |
+| Coordinators | `*_coordinator.py` | **YES** |
+| Handlers | `tcp_*.py`, `*_handler.py` | **YES** |
+| Helpers | `config.py`, `registry.py` | **YES** |
+| Models | `models/*.py` | **YES** (if in node dir) |
+
+**Execution Command:**
+
+```bash
+#!/bin/bash
+# scan_all_types.sh <node_dir>
+
+NODE_DIR=$1  # e.g., hyperscale/distributed/nodes/worker
+
+echo "=== Scanning $NODE_DIR for type hint violations ==="
+
+# Scan parameters
+echo -e "\n--- Untyped Parameters ---"
+for f in "$NODE_DIR"/*.py; do
+    python3 -c "
+import ast
+with open('$f') as f:
+    tree = ast.parse(f.read())
+for node in ast.walk(tree):
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        untyped = [a.arg for a in node.args.args 
+                   if a.arg not in ('self', 'cls') and a.annotation is None]
+        if untyped:
+            print(f'$f:{node.lineno}:{node.name}: {untyped}')
+"
+done
+
+# Scan class attributes
+echo -e "\n--- Untyped Class Attributes ---"
+for f in "$NODE_DIR"/*.py; do
+    python3 scan_class_attrs.py "$f"
+done
+
+# Scan for Any/object
+echo -e "\n--- Any/object Escape Hatches ---"
+grep -rn ": Any\|: object" "$NODE_DIR"/*.py
+
+echo -e "\n=== Scan Complete ==="
+```
+
 ### Output
 
-- **ZERO** untyped parameters (except `self`/`cls`)
+- **ZERO** untyped parameters (except `self`/`cls`) in ALL modular class files
+- **ZERO** untyped class attributes (both public and private, class-level and instance-level)
 - **ZERO** use of `Any` or `object` as type hints (without justification)
 - **ZERO** public methods without return type hints
 - All complex types documented in docstrings
-- LSP diagnostics clean
+- LSP diagnostics clean on ALL scanned files
 
-**BLOCKING**: Phase 3.5k is not complete until ALL functions/methods have properly researched and applied type hints.
+**BLOCKING**: Phase 3.5k is not complete until ALL functions, methods, AND class attributes across ALL modular class files have properly researched and applied type hints.
 
 ---
 
