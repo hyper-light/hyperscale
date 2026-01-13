@@ -561,14 +561,15 @@ class TestCancellationMethods:
 class TestThroughputMethods:
     """Tests for throughput tracking methods."""
 
-    def test_record_forward(self):
+    @pytest.mark.asyncio
+    async def test_record_forward(self):
         """Record forward increments count."""
         state = GateRuntimeState()
 
-        state.record_forward()
+        await state.record_forward()
         assert state._forward_throughput_count == 1
 
-        state.record_forward()
+        await state.record_forward()
         assert state._forward_throughput_count == 2
 
     def test_calculate_throughput_within_interval(self):
@@ -608,26 +609,28 @@ class TestThroughputMethods:
 class TestStateVersionMethods:
     """Tests for state version tracking methods."""
 
-    def test_increment_state_version(self):
+    @pytest.mark.asyncio
+    async def test_increment_state_version(self):
         """Increment state version increments and returns."""
         state = GateRuntimeState()
 
-        version1 = state.increment_state_version()
-        version2 = state.increment_state_version()
-        version3 = state.increment_state_version()
+        version1 = await state.increment_state_version()
+        version2 = await state.increment_state_version()
+        version3 = await state.increment_state_version()
 
         assert version1 == 1
         assert version2 == 2
         assert version3 == 3
 
-    def test_get_state_version(self):
+    @pytest.mark.asyncio
+    async def test_get_state_version(self):
         """Get state version returns current value."""
         state = GateRuntimeState()
 
         assert state.get_state_version() == 0
 
-        state.increment_state_version()
-        state.increment_state_version()
+        await state.increment_state_version()
+        await state.increment_state_version()
 
         assert state.get_state_version() == 2
 

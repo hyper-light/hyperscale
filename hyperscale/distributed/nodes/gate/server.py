@@ -2420,6 +2420,8 @@ class GateServer(HealthAwareServer):
         """Record manager heartbeat."""
         now = time.monotonic()
 
+        self._circuit_breaker_manager.record_success(manager_addr)
+
         if dc_id not in self._dc_registration_states:
             self._dc_registration_states[dc_id] = DatacenterRegistrationState(
                 dc_id=dc_id,
