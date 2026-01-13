@@ -3128,6 +3128,9 @@ class GateServer(HealthAwareServer):
                     for key in health_keys_to_remove:
                         self._manager_health.pop(key, None)
 
+                await self._dispatch_time_tracker.cleanup_stale_entries()
+                await self._observed_latency_tracker.cleanup_stale_entries()
+
             except asyncio.CancelledError:
                 break
             except Exception as error:
