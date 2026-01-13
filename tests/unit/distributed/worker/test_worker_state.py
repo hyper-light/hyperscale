@@ -143,36 +143,39 @@ class TestWorkerStateManagerTracking:
         assert "mgr-1" in state._healthy_manager_ids
         assert state.is_manager_healthy("mgr-1") is True
 
-    def test_mark_manager_unhealthy(self):
+    @pytest.mark.asyncio
+    async def test_mark_manager_unhealthy(self):
         """Test marking a manager as unhealthy."""
         allocator = MockCoreAllocator()
         state = WorkerState(allocator)
 
         state.mark_manager_healthy("mgr-1")
-        state.mark_manager_unhealthy("mgr-1")
+        await state.mark_manager_unhealthy("mgr-1")
 
         assert "mgr-1" not in state._healthy_manager_ids
         assert state.is_manager_healthy("mgr-1") is False
         assert "mgr-1" in state._manager_unhealthy_since
 
-    def test_mark_manager_unhealthy_records_time(self):
+    @pytest.mark.asyncio
+    async def test_mark_manager_unhealthy_records_time(self):
         """Test that marking unhealthy records timestamp."""
         allocator = MockCoreAllocator()
         state = WorkerState(allocator)
 
         before = time.monotonic()
-        state.mark_manager_unhealthy("mgr-1")
+        await state.mark_manager_unhealthy("mgr-1")
         after = time.monotonic()
 
         assert "mgr-1" in state._manager_unhealthy_since
         assert before <= state._manager_unhealthy_since["mgr-1"] <= after
 
-    def test_mark_manager_healthy_clears_unhealthy_since(self):
+    @pytest.mark.asyncio
+    async def test_mark_manager_healthy_clears_unhealthy_since(self):
         """Test that marking healthy clears unhealthy timestamp."""
         allocator = MockCoreAllocator()
         state = WorkerState(allocator)
 
-        state.mark_manager_unhealthy("mgr-1")
+        await state.mark_manager_unhealthy("mgr-1")
         assert "mgr-1" in state._manager_unhealthy_since
 
         state.mark_manager_healthy("mgr-1")
