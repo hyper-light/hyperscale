@@ -1661,7 +1661,9 @@ For each violation:
 5. **Run LSP diagnostics**: Verify no broken references
 6. **Re-calculate complexity**: Verify both original and extracted are ≤4
 
-### Step 5.9e: Post-Refactor Validation (MANDATORY)
+### Step 5.9e: Post-Refactor Validation (MANDATORY - NO SHORTCUTS)
+
+**NO SHORTCUTS**: Do not skip validation steps. Do not assume "it probably works". Run every check.
 
 After EVERY complexity-reducing refactor:
 
@@ -1672,6 +1674,7 @@ After EVERY complexity-reducing refactor:
    - Locally computed
 3. **Attribute Access Validation**: Run Phase 3.5g scanner on modified methods
 4. **Method Existence Check**: All called methods exist on their targets
+5. **Chained Access Validation**: Run Phase 3.5h.1 scanner for chained attribute access
 
 ```bash
 # Quick validation command
@@ -1713,9 +1716,11 @@ async def _process_complex_case(self):
 
 ---
 
-## Phase 6: Clean Up Dead Code
+## Phase 6: Clean Up Dead Code (NO SHORTCUTS)
 
 **Objective**: Remove orphaned implementations.
+
+**NO SHORTCUTS**: Do not comment out code "just in case". Do not leave dead code with TODO comments. Either the code is needed (keep it and wire it up) or it's not (delete it).
 
 **Steps**:
 1. For each modular class, extract all public methods
