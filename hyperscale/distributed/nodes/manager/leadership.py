@@ -80,7 +80,7 @@ class ManagerLeadershipCoordinator:
                 node_host=self._config.host,
                 node_port=self._config.tcp_port,
                 node_id=self._node_id,
-            )
+            ),
         )
 
         for callback in self._on_become_leader_callbacks:
@@ -94,7 +94,7 @@ class ManagerLeadershipCoordinator:
                         node_host=self._config.host,
                         node_port=self._config.tcp_port,
                         node_id=self._node_id,
-                    )
+                    ),
                 )
 
     def on_lose_leadership(self) -> None:
@@ -108,7 +108,7 @@ class ManagerLeadershipCoordinator:
                 node_host=self._config.host,
                 node_port=self._config.tcp_port,
                 node_id=self._node_id,
-            )
+            ),
         )
 
         for callback in self._on_lose_leadership_callbacks:
@@ -122,7 +122,7 @@ class ManagerLeadershipCoordinator:
                         node_host=self._config.host,
                         node_port=self._config.tcp_port,
                         node_id=self._node_id,
-                    )
+                    ),
                 )
 
     def has_quorum(self) -> bool:
@@ -148,16 +148,9 @@ class ManagerLeadershipCoordinator:
         return known_count // 2 + 1
 
     def detect_split_brain(self) -> bool:
-        """
-        Detect potential split-brain scenario.
-
-        Returns:
-            True if split-brain is suspected
-        """
         if not self._is_leader():
             return False
 
-        # Check if we have quorum
         if not self.has_quorum():
             self._task_runner.run(
                 self._logger.log,
@@ -166,14 +159,32 @@ class ManagerLeadershipCoordinator:
                     node_host=self._config.host,
                     node_port=self._config.tcp_port,
                     node_id=self._node_id,
-                )
+                ),
             )
             return True
 
         return False
 
+    def get_cluster_health_level(self) -> str:
+        active_count = self._state.get_active_peer_count()
+        known_count = len(self._state._known_manager_peers) + 1
+        dead_count = len(self._state._dead_managers)
+
+        if known_count <= 1:
+            return "standalone"
+
+        healthy_ratio = active_count / known_count
+
+        if healthy_ratio >= 0.8 and dead_count == 0:
+            return "healthy"
+        elif healthy_ratio >= 0.5:
+            return "degraded"
+        elif self.has_quorum():
+            return "critical"
+        else:
+            return "no_quorum"
+
     def get_leadership_metrics(self) -> dict:
-        """Get leadership-related metrics."""
         return {
             "is_leader": self._is_leader(),
             "current_term": self._get_term(),
@@ -181,4 +192,6 @@ class ManagerLeadershipCoordinator:
             "quorum_size": self.get_quorum_size(),
             "active_peer_count": self._state.get_active_peer_count(),
             "known_peer_count": len(self._state._known_manager_peers),
+            "cluster_health_level": self.get_cluster_health_level(),
+            "dead_manager_count": len(self._state._dead_managers),
         }

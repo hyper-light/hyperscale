@@ -973,6 +973,13 @@ class GateServer(HealthAwareServer):
         self._init_coordinators()
         self._init_handlers()
 
+        # Wire orphan job coordinator to lease manager callback
+        if self._orphan_job_coordinator:
+            self._job_lease_manager._on_lease_expired = (
+                self._orphan_job_coordinator.on_lease_expired
+            )
+            await self._orphan_job_coordinator.start()
+
         # Register with managers
         if self._datacenter_managers:
             await self._register_with_managers()

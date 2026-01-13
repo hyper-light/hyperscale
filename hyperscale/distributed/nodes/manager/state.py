@@ -71,8 +71,12 @@ class ManagerState:
         self._registered_with_managers: set[str] = set()
         self._manager_peer_unhealthy_since: dict[str, float] = {}
         self._dead_managers: set[tuple[str, int]] = set()
+        self._dead_manager_timestamps: dict[tuple[str, int], float] = {}
         self._peer_manager_health_states: dict[str, str] = {}
         self._dc_leader_manager_id: str | None = None
+        self._recovery_verification_pending: dict[tuple[str, int], float] = {}
+        self._last_leader_heartbeat_at: float = 0.0
+        self._consecutive_quorum_failures: int = 0
 
         # Worker tracking
         self._workers: dict[str, WorkerRegistration] = {}

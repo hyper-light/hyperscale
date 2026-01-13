@@ -1005,13 +1005,14 @@ class ManagerServer(HealthAwareServer):
         udp_addr: tuple[str, int],
         tcp_addr: tuple[str, int],
     ) -> None:
-        """Handle manager peer failure."""
         peer_lock = await self._manager_state.get_peer_state_lock(tcp_addr)
         async with peer_lock:
             self._manager_state._peer_state_epoch[tcp_addr] = (
                 self._manager_state._peer_state_epoch.get(tcp_addr, 0) + 1
             )
             self._manager_state._active_manager_peers.discard(tcp_addr)
+            self._manager_state._dead_managers.add(tcp_addr)
+            self._manager_state._dead_manager_timestamps[tcp_addr] = time.monotonic()
 
         await self._udp_logger.log(
             ServerInfo(
@@ -1022,15 +1023,14 @@ class ManagerServer(HealthAwareServer):
             )
         )
 
-        # Handle job leader failure
         await self._handle_job_leader_failure(tcp_addr)
+        await self._check_quorum_status()
 
     async def _handle_manager_peer_recovery(
         self,
         udp_addr: tuple[str, int],
         tcp_addr: tuple[str, int],
     ) -> None:
-        """Handle manager peer recovery."""
         peer_lock = await self._manager_state.get_peer_state_lock(tcp_addr)
 
         async with peer_lock:
@@ -1048,16 +1048,51 @@ class ManagerServer(HealthAwareServer):
                 if current_epoch != initial_epoch:
                     return
 
+            verification_success = await self._verify_peer_recovery(tcp_addr)
+            if not verification_success:
+                await self._udp_logger.log(
+                    ServerWarning(
+                        message=f"Manager peer {tcp_addr} recovery verification failed, not re-adding",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+                return
+
+            async with peer_lock:
+                current_epoch = self._manager_state._peer_state_epoch.get(tcp_addr, 0)
+                if current_epoch != initial_epoch:
+                    return
+
                 self._manager_state._active_manager_peers.add(tcp_addr)
+                self._manager_state._dead_managers.discard(tcp_addr)
+                self._manager_state._dead_manager_timestamps.pop(tcp_addr, None)
 
         await self._udp_logger.log(
             ServerInfo(
-                message=f"Manager peer {tcp_addr} REJOINED",
+                message=f"Manager peer {tcp_addr} REJOINED (verified)",
                 node_host=self._host,
                 node_port=self._tcp_port,
                 node_id=self._node_id.short,
             )
         )
+
+    async def _verify_peer_recovery(self, tcp_addr: tuple[str, int]) -> bool:
+        try:
+            ping_request = PingRequest(requester_id=self._node_id.full)
+            response = await asyncio.wait_for(
+                self._send_to_peer(
+                    tcp_addr,
+                    "ping",
+                    ping_request.dump(),
+                    self._config.tcp_timeout_short_seconds,
+                ),
+                timeout=self._config.tcp_timeout_short_seconds + 1.0,
+            )
+            return response is not None and response != b"error"
+        except (asyncio.TimeoutError, Exception):
+            return False
 
     async def _handle_gate_peer_failure(
         self,
@@ -1113,6 +1148,42 @@ class ManagerServer(HealthAwareServer):
                     node_id=self._node_id.short,
                 )
             )
+
+    async def _check_quorum_status(self) -> None:
+        has_quorum = self._leadership_coordinator.has_quorum()
+
+        if has_quorum:
+            self._manager_state._consecutive_quorum_failures = 0
+            return
+
+        self._manager_state._consecutive_quorum_failures += 1
+
+        if not self.is_leader():
+            return
+
+        max_quorum_failures = 3
+        if self._manager_state._consecutive_quorum_failures >= max_quorum_failures:
+            await self._udp_logger.log(
+                ServerWarning(
+                    message=f"Lost quorum for {self._manager_state._consecutive_quorum_failures} consecutive checks, stepping down",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            self._task_runner.run(self._leader_election._step_down)
+
+    def _should_backup_orphan_scan(self) -> bool:
+        if self.is_leader():
+            return False
+
+        leader_addr = self._leader_election.state.current_leader
+        if leader_addr is None:
+            return True
+
+        leader_last_seen = self._leader_election.state.last_leader_update
+        leader_timeout = self._config.orphan_scan_interval_seconds * 3
+        return (time.monotonic() - leader_last_seen) > leader_timeout
 
     # =========================================================================
     # Heartbeat Handlers
@@ -1249,6 +1320,20 @@ class ManagerServer(HealthAwareServer):
                 for gate_id in gates_to_reap:
                     self._registry.unregister_gate(gate_id)
 
+                # Cleanup stale dead manager tracking (prevents memory leak)
+                dead_manager_cleanup_threshold = now - (
+                    self._config.dead_peer_reap_interval_seconds * 2
+                )
+                dead_managers_to_cleanup = [
+                    tcp_addr
+                    for tcp_addr, dead_since in self._manager_state._dead_manager_timestamps.items()
+                    if dead_since < dead_manager_cleanup_threshold
+                ]
+                for tcp_addr in dead_managers_to_cleanup:
+                    self._manager_state._dead_managers.discard(tcp_addr)
+                    self._manager_state._dead_manager_timestamps.pop(tcp_addr, None)
+                    self._manager_state.remove_peer_lock(tcp_addr)
+
             except asyncio.CancelledError:
                 break
             except Exception as error:
@@ -1276,10 +1361,10 @@ class ManagerServer(HealthAwareServer):
             try:
                 await asyncio.sleep(self._config.orphan_scan_interval_seconds)
 
-                if not self.is_leader():
+                should_scan = self.is_leader() or self._should_backup_orphan_scan()
+                if not should_scan:
                     continue
 
-                # Query each worker for their active workflows
                 for worker_id, worker in list(self._manager_state._workers.items()):
                     try:
                         worker_addr = (worker.node.host, worker.node.tcp_port)
