@@ -201,6 +201,37 @@ class ManagerLeaseCoordinator:
             self._state._job_fencing_tokens[job_id] = new_value
             return new_value
 
+    def set_fence_token(self, job_id: str, value: int) -> None:
+        """
+        Set fencing token for a job to a specific value.
+
+        Used during job initialization or explicit token assignment.
+
+        Args:
+            job_id: Job ID
+            value: Token value to set
+        """
+        self._state._job_fencing_tokens[job_id] = value
+
+    def update_fence_token_if_higher(self, job_id: str, new_token: int) -> bool:
+        """
+        Update fencing token only if new value is higher than current.
+
+        Used during state sync to accept newer tokens from peers.
+
+        Args:
+            job_id: Job ID
+            new_token: Proposed new token value
+
+        Returns:
+            True if token was updated, False if current token is >= new_token
+        """
+        current = self._state._job_fencing_tokens.get(job_id, 0)
+        if new_token > current:
+            self._state._job_fencing_tokens[job_id] = new_token
+            return True
+        return False
+
     def validate_fence_token(self, job_id: str, token: int) -> bool:
         """
         Validate a fencing token is current.
