@@ -49,7 +49,7 @@ class AliveHandler(BaseHandler):
         if target:
             if self._server.is_message_fresh(target, msg_incarnation, b"OK"):
                 await self._server.refute_suspicion(target, msg_incarnation)
-                self._server.update_node_state(
+                await self._server.update_node_state(
                     target,
                     b"OK",
                     msg_incarnation,
