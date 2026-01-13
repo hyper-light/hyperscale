@@ -675,9 +675,8 @@ class WorkerPool:
             # Clear reservations since progress is authoritative
             worker.reserved_cores = 0
 
-            # Signal if cores became available
             if worker.available_cores > old_available:
-                self._cores_available.set()
+                self._cores_condition.notify_all()
 
             return True
 
