@@ -1730,7 +1730,7 @@ class ManagerServer(HealthAwareServer):
                 current_time = time.monotonic()
                 grace_period = self._worker_health_manager.base_deadline
 
-                deadlines_snapshot = list(self._manager_state._worker_deadlines.items())
+                deadlines_snapshot = self._manager_state.iter_worker_deadlines()
 
                 for worker_id, deadline in deadlines_snapshot:
                     if current_time <= deadline:
