@@ -513,21 +513,20 @@ class TestManagerStatePeerManagement:
         """get_active_peer_count returns correct count."""
         state = ManagerState()
 
-        # Initially 1 (self)
         assert state.get_active_peer_count() == 1
 
-        # Add peers
         state._active_manager_peers.add(("10.0.0.1", 8000))
         state._active_manager_peers.add(("10.0.0.2", 8000))
 
         assert state.get_active_peer_count() == 3
 
-    def test_is_peer_active(self):
+    @pytest.mark.asyncio
+    async def test_is_peer_active(self):
         """is_peer_active checks peer status."""
         state = ManagerState()
         peer_addr = ("10.0.0.1", 8000)
 
-        assert state.is_peer_active(peer_addr) is False
+        assert await state.is_peer_active(peer_addr) is False
 
         state._active_manager_peers.add(peer_addr)
 
