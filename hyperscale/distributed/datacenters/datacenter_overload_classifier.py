@@ -122,6 +122,19 @@ class DatacenterOverloadClassifier:
             return DatacenterOverloadState.BUSY
         return DatacenterOverloadState.HEALTHY
 
+    def _classify_by_manager_overload(
+        self,
+        ratio: float,
+        leader_overloaded: bool,
+    ) -> DatacenterOverloadState:
+        if leader_overloaded:
+            return DatacenterOverloadState.DEGRADED
+        if ratio >= 0.5:
+            return DatacenterOverloadState.DEGRADED
+        if ratio >= 0.3:
+            return DatacenterOverloadState.BUSY
+        return DatacenterOverloadState.HEALTHY
+
     def _classify_by_capacity(self, utilization: float) -> DatacenterOverloadState:
         config = self._config
         if utilization >= config.capacity_utilization_unhealthy_threshold:
