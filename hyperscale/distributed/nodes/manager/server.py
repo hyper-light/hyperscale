@@ -4610,16 +4610,90 @@ class ManagerServer(HealthAwareServer):
     # =========================================================================
 
     async def _handle_job_completion(self, job_id: str) -> None:
-        """Handle job completion."""
-        # Clear job state
+        """Handle job completion with notification and cleanup."""
+        job = self._job_manager.get_job_by_id(job_id)
+
+        final_status = JobStatus.COMPLETED.value
+        total_completed = 0
+        total_failed = 0
+        workflow_results: list[WorkflowResult] = []
+        errors: list[str] = []
+        elapsed_seconds = 0.0
+
+        if job:
+            async with job.lock:
+                job.status = JobStatus.COMPLETED.value
+                total_completed = sum(
+                    wf.completed_count for wf in job.workflows.values()
+                )
+                total_failed = sum(wf.failed_count for wf in job.workflows.values())
+                elapsed_seconds = job.elapsed_seconds()
+
+                if job.workflows_failed > 0:
+                    final_status = (
+                        JobStatus.FAILED.value
+                        if job.workflows_failed == job.workflows_total
+                        else JobStatus.COMPLETED.value
+                    )
+
+                for workflow_token, workflow_info in job.workflows.items():
+                    workflow_results.append(
+                        WorkflowResult(
+                            job_id=job_id,
+                            workflow_name=workflow_info.workflow_name,
+                            status=workflow_info.status,
+                            completed_count=workflow_info.completed_count,
+                            failed_count=workflow_info.failed_count,
+                            error=workflow_info.error,
+                        )
+                    )
+                    if workflow_info.error:
+                        errors.append(
+                            f"{workflow_info.workflow_name}: {workflow_info.error}"
+                        )
+
+        origin_gate_addr = self._manager_state._job_origin_gates.get(job_id)
+        if origin_gate_addr:
+            final_result = JobFinalResult(
+                job_id=job_id,
+                datacenter=self._node_id.datacenter,
+                status=final_status,
+                workflow_results=workflow_results,
+                total_completed=total_completed,
+                total_failed=total_failed,
+                errors=errors,
+                elapsed_seconds=elapsed_seconds,
+                fence_token=self._leases.get_job_fencing_token(job_id),
+            )
+
+            try:
+                await self._send_to_peer(
+                    origin_gate_addr,
+                    "job_final_result",
+                    final_result.dump(),
+                    timeout=5.0,
+                )
+            except Exception as send_error:
+                await self._udp_logger.log(
+                    ServerWarning(
+                        message=f"Failed to send job completion to gate: {send_error}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+
         self._leases.clear_job_leases(job_id)
         self._health_monitor.cleanup_job_progress(job_id)
         self._health_monitor.clear_job_suspicions(job_id)
         self._manager_state.clear_job_state(job_id)
 
+        if job:
+            await self._job_manager.remove_job(job.token)
+
         await self._udp_logger.log(
             ServerInfo(
-                message=f"Job {job_id[:8]}... completed",
+                message=f"Job {job_id[:8]}... {final_status.lower()} ({total_completed} completed, {total_failed} failed)",
                 node_host=self._host,
                 node_port=self._tcp_port,
                 node_id=self._node_id.short,
