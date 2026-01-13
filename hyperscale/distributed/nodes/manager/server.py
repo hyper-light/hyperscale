@@ -21,6 +21,7 @@ from hyperscale.distributed.swim.health import FederatedHealthMonitor
 from hyperscale.distributed.env import Env
 from hyperscale.distributed.server import tcp
 
+from hyperscale.reporting.common.results_types import WorkflowStats
 from hyperscale.distributed.models import (
     NodeInfo,
     NodeRole,
