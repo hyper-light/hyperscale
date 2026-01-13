@@ -135,6 +135,10 @@ class ManagerConfig:
     job_timeout_check_interval_seconds: float = 30.0
     job_retention_seconds: float = 3600.0
 
+    # Aggregate health alert thresholds
+    health_alert_overloaded_ratio: float = 0.5
+    health_alert_non_healthy_ratio: float = 0.8
+
     # WAL configuration (AD-38)
     wal_data_dir: Path | None = None
 
@@ -247,5 +251,7 @@ def create_manager_config_from_env(
             env, "JOB_TIMEOUT_CHECK_INTERVAL", 30.0
         ),
         job_retention_seconds=getattr(env, "JOB_RETENTION_SECONDS", 3600.0),
+        health_alert_overloaded_ratio=env.MANAGER_HEALTH_ALERT_OVERLOADED_RATIO,
+        health_alert_non_healthy_ratio=env.MANAGER_HEALTH_ALERT_NON_HEALTHY_RATIO,
         wal_data_dir=wal_data_dir,
     )

@@ -233,6 +233,15 @@ class Env(BaseModel):
         15.0  # Seconds between responsiveness checks
     )
 
+    # Manager Aggregate Health Alert Settings
+    # Thresholds for triggering alerts when worker health degrades across the cluster
+    MANAGER_HEALTH_ALERT_OVERLOADED_RATIO: StrictFloat = (
+        0.5  # Alert when >= 50% of workers are overloaded
+    )
+    MANAGER_HEALTH_ALERT_NON_HEALTHY_RATIO: StrictFloat = (
+        0.8  # Alert when >= 80% of workers are non-healthy (busy/stressed/overloaded)
+    )
+
     # AD-34: Job Timeout Settings
     JOB_TIMEOUT_CHECK_INTERVAL: StrictFloat = 30.0  # Seconds between job timeout checks
 
@@ -708,6 +717,9 @@ class Env(BaseModel):
             "MANAGER_TCP_TIMEOUT_STANDARD": float,
             # Manager batch stats settings
             "MANAGER_BATCH_PUSH_INTERVAL": float,
+            # Manager health alert settings
+            "MANAGER_HEALTH_ALERT_OVERLOADED_RATIO": float,
+            "MANAGER_HEALTH_ALERT_NON_HEALTHY_RATIO": float,
             # AD-44 retry budget settings
             "RETRY_BUDGET_MAX": int,
             "RETRY_BUDGET_PER_WORKFLOW_MAX": int,

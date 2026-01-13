@@ -337,6 +337,9 @@ class ManagerHealthMonitor:
             overloaded_count + stressed_count + busy_count
         ) / total_workers
 
+        overloaded_threshold = self._config.health_alert_overloaded_ratio
+        non_healthy_threshold = self._config.health_alert_non_healthy_ratio
+
         if healthy_count == 0 and total_workers > 0:
             self._task_runner.run(
                 self._logger.log,
@@ -347,7 +350,7 @@ class ManagerHealthMonitor:
                     node_id=self._node_id,
                 ),
             )
-        elif overloaded_ratio >= 0.5:
+        elif overloaded_ratio >= overloaded_threshold:
             self._task_runner.run(
                 self._logger.log,
                 ServerWarning(
@@ -357,7 +360,7 @@ class ManagerHealthMonitor:
                     node_id=self._node_id,
                 ),
             )
-        elif non_healthy_ratio >= 0.8:
+        elif non_healthy_ratio >= non_healthy_threshold:
             self._task_runner.run(
                 self._logger.log,
                 ServerWarning(
