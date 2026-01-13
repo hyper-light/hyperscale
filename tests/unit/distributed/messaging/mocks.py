@@ -214,7 +214,7 @@ class MockServerInterface:
     def read_nodes(self) -> dict[tuple[str, int], Any]:
         return self._nodes
 
-    def get_current_timeout(self) -> float:
+    async def get_current_timeout(self) -> float:
         return self._current_timeout
 
     def get_other_nodes(
