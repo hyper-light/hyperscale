@@ -126,6 +126,11 @@ class GateRuntimeState:
             self._lock_creation_lock = asyncio.Lock()
         return self._lock_creation_lock
 
+    def _get_manager_state_lock(self) -> asyncio.Lock:
+        if self._manager_state_lock is None:
+            self._manager_state_lock = asyncio.Lock()
+        return self._manager_state_lock
+
     async def get_or_create_peer_lock(self, peer_addr: tuple[str, int]) -> asyncio.Lock:
         async with self._get_lock_creation_lock():
             if peer_addr not in self._peer_state_locks:
