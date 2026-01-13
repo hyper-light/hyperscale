@@ -76,6 +76,10 @@ class OverloadStateTracker:
         return self._pending_count
 
 
+# Backwards compatibility alias
+OverloadState = OverloadStateTracker
+
+
 class ManagerLoadShedder:
     """
     Determines whether to shed requests based on priority and load (AD-22).
@@ -99,7 +103,7 @@ class ManagerLoadShedder:
         self._logger = logger
         self._node_id = node_id
         self._task_runner = task_runner
-        self._overload = OverloadState(max_pending)
+        self._overload = OverloadStateTracker(max_pending)
 
         # Map overload state to minimum priority that gets processed
         # Requests with priority >= min_priority are shed
