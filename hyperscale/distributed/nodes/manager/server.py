@@ -2564,31 +2564,26 @@ class ManagerServer(HealthAwareServer):
         try:
             registration = ManagerPeerRegistration.load(data)
 
-            # Register peer
-            self._registry.register_manager_peer(registration.manager_info)
+            # Register peer using the node field (which is ManagerInfo)
+            self._registry.register_manager_peer(registration.node)
 
             # Add to SWIM
             peer_udp_addr = (
-                registration.manager_info.udp_host,
-                registration.manager_info.udp_port,
+                registration.node.udp_host,
+                registration.node.udp_port,
             )
             self._manager_state._manager_udp_to_tcp[peer_udp_addr] = (
-                registration.manager_info.tcp_host,
-                registration.manager_info.tcp_port,
+                registration.node.tcp_host,
+                registration.node.tcp_port,
             )
             self._probe_scheduler.add_member(peer_udp_addr)
 
             response = ManagerPeerRegistrationResponse(
                 accepted=True,
-                manager_info=ManagerInfo(
-                    node_id=self._node_id.full,
-                    tcp_host=self._host,
-                    tcp_port=self._tcp_port,
-                    udp_host=self._host,
-                    udp_port=self._udp_port,
-                    datacenter=self._node_id.datacenter,
-                    is_leader=self.is_leader(),
-                ),
+                manager_id=self._node_id.full,
+                is_leader=self.is_leader(),
+                term=self._leader_election.state.current_term,
+                known_peers=self._get_known_manager_peers(),
             )
 
             return response.dump()
