@@ -23,18 +23,27 @@ from .health_gossip_buffer import (
     MAX_HEALTH_PIGGYBACK_SIZE,
 )
 
+from .worker_state_gossip_buffer import (
+    WorkerStateGossipBuffer,
+    WORKER_STATE_SEPARATOR,
+    MAX_WORKER_STATE_PIGGYBACK_SIZE,
+)
+
 
 __all__ = [
     # Membership gossip
-    'PiggybackUpdate',
-    'GossipBuffer',
-    'MAX_PIGGYBACK_SIZE',
-    'MAX_UDP_PAYLOAD',
+    "PiggybackUpdate",
+    "GossipBuffer",
+    "MAX_PIGGYBACK_SIZE",
+    "MAX_UDP_PAYLOAD",
     # Health gossip (Phase 6.1)
-    'HealthGossipBuffer',
-    'HealthGossipBufferConfig',
-    'HealthGossipEntry',
-    'OverloadSeverity',
-    'MAX_HEALTH_PIGGYBACK_SIZE',
+    "HealthGossipBuffer",
+    "HealthGossipBufferConfig",
+    "HealthGossipEntry",
+    "OverloadSeverity",
+    "MAX_HEALTH_PIGGYBACK_SIZE",
+    # Worker state gossip (AD-48)
+    "WorkerStateGossipBuffer",
+    "WORKER_STATE_SEPARATOR",
+    "MAX_WORKER_STATE_PIGGYBACK_SIZE",
 ]
-
