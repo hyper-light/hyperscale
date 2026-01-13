@@ -183,6 +183,8 @@ from .worker_state import (
     WorkerStatePiggybackUpdate as WorkerStatePiggybackUpdate,
     WorkerListResponse as WorkerListResponse,
     WorkerListRequest as WorkerListRequest,
+    WorkflowReassignmentNotification as WorkflowReassignmentNotification,
+    WorkflowReassignmentBatch as WorkflowReassignmentBatch,
 )
 
 # CRDTs for cross-datacenter synchronization

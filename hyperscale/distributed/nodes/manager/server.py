@@ -101,6 +101,7 @@ from hyperscale.distributed.models.worker_state import (
     WorkerStateUpdate,
     WorkerListResponse,
     WorkerListRequest,
+    WorkflowReassignmentBatch,
 )
 from hyperscale.distributed.reliability import (
     HybridOverloadDetector,
@@ -977,6 +978,9 @@ class ManagerServer(HealthAwareServer):
             worker_id
         )
 
+        if not running_sub_workflows:
+            return
+
         for job_id, workflow_id, sub_token in running_sub_workflows:
             await self._workflow_dispatcher.requeue_workflow(sub_token)
 
@@ -987,6 +991,13 @@ class ManagerServer(HealthAwareServer):
                     node_port=self._tcp_port,
                     node_id=self._node_id.short,
                 )
+            )
+
+        if self._worker_disseminator:
+            await self._worker_disseminator.broadcast_workflow_reassignments(
+                failed_worker_id=worker_id,
+                reason="worker_dead",
+                reassignments=running_sub_workflows,
             )
 
     async def _handle_manager_peer_failure(
@@ -3393,6 +3404,43 @@ class ManagerServer(HealthAwareServer):
             await self._udp_logger.log(
                 ServerError(
                     message=f"List workers error: {error}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            return b"error"
+
+    @tcp.receive()
+    async def workflow_reassignment(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ) -> bytes:
+        try:
+            batch = WorkflowReassignmentBatch.from_bytes(data)
+            if batch is None:
+                return b"invalid"
+
+            if batch.originating_manager_id == self._node_id.full:
+                return b"self"
+
+            await self._udp_logger.log(
+                ServerDebug(
+                    message=f"Received {len(batch.reassignments)} workflow reassignments from {batch.originating_manager_id[:8]}... (worker {batch.failed_worker_id[:8]}... {batch.reason})",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+
+            return b"accepted"
+
+        except Exception as error:
+            await self._udp_logger.log(
+                ServerError(
+                    message=f"Workflow reassignment error: {error}",
                     node_host=self._host,
                     node_port=self._tcp_port,
                     node_id=self._node_id.short,

@@ -11,6 +11,7 @@ from hyperscale.distributed.models.worker_state import (
     WorkerStateUpdate,
     WorkerListResponse,
     WorkerListRequest,
+    WorkflowReassignmentBatch,
 )
 from hyperscale.distributed.swim.gossip.worker_state_gossip_buffer import (
     WorkerStateGossipBuffer,
@@ -373,6 +374,77 @@ class WorkerDisseminator:
         return WorkerListResponse(
             manager_id=self._node_id,
             workers=updates,
+        )
+
+    async def broadcast_workflow_reassignments(
+        self,
+        failed_worker_id: str,
+        reason: str,
+        reassignments: list[tuple[str, str, str]],
+    ) -> None:
+        if not reassignments:
+            return
+
+        peers = list(self._state._active_manager_peers)
+        if not peers:
+            return
+
+        batch = WorkflowReassignmentBatch(
+            originating_manager_id=self._node_id,
+            failed_worker_id=failed_worker_id,
+            reason=reason,
+            timestamp=time.monotonic(),
+            datacenter=self._datacenter,
+            reassignments=reassignments,
+        )
+
+        batch_bytes = batch.to_bytes()
+
+        async def send_to_peer(peer_addr: tuple[str, int]) -> None:
+            try:
+                await asyncio.wait_for(
+                    self._send_tcp(
+                        peer_addr,
+                        "workflow_reassignment",
+                        batch_bytes,
+                        5.0,
+                    ),
+                    timeout=5.0,
+                )
+            except asyncio.TimeoutError:
+                self._task_runner.run(
+                    self._logger.log,
+                    ServerWarning(
+                        message=f"Timeout broadcasting workflow reassignment to {peer_addr}",
+                        node_host=self._config.host,
+                        node_port=self._config.tcp_port,
+                        node_id=self._node_id,
+                    ),
+                )
+            except Exception as broadcast_error:
+                self._task_runner.run(
+                    self._logger.log,
+                    ServerWarning(
+                        message=f"Failed to broadcast workflow reassignment to {peer_addr}: {broadcast_error}",
+                        node_host=self._config.host,
+                        node_port=self._config.tcp_port,
+                        node_id=self._node_id,
+                    ),
+                )
+
+        await asyncio.gather(
+            *[send_to_peer(peer) for peer in peers],
+            return_exceptions=True,
+        )
+
+        self._task_runner.run(
+            self._logger.log,
+            ServerDebug(
+                message=f"Broadcast {len(reassignments)} workflow reassignments from failed worker {failed_worker_id[:8]}...",
+                node_host=self._config.host,
+                node_port=self._config.tcp_port,
+                node_id=self._node_id,
+            ),
         )
 
     def get_gossip_buffer(self) -> WorkerStateGossipBuffer:
