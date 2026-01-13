@@ -39,8 +39,7 @@ class ProbeHandler(BaseHandler):
         target_addr_bytes = context.target_addr_bytes
         message = context.message
 
-        # AD-29: Confirm the sender
-        self._server.confirm_peer(source_addr)
+        await self._server.confirm_peer(source_addr)
 
         # Validate target
         if not await self._server.validate_target(target, b"probe", source_addr):
