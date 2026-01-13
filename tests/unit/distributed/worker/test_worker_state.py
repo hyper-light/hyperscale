@@ -710,7 +710,7 @@ class TestWorkerStateConcurrency:
         access_order = []
 
         async def access_with_lock(manager_id: str, worker_id: int):
-            lock = state.get_or_create_manager_lock(manager_id)
+            lock = await state.get_or_create_manager_lock(manager_id)
             async with lock:
                 access_order.append(f"start-{worker_id}")
                 await asyncio.sleep(0.01)
@@ -721,7 +721,6 @@ class TestWorkerStateConcurrency:
             access_with_lock("mgr-1", 2),
         )
 
-        # Verify serialized access
         assert access_order[0] == "start-1"
         assert access_order[1] == "end-1"
         assert access_order[2] == "start-2"
@@ -736,7 +735,7 @@ class TestWorkerStateConcurrency:
         access_order = []
 
         async def access_with_lock(job_id: str, worker_id: int):
-            lock = state.get_or_create_job_transfer_lock(job_id)
+            lock = await state.get_or_create_job_transfer_lock(job_id)
             async with lock:
                 access_order.append(f"start-{worker_id}")
                 await asyncio.sleep(0.01)
