@@ -69,12 +69,14 @@ class WorkerWorkflowExecutor:
             env: Environment configuration
             logger: Logger instance
         """
-        self._core_allocator = core_allocator
-        self._state = state
-        self._lifecycle = lifecycle
-        self._backpressure_manager = backpressure_manager
-        self._env = env
-        self._logger = logger
+        self._core_allocator: "CoreAllocator" = core_allocator
+        self._state: "WorkerState" = state
+        self._lifecycle: "WorkerLifecycleManager" = lifecycle
+        self._backpressure_manager: "WorkerBackpressureManager | None" = (
+            backpressure_manager
+        )
+        self._env: "Env | None" = env
+        self._logger: "Logger | None" = logger
 
         # Event logger for crash forensics (AD-47)
         self._event_logger: Logger | None = None
