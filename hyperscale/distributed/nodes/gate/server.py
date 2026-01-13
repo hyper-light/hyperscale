@@ -2323,9 +2323,8 @@ class GateServer(HealthAwareServer):
         job_id: str,
         target_dc_count: int,
     ) -> None:
-        """Broadcast job leadership to peer gates."""
         if self._leadership_coordinator:
-            await self._leadership_coordinator.broadcast_job_leadership(
+            await self._leadership_coordinator.broadcast_leadership(
                 job_id, target_dc_count
             )
 
