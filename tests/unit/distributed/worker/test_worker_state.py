@@ -432,46 +432,50 @@ class TestWorkerStateOrphanTracking:
 class TestWorkerStateJobLeadershipTransfer:
     """Test job leadership transfer methods (Section 8)."""
 
-    def test_get_or_create_job_transfer_lock(self):
+    @pytest.mark.asyncio
+    async def test_get_or_create_job_transfer_lock(self):
         """Test getting or creating a job transfer lock."""
         allocator = MockCoreAllocator()
         state = WorkerState(allocator)
 
-        lock1 = state.get_or_create_job_transfer_lock("job-1")
-        lock2 = state.get_or_create_job_transfer_lock("job-1")
+        lock1 = await state.get_or_create_job_transfer_lock("job-1")
+        lock2 = await state.get_or_create_job_transfer_lock("job-1")
 
         assert lock1 is lock2
         assert isinstance(lock1, asyncio.Lock)
 
-    def test_update_job_fence_token_success(self):
+    @pytest.mark.asyncio
+    async def test_update_job_fence_token_success(self):
         """Test updating job fence token with newer value."""
         allocator = MockCoreAllocator()
         state = WorkerState(allocator)
 
-        result = state.update_job_fence_token("job-1", 10)
+        result = await state.update_job_fence_token("job-1", 10)
         assert result is True
         assert state._job_fence_tokens["job-1"] == 10
 
-    def test_update_job_fence_token_stale(self):
+    @pytest.mark.asyncio
+    async def test_update_job_fence_token_stale(self):
         """Test rejecting stale job fence token."""
         allocator = MockCoreAllocator()
         state = WorkerState(allocator)
 
-        state.update_job_fence_token("job-1", 10)
-        result = state.update_job_fence_token("job-1", 5)
+        await state.update_job_fence_token("job-1", 10)
+        result = await state.update_job_fence_token("job-1", 5)
 
         assert result is False
         assert state._job_fence_tokens["job-1"] == 10
 
-    def test_get_job_fence_token(self):
+    @pytest.mark.asyncio
+    async def test_get_job_fence_token(self):
         """Test getting job fence token."""
         allocator = MockCoreAllocator()
         state = WorkerState(allocator)
 
-        assert state.get_job_fence_token("job-1") == -1
+        assert await state.get_job_fence_token("job-1") == -1
 
-        state.update_job_fence_token("job-1", 42)
-        assert state.get_job_fence_token("job-1") == 42
+        await state.update_job_fence_token("job-1", 42)
+        assert await state.get_job_fence_token("job-1") == 42
 
     def test_add_pending_transfer(self):
         """Test adding a pending transfer."""
