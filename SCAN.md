@@ -1056,13 +1056,112 @@ When a method doesn't exist:
 - **DO** find the correct method that provides the needed data
 - **DO** add the method to the class if it genuinely doesn't exist and is needed
 
-**Common Fixes:**
+### Step 3.5h.3: Semantic Intent Investigation (MANDATORY)
 
-| Invalid Call | Correct Call | Reason |
+**CRITICAL: Never blindly swap method names. Always investigate WHY the original code exists.**
+
+When you find an invalid method call like `get_overload_state()` and a similar method like `get_current_state()` exists, you MUST investigate:
+
+1. **What was the original intent?**
+   - Read the surrounding code context (5-10 lines before/after)
+   - Understand what the caller is trying to accomplish
+   - Check if there are comments explaining the purpose
+
+2. **What does the "similar" method actually do?**
+   - Read its docstring and implementation
+   - Check its return type - does it match what the caller expects?
+   - Check its parameters - does the caller provide them correctly?
+
+3. **Are the semantics compatible?**
+   - Does the replacement method provide the SAME information?
+   - Does it have the same side effects (or lack thereof)?
+   - Will the caller's logic still be correct with the replacement?
+
+**Investigation Checklist:**
+
+```
+□ Read the invalid method call in full context (what is it used for?)
+□ Read the candidate replacement method's implementation
+□ Compare return types (exact match? compatible? incompatible?)
+□ Compare parameters (same? different defaults? missing required?)
+□ Verify the caller's logic will still work correctly
+□ Check if the method should be added instead of substituted
+```
+
+**Example: Investigating `get_overload_state()` vs `get_current_state()`**
+
+```python
+# WRONG approach - blind substitution:
+# "get_overload_state doesn't exist, get_current_state is similar, swap them"
+overload_state = self._load_shedder.get_current_state()  # Maybe wrong!
+
+# CORRECT approach - investigate first:
+
+# Step 1: What does the caller want?
+# Context: if self._load_shedder.should_shed("JobSubmission"):
+#              overload_state = self._load_shedder.get_overload_state()
+#              return JobAck(error=f"System under load ({overload_state})")
+# Intent: Get current overload state for error message
+
+# Step 2: What does get_current_state() do?
+# def get_current_state(self, cpu_percent=None, memory_percent=None) -> OverloadState:
+#     """Get the current overload state."""
+#     cpu = cpu_percent if cpu_percent is not None else 0.0
+#     ...
+#     return self._detector.get_state(cpu, memory)
+
+# Step 3: Are semantics compatible?
+# - Returns OverloadState enum (healthy/busy/stressed/overloaded)
+# - With no args, uses defaults (0.0, 0.0) - may not reflect actual state!
+# - Caller uses it in string context - OverloadState has __str__
+
+# Step 4: Decision
+# Option A: Call get_current_state() with actual CPU/memory if available
+# Option B: Call get_current_state() with no args if detector tracks internally
+# Option C: Add get_overload_state() wrapper that gets state without needing args
+
+# Must investigate: Does _detector.get_state(0, 0) return the CURRENT state,
+# or does it return the state FOR those metrics? Check HybridOverloadDetector.
+```
+
+**When to Add the Method vs Substitute:**
+
+| Scenario | Action |
+|----------|--------|
+| Similar method exists with IDENTICAL semantics | Substitute (likely typo) |
+| Similar method exists but needs different parameters | Investigate if caller has those params |
+| Similar method returns different type | DO NOT substitute - add correct method |
+| No similar method, but data exists elsewhere | Add new method that provides it correctly |
+| Method represents genuinely missing functionality | Add the method to the class |
+
+**Red Flags That Indicate WRONG Substitution:**
+
+- Method signature differs significantly (different parameter count/types)
+- Return type is different (even subtly - `list` vs `dict`, `str` vs `enum`)
+- Method has side effects the original likely didn't intend
+- Method name implies different semantics (`get_all_X` vs `get_active_X`)
+- Caller would need modification to use the replacement correctly
+
+**Document Your Investigation:**
+
+When fixing, include a brief comment explaining:
+```python
+# Investigation: get_overload_state() -> get_current_state()
+# - get_current_state() returns OverloadState enum (same intent)
+# - With no args, detector uses internally-tracked CPU/memory
+# - Verified HybridOverloadDetector.get_state() uses last recorded metrics
+# - Semantics match - this was a typo/rename that wasn't propagated
+overload_state = self._load_shedder.get_current_state()
+```
+
+**Common Fixes (After Investigation):**
+
+| Invalid Call | Correct Call | Reason (Investigated) |
 |--------------|--------------|--------|
-| `get_known_manager_peers_list()` | `get_known_manager_peer_values()` | Typo - "peers" vs "peer" |
-| `get_job_status()` | `get_job().status` | Method doesn't exist, use attribute |
-| `iter_active_workers()` | `get_workers().values()` | Different iteration pattern |
+| `get_known_manager_peers_list()` | `get_known_manager_peer_values()` | Typo - both return `list[ManagerInfo]` |
+| `get_job_status()` | `get_job().status` | Method doesn't exist, attribute access equivalent |
+| `iter_active_workers()` | `get_workers().values()` | Same data, different naming convention |
+| `get_overload_state()` | `get_current_state()` | Same return type, default args use tracked metrics |
 
 ### Step 3.5i: Integration with CI/Build
 
