@@ -21,7 +21,7 @@ class BestEffortState:
     dcs_completed: set[str] = field(default_factory=set)
     dcs_failed: set[str] = field(default_factory=set)
 
-    def record_dc_result(self, dc_id: str, success: bool):
+    def record_dc_result(self, dc_id: str, success: bool) -> None:
         """Record result from a datacenter."""
         if success:
             self.dcs_completed.add(dc_id)
@@ -31,7 +31,7 @@ class BestEffortState:
         self.dcs_failed.add(dc_id)
         self.dcs_completed.discard(dc_id)
 
-    def check_completion(self, now: float):
+    def check_completion(self, now: float) -> tuple[bool, str, bool]:
         """
         Check if job should complete.
 
@@ -63,7 +63,7 @@ class BestEffortState:
 
         return False, "waiting", False
 
-    def get_completion_ratio(self):
+    def get_completion_ratio(self) -> float:
         """Get ratio of completed DCs."""
         if not self.target_dcs:
             return 0.0

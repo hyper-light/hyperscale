@@ -56,7 +56,7 @@ class GatePeerCoordinator:
         job_hash_ring: "ConsistentHashRing",
         job_forwarding_tracker: "JobForwardingTracker",
         job_leadership_tracker: "JobLeadershipTracker",
-        versioned_clock: "VersionedClock",
+        versioned_clock: "VersionedStateClock",
         gate_health_config: dict,
         recovery_semaphore: asyncio.Semaphore,
         recovery_jitter_min: float,
