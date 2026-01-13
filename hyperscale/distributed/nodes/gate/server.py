@@ -317,24 +317,12 @@ class GateServer(HealthAwareServer):
         self._gate_peers = gate_peers or []
         self._gate_udp_peers = gate_udp_peers or []
 
-        # UDP -> TCP mapping for peers
-        self._gate_udp_to_tcp: dict[tuple[str, int], tuple[str, int]] = {}
+        # Initialize UDP -> TCP mappings in modular state
         for idx, tcp_addr in enumerate(self._gate_peers):
             if idx < len(self._gate_udp_peers):
-                self._gate_udp_to_tcp[self._gate_udp_peers[idx]] = tcp_addr
-
-        # Active gate peers (AD-29: start empty)
-        self._active_gate_peers: set[tuple[str, int]] = set()
-
-        # Per-peer locks and epochs
-        self._peer_state_locks: dict[tuple[str, int], asyncio.Lock] = {}
-        self._peer_state_epoch: dict[tuple[str, int], int] = {}
-
-        # Gate peer info from heartbeats
-        self._gate_peer_info: dict[tuple[str, int], GateHeartbeat] = {}
-
-        # Known gates
-        self._known_gates: dict[str, GateInfo] = {}
+                self._modular_state.set_udp_to_tcp_mapping(
+                    self._gate_udp_peers[idx], tcp_addr
+                )
 
         # Datacenter manager status
         self._datacenter_manager_status: dict[
