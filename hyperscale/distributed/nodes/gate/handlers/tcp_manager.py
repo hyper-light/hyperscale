@@ -368,7 +368,7 @@ class GateManagerHandler:
                     level=BackpressureLevel(heartbeat.backpressure_level),
                     suggested_delay_ms=heartbeat.backpressure_delay_ms,
                 )
-                self._handle_manager_backpressure_signal(
+                await self._handle_manager_backpressure_signal(
                     manager_addr, datacenter_id, backpressure_signal
                 )
 
