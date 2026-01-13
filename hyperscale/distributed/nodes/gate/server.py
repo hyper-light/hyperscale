@@ -2626,10 +2626,12 @@ class GateServer(HealthAwareServer):
         job_id: str,
         workflow_id: str,
     ) -> None:
-        """Aggregate workflow results from all DCs and forward to client."""
-        workflow_results = self._workflow_dc_results.get(job_id, {}).get(
-            workflow_id, {}
-        )
+        async with self._workflow_dc_results_lock:
+            job_results = self._workflow_dc_results.get(job_id, {})
+            workflow_results = job_results.pop(workflow_id, {})
+            if not job_results and job_id in self._workflow_dc_results:
+                del self._workflow_dc_results[job_id]
+
         if not workflow_results:
             return
 
@@ -2734,9 +2736,6 @@ class GateServer(HealthAwareServer):
                         node_id=self._node_id.short,
                     ),
                 )
-
-        if job_id in self._workflow_dc_results:
-            self._workflow_dc_results[job_id].pop(workflow_id, None)
 
     async def _query_all_datacenters(
         self,
