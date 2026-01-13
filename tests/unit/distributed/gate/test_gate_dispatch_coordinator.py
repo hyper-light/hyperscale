@@ -29,6 +29,7 @@ from hyperscale.distributed.swim.core import CircuitState
 @dataclass
 class MockLogger:
     """Mock logger for testing."""
+
     messages: list[str] = field(default_factory=list)
 
     async def log(self, *args, **kwargs):
@@ -38,6 +39,7 @@ class MockLogger:
 @dataclass
 class MockTaskRunner:
     """Mock task runner for testing."""
+
     tasks: list = field(default_factory=list)
 
     def run(self, coro, *args, **kwargs):
@@ -52,6 +54,7 @@ class MockTaskRunner:
 @dataclass
 class MockGateJobManager:
     """Mock gate job manager."""
+
     jobs: dict = field(default_factory=dict)
     target_dcs: dict = field(default_factory=dict)
     callbacks: dict = field(default_factory=dict)
@@ -73,6 +76,7 @@ class MockGateJobManager:
 @dataclass
 class MockQuorumCircuit:
     """Mock quorum circuit breaker."""
+
     circuit_state: CircuitState = CircuitState.CLOSED
     half_open_after: float = 10.0
     successes: int = 0
@@ -84,6 +88,7 @@ class MockQuorumCircuit:
 @dataclass
 class MockJobSubmission:
     """Mock job submission."""
+
     job_id: str = "job-123"
     workflows: bytes = b"test_workflows"
     vus: int = 10
@@ -98,6 +103,20 @@ class MockJobSubmission:
 
 
 # =============================================================================
+# Async Mock Helpers
+# =============================================================================
+
+
+def make_async_rate_limiter(allowed: bool = True, retry_after: float = 0.0):
+    """Create an async rate limiter function."""
+
+    async def check_rate_limit(client_id: str, op: str) -> tuple[bool, float]:
+        return (allowed, retry_after)
+
+    return check_rate_limit
+
+
+# =============================================================================
 # _check_rate_and_load Tests
 # =============================================================================
 
@@ -105,7 +124,8 @@ class MockJobSubmission:
 class TestCheckRateAndLoadHappyPath:
     """Tests for _check_rate_and_load happy path."""
 
-    def test_allows_when_no_limits(self):
+    @pytest.mark.asyncio
+    async def test_allows_when_no_limits(self):
         """Allows request when no rate limit or load shedding."""
         state = GateRuntimeState()
 
@@ -115,8 +135,8 @@ class TestCheckRateAndLoadHappyPath:
             task_runner=MockTaskRunner(),
             job_manager=MockGateJobManager(),
             job_router=None,
-            check_rate_limit=lambda client_id, op: (True, 0),  # Allowed
-            should_shed_request=lambda req_type: False,  # No shedding
+            check_rate_limit=make_async_rate_limiter(allowed=True, retry_after=0),
+            should_shed_request=lambda req_type: False,
             has_quorum_available=lambda: True,
             quorum_size=lambda: 3,
             quorum_circuit=MockQuorumCircuit(),
@@ -126,9 +146,9 @@ class TestCheckRateAndLoadHappyPath:
             dispatch_to_dcs=AsyncMock(),
         )
 
-        result = coordinator._check_rate_and_load("client-1", "job-1")
+        result = await coordinator._check_rate_and_load("client-1", "job-1")
 
-        assert result is None  # No rejection
+        assert result is None
 
 
 class TestCheckRateAndLoadNegativePath:
@@ -383,7 +403,11 @@ class TestSubmitJobHappyPath:
             has_quorum_available=lambda: True,
             quorum_size=lambda: 3,
             quorum_circuit=quorum_circuit,
-            select_datacenters=lambda count, dcs, job_id: (["dc-east", "dc-west"], [], "healthy"),
+            select_datacenters=lambda count, dcs, job_id: (
+                ["dc-east", "dc-west"],
+                [],
+                "healthy",
+            ),
             assume_leadership=lambda job_id, count: None,
             broadcast_leadership=broadcast,
             dispatch_to_dcs=dispatch,
@@ -473,7 +497,11 @@ class TestSubmitJobNegativePath:
             has_quorum_available=lambda: True,
             quorum_size=lambda: 3,
             quorum_circuit=MockQuorumCircuit(),
-            select_datacenters=lambda count, dcs, job_id: (["dc-1"], [], "initializing"),
+            select_datacenters=lambda count, dcs, job_id: (
+                ["dc-1"],
+                [],
+                "initializing",
+            ),
             assume_leadership=lambda job_id, count: None,
             broadcast_leadership=AsyncMock(),
             dispatch_to_dcs=AsyncMock(),
@@ -591,10 +619,9 @@ class TestConcurrency:
         for i, sub in enumerate(submissions):
             sub.job_id = f"job-{i}"
 
-        acks = await asyncio.gather(*[
-            coordinator.submit_job(("10.0.0.1", 8000), sub)
-            for sub in submissions
-        ])
+        acks = await asyncio.gather(
+            *[coordinator.submit_job(("10.0.0.1", 8000), sub) for sub in submissions]
+        )
 
         # All should be accepted
         assert all(ack.accepted for ack in acks)
