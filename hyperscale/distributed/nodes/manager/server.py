@@ -2621,8 +2621,6 @@ class ManagerServer(HealthAwareServer):
             # Get backpressure signal
             backpressure = self._stats_buffer.get_backpressure_signal()
 
-            from hyperscale.distributed.models import WorkflowProgressAck
-
             ack = WorkflowProgressAck(
                 workflow_id=progress.workflow_id,
                 received=True,
@@ -2641,7 +2639,7 @@ class ManagerServer(HealthAwareServer):
                     node_id=self._node_id.short,
                 )
             )
-            from hyperscale.distributed.models import WorkflowProgressAck
+            
 
             return WorkflowProgressAck(
                 workflow_id="",
