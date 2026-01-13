@@ -180,7 +180,7 @@ class DatacenterHealthManager:
             return self._build_unhealthy_status(dc_id, alive_count, 0)
 
         signals = self._extract_overload_signals(
-            best_heartbeat, alive_count, total_count
+            best_heartbeat, alive_count, total_count, dc_id
         )
         overload_result = self._overload_classifier.classify(signals)
 
