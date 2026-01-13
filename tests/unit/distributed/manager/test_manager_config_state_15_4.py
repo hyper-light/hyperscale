@@ -812,7 +812,8 @@ class TestManagerStateEdgeCases:
         assert state._dispatch_throughput_interval_start == 0.0
         assert state._dispatch_throughput_last_value == 0.0
 
-    def test_latency_tracking_initialized(self):
+    @pytest.mark.asyncio
+    async def test_latency_tracking_initialized(self):
         """Latency tracking fields are initialized."""
         state = ManagerState()
 
