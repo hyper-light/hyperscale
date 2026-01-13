@@ -1187,7 +1187,7 @@ class ManagerServer(HealthAwareServer):
         if leader_addr is None:
             return True
 
-        leader_last_seen = self._leader_election.state.last_leader_update
+        leader_last_seen = self._leader_election.state.last_heartbeat_time
         leader_timeout = self._config.orphan_scan_interval_seconds * 3
         return (time.monotonic() - leader_last_seen) > leader_timeout
 
