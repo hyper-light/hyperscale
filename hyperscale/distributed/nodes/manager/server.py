@@ -1210,7 +1210,7 @@ class ManagerServer(HealthAwareServer):
     ) -> None:
         peer_id = heartbeat.node_id
 
-        if peer_id not in self._manager_state._known_manager_peers:
+        if not self._manager_state.has_known_manager_peer(peer_id):
             peer_info = ManagerInfo(
                 node_id=peer_id,
                 tcp_host=heartbeat.tcp_host or source_addr[0],
