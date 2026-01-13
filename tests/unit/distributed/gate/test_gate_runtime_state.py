@@ -809,14 +809,15 @@ class TestEdgeCases:
             state.mark_job_orphaned(job_id, 1.0)
             assert state.is_job_orphaned(job_id) is True
 
-    def test_empty_dc_ids(self):
+    @pytest.mark.asyncio
+    async def test_empty_dc_ids(self):
         """Handle empty datacenter IDs."""
         state = GateRuntimeState()
 
         class MockHeartbeat:
             pass
 
-        state.update_manager_status("", ("10.0.0.1", 8000), MockHeartbeat(), 1.0)
+        await state.update_manager_status("", ("10.0.0.1", 8000), MockHeartbeat(), 1.0)
         assert "" in state._datacenter_manager_status
 
     def test_very_long_job_ids(self):

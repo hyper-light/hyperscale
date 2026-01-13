@@ -238,24 +238,42 @@ class ClientLeadershipTracker:
         self,
         grace_period_seconds: float,
         check_interval_seconds: float,
+        running_flag: asyncio.Event | None = None,
     ) -> None:
-        """
-        Background task for orphan detection (placeholder).
+        while running_flag is None or running_flag.is_set():
+            try:
+                await asyncio.sleep(check_interval_seconds)
 
-        Periodically checks for jobs that haven't received leader updates
-        within the grace period and marks them as orphaned.
+                now = time.monotonic()
+                orphan_threshold = now - grace_period_seconds
 
-        Args:
-            grace_period_seconds: Time without update before marking orphaned
-            check_interval_seconds: How often to check for orphans
+                for job_id, leader_info in list(self._state._gate_job_leaders.items()):
+                    if (
+                        leader_info.last_updated < orphan_threshold
+                        and not self._state.is_job_orphaned(job_id)
+                    ):
+                        orphan_info = OrphanedJobInfo(
+                            job_id=job_id,
+                            last_leader_id=leader_info.gate_id,
+                            last_leader_addr=(
+                                leader_info.tcp_host,
+                                leader_info.tcp_port,
+                            ),
+                            orphaned_at=now,
+                            last_updated=leader_info.last_updated,
+                        )
+                        self._state.mark_job_orphaned(job_id, orphan_info)
 
-        Note: Full implementation would require async loop integration.
-        Currently a placeholder for future orphan detection logic.
-        """
-        # Placeholder for background orphan detection
-        # In full implementation, would:
-        # 1. Loop with asyncio.sleep(check_interval_seconds)
-        # 2. Check leader last_updated timestamps
-        # 3. Mark jobs as orphaned if grace_period exceeded
-        # 4. Log orphan detections
-        pass
+                        await self._logger.log(
+                            ServerWarning(
+                                message=f"Job {job_id[:8]}... orphaned: no leader update for {now - leader_info.last_updated:.1f}s",
+                                node_host="client",
+                                node_port=0,
+                                node_id="client",
+                            )
+                        )
+
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                pass
