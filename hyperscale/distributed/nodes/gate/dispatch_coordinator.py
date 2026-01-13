@@ -161,8 +161,17 @@ class GateDispatchCoordinator:
             self._state._job_workflow_ids[submission.job_id] = {
                 wf_id for wf_id, _, _ in workflows
             }
-        except Exception:
+        except Exception as workflow_parse_error:
             self._state._job_workflow_ids[submission.job_id] = set()
+            self._task_runner.run(
+                self._logger.log,
+                ServerWarning(
+                    message=f"Failed to parse workflows for job {submission.job_id}: {workflow_parse_error}",
+                    node_host="",
+                    node_port=0,
+                    node_id="",
+                ),
+            )
 
         if submission.callback_addr:
             self._job_manager.set_callback(submission.job_id, submission.callback_addr)
