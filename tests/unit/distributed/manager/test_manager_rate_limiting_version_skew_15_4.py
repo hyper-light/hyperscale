@@ -362,10 +362,10 @@ class TestManagerRateLimitingCoordinatorCleanup:
         await rate_limiting_coordinator.stop_cleanup_loop()
         assert rate_limiting_coordinator._cleanup_task is None
 
-    def test_cleanup_inactive_clients(self, rate_limiting_coordinator):
+    @pytest.mark.asyncio
+    async def test_cleanup_inactive_clients(self, rate_limiting_coordinator):
         """cleanup_inactive_clients removes stale client state."""
-        # This is a pass-through to the underlying limiter
-        cleaned = rate_limiting_coordinator.cleanup_inactive_clients()
+        cleaned = await rate_limiting_coordinator.cleanup_inactive_clients()
         assert cleaned >= 0
 
 
