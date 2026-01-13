@@ -3127,10 +3127,9 @@ class ManagerServer(HealthAwareServer):
                 ).dump()
 
             # Get current deadline (or set default)
-            current_deadline = self._manager_state._worker_deadlines.get(
-                worker_id,
-                time.monotonic() + 30.0,
-            )
+            current_deadline = self._manager_state.get_worker_deadline(worker_id)
+            if current_deadline is None:
+                current_deadline = time.monotonic() + 30.0
 
             # Handle extension request via worker health manager
             response = self._worker_health_manager.handle_extension_request(
@@ -3140,7 +3139,9 @@ class ManagerServer(HealthAwareServer):
 
             # Update stored deadline if granted
             if response.granted:
-                self._manager_state._worker_deadlines[worker_id] = response.new_deadline
+                self._manager_state.set_worker_deadline(
+                    worker_id, response.new_deadline
+                )
 
                 # AD-26 Issue 3: Integrate with SWIM timing wheels (SWIM as authority)
                 hierarchical_detector = self.get_hierarchical_detector()
