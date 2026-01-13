@@ -674,23 +674,24 @@ class TestRateLimitRecovery:
 
         # Exhaust
         for _ in range(10):
-            limiter.check_rate_limit("recovery-client", "test")
+            await limiter.check_rate_limit("recovery-client", "test")
 
-        result = limiter.check_rate_limit("recovery-client", "test")
+        result = await limiter.check_rate_limit("recovery-client", "test")
         assert result.allowed is False
 
         # Wait for recovery
         await asyncio.sleep(0.15)
 
-        result = limiter.check_rate_limit("recovery-client", "test")
+        result = await limiter.check_rate_limit("recovery-client", "test")
         assert result.allowed is True
 
-    def test_metrics_reset(self) -> None:
+    @pytest.mark.asyncio
+    async def test_metrics_reset(self) -> None:
         """Test metrics reset clears counters."""
         limiter = ServerRateLimiter()
 
         for i in range(100):
-            limiter.check_rate_limit(f"client-{i}", "job_submit")
+            await limiter.check_rate_limit(f"client-{i}", "job_submit")
 
         metrics_before = limiter.get_metrics()
         assert metrics_before["total_requests"] == 100
