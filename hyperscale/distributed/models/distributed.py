@@ -1492,21 +1492,19 @@ class JobStateSyncMessage(Message):
     with richer job metadata.
     """
 
-    leader_id: str  # Node ID of the job leader
-    job_id: str  # Job identifier
-    status: str  # Current JobStatus value
-    fencing_token: int  # Current fencing token for consistency
-    workflows_total: int  # Total workflows in job
-    workflows_completed: int  # Completed workflow count
-    workflows_failed: int  # Failed workflow count
-    workflow_statuses: dict[str, str] = field(
-        default_factory=dict
-    )  # workflow_id -> status
-    elapsed_seconds: float = 0.0  # Time since job started
-    timestamp: float = 0.0  # When this sync was generated
-    # Origin gate for direct DC-to-Job-Leader routing
-    # Peer managers need this to route results if they take over job leadership
+    leader_id: str
+    job_id: str
+    status: str
+    fencing_token: int
+    workflows_total: int
+    workflows_completed: int
+    workflows_failed: int
+    workflow_statuses: dict[str, str] = field(default_factory=dict)
+    elapsed_seconds: float = 0.0
+    timestamp: float = 0.0
     origin_gate_addr: tuple[str, int] | None = None
+    context_snapshot: dict[str, dict[str, Any]] = field(default_factory=dict)
+    layer_version: int = 0
 
 
 @dataclass(slots=True)

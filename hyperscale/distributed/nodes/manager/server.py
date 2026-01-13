@@ -1678,37 +1678,44 @@ class ManagerServer(HealthAwareServer):
                 if not led_jobs:
                     continue
 
-                for peer_addr in self._manager_state._active_manager_peers:
-                    try:
-                        sync_msg = JobStateSyncMessage(
-                            source_id=self._node_id.full,
-                            job_leaderships={
-                                job_id: self._node_id.full for job_id in led_jobs
-                            },
-                            fence_tokens={
-                                job_id: self._manager_state._job_fencing_tokens.get(
-                                    job_id, 0
-                                )
-                                for job_id in led_jobs
-                            },
-                            state_version=self._manager_state._state_version,
-                        )
+                for job_id in led_jobs:
+                    if (job := self._job_manager.get_job_by_id(job_id)) is None:
+                        continue
 
-                        await self._send_to_peer(
-                            peer_addr,
-                            "job_state_sync",
-                            sync_msg.dump(),
-                            timeout=2.0,
-                        )
-                    except Exception as sync_error:
-                        await self._udp_logger.log(
-                            ServerWarning(
-                                message=f"Failed to sync job state to peer: {sync_error}",
-                                node_host=self._host,
-                                node_port=self._tcp_port,
-                                node_id=self._node_id.short,
+                    sync_msg = JobStateSyncMessage(
+                        leader_id=self._node_id.full,
+                        job_id=job_id,
+                        status=job.status,
+                        fencing_token=self._manager_state._job_fencing_tokens.get(
+                            job_id, 0
+                        ),
+                        workflows_total=job.workflows_total,
+                        workflows_completed=job.workflows_completed,
+                        workflows_failed=job.workflows_failed,
+                        workflow_statuses={
+                            wf_id: wf.status for wf_id, wf in job.workflows.items()
+                        },
+                        elapsed_seconds=time.monotonic() - job.started_at
+                        if job.started_at
+                        else 0.0,
+                        timestamp=time.monotonic(),
+                        origin_gate_addr=job.submission.origin_gate_addr
+                        if job.submission
+                        else None,
+                        context_snapshot=job.context.dict(),
+                        layer_version=job.layer_version,
+                    )
+
+                    for peer_addr in self._manager_state._active_manager_peers:
+                        try:
+                            await self._send_to_peer(
+                                peer_addr,
+                                "job_state_sync",
+                                sync_msg.dump(),
+                                timeout=2.0,
                             )
-                        )
+                        except Exception:
+                            pass
 
             except asyncio.CancelledError:
                 break
@@ -4019,16 +4026,22 @@ class ManagerServer(HealthAwareServer):
                     accepted=False,
                 ).dump()
 
-            # Update job state tracking
-            job = self._job_manager.get_job(sync_msg.job_id)
-            if job:
+            if job := self._job_manager.get_job(sync_msg.job_id):
                 job.status = sync_msg.status
                 job.workflows_total = sync_msg.workflows_total
                 job.workflows_completed = sync_msg.workflows_completed
                 job.workflows_failed = sync_msg.workflows_failed
                 job.timestamp = time.monotonic()
 
-            # Update fencing token
+                if (
+                    sync_msg.context_snapshot
+                    and sync_msg.layer_version > job.layer_version
+                ):
+                    async with job.lock:
+                        for workflow_name, values in sync_msg.context_snapshot.items():
+                            await job.context.from_dict(workflow_name, values)
+                        job.layer_version = sync_msg.layer_version
+
             current_token = self._manager_state._job_fencing_tokens.get(
                 sync_msg.job_id, 0
             )
@@ -4037,7 +4050,6 @@ class ManagerServer(HealthAwareServer):
                     sync_msg.fencing_token
                 )
 
-            # Update origin gate
             if sync_msg.origin_gate_addr:
                 self._manager_state._job_origin_gates[sync_msg.job_id] = (
                     sync_msg.origin_gate_addr
