@@ -566,9 +566,7 @@ class ManagerServer(HealthAwareServer):
             get_health_has_quorum=self._has_quorum_available,
             get_health_throughput=self._get_dispatch_throughput,
             get_health_expected_throughput=self._get_expected_dispatch_throughput,
-            get_health_overload_state=lambda: self._overload_detector.get_state(
-                0.0, 0.0
-            ),
+            get_health_overload_state=lambda: self._manager_health_state,
             get_current_gate_leader_id=lambda: self._manager_state._current_gate_leader_id,
             get_current_gate_leader_host=lambda: (
                 self._manager_state._current_gate_leader_addr[0]
