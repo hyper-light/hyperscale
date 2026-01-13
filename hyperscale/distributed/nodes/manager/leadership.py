@@ -33,17 +33,17 @@ class ManagerLeadershipCoordinator:
         config: "ManagerConfig",
         logger: "Logger",
         node_id: str,
-        task_runner,
+        task_runner: "TaskRunner",
         is_leader_fn: Callable[[], bool],
         get_term_fn: Callable[[], int],
     ) -> None:
-        self._state = state
-        self._config = config
-        self._logger = logger
-        self._node_id = node_id
-        self._task_runner = task_runner
-        self._is_leader = is_leader_fn
-        self._get_term = get_term_fn
+        self._state: "ManagerState" = state
+        self._config: "ManagerConfig" = config
+        self._logger: "Logger" = logger
+        self._node_id: str = node_id
+        self._task_runner: "TaskRunner" = task_runner
+        self._is_leader: Callable[[], bool] = is_leader_fn
+        self._get_term: Callable[[], int] = get_term_fn
         self._on_become_leader_callbacks: list[Callable[[], None]] = []
         self._on_lose_leadership_callbacks: list[Callable[[], None]] = []
 
