@@ -872,7 +872,7 @@ class ManagerServer(HealthAwareServer):
 
     def _on_node_dead(self, node_addr: tuple[str, int]) -> None:
         """Handle node death detected by SWIM."""
-        worker_id = self._manager_state._worker_addr_to_id.get(node_addr)
+        worker_id = self._manager_state.get_worker_id_from_addr(node_addr)
         if worker_id:
             self._manager_state._worker_unhealthy_since.setdefault(
                 worker_id, time.monotonic()
@@ -897,7 +897,7 @@ class ManagerServer(HealthAwareServer):
     def _on_node_join(self, node_addr: tuple[str, int]) -> None:
         """Handle node join detected by SWIM."""
         # Check if worker
-        worker_id = self._manager_state._worker_addr_to_id.get(node_addr)
+        worker_id = self._manager_state.get_worker_id_from_addr(node_addr)
         if worker_id:
             self._manager_state._worker_unhealthy_since.pop(worker_id, None)
             return
