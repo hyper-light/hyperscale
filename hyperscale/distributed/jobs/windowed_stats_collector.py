@@ -67,11 +67,19 @@ class WindowBucket:
     created_at: float  # When this bucket was created (for cleanup)
 
 
+@dataclass(slots=True)
+class WindowedStatsMetrics:
+    windows_flushed: int = 0
+    windows_dropped_late: int = 0
+    stats_recorded: int = 0
+    stats_dropped_late: int = 0
+
+
 class WindowedStatsCollector:
     """
     Collects workflow progress updates into time-correlated windows.
 
-    Thread-safe for concurrent progress updates from multiple workers.
+    Safe for concurrent progress updates from multiple coroutines.
 
     The collector groups incoming WorkflowProgress updates by their
     collected_at timestamp into discrete time windows. When windows
@@ -89,24 +97,13 @@ class WindowedStatsCollector:
         drift_tolerance_ms: float = 50.0,
         max_window_age_ms: float = 5000.0,
     ):
-        """
-        Initialize the windowed stats collector.
-
-        Args:
-            window_size_ms: Size of each time window in milliseconds.
-            drift_tolerance_ms: Allowed clock drift between workers.
-                Windows are only flushed after current_time exceeds
-                window_end + drift_tolerance.
-            max_window_age_ms: Maximum age before a window is dropped
-                (cleanup for stuck/missed windows).
-        """
         self._window_size_ms = window_size_ms
         self._drift_tolerance_ms = drift_tolerance_ms
         self._max_window_age_ms = max_window_age_ms
 
-        # Buckets indexed by (job_id, workflow_id, bucket_number)
         self._buckets: dict[tuple[str, str, int], WindowBucket] = {}
         self._lock = asyncio.Lock()
+        self._metrics = WindowedStatsMetrics()
 
     def _get_bucket_number(self, collected_at: float) -> int:
         """Convert Unix timestamp to window bucket number."""

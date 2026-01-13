@@ -106,47 +106,51 @@ class TestGatePeerStateHappyPath:
         assert len(state.gate_peers_tcp) == 2
         assert len(state.gate_peers_udp) == 2
 
-    def test_get_or_create_peer_lock(self):
+    @pytest.mark.asyncio
+    async def test_get_or_create_peer_lock(self):
         """Get or create peer lock returns consistent lock."""
         state = GatePeerState()
         peer_addr = ("10.0.0.1", 9001)
 
-        lock1 = state.get_or_create_peer_lock(peer_addr)
-        lock2 = state.get_or_create_peer_lock(peer_addr)
+        lock1 = await state.get_or_create_peer_lock(peer_addr)
+        lock2 = await state.get_or_create_peer_lock(peer_addr)
 
         assert lock1 is lock2
         assert isinstance(lock1, asyncio.Lock)
         assert peer_addr in state.peer_locks
 
-    def test_increment_epoch(self):
+    @pytest.mark.asyncio
+    async def test_increment_epoch(self):
         """Increment epoch returns incremented value."""
         state = GatePeerState()
         peer_addr = ("10.0.0.1", 9001)
 
-        epoch1 = state.increment_epoch(peer_addr)
-        epoch2 = state.increment_epoch(peer_addr)
-        epoch3 = state.increment_epoch(peer_addr)
+        epoch1 = await state.increment_epoch(peer_addr)
+        epoch2 = await state.increment_epoch(peer_addr)
+        epoch3 = await state.increment_epoch(peer_addr)
 
         assert epoch1 == 1
         assert epoch2 == 2
         assert epoch3 == 3
 
-    def test_get_epoch_returns_zero_for_unknown(self):
+    @pytest.mark.asyncio
+    async def test_get_epoch_returns_zero_for_unknown(self):
         """Get epoch returns 0 for unknown peer."""
         state = GatePeerState()
         unknown_addr = ("10.0.0.99", 9001)
 
-        assert state.get_epoch(unknown_addr) == 0
+        assert await state.get_epoch(unknown_addr) == 0
 
-    def test_get_epoch_returns_current_value(self):
+    @pytest.mark.asyncio
+    async def test_get_epoch_returns_current_value(self):
         """Get epoch returns current value after increments."""
         state = GatePeerState()
         peer_addr = ("10.0.0.1", 9001)
 
-        state.increment_epoch(peer_addr)
-        state.increment_epoch(peer_addr)
+        await state.increment_epoch(peer_addr)
+        await state.increment_epoch(peer_addr)
 
-        assert state.get_epoch(peer_addr) == 2
+        assert await state.get_epoch(peer_addr) == 2
 
 
 class TestGatePeerStateConcurrency:
@@ -516,6 +520,7 @@ class TestLeaseTrackingHappyPath:
 
     def test_create(self):
         """Create lease tracking."""
+
         # Mock lease
         class MockLease:
             pass
