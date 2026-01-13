@@ -102,18 +102,20 @@ class WorkerServer(HealthAwareServer):
             seed_managers: Initial manager addresses for registration
         """
         # Build config from env
-        self._config = WorkerConfig.from_env(env, host, tcp_port, udp_port, dc_id)
-        self._env = env
-        self._seed_managers = seed_managers or []
+        self._config: WorkerConfig = WorkerConfig.from_env(
+            env, host, tcp_port, udp_port, dc_id
+        )
+        self._env: Env = env
+        self._seed_managers: list[tuple[str, int]] = seed_managers or []
 
         # Core capacity
-        self._total_cores = self._config.total_cores
-        self._core_allocator = CoreAllocator(self._total_cores)
+        self._total_cores: int = self._config.total_cores
+        self._core_allocator: CoreAllocator = CoreAllocator(self._total_cores)
 
         # Centralized runtime state (single source of truth)
-        self._worker_state = WorkerState(self._core_allocator)
+        self._worker_state: WorkerState = WorkerState(self._core_allocator)
 
-        self._resource_monitor = ProcessResourceMonitor()
+        self._resource_monitor: ProcessResourceMonitor = ProcessResourceMonitor()
 
         # Initialize modules (will be fully wired after super().__init__)
         self._registry = WorkerRegistry(
