@@ -183,12 +183,12 @@ discovered during systematic tracing of SCENARIOS.md test scenarios through the 
 #### E3: TOCTOU Race in Core Allocation (CRITICAL)
 **Location**: `jobs/worker_pool.py:487-546`
 **Issue**: Worker can die between selection and reservation, causing silent dispatch failures.
-**Status**: TODO
+**Status**: FIXED - Uses `asyncio.Condition` with lock, re-verifies worker availability inside lock (lines 521-548), rollback on failure
 
 #### E4: Event Race in wait_for_cores() (HIGH - Deadlock Risk)
 **Location**: `jobs/worker_pool.py:674-704`
 **Issue**: Event race can cause 30s timeout even when cores available.
-**Status**: TODO
+**Status**: FIXED - Uses `asyncio.Condition.wait()` with timeout (line 552-555), notified on core availability changes
 
 #### E5: Missing _worker_health_states Dict (HIGH - Runtime Crash)
 **Location**: `manager/registry.py:147`
