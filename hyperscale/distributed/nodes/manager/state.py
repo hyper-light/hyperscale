@@ -271,7 +271,6 @@ class ManagerState:
         self._cancellation_initiated_at.pop(job_id, None)
 
     def clear_job_state(self, job_id: str) -> None:
-        """Clear all state associated with a job."""
         self._job_leaders.pop(job_id, None)
         self._job_leader_addrs.pop(job_id, None)
         self._job_fencing_tokens.pop(job_id, None)
@@ -282,7 +281,11 @@ class ManagerState:
         self._job_origin_gates.pop(job_id, None)
         self._progress_callbacks.pop(job_id, None)
         self._job_submissions.pop(job_id, None)
-        self._job_reporter_tasks.pop(job_id, None)
+        reporter_tasks = self._job_reporter_tasks.pop(job_id, None)
+        if reporter_tasks:
+            for task in reporter_tasks.values():
+                if not task.done():
+                    task.cancel()
         self._job_timeout_strategies.pop(job_id, None)
         self._job_aggregated_results.pop(job_id, None)
         self.clear_cancellation_state(job_id)

@@ -2400,13 +2400,6 @@ class ManagerServer(HealthAwareServer):
         for wf_id in workflow_ids_to_remove:
             self._manager_state._workflow_completion_events.pop(wf_id, None)
 
-    def _cleanup_reporter_tasks(self, job_id: str) -> None:
-        """Clean up reporter background tasks for a job."""
-        tasks = self._manager_state._job_reporter_tasks.pop(job_id, {})
-        for task in tasks.values():
-            if not task.done():
-                task.cancel()
-
     # =========================================================================
     # TCP Send Helpers
     # =========================================================================
