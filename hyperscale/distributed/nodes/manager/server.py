@@ -829,7 +829,8 @@ class ManagerServer(HealthAwareServer):
             if response and not isinstance(response, Exception):
                 parsed = ManagerPeerRegistrationResponse.load(response)
                 if parsed.accepted:
-                    self._registry.register_manager_peer(parsed.manager_info)
+                    for peer_info in parsed.known_peers:
+                        self._registry.register_manager_peer(peer_info)
                     return True
 
         except Exception as error:
