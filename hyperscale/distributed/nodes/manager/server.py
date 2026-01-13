@@ -3109,6 +3109,65 @@ class ManagerServer(HealthAwareServer):
             return b"error"
 
     @tcp.receive()
+    async def worker_state_update(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ) -> bytes:
+        try:
+            update = WorkerStateUpdate.from_bytes(data)
+            if update is None:
+                return b"invalid"
+
+            if self._worker_disseminator is None:
+                return b"not_ready"
+
+            accepted = await self._worker_disseminator.handle_worker_state_update(
+                update, addr
+            )
+
+            return b"accepted" if accepted else b"rejected"
+
+        except Exception as error:
+            await self._udp_logger.log(
+                ServerError(
+                    message=f"Worker state update error: {error}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            return b"error"
+
+    @tcp.receive()
+    async def list_workers(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ) -> bytes:
+        try:
+            if self._worker_disseminator is None:
+                return WorkerListResponse(
+                    manager_id=self._node_id.full, workers=[]
+                ).dump()
+
+            response = self._worker_disseminator.build_worker_list_response()
+            return response.dump()
+
+        except Exception as error:
+            await self._udp_logger.log(
+                ServerError(
+                    message=f"List workers error: {error}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            return b"error"
+
+    @tcp.receive()
     async def context_forward(
         self,
         addr: tuple[str, int],
