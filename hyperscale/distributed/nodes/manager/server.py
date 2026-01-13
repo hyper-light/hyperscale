@@ -2283,7 +2283,7 @@ class ManagerServer(HealthAwareServer):
                 if sub_wf.worker_id
             }
             if worker_id in job_worker_ids:
-                strategy = self._manager_state._job_timeout_strategies.get(job.job_id)
+                strategy = self._manager_state.get_job_timeout_strategy(job.job_id)
                 if strategy and hasattr(strategy, "record_extension"):
                     await strategy.record_extension(
                         job_id=job.job_id,
@@ -3753,8 +3753,8 @@ class ManagerServer(HealthAwareServer):
                 if submission.origin_gate_addr
                 else None,
             )
-            self._manager_state._job_timeout_strategies[submission.job_id] = (
-                timeout_strategy
+            self._manager_state.set_job_timeout_strategy(
+                submission.job_id, timeout_strategy
             )
 
             self._leases.claim_job_leadership(
