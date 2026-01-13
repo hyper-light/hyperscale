@@ -584,6 +584,11 @@ class ManagerState:
     def set_peer_state_epoch(self, peer_addr: tuple[str, int], epoch: int) -> None:
         self._peer_state_epoch[peer_addr] = epoch
 
+    def increment_peer_state_epoch(self, peer_addr: tuple[str, int]) -> int:
+        new_epoch = self._peer_state_epoch.get(peer_addr, 0) + 1
+        self._peer_state_epoch[peer_addr] = new_epoch
+        return new_epoch
+
     def get_manager_tcp_from_udp(
         self, udp_addr: tuple[str, int]
     ) -> tuple[str, int] | None:
