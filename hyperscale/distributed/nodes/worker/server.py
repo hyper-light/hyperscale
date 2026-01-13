@@ -844,41 +844,49 @@ class WorkerServer(HealthAwareServer):
         if pending is None:
             return
 
-        current_time = time.monotonic()
-        pending_transfer_ttl = self._config.pending_transfer_ttl_seconds
-        if current_time - pending.received_at > pending_transfer_ttl:
-            # Transfer expired, remove it
+        if self._is_pending_transfer_expired(pending):
             del self._pending_transfers[job_id]
             return
 
-        # Check if this workflow is in the pending transfer
-        if workflow_id in pending.workflow_ids:
-            # Apply the pending transfer
-            job_lock = await self._get_job_transfer_lock(job_id)
-            async with job_lock:
-                # Update job leader for this workflow
-                self._workflow_job_leader[workflow_id] = pending.new_manager_addr
-                # Update fence token
-                self._job_fence_tokens[job_id] = pending.fence_token
+        if workflow_id not in pending.workflow_ids:
+            return
 
-                self._task_runner.run(
-                    self._udp_logger.log,
-                    ServerInfo(
-                        message=f"Applied pending transfer for workflow {workflow_id[:8]}... to job {job_id[:8]}...",
-                        node_host=self._host,
-                        node_port=self._tcp_port,
-                        node_id=self._node_id.short,
-                    ),
-                )
+        await self._apply_pending_transfer(job_id, workflow_id, pending)
+        self._cleanup_pending_transfer_if_complete(job_id, workflow_id, pending)
 
-            # Check if all workflows in the transfer have been seen
-            remaining_workflows = [
-                wf_id
-                for wf_id in pending.workflow_ids
-                if wf_id not in self._active_workflows and wf_id != workflow_id
-            ]
-            if not remaining_workflows:
-                del self._pending_transfers[job_id]
+    def _is_pending_transfer_expired(self, pending) -> bool:
+        current_time = time.monotonic()
+        pending_transfer_ttl = self._config.pending_transfer_ttl_seconds
+        return current_time - pending.received_at > pending_transfer_ttl
+
+    async def _apply_pending_transfer(
+        self, job_id: str, workflow_id: str, pending
+    ) -> None:
+        job_lock = await self._get_job_transfer_lock(job_id)
+        async with job_lock:
+            self._workflow_job_leader[workflow_id] = pending.new_manager_addr
+            self._job_fence_tokens[job_id] = pending.fence_token
+
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerInfo(
+                    message=f"Applied pending transfer for workflow {workflow_id[:8]}... to job {job_id[:8]}...",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                ),
+            )
+
+    def _cleanup_pending_transfer_if_complete(
+        self, job_id: str, workflow_id: str, pending
+    ) -> None:
+        remaining_workflows = [
+            wf_id
+            for wf_id in pending.workflow_ids
+            if wf_id not in self._active_workflows and wf_id != workflow_id
+        ]
+        if not remaining_workflows:
+            del self._pending_transfers[job_id]
 
     # =========================================================================
     # Registration Methods
