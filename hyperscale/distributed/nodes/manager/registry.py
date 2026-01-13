@@ -144,7 +144,7 @@ class ManagerRegistry:
             if worker_id in unhealthy_ids:
                 continue
 
-            health_state = self._state._worker_health_states.get(worker_id, "healthy")
+            health_state = self._state._workers._worker_health_states.get(worker_id, "healthy")
             if health_state in counts:
                 counts[health_state] += 1
             else:
