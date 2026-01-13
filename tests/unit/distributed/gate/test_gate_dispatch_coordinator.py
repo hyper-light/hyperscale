@@ -724,8 +724,7 @@ class TestEdgeCases:
             dispatch_to_dcs=AsyncMock(),
         )
 
-        # Client ID is constructed from address
-        result = coordinator._check_rate_and_load("10.0.0.1:8000", "job-1")
+        result = await coordinator._check_rate_and_load("10.0.0.1:8000", "job-1")
         assert result is None
 
     @pytest.mark.asyncio
