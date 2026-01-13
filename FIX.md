@@ -51,33 +51,34 @@ This document catalogs all identified issues across the distributed node impleme
 
 ## 2. High Priority Issues
 
-### 2.1 Manager Server - Duplicate Method Definition
+**All high priority issues have been fixed in Session 4.**
 
-| File | Lines | Issue | Fix |
-|------|-------|-------|-----|
-| `nodes/manager/server.py` | 2295-2311 | First `_select_timeout_strategy()` definition | **Remove** (duplicate) |
-| `nodes/manager/server.py` | 4459-4473 | Second `_select_timeout_strategy()` definition | **Keep** this one |
+### 2.1 Manager Server - Duplicate Method Definition ✅ FIXED
 
-**Impact:** Confusing code, first definition is dead code.
+| File | Lines | Issue | Status |
+|------|-------|-------|--------|
+| `nodes/manager/server.py` | 4459-4473 | Second (incorrect) `_select_timeout_strategy()` removed | ✅ Fixed |
+| `nodes/manager/server.py` | 2295-2311 | First (correct) `_select_timeout_strategy()` kept | ✅ Fixed |
 
-### 2.2 Manager Server - Missing Attribute Initialization
+**Analysis:** The first implementation (passing `self` to timeout strategies) was correct. The second was passing incorrect parameters that didn't match constructor signatures.
 
-| File | Line | Issue | Fix |
-|------|------|-------|-----|
-| `nodes/manager/server.py` | 775 | `_resource_sample_task` assigned but not declared | Add `self._resource_sample_task: asyncio.Task | None = None` to `_init_modules()` around line 500 |
+### 2.2 Manager Server - Missing Attribute Initialization ✅ FIXED
 
-### 2.3 Gate Server - Stub Method
+| File | Line | Issue | Status |
+|------|------|-------|--------|
+| `nodes/manager/server.py` | 501 | Added `self._resource_sample_task: asyncio.Task | None = None` | ✅ Fixed |
 
-| File | Lines | Issue | Fix |
-|------|-------|-------|-----|
-| `nodes/gate/server.py` | 2352-2354 | `_record_dc_job_stats()` is stub (just `pass`) | Implement stats recording logic |
+### 2.3 Gate Server - Stub Method ✅ FIXED
 
-**Current code:**
-```python
-def _record_dc_job_stats(self, dc_id: str, job_id: str, stats: dict) -> None:
-    """Record DC job stats."""
-    pass
-```
+| File | Lines | Issue | Status |
+|------|-------|-------|--------|
+| `nodes/gate/server.py` | 2352-2370 | `_record_dc_job_stats()` fully implemented | ✅ Fixed |
+
+**Implementation:** Now properly records job stats to `_job_stats_crdt` with:
+- `completed` count via `JobStatsCRDT.record_completed()`
+- `failed` count via `JobStatsCRDT.record_failed()`
+- `rate` via `JobStatsCRDT.record_rate()`
+- `status` via `JobStatsCRDT.record_status()`
 
 ---
 
