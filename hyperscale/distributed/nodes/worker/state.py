@@ -263,12 +263,28 @@ class WorkerState:
         async with self._get_counter_lock():
             return self._workflow_fence_tokens.get(workflow_id, -1)
 
-    # =========================================================================
-    # Orphan Tracking (Section 2.7)
-    # =========================================================================
+    def set_workflow_timeout(self, workflow_id: str, timeout_seconds: float) -> None:
+        now = time.monotonic()
+        self._workflow_start_times[workflow_id] = now
+        self._workflow_timeout_seconds[workflow_id] = timeout_seconds
+
+    def get_stuck_workflows(self) -> list[tuple[str, float]]:
+        """
+        Returns (workflow_id, elapsed_seconds) for workflows exceeding their timeout.
+        """
+        now = time.monotonic()
+        stuck: list[tuple[str, float]] = []
+        for workflow_id in list(self._active_workflows.keys()):
+            start_time = self._workflow_start_times.get(workflow_id)
+            timeout = self._workflow_timeout_seconds.get(workflow_id)
+            if start_time is None or timeout is None:
+                continue
+            elapsed = now - start_time
+            if elapsed > timeout:
+                stuck.append((workflow_id, elapsed))
+        return stuck
 
     def mark_workflow_orphaned(self, workflow_id: str) -> None:
-        """Mark a workflow as orphaned."""
         if workflow_id not in self._orphaned_workflows:
             self._orphaned_workflows[workflow_id] = time.monotonic()
 

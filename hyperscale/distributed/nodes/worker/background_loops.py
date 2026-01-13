@@ -15,7 +15,11 @@ import asyncio
 import time
 from typing import TYPE_CHECKING
 
-from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerWarning, ServerError
+from hyperscale.logging.hyperscale_logging_models import (
+    ServerInfo,
+    ServerWarning,
+    ServerError,
+)
 
 if TYPE_CHECKING:
     from hyperscale.logging import Logger
@@ -122,8 +126,13 @@ class WorkerBackgroundLoops:
                 current_time = time.monotonic()
                 managers_to_reap: list[str] = []
 
-                for manager_id, unhealthy_since in list(self._registry._manager_unhealthy_since.items()):
-                    if current_time - unhealthy_since >= self._dead_manager_reap_interval:
+                for manager_id, unhealthy_since in list(
+                    self._registry._manager_unhealthy_since.items()
+                ):
+                    if (
+                        current_time - unhealthy_since
+                        >= self._dead_manager_reap_interval
+                    ):
                         managers_to_reap.append(manager_id)
 
                 for manager_id in managers_to_reap:
@@ -153,7 +162,7 @@ class WorkerBackgroundLoops:
                                 node_host=node_host,
                                 node_port=node_port,
                                 node_id=node_id_short,
-                            )
+                            ),
                         )
 
             except asyncio.CancelledError:
@@ -187,17 +196,27 @@ class WorkerBackgroundLoops:
             try:
                 await asyncio.sleep(self._orphan_check_interval)
 
-                current_time = time.monotonic()
-                workflows_to_cancel: list[str] = []
+                workflows_to_cancel: list[tuple[str, str]] = []
 
-                # Find workflows whose grace period has expired
-                for workflow_id, orphan_timestamp in list(self._state._orphaned_workflows.items()):
-                    elapsed = current_time - orphan_timestamp
+                for workflow_id, orphan_timestamp in list(
+                    self._state._orphaned_workflows.items()
+                ):
+                    elapsed = time.monotonic() - orphan_timestamp
                     if elapsed >= self._orphan_grace_period:
-                        workflows_to_cancel.append(workflow_id)
+                        workflows_to_cancel.append(
+                            (workflow_id, "orphan_grace_period_expired")
+                        )
 
-                # Cancel expired orphaned workflows
-                for workflow_id in workflows_to_cancel:
+                for workflow_id, elapsed in self._state.get_stuck_workflows():
+                    if workflow_id not in self._state._orphaned_workflows:
+                        workflows_to_cancel.append(
+                            (
+                                workflow_id,
+                                f"execution_timeout_exceeded ({elapsed:.1f}s)",
+                            )
+                        )
+
+                for workflow_id, reason in workflows_to_cancel:
                     # Remove from orphan tracking first
                     self._state._orphaned_workflows.pop(workflow_id, None)
 
@@ -209,7 +228,7 @@ class WorkerBackgroundLoops:
                         await self._logger.log(
                             ServerWarning(
                                 message=f"Cancelling orphaned workflow {workflow_id[:8]}... - "
-                                        f"grace period ({self._orphan_grace_period}s) expired",
+                                f"grace period ({self._orphan_grace_period}s) expired",
                                 node_host=node_host,
                                 node_port=node_port,
                                 node_id=node_id_short,
@@ -217,7 +236,9 @@ class WorkerBackgroundLoops:
                         )
 
                     # Cancel the workflow
-                    success, errors = await cancel_workflow(workflow_id, "orphan_grace_period_expired")
+                    success, errors = await cancel_workflow(
+                        workflow_id, "orphan_grace_period_expired"
+                    )
 
                     if not success or errors:
                         if self._logger:
@@ -323,7 +344,10 @@ class WorkerBackgroundLoops:
                     continue
 
                 # BATCH level: aggregate by job
-                if self._backpressure_manager and self._backpressure_manager.should_batch_only():
+                if (
+                    self._backpressure_manager
+                    and self._backpressure_manager.should_batch_only()
+                ):
                     updates = aggregate_progress_by_job(updates)
 
                 # Send updates if we have healthy managers
