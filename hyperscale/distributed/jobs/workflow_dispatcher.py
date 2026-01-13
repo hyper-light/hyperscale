@@ -633,17 +633,16 @@ class WorkflowDispatcher:
                     pending.job_id, leader_term
                 )
 
-                # Create dispatch message
                 dispatch = WorkflowDispatch(
                     job_id=pending.job_id,
-                    workflow_id=str(sub_token),  # Use full tracking token
+                    workflow_id=str(sub_token),
                     workflow=workflow_bytes,
                     context=context_bytes,
                     vus=worker_vus,
                     cores=worker_cores,
                     timeout_seconds=submission.timeout_seconds,
                     fence_token=fence_token,
-                    context_version=0,
+                    context_version=layer_version,
                 )
 
                 # Send dispatch FIRST, only register sub-workflow on success
