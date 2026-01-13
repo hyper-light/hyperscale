@@ -33,8 +33,7 @@ class AckHandler(BaseHandler):
         source_addr = context.source_addr
         target = context.target
 
-        # AD-29: Confirm peer on successful communication
-        self._server.confirm_peer(source_addr)
+        await self._server.confirm_peer(source_addr)
 
         # Complete any pending probe Future for this address
         # This unblocks _probe_with_timeout waiting for ACK
