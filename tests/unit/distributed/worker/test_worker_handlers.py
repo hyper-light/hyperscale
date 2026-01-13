@@ -160,8 +160,11 @@ class TestWorkflowDispatchHandler:
 
         handler = WorkflowDispatchHandler(mock_server)
 
-        # Set existing fence token
-        mock_server._workflow_fence_tokens["wf-456"] = 10
+        # Configure mock to reject stale token
+        mock_server._worker_state.update_workflow_fence_token = AsyncMock(
+            return_value=False
+        )
+        mock_server._worker_state.get_workflow_fence_token = AsyncMock(return_value=10)
 
         dispatch = WorkflowDispatch(
             job_id="job-123",
