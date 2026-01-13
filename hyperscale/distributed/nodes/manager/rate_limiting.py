@@ -228,7 +228,7 @@ class ManagerRateLimitingCoordinator:
         Returns:
             Number of clients cleaned up
         """
-        cleaned = self._server_limiter.cleanup_inactive_clients()
+        cleaned = await self._server_limiter.cleanup_inactive_clients()
 
         if cleaned > 0:
             self._task_runner.run(
