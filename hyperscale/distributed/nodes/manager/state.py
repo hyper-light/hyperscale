@@ -304,6 +304,7 @@ class ManagerState:
         self._worker_circuits.pop(worker_id, None)
         self._worker_unhealthy_since.pop(worker_id, None)
         self._worker_deadlines.pop(worker_id, None)
+        self._worker_health_states.pop(worker_id, None)
 
         progress_keys_to_remove = [
             key for key in self._worker_job_last_progress if key[0] == worker_id
