@@ -299,6 +299,7 @@ class JobInfo:
     workflows_completed: int = 0
     workflows_failed: int = 0
     started_at: float = 0.0  # time.monotonic() when job started
+    completed_at: float = 0.0  # time.monotonic() when job reached terminal state
     timestamp: float = 0.0  # Last update time
 
     # Workflow tracking - keyed by token string for fast lookup
