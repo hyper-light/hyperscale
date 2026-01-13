@@ -389,13 +389,14 @@ class ManagerServer(HealthAwareServer):
             manager_id=self._node_id.short,
         )
 
-        # WorkerPool for worker registration and resource tracking
         self._worker_pool = WorkerPool(
             health_grace_period=30.0,
             get_swim_status=self._get_swim_status_for_worker,
             manager_id=self._node_id.short,
             datacenter=self._node_id.datacenter,
         )
+
+        self._registry.set_worker_pool(self._worker_pool)
 
         # Workflow lifecycle state machine (AD-33)
         self._workflow_lifecycle = ManagerWorkflowLifecycle(
