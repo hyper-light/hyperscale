@@ -44,6 +44,7 @@ from hyperscale.distributed.models import (
     JobAck,
     JobStatus,
     JobFinalResult,
+    JobCancellationComplete,
     WorkflowDispatch,
     WorkflowDispatchAck,
     WorkflowProgress,
@@ -2638,7 +2639,6 @@ class ManagerServer(HealthAwareServer):
                     node_id=self._node_id.short,
                 )
             )
-            
 
             return WorkflowProgressAck(
                 workflow_id="",
