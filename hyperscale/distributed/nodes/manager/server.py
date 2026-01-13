@@ -542,7 +542,7 @@ class ManagerServer(HealthAwareServer):
             get_datacenter=lambda: self._node_id.datacenter,
             is_leader=self.is_leader,
             get_term=lambda: self._leader_election.state.current_term,
-            get_state_version=lambda: self._manager_state._state_version,
+            get_state_version=lambda: self._manager_state.state_version,
             get_active_jobs=lambda: self._job_manager.job_count,
             get_active_workflows=self._get_active_workflow_count,
             get_worker_count=self._manager_state.get_worker_count,
@@ -593,7 +593,7 @@ class ManagerServer(HealthAwareServer):
             host=self._host,
             port=self._tcp_port,
             datacenter=self._node_id.datacenter,
-            version=self._manager_state._state_version,
+            version=self._manager_state.state_version,
             udp_port=self._udp_port,
         )
 
@@ -1952,7 +1952,7 @@ class ManagerServer(HealthAwareServer):
             try:
                 request = StateSyncRequest(
                     requester_id=self._node_id.full,
-                    requester_version=self._manager_state._state_version,
+                    requester_version=self._manager_state.state_version,
                 )
 
                 worker_addr = (worker.node.host, worker.node.tcp_port)
@@ -1990,7 +1990,7 @@ class ManagerServer(HealthAwareServer):
             try:
                 request = StateSyncRequest(
                     requester_id=self._node_id.full,
-                    requester_version=self._manager_state._state_version,
+                    requester_version=self._manager_state.state_version,
                 )
 
                 response = await self.send_tcp(
@@ -3057,7 +3057,7 @@ class ManagerServer(HealthAwareServer):
 
             return StateSyncResponse(
                 responder_id=self._node_id.full,
-                version=self._manager_state._state_version,
+                version=self._manager_state.state_version,
                 snapshot=snapshot.dump(),
             ).dump()
 
@@ -3888,7 +3888,7 @@ class ManagerServer(HealthAwareServer):
                 workflow_id=request.workflow_id,
                 confirming_node=self._node_id.full,
                 confirmed=can_confirm,
-                version=self._manager_state._state_version,
+                version=self._manager_state.state_version,
                 error=None if can_confirm else "Worker not available",
             ).dump()
 
@@ -3898,7 +3898,7 @@ class ManagerServer(HealthAwareServer):
                 workflow_id="unknown",
                 confirming_node=self._node_id.full,
                 confirmed=False,
-                version=self._manager_state._state_version,
+                version=self._manager_state.state_version,
                 error=str(error),
             ).dump()
 
