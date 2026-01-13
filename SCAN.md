@@ -2446,24 +2446,32 @@ grep -n "while True:" "$FILE"
 
 ---
 
-## Phase 7: Verify Completeness (NO SHORTCUTS)
+## Phase 7: Verify Completeness (MANDATORY - NO SHORTCUTS)
 
 **Objective**: Ensure refactor is complete and correct.
 
 **NO SHORTCUTS**: Do not mark items as "done" if they have workarounds. Do not skip checklist items. Every box must be honestly checked.
 
-**Checklist**:
-- [ ] Re-run Phase 3 matrix: all methods now exist
-- [ ] Re-run Phase 3.5g scanner: **ZERO** single-level attribute access violations
-- [ ] Re-run Phase 3.5h.1 scanner: **ZERO** chained attribute access violations
-- [ ] Re-run Phase 4: **ZERO** direct state access violations
-- [ ] LSP diagnostics clean on ALL modified files
-- [ ] No duplicate method implementations across modular classes
-- [ ] No orphaned/dead methods in modular classes
-- [ ] All call sites reference correct component and method
-- [ ] No proxy fields or workaround comments in fixes
+**MANDATORY Verification Checklist** (ALL items must pass):
 
-**BLOCKING**: Phase 7 cannot pass with ANY violations. If ANY check fails, return to the appropriate phase and fix properly - no shortcuts.
+| # | Check | Scanner/Command | Required Result |
+|---|-------|-----------------|-----------------|
+| 1 | Phase 3 method existence | Phase 3 matrix | All methods exist |
+| 2 | Phase 3.5g attribute access | Automated scanner | **ZERO** violations |
+| 3 | Phase 3.5h.1 chained attribute access | Chained access scanner | **ZERO** violations |
+| 4 | **Phase 3.5h.2 method call validation** | Method existence scanner | **ZERO** violations |
+| 5 | Phase 4 direct state access | `grep "self._state._"` | **ZERO** matches |
+| 6 | Phase 5.9 cyclomatic complexity | CC scanner | **ZERO** methods with CC > 4 |
+| 7 | Phase 6.5 runtime correctness | Race/leak/error scanners | **ZERO** violations |
+| 8 | LSP diagnostics | `lsp_diagnostics` | Clean on ALL modified files |
+| 9 | Duplicate methods | Manual review | None across modular classes |
+| 10 | Dead methods | Reference search | None in modular classes |
+| 11 | Call site correctness | Manual review | All use correct component/method |
+| 12 | No workarounds | `grep "proxy\|workaround\|TODO"` | No shortcut comments |
+
+**Execution Order**: Run checks 1-7 in order. If ANY fails, return to that phase and fix before proceeding.
+
+**BLOCKING**: Phase 7 cannot pass with ANY violations. If ANY check fails, return to the appropriate phase and fix properly - no shortcuts. "Mostly done" is NOT done.
 
 ---
 
