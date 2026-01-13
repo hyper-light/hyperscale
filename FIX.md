@@ -46,7 +46,7 @@ discovered during systematic tracing of SCENARIOS.md test scenarios through the 
 #### A3: Synthetic Heartbeat Not Cleaned (MEDIUM)
 **Location**: `gate/handlers/tcp_manager.py:444-459`
 **Issue**: Synthetic heartbeats from peer broadcasts never cleaned if real heartbeat never arrives.
-**Status**: TODO
+**Status**: FIXED - Synthetic heartbeats update `_manager_last_status` (line 486) and are cleaned by discovery_maintenance_loop via stale threshold
 
 ---
 
@@ -84,7 +84,7 @@ discovered during systematic tracing of SCENARIOS.md test scenarios through the 
 #### B6: Silent Exception in Dispatch Coordinator (MEDIUM)
 **Location**: `gate/dispatch_coordinator.py:164`
 **Issue**: Exception silently swallowed, sets empty workflow set.
-**Status**: TODO
+**Status**: FIXED - Exception now logged via ServerWarning (lines 167-175), empty set is reasonable fallback
 
 #### B7: Incomplete GateJobTimeoutTracker.stop() (MEDIUM)
 **Location**: `jobs/gates/gate_job_timeout_tracker.py:142`
