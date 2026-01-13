@@ -145,6 +145,9 @@ class WorkflowDispatcher:
         # Shutdown flag
         self._shutting_down: bool = False
 
+        # Jobs currently being cancelled (prevents dispatch during cancellation)
+        self._cancelling_jobs: set[str] = set()
+
     # =========================================================================
     # Workflow Registration
     # =========================================================================
