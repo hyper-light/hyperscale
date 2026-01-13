@@ -383,6 +383,16 @@ class WorkerServer(HealthAwareServer):
         """Backward compatibility - delegate to registry."""
         self._registry._primary_manager_id = value
 
+    @property
+    def _transfer_metrics_received(self) -> int:
+        """Transfer metrics received - delegate to state."""
+        return self._worker_state._transfer_metrics_received
+
+    @property
+    def _transfer_metrics_accepted(self) -> int:
+        """Transfer metrics accepted - delegate to state."""
+        return self._worker_state._transfer_metrics_accepted
+
     # =========================================================================
     # Lifecycle Methods
     # =========================================================================
