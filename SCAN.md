@@ -1794,6 +1794,291 @@ lsp_hover(file="server.py", line=1625, character=<column_of_completed_at>)
 
 ---
 
+### Step 3.5k: Type Hint Validation (MANDATORY - CRITICAL)
+
+**STATUS: MANDATORY** - This step MUST be executed. Missing or incorrect type hints cause runtime surprises, make code harder to understand, and prevent static analysis tools from catching bugs.
+
+**The Problem:**
+
+Functions and methods without type hints (or with incorrect hints) create multiple issues:
+
+```python
+# PROBLEM 1: Missing parameter type hint
+def process_job(self, job):  # What is 'job'? JobInfo? JobSubmission? dict?
+    return job.status  # Will this work?
+
+# PROBLEM 2: Missing return type hint
+async def get_worker_state(self, worker_id: str):  # Returns what? WorkerState? dict? None?
+    return self._workers.get(worker_id)
+
+# PROBLEM 3: Incorrect type hint
+def calculate_progress(self, count: int) -> float:  # Actually returns int!
+    return count * 100 // total
+
+# PROBLEM 4: Any/object escape hatches
+def handle_message(self, msg: Any) -> Any:  # Type system defeated
+    return process(msg)
+```
+
+**Why This Matters:**
+
+1. **Runtime errors**: Wrong type passed → `AttributeError` in production
+2. **Maintenance burden**: Future developers can't understand data flow
+3. **IDE support broken**: No autocomplete, no inline errors
+4. **Static analysis defeated**: LSP and type checkers can't help
+5. **Refactoring hazard**: Can't safely rename/change types
+
+**Codebase Rule (from AGENTS.md):**
+> "Type hints required, but we prefer to infer return types."
+> "For test workflow classes, type hints and return type hints are REQUIRED."
+> "If you can use generics, do so. Avoid using Any for typehints."
+
+### Step 3.5k.1: Scan for Missing Parameter Type Hints
+
+**Detection Script:**
+
+```python
+import ast
+from pathlib import Path
+
+def find_untyped_parameters(file_path: str) -> list[tuple[int, str, str, list[str]]]:
+    """
+    Find function/method parameters without type hints.
+    
+    Returns: [(line, func_name, kind, [untyped_params])]
+    """
+    with open(file_path) as f:
+        tree = ast.parse(f.read())
+    
+    violations = []
+    
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            untyped = []
+            for arg in node.args.args:
+                # Skip 'self' and 'cls'
+                if arg.arg in ('self', 'cls'):
+                    continue
+                # Check if annotation exists
+                if arg.annotation is None:
+                    untyped.append(arg.arg)
+            
+            # Also check *args and **kwargs
+            if node.args.vararg and node.args.vararg.annotation is None:
+                untyped.append(f"*{node.args.vararg.arg}")
+            if node.args.kwarg and node.args.kwarg.annotation is None:
+                untyped.append(f"**{node.args.kwarg.arg}")
+            
+            if untyped:
+                kind = "async def" if isinstance(node, ast.AsyncFunctionDef) else "def"
+                violations.append((node.lineno, node.name, kind, untyped))
+    
+    return violations
+
+# Usage
+violations = find_untyped_parameters("server.py")
+for line, name, kind, params in violations:
+    print(f"Line {line}: {kind} {name}() - untyped: {', '.join(params)}")
+```
+
+**Quick Detection Command:**
+
+```bash
+# Find function definitions and check for untyped parameters
+python3 -c "
+import ast
+with open('server.py') as f:
+    tree = ast.parse(f.read())
+for node in ast.walk(tree):
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        untyped = [a.arg for a in node.args.args 
+                   if a.arg not in ('self', 'cls') and a.annotation is None]
+        if untyped:
+            print(f'{node.lineno}:{node.name}: {untyped}')
+"
+```
+
+### Step 3.5k.2: Research and Apply Correct Type Hints
+
+**CRITICAL: Do not guess types. Research what is actually passed.**
+
+For each untyped parameter:
+
+1. **Find all call sites:**
+   ```bash
+   grep -n "\.method_name(" server.py handlers/*.py
+   ```
+
+2. **Trace what is passed:**
+   ```python
+   # If call site shows:
+   await self._process_job(job_info)
+   # Find where job_info comes from:
+   job_info = self._job_manager.get_job(job_id)
+   # Check get_job return type:
+   def get_job(self, job_id: str) -> JobInfo | None:
+   # Therefore parameter type is: JobInfo
+   ```
+
+3. **Use LSP hover to confirm:**
+   ```bash
+   lsp_hover(file="server.py", line=<call_site_line>, character=<arg_position>)
+   ```
+
+4. **Apply the type hint:**
+   ```python
+   # Before:
+   def _process_job(self, job):
+   
+   # After:
+   def _process_job(self, job: JobInfo) -> None:
+   ```
+
+### Step 3.5k.3: Handle Complex Types
+
+**Union Types (multiple possible types):**
+
+```python
+# If different call sites pass different types:
+await self._handle_message(job_submission)  # JobSubmission
+await self._handle_message(progress_report)  # WorkflowProgress
+
+# Use union:
+def _handle_message(self, message: JobSubmission | WorkflowProgress) -> None:
+```
+
+**Optional Types (can be None):**
+
+```python
+# If call site shows:
+worker = self._workers.get(worker_id)  # Returns WorkerInfo | None
+await self._process_worker(worker)
+
+# Parameter must accept None:
+def _process_worker(self, worker: WorkerInfo | None) -> None:
+    if worker is None:
+        return
+    # ...
+```
+
+**Generic Types:**
+
+```python
+# For collections, specify element types:
+def _process_jobs(self, jobs: list[JobInfo]) -> None:
+def _handle_workers(self, workers: dict[str, WorkerInfo]) -> None:
+
+# For callbacks:
+def _register_callback(self, callback: Callable[[JobInfo], Awaitable[None]]) -> None:
+```
+
+**Avoid Any - Use Generics Instead:**
+
+```python
+# WRONG:
+def _transform(self, data: Any) -> Any:
+
+# RIGHT - use TypeVar:
+T = TypeVar('T')
+def _transform(self, data: T) -> T:
+
+# OR be specific:
+def _transform(self, data: bytes) -> dict[str, str]:
+```
+
+### Step 3.5k.4: Validate Return Types (When Required)
+
+**Per AGENTS.md**: Return types are inferred by default, BUT are REQUIRED for:
+- Public API methods
+- Methods with complex return logic
+- Test workflow classes
+
+**Detection for missing return types on public methods:**
+
+```python
+def find_public_methods_without_return_type(file_path: str) -> list[tuple[int, str]]:
+    """Find public methods (no leading _) without return type hints."""
+    with open(file_path) as f:
+        tree = ast.parse(f.read())
+    
+    violations = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            # Public method = no leading underscore (except __init__, __str__, etc.)
+            if not node.name.startswith('_') or node.name.startswith('__'):
+                if node.returns is None and node.name != '__init__':
+                    violations.append((node.lineno, node.name))
+    
+    return violations
+```
+
+### Step 3.5k.5: Fix Patterns
+
+| Issue | Wrong Fix | Correct Fix |
+|-------|-----------|-------------|
+| Unknown parameter type | Use `Any` | Research call sites, use specific type |
+| Multiple possible types | Use `object` | Use `Union[A, B]` or `A \| B` |
+| Complex nested type | Use `dict` | Use `dict[str, list[WorkerInfo]]` |
+| Callback parameter | Use `Callable` | Use `Callable[[ArgType], ReturnType]` |
+| Optional parameter | Omit `None` | Use `Type \| None` explicitly |
+
+### Step 3.5k.6: Validation
+
+After adding type hints, verify:
+
+1. **LSP diagnostics clean:**
+   ```bash
+   lsp_diagnostics(file="server.py", severity="error")
+   ```
+
+2. **No Any/object escape hatches:**
+   ```bash
+   grep -n ": Any\|: object" server.py
+   # Should return zero matches (or justified exceptions)
+   ```
+
+3. **All parameters typed:**
+   ```bash
+   # Re-run the scanner - should return zero violations
+   python3 scan_untyped_params.py server.py
+   ```
+
+### Step 3.5k.7: Documentation
+
+For complex types, add docstring explaining:
+
+```python
+async def _route_job(
+    self,
+    job: JobSubmission,
+    candidates: list[DatacenterHealth],
+    strategy: RoutingStrategy | None = None,
+) -> tuple[str, ManagerInfo] | None:
+    """
+    Route job to best datacenter.
+    
+    Args:
+        job: Job submission request with routing preferences
+        candidates: Pre-filtered list of healthy datacenters
+        strategy: Override routing strategy (default: use job.routing_strategy)
+    
+    Returns:
+        Tuple of (datacenter_id, selected_manager) or None if no suitable DC found
+    """
+```
+
+### Output
+
+- **ZERO** untyped parameters (except `self`/`cls`)
+- **ZERO** use of `Any` or `object` as type hints (without justification)
+- **ZERO** public methods without return type hints
+- All complex types documented in docstrings
+- LSP diagnostics clean
+
+**BLOCKING**: Phase 3.5k is not complete until ALL functions/methods have properly researched and applied type hints.
+
+---
+
 ## Phase 4: Check Direct State Access
 
 **Objective**: Find and FIX abstraction violations where server bypasses components.
