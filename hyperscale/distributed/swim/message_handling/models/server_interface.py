@@ -60,15 +60,13 @@ class ServerInterface(Protocol):
 
     # === Node State ===
 
-    def update_node_state(
+    async def update_node_state(
         self,
         node: tuple[str, int],
         status: bytes,
         incarnation: int,
         timestamp: float,
-    ) -> None:
-        """Update a node's membership state."""
-        ...
+    ) -> None: ...
 
     def is_message_fresh(
         self,
