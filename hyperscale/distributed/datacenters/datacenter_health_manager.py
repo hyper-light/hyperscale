@@ -91,6 +91,7 @@ class DatacenterHealthManager:
         self._dc_manager_info: dict[str, dict[tuple[str, int], ManagerInfo]] = {}
         self._known_datacenters: set[str] = set()
         self._previous_health_states: dict[str, str] = {}
+        self._pending_transitions: list[tuple[str, str, str]] = []
 
     # =========================================================================
     # Manager Heartbeat Updates
@@ -259,72 +260,19 @@ class DatacenterHealthManager:
         status = self.get_datacenter_health(dc_id)
         return getattr(status, "health_severity_weight", 1.0)
 
-        # Get configured manager count if available
-        if self._get_configured_managers:
-            configured = self._get_configured_managers(dc_id)
-            total_count = max(total_count, len(configured))
+    def _record_health_transition(self, dc_id: str, new_health: str) -> None:
+        previous_health = self._previous_health_states.get(dc_id)
+        self._previous_health_states[dc_id] = new_health
 
-        # === UNHEALTHY: No managers registered ===
-        if total_count == 0:
-            return DatacenterStatus(
-                dc_id=dc_id,
-                health=DatacenterHealth.UNHEALTHY.value,
-                available_capacity=0,
-                queue_depth=0,
-                manager_count=0,
-                worker_count=0,
-                last_update=time.monotonic(),
-            )
+        if previous_health and previous_health != new_health:
+            self._pending_transitions.append((dc_id, previous_health, new_health))
 
-        # === UNHEALTHY: No fresh heartbeats or no workers ===
-        if not best_heartbeat or best_heartbeat.worker_count == 0:
-            return DatacenterStatus(
-                dc_id=dc_id,
-                health=DatacenterHealth.UNHEALTHY.value,
-                available_capacity=0,
-                queue_depth=0,
-                manager_count=alive_count,
-                worker_count=0,
-                last_update=time.monotonic(),
-            )
-
-        # Extract health info from best heartbeat
-        total_workers = best_heartbeat.worker_count
-        healthy_workers = getattr(best_heartbeat, "healthy_worker_count", total_workers)
-        available_cores = best_heartbeat.available_cores
-
-        # === Check for DEGRADED state ===
-        is_degraded = False
-
-        # Majority of managers unhealthy?
-        manager_quorum = total_count // 2 + 1
-        if total_count > 0 and alive_count < manager_quorum:
-            is_degraded = True
-
-        # Majority of workers unhealthy?
-        worker_quorum = total_workers // 2 + 1
-        if total_workers > 0 and healthy_workers < worker_quorum:
-            is_degraded = True
-
-        # === Determine final health state ===
-        if is_degraded:
-            health = DatacenterHealth.DEGRADED
-        elif available_cores == 0:
-            # Not degraded, but no capacity = BUSY (transient)
-            health = DatacenterHealth.BUSY
-        else:
-            # Not degraded, has capacity = HEALTHY
-            health = DatacenterHealth.HEALTHY
-
-        return DatacenterStatus(
-            dc_id=dc_id,
-            health=health.value,
-            available_capacity=available_cores,
-            queue_depth=getattr(best_heartbeat, "queue_depth", 0),
-            manager_count=alive_count,
-            worker_count=healthy_workers,
-            last_update=time.monotonic(),
-        )
+    def get_and_clear_health_transitions(
+        self,
+    ) -> list[tuple[str, str, str]]:
+        transitions = list(self._pending_transitions)
+        self._pending_transitions.clear()
+        return transitions
 
     def get_all_datacenter_health(self) -> dict[str, DatacenterStatus]:
         """Get health classification for all known datacenters."""
