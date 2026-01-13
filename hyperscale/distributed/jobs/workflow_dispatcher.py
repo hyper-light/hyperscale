@@ -598,11 +598,17 @@ class WorkflowDispatcher:
 
             total_allocated = sum(cores for _, cores in allocations)
 
-            # Serialize workflow
             workflow_bytes = cloudpickle.dumps(pending.workflow)
-            context_bytes = cloudpickle.dumps({})
 
-            # Create tracking token
+            context_for_workflow = await self._job_manager.get_context_for_workflow(
+                pending.job_id,
+                pending.workflow_id,
+                pending.dependencies,
+            )
+            context_bytes = _serialize_context(context_for_workflow)
+            layer_version = await self._job_manager.get_layer_version(pending.job_id)
+
+            workflow_token = TrackingToken.for_workflow(
             workflow_token = TrackingToken.for_workflow(
                 self._datacenter,
                 self._manager_id,
