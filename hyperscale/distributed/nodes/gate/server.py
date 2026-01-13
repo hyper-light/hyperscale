@@ -155,7 +155,6 @@ from hyperscale.distributed.capacity import (
 from hyperscale.logging.hyperscale_logging_models import (
     ServerInfo,
     ServerWarning,
-    ServerError,
     ServerDebug,
 )
 
