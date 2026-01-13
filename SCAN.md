@@ -64,6 +64,150 @@ For EACH component:
 
 ---
 
+## Phase 3.5: Object Attribute Access Validation
+
+**Objective**: Verify that attribute accesses on domain objects reference attributes that actually exist.
+
+### The Problem
+
+Phase 3 validates component method calls (`self._component.method()`), but misses attribute access on objects returned from those methods or stored in collections:
+
+```python
+# Phase 3 catches: component method doesn't exist
+self._job_manager.nonexistent_method()  # CAUGHT
+
+# Phase 3.5 catches: object attribute doesn't exist
+job = self._job_manager.get_job(job_id)
+for wf in job.workflows.values():
+    total += wf.completed_count  # MISSED - WorkflowInfo has no completed_count!
+```
+
+This class of bug occurs when:
+- Code assumes an object has attributes from a different (related) class
+- Refactoring moved attributes to nested objects but call sites weren't updated
+- Copy-paste from similar code that operates on different types
+
+### Step 3.5a: Identify Domain Object Iterations
+
+Find all loops that iterate over domain collections:
+
+```bash
+grep -n "for .* in .*\.values()\|for .* in .*\.items()\|for .* in self\._" server.py
+```
+
+Build table of iteration patterns:
+
+| Line | Variable | Collection Source | Expected Type |
+|------|----------|-------------------|---------------|
+| 4284 | `wf` | `job.workflows.values()` | `WorkflowInfo` |
+| ... | ... | ... | ... |
+
+### Step 3.5b: Extract Attribute Accesses in Loop Bodies
+
+For each iteration, identify attributes accessed on the loop variable:
+
+```bash
+# For variable 'wf' accessed in loop
+grep -A20 "for wf in" server.py | grep "wf\.[a-z_]*"
+```
+
+Build attribute access table:
+
+| Line | Object | Attribute Accessed | 
+|------|--------|-------------------|
+| 4285 | `wf` | `completed_count` |
+| 4286 | `wf` | `failed_count` |
+
+### Step 3.5c: Validate Against Class Definition
+
+For each attribute access, verify the attribute exists on the expected type:
+
+1. Find the class definition:
+   ```bash
+   grep -rn "class WorkflowInfo" --include="*.py"
+   ```
+
+2. Extract class attributes:
+   ```bash
+   # Check dataclass fields
+   grep -A30 "class WorkflowInfo" <file>.py | grep -E "^\s+\w+:\s"
+   
+   # Check @property methods
+   grep -A30 "class WorkflowInfo" <file>.py | grep "@property" -A1
+   ```
+
+3. Build validation matrix:
+
+| Object Type | Attribute | Exists? | Actual Location (if different) |
+|-------------|-----------|---------|-------------------------------|
+| `WorkflowInfo` | `completed_count` | **NO** | `SubWorkflowInfo.progress.completed_count` |
+| `WorkflowInfo` | `failed_count` | **NO** | `SubWorkflowInfo.progress.failed_count` |
+
+### Step 3.5d: Fix Invalid Accesses
+
+For each invalid attribute access:
+
+1. **Trace the correct path**: Find where the attribute actually lives
+2. **Understand the data model**: Why is it there and not here?
+3. **Fix the access pattern**: Update code to navigate to correct location
+
+Common patterns:
+
+| Bug Pattern | Fix Pattern |
+|-------------|-------------|
+| Accessing child attribute on parent | Navigate through relationship |
+| Accessing aggregated value that doesn't exist | Compute aggregation from children |
+| Accessing attribute from wrong type in union | Add type guard |
+
+**Example fix** (WorkflowInfo.completed_count bug):
+
+```python
+# BEFORE (broken):
+for wf in job.workflows.values():
+    total += wf.completed_count  # WorkflowInfo has no completed_count
+
+# AFTER (fixed):
+for workflow_info in job.workflows.values():
+    for sub_wf_token in workflow_info.sub_workflow_tokens:
+        if sub_wf_info := job.sub_workflows.get(sub_wf_token):
+            if sub_wf_info.progress:
+                total += sub_wf_info.progress.completed_count
+```
+
+### Step 3.5e: LSP-Assisted Validation
+
+Use LSP hover to verify types in complex expressions:
+
+```bash
+# Hover over variable to confirm type
+lsp_hover(file="server.py", line=4284, character=12)  # 'wf' variable
+```
+
+LSP will show the inferred type. If accessing `.completed_count` on `WorkflowInfo`, LSP would show an error - use this to catch issues early.
+
+### Step 3.5f: Systematic Scan Pattern
+
+For comprehensive coverage, check all domain model types used in server:
+
+1. List all domain models imported:
+   ```bash
+   grep "from.*models.*import" server.py
+   ```
+
+2. For each model, search for attribute accesses:
+   ```bash
+   grep -n "\.\(completed_count\|failed_count\|status\|..." server.py
+   ```
+
+3. Cross-reference with class definitions
+
+### Output
+
+- Zero attribute accesses on non-existent attributes
+- Data model navigation paths documented for complex aggregations
+
+---
+
 ## Phase 4: Check Direct State Access
 
 **Objective**: Find and FIX abstraction violations where server bypasses components.
