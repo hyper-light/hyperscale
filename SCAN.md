@@ -166,12 +166,12 @@ Common patterns:
 for wf in job.workflows.values():
     total += wf.completed_count  # WorkflowInfo has no completed_count
 
-# AFTER (fixed):
+# AFTER (fixed - combined conditions, walrus operator for clarity):
 for workflow_info in job.workflows.values():
     for sub_wf_token in workflow_info.sub_workflow_tokens:
-        if sub_wf_info := job.sub_workflows.get(sub_wf_token):
-            if sub_wf_info.progress:
-                total += sub_wf_info.progress.completed_count
+        sub_wf_info = job.sub_workflows.get(sub_wf_token)
+        if sub_wf_info and (progress := sub_wf_info.progress):
+            total += progress.completed_count
 ```
 
 ### Step 3.5e: LSP-Assisted Validation
