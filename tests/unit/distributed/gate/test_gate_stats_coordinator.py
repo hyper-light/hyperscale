@@ -164,20 +164,12 @@ class TestClassifyUpdateTierEdgeCases:
 
 
 class TestSendImmediateUpdateHappyPath:
-    """Tests for send_immediate_update happy path."""
-
     @pytest.mark.asyncio
     async def test_sends_update_with_callback(self):
-        """Sends update when callback exists."""
-        state = GateRuntimeState()
         send_tcp = AsyncMock()
         job_status = MockJobStatus()
 
-        coordinator = GateStatsCoordinator(
-            state=state,
-            logger=MockLogger(),
-            task_runner=MockTaskRunner(),
-            windowed_stats=MockWindowedStatsCollector(),
+        coordinator = create_coordinator(
             get_job_callback=lambda x: ("10.0.0.1", 8000) if x == "job-1" else None,
             get_job_status=lambda x: job_status if x == "job-1" else None,
             send_tcp=send_tcp,
@@ -192,16 +184,10 @@ class TestSendImmediateUpdateHappyPath:
 
     @pytest.mark.asyncio
     async def test_no_op_without_callback(self):
-        """No-op when no callback registered."""
-        state = GateRuntimeState()
         send_tcp = AsyncMock()
 
-        coordinator = GateStatsCoordinator(
-            state=state,
-            logger=MockLogger(),
-            task_runner=MockTaskRunner(),
-            windowed_stats=MockWindowedStatsCollector(),
-            get_job_callback=lambda x: None,  # No callback
+        coordinator = create_coordinator(
+            get_job_callback=lambda x: None,
             get_job_status=lambda x: MockJobStatus(),
             send_tcp=send_tcp,
         )
@@ -212,17 +198,11 @@ class TestSendImmediateUpdateHappyPath:
 
     @pytest.mark.asyncio
     async def test_no_op_without_job_status(self):
-        """No-op when job status not found."""
-        state = GateRuntimeState()
         send_tcp = AsyncMock()
 
-        coordinator = GateStatsCoordinator(
-            state=state,
-            logger=MockLogger(),
-            task_runner=MockTaskRunner(),
-            windowed_stats=MockWindowedStatsCollector(),
+        coordinator = create_coordinator(
             get_job_callback=lambda x: ("10.0.0.1", 8000),
-            get_job_status=lambda x: None,  # No job status
+            get_job_status=lambda x: None,
             send_tcp=send_tcp,
         )
 
