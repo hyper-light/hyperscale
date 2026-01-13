@@ -19,9 +19,11 @@ from hyperscale.distributed.datacenters.manager_dispatcher import (
     DispatchStats as DispatchStats,
 )
 from hyperscale.distributed.datacenters.lease_manager import (
-    LeaseManager as LeaseManager,
+    DatacenterLeaseManager as DatacenterLeaseManager,
     LeaseStats as LeaseStats,
 )
+
+LeaseManager = DatacenterLeaseManager
 from hyperscale.distributed.datacenters.cross_dc_correlation import (
     CrossDCCorrelationDetector as CrossDCCorrelationDetector,
     CrossDCCorrelationConfig as CrossDCCorrelationConfig,
