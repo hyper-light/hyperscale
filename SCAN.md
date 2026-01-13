@@ -2133,6 +2133,196 @@ for f in hyperscale/distributed/nodes/gate/*.py; do
 done
 ```
 
+### Step 3.5k.1d: Incomplete Generic Type Detection (MANDATORY - CRITICAL)
+
+**The Problem:**
+
+Generic types (`dict`, `list`, `set`, `tuple`, `Callable`, `Awaitable`, etc.) without their type parameters are nearly as bad as `Any` - they defeat the type system:
+
+```python
+# WRONG: Incomplete generic types - type parameters missing
+class WorkerState:
+    _workers: dict                    # dict of WHAT? dict[?, ?]
+    _pending_ids: list                # list of WHAT? list[?]
+    _seen_tokens: set                 # set of WHAT? set[?]
+    _callback: Callable               # Callable with what signature?
+    _result: tuple                    # tuple of WHAT? tuple[?, ?, ?]
+    _future: Awaitable                # Awaitable of WHAT?
+    
+    def process(self, items: list):   # list of WHAT?
+        pass
+    
+    def get_mapping(self) -> dict:    # dict of WHAT?
+        return {}
+
+# CORRECT: All generic type parameters specified
+class WorkerState:
+    _workers: dict[str, WorkerInfo]
+    _pending_ids: list[str]
+    _seen_tokens: set[int]
+    _callback: Callable[[JobInfo], Awaitable[None]]
+    _result: tuple[str, int, bool]
+    _future: Awaitable[JobResult]
+    
+    def process(self, items: list[JobInfo]) -> None:
+        pass
+    
+    def get_mapping(self) -> dict[str, WorkerInfo]:
+        return {}
+```
+
+**Why Incomplete Generics Are Dangerous:**
+
+1. **Silent type erasure**: `dict` becomes `dict[Any, Any]` - no type checking
+2. **False confidence**: Code looks typed but provides no safety
+3. **IDE degradation**: Autocomplete shows `Any` methods, not actual type methods
+4. **Refactoring blind spots**: Can't catch type mismatches when changing code
+
+**Generic Types That MUST Have Parameters:**
+
+| Type | Required Parameters | Example |
+|------|---------------------|---------|
+| `dict` | `[KeyType, ValueType]` | `dict[str, JobInfo]` |
+| `list` | `[ElementType]` | `list[WorkerInfo]` |
+| `set` | `[ElementType]` | `set[str]` |
+| `frozenset` | `[ElementType]` | `frozenset[int]` |
+| `tuple` | `[Type1, Type2, ...]` or `[Type, ...]` | `tuple[str, int]` or `tuple[int, ...]` |
+| `Callable` | `[[ArgTypes], ReturnType]` | `Callable[[str, int], bool]` |
+| `Awaitable` | `[ResultType]` | `Awaitable[JobResult]` |
+| `Coroutine` | `[YieldType, SendType, ReturnType]` | `Coroutine[Any, Any, JobResult]` |
+| `AsyncIterator` | `[YieldType]` | `AsyncIterator[WorkerInfo]` |
+| `Iterator` | `[YieldType]` | `Iterator[str]` |
+| `Generator` | `[YieldType, SendType, ReturnType]` | `Generator[int, None, None]` |
+| `Optional` | `[Type]` | `Optional[JobInfo]` (prefer `Type \| None`) |
+| `Union` | `[Type1, Type2, ...]` | `Union[str, int]` (prefer `str \| int`) |
+| `Sequence` | `[ElementType]` | `Sequence[JobInfo]` |
+| `Mapping` | `[KeyType, ValueType]` | `Mapping[str, int]` |
+| `MutableMapping` | `[KeyType, ValueType]` | `MutableMapping[str, JobInfo]` |
+| `Iterable` | `[ElementType]` | `Iterable[WorkerInfo]` |
+
+**Detection Script:**
+
+```python
+import ast
+import re
+from pathlib import Path
+
+# Generic types that require parameters
+GENERIC_TYPES = {
+    'dict', 'Dict',
+    'list', 'List', 
+    'set', 'Set',
+    'frozenset', 'FrozenSet',
+    'tuple', 'Tuple',
+    'Callable',
+    'Awaitable',
+    'Coroutine',
+    'AsyncIterator', 'AsyncIterable',
+    'Iterator', 'Iterable',
+    'Generator', 'AsyncGenerator',
+    'Optional',
+    'Union',
+    'Sequence', 'MutableSequence',
+    'Mapping', 'MutableMapping',
+    'Collection',
+    'AbstractSet', 'MutableSet',
+}
+
+def find_incomplete_generics(file_path: str) -> list[tuple[int, str, str]]:
+    """
+    Find generic type hints without type parameters.
+    
+    Returns: [(line, context, incomplete_type)]
+    """
+    with open(file_path) as f:
+        source = f.read()
+        lines = source.split('\n')
+    
+    violations = []
+    
+    # Pattern: matches bare generic types not followed by [
+    # e.g., ": dict" or ": list" or "-> dict" but not ": dict[" or ": list["
+    for i, line in enumerate(lines, 1):
+        for generic in GENERIC_TYPES:
+            # Match ": <generic>" or "-> <generic>" not followed by "["
+            patterns = [
+                rf':\s*{generic}\s*(?:=|,|\)|$|\s*#)',  # : dict = or : dict, or : dict) or end
+                rf'->\s*{generic}\s*(?::|,|\)|$|\s*#)',  # -> dict: or -> dict
+            ]
+            for pattern in patterns:
+                if re.search(pattern, line):
+                    # Verify it's not actually complete (has [...])
+                    if not re.search(rf'{generic}\s*\[', line):
+                        context = line.strip()[:60]
+                        violations.append((i, context, generic))
+    
+    return violations
+
+# Usage
+for py_file in Path("hyperscale/distributed/nodes/worker").glob("*.py"):
+    violations = find_incomplete_generics(str(py_file))
+    if violations:
+        print(f"\n{py_file}:")
+        for line, context, generic in violations:
+            print(f"  Line {line}: incomplete `{generic}` in: {context}")
+```
+
+**Quick Detection Command:**
+
+```bash
+# Find bare dict/list/set/tuple without type parameters
+grep -rn ": dict\s*=\|: dict$\|: dict,\|: dict)\|-> dict:" *.py | grep -v "\[" 
+grep -rn ": list\s*=\|: list$\|: list,\|: list)\|-> list:" *.py | grep -v "\["
+grep -rn ": set\s*=\|: set$\|: set,\|: set)\|-> set:" *.py | grep -v "\["
+grep -rn ": tuple\s*=\|: tuple$\|: tuple,\|: tuple)\|-> tuple:" *.py | grep -v "\["
+grep -rn ": Callable\s*=\|: Callable$\|: Callable,\|: Callable)" *.py | grep -v "\["
+```
+
+**Fix Pattern:**
+
+For each incomplete generic, research what types it actually contains:
+
+```python
+# Step 1: Find where the variable is populated
+self._workers = {}  # Where do items come from?
+
+# Step 2: Find assignments/mutations
+self._workers[worker_id] = worker_info  # worker_id is str, worker_info is WorkerInfo
+
+# Step 3: Apply complete type
+_workers: dict[str, WorkerInfo]
+```
+
+**Common Incomplete → Complete Fixes:**
+
+| Incomplete | Research Question | Likely Complete Type |
+|------------|-------------------|---------------------|
+| `dict` | What are keys? What are values? | `dict[str, JobInfo]` |
+| `list` | What elements are stored? | `list[WorkerInfo]` |
+| `set` | What elements are stored? | `set[str]` |
+| `tuple` | What's the fixed structure? | `tuple[str, int, bool]` |
+| `Callable` | What args? What return? | `Callable[[str], Awaitable[None]]` |
+
+**Special Cases:**
+
+```python
+# Empty containers - still need types
+_empty_cache: dict[str, JobInfo] = {}  # Even if always empty, declare types
+_placeholder: list[str] = []
+
+# Homogeneous tuples (variable length)
+_ids: tuple[str, ...]  # Zero or more strings
+
+# Heterogeneous tuples (fixed structure) 
+_pair: tuple[str, int]  # Exactly one string and one int
+
+# Callable with no args
+_factory: Callable[[], JobInfo]  # No args, returns JobInfo
+
+# Async callable
+_handler: Callable[[Request], Awaitable[Response]]
+```
+
 ### Step 3.5k.2: Research and Apply Correct Type Hints
 
 **CRITICAL: Do not guess types. Research what is actually passed.**
