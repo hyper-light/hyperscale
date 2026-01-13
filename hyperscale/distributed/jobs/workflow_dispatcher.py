@@ -609,7 +609,6 @@ class WorkflowDispatcher:
             layer_version = await self._job_manager.get_layer_version(pending.job_id)
 
             workflow_token = TrackingToken.for_workflow(
-            workflow_token = TrackingToken.for_workflow(
                 self._datacenter,
                 self._manager_id,
                 pending.job_id,
