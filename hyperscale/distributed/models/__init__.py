@@ -178,6 +178,13 @@ from .distributed import (
     JobFinalStatus as JobFinalStatus,
 )
 
+from .worker_state import (
+    WorkerStateUpdate as WorkerStateUpdate,
+    WorkerStatePiggybackUpdate as WorkerStatePiggybackUpdate,
+    WorkerListResponse as WorkerListResponse,
+    WorkerListRequest as WorkerListRequest,
+)
+
 # CRDTs for cross-datacenter synchronization
 from .crdt import (
     GCounter as GCounter,
