@@ -1381,20 +1381,22 @@ class GateServer(HealthAwareServer):
                 ),
             )
 
-            if push.job_id not in self._workflow_dc_results:
-                self._workflow_dc_results[push.job_id] = {}
-            if push.workflow_id not in self._workflow_dc_results[push.job_id]:
-                self._workflow_dc_results[push.job_id][push.workflow_id] = {}
-            self._workflow_dc_results[push.job_id][push.workflow_id][
-                push.datacenter
-            ] = push
+            async with self._workflow_dc_results_lock:
+                if push.job_id not in self._workflow_dc_results:
+                    self._workflow_dc_results[push.job_id] = {}
+                if push.workflow_id not in self._workflow_dc_results[push.job_id]:
+                    self._workflow_dc_results[push.job_id][push.workflow_id] = {}
+                self._workflow_dc_results[push.job_id][push.workflow_id][
+                    push.datacenter
+                ] = push
 
-            target_dcs = self._job_manager.get_target_dcs(push.job_id)
-            received_dcs = set(
-                self._workflow_dc_results[push.job_id][push.workflow_id].keys()
-            )
+                target_dcs = self._job_manager.get_target_dcs(push.job_id)
+                received_dcs = set(
+                    self._workflow_dc_results[push.job_id][push.workflow_id].keys()
+                )
+                should_aggregate = target_dcs and received_dcs >= target_dcs
 
-            if target_dcs and received_dcs >= target_dcs:
+            if should_aggregate:
                 await self._aggregate_and_forward_workflow_result(
                     push.job_id, push.workflow_id
                 )
