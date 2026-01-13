@@ -691,7 +691,7 @@ class TestConcurrency:
         execution_order = []
 
         async def task(task_id: int, delay: float):
-            lock = state.get_or_create_peer_lock(peer_addr)
+            lock = await state.get_or_create_peer_lock(peer_addr)
             async with lock:
                 execution_order.append(f"start-{task_id}")
                 await asyncio.sleep(delay)
