@@ -41,6 +41,8 @@ import asyncio
 import time
 from typing import Any, Callable, Coroutine
 
+import cloudpickle
+
 from hyperscale.core.graph.workflow import Workflow
 from hyperscale.core.state.context import Context
 from hyperscale.distributed.models import (
