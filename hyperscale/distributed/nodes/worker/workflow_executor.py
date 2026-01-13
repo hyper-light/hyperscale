@@ -7,7 +7,7 @@ Extracted from worker_impl.py for modularity (AD-33 compliance).
 
 import asyncio
 import time
-from typing import TYPE_CHECKING
+from typing import Any, TYPE_CHECKING
 
 import cloudpickle
 
