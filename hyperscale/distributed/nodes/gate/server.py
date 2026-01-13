@@ -2465,6 +2465,21 @@ class GateServer(HealthAwareServer):
 
         self._dc_backpressure[dc_id] = max_level
 
+    async def _update_dc_backpressure(self, dc_id: str) -> None:
+        async with self._backpressure_lock:
+            self._update_dc_backpressure_locked(dc_id)
+
+    async def _clear_manager_backpressure(self, manager_addr: tuple[str, int]) -> None:
+        async with self._backpressure_lock:
+            self._manager_backpressure.pop(manager_addr, None)
+
+    async def _set_manager_backpressure_none(
+        self, manager_addr: tuple[str, int], dc_id: str
+    ) -> None:
+        async with self._backpressure_lock:
+            self._manager_backpressure[manager_addr] = BackpressureLevel.NONE
+            self._update_dc_backpressure_locked(dc_id)
+
     async def _broadcast_manager_discovery(
         self,
         dc_id: str,

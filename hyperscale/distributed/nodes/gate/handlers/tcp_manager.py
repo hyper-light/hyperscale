@@ -9,7 +9,7 @@ Handles manager-facing operations:
 
 import asyncio
 import time
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Awaitable, Callable
 
 from hyperscale.distributed.models import (
     GateInfo,
