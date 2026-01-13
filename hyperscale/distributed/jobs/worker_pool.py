@@ -434,6 +434,7 @@ class WorkerPool:
 
         Updates available cores and last seen time.
         Thread-safe: uses allocation lock for core updates.
+        Idempotent: ignores stale heartbeats based on version number.
 
         Returns True if worker exists and was updated.
         """
@@ -442,6 +443,14 @@ class WorkerPool:
             return False
 
         async with self._cores_condition:
+            # Idempotency check: skip if heartbeat version is older or same
+            # This prevents duplicate processing from both SWIM and TCP paths
+            if (
+                worker.heartbeat is not None
+                and heartbeat.version <= worker.heartbeat.version
+            ):
+                return True  # Already processed this or newer heartbeat
+
             worker.heartbeat = heartbeat
             worker.last_seen = time.monotonic()
 
