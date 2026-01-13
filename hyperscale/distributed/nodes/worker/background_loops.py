@@ -58,20 +58,22 @@ class WorkerBackgroundLoops:
             logger: Logger instance
             backpressure_manager: Optional backpressure manager
         """
-        self._registry = registry
-        self._state = state
-        self._discovery_service = discovery_service
-        self._logger = logger
-        self._backpressure_manager = backpressure_manager
-        self._running = False
+        self._registry: "WorkerRegistry" = registry
+        self._state: "WorkerState" = state
+        self._discovery_service: "DiscoveryService" = discovery_service
+        self._logger: "Logger | None" = logger
+        self._backpressure_manager: "WorkerBackpressureManager | None" = (
+            backpressure_manager
+        )
+        self._running: bool = False
 
         # Loop intervals (can be overridden via config)
-        self._dead_manager_reap_interval = 60.0
-        self._dead_manager_check_interval = 10.0
-        self._orphan_grace_period = 120.0
-        self._orphan_check_interval = 10.0
-        self._discovery_failure_decay_interval = 60.0
-        self._progress_flush_interval = 0.5
+        self._dead_manager_reap_interval: float = 60.0
+        self._dead_manager_check_interval: float = 10.0
+        self._orphan_grace_period: float = 120.0
+        self._orphan_check_interval: float = 10.0
+        self._discovery_failure_decay_interval: float = 60.0
+        self._progress_flush_interval: float = 0.5
 
     def configure(
         self,
