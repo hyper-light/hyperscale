@@ -591,8 +591,8 @@ class TestIntegrationScenarios:
         hash_ring = ConsistentHashRing()
 
         # Register gates in hash ring
-        hash_ring.add_node("gate-1", "10.0.0.1", 8080)
-        hash_ring.add_node("gate-2", "10.0.0.2", 8080)
+        await hash_ring.add_node("gate-1", "10.0.0.1", 8080)
+        await hash_ring.add_node("gate-2", "10.0.0.2", 8080)
 
         # Setup forwarding
         gate2_tracker.register_peer("gate-1", "10.0.0.1", 8080)
@@ -600,7 +600,7 @@ class TestIntegrationScenarios:
         # Find a job that maps to gate-1
         test_job_id = "job-for-gate1"
         # Ensure the job maps to gate-1 by checking
-        while hash_ring.get_owner_id(test_job_id) != "gate-1":
+        while await hash_ring.get_owner_id(test_job_id) != "gate-1":
             test_job_id = f"job-{hash(test_job_id)}"
 
         # Gate-1 receives and stores job
