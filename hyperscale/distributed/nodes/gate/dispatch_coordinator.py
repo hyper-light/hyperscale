@@ -34,7 +34,7 @@ if TYPE_CHECKING:
     from hyperscale.distributed.jobs.gates import GateJobManager
     from hyperscale.distributed.routing import GateJobRouter
     from hyperscale.logging import Logger
-    from hyperscale.taskex import TaskRunner
+    from hyperscale.distributed.taskex import TaskRunner
 
 
 class GateDispatchCoordinator:

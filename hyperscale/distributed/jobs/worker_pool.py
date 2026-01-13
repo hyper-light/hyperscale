@@ -660,7 +660,7 @@ class WorkerPool:
 
         Returns True if worker was found and updated.
         """
-        async with self._allocation_lock:
+        async with self._cores_condition:
             worker = self._workers.get(node_id)
             if not worker:
                 return False
@@ -668,7 +668,6 @@ class WorkerPool:
             old_available = worker.available_cores
             worker.available_cores = worker_available_cores
 
-            # Clear reservations since progress is authoritative
             worker.reserved_cores = 0
 
             if worker.available_cores > old_available:
