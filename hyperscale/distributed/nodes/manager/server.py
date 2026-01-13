@@ -1907,14 +1907,12 @@ class ManagerServer(HealthAwareServer):
         )
 
     def _get_available_cores_for_healthy_workers(self) -> int:
-        """Get total available cores across healthy workers."""
-        total = 0
-        healthy_ids = self._registry.get_healthy_worker_ids()
-        for worker_id in healthy_ids:
-            worker = self._manager_state._workers.get(worker_id)
-            if worker:
-                total += worker.available_cores
-        return total
+        """Get total available cores across healthy workers.
+
+        Uses WorkerPool which tracks real-time worker capacity from heartbeats,
+        rather than stale WorkerRegistration data from initial registration.
+        """
+        return self._worker_pool.get_total_available_cores()
 
     def _get_total_cores(self) -> int:
         """Get total cores across all workers."""
