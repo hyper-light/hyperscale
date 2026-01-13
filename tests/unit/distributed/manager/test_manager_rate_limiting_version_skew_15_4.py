@@ -18,11 +18,16 @@ import pytest
 import time
 from unittest.mock import MagicMock, AsyncMock, patch
 
-from hyperscale.distributed.nodes.manager.rate_limiting import ManagerRateLimitingCoordinator
+from hyperscale.distributed.nodes.manager.rate_limiting import (
+    ManagerRateLimitingCoordinator,
+)
 from hyperscale.distributed.nodes.manager.version_skew import ManagerVersionSkewHandler
 from hyperscale.distributed.nodes.manager.config import ManagerConfig
 from hyperscale.distributed.nodes.manager.state import ManagerState
-from hyperscale.distributed.reliability.overload import HybridOverloadDetector, OverloadState
+from hyperscale.distributed.reliability.overload import (
+    HybridOverloadDetector,
+    OverloadState,
+)
 from hyperscale.distributed.reliability.priority import RequestPriority
 from hyperscale.distributed.reliability.rate_limiting import RateLimitResult
 from hyperscale.distributed.protocol.version import (
@@ -122,9 +127,10 @@ class TestManagerRateLimitingCoordinatorHappyPath:
         assert rate_limiting_coordinator._cleanup_task is None
         assert rate_limiting_coordinator.overload_detector is overload_detector
 
-    def test_check_rate_limit_allows_request(self, rate_limiting_coordinator):
+    @pytest.mark.asyncio
+    async def test_check_rate_limit_allows_request(self, rate_limiting_coordinator):
         """check_rate_limit allows requests within limits."""
-        result = rate_limiting_coordinator.check_rate_limit(
+        result = await rate_limiting_coordinator.check_rate_limit(
             client_id="client-1",
             operation="job_submit",
             priority=RequestPriority.NORMAL,
@@ -134,27 +140,29 @@ class TestManagerRateLimitingCoordinatorHappyPath:
         assert result.allowed is True
         assert result.retry_after_seconds == 0.0
 
-    def test_check_rate_limit_critical_always_allowed(self, rate_limiting_coordinator):
+    @pytest.mark.asyncio
+    async def test_check_rate_limit_critical_always_allowed(
+        self, rate_limiting_coordinator
+    ):
         """CRITICAL priority requests are always allowed."""
-        # Even if we exhaust the rate limit
         for idx in range(200):
-            rate_limiting_coordinator.check_rate_limit(
+            await rate_limiting_coordinator.check_rate_limit(
                 client_id="client-1",
                 operation="job_submit",
                 priority=RequestPriority.NORMAL,
             )
 
-        # CRITICAL should still pass
-        result = rate_limiting_coordinator.check_rate_limit(
+        result = await rate_limiting_coordinator.check_rate_limit(
             client_id="client-1",
             operation="job_submit",
             priority=RequestPriority.CRITICAL,
         )
         assert result.allowed is True
 
-    def test_check_simple_allows_request(self, rate_limiting_coordinator):
+    @pytest.mark.asyncio
+    async def test_check_simple_allows_request(self, rate_limiting_coordinator):
         """check_simple provides simple rate limiting."""
-        result = rate_limiting_coordinator.check_simple(("192.168.1.1", 5000))
+        result = await rate_limiting_coordinator.check_simple(("192.168.1.1", 5000))
         assert result is True
 
     @pytest.mark.asyncio
@@ -383,10 +391,7 @@ class TestManagerRateLimitingCoordinatorConcurrency:
             results.append((client_id, result.allowed))
 
         # Run concurrent checks for different clients
-        await asyncio.gather(*[
-            check_limit(f"client-{idx}")
-            for idx in range(20)
-        ])
+        await asyncio.gather(*[check_limit(f"client-{idx}") for idx in range(20)])
 
         assert len(results) == 20
         # All should be allowed (different clients, first request each)
@@ -533,8 +538,13 @@ class TestManagerVersionSkewHandlerHappyPath:
 
         version_skew_handler.negotiate_with_worker(worker_id, remote_caps)
 
-        assert version_skew_handler.worker_supports_feature(worker_id, "heartbeat") is True
-        assert version_skew_handler.worker_supports_feature(worker_id, "unknown_feature") is False
+        assert (
+            version_skew_handler.worker_supports_feature(worker_id, "heartbeat") is True
+        )
+        assert (
+            version_skew_handler.worker_supports_feature(worker_id, "unknown_feature")
+            is False
+        )
 
     def test_gate_supports_feature(self, version_skew_handler):
         """Check if gate supports feature after negotiation."""
@@ -574,9 +584,7 @@ class TestManagerVersionSkewHandlerNegativePath:
     def test_negotiate_with_worker_incompatible_version(self, version_skew_handler):
         """Negotiation fails with incompatible major version."""
         worker_id = "worker-incompat"
-        incompatible_version = ProtocolVersion(
-            CURRENT_PROTOCOL_VERSION.major + 1, 0
-        )
+        incompatible_version = ProtocolVersion(CURRENT_PROTOCOL_VERSION.major + 1, 0)
         remote_caps = NodeCapabilities(
             protocol_version=incompatible_version,
             capabilities=set(),
@@ -590,9 +598,7 @@ class TestManagerVersionSkewHandlerNegativePath:
     def test_negotiate_with_gate_incompatible_version(self, version_skew_handler):
         """Gate negotiation fails with incompatible version."""
         gate_id = "gate-incompat"
-        incompatible_version = ProtocolVersion(
-            CURRENT_PROTOCOL_VERSION.major + 1, 0
-        )
+        incompatible_version = ProtocolVersion(CURRENT_PROTOCOL_VERSION.major + 1, 0)
         remote_caps = NodeCapabilities(
             protocol_version=incompatible_version,
             capabilities=set(),
@@ -604,9 +610,7 @@ class TestManagerVersionSkewHandlerNegativePath:
     def test_negotiate_with_peer_incompatible_version(self, version_skew_handler):
         """Peer negotiation fails with incompatible version."""
         peer_id = "peer-incompat"
-        incompatible_version = ProtocolVersion(
-            CURRENT_PROTOCOL_VERSION.major + 1, 0
-        )
+        incompatible_version = ProtocolVersion(CURRENT_PROTOCOL_VERSION.major + 1, 0)
         remote_caps = NodeCapabilities(
             protocol_version=incompatible_version,
             capabilities=set(),
@@ -617,21 +621,26 @@ class TestManagerVersionSkewHandlerNegativePath:
 
     def test_worker_supports_feature_not_negotiated(self, version_skew_handler):
         """Feature check returns False for non-negotiated worker."""
-        assert version_skew_handler.worker_supports_feature(
-            "nonexistent-worker", "heartbeat"
-        ) is False
+        assert (
+            version_skew_handler.worker_supports_feature(
+                "nonexistent-worker", "heartbeat"
+            )
+            is False
+        )
 
     def test_gate_supports_feature_not_negotiated(self, version_skew_handler):
         """Feature check returns False for non-negotiated gate."""
-        assert version_skew_handler.gate_supports_feature(
-            "nonexistent-gate", "heartbeat"
-        ) is False
+        assert (
+            version_skew_handler.gate_supports_feature("nonexistent-gate", "heartbeat")
+            is False
+        )
 
     def test_peer_supports_feature_not_negotiated(self, version_skew_handler):
         """Feature check returns False for non-negotiated peer."""
-        assert version_skew_handler.peer_supports_feature(
-            "nonexistent-peer", "heartbeat"
-        ) is False
+        assert (
+            version_skew_handler.peer_supports_feature("nonexistent-peer", "heartbeat")
+            is False
+        )
 
 
 # =============================================================================
@@ -826,10 +835,7 @@ class TestManagerVersionSkewHandlerConcurrency:
             results.append((worker_id, result.compatible))
 
         # Run concurrent negotiations
-        await asyncio.gather(*[
-            negotiate_worker(f"worker-{idx}")
-            for idx in range(20)
-        ])
+        await asyncio.gather(*[negotiate_worker(f"worker-{idx}") for idx in range(20)])
 
         assert len(results) == 20
         assert all(compatible for _, compatible in results)
@@ -852,10 +858,7 @@ class TestManagerVersionSkewHandlerConcurrency:
             )
             results.append((worker_id, result))
 
-        await asyncio.gather(*[
-            check_feature(f"worker-{idx}")
-            for idx in range(10)
-        ])
+        await asyncio.gather(*[check_feature(f"worker-{idx}") for idx in range(10)])
 
         assert len(results) == 10
         assert all(supports for _, supports in results)
