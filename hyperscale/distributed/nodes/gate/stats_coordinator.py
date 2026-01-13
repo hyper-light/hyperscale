@@ -5,13 +5,15 @@ Provides tiered update classification, batch stats loops, and windowed
 stats aggregation following the REFACTOR.md pattern.
 """
 
-import asyncio
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 from hyperscale.distributed.models import (
     JobStatus,
     UpdateTier,
     JobStatusPush,
+    JobBatchPush,
+    DCStats,
+    GlobalJobStatus,
 )
 from hyperscale.distributed.jobs import WindowedStatsCollector
 
