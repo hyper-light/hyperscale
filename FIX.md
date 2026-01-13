@@ -294,21 +294,42 @@ async def _aggregate_and_forward_workflow_result(self, job_id: str, workflow_id:
 
 | ID | Severity | Category | Location | Status |
 |----|----------|----------|----------|--------|
-| F1 | CRITICAL | Missing Method | windowed_stats_collector.py | TODO |
-| F2 | CRITICAL | Missing Method | windowed_stats_collector.py | TODO |
-| F3 | CRITICAL | Missing Method | windowed_stats_collector.py | TODO |
-| F4 | MEDIUM | Race Condition | stats_coordinator.py | TODO |
-| F5 | MEDIUM | Race Condition | crdt.py | TODO |
+| F1 | CRITICAL | Missing Method | windowed_stats_collector.py | FIXED |
+| F2 | CRITICAL | Missing Method | windowed_stats_collector.py | FIXED |
+| F3 | CRITICAL | Missing Method | windowed_stats_collector.py | FIXED |
+| F4 | MEDIUM | Race Condition | stats_coordinator.py | FIXED |
+| F5 | MEDIUM | Race Condition | crdt.py | DOCUMENTED (not used yet) |
 | F6 | MEDIUM | Race Condition | windowed_stats_collector.py | DOCUMENTED |
-| F7 | LOW | Blocking Call | tcp_windowed_stats.py | TODO |
+| F7 | LOW | Blocking Call | tcp_windowed_stats.py | FIXED |
 | F8 | LOW | Observability | gate/server.py | OPTIONAL |
-| F9 | LOW | Race Condition | gate/server.py | TODO |
+| F9 | LOW | Race Condition | gate/server.py | FIXED |
 
 ---
 
-## Next Steps
+## Fixes Applied
 
-1. **Immediate**: Fix F1, F2, F3 - these will cause runtime crashes
-2. **Soon**: Fix F4 - violates backpressure contract
-3. **Consider**: F5, F7, F9 - edge cases but worth addressing
-4. **Optional**: F6, F8 - documentation/observability improvements
+- **F1, F2, F3**: Added missing methods to `WindowedStatsCollector`:
+  - `get_jobs_with_pending_stats()` - returns list of job IDs with pending windows
+  - `get_aggregated_stats(job_id)` - async method to get and flush closed windows for a job
+  - `record(worker_id, progress)` - convenience wrapper for `add_progress()`
+  - Also made `WindowedStatsPush` inherit from `Message` for proper serialization
+
+- **F4**: Fixed backpressure race in `stats_coordinator.py`:
+  - Re-check backpressure level after sleep before pushing stats
+
+- **F7**: Fixed sync callback in `tcp_windowed_stats.py`:
+  - Check if callback is async with `asyncio.iscoroutinefunction()`
+  - Run sync callbacks in executor to avoid blocking event loop
+
+- **F9**: Fixed result aggregation race in `gate/server.py`:
+  - Added `_workflow_dc_results_lock` asyncio.Lock
+  - Protected workflow result storage and aggregation with lock
+  - Use atomic pop pattern in `_aggregate_and_forward_workflow_result()`
+
+---
+
+## Remaining Items
+
+- **F5**: CRDT merge race - not currently used in production code, documented for future
+- **F6**: Late-arriving stats - inherent to time-windowed design, documented
+- **F8**: Duplicate detection - optional observability improvement
