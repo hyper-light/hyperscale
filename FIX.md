@@ -199,7 +199,7 @@ discovered during systematic tracing of SCENARIOS.md test scenarios through the 
 #### E6: Dispatch Semaphore Cleanup Issue (MEDIUM)
 **Location**: `manager/registry.py:96`
 **Issue**: Semaphore deleted while dispatch may be in progress.
-**Status**: TODO
+**Status**: FIXED - Added `_dispatch_semaphores.pop()` to `unregister_worker()` and `remove_worker_state()`
 
 ---
 
