@@ -71,13 +71,12 @@ class MockWindowedStatsCollector:
 
 @dataclass
 class MockJobStatus:
-    """Mock job status object."""
-
     status: str = JobStatus.RUNNING.value
     total_completed: int = 100
     total_failed: int = 5
     overall_rate: float = 50.0
     elapsed_seconds: float = 10.0
+    datacenters: list = field(default_factory=list)
 
 
 # =============================================================================
