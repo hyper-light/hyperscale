@@ -704,6 +704,12 @@ class ManagerHeartbeat(Message):
     health_throughput: float = 0.0
     health_expected_throughput: float = 0.0
     health_overload_state: str = "healthy"
+    # Worker overload tracking for DC-level health classification
+    # Counts workers in "overloaded" state (from HybridOverloadDetector)
+    # Used by gates to factor overload into DC health, not just connectivity
+    overloaded_worker_count: int = 0
+    stressed_worker_count: int = 0
+    busy_worker_count: int = 0
     # Extension and LHM tracking for cross-DC correlation (Phase 7)
     # Used by gates to distinguish load from failures
     workers_with_extensions: int = 0  # Workers currently with active extensions
