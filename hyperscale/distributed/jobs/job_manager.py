@@ -913,6 +913,39 @@ class JobManager:
             return None
         return job.context
 
+    async def get_layer_version(self, job_id: str) -> int:
+        job = self.get_job_by_id(job_id)
+        if job is None:
+            return 0
+        async with job.lock:
+            return job.layer_version
+
+    async def increment_layer_version(self, job_id: str) -> int:
+        job = self.get_job_by_id(job_id)
+        if job is None:
+            return 0
+        async with job.lock:
+            job.layer_version += 1
+            return job.layer_version
+
+    async def get_context_for_workflow(
+        self,
+        job_id: str,
+        workflow_name: str,
+        dependencies: set[str],
+    ) -> dict[str, Any]:
+        job = self.get_job_by_id(job_id)
+        if job is None:
+            return {}
+
+        async with job.lock:
+            context_for_workflow: dict[str, Any] = {}
+            for dependency_name in dependencies:
+                if dependency_name in job.context:
+                    dependency_context = job.context[dependency_name]
+                    context_for_workflow.update(dependency_context)
+            return context_for_workflow
+
     # =========================================================================
     # Iteration Helpers
     # =========================================================================
