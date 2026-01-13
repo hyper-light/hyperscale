@@ -93,11 +93,7 @@ from hyperscale.distributed.models import (
     JobFinalStatus,
 )
 from hyperscale.distributed.swim.core import (
-    QuorumError,
-    QuorumUnavailableError,
-    QuorumCircuitOpenError,
     ErrorStats,
-    CircuitState,
 )
 from hyperscale.distributed.swim.detection import HierarchicalConfig
 from hyperscale.distributed.health import (
@@ -105,7 +101,6 @@ from hyperscale.distributed.health import (
     ManagerHealthConfig,
     GateHealthState,
     GateHealthConfig,
-    RoutingDecision,
     CircuitBreakerManager,
     LatencyTracker,
 )
@@ -113,10 +108,6 @@ from hyperscale.distributed.reliability import (
     HybridOverloadDetector,
     LoadShedder,
     ServerRateLimiter,
-    RetryExecutor,
-    RetryConfig,
-    JitterStrategy,
-    BackpressureLevel,
     BackpressureSignal,
 )
 from hyperscale.distributed.jobs.gates import (
