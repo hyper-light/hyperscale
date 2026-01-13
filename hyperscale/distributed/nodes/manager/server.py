@@ -108,6 +108,7 @@ from hyperscale.distributed.reliability import (
     StatsBuffer,
     StatsBufferConfig,
 )
+from hyperscale.distributed.resources import ProcessResourceMonitor
 from hyperscale.distributed.health import WorkerHealthManager, WorkerHealthManagerConfig
 from hyperscale.distributed.protocol.version import (
     CURRENT_PROTOCOL_VERSION,
