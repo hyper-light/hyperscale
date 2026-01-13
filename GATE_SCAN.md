@@ -1,102 +1,202 @@
-# Gate Coordinator Analysis Workflow
+# Gate Server Analysis Workflow
 
-**Scope:** This workflow applies specifically to `hyperscale/distributed/nodes/gate/server.py` and its coordinator classes in `hyperscale/distributed/nodes/gate/`.
+**Scope:** `hyperscale/distributed/nodes/gate/server.py` and related modules.
 
-## Gate Coordinators
+## Key Components
 
+**Coordinators** (in `hyperscale/distributed/nodes/gate/`):
 - `GateDispatchCoordinator` (dispatch_coordinator.py)
 - `GateStatsCoordinator` (stats_coordinator.py)
 - `GatePeerCoordinator` (peer_coordinator.py)
 - `GateHealthCoordinator` (health_coordinator.py)
 - `GateLeadershipCoordinator` (leadership_coordinator.py)
 
-## Workflow Steps
+**Trackers/Managers** (in `hyperscale/distributed/jobs/`):
+- `JobLeadershipTracker` (job_leadership_tracker.py)
+- `GateJobManager` (gates/gate_job_manager.py)
+- `GateJobTimeoutTracker` (gates/gate_job_timeout_tracker.py)
 
-### 1. Identify Coordinator Call Sites
+**Handlers** (in `hyperscale/distributed/nodes/gate/handlers/`):
+- TCP and UDP message handlers
 
-For each coordinator, find where server.py calls its methods:
+---
+
+## Phase 1: Find All External Calls
+
+Scan server.py for ALL calls to injected dependencies:
 
 ```bash
+# Coordinators
 grep -n "_dispatch_coordinator\." server.py
 grep -n "_stats_coordinator\." server.py
 grep -n "_peer_coordinator\." server.py
 grep -n "_health_coordinator\." server.py
 grep -n "_leadership_coordinator\." server.py
+
+# Trackers/Managers
+grep -n "_job_leadership_tracker\." server.py
+grep -n "_job_manager\." server.py
+grep -n "_job_timeout_tracker\." server.py
+
+# Other injected dependencies
+grep -n "_job_router\." server.py
+grep -n "_circuit_breaker_manager\." server.py
+grep -n "_dispatch_time_tracker\." server.py
 ```
 
-### 2. Check if Method Exists
+---
 
-Verify each called method exists in the coordinator class:
+## Phase 2: Verify Methods Exist
+
+For EACH method call found, verify the method exists:
 
 ```bash
-grep -n "def method_name" coordinator_file.py
+grep -n "def method_name" target_file.py
 ```
 
-**If missing → flag as unimplemented functionality**
+**If missing → flag for implementation**
 
-### 3. Trace the Call Chain
+---
 
-Map the full flow:
-- **Handler** → calls server method → calls coordinator method
-- OR **Handler** → has logic inline (duplicate of coordinator)
+## Phase 3: Trace Full Call Chains
 
-### 4. Check for Duplicate Functionality
+For each server method, trace backwards and forwards:
 
-Compare:
-- What the **coordinator method** does (or should do)
-- What the **server wrapper method** does
-- What the **handler** does inline
+```
+WHO CALLS IT?          WHAT DOES IT DO?           WHAT DOES IT CALL?
+─────────────          ────────────────           ──────────────────
+Handler method    →    Server wrapper method  →   Coordinator/Tracker method
+     ↓                       ↓                           ↓
+tcp_job.py             server.py                  coordinator.py
+```
 
-**Red flags:**
-- Server wrapper doing business logic before/after delegation
-- Handler has same logic that exists in coordinator
-- Coordinator method calls back to server (circular)
-
-### 5. Check Dependencies
-
-For each coordinator method, verify all injected callbacks exist:
+### Finding Callers
 
 ```bash
-grep -n "self._callback_name" coordinator_file.py
+# Find what calls a server method
+grep -rn "method_name" hyperscale/distributed/nodes/gate/handlers/
+grep -n "self\.method_name\|self\._method_name" server.py
 ```
 
-Then verify each exists in server.py:
+### Identifying Orphaned Methods
 
-```bash
-grep -n "def _callback_name" server.py
+Server methods that:
+- Are never called (dead code)
+- Call non-existent coordinator methods (broken)
+- Have inline logic that should be delegated (needs refactor)
+
+---
+
+## Phase 4: Check for Issues
+
+### Issue Type 1: Missing Method
+```
+server.py calls coordinator.foo()
+BUT coordinator.py has no def foo()
+→ IMPLEMENT foo() in coordinator
 ```
 
-### 6. Reference Old Implementation
+### Issue Type 2: Signature Mismatch
+```
+server.py calls coordinator.foo(a, b, c)
+BUT coordinator.py has def foo(x)
+→ FIX call site OR fix method signature
+```
 
-Check `examples/old/gate_impl.py` for the canonical implementation:
+### Issue Type 3: Duplicate Logic
+```
+server.py wrapper does X then calls coordinator.foo()
+AND coordinator.foo() also does X
+→ REMOVE X from server wrapper
+```
+
+### Issue Type 4: Missing Delegation
+```
+server.py method has business logic inline
+BUT should delegate to coordinator
+→ MOVE logic to coordinator, simplify server to delegation
+```
+
+### Issue Type 5: Circular Dependency
+```
+server.py calls coordinator.foo()
+AND coordinator.foo() calls back to server via callback
+AND callback does same thing as foo()
+→ REFACTOR to eliminate circular logic
+```
+
+---
+
+## Phase 5: Reference Implementation
+
+Check `examples/old/gate_impl.py` for canonical behavior:
 
 ```bash
 grep -n "def method_name" examples/old/gate_impl.py
 ```
 
-Read the full method to understand intended behavior.
+Read the full method to understand:
+- What parameters it expects
+- What it returns
+- What side effects it has
+- What other methods it calls
 
-### 7. Decision Matrix
+---
 
-| Situation | Action |
-|-----------|--------|
-| Method missing in coordinator | Implement in coordinator using old gate_impl.py as reference |
-| Server wrapper has business logic | Move logic to coordinator, simplify wrapper to pure delegation |
-| Handler has inline logic that coordinator has | Handler is legacy - coordinator is correct (future cleanup) |
-| Coordinator calls back to server | Circular dependency - refactor to inject dependency or move logic |
-| Dependency callback missing in server | Add missing method to server.py |
+## Phase 6: Decision Matrix
 
-### 8. Cleanup Checklist
+| Finding | Action |
+|---------|--------|
+| Method missing in target | Implement using old gate_impl.py as reference |
+| Signature mismatch | Fix caller or callee to match |
+| Server wrapper has business logic | Move to coordinator, simplify wrapper |
+| Handler has inline logic | Note for future cleanup (handler is legacy) |
+| Dead/orphaned server method | Remove if truly unused |
+| Circular callback pattern | Refactor to inject dependency directly |
 
-After fixing:
-- [ ] Coordinator method fully implemented
+---
+
+## Phase 7: Verification Checklist
+
+After each fix:
+- [ ] Method exists at target location
+- [ ] Method signature matches call site
 - [ ] Server wrapper is pure delegation (no business logic)
-- [ ] All coordinator dependencies exist in server
-- [ ] No duplicate timing/tracking/logging between server and coordinator
-- [ ] LSP diagnostics clean on both files
+- [ ] No duplicate logic between layers
+- [ ] LSP diagnostics clean on affected files
+- [ ] Reference old gate_impl.py for correctness
+
+---
+
+## Automated Scan Script
+
+```bash
+#!/bin/bash
+# Run from hyperscale root
+
+SERVER="hyperscale/distributed/nodes/gate/server.py"
+
+echo "=== COORDINATOR CALLS ==="
+for coord in dispatch_coordinator stats_coordinator peer_coordinator health_coordinator leadership_coordinator; do
+    echo "--- _${coord} ---"
+    grep -on "_${coord}\.[a-zA-Z_]*" $SERVER | sort -u
+done
+
+echo ""
+echo "=== TRACKER/MANAGER CALLS ==="
+for tracker in job_leadership_tracker job_manager job_timeout_tracker job_router circuit_breaker_manager dispatch_time_tracker; do
+    echo "--- _${tracker} ---"
+    grep -on "_${tracker}\.[a-zA-Z_]*" $SERVER | sort -u
+done
+```
+
+Then for each method found, verify it exists in the target class.
+
+---
 
 ## Notes
 
 - This workflow is gate-specific
-- Manager and worker nodes have different architectures without this coordinator pattern
-- Reference `examples/old/gate_impl.py` for canonical behavior when in doubt
+- Manager and worker nodes have different architectures
+- Reference `examples/old/gate_impl.py` for canonical behavior
+- When in doubt, the coordinator should own the business logic
