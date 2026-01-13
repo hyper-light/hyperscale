@@ -749,12 +749,13 @@ class TestConcurrency:
 class TestEdgeCases:
     """Tests for edge cases and boundary conditions."""
 
-    def test_many_active_peers(self):
+    @pytest.mark.asyncio
+    async def test_many_active_peers(self):
         """Handle many active peers."""
         state = GateRuntimeState()
 
         for i in range(1000):
-            state.add_active_peer((f"10.0.{i // 256}.{i % 256}", 9000))
+            await state.add_active_peer((f"10.0.{i // 256}.{i % 256}", 9000))
 
         assert state.get_active_peer_count() == 1000
 
@@ -776,12 +777,13 @@ class TestEdgeCases:
 
         assert len(state._dead_job_leaders) == 1000
 
-    def test_large_fence_token(self):
+    @pytest.mark.asyncio
+    async def test_large_fence_token(self):
         """Handle large fence token values."""
         state = GateRuntimeState()
         state._fence_token = 2**62
 
-        token = state.next_fence_token()
+        token = await state.next_fence_token()
         assert token == 2**62 + 1
 
     def test_special_characters_in_job_ids(self):
