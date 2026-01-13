@@ -523,57 +523,63 @@ class TestWorkerStateJobLeadershipTransfer:
 class TestWorkerStateTransferMetrics:
     """Test transfer metrics methods (Section 8.6)."""
 
-    def test_increment_transfer_received(self):
+    @pytest.mark.asyncio
+    async def test_increment_transfer_received(self):
         """Test incrementing transfer received counter."""
         allocator = MockCoreAllocator()
         state = WorkerState(allocator)
 
         assert state._transfer_metrics_received == 0
 
-        state.increment_transfer_received()
+        await state.increment_transfer_received()
         assert state._transfer_metrics_received == 1
 
-    def test_increment_transfer_accepted(self):
+    @pytest.mark.asyncio
+    async def test_increment_transfer_accepted(self):
         """Test incrementing transfer accepted counter."""
         allocator = MockCoreAllocator()
         state = WorkerState(allocator)
 
-        state.increment_transfer_accepted()
+        await state.increment_transfer_accepted()
         assert state._transfer_metrics_accepted == 1
 
-    def test_increment_transfer_rejected_stale_token(self):
+    @pytest.mark.asyncio
+    async def test_increment_transfer_rejected_stale_token(self):
         """Test incrementing stale token rejection counter."""
         allocator = MockCoreAllocator()
         state = WorkerState(allocator)
 
-        state.increment_transfer_rejected_stale_token()
+        await state.increment_transfer_rejected_stale_token()
         assert state._transfer_metrics_rejected_stale_token == 1
 
-    def test_increment_transfer_rejected_unknown_manager(self):
+    @pytest.mark.asyncio
+    async def test_increment_transfer_rejected_unknown_manager(self):
         """Test incrementing unknown manager rejection counter."""
         allocator = MockCoreAllocator()
         state = WorkerState(allocator)
 
-        state.increment_transfer_rejected_unknown_manager()
+        await state.increment_transfer_rejected_unknown_manager()
         assert state._transfer_metrics_rejected_unknown_manager == 1
 
-    def test_increment_transfer_rejected_other(self):
+    @pytest.mark.asyncio
+    async def test_increment_transfer_rejected_other(self):
         """Test incrementing other rejection counter."""
         allocator = MockCoreAllocator()
         state = WorkerState(allocator)
 
-        state.increment_transfer_rejected_other()
+        await state.increment_transfer_rejected_other()
         assert state._transfer_metrics_rejected_other == 1
 
-    def test_get_transfer_metrics(self):
+    @pytest.mark.asyncio
+    async def test_get_transfer_metrics(self):
         """Test getting transfer metrics summary."""
         allocator = MockCoreAllocator()
         state = WorkerState(allocator)
 
-        state.increment_transfer_received()
-        state.increment_transfer_received()
-        state.increment_transfer_accepted()
-        state.increment_transfer_rejected_stale_token()
+        await state.increment_transfer_received()
+        await state.increment_transfer_received()
+        await state.increment_transfer_accepted()
+        await state.increment_transfer_rejected_stale_token()
 
         metrics = state.get_transfer_metrics()
 
