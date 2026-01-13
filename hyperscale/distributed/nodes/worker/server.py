@@ -154,20 +154,22 @@ class WorkerServer(HealthAwareServer):
         )
 
         # AD-28: Enhanced DNS Discovery
-        static_seeds = [f"{host}:{port}" for host, port in self._seed_managers]
+        static_seeds: list[str] = [
+            f"{host}:{port}" for host, port in self._seed_managers
+        ]
         discovery_config = env.get_discovery_config(
             node_role="worker",
             static_seeds=static_seeds,
         )
-        self._discovery_service = DiscoveryService(discovery_config)
+        self._discovery_service: DiscoveryService = DiscoveryService(discovery_config)
 
-        self._discovery_manager = WorkerDiscoveryManager(
+        self._discovery_manager: WorkerDiscoveryManager = WorkerDiscoveryManager(
             discovery_service=self._discovery_service,
             logger=None,
         )
 
         # New modular components
-        self._lifecycle_manager = WorkerLifecycleManager(
+        self._lifecycle_manager: WorkerLifecycleManager = WorkerLifecycleManager(
             host=host,
             tcp_port=tcp_port,
             udp_port=udp_port,
