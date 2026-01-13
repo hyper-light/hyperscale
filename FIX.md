@@ -136,13 +136,13 @@ discovered during systematic tracing of SCENARIOS.md test scenarios through the 
 #### D1: Rate Limiter Cleanup Race Condition (CRITICAL)
 **Location**: `reliability/rate_limiting.py:634-655`
 **Issue**: `cleanup_inactive_clients()` not thread-safe, can race with request handling.
-**Status**: TODO
+**Status**: FIXED - Uses `async with self._async_lock` (line 652) for thread-safety
 
 #### D2: Rate Limiter Memory Leak (HIGH)
 **Location**: `reliability/rate_limiting.py:419, 641-653`
 **Issue**: `max_tracked_clients` config exists but not enforced.
 **Impact**: Ephemeral clients accumulate unbounded.
-**Status**: TODO
+**Status**: FIXED - Cap enforced with LRU eviction via `_evict_oldest_client()` (lines 585-586)
 
 #### D3: Backpressure Propagation Race (HIGH)
 **Location**: `gate/server.py:2401-2427`
