@@ -140,7 +140,33 @@ class ManagerDispatchCoordinator:
                         )
                         # Update throughput counter
                         self._state._dispatch_throughput_count += 1
+                    else:
+                        # Worker rejected dispatch - record failure
+                        self._task_runner.run(
+                            self._logger.log,
+                            ServerWarning(
+                                message=f"Worker {worker_id[:8]}... rejected dispatch for workflow {workflow_id[:8]}...: {ack.rejection_reason}",
+                                node_host=self._config.host,
+                                node_port=self._config.tcp_port,
+                                node_id=self._node_id,
+                            ),
+                        )
+                        self._state._dispatch_failure_count += 1
                     return ack
+
+                # Response was None or Exception - worker unreachable or timeout
+                self._task_runner.run(
+                    self._logger.log,
+                    ServerWarning(
+                        message=f"Dispatch to worker {worker_id[:8]}... got no response for workflow {workflow_id[:8]}...",
+                        node_host=self._config.host,
+                        node_port=self._config.tcp_port,
+                        node_id=self._node_id,
+                    ),
+                )
+                self._state._dispatch_failure_count += 1
+                if circuit := self._state._worker_circuits.get(worker_id):
+                    circuit.record_error()
 
             except Exception as e:
                 self._task_runner.run(
@@ -152,6 +178,7 @@ class ManagerDispatchCoordinator:
                         node_id=self._node_id,
                     ),
                 )
+                self._state._dispatch_failure_count += 1
                 # Record failure in circuit breaker
                 if circuit := self._state._worker_circuits.get(worker_id):
                     circuit.record_error()
