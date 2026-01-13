@@ -2485,6 +2485,7 @@ class WorkerStatus(Message):
     reserved_cores: int = 0
     is_remote: bool = False
     owner_manager_id: str = ""
+    overload_state: str = "healthy"  # AD-17: healthy|busy|stressed|overloaded
 
     @property
     def node_id(self) -> str:
