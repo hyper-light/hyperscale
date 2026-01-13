@@ -178,10 +178,10 @@ class TestManagerRateLimitingCoordinatorHappyPath:
         assert isinstance(result, RateLimitResult)
         assert result.allowed is True
 
-    def test_get_metrics(self, rate_limiting_coordinator):
+    @pytest.mark.asyncio
+    async def test_get_metrics(self, rate_limiting_coordinator):
         """get_metrics returns server and cooperative metrics."""
-        # Make some requests
-        rate_limiting_coordinator.check_rate_limit(
+        await rate_limiting_coordinator.check_rate_limit(
             client_id="client-1",
             operation="job_submit",
         )
@@ -192,14 +192,14 @@ class TestManagerRateLimitingCoordinatorHappyPath:
         assert "cooperative" in metrics
         assert metrics["server"]["total_requests"] >= 1
 
-    def test_get_client_stats(self, rate_limiting_coordinator):
+    @pytest.mark.asyncio
+    async def test_get_client_stats(self, rate_limiting_coordinator):
         """get_client_stats returns operation stats for client."""
-        # Make requests to create client state
-        rate_limiting_coordinator.check_rate_limit(
+        await rate_limiting_coordinator.check_rate_limit(
             client_id="client-stats",
             operation="job_submit",
         )
-        rate_limiting_coordinator.check_rate_limit(
+        await rate_limiting_coordinator.check_rate_limit(
             client_id="client-stats",
             operation="heartbeat",
         )
@@ -209,22 +209,20 @@ class TestManagerRateLimitingCoordinatorHappyPath:
         assert "job_submit" in stats
         assert "heartbeat" in stats
 
-    def test_reset_client(self, rate_limiting_coordinator):
+    @pytest.mark.asyncio
+    async def test_reset_client(self, rate_limiting_coordinator):
         """reset_client clears client rate limit state."""
         client_id = "client-to-reset"
 
-        # Make requests
         for idx in range(10):
-            rate_limiting_coordinator.check_rate_limit(
+            await rate_limiting_coordinator.check_rate_limit(
                 client_id=client_id,
                 operation="job_submit",
             )
 
-        # Reset
         rate_limiting_coordinator.reset_client(client_id)
 
-        # Client should have fresh state
-        result = rate_limiting_coordinator.check_rate_limit(
+        result = await rate_limiting_coordinator.check_rate_limit(
             client_id=client_id,
             operation="job_submit",
         )
