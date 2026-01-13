@@ -137,7 +137,7 @@ from hyperscale.logging.hyperscale_logging_models import (
     ServerDebug,
 )
 
-from .config import ManagerConfig, create_manager_config_from_env
+from .config import create_manager_config_from_env
 from .state import ManagerState
 from .registry import ManagerRegistry
 from .dispatch import ManagerDispatchCoordinator
