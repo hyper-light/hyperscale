@@ -223,11 +223,6 @@ class WorkerState:
         return self._active_workflows.get(workflow_id)
 
     def remove_active_workflow(self, workflow_id: str) -> WorkflowProgress | None:
-        """
-        Remove a workflow from active tracking.
-
-        Returns the removed progress or None if not found.
-        """
         progress = self._active_workflows.pop(workflow_id, None)
         self._workflow_job_leader.pop(workflow_id, None)
         self._workflow_cores_completed.pop(workflow_id, None)
@@ -235,6 +230,8 @@ class WorkerState:
         self._workflow_tokens.pop(workflow_id, None)
         self._workflow_id_to_name.pop(workflow_id, None)
         self._orphaned_workflows.pop(workflow_id, None)
+        self._workflow_start_times.pop(workflow_id, None)
+        self._workflow_timeout_seconds.pop(workflow_id, None)
         return progress
 
     def get_workflow_job_leader(self, workflow_id: str) -> tuple[str, int] | None:
