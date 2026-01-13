@@ -2234,14 +2234,16 @@ class GateServer(HealthAwareServer):
         return self._load_shedder.should_shed_handler(request_type)
 
     def _has_quorum_available(self) -> bool:
-        """Check if quorum is available."""
+        if self._leadership_coordinator:
+            return self._leadership_coordinator.has_quorum(self._gate_state.value)
         if self._gate_state != GateState.ACTIVE:
             return False
         active_count = self._modular_state.get_active_peer_count() + 1
         return active_count >= self._quorum_size()
 
     def _quorum_size(self) -> int:
-        """Calculate quorum size."""
+        if self._leadership_coordinator:
+            return self._leadership_coordinator.get_quorum_size()
         total_gates = self._modular_state.get_active_peer_count() + 1
         return (total_gates // 2) + 1
 
