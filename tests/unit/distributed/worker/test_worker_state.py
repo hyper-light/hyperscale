@@ -205,28 +205,30 @@ class TestWorkerStateManagerTracking:
         assert ("192.168.1.1", 8000) in addrs
         assert ("192.168.1.2", 8001) in addrs
 
-    def test_get_or_create_manager_lock(self):
+    @pytest.mark.asyncio
+    async def test_get_or_create_manager_lock(self):
         """Test getting or creating a manager lock."""
         allocator = MockCoreAllocator()
         state = WorkerState(allocator)
 
-        lock1 = state.get_or_create_manager_lock("mgr-1")
-        lock2 = state.get_or_create_manager_lock("mgr-1")
+        lock1 = await state.get_or_create_manager_lock("mgr-1")
+        lock2 = await state.get_or_create_manager_lock("mgr-1")
 
         assert lock1 is lock2
         assert isinstance(lock1, asyncio.Lock)
 
-    def test_increment_manager_epoch(self):
+    @pytest.mark.asyncio
+    async def test_increment_manager_epoch(self):
         """Test incrementing manager epoch."""
         allocator = MockCoreAllocator()
         state = WorkerState(allocator)
 
-        assert state.get_manager_epoch("mgr-1") == 0
+        assert await state.get_manager_epoch("mgr-1") == 0
 
-        epoch1 = state.increment_manager_epoch("mgr-1")
+        epoch1 = await state.increment_manager_epoch("mgr-1")
         assert epoch1 == 1
 
-        epoch2 = state.increment_manager_epoch("mgr-1")
+        epoch2 = await state.increment_manager_epoch("mgr-1")
         assert epoch2 == 2
 
 
