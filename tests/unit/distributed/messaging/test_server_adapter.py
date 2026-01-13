@@ -727,23 +727,20 @@ class TestServerAdapterConcurrency:
 
 
 class TestServerAdapterContextManagement:
-    """Tests for ServerAdapter context management."""
-
-    def test_context_with_value(
+    @pytest.mark.asyncio
+    async def test_context_with_value(
         self, mock_health_aware_server: MockHealthAwareServer
     ) -> None:
-        """Adapter delegates context_with_value to server."""
         adapter = ServerAdapter(mock_health_aware_server)
 
-        ctx = adapter.context_with_value(("192.168.1.1", 8000))
+        ctx = await adapter.context_with_value(("192.168.1.1", 8000))
 
         assert ctx is not None
 
-    def test_write_context(
+    @pytest.mark.asyncio
+    async def test_write_context(
         self, mock_health_aware_server: MockHealthAwareServer
     ) -> None:
-        """Adapter delegates write_context to server."""
         adapter = ServerAdapter(mock_health_aware_server)
 
-        # Should not raise
-        adapter.write_context("key", "value")
+        await adapter.write_context("key", "value")
