@@ -27,6 +27,14 @@ from hyperscale.distributed.models import (
     DatacenterHealth,
     DatacenterStatus,
 )
+from hyperscale.distributed.datacenters.datacenter_overload_config import (
+    DatacenterOverloadConfig,
+    DatacenterOverloadState,
+)
+from hyperscale.distributed.datacenters.datacenter_overload_classifier import (
+    DatacenterOverloadClassifier,
+    DatacenterOverloadSignals,
+)
 
 
 @dataclass(slots=True)
@@ -65,6 +73,7 @@ class DatacenterHealthManager:
         self,
         heartbeat_timeout: float = 30.0,
         get_configured_managers: Callable[[str], list[tuple[str, int]]] | None = None,
+        overload_config: DatacenterOverloadConfig | None = None,
     ):
         """
         Initialize DatacenterHealthManager.
@@ -73,16 +82,15 @@ class DatacenterHealthManager:
             heartbeat_timeout: Seconds before a heartbeat is considered stale.
             get_configured_managers: Optional callback to get configured managers
                                       for a DC (to know total expected managers).
+            overload_config: Configuration for overload-based health classification.
         """
         self._heartbeat_timeout = heartbeat_timeout
         self._get_configured_managers = get_configured_managers
+        self._overload_classifier = DatacenterOverloadClassifier(overload_config)
 
-        # Per-datacenter, per-manager heartbeat tracking
-        # dc_id -> {manager_addr -> ManagerInfo}
         self._dc_manager_info: dict[str, dict[tuple[str, int], ManagerInfo]] = {}
-
-        # Known datacenter IDs (from configuration or discovery)
         self._known_datacenters: set[str] = set()
+        self._previous_health_states: dict[str, str] = {}
 
     # =========================================================================
     # Manager Heartbeat Updates
@@ -157,7 +165,9 @@ class DatacenterHealthManager:
             DatacenterStatus with health classification.
         """
         # Get best manager heartbeat for this DC
-        best_heartbeat, alive_count, total_count = self._get_best_manager_heartbeat(dc_id)
+        best_heartbeat, alive_count, total_count = self._get_best_manager_heartbeat(
+            dc_id
+        )
 
         # Get configured manager count if available
         if self._get_configured_managers:
@@ -228,12 +238,18 @@ class DatacenterHealthManager:
 
     def get_all_datacenter_health(self) -> dict[str, DatacenterStatus]:
         """Get health classification for all known datacenters."""
-        return {dc_id: self.get_datacenter_health(dc_id) for dc_id in self._known_datacenters}
+        return {
+            dc_id: self.get_datacenter_health(dc_id)
+            for dc_id in self._known_datacenters
+        }
 
     def is_datacenter_healthy(self, dc_id: str) -> bool:
         """Check if a datacenter is healthy or busy (can accept jobs)."""
         status = self.get_datacenter_health(dc_id)
-        return status.health in (DatacenterHealth.HEALTHY.value, DatacenterHealth.BUSY.value)
+        return status.health in (
+            DatacenterHealth.HEALTHY.value,
+            DatacenterHealth.BUSY.value,
+        )
 
     def get_healthy_datacenters(self) -> list[str]:
         """Get list of healthy datacenter IDs."""
