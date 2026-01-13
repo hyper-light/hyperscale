@@ -77,7 +77,7 @@ class ManagerRegistry:
                 node_host=self._config.host,
                 node_port=self._config.tcp_port,
                 node_id=self._node_id,
-            )
+            ),
         )
 
     def unregister_worker(self, worker_id: str) -> None:
@@ -143,6 +143,30 @@ class ManagerRegistry:
             Health state string, defaults to "healthy" if unknown
         """
         return self._state._worker_health_states.get(worker_id, "healthy")
+
+    def get_worker_health_state_counts(self) -> dict[str, int]:
+        """
+        Count workers by overload-based health state.
+
+        Only counts workers that are NOT connectivity-unhealthy.
+
+        Returns:
+            Dict with counts: {"healthy": N, "busy": N, "stressed": N, "overloaded": N}
+        """
+        counts = {"healthy": 0, "busy": 0, "stressed": 0, "overloaded": 0}
+        unhealthy_ids = set(self._state._worker_unhealthy_since.keys())
+
+        for worker_id in self._state._workers:
+            if worker_id in unhealthy_ids:
+                continue
+
+            health_state = self._state._worker_health_states.get(worker_id, "healthy")
+            if health_state in counts:
+                counts[health_state] += 1
+            else:
+                counts["healthy"] += 1
+
+        return counts
 
     def get_workers_by_health_bucket(
         self,
@@ -221,7 +245,7 @@ class ManagerRegistry:
                 node_host=self._config.host,
                 node_port=self._config.tcp_port,
                 node_id=self._node_id,
-            )
+            ),
         )
 
     def unregister_gate(self, gate_id: str) -> None:
@@ -242,7 +266,8 @@ class ManagerRegistry:
     def get_healthy_gates(self) -> list[GateInfo]:
         """Get all healthy gates."""
         return [
-            gate for gate_id, gate in self._state._known_gates.items()
+            gate
+            for gate_id, gate in self._state._known_gates.items()
             if gate_id in self._state._healthy_gate_ids
         ]
 
@@ -274,7 +299,7 @@ class ManagerRegistry:
                 node_host=self._config.host,
                 node_port=self._config.tcp_port,
                 node_id=self._node_id,
-            )
+            ),
         )
 
     def unregister_manager_peer(self, peer_id: str) -> None:
@@ -298,7 +323,8 @@ class ManagerRegistry:
     def get_active_manager_peers(self) -> list[ManagerInfo]:
         """Get all active manager peers."""
         return [
-            peer for peer_id, peer in self._state._known_manager_peers.items()
+            peer
+            for peer_id, peer in self._state._known_manager_peers.items()
             if peer_id in self._state._active_manager_peer_ids
         ]
 
