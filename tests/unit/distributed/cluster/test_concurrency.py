@@ -498,7 +498,7 @@ class TestServerRateLimiterConcurrency:
 
         async def trigger_cleanup():
             for _ in range(10):
-                limiter.cleanup_inactive_clients()
+                await limiter.cleanup_inactive_clients()
                 await asyncio.sleep(0.05)
 
         # Run concurrent access and cleanup
