@@ -5,6 +5,7 @@ Manages per-manager circuit breakers to isolate failures and prevent
 cascading failures when a manager becomes unhealthy.
 """
 
+import asyncio
 from dataclasses import dataclass
 
 from hyperscale.distributed.swim.core import (
@@ -17,6 +18,7 @@ from hyperscale.distributed.env import Env
 @dataclass(slots=True)
 class CircuitBreakerConfig:
     """Configuration for circuit breakers."""
+
     max_errors: int = 5
     window_seconds: float = 60.0
     half_open_after: float = 30.0
@@ -30,7 +32,7 @@ class CircuitBreakerManager:
     manager don't affect dispatch to other managers.
     """
 
-    __slots__ = ('_circuits', '_config')
+    __slots__ = ("_circuits", "_config")
 
     def __init__(self, env: Env):
         """
@@ -41,9 +43,9 @@ class CircuitBreakerManager:
         """
         cb_config = env.get_circuit_breaker_config()
         self._config = CircuitBreakerConfig(
-            max_errors=cb_config['max_errors'],
-            window_seconds=cb_config['window_seconds'],
-            half_open_after=cb_config['half_open_after'],
+            max_errors=cb_config["max_errors"],
+            window_seconds=cb_config["window_seconds"],
+            half_open_after=cb_config["half_open_after"],
         )
         self._circuits: dict[tuple[str, int], ErrorStats] = {}
 
@@ -113,7 +115,8 @@ class CircuitBreakerManager:
                 for addr in self._circuits.keys()
             },
             "open_circuits": [
-                f"{addr[0]}:{addr[1]}" for addr in self._circuits.keys()
+                f"{addr[0]}:{addr[1]}"
+                for addr in self._circuits.keys()
                 if self.is_circuit_open(addr)
             ],
         }
