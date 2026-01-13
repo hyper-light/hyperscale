@@ -61,6 +61,7 @@ class GateDispatchCoordinator:
         job_manager: "GateJobManager",
         job_router: "GateJobRouter | None",
         job_timeout_tracker: "GateJobTimeoutTracker",
+        dispatch_time_tracker: "DispatchTimeTracker",
         circuit_breaker_manager: "CircuitBreakerManager",
         datacenter_managers: dict[str, list[tuple[str, int]]],
         check_rate_limit: Callable,
@@ -86,6 +87,7 @@ class GateDispatchCoordinator:
         self._job_manager = job_manager
         self._job_router = job_router
         self._job_timeout_tracker = job_timeout_tracker
+        self._dispatch_time_tracker = dispatch_time_tracker
         self._circuit_breaker_manager = circuit_breaker_manager
         self._datacenter_managers = datacenter_managers
         self._check_rate_limit = check_rate_limit
