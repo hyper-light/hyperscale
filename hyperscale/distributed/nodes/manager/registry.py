@@ -150,14 +150,9 @@ class ManagerRegistry:
         return self._state._worker_health_states.get(worker_id, "healthy")
 
     def get_worker_health_state_counts(self) -> dict[str, int]:
-        """
-        Count workers by overload-based health state.
+        if self._worker_pool:
+            return self._worker_pool.get_worker_health_state_counts()
 
-        Only counts workers that are NOT connectivity-unhealthy.
-
-        Returns:
-            Dict with counts: {"healthy": N, "busy": N, "stressed": N, "overloaded": N}
-        """
         counts = {"healthy": 0, "busy": 0, "stressed": 0, "overloaded": 0}
         unhealthy_ids = set(self._state._worker_unhealthy_since.keys())
 
