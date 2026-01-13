@@ -193,6 +193,7 @@ from .crdt import (
     LWWRegister as LWWRegister,
     LWWMap as LWWMap,
     JobStatsCRDT as JobStatsCRDT,
+    ThreadSafeJobStatsCRDT as ThreadSafeJobStatsCRDT,
 )
 
 # Internal job tracking models

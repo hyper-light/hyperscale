@@ -86,6 +86,7 @@ class ManagerState:
         self._worker_unhealthy_since: dict[str, float] = {}
         self._worker_deadlines: dict[str, float] = {}
         self._worker_job_last_progress: dict[tuple[str, str], float] = {}
+        self._worker_health_states: dict[str, str] = {}
         self._dispatch_semaphores: dict[str, asyncio.Semaphore] = {}
 
         # Versioned state clock
