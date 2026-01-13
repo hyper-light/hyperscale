@@ -1161,7 +1161,7 @@ class ManagerServer(HealthAwareServer):
             )
 
     async def _check_quorum_status(self) -> None:
-        has_quorum = self._leadership_coordinator.has_quorum()
+        has_quorum = self._leadership.has_quorum()
 
         if has_quorum:
             self._manager_state._consecutive_quorum_failures = 0
