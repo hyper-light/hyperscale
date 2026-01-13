@@ -229,7 +229,11 @@ class DatacenterHealthManager:
         heartbeat: ManagerHeartbeat,
         alive_managers: int,
         total_managers: int,
+        dc_id: str,
     ) -> DatacenterOverloadSignals:
+        manager_health_counts = self._aggregate_manager_health_states(dc_id)
+        leader_health_state = getattr(heartbeat, "health_overload_state", "healthy")
+
         return DatacenterOverloadSignals(
             total_workers=heartbeat.worker_count,
             healthy_workers=getattr(
@@ -242,7 +246,34 @@ class DatacenterHealthManager:
             alive_managers=alive_managers,
             total_cores=heartbeat.total_cores,
             available_cores=heartbeat.available_cores,
+            overloaded_managers=manager_health_counts.get("overloaded", 0),
+            stressed_managers=manager_health_counts.get("stressed", 0),
+            busy_managers=manager_health_counts.get("busy", 0),
+            leader_health_state=leader_health_state,
         )
+
+    def _aggregate_manager_health_states(self, dc_id: str) -> dict[str, int]:
+        dc_managers = self._dc_manager_info.get(dc_id, {})
+        now = time.monotonic()
+        counts: dict[str, int] = {
+            "healthy": 0,
+            "busy": 0,
+            "stressed": 0,
+            "overloaded": 0,
+        }
+
+        for manager_addr, info in dc_managers.items():
+            is_fresh = (now - info.last_seen) < self._heartbeat_timeout
+            if not is_fresh or not info.is_alive:
+                continue
+
+            health_state = getattr(info.heartbeat, "health_overload_state", "healthy")
+            if health_state in counts:
+                counts[health_state] += 1
+            else:
+                counts["healthy"] += 1
+
+        return counts
 
     def _map_overload_state_to_health(
         self,
