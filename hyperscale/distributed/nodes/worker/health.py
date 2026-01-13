@@ -6,7 +6,7 @@ integration for worker health reporting.
 """
 
 import time
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 if TYPE_CHECKING:
     from hyperscale.logging import Logger
@@ -45,15 +45,11 @@ class WorkerHealthIntegration:
         self._on_manager_failure: Callable[[str], None] | None = None
         self._on_manager_recovery: Callable[[str], None] | None = None
 
-    def set_failure_callback(
-        self, callback: Callable[[str], None]
-    ) -> None:
+    def set_failure_callback(self, callback: Callable[[str], None]) -> None:
         """Set callback for manager failure events."""
         self._on_manager_failure = callback
 
-    def set_recovery_callback(
-        self, callback: Callable[[str], None]
-    ) -> None:
+    def set_recovery_callback(self, callback: Callable[[str], None]) -> None:
         """Set callback for manager recovery events."""
         self._on_manager_recovery = callback
 
@@ -85,7 +81,7 @@ class WorkerHealthIntegration:
             if self._on_manager_recovery:
                 self._on_manager_recovery(manager_id)
 
-    def get_health_embedding(self) -> dict:
+    def get_health_embedding(self) -> dict[str, Any]:
         """
         Get health data for SWIM state embedding.
 
