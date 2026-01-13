@@ -14,15 +14,33 @@ class DatacenterCapacityAggregator:
     Aggregates manager heartbeats into datacenter-wide capacity metrics.
     """
 
-    def __init__(self, staleness_threshold_seconds: float = 30.0) -> None:
+    def __init__(
+        self,
+        staleness_threshold_seconds: float = 30.0,
+        max_managers: int = 10000,
+    ) -> None:
         self._staleness_threshold_seconds = staleness_threshold_seconds
+        self._max_managers = max_managers
         self._manager_heartbeats: dict[str, tuple[ManagerHeartbeat, float]] = {}
 
     def record_heartbeat(self, heartbeat: ManagerHeartbeat) -> None:
-        """
-        Record a manager heartbeat for aggregation.
-        """
+        if (
+            heartbeat.node_id not in self._manager_heartbeats
+            and len(self._manager_heartbeats) >= self._max_managers
+        ):
+            self._evict_oldest()
+
         self._manager_heartbeats[heartbeat.node_id] = (heartbeat, time.monotonic())
+
+    def _evict_oldest(self) -> None:
+        if not self._manager_heartbeats:
+            return
+
+        oldest_manager_id = min(
+            self._manager_heartbeats.keys(),
+            key=lambda manager_id: self._manager_heartbeats[manager_id][1],
+        )
+        self._manager_heartbeats.pop(oldest_manager_id, None)
 
     def get_capacity(
         self, datacenter_id: str, health_bucket: str = "healthy"
