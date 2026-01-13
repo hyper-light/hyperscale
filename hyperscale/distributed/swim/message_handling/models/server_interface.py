@@ -50,9 +50,7 @@ class ServerInterface(Protocol):
 
     # === Peer Confirmation (AD-29) ===
 
-    def confirm_peer(self, peer: tuple[str, int]) -> bool:
-        """Mark a peer as confirmed after successful communication."""
-        ...
+    async def confirm_peer(self, peer: tuple[str, int]) -> bool: ...
 
     def is_peer_confirmed(self, peer: tuple[str, int]) -> bool:
         """Check if a peer has been confirmed."""
