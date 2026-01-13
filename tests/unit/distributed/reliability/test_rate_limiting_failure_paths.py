@@ -378,7 +378,7 @@ class TestServerRateLimiterFailurePaths:
         limiter = ServerRateLimiter(config=config)
 
         for _ in range(10):
-            limiter.check_rate_limit("async-client", "test")
+            await limiter.check_rate_limit("async-client", "test")
 
         result = await limiter.check_rate_limit_async(
             "async-client", "test", max_wait=0.2
@@ -393,7 +393,7 @@ class TestServerRateLimiterFailurePaths:
         limiter = ServerRateLimiter(config=config)
 
         for _ in range(10):
-            limiter.check_rate_limit("timeout-client", "test")
+            await limiter.check_rate_limit("timeout-client", "test")
 
         result = await limiter.check_rate_limit_async(
             "timeout-client", "test", max_wait=0.01

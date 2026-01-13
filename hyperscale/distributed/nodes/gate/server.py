@@ -2443,43 +2443,29 @@ class GateServer(HealthAwareServer):
         dc_id: str,
         signal: BackpressureSignal,
     ) -> None:
-        """Handle backpressure signal from manager."""
-        async with self._backpressure_lock:
-            self._manager_backpressure[manager_addr] = signal.level
-            self._backpressure_delay_ms = max(
-                self._backpressure_delay_ms,
-                signal.suggested_delay_ms,
-            )
-            self._update_dc_backpressure_locked(dc_id)
-
-    def _update_dc_backpressure_locked(self, dc_id: str) -> None:
-        """Update DC backpressure level. Must be called with _backpressure_lock held."""
-        manager_addrs = self._datacenter_managers.get(dc_id, [])
-        if not manager_addrs:
-            return
-
-        max_level = BackpressureLevel.NONE
-        for manager_addr in manager_addrs:
-            level = self._manager_backpressure.get(manager_addr, BackpressureLevel.NONE)
-            if level > max_level:
-                max_level = level
-
-        self._dc_backpressure[dc_id] = max_level
+        await self._modular_state.update_backpressure(
+            manager_addr,
+            dc_id,
+            signal.level,
+            signal.suggested_delay_ms,
+            self._datacenter_managers,
+        )
 
     async def _update_dc_backpressure(self, dc_id: str) -> None:
-        async with self._backpressure_lock:
-            self._update_dc_backpressure_locked(dc_id)
+        async with self._modular_state._get_backpressure_lock():
+            self._modular_state._update_dc_backpressure_locked(
+                dc_id, self._datacenter_managers
+            )
 
     async def _clear_manager_backpressure(self, manager_addr: tuple[str, int]) -> None:
-        async with self._backpressure_lock:
-            self._manager_backpressure.pop(manager_addr, None)
+        await self._modular_state.remove_manager_backpressure(manager_addr)
 
     async def _set_manager_backpressure_none(
         self, manager_addr: tuple[str, int], dc_id: str
     ) -> None:
-        async with self._backpressure_lock:
-            self._manager_backpressure[manager_addr] = BackpressureLevel.NONE
-            self._update_dc_backpressure_locked(dc_id)
+        await self._modular_state.clear_manager_backpressure(
+            manager_addr, dc_id, self._datacenter_managers
+        )
 
     async def _broadcast_manager_discovery(
         self,
