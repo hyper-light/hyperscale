@@ -360,10 +360,6 @@ class GateServer(HealthAwareServer):
 
         # Backpressure tracking (AD-37) - state managed by _modular_state
 
-        # Throughput tracking
-        self._forward_throughput_count: int = 0
-        self._forward_throughput_interval_start: float = time.monotonic()
-        self._forward_throughput_last_value: float = 0.0
         self._forward_throughput_interval_seconds: float = getattr(
             env, "GATE_THROUGHPUT_INTERVAL_SECONDS", 10.0
         )
@@ -2086,25 +2082,15 @@ class GateServer(HealthAwareServer):
         return 0
 
     def _get_forward_throughput(self) -> float:
-        """Get current forward throughput."""
-        now = time.monotonic()
-        elapsed = now - self._forward_throughput_interval_start
-        if elapsed >= self._forward_throughput_interval_seconds:
-            throughput = (
-                self._forward_throughput_count / elapsed if elapsed > 0 else 0.0
-            )
-            self._forward_throughput_last_value = throughput
-            self._forward_throughput_count = 0
-            self._forward_throughput_interval_start = now
-        return self._forward_throughput_last_value
+        return self._modular_state.calculate_throughput(
+            time.monotonic(), self._forward_throughput_interval_seconds
+        )
 
     def _get_expected_forward_throughput(self) -> float:
-        """Get expected forward throughput."""
         return 100.0
 
     def _record_forward_throughput_event(self) -> None:
-        """Record a forward throughput event."""
-        self._forward_throughput_count += 1
+        self._task_runner.run(self._modular_state.record_forward)
 
     def _classify_datacenter_health(self, dc_id: str) -> DatacenterStatus:
         return self._dc_health_manager.get_datacenter_health(dc_id)
