@@ -550,13 +550,17 @@ class WorkflowDispatcher:
 
         Returns True if dispatch succeeded.
         """
-        # Mark dispatch in progress (atomic check-and-set would be better but
-        # this runs under dispatch_lock so we're safe)
+        if pending.job_id in self._cancelling_jobs:
+            return False
+
         if pending.dispatch_in_progress:
-            return False  # Another dispatch is already in progress
+            return False
         pending.dispatch_in_progress = True
 
         try:
+            if pending.job_id in self._cancelling_jobs:
+                return False
+
             is_retry = pending.dispatch_attempts > 0
 
             if is_retry:
@@ -1021,6 +1025,7 @@ class WorkflowDispatcher:
         Returns:
             List of workflow IDs that were cancelled from the pending queue
         """
+        self._cancelling_jobs.add(job_id)
         cancelled_workflow_ids: list[str] = []
 
         async with self._pending_lock:
