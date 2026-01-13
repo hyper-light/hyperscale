@@ -2078,11 +2078,16 @@ class ManagerServer(HealthAwareServer):
         return sum(w.total_cores for w in self._manager_state._workers.values())
 
     def _get_job_worker_count(self, job_id: str) -> int:
-        """Get number of workers for a job."""
+        """Get number of unique workers assigned to a job's sub-workflows."""
         job = self._job_manager.get_job(job_id)
-        if job:
-            return len(job.workers)
-        return 0
+        if not job:
+            return 0
+        worker_ids = {
+            sub_wf.token.worker_id
+            for sub_wf in job.sub_workflows.values()
+            if sub_wf.token.worker_id
+        }
+        return len(worker_ids)
 
     def _has_quorum_available(self) -> bool:
         """Check if quorum is available."""
