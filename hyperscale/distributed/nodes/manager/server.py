@@ -868,13 +868,11 @@ class ManagerServer(HealthAwareServer):
 
     def _on_node_dead(self, node_addr: tuple[str, int]) -> None:
         """Handle node death detected by SWIM."""
-        # Check if worker
         worker_id = self._manager_state._worker_addr_to_id.get(node_addr)
         if worker_id:
-            if worker_id not in self._manager_state._worker_unhealthy_since:
-                self._manager_state._worker_unhealthy_since[worker_id] = (
-                    time.monotonic()
-                )
+            self._manager_state._worker_unhealthy_since.setdefault(
+                worker_id, time.monotonic()
+            )
             self._task_runner.run(self._handle_worker_failure, worker_id)
             return
 
@@ -4366,14 +4364,15 @@ class ManagerServer(HealthAwareServer):
 
                     for sub_token_str in wf_info.sub_workflow_tokens:
                         sub_info = job.sub_workflows.get(sub_token_str)
-                        if sub_info:
-                            if sub_info.worker_id:
-                                assigned_workers.append(sub_info.worker_id)
-                            provisioned_cores += sub_info.cores_allocated
-                            if sub_info.progress:
-                                completed_count += sub_info.progress.completed_count
-                                failed_count += sub_info.progress.failed_count
-                                rate_per_second += sub_info.progress.rate_per_second
+                        if not sub_info:
+                            continue
+                        if sub_info.worker_id:
+                            assigned_workers.append(sub_info.worker_id)
+                        provisioned_cores += sub_info.cores_allocated
+                        if progress := sub_info.progress:
+                            completed_count += progress.completed_count
+                            failed_count += progress.failed_count
+                            rate_per_second += progress.rate_per_second
 
                     workflows.append(
                         WorkflowStatusInfo(
