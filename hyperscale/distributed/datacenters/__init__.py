@@ -11,8 +11,11 @@ This module provides datacenter-level abstractions:
 
 from hyperscale.distributed.datacenters.datacenter_health_manager import (
     DatacenterHealthManager as DatacenterHealthManager,
-    ManagerInfo as ManagerInfo,
+    CachedManagerInfo as CachedManagerInfo,
 )
+
+# Backwards compatibility alias
+ManagerInfo = CachedManagerInfo
 from hyperscale.distributed.datacenters.manager_dispatcher import (
     ManagerDispatcher as ManagerDispatcher,
     DispatchResult as DispatchResult,

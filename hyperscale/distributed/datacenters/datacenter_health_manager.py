@@ -38,7 +38,7 @@ from hyperscale.distributed.datacenters.datacenter_overload_classifier import (
 
 
 @dataclass(slots=True)
-class CachedManagerInfo:
+class CachedCachedManagerInfo:
     """Cached information about a manager for health tracking."""
 
     heartbeat: ManagerHeartbeat
@@ -88,7 +88,7 @@ class DatacenterHealthManager:
         self._get_configured_managers = get_configured_managers
         self._overload_classifier = DatacenterOverloadClassifier(overload_config)
 
-        self._dc_manager_info: dict[str, dict[tuple[str, int], ManagerInfo]] = {}
+        self._dc_manager_info: dict[str, dict[tuple[str, int], CachedManagerInfo]] = {}
         self._known_datacenters: set[str] = set()
         self._previous_health_states: dict[str, str] = {}
         self._pending_transitions: list[tuple[str, str, str]] = []
@@ -116,7 +116,7 @@ class DatacenterHealthManager:
         if dc_id not in self._dc_manager_info:
             self._dc_manager_info[dc_id] = {}
 
-        self._dc_manager_info[dc_id][manager_addr] = ManagerInfo(
+        self._dc_manager_info[dc_id][manager_addr] = CachedManagerInfo(
             heartbeat=heartbeat,
             last_seen=time.monotonic(),
             is_alive=True,
@@ -141,7 +141,7 @@ class DatacenterHealthManager:
 
     def get_manager_info(
         self, dc_id: str, manager_addr: tuple[str, int]
-    ) -> ManagerInfo | None:
+    ) -> CachedManagerInfo | None:
         """Get cached manager info."""
         return self._dc_manager_info.get(dc_id, {}).get(manager_addr)
 
