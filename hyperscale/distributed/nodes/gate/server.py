@@ -2102,15 +2102,27 @@ class GateServer(HealthAwareServer):
         return (primary, fallback, worst_health)
 
     def _build_datacenter_candidates(self) -> list[DatacenterCandidate]:
-        """Build datacenter candidates for job router."""
         candidates = []
         for dc_id in self._datacenter_managers.keys():
             status = self._classify_datacenter_health(dc_id)
             candidates.append(
                 DatacenterCandidate(
                     datacenter_id=dc_id,
-                    health=status.health,
-                    available_capacity=status.available_capacity,
+                    health_bucket=status.health.upper(),
+                    available_cores=status.available_capacity,
+                    total_cores=status.available_capacity + status.queue_depth,
+                    queue_depth=status.queue_depth,
+                    lhm_multiplier=1.0,
+                    circuit_breaker_pressure=0.0,
+                    total_managers=status.manager_count,
+                    healthy_managers=status.manager_count,
+                    health_severity_weight=getattr(
+                        status, "health_severity_weight", 1.0
+                    ),
+                    worker_overload_ratio=getattr(status, "worker_overload_ratio", 0.0),
+                    overloaded_worker_count=getattr(
+                        status, "overloaded_worker_count", 0
+                    ),
                 )
             )
         return candidates
