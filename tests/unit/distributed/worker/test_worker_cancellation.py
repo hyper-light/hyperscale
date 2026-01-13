@@ -212,7 +212,7 @@ class TestWorkerCancellationHandlerCancelWorkflow:
         handler.create_cancel_event("wf-1")
 
         task_runner_cancel = AsyncMock(side_effect=RuntimeError("Cancel failed"))
-        increment_version = MagicMock()
+        increment_version = AsyncMock()
 
         success, errors = await handler.cancel_workflow(
             workflow_id="wf-1",
@@ -221,21 +221,19 @@ class TestWorkerCancellationHandlerCancelWorkflow:
             increment_version=increment_version,
         )
 
-        # Should still succeed overall, with error recorded
         assert success is True
         assert len(errors) == 1
         assert "TaskRunner cancel failed" in errors[0]
 
     @pytest.mark.asyncio
     async def test_cancel_workflow_updates_status(self) -> None:
-        """Test that cancellation updates workflow status."""
         state = MockWorkerState()
         state.add_workflow("wf-1", token="token-123")
         handler = WorkerCancellationHandler(state)
         handler.create_cancel_event("wf-1")
 
         task_runner_cancel = AsyncMock()
-        increment_version = MagicMock()
+        increment_version = AsyncMock()
 
         await handler.cancel_workflow(
             workflow_id="wf-1",
@@ -248,14 +246,13 @@ class TestWorkerCancellationHandlerCancelWorkflow:
 
     @pytest.mark.asyncio
     async def test_cancel_workflow_signals_event(self) -> None:
-        """Test that cancellation signals the cancel event."""
         state = MockWorkerState()
         state.add_workflow("wf-1", token="token-123")
         handler = WorkerCancellationHandler(state)
         event = handler.create_cancel_event("wf-1")
 
         task_runner_cancel = AsyncMock()
-        increment_version = MagicMock()
+        increment_version = AsyncMock()
 
         await handler.cancel_workflow(
             workflow_id="wf-1",
@@ -307,7 +304,9 @@ class TestWorkerCancellationHandlerWithRemoteManager:
 
         # Set up mock remote manager that times out
         remote_manager = MagicMock()
-        remote_manager.await_workflow_cancellation = AsyncMock(return_value=(False, ["timeout"]))
+        remote_manager.await_workflow_cancellation = AsyncMock(
+            return_value=(False, ["timeout"])
+        )
         handler.set_remote_manager(remote_manager)
 
         task_runner_cancel = AsyncMock()
@@ -513,9 +512,7 @@ class TestWorkerCancellationHandlerConcurrency:
         async def create_event(workflow_id: str):
             return handler.create_cancel_event(workflow_id)
 
-        events = await asyncio.gather(*[
-            create_event(f"wf-{i}") for i in range(10)
-        ])
+        events = await asyncio.gather(*[create_event(f"wf-{i}") for i in range(10)])
 
         assert len(events) == 10
         assert len(state._workflow_cancel_events) == 10
@@ -533,9 +530,7 @@ class TestWorkerCancellationHandlerConcurrency:
             await asyncio.sleep(0.001)
             return handler.signal_cancellation(workflow_id)
 
-        results = await asyncio.gather(*[
-            signal_cancel(f"wf-{i}") for i in range(10)
-        ])
+        results = await asyncio.gather(*[signal_cancel(f"wf-{i}") for i in range(10)])
 
         assert all(results)
         # All events should be set
@@ -586,9 +581,7 @@ class TestWorkerCancellationHandlerConcurrency:
                 increment_version=increment_version,
             )
 
-        results = await asyncio.gather(*[
-            cancel_one(f"wf-{i}") for i in range(5)
-        ])
+        results = await asyncio.gather(*[cancel_one(f"wf-{i}") for i in range(5)])
 
         assert all(success for success, _ in results)
         assert task_runner_cancel.await_count == 5
