@@ -2690,7 +2690,6 @@ class ManagerServer(HealthAwareServer):
                     context_updates_bytes=result.context_updates,
                 )
 
-            # Record sub-workflow result and check if parent workflow is complete
             (
                 result_recorded,
                 parent_complete,
@@ -2699,7 +2698,6 @@ class ManagerServer(HealthAwareServer):
                 result=result,
             )
 
-            # If all sub-workflows are complete, mark parent workflow as completed/failed
             if result_recorded and parent_complete:
                 sub_token = TrackingToken.parse(result.workflow_id)
                 parent_workflow_token = sub_token.workflow_token
