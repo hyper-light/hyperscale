@@ -3187,6 +3187,8 @@ class GateServer(HealthAwareServer):
 
                 await self._check_quorum_status()
 
+                self._log_health_transitions()
+
             except asyncio.CancelledError:
                 break
             except Exception as error:
