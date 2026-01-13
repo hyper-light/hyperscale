@@ -554,12 +554,12 @@ class ManagerServer(HealthAwareServer):
             on_worker_heartbeat=self._handle_embedded_worker_heartbeat,
             on_manager_heartbeat=self._handle_manager_peer_heartbeat,
             on_gate_heartbeat=self._handle_gate_heartbeat,
-            get_manager_state=lambda: self._manager_state._manager_state.value,
+            get_manager_state=lambda: self._manager_state.manager_state_enum.value,
             get_tcp_host=lambda: self._host,
             get_tcp_port=lambda: self._tcp_port,
             get_udp_host=lambda: self._host,
             get_udp_port=lambda: self._udp_port,
-            get_health_accepting_jobs=lambda: self._manager_state._manager_state
+            get_health_accepting_jobs=lambda: self._manager_state.manager_state_enum
             == ManagerStateEnum.ACTIVE,
             get_health_has_quorum=self._has_quorum_available,
             get_health_throughput=self._get_dispatch_throughput,
@@ -654,7 +654,7 @@ class ManagerServer(HealthAwareServer):
 
         # Mark as started
         self._started = True
-        self._manager_state._manager_state = ManagerStateEnum.ACTIVE
+        self._manager_state.set_manager_state_enum(ManagerStateEnum.ACTIVE)
 
         # Register with seed managers
         await self._register_with_peer_managers()
@@ -692,7 +692,7 @@ class ManagerServer(HealthAwareServer):
             return
 
         self._running = False
-        self._manager_state._manager_state = ManagerStateEnum.DRAINING
+        self._manager_state.set_manager_state_enum(ManagerStateEnum.DRAINING)
 
         # Cancel background tasks
         await self._cancel_background_tasks()
@@ -709,7 +709,7 @@ class ManagerServer(HealthAwareServer):
     def abort(self) -> None:
         """Abort the manager server immediately."""
         self._running = False
-        self._manager_state._manager_state = ManagerStateEnum.OFFLINE
+        self._manager_state.set_manager_state_enum(ManagerStateEnum.OFFLINE)
 
         # Cancel all background tasks synchronously
         for task in self._get_background_tasks():
@@ -3716,11 +3716,11 @@ class ManagerServer(HealthAwareServer):
             )
 
             # Only active managers accept jobs
-            if self._manager_state._manager_state != ManagerStateEnum.ACTIVE:
+            if self._manager_state.manager_state_enum != ManagerStateEnum.ACTIVE:
                 return JobAck(
                     job_id=submission.job_id,
                     accepted=False,
-                    error=f"Manager is {self._manager_state._manager_state.value}, not accepting jobs",
+                    error=f"Manager is {self._manager_state.manager_state_enum.value}, not accepting jobs",
                 ).dump()
 
             # Create job using JobManager
