@@ -26,9 +26,13 @@ from unittest.mock import MagicMock, AsyncMock
 from hyperscale.distributed.nodes.manager.state import ManagerState
 from hyperscale.distributed.nodes.manager.config import ManagerConfig
 from hyperscale.distributed.nodes.manager.registry import ManagerRegistry
-from hyperscale.distributed.nodes.manager.cancellation import ManagerCancellationCoordinator
+from hyperscale.distributed.nodes.manager.cancellation import (
+    ManagerCancellationCoordinator,
+)
 from hyperscale.distributed.nodes.manager.leases import ManagerLeaseCoordinator
-from hyperscale.distributed.nodes.manager.workflow_lifecycle import ManagerWorkflowLifecycle
+from hyperscale.distributed.nodes.manager.workflow_lifecycle import (
+    ManagerWorkflowLifecycle,
+)
 from hyperscale.distributed.nodes.manager.dispatch import ManagerDispatchCoordinator
 from hyperscale.distributed.nodes.manager.health import (
     ManagerHealthMonitor,
@@ -108,7 +112,14 @@ def mock_worker_registration():
 class TestManagerRegistryHappyPath:
     """Happy path tests for ManagerRegistry."""
 
-    def test_register_worker(self, manager_state, manager_config, mock_logger, mock_task_runner, mock_worker_registration):
+    def test_register_worker(
+        self,
+        manager_state,
+        manager_config,
+        mock_logger,
+        mock_task_runner,
+        mock_worker_registration,
+    ):
         """Can register a worker."""
         registry = ManagerRegistry(
             state=manager_state,
@@ -124,7 +135,14 @@ class TestManagerRegistryHappyPath:
         assert ("10.0.0.100", 6000) in manager_state._worker_addr_to_id
         assert "worker-test-123" in manager_state._worker_circuits
 
-    def test_unregister_worker(self, manager_state, manager_config, mock_logger, mock_task_runner, mock_worker_registration):
+    def test_unregister_worker(
+        self,
+        manager_state,
+        manager_config,
+        mock_logger,
+        mock_task_runner,
+        mock_worker_registration,
+    ):
         """Can unregister a worker."""
         registry = ManagerRegistry(
             state=manager_state,
@@ -140,7 +158,14 @@ class TestManagerRegistryHappyPath:
         assert "worker-test-123" not in manager_state._workers
         assert ("10.0.0.100", 6000) not in manager_state._worker_addr_to_id
 
-    def test_get_worker(self, manager_state, manager_config, mock_logger, mock_task_runner, mock_worker_registration):
+    def test_get_worker(
+        self,
+        manager_state,
+        manager_config,
+        mock_logger,
+        mock_task_runner,
+        mock_worker_registration,
+    ):
         """Can get worker by ID."""
         registry = ManagerRegistry(
             state=manager_state,
@@ -158,7 +183,14 @@ class TestManagerRegistryHappyPath:
         result_none = registry.get_worker("nonexistent")
         assert result_none is None
 
-    def test_get_worker_by_addr(self, manager_state, manager_config, mock_logger, mock_task_runner, mock_worker_registration):
+    def test_get_worker_by_addr(
+        self,
+        manager_state,
+        manager_config,
+        mock_logger,
+        mock_task_runner,
+        mock_worker_registration,
+    ):
         """Can get worker by address."""
         registry = ManagerRegistry(
             state=manager_state,
@@ -173,7 +205,14 @@ class TestManagerRegistryHappyPath:
         result = registry.get_worker_by_addr(("10.0.0.100", 6000))
         assert result is mock_worker_registration
 
-    def test_get_healthy_worker_ids(self, manager_state, manager_config, mock_logger, mock_task_runner, mock_worker_registration):
+    def test_get_healthy_worker_ids(
+        self,
+        manager_state,
+        manager_config,
+        mock_logger,
+        mock_task_runner,
+        mock_worker_registration,
+    ):
         """Can get healthy worker IDs."""
         registry = ManagerRegistry(
             state=manager_state,
@@ -198,7 +237,9 @@ class TestManagerRegistryHappyPath:
 class TestManagerRegistryGateManagement:
     """Tests for gate management in ManagerRegistry."""
 
-    def test_register_gate(self, manager_state, manager_config, mock_logger, mock_task_runner):
+    def test_register_gate(
+        self, manager_state, manager_config, mock_logger, mock_task_runner
+    ):
         """Can register a gate."""
         registry = ManagerRegistry(
             state=manager_state,
@@ -216,7 +257,9 @@ class TestManagerRegistryGateManagement:
         assert "gate-123" in manager_state._known_gates
         assert "gate-123" in manager_state._healthy_gate_ids
 
-    def test_unregister_gate(self, manager_state, manager_config, mock_logger, mock_task_runner):
+    def test_unregister_gate(
+        self, manager_state, manager_config, mock_logger, mock_task_runner
+    ):
         """Can unregister a gate."""
         registry = ManagerRegistry(
             state=manager_state,
@@ -235,7 +278,9 @@ class TestManagerRegistryGateManagement:
         assert "gate-123" not in manager_state._known_gates
         assert "gate-123" not in manager_state._healthy_gate_ids
 
-    def test_mark_gate_unhealthy(self, manager_state, manager_config, mock_logger, mock_task_runner):
+    def test_mark_gate_unhealthy(
+        self, manager_state, manager_config, mock_logger, mock_task_runner
+    ):
         """Can mark gate as unhealthy."""
         registry = ManagerRegistry(
             state=manager_state,
@@ -254,7 +299,9 @@ class TestManagerRegistryGateManagement:
         assert "gate-123" not in manager_state._healthy_gate_ids
         assert "gate-123" in manager_state._gate_unhealthy_since
 
-    def test_mark_gate_healthy(self, manager_state, manager_config, mock_logger, mock_task_runner):
+    def test_mark_gate_healthy(
+        self, manager_state, manager_config, mock_logger, mock_task_runner
+    ):
         """Can mark gate as healthy."""
         registry = ManagerRegistry(
             state=manager_state,
@@ -278,7 +325,9 @@ class TestManagerRegistryGateManagement:
 class TestManagerRegistryHealthBuckets:
     """Tests for AD-17 health bucket selection."""
 
-    def test_get_workers_by_health_bucket(self, manager_state, manager_config, mock_logger, mock_task_runner):
+    def test_get_workers_by_health_bucket(
+        self, manager_state, manager_config, mock_logger, mock_task_runner
+    ):
         """Workers are bucketed by health state."""
         registry = ManagerRegistry(
             state=manager_state,
@@ -323,7 +372,9 @@ class TestManagerRegistryHealthBuckets:
 class TestManagerLeaseCoordinatorHappyPath:
     """Happy path tests for ManagerLeaseCoordinator."""
 
-    def test_claim_job_leadership(self, manager_state, manager_config, mock_logger, mock_task_runner):
+    def test_claim_job_leadership(
+        self, manager_state, manager_config, mock_logger, mock_task_runner
+    ):
         """Can claim job leadership."""
         leases = ManagerLeaseCoordinator(
             state=manager_state,
@@ -340,7 +391,9 @@ class TestManagerLeaseCoordinatorHappyPath:
         assert leases.get_job_leader("job-123") == "manager-1"
         assert leases.get_job_leader_addr("job-123") == ("127.0.0.1", 8000)
 
-    def test_cannot_claim_if_other_leader(self, manager_state, manager_config, mock_logger, mock_task_runner):
+    def test_cannot_claim_if_other_leader(
+        self, manager_state, manager_config, mock_logger, mock_task_runner
+    ):
         """Cannot claim leadership if another manager is leader."""
         leases = ManagerLeaseCoordinator(
             state=manager_state,
@@ -358,7 +411,9 @@ class TestManagerLeaseCoordinatorHappyPath:
         assert result is False
         assert leases.get_job_leader("job-123") == "manager-2"
 
-    def test_release_job_leadership(self, manager_state, manager_config, mock_logger, mock_task_runner):
+    def test_release_job_leadership(
+        self, manager_state, manager_config, mock_logger, mock_task_runner
+    ):
         """Can release job leadership."""
         leases = ManagerLeaseCoordinator(
             state=manager_state,
@@ -374,7 +429,9 @@ class TestManagerLeaseCoordinatorHappyPath:
         assert leases.is_job_leader("job-123") is False
         assert leases.get_job_leader("job-123") is None
 
-    def test_transfer_job_leadership(self, manager_state, manager_config, mock_logger, mock_task_runner):
+    def test_transfer_job_leadership(
+        self, manager_state, manager_config, mock_logger, mock_task_runner
+    ):
         """Can transfer job leadership."""
         leases = ManagerLeaseCoordinator(
             state=manager_state,
@@ -400,7 +457,10 @@ class TestManagerLeaseCoordinatorHappyPath:
 class TestManagerLeaseCoordinatorFencing:
     """Tests for fencing token management."""
 
-    def test_fence_token_increments(self, manager_state, manager_config, mock_logger, mock_task_runner):
+    @pytest.mark.asyncio
+    async def test_fence_token_increments(
+        self, manager_state, manager_config, mock_logger, mock_task_runner
+    ):
         """Fence token increments correctly."""
         leases = ManagerLeaseCoordinator(
             state=manager_state,
@@ -415,13 +475,16 @@ class TestManagerLeaseCoordinatorFencing:
         token1 = leases.get_fence_token("job-123")
         assert token1 == 1
 
-        token2 = leases.increment_fence_token("job-123")
+        token2 = await leases.increment_fence_token("job-123")
         assert token2 == 2
 
-        token3 = leases.increment_fence_token("job-123")
+        token3 = await leases.increment_fence_token("job-123")
         assert token3 == 3
 
-    def test_validate_fence_token(self, manager_state, manager_config, mock_logger, mock_task_runner):
+    @pytest.mark.asyncio
+    async def test_validate_fence_token(
+        self, manager_state, manager_config, mock_logger, mock_task_runner
+    ):
         """Can validate fence tokens."""
         leases = ManagerLeaseCoordinator(
             state=manager_state,
@@ -432,13 +495,15 @@ class TestManagerLeaseCoordinatorFencing:
         )
 
         leases.claim_job_leadership("job-123", ("127.0.0.1", 8000))
-        leases.increment_fence_token("job-123")  # Now at 2
+        await leases.increment_fence_token("job-123")
 
         assert leases.validate_fence_token("job-123", 2) is True
         assert leases.validate_fence_token("job-123", 3) is True
         assert leases.validate_fence_token("job-123", 1) is False
 
-    def test_layer_version_increments(self, manager_state, manager_config, mock_logger, mock_task_runner):
+    def test_layer_version_increments(
+        self, manager_state, manager_config, mock_logger, mock_task_runner
+    ):
         """Layer version increments correctly."""
         leases = ManagerLeaseCoordinator(
             state=manager_state,
@@ -460,7 +525,9 @@ class TestManagerLeaseCoordinatorFencing:
 class TestManagerLeaseCoordinatorEdgeCases:
     """Edge case tests for ManagerLeaseCoordinator."""
 
-    def test_get_led_job_ids(self, manager_state, manager_config, mock_logger, mock_task_runner):
+    def test_get_led_job_ids(
+        self, manager_state, manager_config, mock_logger, mock_task_runner
+    ):
         """Can get list of jobs we lead."""
         leases = ManagerLeaseCoordinator(
             state=manager_state,
@@ -480,7 +547,9 @@ class TestManagerLeaseCoordinatorEdgeCases:
         assert "job-2" in led_jobs
         assert "job-3" not in led_jobs
 
-    def test_clear_job_leases(self, manager_state, manager_config, mock_logger, mock_task_runner):
+    def test_clear_job_leases(
+        self, manager_state, manager_config, mock_logger, mock_task_runner
+    ):
         """Can clear all lease state for a job."""
         leases = ManagerLeaseCoordinator(
             state=manager_state,
@@ -510,7 +579,9 @@ class TestManagerCancellationCoordinatorHappyPath:
     """Happy path tests for ManagerCancellationCoordinator."""
 
     @pytest.mark.asyncio
-    async def test_cancel_job_not_found(self, manager_state, manager_config, mock_logger, mock_task_runner):
+    async def test_cancel_job_not_found(
+        self, manager_state, manager_config, mock_logger, mock_task_runner
+    ):
         """Cancelling nonexistent job returns error."""
         coord = ManagerCancellationCoordinator(
             state=manager_state,
@@ -531,7 +602,9 @@ class TestManagerCancellationCoordinatorHappyPath:
         # Should return error response
         assert b"Job not found" in result or b"accepted" in result.lower()
 
-    def test_is_workflow_cancelled(self, manager_state, manager_config, mock_logger, mock_task_runner):
+    def test_is_workflow_cancelled(
+        self, manager_state, manager_config, mock_logger, mock_task_runner
+    ):
         """Can check if workflow is cancelled."""
         coord = ManagerCancellationCoordinator(
             state=manager_state,
@@ -552,7 +625,9 @@ class TestManagerCancellationCoordinatorHappyPath:
 
         assert coord.is_workflow_cancelled("wf-123") is True
 
-    def test_cleanup_old_cancellations(self, manager_state, manager_config, mock_logger, mock_task_runner):
+    def test_cleanup_old_cancellations(
+        self, manager_state, manager_config, mock_logger, mock_task_runner
+    ):
         """Can cleanup old cancellation records."""
         coord = ManagerCancellationCoordinator(
             state=manager_state,
@@ -589,7 +664,9 @@ class TestManagerCancellationCoordinatorHappyPath:
 class TestManagerHealthMonitorHappyPath:
     """Happy path tests for ManagerHealthMonitor."""
 
-    def test_handle_worker_failure(self, manager_state, manager_config, mock_logger, mock_task_runner):
+    def test_handle_worker_failure(
+        self, manager_state, manager_config, mock_logger, mock_task_runner
+    ):
         """Can handle worker failure."""
         registry = ManagerRegistry(
             state=manager_state,
@@ -612,7 +689,9 @@ class TestManagerHealthMonitorHappyPath:
 
         assert "worker-123" in manager_state._worker_unhealthy_since
 
-    def test_handle_worker_recovery(self, manager_state, manager_config, mock_logger, mock_task_runner):
+    def test_handle_worker_recovery(
+        self, manager_state, manager_config, mock_logger, mock_task_runner
+    ):
         """Can handle worker recovery."""
         registry = ManagerRegistry(
             state=manager_state,
@@ -636,7 +715,9 @@ class TestManagerHealthMonitorHappyPath:
 
         assert "worker-123" not in manager_state._worker_unhealthy_since
 
-    def test_get_worker_health_status(self, manager_state, manager_config, mock_logger, mock_task_runner):
+    def test_get_worker_health_status(
+        self, manager_state, manager_config, mock_logger, mock_task_runner
+    ):
         """Can get worker health status."""
         registry = ManagerRegistry(
             state=manager_state,
@@ -670,7 +751,9 @@ class TestManagerHealthMonitorHappyPath:
 class TestManagerHealthMonitorJobSuspicion:
     """Tests for AD-30 job suspicion tracking."""
 
-    def test_suspect_job(self, manager_state, manager_config, mock_logger, mock_task_runner):
+    def test_suspect_job(
+        self, manager_state, manager_config, mock_logger, mock_task_runner
+    ):
         """Can start job suspicion."""
         registry = ManagerRegistry(
             state=manager_state,
@@ -693,7 +776,9 @@ class TestManagerHealthMonitorJobSuspicion:
 
         assert ("job-123", "worker-456") in monitor._job_suspicions
 
-    def test_refute_job_suspicion(self, manager_state, manager_config, mock_logger, mock_task_runner):
+    def test_refute_job_suspicion(
+        self, manager_state, manager_config, mock_logger, mock_task_runner
+    ):
         """Can refute job suspicion."""
         registry = ManagerRegistry(
             state=manager_state,
@@ -717,7 +802,9 @@ class TestManagerHealthMonitorJobSuspicion:
 
         assert ("job-123", "worker-456") not in monitor._job_suspicions
 
-    def test_get_node_status(self, manager_state, manager_config, mock_logger, mock_task_runner):
+    def test_get_node_status(
+        self, manager_state, manager_config, mock_logger, mock_task_runner
+    ):
         """Can get comprehensive node status."""
         registry = ManagerRegistry(
             state=manager_state,
@@ -746,7 +833,9 @@ class TestManagerHealthMonitorJobSuspicion:
         # Clear and suspect for job
         del manager_state._worker_unhealthy_since["worker-123"]
         monitor.suspect_job("job-456", "worker-123")
-        assert monitor.get_node_status("worker-123", "job-456") == NodeStatus.SUSPECTED_JOB
+        assert (
+            monitor.get_node_status("worker-123", "job-456") == NodeStatus.SUSPECTED_JOB
+        )
 
 
 class TestJobSuspicionClass:
@@ -803,7 +892,9 @@ class TestExtensionTracker:
             max_extensions=5,
         )
 
-        granted, seconds = tracker.request_extension("long_workflow", current_progress=0.1)
+        granted, seconds = tracker.request_extension(
+            "long_workflow", current_progress=0.1
+        )
 
         assert granted is True
         assert seconds == 30.0  # Full base deadline on first extension
@@ -821,11 +912,15 @@ class TestExtensionTracker:
         tracker.request_extension("long_workflow", current_progress=0.1)
 
         # Second extension without progress should fail
-        granted, seconds = tracker.request_extension("long_workflow", current_progress=0.1)
+        granted, seconds = tracker.request_extension(
+            "long_workflow", current_progress=0.1
+        )
         assert granted is False
 
         # Second extension with progress should succeed
-        granted, seconds = tracker.request_extension("long_workflow", current_progress=0.2)
+        granted, seconds = tracker.request_extension(
+            "long_workflow", current_progress=0.2
+        )
         assert granted is True
 
     def test_extension_limit(self):
@@ -872,7 +967,9 @@ class TestExtensionTracker:
 class TestManagerStatsCoordinatorHappyPath:
     """Happy path tests for ManagerStatsCoordinator."""
 
-    def test_record_dispatch(self, manager_state, manager_config, mock_logger, mock_task_runner):
+    def test_record_dispatch(
+        self, manager_state, manager_config, mock_logger, mock_task_runner
+    ):
         """Can record dispatch for throughput tracking."""
         stats = ManagerStatsCoordinator(
             state=manager_state,
@@ -895,7 +992,9 @@ class TestManagerStatsCoordinatorHappyPath:
 class TestManagerStatsCoordinatorProgressState:
     """Tests for AD-19 progress state tracking."""
 
-    def test_get_progress_state_normal(self, manager_state, manager_config, mock_logger, mock_task_runner):
+    def test_get_progress_state_normal(
+        self, manager_state, manager_config, mock_logger, mock_task_runner
+    ):
         """Progress state is NORMAL when no workers."""
         stats = ManagerStatsCoordinator(
             state=manager_state,
@@ -913,7 +1012,9 @@ class TestManagerStatsCoordinatorProgressState:
 class TestManagerStatsCoordinatorBackpressure:
     """Tests for AD-23 backpressure."""
 
-    def test_backpressure_levels(self, manager_state, manager_config, mock_logger, mock_task_runner):
+    def test_backpressure_levels(
+        self, manager_state, manager_config, mock_logger, mock_task_runner
+    ):
         """Backpressure levels based on buffer fill."""
         stats = ManagerStatsCoordinator(
             state=manager_state,
@@ -938,7 +1039,9 @@ class TestManagerStatsCoordinatorBackpressure:
         stats._stats_buffer_count = 10000
         assert stats.get_backpressure_level() == BackpressureLevel.REJECT
 
-    def test_should_apply_backpressure(self, manager_state, manager_config, mock_logger, mock_task_runner):
+    def test_should_apply_backpressure(
+        self, manager_state, manager_config, mock_logger, mock_task_runner
+    ):
         """should_apply_backpressure checks high watermark."""
         stats = ManagerStatsCoordinator(
             state=manager_state,
@@ -957,7 +1060,9 @@ class TestManagerStatsCoordinatorBackpressure:
 class TestManagerStatsCoordinatorMetrics:
     """Tests for stats metrics."""
 
-    def test_get_stats_metrics(self, manager_state, manager_config, mock_logger, mock_task_runner):
+    def test_get_stats_metrics(
+        self, manager_state, manager_config, mock_logger, mock_task_runner
+    ):
         """Can get stats metrics."""
         stats = ManagerStatsCoordinator(
             state=manager_state,
@@ -990,7 +1095,9 @@ class TestCoreModulesConcurrency:
     """Concurrency tests for core modules."""
 
     @pytest.mark.asyncio
-    async def test_concurrent_job_leadership_claims(self, manager_state, manager_config, mock_logger, mock_task_runner):
+    async def test_concurrent_job_leadership_claims(
+        self, manager_state, manager_config, mock_logger, mock_task_runner
+    ):
         """Multiple managers cannot simultaneously claim same job."""
         leases1 = ManagerLeaseCoordinator(
             state=manager_state,
@@ -1017,7 +1124,9 @@ class TestCoreModulesConcurrency:
         assert result2 is False
 
     @pytest.mark.asyncio
-    async def test_concurrent_fence_token_increments(self, manager_state, manager_config, mock_logger, mock_task_runner):
+    async def test_concurrent_fence_token_increments(
+        self, manager_state, manager_config, mock_logger, mock_task_runner
+    ):
         """Fence token increments are sequential."""
         leases = ManagerLeaseCoordinator(
             state=manager_state,
