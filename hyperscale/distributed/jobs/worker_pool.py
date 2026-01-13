@@ -441,7 +441,7 @@ class WorkerPool:
         if not worker:
             return False
 
-        async with self._allocation_lock:
+        async with self._cores_condition:
             worker.heartbeat = heartbeat
             worker.last_seen = time.monotonic()
 
@@ -609,7 +609,7 @@ class WorkerPool:
         Called when a dispatch fails or workflow completes.
         Thread-safe: uses allocation lock.
         """
-        async with self._allocation_lock:
+        async with self._cores_condition:
             worker = self._workers.get(node_id)
             if not worker:
                 return False
@@ -633,7 +633,7 @@ class WorkerPool:
 
         Thread-safe: uses allocation lock.
         """
-        async with self._allocation_lock:
+        async with self._cores_condition:
             worker = self._workers.get(node_id)
             if not worker:
                 return False
