@@ -1805,7 +1805,7 @@ class ManagerServer(HealthAwareServer):
                         layer_version=job.layer_version,
                     )
 
-                    for peer_addr in self._manager_state._active_manager_peers:
+                    for peer_addr in self._manager_state.get_active_manager_peers():
                         try:
                             await self._send_to_peer(
                                 peer_addr,
@@ -1986,7 +1986,7 @@ class ManagerServer(HealthAwareServer):
 
     async def _sync_state_from_manager_peers(self) -> None:
         """Sync state from peer managers."""
-        for peer_addr in self._manager_state._active_manager_peers:
+        for peer_addr in self._manager_state.get_active_manager_peers():
             try:
                 request = StateSyncRequest(
                     requester_id=self._node_id.full,
@@ -2098,7 +2098,7 @@ class ManagerServer(HealthAwareServer):
 
     def _has_quorum_available(self) -> bool:
         """Check if quorum is available."""
-        active_count = len(self._manager_state._active_manager_peers) + 1
+        active_count = self._manager_state.get_active_peer_count()
         return active_count >= self._quorum_size
 
     def _get_dispatch_throughput(self) -> float:
@@ -4453,7 +4453,7 @@ class ManagerServer(HealthAwareServer):
             workflow_names=workflow_names,
         )
 
-        for peer_addr in self._manager_state._active_manager_peers:
+        for peer_addr in self._manager_state.get_active_manager_peers():
             try:
                 await self.send_tcp(
                     peer_addr,
