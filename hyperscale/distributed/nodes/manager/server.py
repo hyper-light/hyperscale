@@ -1122,7 +1122,7 @@ class ManagerServer(HealthAwareServer):
         tcp_addr: tuple[str, int],
     ) -> None:
         """Handle gate peer recovery."""
-        for gate_id, gate_info in self._manager_state._known_gates.items():
+        for gate_id, gate_info in self._manager_state.iter_known_gates():
             if (gate_info.tcp_host, gate_info.tcp_port) == tcp_addr:
                 self._registry.mark_gate_healthy(gate_id)
                 break
@@ -1251,7 +1251,7 @@ class ManagerServer(HealthAwareServer):
         gate_id = heartbeat.node_id
 
         # Register gate if not known
-        if gate_id not in self._manager_state._known_gates:
+        if not self._manager_state.get_known_gate(gate_id):
             gate_info = GateInfo(
                 node_id=gate_id,
                 tcp_host=heartbeat.tcp_host or source_addr[0],
@@ -1266,7 +1266,7 @@ class ManagerServer(HealthAwareServer):
         # Update gate leader tracking
         if heartbeat.is_leader:
             self._manager_state._current_gate_leader_id = gate_id
-            gate_info = self._manager_state._known_gates.get(gate_id)
+            gate_info = self._manager_state.get_known_gate(gate_id)
             if gate_info:
                 self._manager_state._current_gate_leader_addr = (
                     gate_info.tcp_host,
