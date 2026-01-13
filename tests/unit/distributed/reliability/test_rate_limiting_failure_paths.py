@@ -102,9 +102,9 @@ class TestSlidingWindowCounterEdgeCases:
         counter.try_acquire(10)
 
         # Try multiple concurrent acquires
-        results = await asyncio.gather(*[
-            counter.acquire_async(3, max_wait=0.2) for _ in range(5)
-        ])
+        results = await asyncio.gather(
+            *[counter.acquire_async(3, max_wait=0.2) for _ in range(5)]
+        )
 
         # Some should succeed after window rotation
         success_count = sum(1 for r in results if r)
@@ -153,7 +153,7 @@ class TestTokenBucketEdgeCases:
         acquired, wait_time = bucket.try_acquire(1)
 
         assert acquired is False
-        assert wait_time == float('inf')
+        assert wait_time == float("inf")
 
     def test_bucket_with_very_high_refill_rate(self) -> None:
         """Test bucket with very high refill rate."""
@@ -176,7 +176,8 @@ class TestTokenBucketEdgeCases:
 class TestAdaptiveRateLimiterEdgeCases:
     """Test edge cases in AdaptiveRateLimiter."""
 
-    def test_rapid_state_transitions(self) -> None:
+    @pytest.mark.asyncio
+    async def test_rapid_state_transitions(self) -> None:
         """Test behavior during rapid state transitions."""
         config = OverloadConfig(
             absolute_bounds=(10.0, 50.0, 100.0),
@@ -189,7 +190,7 @@ class TestAdaptiveRateLimiterEdgeCases:
         # Start healthy
         for _ in range(5):
             detector.record_latency(5.0)
-        result = limiter.check("client-1", "default", RequestPriority.LOW)
+        result = await limiter.check("client-1", "default", RequestPriority.LOW)
         assert result.allowed is True
 
         # Spike to overloaded
@@ -197,14 +198,15 @@ class TestAdaptiveRateLimiterEdgeCases:
             detector.record_latency(150.0)
 
         # Should shed low priority
-        result = limiter.check("client-1", "default", RequestPriority.LOW)
+        result = await limiter.check("client-1", "default", RequestPriority.LOW)
         # May or may not be shed depending on exact state
 
         # Critical should always pass
-        result = limiter.check("client-1", "default", RequestPriority.CRITICAL)
+        result = await limiter.check("client-1", "default", RequestPriority.CRITICAL)
         assert result.allowed is True
 
-    def test_many_clients_memory_pressure(self) -> None:
+    @pytest.mark.asyncio
+    async def test_many_clients_memory_pressure(self) -> None:
         """Test with many clients to check memory handling."""
         adaptive_config = AdaptiveRateLimitConfig(
             inactive_cleanup_seconds=0.1,
@@ -213,7 +215,7 @@ class TestAdaptiveRateLimiterEdgeCases:
 
         # Create many clients
         for i in range(1000):
-            limiter.check(f"client-{i}", "default", RequestPriority.NORMAL)
+            await limiter.check(f"client-{i}", "default", RequestPriority.NORMAL)
 
         metrics = limiter.get_metrics()
         # Note: adaptive limiter only creates counters when stressed
@@ -221,12 +223,13 @@ class TestAdaptiveRateLimiterEdgeCases:
         assert metrics["total_requests"] == 1000
 
         # Wait and cleanup
-        time.sleep(0.15)
-        cleaned = limiter.cleanup_inactive_clients()
+        await asyncio.sleep(0.15)
+        cleaned = await limiter.cleanup_inactive_clients()
         # Should clean up tracked clients
         assert cleaned >= 0
 
-    def test_priority_ordering(self) -> None:
+    @pytest.mark.asyncio
+    async def test_priority_ordering(self) -> None:
         """Test that priority ordering is correct."""
         config = OverloadConfig(absolute_bounds=(10.0, 20.0, 50.0))
         detector = HybridOverloadDetector(config=config)
@@ -237,18 +240,23 @@ class TestAdaptiveRateLimiterEdgeCases:
             detector.record_latency(100.0)
 
         # Verify priority ordering
-        assert limiter.check("c1", "default", RequestPriority.CRITICAL).allowed is True
-        assert limiter.check("c2", "default", RequestPriority.HIGH).allowed is False
-        assert limiter.check("c3", "default", RequestPriority.NORMAL).allowed is False
-        assert limiter.check("c4", "default", RequestPriority.LOW).allowed is False
+        result = await limiter.check("c1", "default", RequestPriority.CRITICAL)
+        assert result.allowed is True
+        result = await limiter.check("c2", "default", RequestPriority.HIGH)
+        assert result.allowed is False
+        result = await limiter.check("c3", "default", RequestPriority.NORMAL)
+        assert result.allowed is False
+        result = await limiter.check("c4", "default", RequestPriority.LOW)
+        assert result.allowed is False
 
-    def test_reset_metrics_clears_counters(self) -> None:
+    @pytest.mark.asyncio
+    async def test_reset_metrics_clears_counters(self) -> None:
         """Test that reset_metrics clears all counters."""
         limiter = AdaptiveRateLimiter()
 
         # Generate activity
         for i in range(100):
-            limiter.check(f"client-{i}", "default", RequestPriority.NORMAL)
+            await limiter.check(f"client-{i}", "default", RequestPriority.NORMAL)
 
         metrics_before = limiter.get_metrics()
         assert metrics_before["total_requests"] == 100
@@ -312,9 +320,7 @@ class TestServerRateLimiterFailurePaths:
 
     def test_rapid_requests_from_single_client(self) -> None:
         """Test rapid requests exhaust counter."""
-        config = RateLimitConfig(
-            operation_limits={"test": (10, 1.0)}
-        )
+        config = RateLimitConfig(operation_limits={"test": (10, 1.0)})
         limiter = ServerRateLimiter(config=config)
 
         allowed_count = 0
@@ -329,9 +335,7 @@ class TestServerRateLimiterFailurePaths:
 
     def test_reset_client_restores_capacity(self) -> None:
         """Test reset_client restores capacity."""
-        config = RateLimitConfig(
-            operation_limits={"test": (5, 1.0)}
-        )
+        config = RateLimitConfig(operation_limits={"test": (5, 1.0)})
         limiter = ServerRateLimiter(config=config)
 
         # Exhaust
@@ -365,9 +369,7 @@ class TestServerRateLimiterFailurePaths:
     @pytest.mark.asyncio
     async def test_async_rate_limit_with_wait(self) -> None:
         """Test async rate limit with waiting."""
-        config = RateLimitConfig(
-            operation_limits={"test": (10, 100.0)}
-        )
+        config = RateLimitConfig(operation_limits={"test": (10, 100.0)})
         limiter = ServerRateLimiter(config=config)
 
         for _ in range(10):
@@ -382,9 +384,7 @@ class TestServerRateLimiterFailurePaths:
     @pytest.mark.asyncio
     async def test_async_rate_limit_timeout(self) -> None:
         """Test async rate limit timing out."""
-        config = RateLimitConfig(
-            operation_limits={"test": (10, 1.0)}
-        )
+        config = RateLimitConfig(operation_limits={"test": (10, 1.0)})
         limiter = ServerRateLimiter(config=config)
 
         for _ in range(10):
@@ -438,9 +438,9 @@ class TestCooperativeRateLimiterFailurePaths:
         limiter.handle_rate_limit("concurrent_op", retry_after=0.1)
 
         start = time.monotonic()
-        wait_times = await asyncio.gather(*[
-            limiter.wait_if_needed("concurrent_op") for _ in range(5)
-        ])
+        wait_times = await asyncio.gather(
+            *[limiter.wait_if_needed("concurrent_op") for _ in range(5)]
+        )
         elapsed = time.monotonic() - start
 
         assert elapsed < 0.2
@@ -512,7 +512,10 @@ class TestRateLimitRetryFailurePaths:
         )
 
         assert result.success is False
-        assert "exceed" in result.final_error.lower() or "max" in result.final_error.lower()
+        assert (
+            "exceed" in result.final_error.lower()
+            or "max" in result.final_error.lower()
+        )
 
     @pytest.mark.asyncio
     async def test_operation_exception(self) -> None:
@@ -566,14 +569,14 @@ class TestRateLimitResponseDetection:
 
     def test_is_rate_limit_response_too_short(self) -> None:
         """Test rejection of too-short data."""
-        data = b'short'
+        data = b"short"
 
         result = is_rate_limit_response(data)
         assert result is False
 
     def test_is_rate_limit_response_empty(self) -> None:
         """Test rejection of empty data."""
-        data = b''
+        data = b""
 
         result = is_rate_limit_response(data)
         assert result is False

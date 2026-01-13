@@ -182,20 +182,6 @@ class GateHealthCoordinator:
             self._versioned_clock.update_entity, dc_key, heartbeat.version
         )
 
-    async def handle_manager_backpressure_signal(
-        self,
-        manager_addr: tuple[str, int],
-        datacenter_id: str,
-        signal: BackpressureSignal,
-    ) -> None:
-        await self._state.update_backpressure(
-            manager_addr,
-            datacenter_id,
-            signal.level,
-            signal.suggested_delay_ms,
-            self._datacenter_managers,
-        )
-
     def classify_datacenter_health(self, datacenter_id: str) -> DatacenterStatus:
         """
         Classify datacenter health based on TCP heartbeats and UDP probes.
