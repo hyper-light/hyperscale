@@ -492,7 +492,6 @@ class TestWorkerRegistryConcurrency:
 
     @pytest.mark.asyncio
     async def test_concurrent_manager_registration(self):
-        """Test concurrent manager registration."""
         logger = MagicMock()
         registry = WorkerRegistry(logger)
 
@@ -501,7 +500,7 @@ class TestWorkerRegistryConcurrency:
             mgr.tcp_host = f"192.168.1.{manager_id[-1]}"
             mgr.tcp_port = 8000
             registry.add_manager(manager_id, mgr)
-            registry.mark_manager_healthy(manager_id)
+            await registry.mark_manager_healthy(manager_id)
             await asyncio.sleep(0.001)
 
         await asyncio.gather(*[register_manager(f"mgr-{i}") for i in range(10)])
