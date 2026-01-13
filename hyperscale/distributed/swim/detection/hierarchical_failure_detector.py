@@ -856,7 +856,8 @@ class HierarchicalFailureDetector:
 
     def get_recent_events(self, limit: int = 10) -> list[FailureEvent]:
         """Get recent failure events for debugging."""
-        return self._recent_events[-limit:]
+        events = list(self._recent_events)
+        return events[-limit:]
 
     async def get_global_suspicion_state(
         self,
