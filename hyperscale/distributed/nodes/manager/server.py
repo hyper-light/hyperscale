@@ -4278,19 +4278,16 @@ class ManagerServer(HealthAwareServer):
             # Calculate elapsed time
             elapsed = time.monotonic() - job.timestamp if job.timestamp > 0 else 0.0
 
-            # Count completed/failed by aggregating from sub-workflows
-            # WorkflowInfo doesn't have completed_count/failed_count directly;
-            # those are on SubWorkflowInfo.progress (WorkflowProgress)
+            # Aggregate completed/failed from sub-workflows (WorkflowInfo has no counts;
+            # they live on SubWorkflowInfo.progress)
             total_completed = 0
             total_failed = 0
             for workflow_info in job.workflows.values():
                 for sub_workflow_token in workflow_info.sub_workflow_tokens:
-                    if sub_workflow_info := job.sub_workflows.get(sub_workflow_token):
-                        if sub_workflow_info.progress:
-                            total_completed += (
-                                sub_workflow_info.progress.completed_count
-                            )
-                            total_failed += sub_workflow_info.progress.failed_count
+                    sub_workflow_info = job.sub_workflows.get(sub_workflow_token)
+                    if sub_workflow_info and (progress := sub_workflow_info.progress):
+                        total_completed += progress.completed_count
+                        total_failed += progress.failed_count
 
             return RegisterCallbackResponse(
                 job_id=job_id,
