@@ -372,6 +372,10 @@ class ManagerServer(HealthAwareServer):
 
         # Load shedding (AD-22)
         self._overload_detector = HybridOverloadDetector()
+        self._resource_monitor = ProcessResourceMonitor()
+        self._last_resource_metrics: "ResourceMetrics | None" = None
+        self._manager_health_state: str = "healthy"
+        self._previous_manager_health_state: str = "healthy"
         self._load_shedder = ManagerLoadShedder(
             config=self._config,
             logger=self._udp_logger,
