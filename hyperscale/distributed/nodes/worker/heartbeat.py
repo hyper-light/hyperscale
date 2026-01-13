@@ -5,7 +5,7 @@ Handles manager heartbeats from SWIM and peer confirmation logic.
 Extracted from worker_impl.py for modularity.
 """
 
-from typing import TYPE_CHECKING
+from typing import Any, Callable, TYPE_CHECKING
 
 from hyperscale.distributed.models import ManagerHeartbeat, ManagerInfo
 from hyperscale.logging.hyperscale_logging_models import ServerDebug, ServerInfo
@@ -35,12 +35,12 @@ class WorkerHeartbeatHandler:
             registry: WorkerRegistry for manager tracking
             logger: Logger instance
         """
-        self._registry = registry
-        self._logger = logger
+        self._registry: "WorkerRegistry" = registry
+        self._logger: "Logger | None" = logger
 
         # Callbacks for registration and job leadership updates
-        self._on_new_manager_discovered: callable | None = None
-        self._on_job_leadership_update: callable | None = None
+        self._on_new_manager_discovered: "Callable[..., Any] | None" = None
+        self._on_job_leadership_update: "Callable[..., Any] | None" = None
 
     def set_callbacks(
         self,
