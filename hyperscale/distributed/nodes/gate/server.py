@@ -2371,17 +2371,16 @@ class GateServer(HealthAwareServer):
 
         self._circuit_breaker_manager.record_success(manager_addr)
 
-        if dc_id not in self._dc_registration_states:
-            self._dc_registration_states[dc_id] = DatacenterRegistrationState(
+        dc_state = self._dc_registration_states.setdefault(
+            dc_id,
+            DatacenterRegistrationState(
                 dc_id=dc_id,
                 configured_managers=[manager_addr],
-            )
-        else:
-            dc_state = self._dc_registration_states[dc_id]
-            if manager_addr not in dc_state.configured_managers:
-                dc_state.configured_managers.append(manager_addr)
+            ),
+        )
+        if manager_addr not in dc_state.configured_managers:
+            dc_state.configured_managers.append(manager_addr)
 
-        dc_state = self._dc_registration_states[dc_id]
         dc_state.record_heartbeat(manager_addr, node_id, generation, now)
 
     async def _handle_manager_backpressure_signal(
