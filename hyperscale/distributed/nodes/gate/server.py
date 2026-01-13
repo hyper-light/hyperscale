@@ -91,6 +91,7 @@ from hyperscale.distributed.models import (
     JobTimeoutReport,
     JobLeaderTransfer,
     JobFinalStatus,
+    WorkflowProgress,
 )
 from hyperscale.distributed.swim.core import (
     ErrorStats,
@@ -1743,8 +1744,6 @@ class GateServer(HealthAwareServer):
         """Handle windowed stats push from Manager."""
         try:
             push: WindowedStatsPush = cloudpickle.loads(data)
-
-            from hyperscale.distributed.models import WorkflowProgress
 
             for worker_stat in push.per_worker_stats:
                 progress = WorkflowProgress(
