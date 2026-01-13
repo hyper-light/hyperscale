@@ -293,14 +293,14 @@ class TestServerAdapterStateAccess:
 
         assert ("192.168.1.1", 8000) in nodes
 
-    def test_get_current_timeout(
+    @pytest.mark.asyncio
+    async def test_get_current_timeout(
         self, mock_health_aware_server: MockHealthAwareServer
     ) -> None:
-        """Adapter delegates get_current_timeout to context."""
         mock_health_aware_server._context.read.return_value = 1.5
         adapter = ServerAdapter(mock_health_aware_server)
 
-        timeout = adapter.get_current_timeout()
+        timeout = await adapter.get_current_timeout()
 
         assert timeout == 1.5
 
