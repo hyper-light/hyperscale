@@ -4,22 +4,14 @@ Role-based certificate validation for mTLS.
 Enforces the node communication matrix based on certificate claims.
 """
 
-from dataclasses import dataclass, field
-from enum import Enum
+from dataclasses import dataclass
 from typing import ClassVar
 
 from cryptography import x509
 from cryptography.hazmat.backends import default_backend
 from cryptography.x509.oid import NameOID, ExtensionOID
 
-
-class NodeRole(str, Enum):
-    """Node roles in the distributed system."""
-
-    CLIENT = "client"
-    GATE = "gate"
-    MANAGER = "manager"
-    WORKER = "worker"
+from hyperscale.distributed.models.distributed import NodeRole
 
 
 class RoleValidationError(Exception):
@@ -353,7 +345,9 @@ class RoleValidator:
             # Extract role from OU (Organizational Unit)
             role = NodeRole.CLIENT  # Default fallback
             try:
-                ou_attribute = cert.subject.get_attributes_for_oid(NameOID.ORGANIZATIONAL_UNIT_NAME)
+                ou_attribute = cert.subject.get_attributes_for_oid(
+                    NameOID.ORGANIZATIONAL_UNIT_NAME
+                )
                 if ou_attribute:
                     role_str = ou_attribute[0].value.lower()
                     # Map OU value to NodeRole
@@ -368,7 +362,9 @@ class RoleValidator:
             region_id = ""
 
             try:
-                san_extension = cert.extensions.get_extension_for_oid(ExtensionOID.SUBJECT_ALTERNATIVE_NAME)
+                san_extension = cert.extensions.get_extension_for_oid(
+                    ExtensionOID.SUBJECT_ALTERNATIVE_NAME
+                )
                 san_values = san_extension.value
 
                 # Parse DNS names in SAN

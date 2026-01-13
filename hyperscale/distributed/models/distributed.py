@@ -27,6 +27,7 @@ if TYPE_CHECKING:
 class NodeRole(str, Enum):
     """Role of a node in the distributed system."""
 
+    CLIENT = "client"
     GATE = "gate"
     MANAGER = "manager"
     WORKER = "worker"
