@@ -339,16 +339,13 @@ class TestServerAdapterPeerConfirmation:
 
 
 class TestServerAdapterNodeState:
-    """Tests for ServerAdapter node state methods."""
-
-    def test_update_node_state(
+    @pytest.mark.asyncio
+    async def test_update_node_state(
         self, mock_health_aware_server: MockHealthAwareServer
     ) -> None:
-        """Adapter delegates update_node_state to server."""
         adapter = ServerAdapter(mock_health_aware_server)
 
-        # Should not raise
-        adapter.update_node_state(("192.168.1.1", 8000), b"OK", 1, 12345.0)
+        await adapter.update_node_state(("192.168.1.1", 8000), b"OK", 1, 12345.0)
 
     def test_is_message_fresh(
         self, mock_health_aware_server: MockHealthAwareServer
