@@ -337,6 +337,9 @@ class TestManagerRegistryHealthBuckets:
             task_runner=mock_task_runner,
         )
 
+        # Track health states for mocking
+        health_states: dict[str, str] = {}
+
         # Create workers with different health states
         for worker_id, health_state in [
             ("worker-healthy-1", "healthy"),
@@ -355,9 +358,16 @@ class TestManagerRegistryHealthBuckets:
             reg.node = node
 
             registry.register_worker(reg)
-            registry.update_worker_health_state(worker_id, health_state)
+            health_states[worker_id] = health_state
+
+        # Mock get_worker_health_state to return our configured states
+        original_get_health = registry.get_worker_health_state
+        registry.get_worker_health_state = lambda wid: health_states.get(wid, "healthy")
 
         buckets = registry.get_workers_by_health_bucket(cores_required=1)
+
+        # Restore original method
+        registry.get_worker_health_state = original_get_health
 
         assert len(buckets["healthy"]) == 2
         assert len(buckets["busy"]) == 1
