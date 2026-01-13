@@ -49,7 +49,9 @@ class OverloadConfig:
 
     # Delta detection parameters
     ema_alpha: float = 0.1  # Smoothing factor for fast baseline (lower = more stable)
-    slow_ema_alpha: float = 0.02  # Smoothing factor for stable baseline (for drift detection)
+    slow_ema_alpha: float = (
+        0.02  # Smoothing factor for stable baseline (for drift detection)
+    )
     current_window: int = 10  # Samples for current average
     trend_window: int = 20  # Samples for trend calculation
 
@@ -88,6 +90,21 @@ class OverloadConfig:
     # Hysteresis: number of consecutive samples at a state before transitioning
     # Prevents flapping between states on single-sample variations
     hysteresis_samples: int = 2
+
+    def __post_init__(self) -> None:
+        self._validate_ascending("delta_thresholds", self.delta_thresholds)
+        self._validate_ascending("absolute_bounds", self.absolute_bounds)
+        self._validate_ascending("cpu_thresholds", self.cpu_thresholds)
+        self._validate_ascending("memory_thresholds", self.memory_thresholds)
+
+    def _validate_ascending(
+        self, name: str, values: tuple[float, float, float]
+    ) -> None:
+        if not (values[0] <= values[1] <= values[2]):
+            raise ValueError(
+                f"{name} must be in ascending order: "
+                f"got ({values[0]}, {values[1]}, {values[2]})"
+            )
 
 
 class HybridOverloadDetector:
@@ -166,7 +183,9 @@ class HybridOverloadDetector:
 
             # Slow baseline - stable reference for drift detection
             slow_alpha = self._config.slow_ema_alpha
-            self._slow_baseline_ema = slow_alpha * latency_ms + (1 - slow_alpha) * self._slow_baseline_ema
+            self._slow_baseline_ema = (
+                slow_alpha * latency_ms + (1 - slow_alpha) * self._slow_baseline_ema
+            )
 
         # Calculate and track delta (% above baseline)
         # Only track delta after we have enough samples for a meaningful average
@@ -270,7 +289,10 @@ class HybridOverloadDetector:
         # above the slow baseline, escalate the state. This catches gradual degradation
         # where delta stays moderate but the operating point keeps shifting upward.
         # Only escalate if we're already in an elevated state (not from HEALTHY).
-        if baseline_drift > self._config.drift_threshold and base_state != OverloadState.HEALTHY:
+        if (
+            baseline_drift > self._config.drift_threshold
+            and base_state != OverloadState.HEALTHY
+        ):
             if base_state == OverloadState.BUSY:
                 return OverloadState.STRESSED
             elif base_state == OverloadState.STRESSED:
