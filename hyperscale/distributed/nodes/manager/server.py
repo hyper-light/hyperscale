@@ -433,6 +433,9 @@ class ManagerServer(HealthAwareServer):
         # WorkflowLifecycleStateMachine (initialized in start())
         self._workflow_lifecycle_states: WorkflowLifecycleStateMachine | None = None
 
+        # WorkerDisseminator (AD-48, initialized in start())
+        self._worker_disseminator: "WorkerDisseminator | None" = None
+
         # Federated health monitor for gate probing
         fed_config = self._env.get_federated_health_config()
         self._gate_health_monitor = FederatedHealthMonitor(
