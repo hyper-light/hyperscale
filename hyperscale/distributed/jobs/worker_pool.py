@@ -549,40 +549,41 @@ class WorkerPool:
         self,
         cores_needed: int,
     ) -> list[tuple[str, int]]:
-        """
-        Select workers to satisfy core requirement.
-
-        Uses a greedy algorithm to pack workflows onto workers
-        while respecting available cores.
-
-        Must be called with allocation lock held.
-        """
         allocations: list[tuple[str, int]] = []
         remaining = cores_needed
 
-        # Get healthy workers sorted by available cores (descending)
-        healthy_workers = [
-            (node_id, worker)
-            for node_id, worker in self._workers.items()
-            if self.is_worker_healthy(node_id)
-        ]
-        healthy_workers.sort(
-            key=lambda x: x[1].available_cores - x[1].reserved_cores,
-            reverse=True,
-        )
+        bucket_priority = ["HEALTHY", "BUSY", "DEGRADED"]
 
-        for node_id, worker in healthy_workers:
+        workers_by_bucket: dict[str, list[tuple[str, WorkerStatus]]] = {
+            bucket: [] for bucket in bucket_priority
+        }
+
+        for node_id, worker in self._workers.items():
+            bucket = self.get_worker_health_bucket(node_id)
+            if bucket in workers_by_bucket:
+                workers_by_bucket[bucket].append((node_id, worker))
+
+        for bucket in bucket_priority:
             if remaining <= 0:
                 break
 
-            available = worker.available_cores - worker.reserved_cores
-            if available <= 0:
-                continue
+            bucket_workers = workers_by_bucket[bucket]
+            bucket_workers.sort(
+                key=lambda x: x[1].available_cores - x[1].reserved_cores,
+                reverse=True,
+            )
 
-            # Allocate as many cores as possible from this worker
-            to_allocate = min(available, remaining)
-            allocations.append((node_id, to_allocate))
-            remaining -= to_allocate
+            for node_id, worker in bucket_workers:
+                if remaining <= 0:
+                    break
+
+                available = worker.available_cores - worker.reserved_cores
+                if available <= 0:
+                    continue
+
+                to_allocate = min(available, remaining)
+                allocations.append((node_id, to_allocate))
+                remaining -= to_allocate
 
         return allocations
 
