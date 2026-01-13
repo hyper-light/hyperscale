@@ -111,53 +111,51 @@ class TestWorkerRegistryManagerOperations:
 
 
 class TestWorkerRegistryHealthTracking:
-    """Test manager health tracking."""
-
-    def test_mark_manager_healthy(self):
-        """Test marking a manager as healthy."""
+    @pytest.mark.asyncio
+    async def test_mark_manager_healthy(self):
         logger = MagicMock()
         registry = WorkerRegistry(logger)
 
-        registry.mark_manager_healthy("mgr-1")
+        await registry.mark_manager_healthy("mgr-1")
 
         assert "mgr-1" in registry._healthy_manager_ids
         assert registry.is_manager_healthy("mgr-1") is True
 
-    def test_mark_manager_unhealthy(self):
-        """Test marking a manager as unhealthy."""
+    @pytest.mark.asyncio
+    async def test_mark_manager_unhealthy(self):
         logger = MagicMock()
         registry = WorkerRegistry(logger)
 
-        registry.mark_manager_healthy("mgr-1")
-        registry.mark_manager_unhealthy("mgr-1")
+        await registry.mark_manager_healthy("mgr-1")
+        await registry.mark_manager_unhealthy("mgr-1")
 
         assert "mgr-1" not in registry._healthy_manager_ids
         assert registry.is_manager_healthy("mgr-1") is False
 
-    def test_mark_manager_unhealthy_records_timestamp(self):
-        """Test that marking unhealthy records timestamp."""
+    @pytest.mark.asyncio
+    async def test_mark_manager_unhealthy_records_timestamp(self):
         logger = MagicMock()
         registry = WorkerRegistry(logger)
 
         before = time.monotonic()
-        registry.mark_manager_unhealthy("mgr-1")
+        await registry.mark_manager_unhealthy("mgr-1")
         after = time.monotonic()
 
         assert "mgr-1" in registry._manager_unhealthy_since
         assert before <= registry._manager_unhealthy_since["mgr-1"] <= after
 
-    def test_mark_manager_healthy_clears_unhealthy(self):
-        """Test that marking healthy clears unhealthy timestamp."""
+    @pytest.mark.asyncio
+    async def test_mark_manager_healthy_clears_unhealthy(self):
         logger = MagicMock()
         registry = WorkerRegistry(logger)
 
-        registry.mark_manager_unhealthy("mgr-1")
-        registry.mark_manager_healthy("mgr-1")
+        await registry.mark_manager_unhealthy("mgr-1")
+        await registry.mark_manager_healthy("mgr-1")
 
         assert "mgr-1" not in registry._manager_unhealthy_since
 
-    def test_get_healthy_manager_tcp_addrs(self):
-        """Test getting healthy manager TCP addresses."""
+    @pytest.mark.asyncio
+    async def test_get_healthy_manager_tcp_addrs(self):
         logger = MagicMock()
         registry = WorkerRegistry(logger)
 
@@ -171,8 +169,8 @@ class TestWorkerRegistryHealthTracking:
 
         registry.add_manager("mgr-1", mgr1)
         registry.add_manager("mgr-2", mgr2)
-        registry.mark_manager_healthy("mgr-1")
-        registry.mark_manager_healthy("mgr-2")
+        await registry.mark_manager_healthy("mgr-1")
+        await registry.mark_manager_healthy("mgr-2")
 
         addrs = registry.get_healthy_manager_tcp_addrs()
 
@@ -181,7 +179,6 @@ class TestWorkerRegistryHealthTracking:
         assert ("192.168.1.2", 8001) in addrs
 
     def test_get_healthy_manager_tcp_addrs_empty(self):
-        """Test getting healthy managers when none are healthy."""
         logger = MagicMock()
         registry = WorkerRegistry(logger)
 
@@ -509,9 +506,7 @@ class TestWorkerRegistryConcurrency:
             registry.mark_manager_healthy(manager_id)
             await asyncio.sleep(0.001)
 
-        await asyncio.gather(*[
-            register_manager(f"mgr-{i}") for i in range(10)
-        ])
+        await asyncio.gather(*[register_manager(f"mgr-{i}") for i in range(10)])
 
         assert len(registry._known_managers) == 10
         assert len(registry._healthy_manager_ids) == 10
