@@ -4565,49 +4565,80 @@ class ManagerServer(HealthAwareServer):
     async def _handle_job_completion(self, job_id: str) -> None:
         """Handle job completion with notification and cleanup."""
         job = self._job_manager.get_job_by_id(job_id)
+        if not job:
+            return await self._send_job_completion_to_gate(job_id, [], [], 0, 0, 0.0)
 
-        final_status = JobStatus.COMPLETED.value
-        total_completed = 0
-        total_failed = 0
+        async with job.lock:
+            job.status = JobStatus.COMPLETED.value
+            elapsed_seconds = job.elapsed_seconds()
+            final_status = self._determine_final_job_status(job)
+            workflow_results, errors, total_completed, total_failed = (
+                self._aggregate_workflow_results(job)
+            )
+
+        await self._send_job_completion_to_gate(
+            job_id,
+            workflow_results,
+            errors,
+            total_completed,
+            total_failed,
+            elapsed_seconds,
+        )
+
+    def _determine_final_job_status(self, job: JobInfo) -> str:
+        if job.workflows_failed == 0:
+            return JobStatus.COMPLETED.value
+        if job.workflows_failed == job.workflows_total:
+            return JobStatus.FAILED.value
+        return JobStatus.COMPLETED.value
+
+    def _aggregate_workflow_results(
+        self, job: JobInfo
+    ) -> tuple[list[WorkflowResult], list[str], int, int]:
         workflow_results: list[WorkflowResult] = []
         errors: list[str] = []
-        elapsed_seconds = 0.0
+        total_completed = 0
+        total_failed = 0
 
-        if job:
-            async with job.lock:
-                job.status = JobStatus.COMPLETED.value
-                elapsed_seconds = job.elapsed_seconds()
+        for workflow_token, workflow_info in job.workflows.items():
+            stats, completed, failed = self._aggregate_sub_workflow_stats(
+                job, workflow_info
+            )
+            total_completed += completed
+            total_failed += failed
 
-                if job.workflows_failed > 0:
-                    final_status = (
-                        JobStatus.FAILED.value
-                        if job.workflows_failed == job.workflows_total
-                        else JobStatus.COMPLETED.value
-                    )
+            workflow_results.append(
+                WorkflowResult(
+                    workflow_id=workflow_info.token.workflow_id or workflow_token,
+                    workflow_name=workflow_info.name,
+                    status=workflow_info.status.value,
+                    results=stats,
+                    error=workflow_info.error,
+                )
+            )
+            if workflow_info.error:
+                errors.append(f"{workflow_info.name}: {workflow_info.error}")
 
-                for workflow_token, workflow_info in job.workflows.items():
-                    # Aggregate stats from sub-workflows
-                    workflow_stats: list[WorkflowStats] = []
-                    for sub_wf_token in workflow_info.sub_workflow_tokens:
-                        sub_wf = job.sub_workflows.get(sub_wf_token)
-                        if sub_wf and sub_wf.result:
-                            workflow_stats.extend(sub_wf.result.results)
-                            if sub_wf.progress:
-                                total_completed += sub_wf.progress.completed_count
-                                total_failed += sub_wf.progress.failed_count
+        return workflow_results, errors, total_completed, total_failed
 
-                    workflow_results.append(
-                        WorkflowResult(
-                            workflow_id=workflow_info.token.workflow_id
-                            or workflow_token,
-                            workflow_name=workflow_info.name,
-                            status=workflow_info.status.value,
-                            results=workflow_stats,
-                            error=workflow_info.error,
-                        )
-                    )
-                    if workflow_info.error:
-                        errors.append(f"{workflow_info.name}: {workflow_info.error}")
+    def _aggregate_sub_workflow_stats(
+        self, job: JobInfo, workflow_info: WorkflowInfo
+    ) -> tuple[list[WorkflowStats], int, int]:
+        stats: list[WorkflowStats] = []
+        completed = 0
+        failed = 0
+
+        for sub_wf_token in workflow_info.sub_workflow_tokens:
+            sub_wf = job.sub_workflows.get(sub_wf_token)
+            if not sub_wf:
+                continue
+            if sub_wf.result:
+                stats.extend(sub_wf.result.results)
+            if progress := sub_wf.progress:
+                completed += progress.completed_count
+                failed += progress.failed_count
+
+        return stats, completed, failed
 
         origin_gate_addr = self._manager_state._job_origin_gates.get(job_id)
         if origin_gate_addr:
