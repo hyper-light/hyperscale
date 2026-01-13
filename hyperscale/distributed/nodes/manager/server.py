@@ -565,15 +565,15 @@ class ManagerServer(HealthAwareServer):
             get_health_throughput=self._get_dispatch_throughput,
             get_health_expected_throughput=self._get_expected_dispatch_throughput,
             get_health_overload_state=lambda: self._manager_health_state,
-            get_current_gate_leader_id=lambda: self._manager_state._current_gate_leader_id,
+            get_current_gate_leader_id=lambda: self._manager_state.current_gate_leader_id,
             get_current_gate_leader_host=lambda: (
-                self._manager_state._current_gate_leader_addr[0]
-                if self._manager_state._current_gate_leader_addr
+                self._manager_state.current_gate_leader_addr[0]
+                if self._manager_state.current_gate_leader_addr
                 else None
             ),
             get_current_gate_leader_port=lambda: (
-                self._manager_state._current_gate_leader_addr[1]
-                if self._manager_state._current_gate_leader_addr
+                self._manager_state.current_gate_leader_addr[1]
+                if self._manager_state.current_gate_leader_addr
                 else None
             ),
             get_known_gates=self._get_known_gates_for_heartbeat,
@@ -671,7 +671,7 @@ class ManagerServer(HealthAwareServer):
         # Start background tasks
         self._start_background_tasks()
 
-        manager_count = len(self._manager_state._known_manager_peers) + 1
+        manager_count = self._manager_state.get_known_manager_peer_count() + 1
         await self._udp_logger.log(
             ServerInfo(
                 message=f"Manager started, {manager_count} managers in cluster",
