@@ -526,8 +526,8 @@ else:
 | Complexity | Action |
 |------------|--------|
 | 1-3 | Acceptable |
-| 4-6 | Review for simplification |
-| 7+ | Must refactor - extract methods or restructure |
+| 4 | Maximum allowed - review for simplification |
+| 5+ | Must refactor - extract methods or restructure |
 
 Count complexity by adding 1 for:
 - Each `if`, `elif`, `else`
