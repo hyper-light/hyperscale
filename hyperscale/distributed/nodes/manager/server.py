@@ -944,20 +944,50 @@ class ManagerServer(HealthAwareServer):
             )
 
     def _on_worker_dead_for_job(self, job_id: str, worker_id: str) -> None:
-        """Handle worker death for specific job (AD-30)."""
-        # This would trigger workflow reschedule
-        pass
+        if not self._workflow_dispatcher or not self._job_manager:
+            return
+
+        job = self._job_manager.get_job_by_id(job_id)
+        if not job:
+            return
+
+        sub_workflows_to_requeue = [
+            sub.token_str
+            for sub in job.sub_workflows.values()
+            if sub.worker_id == worker_id and sub.result is None
+        ]
+
+        for sub_token in sub_workflows_to_requeue:
+            self._task_runner.run(
+                self._workflow_dispatcher.requeue_workflow,
+                sub_token,
+            )
 
     # =========================================================================
     # Failure/Recovery Handlers
     # =========================================================================
 
     async def _handle_worker_failure(self, worker_id: str) -> None:
-        """Handle worker failure."""
         self._health_monitor.handle_worker_failure(worker_id)
 
-        # Trigger workflow retry for workflows on this worker
-        # Implementation delegated to workflow lifecycle coordinator
+        if not self._workflow_dispatcher or not self._job_manager:
+            return
+
+        running_sub_workflows = self._job_manager.get_running_sub_workflows_on_worker(
+            worker_id
+        )
+
+        for job_id, workflow_id, sub_token in running_sub_workflows:
+            await self._workflow_dispatcher.requeue_workflow(sub_token)
+
+            await self._udp_logger.log(
+                ServerInfo(
+                    message=f"Requeued workflow {workflow_id[:8]}... from failed worker {worker_id[:8]}...",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
 
     async def _handle_manager_peer_failure(
         self,

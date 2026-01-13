@@ -1007,12 +1007,20 @@ class JobManager:
         return list(job.workflows.values())
 
     def get_jobs_as_wire_progress(self) -> dict[str, JobProgress]:
-        """
-        Get all jobs converted to wire protocol JobProgress.
-
-        Used for state sync between managers.
-        """
         return {job.job_id: job.to_wire_progress() for job in self._jobs.values()}
+
+    def get_running_sub_workflows_on_worker(
+        self,
+        worker_id: str,
+    ) -> list[tuple[str, str, str]]:
+        return [
+            (job.job_id, wf.token.workflow_id or "", sub.token_str)
+            for job in self._jobs.values()
+            for wf in job.workflows.values()
+            if wf.status == WorkflowStatus.RUNNING
+            for sub in job.sub_workflows.values()
+            if sub.worker_id == worker_id and sub.result is None
+        ]
 
     # =========================================================================
     # Job Cleanup
