@@ -3732,7 +3732,6 @@ class ManagerServer(HealthAwareServer):
                 timeout_strategy
             )
 
-            # Set job leadership (initializes fence token, layer version, and context)
             self._leases.claim_job_leadership(
                 job_id=submission.job_id,
                 tcp_addr=(self._host, self._tcp_port),
