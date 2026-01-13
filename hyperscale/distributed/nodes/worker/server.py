@@ -194,7 +194,9 @@ class WorkerServer(HealthAwareServer):
         self._workflow_fence_tokens: dict[str, int] = (
             self._worker_state._workflow_fence_tokens
         )
-        self._pending_workflows: list = self._worker_state._pending_workflows
+        self._pending_workflows: list[WorkflowDispatch] = (
+            self._worker_state._pending_workflows
+        )
         self._orphaned_workflows: dict[str, float] = (
             self._worker_state._orphaned_workflows
         )
@@ -204,7 +206,9 @@ class WorkerServer(HealthAwareServer):
             self._worker_state._job_leader_transfer_locks
         )
         self._job_fence_tokens: dict[str, int] = self._worker_state._job_fence_tokens
-        self._pending_transfers: dict = self._worker_state._pending_transfers
+        self._pending_transfers: dict[str, PendingTransfer] = (
+            self._worker_state._pending_transfers
+        )
 
         # Negotiated capabilities (AD-25)
         self._negotiated_capabilities: NegotiatedCapabilities | None = None
