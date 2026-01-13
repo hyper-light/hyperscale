@@ -147,7 +147,7 @@ discovered during systematic tracing of SCENARIOS.md test scenarios through the 
 #### D3: Backpressure Propagation Race (HIGH)
 **Location**: `gate/server.py:2401-2427`
 **Issue**: `_manager_backpressure` dict updated without lock.
-**Status**: TODO
+**Status**: FIXED - All backpressure methods use `_get_backpressure_lock()` (state.py lines 232, 245, 250)
 
 #### D4: Invalid Threshold Handling (MEDIUM)
 **Location**: `reliability/overload.py:283-298`
