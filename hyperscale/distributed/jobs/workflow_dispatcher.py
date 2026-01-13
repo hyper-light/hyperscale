@@ -47,14 +47,9 @@ from hyperscale.distributed.reliability import (
 from hyperscale.distributed.env import Env
 from hyperscale.logging import Logger
 
-CONTEXT_COMPRESSION_THRESHOLD = 1024
-
 
 def _serialize_context(context_dict: dict) -> bytes:
-    pickled = cloudpickle.dumps(context_dict)
-    if len(pickled) > CONTEXT_COMPRESSION_THRESHOLD:
-        return b"\x01" + zlib.compress(pickled, level=6)
-    return b"\x00" + pickled
+    return cloudpickle.dumps(context_dict)
 
 
 class WorkflowDispatcher:
