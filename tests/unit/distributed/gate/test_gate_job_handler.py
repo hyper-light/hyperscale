@@ -705,11 +705,12 @@ class TestHandleProgressHappyPath:
             quorum_circuit=MockQuorumCircuit(),
             load_shedder=MockLoadShedder(),
             job_lease_manager=MagicMock(),
+            idempotency_cache=None,
             get_node_id=lambda: MockNodeId(),
             get_host=lambda: "127.0.0.1",
             get_tcp_port=lambda: 9000,
             is_leader=lambda: True,
-            check_rate_limit=lambda client_id, op: (True, 0),
+            check_rate_limit=make_async_rate_limiter(allowed=True, retry_after=0),
             should_shed_request=lambda req_type: False,
             has_quorum_available=lambda: True,
             quorum_size=lambda: 3,
@@ -762,7 +763,7 @@ class TestHandleProgressFencingTokens:
                 timestamp=1234567890.0,
             ),
         )
-        job_manager.set_fence_token("job-123", 10)  # Current token is 10
+        job_manager.set_fence_token("job-123", 10)
 
         handler = GateJobHandler(
             state=state,
@@ -774,6 +775,7 @@ class TestHandleProgressFencingTokens:
             quorum_circuit=MockQuorumCircuit(),
             load_shedder=MockLoadShedder(),
             job_lease_manager=MagicMock(),
+            idempotency_cache=None,
             get_node_id=lambda: MockNodeId(),
             get_host=lambda: "127.0.0.1",
             get_tcp_port=lambda: 9000,
