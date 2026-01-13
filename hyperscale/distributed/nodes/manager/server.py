@@ -1672,7 +1672,7 @@ class ManagerServer(HealthAwareServer):
                     continue
 
                 for job_id, strategy in list(
-                    self._manager_state._job_timeout_strategies.items()
+                    self._manager_state.iter_job_timeout_strategies()
                 ):
                     try:
                         timed_out, reason = await strategy.check_timeout(job_id)
@@ -2043,7 +2043,7 @@ class ManagerServer(HealthAwareServer):
     async def _resume_timeout_tracking_for_all_jobs(self) -> None:
         """Resume timeout tracking for all jobs as new leader."""
         for job_id in self._leases.get_led_job_ids():
-            strategy = self._manager_state._job_timeout_strategies.get(job_id)
+            strategy = self._manager_state.get_job_timeout_strategy(job_id)
             if strategy:
                 await strategy.resume_tracking(job_id)
 
@@ -2898,7 +2898,7 @@ class ManagerServer(HealthAwareServer):
                         )
 
             # Stop timeout tracking (AD-34 Part 10.4.9)
-            strategy = self._manager_state._job_timeout_strategies.get(job_id)
+            strategy = self._manager_state.get_job_timeout_strategy(job_id)
             if strategy:
                 await strategy.stop_tracking(job_id, "cancelled")
 
