@@ -1892,6 +1892,7 @@ class ManagerServer(HealthAwareServer):
 
     def _build_manager_heartbeat(self) -> ManagerHeartbeat:
         """Build manager heartbeat for gates."""
+        health_state_counts = self._health_monitor.get_worker_health_state_counts()
         return ManagerHeartbeat(
             node_id=self._node_id.full,
             datacenter=self._node_id.datacenter,
@@ -1906,6 +1907,9 @@ class ManagerServer(HealthAwareServer):
             tcp_port=self._tcp_port,
             udp_host=self._host,
             udp_port=self._udp_port,
+            overloaded_worker_count=health_state_counts.get("overloaded", 0),
+            stressed_worker_count=health_state_counts.get("stressed", 0),
+            busy_worker_count=health_state_counts.get("busy", 0),
         )
 
     def _get_healthy_gate_tcp_addrs(self) -> list[tuple[str, int]]:
