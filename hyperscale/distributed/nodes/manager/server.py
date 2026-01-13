@@ -96,7 +96,6 @@ from hyperscale.distributed.models import (
 from hyperscale.distributed.models.worker_state import (
     WorkerStateUpdate,
     WorkerListResponse,
-    WorkerListRequest,
     WorkflowReassignmentBatch,
 )
 from hyperscale.distributed.reliability import (
@@ -114,11 +113,7 @@ from hyperscale.distributed.protocol.version import (
     negotiate_capabilities,
     get_features_for_version,
 )
-from hyperscale.distributed.discovery import DiscoveryService
-from hyperscale.distributed.discovery.security.role_validator import (
-    RoleValidator,
-    NodeRole as SecurityNodeRole,
-)
+from hyperscale.distributed.discovery.security.role_validator import RoleValidator
 from hyperscale.distributed.jobs import (
     JobManager,
     WorkerPool,
