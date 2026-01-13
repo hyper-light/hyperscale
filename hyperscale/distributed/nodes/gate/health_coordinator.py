@@ -423,6 +423,47 @@ class GateHealthCoordinator:
             except Exception:
                 pass
 
+    def build_datacenter_candidates(
+        self,
+        datacenter_ids: list[str],
+    ) -> list[DatacenterCandidate]:
+        """
+        Build datacenter candidates for job routing.
+
+        Creates DatacenterCandidate objects with health and capacity info
+        for the job router to use in datacenter selection.
+
+        Args:
+            datacenter_ids: List of datacenter IDs to build candidates for
+
+        Returns:
+            List of DatacenterCandidate objects with health/capacity metrics
+        """
+        candidates: list[DatacenterCandidate] = []
+        for datacenter_id in datacenter_ids:
+            status = self.classify_datacenter_health(datacenter_id)
+            candidates.append(
+                DatacenterCandidate(
+                    datacenter_id=datacenter_id,
+                    health_bucket=status.health.upper(),
+                    available_cores=status.available_capacity,
+                    total_cores=status.available_capacity + status.queue_depth,
+                    queue_depth=status.queue_depth,
+                    lhm_multiplier=1.0,
+                    circuit_breaker_pressure=0.0,
+                    total_managers=status.manager_count,
+                    healthy_managers=status.manager_count,
+                    health_severity_weight=getattr(
+                        status, "health_severity_weight", 1.0
+                    ),
+                    worker_overload_ratio=getattr(status, "worker_overload_ratio", 0.0),
+                    overloaded_worker_count=getattr(
+                        status, "overloaded_worker_count", 0
+                    ),
+                )
+            )
+        return candidates
+
     def check_and_notify_partition_healed(self) -> bool:
         return self._cross_dc_correlation.check_partition_healed()
 
