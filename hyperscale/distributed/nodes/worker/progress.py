@@ -63,9 +63,9 @@ class WorkerProgressReporter:
         state: "WorkerState",
         logger: "Logger | None" = None,
     ) -> None:
-        self._registry = registry
-        self._state = state
-        self._logger = logger
+        self._registry: "WorkerRegistry" = registry
+        self._state: "WorkerState" = state
+        self._logger: "Logger | None" = logger
         self._pending_results: deque[PendingResult] = deque(
             maxlen=self.MAX_PENDING_RESULTS
         )

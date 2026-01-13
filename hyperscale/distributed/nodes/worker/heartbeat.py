@@ -44,8 +44,8 @@ class WorkerHeartbeatHandler:
 
     def set_callbacks(
         self,
-        on_new_manager_discovered: callable | None = None,
-        on_job_leadership_update: callable | None = None,
+        on_new_manager_discovered: Callable[..., Any] | None = None,
+        on_job_leadership_update: Callable[..., Any] | None = None,
     ) -> None:
         """
         Set callbacks for heartbeat events.
