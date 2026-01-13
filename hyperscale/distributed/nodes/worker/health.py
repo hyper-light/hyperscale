@@ -37,9 +37,9 @@ class WorkerHealthIntegration:
             backpressure_manager: WorkerBackpressureManager for overload state
             logger: Logger instance for logging
         """
-        self._registry = registry
-        self._backpressure_manager = backpressure_manager
-        self._logger = logger
+        self._registry: "WorkerRegistry" = registry
+        self._backpressure_manager: "WorkerBackpressureManager" = backpressure_manager
+        self._logger: "Logger" = logger
 
         # Callbacks for external handlers
         self._on_manager_failure: Callable[[str], None] | None = None
