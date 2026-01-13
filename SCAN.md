@@ -132,6 +132,23 @@ grep -rn "<key_operation_or_variable>" <node_directory>/*.py
 
 **Never optimize for ease of fix. Always optimize for correctness of architecture.**
 
+**MANDATORY: Do the refactor. No exceptions for complexity.**
+
+When a refactor is identified as the correct solution, execute it fully regardless of:
+- Number of files affected
+- Number of call sites to update
+- Complexity of the change
+- Time required
+
+**There is no "too complex to refactor now" exemption.** If the correct fix requires touching 50 files, touch 50 files. If it requires updating 200 call sites, update 200 call sites. Deferring correct fixes creates technical debt that compounds.
+
+The only valid reasons to pause a refactor:
+1. **Ambiguity in requirements** - unclear what the correct behavior should be (ask for clarification)
+2. **Missing domain knowledge** - need to understand existing behavior before changing (research first)
+3. **Risk of data loss** - change could corrupt persistent state (design migration first)
+
+"This refactor is large" is NOT a valid reason to defer. "This refactor is complex" is NOT a valid reason to simplify. Execute the correct fix.
+
 When faced with a problem, there are typically multiple solutions:
 - **Shortcut**: Add alias, wrapper, shim, adapter, or duplicate to make the call site work
 - **Correct**: Fix the root cause - update call sites, consolidate implementations, remove duplication
@@ -465,12 +482,14 @@ For each candidate, identify target:
 
 ### Step 10d: Execute Delegations
 
+**No deferral for complexity.** If a method should be delegated, delegate it now. Not "later when we have time." Not "in a follow-up PR." Now.
+
 For each candidate, one at a time:
 
 1. **Move logic to coordinator**:
    - Copy method body
    - Adapt to use coordinator's state references
-   - Add docstring
+   - Add docstring if public API
 
 2. **Replace server method with delegation**:
    ```python
@@ -486,9 +505,17 @@ For each candidate, one at a time:
        return self._peer_coordinator.get_healthy_gates()
    ```
 
-3. **Run LSP diagnostics**
+3. **Keep fallback in server** (temporarily) if coordinator may be None:
+   ```python
+   def _get_healthy_gates(self) -> list[GateInfo]:
+       if self._peer_coordinator:
+           return self._peer_coordinator.get_healthy_gates()
+       # Fallback logic here (to be removed once all paths initialize coordinator)
+   ```
 
-4. **Commit**
+4. **Run LSP diagnostics**
+
+5. **Commit**
 
 ### Step 10e: Verify Server is "Thin"
 
