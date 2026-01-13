@@ -104,7 +104,7 @@ class GateHealthCoordinator:
         self._get_tcp_port = get_tcp_port
         self._confirm_manager_for_dc = confirm_manager_for_dc
 
-    def handle_embedded_manager_heartbeat(
+    async def handle_embedded_manager_heartbeat(
         self,
         heartbeat: ManagerHeartbeat,
         source_addr: tuple[str, int],
