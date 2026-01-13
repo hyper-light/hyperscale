@@ -4117,12 +4117,12 @@ class ManagerServer(HealthAwareServer):
                 ).dump()
 
             # Record job leadership
-            self._manager_state._job_leaders[announcement.job_id] = (
-                announcement.leader_id
+            self._manager_state.set_job_leader(
+                announcement.job_id, announcement.leader_id
             )
-            self._manager_state._job_leader_addrs[announcement.job_id] = (
-                announcement.leader_host,
-                announcement.leader_tcp_port,
+            self._manager_state.set_job_leader_addr(
+                announcement.job_id,
+                (announcement.leader_host, announcement.leader_tcp_port),
             )
 
             # Initialize context for this job
@@ -4167,7 +4167,7 @@ class ManagerServer(HealthAwareServer):
             sync_msg = JobStateSyncMessage.load(data)
 
             # Only accept from actual job leader
-            current_leader = self._manager_state._job_leaders.get(sync_msg.job_id)
+            current_leader = self._manager_state.get_job_leader(sync_msg.job_id)
             if current_leader and current_leader != sync_msg.leader_id:
                 return JobStateSyncAck(
                     job_id=sync_msg.job_id,
@@ -4528,7 +4528,7 @@ class ManagerServer(HealthAwareServer):
 
     def _is_job_leader(self, job_id: str) -> bool:
         """Check if this manager is the leader for a job."""
-        leader_id = self._manager_state._job_leaders.get(job_id)
+        leader_id = self._manager_state.get_job_leader(job_id)
         return leader_id == self._node_id.full
 
     async def _apply_context_updates(
