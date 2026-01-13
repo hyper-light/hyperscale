@@ -839,6 +839,7 @@ class GateServer(HealthAwareServer):
             record_manager_heartbeat=self._record_manager_heartbeat,
             handle_manager_backpressure_signal=self._handle_manager_backpressure_signal,
             update_dc_backpressure=self._update_dc_backpressure,
+            set_manager_backpressure_none=self._set_manager_backpressure_none,
             broadcast_manager_discovery=self._broadcast_manager_discovery,
         )
 
@@ -3131,7 +3132,7 @@ class GateServer(HealthAwareServer):
 
                 for manager_addr in stale_manager_addrs:
                     self._manager_last_status.pop(manager_addr, None)
-                    self._manager_backpressure.pop(manager_addr, None)
+                    await self._clear_manager_backpressure(manager_addr)
                     self._manager_negotiated_caps.pop(manager_addr, None)
 
                     for dc_id in list(self._datacenter_manager_status.keys()):
