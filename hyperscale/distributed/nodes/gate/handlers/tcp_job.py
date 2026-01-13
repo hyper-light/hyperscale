@@ -216,7 +216,6 @@ class GateJobHandler:
             negotiated_features = client_features & our_features
             negotiated_caps_str = ",".join(sorted(negotiated_features))
 
-            idempotency_key: IdempotencyKey | None = None
             if submission.idempotency_key and self._idempotency_cache is not None:
                 idempotency_key = IdempotencyKey.parse(submission.idempotency_key)
                 found, entry = await self._idempotency_cache.check_or_insert(
@@ -360,30 +359,24 @@ class GateJobHandler:
             return ack_response
 
         except QuorumCircuitOpenError as error:
+            job_id = submission.job_id if submission is not None else "unknown"
             error_ack = JobAck(
-                job_id=submission.job_id if "submission" in dir() else "unknown",
+                job_id=job_id,
                 accepted=False,
                 error=str(error),
             ).dump()
-            if (
-                "idempotency_key" in dir()
-                and idempotency_key is not None
-                and self._idempotency_cache is not None
-            ):
+            if idempotency_key is not None and self._idempotency_cache is not None:
                 await self._idempotency_cache.reject(idempotency_key, error_ack)
             return error_ack
         except QuorumError as error:
             self._quorum_circuit.record_error()
+            job_id = submission.job_id if submission is not None else "unknown"
             error_ack = JobAck(
-                job_id=submission.job_id if "submission" in dir() else "unknown",
+                job_id=job_id,
                 accepted=False,
                 error=str(error),
             ).dump()
-            if (
-                "idempotency_key" in dir()
-                and idempotency_key is not None
-                and self._idempotency_cache is not None
-            ):
+            if idempotency_key is not None and self._idempotency_cache is not None:
                 await self._idempotency_cache.reject(idempotency_key, error_ack)
             return error_ack
         except Exception as error:
@@ -395,16 +388,13 @@ class GateJobHandler:
                     node_id=self._get_node_id().short,
                 )
             )
+            job_id = submission.job_id if submission is not None else "unknown"
             error_ack = JobAck(
-                job_id="unknown",
+                job_id=job_id,
                 accepted=False,
                 error=str(error),
             ).dump()
-            if (
-                "idempotency_key" in dir()
-                and idempotency_key is not None
-                and self._idempotency_cache is not None
-            ):
+            if idempotency_key is not None and self._idempotency_cache is not None:
                 await self._idempotency_cache.reject(idempotency_key, error_ack)
             return error_ack
 

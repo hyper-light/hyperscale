@@ -1,7 +1,7 @@
 """
 Integration tests for GateStatsCoordinator (Section 15.3.7).
 
-Tests statistics coordination including tiered updates, batch stats loops,
+Tests statistics coordination including tiered updates, batch stats,
 and windowed stats aggregation.
 """
 
@@ -12,7 +12,12 @@ from unittest.mock import AsyncMock
 
 from hyperscale.distributed.nodes.gate.stats_coordinator import GateStatsCoordinator
 from hyperscale.distributed.nodes.gate.state import GateRuntimeState
-from hyperscale.distributed.models import JobStatus, UpdateTier
+from hyperscale.distributed.models import (
+    JobStatus,
+    UpdateTier,
+    GlobalJobStatus,
+    DCJobProgress,
+)
 from hyperscale.distributed.reliability import BackpressureLevel
 
 
