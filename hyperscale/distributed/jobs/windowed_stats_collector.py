@@ -36,26 +36,12 @@ class WorkerWindowStats:
 
 
 @dataclass(slots=True)
-class WindowedStatsPush:
-    """
-    Time-windowed stats push to client or gate.
-
-    When is_aggregated=True (for clients):
-        - Contains aggregated stats across all workers in window
-        - step_stats are merged by step name
-
-    When is_aggregated=False (for gates):
-        - per_worker_stats contains individual worker progress
-        - Gate performs its own aggregation across DCs
-    """
-
+class WindowedStatsPush(Message):
     job_id: str
     workflow_id: str
     workflow_name: str = ""
-    window_start: float = 0.0  # Unix timestamp
-    window_end: float = 0.0  # Unix timestamp
-
-    # Aggregated stats (when is_aggregated=True)
+    window_start: float = 0.0
+    window_end: float = 0.0
     completed_count: int = 0
     failed_count: int = 0
     rate_per_second: float = 0.0
@@ -63,12 +49,9 @@ class WindowedStatsPush:
     worker_count: int = 0
     avg_cpu_percent: float = 0.0
     avg_memory_mb: float = 0.0
-
-    # Per-worker stats (when is_aggregated=False, for gate forwarding)
     per_worker_stats: list[WorkerWindowStats] = field(default_factory=list)
-
     is_aggregated: bool = True
-    datacenter: str = ""  # Set by manager when forwarding to gate
+    datacenter: str = ""
 
 
 @dataclass(slots=True)
