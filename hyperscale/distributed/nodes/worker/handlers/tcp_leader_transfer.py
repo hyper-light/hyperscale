@@ -37,7 +37,7 @@ class JobLeaderTransferHandler:
         Args:
             server: WorkerServer instance for state access
         """
-        self._server = server
+        self._server: "WorkerServer" = server
 
     async def handle(
         self,
