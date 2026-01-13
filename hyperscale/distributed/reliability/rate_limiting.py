@@ -1096,14 +1096,14 @@ class ServerRateLimiter:
             client_id, operation, priority, tokens, max_wait
         )
 
-    def cleanup_inactive_clients(self) -> int:
+    async def cleanup_inactive_clients(self) -> int:
         """
         Remove counters for clients that have been inactive.
 
         Returns:
             Number of clients cleaned up
         """
-        cleaned = self._adaptive.cleanup_inactive_clients()
+        cleaned = await self._adaptive.cleanup_inactive_clients()
         self._clients_cleaned += cleaned
         return cleaned
 
