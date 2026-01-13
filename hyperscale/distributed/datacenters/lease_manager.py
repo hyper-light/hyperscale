@@ -36,7 +36,7 @@ class LeaseStats:
     active_leases: int = 0
 
 
-class LeaseManager:
+class DatacenterLeaseManager:
     """
     Manages job-to-datacenter leases for at-most-once delivery.
 
@@ -44,7 +44,7 @@ class LeaseManager:
     Only the lease holder can dispatch operations for that job to that DC.
 
     Example usage:
-        manager = LeaseManager(
+        manager = DatacenterLeaseManager(
             node_id="gate-1",
             lease_timeout=30.0,
         )
@@ -389,11 +389,7 @@ class LeaseManager:
     def get_job_leases(self, job_id: str) -> list[DatacenterLease]:
         """Get all leases for a specific job."""
         prefix = f"{job_id}:"
-        return [
-            lease
-            for key, lease in self._leases.items()
-            if key.startswith(prefix)
-        ]
+        return [lease for key, lease in self._leases.items() if key.startswith(prefix)]
 
     # =========================================================================
     # Internal Helpers
