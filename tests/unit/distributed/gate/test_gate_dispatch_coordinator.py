@@ -154,7 +154,8 @@ class TestCheckRateAndLoadHappyPath:
 class TestCheckRateAndLoadNegativePath:
     """Tests for _check_rate_and_load negative paths."""
 
-    def test_rejects_when_rate_limited(self):
+    @pytest.mark.asyncio
+    async def test_rejects_when_rate_limited(self):
         """Rejects request when rate limited."""
         state = GateRuntimeState()
 
@@ -164,7 +165,7 @@ class TestCheckRateAndLoadNegativePath:
             task_runner=MockTaskRunner(),
             job_manager=MockGateJobManager(),
             job_router=None,
-            check_rate_limit=lambda client_id, op: (False, 5.0),  # Rate limited
+            check_rate_limit=make_async_rate_limiter(allowed=False, retry_after=5.0),
             should_shed_request=lambda req_type: False,
             has_quorum_available=lambda: True,
             quorum_size=lambda: 3,
@@ -175,13 +176,14 @@ class TestCheckRateAndLoadNegativePath:
             dispatch_to_dcs=AsyncMock(),
         )
 
-        result = coordinator._check_rate_and_load("client-1", "job-1")
+        result = await coordinator._check_rate_and_load("client-1", "job-1")
 
         assert result is not None
         assert result.accepted is False
         assert "Rate limited" in result.error
 
-    def test_rejects_when_shedding(self):
+    @pytest.mark.asyncio
+    async def test_rejects_when_shedding(self):
         """Rejects request when load shedding."""
         state = GateRuntimeState()
 
@@ -191,8 +193,8 @@ class TestCheckRateAndLoadNegativePath:
             task_runner=MockTaskRunner(),
             job_manager=MockGateJobManager(),
             job_router=None,
-            check_rate_limit=lambda client_id, op: (True, 0),
-            should_shed_request=lambda req_type: True,  # Shedding
+            check_rate_limit=make_async_rate_limiter(allowed=True, retry_after=0),
+            should_shed_request=lambda req_type: True,
             has_quorum_available=lambda: True,
             quorum_size=lambda: 3,
             quorum_circuit=MockQuorumCircuit(),
@@ -202,7 +204,7 @@ class TestCheckRateAndLoadNegativePath:
             dispatch_to_dcs=AsyncMock(),
         )
 
-        result = coordinator._check_rate_and_load("client-1", "job-1")
+        result = await coordinator._check_rate_and_load("client-1", "job-1")
 
         assert result is not None
         assert result.accepted is False
