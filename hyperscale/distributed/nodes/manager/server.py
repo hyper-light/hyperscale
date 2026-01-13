@@ -4169,13 +4169,9 @@ class ManagerServer(HealthAwareServer):
                             await job.context.from_dict(workflow_name, values)
                         job.layer_version = sync_msg.layer_version
 
-            current_token = self._manager_state._job_fencing_tokens.get(
-                sync_msg.job_id, 0
+            self._leases.update_fence_token_if_higher(
+                sync_msg.job_id, sync_msg.fencing_token
             )
-            if sync_msg.fencing_token > current_token:
-                self._manager_state._job_fencing_tokens[sync_msg.job_id] = (
-                    sync_msg.fencing_token
-                )
 
             if sync_msg.origin_gate_addr:
                 self._manager_state._job_origin_gates[sync_msg.job_id] = (
