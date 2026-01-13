@@ -10,7 +10,7 @@ to maintain single source of truth (no duplicate state).
 
 import asyncio
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from hyperscale.distributed.models import (
     WorkflowProgress,
@@ -224,7 +224,7 @@ class WorkerExecutor:
         """Stop background loops."""
         self._running = False
 
-    def get_execution_metrics(self) -> dict:
+    def get_execution_metrics(self) -> dict[str, Any]:
         """
         Get execution metrics summary.
 
