@@ -496,6 +496,9 @@ class TestGatePingHandlerStateConsistency:
             get_datacenter_managers=lambda: {},
         )
 
+        async def mock_handle_exception(error, context):
+            pass
+
         # Modify state while processing
         async def modify_state():
             await asyncio.sleep(0.001)
@@ -506,7 +509,7 @@ class TestGatePingHandlerStateConsistency:
             return await handler.handle_ping(
                 addr=("10.0.0.1", 8000),
                 data=b"ping_data",
-                clock_time=12345,
+                handle_exception=mock_handle_exception,
             )
 
         # Run both concurrently
