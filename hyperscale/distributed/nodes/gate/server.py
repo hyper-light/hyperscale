@@ -3031,7 +3031,7 @@ class GateServer(HealthAwareServer):
 
                     self._job_stats_crdt.pop(job_id, None)
 
-                    state_reporter_tasks = self._state._job_reporter_tasks.pop(
+                    state_reporter_tasks = self._modular_state._job_reporter_tasks.pop(
                         job_id, None
                     )
                     if state_reporter_tasks:
