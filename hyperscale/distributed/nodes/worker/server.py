@@ -886,7 +886,7 @@ class WorkerServer(HealthAwareServer):
             )
 
     def _cleanup_pending_transfer_if_complete(
-        self, job_id: str, workflow_id: str, pending
+        self, job_id: str, workflow_id: str, pending: PendingTransfer
     ) -> None:
         remaining_workflows = [
             wf_id
@@ -1023,7 +1023,7 @@ class WorkerServer(HealthAwareServer):
                 break
 
     async def _handle_manager_heartbeat(
-        self, heartbeat, source_addr: tuple[str, int]
+        self, heartbeat: ManagerHeartbeat, source_addr: tuple[str, int]
     ) -> None:
         """Handle manager heartbeat from SWIM."""
         if self._event_logger is not None:
