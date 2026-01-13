@@ -254,9 +254,8 @@ async def run_test():
         print("-" * 50)
         await asyncio.sleep(CLUSTER_STABILIZATION_TIME)
 
-        # Verify all gates see each other in the hash ring
         for i, gate in enumerate(gates):
-            ring_nodes = gate._job_hash_ring.get_all_nodes()
+            ring_nodes = await gate._job_hash_ring.get_all_nodes()
             expected_nodes = len(GATE_CONFIGS)
             if len(ring_nodes) == expected_nodes:
                 print(
