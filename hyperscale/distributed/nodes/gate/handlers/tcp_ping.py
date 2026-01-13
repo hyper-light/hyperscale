@@ -57,7 +57,7 @@ class GatePingHandler:
         self,
         addr: tuple[str, int],
         data: bytes,
-        handle_exception: callable,
+        handle_exception: Callable[[Exception, str], Awaitable[None]],
     ) -> bytes:
         """
         Process ping request.
