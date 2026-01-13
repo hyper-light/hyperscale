@@ -40,10 +40,10 @@ class GateStatsCoordinator:
         logger: "Logger",
         task_runner: "TaskRunner",
         windowed_stats: WindowedStatsCollector,
-        get_job_callback: callable,
-        get_job_status: callable,
-        send_tcp: callable,
-        stats_push_interval_ms: float = 1000.0,
+        get_job_callback: Callable[[str], tuple[str, int] | None],
+        get_job_status: Callable[[str], GlobalJobStatus | None],
+        get_all_running_jobs: Callable[[], list[tuple[str, GlobalJobStatus]]],
+        send_tcp: Callable,
     ) -> None:
         self._state = state
         self._logger = logger
@@ -51,9 +51,8 @@ class GateStatsCoordinator:
         self._windowed_stats = windowed_stats
         self._get_job_callback = get_job_callback
         self._get_job_status = get_job_status
+        self._get_all_running_jobs = get_all_running_jobs
         self._send_tcp = send_tcp
-        self._stats_push_interval_ms = stats_push_interval_ms
-        self._batch_stats_task: asyncio.Task | None = None
 
     def classify_update_tier(
         self,
