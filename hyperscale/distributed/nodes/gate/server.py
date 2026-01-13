@@ -48,6 +48,7 @@ from hyperscale.distributed.swim import HealthAwareServer, GateStateEmbedder
 from hyperscale.distributed.swim.health import (
     FederatedHealthMonitor,
     DCLeaderAnnouncement,
+    CrossClusterAck,
 )
 from hyperscale.distributed.models import (
     NodeInfo,

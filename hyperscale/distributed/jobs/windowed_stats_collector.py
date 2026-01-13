@@ -150,6 +150,7 @@ class WindowedStatsCollector:
                 )
 
             self._buckets[key].worker_stats[worker_id] = progress
+            self._metrics.stats_recorded += 1
 
     async def flush_closed_windows(
         self,
@@ -184,10 +185,12 @@ class WindowedStatsCollector:
                         push = self._unaggregated_bucket(bucket)
                     results.append(push)
                     keys_to_remove.append(key)
+                    self._metrics.windows_flushed += 1
 
-                # Also cleanup very old windows (missed or stuck)
                 elif (now - bucket.created_at) * 1000 > self._max_window_age_ms:
                     keys_to_remove.append(key)
+                    self._metrics.windows_dropped_late += 1
+                    self._metrics.stats_dropped_late += len(bucket.worker_stats)
 
             for key in keys_to_remove:
                 del self._buckets[key]
