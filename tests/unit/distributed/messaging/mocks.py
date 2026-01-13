@@ -126,6 +126,9 @@ class MockIncarnationTracker:
     def get_required_rejoin_incarnation(self, node: tuple[str, int]) -> int:
         return 0
 
+    def clear_death_record(self, node: tuple[str, int]) -> None:
+        pass
+
 
 @dataclass
 class MockAuditLog:
