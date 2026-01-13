@@ -217,28 +217,22 @@ class WorkerBackgroundLoops:
                         )
 
                 for workflow_id, reason in workflows_to_cancel:
-                    # Remove from orphan tracking first
                     self._state._orphaned_workflows.pop(workflow_id, None)
 
-                    # Check if workflow is still active
                     if workflow_id not in self._state._active_workflows:
                         continue
 
                     if self._logger:
                         await self._logger.log(
                             ServerWarning(
-                                message=f"Cancelling orphaned workflow {workflow_id[:8]}... - "
-                                f"grace period ({self._orphan_grace_period}s) expired",
+                                message=f"Cancelling workflow {workflow_id[:8]}... - {reason}",
                                 node_host=node_host,
                                 node_port=node_port,
                                 node_id=node_id_short,
                             )
                         )
 
-                    # Cancel the workflow
-                    success, errors = await cancel_workflow(
-                        workflow_id, "orphan_grace_period_expired"
-                    )
+                    success, errors = await cancel_workflow(workflow_id, reason)
 
                     if not success or errors:
                         if self._logger:
