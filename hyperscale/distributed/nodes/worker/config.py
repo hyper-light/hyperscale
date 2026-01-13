@@ -103,12 +103,12 @@ class WorkerConfig:
     @classmethod
     def from_env(
         cls,
-        env,
+        env: Env,
         host: str,
         tcp_port: int,
         udp_port: int,
         datacenter_id: str = "default",
-    ) -> "WorkerConfig":
+    ) -> WorkerConfig:
         """
         Create worker configuration from Env object.
 

@@ -21,6 +21,7 @@ from hyperscale.logging.hyperscale_logging_models import ServerError, ServerInfo
 if TYPE_CHECKING:
     from hyperscale.distributed.env import Env
     from hyperscale.logging import Logger
+    from hyperscale.ui import InterfaceUpdatesController
 
 
 class WorkerLifecycleManager:
