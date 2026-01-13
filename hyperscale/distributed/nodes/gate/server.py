@@ -711,6 +711,9 @@ class GateServer(HealthAwareServer):
             task_runner=self._task_runner,
             job_manager=self._job_manager,
             job_router=self._job_router,
+            job_timeout_tracker=self._job_timeout_tracker,
+            circuit_breaker_manager=self._circuit_breaker_manager,
+            datacenter_managers=self._datacenter_managers,
             check_rate_limit=self._check_rate_limit_for_operation,
             should_shed_request=self._should_shed_request,
             has_quorum_available=self._has_quorum_available,
@@ -719,7 +722,14 @@ class GateServer(HealthAwareServer):
             select_datacenters=self._select_datacenters_with_fallback,
             assume_leadership=self._job_leadership_tracker.assume_leadership,
             broadcast_leadership=self._broadcast_job_leadership,
-            dispatch_to_dcs=self._dispatch_job_to_datacenters,
+            send_tcp=self._send_tcp,
+            increment_version=self._increment_version,
+            confirm_manager_for_dc=self._confirm_manager_for_dc,
+            suspect_manager_for_dc=self._suspect_manager_for_dc,
+            record_forward_throughput_event=self._record_forward_throughput_event,
+            get_node_host=lambda: self._host,
+            get_node_port=lambda: self._tcp_port,
+            get_node_id_short=lambda: self._node_id.short,
         )
 
         self._peer_coordinator = GatePeerCoordinator(
