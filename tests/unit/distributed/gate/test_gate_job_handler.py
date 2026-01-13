@@ -388,7 +388,7 @@ class TestHandleSubmissionRateLimiting:
         """Different clients are rate limited separately."""
         rate_limited_clients = {"10.0.0.1:8000"}
 
-        def check_rate(client_id: str, op: str):
+        async def check_rate(client_id: str, op: str):
             if client_id in rate_limited_clients:
                 return (False, 5.0)
             return (True, 0.0)
@@ -403,6 +403,7 @@ class TestHandleSubmissionRateLimiting:
             quorum_circuit=MockQuorumCircuit(),
             load_shedder=MockLoadShedder(),
             job_lease_manager=MagicMock(),
+            idempotency_cache=None,
             get_node_id=lambda: MockNodeId(),
             get_host=lambda: "127.0.0.1",
             get_tcp_port=lambda: 9000,

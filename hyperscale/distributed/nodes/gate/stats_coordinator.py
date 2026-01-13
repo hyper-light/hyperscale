@@ -123,10 +123,10 @@ class GateStatsCoordinator:
             job_id=job_id,
             status=job.status,
             message=message,
-            total_completed=getattr(job, 'total_completed', 0),
-            total_failed=getattr(job, 'total_failed', 0),
-            overall_rate=getattr(job, 'overall_rate', 0.0),
-            elapsed_seconds=getattr(job, 'elapsed_seconds', 0.0),
+            total_completed=getattr(job, "total_completed", 0),
+            total_failed=getattr(job, "total_failed", 0),
+            overall_rate=getattr(job, "overall_rate", 0.0),
+            elapsed_seconds=getattr(job, "elapsed_seconds", 0.0),
             is_final=is_final,
         )
 
@@ -180,11 +180,10 @@ class GateStatsCoordinator:
 
                 await asyncio.sleep(interval_seconds)
 
-                # Skip push entirely under REJECT backpressure (non-critical updates)
-                if backpressure_level == BackpressureLevel.REJECT:
+                current_backpressure_level = self._state.get_max_backpressure_level()
+                if current_backpressure_level == BackpressureLevel.REJECT:
                     continue
 
-                # Get jobs with pending stats
                 pending_jobs = self._windowed_stats.get_jobs_with_pending_stats()
 
                 for job_id in pending_jobs:
@@ -206,15 +205,15 @@ class GateStatsCoordinator:
         if not (callback := self._state._progress_callbacks.get(job_id)):
             return
 
-        # Get aggregated stats from windowed collector
-        stats = self._windowed_stats.get_aggregated_stats(job_id)
-        if not stats:
+        stats_list = await self._windowed_stats.get_aggregated_stats(job_id)
+        if not stats_list:
             return
 
-        try:
-            await self._send_tcp(callback, "windowed_stats_push", stats.dump())
-        except Exception:
-            pass  # Best effort
+        for stats in stats_list:
+            try:
+                await self._send_tcp(callback, "windowed_stats_push", stats.dump())
+            except Exception:
+                pass
 
 
 __all__ = ["GateStatsCoordinator"]
