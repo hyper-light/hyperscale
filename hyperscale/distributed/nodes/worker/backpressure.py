@@ -44,26 +44,26 @@ class WorkerBackpressureManager:
         batch_delay_ms: int = 1000,
         reject_delay_ms: int = 2000,
     ) -> None:
-        self._state = state
-        self._logger = logger
-        self._registry = registry
-        self._overload_detector = HybridOverloadDetector()
-        self._poll_interval = poll_interval
-        self._running = False
+        self._state: "WorkerState" = state
+        self._logger: "Logger | None" = logger
+        self._registry: "WorkerRegistry | None" = registry
+        self._overload_detector: HybridOverloadDetector = HybridOverloadDetector()
+        self._poll_interval: float = poll_interval
+        self._running: bool = False
 
         # Configurable backpressure delay defaults (AD-37)
-        self._throttle_delay_ms = throttle_delay_ms
-        self._batch_delay_ms = batch_delay_ms
-        self._reject_delay_ms = reject_delay_ms
+        self._throttle_delay_ms: int = throttle_delay_ms
+        self._batch_delay_ms: int = batch_delay_ms
+        self._reject_delay_ms: int = reject_delay_ms
 
         # Resource getters (set by server)
-        self._get_cpu_percent: callable = lambda: 0.0
-        self._get_memory_percent: callable = lambda: 0.0
+        self._get_cpu_percent: Callable[[], float] = lambda: 0.0
+        self._get_memory_percent: Callable[[], float] = lambda: 0.0
 
     def set_resource_getters(
         self,
-        cpu_getter: callable,
-        memory_getter: callable,
+        cpu_getter: Callable[[], float],
+        memory_getter: Callable[[], float],
     ) -> None:
         """
         Set resource getter functions.
