@@ -2809,16 +2809,23 @@ class ManagerServer(HealthAwareServer):
                         )
                     )
 
-            # Step 3: Cancel ALL running workflows on workers
-            for workflow_id, workflow in job.workflows.items():
-                if workflow_id in pending_cancelled:
+            # Step 3: Cancel ALL running sub-workflows on workers
+            for workflow_id, workflow_info in job.workflows.items():
+                if (
+                    workflow_id in pending_cancelled
+                    or workflow_info.status != WorkflowStatus.RUNNING
+                ):
                     continue
 
-                if workflow.status == WorkflowStatus.RUNNING and workflow.worker_id:
-                    worker = self._manager_state.get_worker(workflow.worker_id)
+                for sub_wf_token in workflow_info.sub_workflow_tokens:
+                    sub_wf = job.sub_workflows.get(sub_wf_token)
+                    if not (sub_wf and sub_wf.token.worker_id):
+                        continue
+
+                    worker = self._manager_state.get_worker(sub_wf.token.worker_id)
                     if not worker:
                         workflow_errors[workflow_id] = (
-                            f"Worker {workflow.worker_id} not found"
+                            f"Worker {sub_wf.token.worker_id} not found"
                         )
                         continue
 
