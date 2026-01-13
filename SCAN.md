@@ -273,6 +273,198 @@ EOF
 
 **BLOCKING**: Do not proceed to Phase 1 until alias map is generated and reviewed.
 
+### Step 0e: Dynamic/Inline Import Detection (MANDATORY)
+
+**Objective**: Detect and reject all imports that are not at the top of the file.
+
+**The Problem:**
+
+Dynamic or inline imports violate Python conventions and our codebase rules:
+
+```python
+# WRONG - inline import inside function
+async def _handle_request(self, request: bytes):
+    from hyperscale.distributed.models import JobSubmission  # VIOLATION!
+    job = JobSubmission.load(request)
+    
+# WRONG - conditional import
+if some_condition:
+    import heavy_module  # VIOLATION!
+
+# WRONG - import inside class body
+class MyServer:
+    from typing import Dict  # VIOLATION!
+    
+# WRONG - lazy import pattern
+def get_parser():
+    import json  # VIOLATION!
+    return json.loads
+
+# CORRECT - all imports at top of file
+from hyperscale.distributed.models import JobSubmission
+import json
+
+async def _handle_request(self, request: bytes):
+    job = JobSubmission.load(request)
+```
+
+**Why Inline Imports Are Forbidden:**
+
+1. **Hidden dependencies**: Dependencies aren't visible at file top
+2. **Inconsistent load times**: Import happens at runtime, not startup
+3. **Harder to track**: Import alias resolution misses inline imports
+4. **Circular import masking**: Hides circular dependency issues until runtime
+5. **Testing difficulty**: Harder to mock/patch imports
+
+**Exception**: `TYPE_CHECKING` blocks are allowed (they're not executed at runtime):
+
+```python
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from heavy_module import HeavyClass  # OK - only for type hints
+```
+
+**Detection Script:**
+
+```python
+import ast
+from pathlib import Path
+
+def find_inline_imports(file_path: str) -> list[tuple[int, str, str]]:
+    """
+    Find all imports that are not at module level.
+    
+    Returns: [(line_number, import_statement, context)]
+    """
+    with open(file_path) as f:
+        source = f.read()
+        tree = ast.parse(source)
+        lines = source.split('\n')
+    
+    violations = []
+    
+    # Track if we're inside TYPE_CHECKING block
+    type_checking_ranges = []
+    
+    for node in ast.walk(tree):
+        # Find TYPE_CHECKING blocks
+        if isinstance(node, ast.If):
+            if (isinstance(node.test, ast.Name) and node.test.id == 'TYPE_CHECKING') or \
+               (isinstance(node.test, ast.Attribute) and node.test.attr == 'TYPE_CHECKING'):
+                # Record the range of this block
+                type_checking_ranges.append((node.lineno, node.end_lineno or node.lineno + 100))
+    
+    def is_in_type_checking(lineno: int) -> bool:
+        return any(start <= lineno <= end for start, end in type_checking_ranges)
+    
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            # Check if this import is inside a function, class, or other block
+            # by checking if it has a parent that's not Module
+            
+            # Get the line
+            line = lines[node.lineno - 1].strip() if node.lineno <= len(lines) else ""
+            
+            # Skip if in TYPE_CHECKING block
+            if is_in_type_checking(node.lineno):
+                continue
+            
+            # Check parent context by walking tree with parent tracking
+            parent = getattr(node, '_parent', None)
+            
+    # Alternative: use line-based detection for simplicity
+    violations = []
+    in_type_checking = False
+    indent_stack = [0]
+    
+    for lineno, line in enumerate(lines, 1):
+        stripped = line.strip()
+        
+        # Track TYPE_CHECKING blocks
+        if 'if TYPE_CHECKING' in line or 'if typing.TYPE_CHECKING' in line:
+            in_type_checking = True
+            continue
+        
+        # Rough indent tracking to exit TYPE_CHECKING
+        if in_type_checking:
+            current_indent = len(line) - len(line.lstrip())
+            if stripped and not stripped.startswith('#') and current_indent == 0:
+                in_type_checking = False
+        
+        # Skip if in TYPE_CHECKING
+        if in_type_checking:
+            continue
+        
+        # Check for import statements
+        if stripped.startswith('import ') or stripped.startswith('from '):
+            # Check indentation - top-level imports have 0 indent
+            indent = len(line) - len(line.lstrip())
+            if indent > 0:
+                # Determine context
+                context = "indented block"
+                for i in range(lineno - 1, 0, -1):
+                    prev = lines[i - 1].strip()
+                    if prev.startswith('def ') or prev.startswith('async def '):
+                        context = f"inside function"
+                        break
+                    elif prev.startswith('class '):
+                        context = f"inside class"
+                        break
+                    elif prev.startswith('if ') or prev.startswith('elif ') or prev.startswith('else'):
+                        context = f"inside conditional"
+                        break
+                    elif prev.startswith('try:') or prev.startswith('except') or prev.startswith('finally'):
+                        context = f"inside try/except"
+                        break
+                    elif prev.startswith('with '):
+                        context = f"inside with block"
+                        break
+                
+                violations.append((lineno, stripped, context))
+    
+    return violations
+
+# Usage
+violations = find_inline_imports("hyperscale/distributed/nodes/manager/server.py")
+if violations:
+    print(f"❌ Found {len(violations)} inline import(s):\n")
+    for line_num, statement, context in violations:
+        print(f"  Line {line_num} ({context}): {statement}")
+else:
+    print("✅ All imports are at module level")
+```
+
+**Quick Detection Command:**
+
+```bash
+# Find potentially inline imports (imports with leading whitespace)
+grep -n "^[[:space:]]\+import \|^[[:space:]]\+from .* import" server.py | \
+    grep -v "TYPE_CHECKING" | \
+    grep -v "^[0-9]*:[[:space:]]*#"
+```
+
+**Fix Pattern:**
+
+Move ALL inline imports to the top of the file:
+
+```python
+# BEFORE (violation):
+async def _process_workflow(self, workflow_id: str):
+    from hyperscale.distributed.models import WorkflowStatus
+    status = WorkflowStatus.RUNNING
+    ...
+
+# AFTER (correct):
+from hyperscale.distributed.models import WorkflowStatus
+
+async def _process_workflow(self, workflow_id: str):
+    status = WorkflowStatus.RUNNING
+    ...
+```
+
+**BLOCKING**: Do not proceed to Phase 1 if ANY inline imports exist (except in TYPE_CHECKING blocks).
+
 ---
 
 ## Phase 1: Extract All Component Calls
