@@ -809,6 +809,22 @@ class ManagerState:
     def remove_workflow_completion_event(self, workflow_id: str) -> None:
         self._workflow_completion_events.pop(workflow_id, None)
 
+    def remove_workflow_completion_events_for_job(self, job_id: str) -> None:
+        workflow_ids_to_remove = [
+            wf_id
+            for wf_id in self._workflow_completion_events
+            if wf_id.startswith(f"{job_id}:")
+        ]
+        for wf_id in workflow_ids_to_remove:
+            self._workflow_completion_events.pop(wf_id, None)
+
+    def remove_workflow_retries_for_job(self, job_id: str) -> None:
+        workflow_ids_to_remove = [
+            wf_id for wf_id in self._workflow_retries if wf_id.startswith(f"{job_id}:")
+        ]
+        for wf_id in workflow_ids_to_remove:
+            self._workflow_retries.pop(wf_id, None)
+
     # =========================================================================
     # Progress Callbacks Accessors (2 direct accesses)
     # =========================================================================
@@ -838,6 +854,9 @@ class ManagerState:
 
     def set_job_submission(self, job_id: str, submission: JobSubmission) -> None:
         self._job_submissions[job_id] = submission
+
+    def iter_job_submissions(self) -> list[tuple[str, JobSubmission]]:
+        return list(self._job_submissions.items())
 
     # =========================================================================
     # Healthy Gate IDs Accessors (2 direct accesses)
