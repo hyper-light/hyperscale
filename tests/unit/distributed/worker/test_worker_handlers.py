@@ -84,7 +84,7 @@ class MockServerForHandlers:
             self._job_transfer_locks[job_id] = asyncio.Lock()
         return self._job_transfer_locks[job_id]
 
-    def _validate_transfer_fence_token(self, job_id, fence_token):
+    async def _validate_transfer_fence_token(self, job_id, fence_token):
         current = self._job_fence_tokens.get(job_id, -1)
         if fence_token <= current:
             return False, f"Stale token: {fence_token} <= {current}"
