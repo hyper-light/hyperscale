@@ -649,6 +649,9 @@ class ManagerState:
     def iter_dead_manager_timestamps(self) -> list[tuple[tuple[str, int], float]]:
         return list(self._dead_manager_timestamps.items())
 
+    def clear_dead_manager_timestamp(self, addr: tuple[str, int]) -> None:
+        self._dead_manager_timestamps.pop(addr, None)
+
     # =========================================================================
     # Gate Leader Accessors (5 direct accesses)
     # =========================================================================
