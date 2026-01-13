@@ -89,7 +89,7 @@ discovered during systematic tracing of SCENARIOS.md test scenarios through the 
 #### B7: Incomplete GateJobTimeoutTracker.stop() (MEDIUM)
 **Location**: `jobs/gates/gate_job_timeout_tracker.py:142`
 **Issue**: `_tracked_jobs` dict never cleared on shutdown.
-**Status**: TODO
+**Status**: FIXED - `_tracked_jobs.clear()` called in stop() (lines 144-145)
 
 ---
 

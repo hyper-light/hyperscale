@@ -33,7 +33,9 @@ from .state import GateRuntimeState
 
 if TYPE_CHECKING:
     from hyperscale.distributed.swim.core import NodeId
-    from hyperscale.distributed.hash_ring import ConsistentHashRing
+    from hyperscale.distributed.jobs.gates.consistent_hash_ring import (
+        ConsistentHashRing,
+    )
     from hyperscale.distributed.jobs import JobLeadershipTracker
     from hyperscale.distributed.jobs.gates import GateJobManager
     from hyperscale.distributed.leases import JobLease
