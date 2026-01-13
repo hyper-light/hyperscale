@@ -134,8 +134,8 @@ class TestGateConfigDefaults:
     def test_default_orphan_tracking(self):
         """Verify default orphan tracking configuration."""
         config = GateConfig(host="localhost", tcp_port=9000, udp_port=9001)
-        assert config.orphan_grace_period_seconds == 120.0
-        assert config.orphan_check_interval_seconds == 30.0
+        assert config.orphan_grace_period_seconds == 30.0
+        assert config.orphan_check_interval_seconds == 15.0
 
     def test_default_timeout_tracking(self):
         """Verify default timeout tracking configuration (AD-34)."""
@@ -338,6 +338,7 @@ class TestGateConfigImmutability:
     def test_config_is_dataclass(self):
         """Verify GateConfig is a proper dataclass."""
         from dataclasses import is_dataclass
+
         assert is_dataclass(GateConfig)
 
     def test_mutable_default_factories_are_safe(self):
