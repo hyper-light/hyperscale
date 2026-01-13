@@ -946,7 +946,7 @@ class TestCrossComponentConcurrency:
         async def simulate_request_flow(client_id: str, request_num: int):
             try:
                 # Check rate limit
-                result = rate_limiter.check_rate_limit(client_id, "submit")
+                result = await rate_limiter.check_rate_limit(client_id, "submit")
                 if not result.allowed:
                     return
 
