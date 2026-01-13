@@ -5,7 +5,6 @@ These dataclasses define the wire format for all TCP communication
 in the distributed Hyperscale architecture.
 """
 
-import zlib
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any
