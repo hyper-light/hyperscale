@@ -530,20 +530,22 @@ class TestManagerStatePeerManagement:
 
         state._active_manager_peers.add(peer_addr)
 
-        assert state.is_peer_active(peer_addr) is True
+        assert await state.is_peer_active(peer_addr) is True
 
-    def test_add_active_peer(self):
+    @pytest.mark.asyncio
+    async def test_add_active_peer(self):
         """add_active_peer adds to both sets."""
         state = ManagerState()
         peer_addr = ("10.0.0.1", 8000)
         node_id = "manager-123"
 
-        state.add_active_peer(peer_addr, node_id)
+        await state.add_active_peer(peer_addr, node_id)
 
         assert peer_addr in state._active_manager_peers
         assert node_id in state._active_manager_peer_ids
 
-    def test_remove_active_peer(self):
+    @pytest.mark.asyncio
+    async def test_remove_active_peer(self):
         """remove_active_peer removes from both sets."""
         state = ManagerState()
         peer_addr = ("10.0.0.1", 8000)
@@ -552,7 +554,7 @@ class TestManagerStatePeerManagement:
         state._active_manager_peers.add(peer_addr)
         state._active_manager_peer_ids.add(node_id)
 
-        state.remove_active_peer(peer_addr, node_id)
+        await state.remove_active_peer(peer_addr, node_id)
 
         assert peer_addr not in state._active_manager_peers
         assert node_id not in state._active_manager_peer_ids
