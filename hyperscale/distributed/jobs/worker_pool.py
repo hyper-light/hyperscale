@@ -620,8 +620,7 @@ class WorkerPool:
 
             worker.reserved_cores = max(0, worker.reserved_cores - cores)
 
-            # Signal that cores are available
-            self._cores_available.set()
+            self._cores_condition.notify_all()
 
             return True
 

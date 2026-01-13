@@ -141,7 +141,7 @@ class TestDatacenterHealthManager:
         assert status.health == DatacenterHealth.BUSY.value
 
     def test_datacenter_degraded_workers(self) -> None:
-        """Test degraded classification when majority workers unhealthy."""
+        """Test degraded classification when worker overload ratio exceeds 50%."""
         health_mgr = DatacenterHealthManager()
 
         heartbeat = ManagerHeartbeat(
@@ -153,8 +153,9 @@ class TestDatacenterHealthManager:
             active_jobs=5,
             active_workflows=10,
             worker_count=10,
-            healthy_worker_count=3,  # Minority healthy
-            available_cores=20,
+            healthy_worker_count=4,
+            overloaded_worker_count=6,
+            available_cores=60,
             total_cores=100,
         )
 
