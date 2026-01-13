@@ -493,7 +493,7 @@ class MockServerInterface:
 
     # === Context Management ===
 
-    def context_with_value(self, target: tuple[str, int]) -> "MockContextManager":
+    async def context_with_value(self, target: tuple[str, int]) -> "MockContextManager":
         return MockContextManager()
 
     def write_context(self, key: Any, value: Any) -> None:
