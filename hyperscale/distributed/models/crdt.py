@@ -318,10 +318,10 @@ class JobStatsCRDT:
     non-monotonic values. Safe to merge from any subset of DCs
     at any time without coordination.
 
-    Thread Safety:
-        The merge_in_place() method is NOT thread-safe. For concurrent
-        access in async contexts, use ThreadSafeJobStatsCRDT wrapper
-        which provides asyncio.Lock protection around merge operations.
+    Concurrency:
+        The merge_in_place() method is NOT safe for concurrent coroutines.
+        For concurrent access in async contexts, use AsyncSafeJobStatsCRDT
+        wrapper which provides asyncio.Lock protection around merge operations.
 
         The immutable merge() method returns a new instance and is
         inherently safe for concurrent reads (but concurrent merge +
