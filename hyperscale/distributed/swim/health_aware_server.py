@@ -1203,6 +1203,9 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         """
         await self._state_embedder.process_state(state_data, source_addr)
 
+    def _get_worker_state_piggyback(self, max_size: int) -> bytes:
+        return b""
+
     async def _build_xprobe_response(
         self,
         source_addr: tuple[str, int] | bytes,
