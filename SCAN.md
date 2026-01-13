@@ -187,6 +187,61 @@ For each fix, note:
 
 ---
 
+## Phase 5.5: Server-Side Consolidation
+
+**Objective**: Ensure server is a thin orchestration layer, not a dumping ground for business logic.
+
+### Step 5.5a: Identify Incomplete Delegation
+
+Search for patterns that suggest logic should be moved to a coordinator:
+
+```bash
+# Find complex logic blocks (multiple operations on same component)
+grep -n "self._<component>.*\n.*self._<component>" server.py
+
+# Find business logic patterns (conditionals around component calls)
+grep -B2 -A2 "if.*self._<component>" server.py
+```
+
+**Red flags**:
+- Multiple sequential calls to same component that could be one method
+- Conditional logic wrapping component calls (the condition should be inside the component)
+- Data transformation before/after component calls (component should handle its own data format)
+- Try/except blocks around component calls (component should handle its own errors)
+
+### Step 5.5b: Identify Duplicate Server Code
+
+```bash
+# Find similar method patterns
+grep -n "async def _" server.py | look for similar names
+```
+
+**Red flags**:
+- Methods with similar names doing similar things (`_handle_X_from_manager`, `_handle_X_from_gate`)
+- Copy-pasted code blocks with minor variations
+- Same error handling pattern repeated
+
+### Step 5.5c: Identify Useless Wrappers
+
+Server methods that ONLY do:
+```python
+async def _do_thing(self, ...):
+    return await self._coordinator.do_thing(...)
+```
+
+These should either:
+- Be removed (caller uses coordinator directly)
+- OR have the component method renamed to match the server's public interface
+
+### Step 5.5d: Apply the Robustness Principle
+
+For each issue found:
+1. **Move logic to component** - don't keep it in server
+2. **Consolidate duplicates** - one implementation, not two similar ones
+3. **Remove useless wrappers** - direct delegation or nothing
+
+---
+
 ## Phase 6: Clean Up Dead Code
 
 **Objective**: Remove orphaned implementations.
