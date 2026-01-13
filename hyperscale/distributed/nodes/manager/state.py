@@ -646,6 +646,9 @@ class ManagerState:
     def get_dead_manager_timestamp(self, addr: tuple[str, int]) -> float | None:
         return self._dead_manager_timestamps.get(addr)
 
+    def iter_dead_manager_timestamps(self) -> list[tuple[tuple[str, int], float]]:
+        return list(self._dead_manager_timestamps.items())
+
     # =========================================================================
     # Gate Leader Accessors (5 direct accesses)
     # =========================================================================
@@ -924,6 +927,9 @@ class ManagerState:
 
     def clear_manager_peer_unhealthy_since(self, peer_id: str) -> None:
         self._manager_peer_unhealthy_since.pop(peer_id, None)
+
+    def iter_manager_peer_unhealthy_since(self) -> list[tuple[str, float]]:
+        return list(self._manager_peer_unhealthy_since.items())
 
     def get_gate_unhealthy_since(self, gate_id: str) -> float | None:
         return self._gate_unhealthy_since.get(gate_id)
