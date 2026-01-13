@@ -735,6 +735,7 @@ class GateServer(HealthAwareServer):
             get_udp_port=lambda: self._udp_port,
             confirm_peer=self._confirm_peer,
             handle_job_leader_failure=self._handle_job_leader_failure,
+            is_leader=self.is_leader,
         )
 
         self._health_coordinator = GateHealthCoordinator(
@@ -2248,40 +2249,21 @@ class GateServer(HealthAwareServer):
         return (total_gates // 2) + 1
 
     def _get_healthy_gates(self) -> list[GateInfo]:
-        """Get list of healthy gates."""
-        gates = [
+        if self._peer_coordinator:
+            return self._peer_coordinator.get_healthy_gates()
+
+        node_id = self._node_id
+        return [
             GateInfo(
-                gate_id=self._node_id.full,
+                node_id=node_id.full,
                 tcp_host=self._host,
                 tcp_port=self._tcp_port,
                 udp_host=self._host,
                 udp_port=self._udp_port,
+                datacenter=node_id.datacenter,
                 is_leader=self.is_leader(),
-                term=self._leader_election.state.current_term,
-                state=self._gate_state.value,
             )
         ]
-
-        for peer_addr in self._modular_state.get_active_peers():
-            for udp_addr, tcp_addr in self._modular_state.iter_udp_to_tcp_mappings():
-                if tcp_addr == peer_addr:
-                    heartbeat = self._modular_state.get_gate_peer_heartbeat(udp_addr)
-                    if heartbeat:
-                        gates.append(
-                            GateInfo(
-                                gate_id=heartbeat.node_id,
-                                tcp_host=heartbeat.tcp_host,
-                                tcp_port=heartbeat.tcp_port,
-                                udp_host=udp_addr[0],
-                                udp_port=udp_addr[1],
-                                is_leader=heartbeat.is_leader,
-                                term=heartbeat.term,
-                                state=heartbeat.state,
-                            )
-                        )
-                    break
-
-        return gates
 
     async def _broadcast_job_leadership(
         self,
