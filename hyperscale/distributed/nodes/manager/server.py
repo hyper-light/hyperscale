@@ -1625,9 +1625,9 @@ class ManagerServer(HealthAwareServer):
 
                 for job in list(self._job_manager.iter_jobs()):
                     if job.status in (
-                        JobStatus.COMPLETED,
-                        JobStatus.FAILED,
-                        JobStatus.CANCELLED,
+                        JobStatus.COMPLETED.value,
+                        JobStatus.FAILED.value,
+                        JobStatus.CANCELLED.value,
                     ):
                         if (
                             job.completed_at
