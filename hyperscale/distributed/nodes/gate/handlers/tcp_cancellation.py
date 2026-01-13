@@ -295,26 +295,12 @@ class GateCancellationHandler:
                 is_ad20, "unknown", success=False, error=str(error)
             )
 
-    async def handle_job_cancellation_complete(
+    async def handle_cancellation_complete(
         self,
         addr: tuple[str, int],
         data: bytes,
         handle_exception: Callable,
     ) -> bytes:
-        """
-        Handle job cancellation completion push from manager (AD-20).
-
-        Managers push this notification after all workflows in a job have
-        reported cancellation completion.
-
-        Args:
-            addr: Manager address
-            data: Serialized JobCancellationComplete
-            handle_exception: Callback for exception handling
-
-        Returns:
-            b"OK" or b"ERROR"
-        """
         try:
             completion = JobCancellationComplete.load(data)
             job_id = completion.job_id
