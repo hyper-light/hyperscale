@@ -668,11 +668,14 @@ class ManagerState:
     # Job Layer Version Accessors (4 direct accesses)
     # =========================================================================
 
-    def get_job_layer_version(self, job_id: str) -> int:
-        return self._job_layer_version.get(job_id, 0)
+    def get_job_layer_version(self, job_id: str, default: int = 0) -> int:
+        return self._job_layer_version.get(job_id, default)
 
     def set_job_layer_version(self, job_id: str, version: int) -> None:
         self._job_layer_version[job_id] = version
+
+    def setdefault_job_layer_version(self, job_id: str, default: int = 0) -> int:
+        return self._job_layer_version.setdefault(job_id, default)
 
     def increment_job_layer_version(self, job_id: str) -> int:
         current = self._job_layer_version.get(job_id, 0)

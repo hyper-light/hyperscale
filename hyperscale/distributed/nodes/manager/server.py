@@ -3602,8 +3602,8 @@ class ManagerServer(HealthAwareServer):
             sync = ContextLayerSync.load(data)
 
             # Check if this is a newer layer version
-            current_version = self._manager_state._job_layer_version.get(
-                sync.job_id, -1
+            current_version = self._manager_state.get_job_layer_version(
+                sync.job_id, default=-1
             )
             if sync.layer_version <= current_version:
                 return ContextLayerSyncAck(
@@ -3621,7 +3621,7 @@ class ManagerServer(HealthAwareServer):
                 await context.from_dict(workflow_name, values)
 
             # Update layer version
-            self._manager_state._job_layer_version[sync.job_id] = sync.layer_version
+            self._manager_state.set_job_layer_version(sync.job_id, sync.layer_version)
 
             # Update job leader if not set
             if not self._manager_state.has_job_leader(sync.job_id):
@@ -4126,8 +4126,7 @@ class ManagerServer(HealthAwareServer):
             # Initialize context for this job
             self._manager_state.get_or_create_job_context(announcement.job_id)
 
-            if announcement.job_id not in self._manager_state._job_layer_version:
-                self._manager_state._job_layer_version[announcement.job_id] = 0
+            self._manager_state.setdefault_job_layer_version(announcement.job_id, 0)
 
             # Track remote job
             await self._job_manager.track_remote_job(
