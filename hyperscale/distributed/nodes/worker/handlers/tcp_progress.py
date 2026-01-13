@@ -28,7 +28,7 @@ class WorkflowProgressHandler:
         Args:
             server: WorkerServer instance for state access
         """
-        self._server = server
+        self._server: "WorkerServer" = server
 
     def process_ack(self, data: bytes, workflow_id: str | None = None) -> None:
         """

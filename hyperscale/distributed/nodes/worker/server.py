@@ -1222,7 +1222,7 @@ class WorkerServer(HealthAwareServer):
                 workflow_id,
                 success,
                 errors,
-                time.time(),
+                time.monotonic(),
                 self._node_id.full,
                 self.send_tcp,
                 self._host,
