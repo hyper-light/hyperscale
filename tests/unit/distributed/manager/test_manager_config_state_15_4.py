@@ -817,6 +817,6 @@ class TestManagerStateEdgeCases:
         """Latency tracking fields are initialized."""
         state = ManagerState()
 
-        assert state._gate_latency_samples == []
+        assert len(state._gate_latency_samples) == 0
         assert state._peer_manager_latency_samples == {}
         assert state._worker_latency_samples == {}
