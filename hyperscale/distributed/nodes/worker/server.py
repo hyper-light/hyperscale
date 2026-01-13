@@ -1264,8 +1264,11 @@ class WorkerServer(HealthAwareServer):
                     progress=progress,
                     send_tcp=self.send_tcp,
                 )
-            except Exception:
-                pass
+            except Exception as exc:
+                await self._logger.log(
+                    f"Failed to report progress for workflow {workflow_id}: {exc}",
+                    level="debug",
+                )
 
     # =========================================================================
     # Environment Property (for tcp_dispatch.py)
