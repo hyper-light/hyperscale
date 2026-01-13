@@ -224,7 +224,8 @@ class TestResourceExhaustion:
 
         assert bucket.available_tokens >= 9  # Allow for timing variance
 
-    def test_rate_limiter_sustained_overload(self):
+    @pytest.mark.asyncio
+    async def test_rate_limiter_sustained_overload(self):
         """Test rate limiter under sustained overload."""
         config = RateLimitConfig(
             default_bucket_size=10,
@@ -236,7 +237,7 @@ class TestResourceExhaustion:
         allowed = 0
         rejected = 0
         for _ in range(100):
-            result = limiter.check_rate_limit("client-1", "burst_op")
+            result = await limiter.check_rate_limit("client-1", "burst_op")
             if result.allowed:
                 allowed += 1
             else:
