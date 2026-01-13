@@ -1272,59 +1272,60 @@ class ManagerServer(HealthAwareServer):
     # Background Loops
     # =========================================================================
 
+    def _reap_dead_workers(self, now: float) -> None:
+        worker_reap_threshold = now - self._config.dead_worker_reap_interval_seconds
+        workers_to_reap = [
+            worker_id
+            for worker_id, unhealthy_since in self._manager_state.iter_worker_unhealthy_since()
+            if unhealthy_since < worker_reap_threshold
+        ]
+        for worker_id in workers_to_reap:
+            self._registry.unregister_worker(worker_id)
+
+    def _reap_dead_peers(self, now: float) -> None:
+        peer_reap_threshold = now - self._config.dead_peer_reap_interval_seconds
+        peers_to_reap = [
+            peer_id
+            for peer_id, unhealthy_since in self._manager_state.iter_manager_peer_unhealthy_since()
+            if unhealthy_since < peer_reap_threshold
+        ]
+        for peer_id in peers_to_reap:
+            self._registry.unregister_manager_peer(peer_id)
+
+    def _reap_dead_gates(self, now: float) -> None:
+        gate_reap_threshold = now - self._config.dead_gate_reap_interval_seconds
+        gates_to_reap = [
+            gate_id
+            for gate_id, unhealthy_since in self._manager_state.iter_gate_unhealthy_since()
+            if unhealthy_since < gate_reap_threshold
+        ]
+        for gate_id in gates_to_reap:
+            self._registry.unregister_gate(gate_id)
+
+    def _cleanup_stale_dead_manager_tracking(self, now: float) -> None:
+        dead_manager_cleanup_threshold = now - (
+            self._config.dead_peer_reap_interval_seconds * 2
+        )
+        dead_managers_to_cleanup = [
+            tcp_addr
+            for tcp_addr, dead_since in self._manager_state.iter_dead_manager_timestamps()
+            if dead_since < dead_manager_cleanup_threshold
+        ]
+        for tcp_addr in dead_managers_to_cleanup:
+            self._manager_state.remove_dead_manager(tcp_addr)
+            self._manager_state.clear_dead_manager_timestamp(tcp_addr)
+            self._manager_state.remove_peer_lock(tcp_addr)
+
     async def _dead_node_reap_loop(self) -> None:
-        """Periodically reap dead nodes."""
         while self._running:
             try:
                 await asyncio.sleep(self._config.dead_node_check_interval_seconds)
 
                 now = time.monotonic()
-
-                # Reap dead workers
-                worker_reap_threshold = (
-                    now - self._config.dead_worker_reap_interval_seconds
-                )
-                workers_to_reap = [
-                    worker_id
-                    for worker_id, unhealthy_since in self._manager_state.iter_worker_unhealthy_since()
-                    if unhealthy_since < worker_reap_threshold
-                ]
-                for worker_id in workers_to_reap:
-                    self._registry.unregister_worker(worker_id)
-
-                # Reap dead peers
-                peer_reap_threshold = now - self._config.dead_peer_reap_interval_seconds
-                peers_to_reap = [
-                    peer_id
-                    for peer_id, unhealthy_since in self._manager_state.iter_manager_peer_unhealthy_since()
-                    if unhealthy_since < peer_reap_threshold
-                ]
-                for peer_id in peers_to_reap:
-                    self._registry.unregister_manager_peer(peer_id)
-
-                # Reap dead gates
-                gate_reap_threshold = now - self._config.dead_gate_reap_interval_seconds
-                gates_to_reap = [
-                    gate_id
-                    for gate_id, unhealthy_since in self._manager_state.iter_gate_unhealthy_since()
-                    if unhealthy_since < gate_reap_threshold
-                ]
-                for gate_id in gates_to_reap:
-                    self._registry.unregister_gate(gate_id)
-
-                # Cleanup stale dead manager tracking (prevents memory leak)
-                dead_manager_cleanup_threshold = now - (
-                    self._config.dead_peer_reap_interval_seconds * 2
-                )
-                dead_managers_to_cleanup = [
-                    tcp_addr
-                    for tcp_addr, dead_since in self._manager_state.iter_dead_manager_timestamps()
-                    if dead_since < dead_manager_cleanup_threshold
-                ]
-                for tcp_addr in dead_managers_to_cleanup:
-                    self._manager_state.remove_dead_manager(tcp_addr)
-                    self._manager_state.clear_dead_manager_timestamp(tcp_addr)
-                    self._manager_state.remove_peer_lock(tcp_addr)
+                self._reap_dead_workers(now)
+                self._reap_dead_peers(now)
+                self._reap_dead_gates(now)
+                self._cleanup_stale_dead_manager_tracking(now)
 
             except asyncio.CancelledError:
                 break
