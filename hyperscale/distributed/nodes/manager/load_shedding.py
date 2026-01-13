@@ -26,14 +26,18 @@ if TYPE_CHECKING:
 
 
 # Re-export RequestPriority for backwards compatibility
-__all__ = ["RequestPriority", "OverloadState", "ManagerLoadShedder"]
+__all__ = ["RequestPriority", "OverloadStateTracker", "ManagerLoadShedder"]
+
+# Backwards compatibility alias
+OverloadState = "OverloadStateTracker"
 
 
-class OverloadState:
+class OverloadStateTracker:
     """
-    Simple overload state tracker.
+    Tracks pending request counts to determine current overload state.
 
-    Tracks system load for shedding decisions.
+    Note: This is distinct from reliability.overload.OverloadState (an Enum).
+    This class is a stateful tracker; the Enum is just the state values.
     """
 
     __slots__ = ("_pending_count", "_max_pending", "_state")
