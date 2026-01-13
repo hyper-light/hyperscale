@@ -358,11 +358,7 @@ class GateServer(HealthAwareServer):
         self._overload_detector = HybridOverloadDetector()
         self._load_shedder = LoadShedder(self._overload_detector)
 
-        # Backpressure tracking (AD-37)
-        self._manager_backpressure: dict[tuple[str, int], BackpressureLevel] = {}
-        self._backpressure_delay_ms: int = 0
-        self._dc_backpressure: dict[str, BackpressureLevel] = {}
-        self._backpressure_lock = asyncio.Lock()
+        # Backpressure tracking (AD-37) - state managed by _modular_state
 
         # Throughput tracking
         self._forward_throughput_count: int = 0
