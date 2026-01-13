@@ -101,7 +101,7 @@ discovered during systematic tracing of SCENARIOS.md test scenarios through the 
 - `_on_dc_latency()` callback never triggered
 - Cross-DC correlation detector never receives latency signals
 - Partition detection broken
-**Status**: TODO
+**Status**: FIXED - `_handle_xack_response` implemented at line 1057-1085, passes ack to FederatedHealthMonitor which invokes `_on_dc_latency` callback
 
 #### C2: No Circuit Breaker Success Recording (CRITICAL)
 **Location**: `gate/server.py:1939, 2516`
