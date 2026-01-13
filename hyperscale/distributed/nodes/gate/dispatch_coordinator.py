@@ -27,6 +27,7 @@ from hyperscale.distributed.swim.core import (
     QuorumCircuitOpenError,
     QuorumUnavailableError,
 )
+from hyperscale.logging.hyperscale_logging_models import ServerWarning
 
 if TYPE_CHECKING:
     from hyperscale.distributed.nodes.gate.state import GateRuntimeState
