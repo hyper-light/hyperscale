@@ -931,6 +931,10 @@ class ManagerServer(HealthAwareServer):
     def _on_worker_globally_dead(self, worker_id: str) -> None:
         """Handle worker global death (AD-30)."""
         self._health_monitor.on_global_death(worker_id)
+        if self._worker_disseminator:
+            self._task_runner.run(
+                self._worker_disseminator.broadcast_worker_dead, worker_id, "dead"
+            )
 
     def _on_worker_dead_for_job(self, job_id: str, worker_id: str) -> None:
         """Handle worker death for specific job (AD-30)."""
@@ -2064,6 +2068,9 @@ class ManagerServer(HealthAwareServer):
 
         await self._handle_worker_failure(worker_id)
         self._manager_state._worker_deadlines.pop(worker_id, None)
+
+        if self._worker_disseminator:
+            await self._worker_disseminator.broadcast_worker_dead(worker_id, "evicted")
 
     def _cleanup_job(self, job_id: str) -> None:
         """
