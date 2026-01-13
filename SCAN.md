@@ -1915,6 +1915,224 @@ for node in ast.walk(tree):
 "
 ```
 
+### Step 3.5k.1b: Scan for Untyped Class Attributes (ALL Classes)
+
+**CRITICAL: This applies to ALL modular classes** - state classes, coordinators, handlers, server, and helpers. Both public AND private attributes (`_private` and `public`) require type hints.
+
+**The Problem:**
+
+```python
+# WRONG: Untyped attributes in __init__
+class WorkerState:
+    def __init__(self):
+        self._workers = {}  # What type? dict[str, WorkerInfo]? dict[str, Any]?
+        self._pending = []  # list[str]? list[JobInfo]? list[Any]?
+        self._lock = None   # asyncio.Lock? threading.Lock? None forever?
+        self.running = True # bool? Presumed but not declared
+
+# WRONG: Untyped class-level attributes
+class JobManager:
+    _instance = None  # What type?
+    DEFAULT_TIMEOUT = 30  # int? float?
+```
+
+**Detection Script (Comprehensive):**
+
+```python
+import ast
+from pathlib import Path
+from typing import NamedTuple
+
+class UntypedAttribute(NamedTuple):
+    line: int
+    class_name: str
+    attr_name: str
+    location: str  # "__init__", "class_body", or method name
+
+def find_untyped_class_attributes(file_path: str) -> list[UntypedAttribute]:
+    """
+    Find ALL untyped class attributes - both class-level and instance-level.
+    
+    Checks:
+    1. Class-level assignments without annotations
+    2. self.X = ... in __init__ without prior annotation
+    3. self.X = ... in other methods without prior annotation
+    """
+    with open(file_path) as f:
+        source = f.read()
+        tree = ast.parse(source)
+    
+    violations = []
+    
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ClassDef):
+            continue
+        
+        class_name = node.name
+        
+        # Collect declared annotations (class-level type hints)
+        declared_attrs: set[str] = set()
+        
+        for item in node.body:
+            # Class-level annotations: attr: Type or attr: Type = value
+            if isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name):
+                declared_attrs.add(item.target.id)
+            
+            # Class-level assignment WITHOUT annotation = violation
+            elif isinstance(item, ast.Assign):
+                for target in item.targets:
+                    if isinstance(target, ast.Name):
+                        if target.id not in declared_attrs:
+                            violations.append(UntypedAttribute(
+                                line=item.lineno,
+                                class_name=class_name,
+                                attr_name=target.id,
+                                location="class_body"
+                            ))
+        
+        # Now check methods for self.X assignments
+        for item in node.body:
+            if not isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            
+            method_name = item.name
+            
+            for stmt in ast.walk(item):
+                # Look for self.X = ... assignments
+                if isinstance(stmt, ast.Assign):
+                    for target in stmt.targets:
+                        if (isinstance(target, ast.Attribute) and
+                            isinstance(target.value, ast.Name) and
+                            target.value.id == 'self'):
+                            attr_name = target.attr
+                            # Check if this attribute was declared with a type hint
+                            if attr_name not in declared_attrs:
+                                violations.append(UntypedAttribute(
+                                    line=stmt.lineno,
+                                    class_name=class_name,
+                                    attr_name=attr_name,
+                                    location=method_name
+                                ))
+                                # Add to declared to avoid duplicate reports
+                                declared_attrs.add(attr_name)
+    
+    return violations
+
+# Usage - scan all modular class files
+def scan_directory(directory: str) -> dict[str, list[UntypedAttribute]]:
+    results = {}
+    for py_file in Path(directory).glob("**/*.py"):
+        violations = find_untyped_class_attributes(str(py_file))
+        if violations:
+            results[str(py_file)] = violations
+    return results
+
+# Run on worker module
+results = scan_directory("hyperscale/distributed/nodes/worker")
+for file_path, violations in results.items():
+    print(f"\n{file_path}:")
+    for v in violations:
+        print(f"  Line {v.line}: {v.class_name}.{v.attr_name} (in {v.location})")
+```
+
+**Quick Detection Command:**
+
+```bash
+# Find self.X = assignments in __init__ without type annotations
+python3 -c "
+import ast
+import sys
+
+file_path = sys.argv[1] if len(sys.argv) > 1 else 'state.py'
+
+with open(file_path) as f:
+    tree = ast.parse(f.read())
+
+for node in ast.walk(tree):
+    if isinstance(node, ast.ClassDef):
+        # Get declared type hints
+        declared = {item.target.id for item in node.body 
+                    if isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name)}
+        
+        # Find __init__
+        for item in node.body:
+            if isinstance(item, ast.FunctionDef) and item.name == '__init__':
+                for stmt in ast.walk(item):
+                    if isinstance(stmt, ast.Assign):
+                        for t in stmt.targets:
+                            if (isinstance(t, ast.Attribute) and 
+                                isinstance(t.value, ast.Name) and 
+                                t.value.id == 'self' and
+                                t.attr not in declared):
+                                print(f'{stmt.lineno}:{node.name}.{t.attr}')
+" state.py
+```
+
+**Correct Pattern - Class Attribute Type Hints:**
+
+```python
+# CORRECT: Type hints declared at class level, initialized in __init__
+class WorkerState:
+    # Declare all attributes with types at class level
+    _workers: dict[str, WorkerInfo]
+    _pending_jobs: list[JobInfo]
+    _job_fence_tokens: dict[str, int]
+    _lock: asyncio.Lock
+    _logger: Logger | None
+    _running: bool
+    
+    # Class-level constants also need types
+    DEFAULT_TIMEOUT: float = 30.0
+    MAX_RETRIES: int = 3
+    
+    def __init__(self, logger: Logger | None = None):
+        # Initialize (types already declared above)
+        self._workers = {}
+        self._pending_jobs = []
+        self._job_fence_tokens = {}
+        self._lock = asyncio.Lock()
+        self._logger = logger
+        self._running = False
+
+# ALSO CORRECT: Inline annotation in __init__ (less preferred but valid)
+class JobManager:
+    def __init__(self, config: JobConfig):
+        self._config: JobConfig = config
+        self._cache: dict[str, JobInfo] = {}
+        self._active_count: int = 0
+```
+
+**Why Class-Level Declaration is Preferred:**
+
+1. **Single source of truth**: All attributes visible at top of class
+2. **IDE support**: Better autocomplete before __init__ runs
+3. **Documentation**: Clear picture of class state at a glance
+4. **Dataclass compatibility**: Same pattern as @dataclass
+
+### Step 3.5k.1c: Scan All Modular Class Files
+
+**MANDATORY**: Run the attribute scanner on ALL files in the node module:
+
+```bash
+# For worker node
+for f in hyperscale/distributed/nodes/worker/*.py; do
+    echo "=== $f ===" 
+    python3 scan_class_attrs.py "$f"
+done
+
+# For manager node  
+for f in hyperscale/distributed/nodes/manager/*.py; do
+    echo "=== $f ==="
+    python3 scan_class_attrs.py "$f"
+done
+
+# For gate node
+for f in hyperscale/distributed/nodes/gate/*.py; do
+    echo "=== $f ==="
+    python3 scan_class_attrs.py "$f"
+done
+```
+
 ### Step 3.5k.2: Research and Apply Correct Type Hints
 
 **CRITICAL: Do not guess types. Research what is actually passed.**
