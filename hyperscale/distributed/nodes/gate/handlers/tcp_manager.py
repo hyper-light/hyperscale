@@ -89,8 +89,9 @@ class GateManagerHandler:
             get_tcp_port: Callback to get this gate's TCP port
             get_healthy_gates: Callback to get healthy gate list
             record_manager_heartbeat: Callback to record manager heartbeat
-            handle_manager_backpressure_signal: Callback for backpressure handling
-            update_dc_backpressure: Callback to update DC backpressure
+            handle_manager_backpressure_signal: Async callback for backpressure handling
+            update_dc_backpressure: Async callback to update DC backpressure
+            set_manager_backpressure_none: Async callback to clear manager backpressure
             broadcast_manager_discovery: Callback to broadcast discovery
         """
         self._state = state
@@ -107,6 +108,7 @@ class GateManagerHandler:
         self._record_manager_heartbeat = record_manager_heartbeat
         self._handle_manager_backpressure_signal = handle_manager_backpressure_signal
         self._update_dc_backpressure = update_dc_backpressure
+        self._set_manager_backpressure_none = set_manager_backpressure_none
         self._broadcast_manager_discovery = broadcast_manager_discovery
 
     async def handle_status_update(
@@ -148,12 +150,11 @@ class GateManagerHandler:
                     level=BackpressureLevel(status.backpressure_level),
                     suggested_delay_ms=status.backpressure_delay_ms,
                 )
-                self._handle_manager_backpressure_signal(
+                await self._handle_manager_backpressure_signal(
                     manager_addr, datacenter_id, backpressure_signal
                 )
-            elif manager_addr in self._state._manager_backpressure:
-                self._state._manager_backpressure[manager_addr] = BackpressureLevel.NONE
-                self._update_dc_backpressure(datacenter_id)
+            else:
+                await self._set_manager_backpressure_none(manager_addr, datacenter_id)
 
             return b"ok"
 
