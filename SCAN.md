@@ -2550,12 +2550,13 @@ echo -e "\n=== Scan Complete ==="
 
 - **ZERO** untyped parameters (except `self`/`cls`) in ALL modular class files
 - **ZERO** untyped class attributes (both public and private, class-level and instance-level)
+- **ZERO** incomplete generic types (`dict` without `[K, V]`, `list` without `[T]`, etc.)
 - **ZERO** use of `Any` or `object` as type hints (without justification)
 - **ZERO** public methods without return type hints
 - All complex types documented in docstrings
 - LSP diagnostics clean on ALL scanned files
 
-**BLOCKING**: Phase 3.5k is not complete until ALL functions, methods, AND class attributes across ALL modular class files have properly researched and applied type hints.
+**BLOCKING**: Phase 3.5k is not complete until ALL functions, methods, AND class attributes across ALL modular class files have properly researched and applied type hints with complete generic parameters.
 
 ---
 
