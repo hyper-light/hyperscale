@@ -227,7 +227,7 @@ class MockServerInterface:
 
     # === Peer Confirmation ===
 
-    def confirm_peer(self, peer: tuple[str, int]) -> bool:
+    async def confirm_peer(self, peer: tuple[str, int]) -> bool:
         if peer in self._confirmed_peers:
             return False
         self._confirmed_peers.add(peer)
