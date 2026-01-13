@@ -364,10 +364,6 @@ class TestCircuitBreakerManagerFailureModes:
         await manager.record_failure(addr3)
         await manager.record_failure(addr3)
 
-        status = manager.get_all_circuit_status()
-
-        # Note: get_all_circuit_status calls is_circuit_open synchronously
-        # but the actual circuits should be marked as OPEN in their state
         circuit1 = await manager.get_circuit(addr1)
         circuit3 = await manager.get_circuit(addr3)
         assert circuit1.circuit_state == CircuitState.OPEN
