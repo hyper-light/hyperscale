@@ -279,6 +279,235 @@ For each issue found:
 
 ---
 
+## Phase 9: Duplicate State Detection
+
+**Objective**: Find and eliminate duplicate state between server and modular classes (state/coordinators).
+
+### The Problem
+
+Server often has instance variables that duplicate state already managed by `_modular_state` or coordinators:
+
+```python
+# In server __init__:
+self._active_gate_peers: set[tuple[str, int]] = set()  # DUPLICATE
+self._gate_peer_info: dict[...] = {}                    # DUPLICATE
+
+# In GateRuntimeState:
+self._active_gate_peers: set[tuple[str, int]] = set()  # CANONICAL
+self._gate_peer_info: dict[...] = {}                    # CANONICAL
+```
+
+This causes:
+- **Drift**: Values can differ between server and state
+- **Confusion**: Which is source of truth?
+- **Bugs**: Updates to one don't update the other
+- **Maintenance burden**: Same logic duplicated
+
+### Step 9a: Extract Server Instance Variables
+
+```bash
+# Get all instance variable declarations from __init__
+grep -n "self\._[a-z_]* = \|self\._[a-z_]*: " server.py | head -200
+```
+
+Build table:
+| Variable | Type | Line | Purpose |
+|----------|------|------|---------|
+
+### Step 9b: Extract State Class Variables
+
+```bash
+# Get all instance variables from state class
+grep -n "self\._[a-z_]* = \|self\._[a-z_]*: " state.py
+```
+
+Build table:
+| Variable | Type | Line | Purpose |
+|----------|------|------|---------|
+
+### Step 9c: Build Comparison Matrix
+
+Cross-reference the two tables:
+
+| Variable Name | In Server? | In State? | Verdict |
+|---------------|------------|-----------|---------|
+| `_active_gate_peers` | Yes (L327) | Yes (L52) | **DUPLICATE** |
+| `_gate_peer_info` | Yes (L334) | Yes (L55) | **DUPLICATE** |
+| `_job_manager` | Yes (L380) | No | OK - component ref |
+| `_forward_throughput_count` | No | Yes (L111) | OK - state owns it |
+
+### Step 9d: Classify Duplicates
+
+For each duplicate, determine the pattern:
+
+| Pattern | Description | Action |
+|---------|-------------|--------|
+| **Shadow Copy** | Server has copy of state variable | Remove from server, use `_modular_state.X` |
+| **Initialization Copy** | Server initializes, never syncs | Remove from server, initialize in state |
+| **Stale Migration** | Variable moved to state but not removed from server | Remove from server |
+| **Access Convenience** | Server caches for faster access | Remove; access through state (perf is rarely an issue) |
+
+### Step 9e: Consolidate to State
+
+For each duplicate:
+
+1. **Find all usages in server**:
+   ```bash
+   grep -n "self\._<variable>" server.py
+   ```
+
+2. **Replace with state access**:
+   ```python
+   # Before:
+   self._active_gate_peers.add(addr)
+   
+   # After:
+   self._modular_state._active_gate_peers.add(addr)
+   # OR better - use a state method:
+   self._modular_state.add_active_peer(addr)
+   ```
+
+3. **Remove declaration from server `__init__`**
+
+4. **Verify with LSP diagnostics**
+
+### Step 9f: Create State Methods (if needed)
+
+If the server was doing multi-step operations on the variable, create a method in state:
+
+```python
+# In state.py:
+def add_active_peer(self, addr: tuple[str, int]) -> None:
+    """Add peer to active set."""
+    self._active_gate_peers.add(addr)
+    
+def remove_active_peer(self, addr: tuple[str, int]) -> None:
+    """Remove peer from active set."""
+    self._active_gate_peers.discard(addr)
+```
+
+Then server uses:
+```python
+self._modular_state.add_active_peer(addr)
+```
+
+### Output
+
+- Zero duplicate variables between server and state
+- All state access goes through `_modular_state` or coordinator methods
+- Server `__init__` only contains configuration and component references
+
+---
+
+## Phase 10: Delegation Opportunity Analysis
+
+**Objective**: Proactively identify server methods that should be delegated to coordinators.
+
+### The Goal
+
+Server should be a **thin orchestration layer**:
+- Receives requests
+- Routes to appropriate coordinator
+- Handles lifecycle events
+- Wires components together
+
+Business logic belongs in coordinators/state.
+
+### Step 10a: Categorize Server Methods
+
+List all private methods:
+```bash
+grep -n "async def _\|def _" server.py
+```
+
+Categorize each method:
+
+| Category | Description | Where It Belongs |
+|----------|-------------|------------------|
+| **Business Logic** | Conditionals on domain data, iterations over collections, calculations | Coordinator |
+| **Orchestration** | Calling coordinators, handling responses, wiring | Server (keep) |
+| **Lifecycle Hook** | `_on_peer_confirmed`, `_on_node_dead` | Server (keep) |
+| **Protocol Handler** | Network/message handling | Server (keep) |
+| **Pure Delegation** | Single call to coordinator | Server or eliminate |
+
+### Step 10b: Identify Delegation Candidates
+
+A method is a **delegation candidate** if it:
+
+1. **Contains conditional logic** (if/else, match) on domain data
+2. **Iterates over domain collections** (workers, datacenters, jobs)
+3. **Performs calculations** (counts, averages, selections)
+4. **Has no I/O or coordinator calls** - pure computation
+5. **Could be unit tested in isolation** without server context
+6. **Is > 10 lines** of actual logic (not just delegation)
+
+Build candidate list:
+
+| Method | Lines | Logic Type | Target Coordinator |
+|--------|-------|------------|-------------------|
+| `_get_healthy_gates` | 33 | Iteration + construction | `peer_coordinator` |
+| `_has_quorum_available` | 5 | Business logic | `leadership_coordinator` |
+| `_legacy_select_datacenters` | 40 | Selection algorithm | `health_coordinator` |
+
+### Step 10c: Match to Existing Coordinators
+
+For each candidate, identify target:
+
+| Candidate | Best Fit Coordinator | Reasoning |
+|-----------|---------------------|-----------|
+| `_get_healthy_gates` | `peer_coordinator` | Manages peer/gate state |
+| `_has_quorum_available` | `leadership_coordinator` | Manages quorum/leadership |
+| `_build_datacenter_candidates` | `health_coordinator` | Manages DC health |
+
+**If no coordinator fits:**
+- Consider if a new coordinator is warranted
+- Or if the method is actually orchestration (keep in server)
+
+### Step 10d: Execute Delegations
+
+For each candidate, one at a time:
+
+1. **Move logic to coordinator**:
+   - Copy method body
+   - Adapt to use coordinator's state references
+   - Add docstring
+
+2. **Replace server method with delegation**:
+   ```python
+   # Before (in server):
+   def _get_healthy_gates(self) -> list[GateInfo]:
+       gates = [...]
+       for peer_addr in self._active_gate_peers:
+           ...
+       return gates
+   
+   # After (in server):
+   def _get_healthy_gates(self) -> list[GateInfo]:
+       return self._peer_coordinator.get_healthy_gates()
+   ```
+
+3. **Run LSP diagnostics**
+
+4. **Commit**
+
+### Step 10e: Verify Server is "Thin"
+
+After delegation, server methods should average:
+- **< 15 lines** of actual code (not counting docstrings)
+- **1-3 coordinator calls** per method
+- **Minimal conditionals** (those should be in coordinators)
+
+### Red Flags (methods to investigate)
+
+```bash
+# Find long methods
+awk '/def _/{p=1;n=0} p{n++} /^    def |^class /{if(p&&n>20)print prev,n;p=0} {prev=$0}' server.py
+```
+
+Any method > 20 lines should be scrutinized for delegation opportunities.
+
+---
+
 ## Example Application
 
 **Input**: `fence_token=self._leases.get_job_fencing_token(job_id)` at line 4629
