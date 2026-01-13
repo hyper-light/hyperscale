@@ -39,7 +39,7 @@ class WorkerState:
             core_allocator: The CoreAllocator instance for core management
         """
         # Core allocation
-        self._core_allocator = core_allocator
+        self._core_allocator: "CoreAllocator" = core_allocator
 
         # Manager tracking
         self._known_managers: dict[str, ManagerInfo] = {}
@@ -65,7 +65,7 @@ class WorkerState:
 
         # Progress buffering
         self._progress_buffer: dict[str, WorkflowProgress] = {}
-        self._progress_buffer_lock = asyncio.Lock()
+        self._progress_buffer_lock: asyncio.Lock = asyncio.Lock()
 
         # Backpressure tracking (AD-23)
         self._manager_backpressure: dict[str, BackpressureLevel] = {}
