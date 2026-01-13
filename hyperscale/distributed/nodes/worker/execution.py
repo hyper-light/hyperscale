@@ -55,13 +55,15 @@ class WorkerExecutor:
             progress_flush_interval: Interval for progress buffer flush
             backpressure_manager: Backpressure manager for AD-37 compliance
         """
-        self._core_allocator = core_allocator
-        self._logger = logger
-        self._state = state
-        self._progress_update_interval = progress_update_interval
-        self._progress_flush_interval = progress_flush_interval
-        self._backpressure_manager = backpressure_manager
-        self._running = False
+        self._core_allocator: "CoreAllocator" = core_allocator
+        self._logger: "Logger" = logger
+        self._state: "WorkerState" = state
+        self._progress_update_interval: float = progress_update_interval
+        self._progress_flush_interval: float = progress_flush_interval
+        self._backpressure_manager: "WorkerBackpressureManager | None" = (
+            backpressure_manager
+        )
+        self._running: bool = False
 
     @property
     def available_cores(self) -> int:
