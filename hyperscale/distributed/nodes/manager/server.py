@@ -1763,8 +1763,42 @@ class ManagerServer(HealthAwareServer):
             )
 
     def get_manager_health_state(self) -> str:
-        """Get current manager health overload state."""
         return self._manager_health_state
+
+    def _log_peer_manager_health_transition(
+        self,
+        peer_id: str,
+        previous_state: str,
+        new_state: str,
+    ) -> None:
+        state_severity = {"healthy": 0, "busy": 1, "stressed": 2, "overloaded": 3}
+        previous_severity = state_severity.get(previous_state, 0)
+        new_severity = state_severity.get(new_state, 0)
+        is_degradation = new_severity > previous_severity
+
+        if is_degradation:
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerWarning(
+                    message=f"Peer manager {peer_id[:8]}... health degraded: {previous_state} -> {new_state}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                ),
+            )
+        else:
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerDebug(
+                    message=f"Peer manager {peer_id[:8]}... health improved: {previous_state} -> {new_state}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                ),
+            )
+
+    def get_peer_manager_health_states(self) -> dict[str, str]:
+        return dict(self._manager_state._peer_manager_health_states)
 
     # =========================================================================
     # State Sync
