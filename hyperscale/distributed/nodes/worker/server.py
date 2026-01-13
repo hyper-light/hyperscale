@@ -900,6 +900,17 @@ class WorkerServer(HealthAwareServer):
     # Registration Methods
     # =========================================================================
 
+    def add_to_probe_scheduler(self, peer_udp_addr: tuple[str, int]) -> None:
+        """
+        Add a peer to the SWIM probe scheduler.
+
+        Wrapper around _probe_scheduler.add_member for use as callback.
+
+        Args:
+            peer_udp_addr: UDP address tuple (host, port) of peer to probe
+        """
+        self._probe_scheduler.add_member(peer_udp_addr)
+
     async def _register_with_manager(self, manager_addr: tuple[str, int]) -> bool:
         """Register this worker with a manager."""
         return await self._registration_handler.register_with_manager(
