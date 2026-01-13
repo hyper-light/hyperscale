@@ -5,6 +5,7 @@ Handles gate/manager leader tracking, fence token validation, and orphan detecti
 Implements AD-16 (Leadership Transfer) semantics.
 """
 
+import asyncio
 import time
 
 from hyperscale.distributed.models import (
@@ -14,6 +15,7 @@ from hyperscale.distributed.models import (
 )
 from hyperscale.distributed.nodes.client.state import ClientState
 from hyperscale.logging import Logger
+from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerWarning
 
 
 class ClientLeadershipTracker:

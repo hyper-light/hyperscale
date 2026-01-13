@@ -207,7 +207,8 @@ class TestGatePeerMethods:
 class TestDatacenterManagerMethods:
     """Tests for datacenter and manager tracking methods."""
 
-    def test_update_manager_status(self):
+    @pytest.mark.asyncio
+    async def test_update_manager_status(self):
         """Update manager status stores heartbeat and timestamp."""
         state = GateRuntimeState()
         dc_id = "dc-east"
@@ -219,27 +220,33 @@ class TestDatacenterManagerMethods:
         heartbeat = MockHeartbeat()
         timestamp = time.monotonic()
 
-        state.update_manager_status(dc_id, manager_addr, heartbeat, timestamp)
+        await state.update_manager_status(dc_id, manager_addr, heartbeat, timestamp)
 
         assert dc_id in state._datacenter_manager_status
         assert manager_addr in state._datacenter_manager_status[dc_id]
         assert state._datacenter_manager_status[dc_id][manager_addr] is heartbeat
         assert state._manager_last_status[manager_addr] == timestamp
 
-    def test_update_manager_status_multiple_dcs(self):
+    @pytest.mark.asyncio
+    async def test_update_manager_status_multiple_dcs(self):
         """Update manager status for multiple DCs."""
         state = GateRuntimeState()
 
         class MockHeartbeat:
             pass
 
-        state.update_manager_status("dc-east", ("10.0.0.1", 8000), MockHeartbeat(), 1.0)
-        state.update_manager_status("dc-west", ("10.0.1.1", 8000), MockHeartbeat(), 2.0)
+        await state.update_manager_status(
+            "dc-east", ("10.0.0.1", 8000), MockHeartbeat(), 1.0
+        )
+        await state.update_manager_status(
+            "dc-west", ("10.0.1.1", 8000), MockHeartbeat(), 2.0
+        )
 
         assert "dc-east" in state._datacenter_manager_status
         assert "dc-west" in state._datacenter_manager_status
 
-    def test_get_manager_status(self):
+    @pytest.mark.asyncio
+    async def test_get_manager_status(self):
         """Get manager status returns heartbeat."""
         state = GateRuntimeState()
 
@@ -247,7 +254,7 @@ class TestDatacenterManagerMethods:
             pass
 
         heartbeat = MockHeartbeat()
-        state.update_manager_status("dc-east", ("10.0.0.1", 8000), heartbeat, 1.0)
+        await state.update_manager_status("dc-east", ("10.0.0.1", 8000), heartbeat, 1.0)
 
         result = state.get_manager_status("dc-east", ("10.0.0.1", 8000))
         assert result is heartbeat
