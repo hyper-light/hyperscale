@@ -172,13 +172,13 @@ discovered during systematic tracing of SCENARIOS.md test scenarios through the 
 **Location**: `manager/registry.py:81-98`
 **Issue**: `unregister_worker()` doesn't clean `_worker_job_last_progress`.
 **Impact**: O(workers × jobs) entries never freed.
-**Status**: TODO
+**Status**: FIXED - `unregister_worker()` now cleans up all worker job progress entries (lines 101-105)
 
 #### E2: Missing _worker_latency_samples Cleanup (HIGH)
 **Location**: `manager/registry.py:81-98`
 **Issue**: `_worker_latency_samples` not cleaned on unregister.
 **Impact**: 1000-entry deque per worker never freed.
-**Status**: TODO
+**Status**: FIXED - `unregister_worker()` now cleans up worker latency samples (line 99)
 
 #### E3: TOCTOU Race in Core Allocation (CRITICAL)
 **Location**: `jobs/worker_pool.py:487-546`
