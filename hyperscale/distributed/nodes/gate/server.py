@@ -2203,12 +2203,16 @@ class GateServer(HealthAwareServer):
         return (primary, fallback, worst_health)
 
     def _build_datacenter_candidates(self) -> list[DatacenterCandidate]:
-        candidates = []
-        for dc_id in self._datacenter_managers.keys():
-            status = self._classify_datacenter_health(dc_id)
+        datacenter_ids = list(self._datacenter_managers.keys())
+        if self._health_coordinator:
+            return self._health_coordinator.build_datacenter_candidates(datacenter_ids)
+
+        candidates: list[DatacenterCandidate] = []
+        for datacenter_id in datacenter_ids:
+            status = self._classify_datacenter_health(datacenter_id)
             candidates.append(
                 DatacenterCandidate(
-                    datacenter_id=dc_id,
+                    datacenter_id=datacenter_id,
                     health_bucket=status.health.upper(),
                     available_cores=status.available_capacity,
                     total_cores=status.available_capacity + status.queue_depth,
