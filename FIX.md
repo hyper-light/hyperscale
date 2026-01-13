@@ -41,7 +41,7 @@ discovered during systematic tracing of SCENARIOS.md test scenarios through the 
 **Location**: `gate/handlers/tcp_manager.py:131-134`
 **Issue**: Manager status updates have no synchronization with cleanup loop.
 **Impact**: Data corruption, incorrect health states.
-**Status**: TODO
+**Status**: FIXED - `update_manager_status()` uses `_manager_state_lock` for synchronization (state.py line 181)
 
 #### A3: Synthetic Heartbeat Not Cleaned (MEDIUM)
 **Location**: `gate/handlers/tcp_manager.py:444-459`
