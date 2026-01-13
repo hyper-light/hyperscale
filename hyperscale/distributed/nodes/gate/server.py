@@ -2029,18 +2029,12 @@ class GateServer(HealthAwareServer):
         heartbeat: ManagerHeartbeat,
         source_addr: tuple[str, int],
     ) -> None:
-        """Handle embedded manager heartbeat from SWIM."""
         self._capacity_aggregator.record_heartbeat(heartbeat)
 
         if self._health_coordinator:
-            self._health_coordinator.handle_embedded_manager_heartbeat(
-                heartbeat.datacenter,
+            await self._health_coordinator.handle_embedded_manager_heartbeat(
+                heartbeat,
                 source_addr,
-                heartbeat.node_id,
-                heartbeat.is_leader,
-                heartbeat.term,
-                heartbeat.worker_count,
-                heartbeat.available_cores,
             )
 
     async def _handle_gate_peer_heartbeat(
