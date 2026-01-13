@@ -6,7 +6,7 @@ import asyncio
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Callable, Any
+from typing import Callable
 
 from hyperscale.distributed.swim.core.types import Status
 from hyperscale.distributed.swim.core.node_state import NodeState
