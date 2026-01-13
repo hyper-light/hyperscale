@@ -57,6 +57,7 @@ class TrackingToken:
     - Workflow:    datacenter:manager_id:job_id:workflow_id
     - Sub-workflow: datacenter:manager_id:job_id:workflow_id:worker_id
     """
+
     datacenter: str
     manager_id: str
     job_id: str
@@ -111,7 +112,9 @@ class TrackingToken:
         """
         parts = token_str.split(":")
         if len(parts) < 3:
-            raise ValueError(f"Invalid token format (need at least 3 parts): {token_str}")
+            raise ValueError(
+                f"Invalid token format (need at least 3 parts): {token_str}"
+            )
 
         datacenter = parts[0]
         manager_id = parts[1]
@@ -132,7 +135,9 @@ class TrackingToken:
         if self.worker_id:
             return f"{self.datacenter}:{self.manager_id}:{self.job_id}:{self.workflow_id}:{self.worker_id}"
         elif self.workflow_id:
-            return f"{self.datacenter}:{self.manager_id}:{self.job_id}:{self.workflow_id}"
+            return (
+                f"{self.datacenter}:{self.manager_id}:{self.job_id}:{self.workflow_id}"
+            )
         else:
             return f"{self.datacenter}:{self.manager_id}:{self.job_id}"
 
@@ -199,11 +204,14 @@ class TrackingToken:
 @dataclass(slots=True)
 class WorkflowInfo:
     """Information about a workflow within a job."""
-    token: TrackingToken          # Full tracking token (DC:manager:job:workflow)
+
+    token: TrackingToken  # Full tracking token (DC:manager:job:workflow)
     name: str
     workflow: Workflow | None = None
     status: WorkflowStatus = WorkflowStatus.PENDING
-    sub_workflow_tokens: list[str] = field(default_factory=list)  # Sub-workflow token strings
+    sub_workflow_tokens: list[str] = field(
+        default_factory=list
+    )  # Sub-workflow token strings
     completion_event: asyncio.Event = field(default_factory=asyncio.Event)
     error: str | None = None
     aggregation_error: str | None = None  # Separate from workflow error
@@ -216,16 +224,16 @@ class WorkflowInfo:
 
 @dataclass(slots=True)
 class SubWorkflowInfo:
-    """Information about a sub-workflow dispatched to a specific worker."""
-    token: TrackingToken          # Full tracking token (DC:manager:job:workflow:worker)
-    parent_token: TrackingToken   # Parent workflow token
+    token: TrackingToken
+    parent_token: TrackingToken
     cores_allocated: int
     progress: WorkflowProgress | None = None
     result: WorkflowFinalResult | None = None
+    dispatched_context: bytes = b""
+    dispatched_version: int = 0
 
     @property
     def token_str(self) -> str:
-        """Get token as string."""
         return str(self.token)
 
     @property
@@ -249,6 +257,7 @@ class TimeoutTrackingState:
     - Extensions are additive: effective_timeout = timeout_seconds + total_extensions_granted
     - Extension grant = progress signal (updates last_progress_at)
     """
+
     strategy_type: str  # "local_authority" | "gate_coordinated"
     gate_addr: tuple[str, int] | None
 
@@ -279,7 +288,8 @@ class TimeoutTrackingState:
 @dataclass(slots=True)
 class JobInfo:
     """All state for a single job, protected by its own lock."""
-    token: TrackingToken          # Job-level token (DC:manager:job)
+
+    token: TrackingToken  # Job-level token (DC:manager:job)
     submission: JobSubmission | None  # None for remote jobs tracked by non-leaders
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
@@ -288,12 +298,16 @@ class JobInfo:
     workflows_total: int = 0
     workflows_completed: int = 0
     workflows_failed: int = 0
-    started_at: float = 0.0       # time.monotonic() when job started
-    timestamp: float = 0.0        # Last update time
+    started_at: float = 0.0  # time.monotonic() when job started
+    timestamp: float = 0.0  # Last update time
 
     # Workflow tracking - keyed by token string for fast lookup
-    workflows: dict[str, WorkflowInfo] = field(default_factory=dict)  # workflow_token_str -> info
-    sub_workflows: dict[str, SubWorkflowInfo] = field(default_factory=dict)  # sub_workflow_token_str -> info
+    workflows: dict[str, WorkflowInfo] = field(
+        default_factory=dict
+    )  # workflow_token_str -> info
+    sub_workflows: dict[str, SubWorkflowInfo] = field(
+        default_factory=dict
+    )  # sub_workflow_token_str -> info
 
     # Context for dependent workflows
     context: Context = field(default_factory=Context)
@@ -342,7 +356,9 @@ class JobInfo:
             for sub_wf_token_str in wf_info.sub_workflow_tokens:
                 if sub_wf_info := self.sub_workflows.get(sub_wf_token_str):
                     if sub_wf_info.progress:
-                        aggregated_completed_count += sub_wf_info.progress.completed_count
+                        aggregated_completed_count += (
+                            sub_wf_info.progress.completed_count
+                        )
                         aggregated_failed_count += sub_wf_info.progress.failed_count
 
             wf_progress = WorkflowProgress(
@@ -386,6 +402,7 @@ class PendingWorkflow:
     - ready_event: Set when dependencies are satisfied AND workflow is ready for dispatch
     - Dispatch loop waits on ready_event instead of polling
     """
+
     job_id: str
     workflow_id: str
     workflow_name: str
@@ -393,7 +410,7 @@ class PendingWorkflow:
     vus: int
     priority: StagePriority
     is_test: bool
-    dependencies: set[str]           # workflow_ids this depends on
+    dependencies: set[str]  # workflow_ids this depends on
     completed_dependencies: set[str] = field(default_factory=set)
     dispatched: bool = False
     cores_allocated: int = 0
@@ -402,18 +419,18 @@ class PendingWorkflow:
     ready_event: asyncio.Event = field(default_factory=_create_event)
 
     # Timeout tracking
-    registered_at: float = 0.0           # time.monotonic() when registered
-    dispatched_at: float = 0.0           # time.monotonic() when dispatched
-    timeout_seconds: float = 300.0       # Max seconds before eviction
+    registered_at: float = 0.0  # time.monotonic() when registered
+    dispatched_at: float = 0.0  # time.monotonic() when dispatched
+    timeout_seconds: float = 300.0  # Max seconds before eviction
 
     # Dispatch attempt tracking (for the dispatch flag race fix)
-    dispatch_in_progress: bool = False   # True while async dispatch is in progress
+    dispatch_in_progress: bool = False  # True while async dispatch is in progress
 
     # Retry tracking with exponential backoff
-    dispatch_attempts: int = 0           # Number of dispatch attempts
-    last_dispatch_attempt: float = 0.0   # time.monotonic() of last attempt
-    next_retry_delay: float = 1.0        # Seconds until next retry allowed
-    max_dispatch_attempts: int = 5       # Max retries before marking failed
+    dispatch_attempts: int = 0  # Number of dispatch attempts
+    last_dispatch_attempt: float = 0.0  # time.monotonic() of last attempt
+    next_retry_delay: float = 1.0  # Seconds until next retry allowed
+    max_dispatch_attempts: int = 5  # Max retries before marking failed
 
     def check_and_signal_ready(self) -> bool:
         """
