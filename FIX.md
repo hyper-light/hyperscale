@@ -152,7 +152,7 @@ discovered during systematic tracing of SCENARIOS.md test scenarios through the 
 #### D4: Invalid Threshold Handling (MEDIUM)
 **Location**: `reliability/overload.py:283-298`
 **Issue**: No validation that thresholds are in ascending order.
-**Status**: TODO
+**Status**: FIXED - `__post_init__` validates all thresholds via `_validate_ascending()` (lines 94-98)
 
 #### D5: Capacity Aggregator Unbounded Growth (MEDIUM)
 **Location**: `capacity/capacity_aggregator.py:56-66`
