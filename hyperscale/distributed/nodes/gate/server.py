@@ -2932,8 +2932,7 @@ class GateServer(HealthAwareServer):
             except Exception as error:
                 await self.handle_exception(error, "lease_cleanup_loop")
 
-    async def _job_cleanup_loop(self) -> None:
-        """Periodically clean up completed jobs."""
+    def _get_expired_terminal_jobs(self, now: float) -> list[str]:
         terminal_states = {
             JobStatus.COMPLETED.value,
             JobStatus.FAILED.value,
@@ -2941,45 +2940,52 @@ class GateServer(HealthAwareServer):
             JobStatus.TIMEOUT.value,
         }
 
+        jobs_to_remove = []
+        for job_id, job in list(self._job_manager.items()):
+            if job.status not in terminal_states:
+                continue
+            age = now - getattr(job, "timestamp", now)
+            if age > self._job_max_age:
+                jobs_to_remove.append(job_id)
+
+        return jobs_to_remove
+
+    def _cancel_reporter_tasks(self, tasks: dict | None) -> None:
+        if not tasks:
+            return
+        for task in tasks.values():
+            if task and not task.done():
+                task.cancel()
+
+    def _cleanup_single_job(self, job_id: str) -> None:
+        self._job_manager.delete_job(job_id)
+        self._workflow_dc_results.pop(job_id, None)
+        self._job_workflow_ids.pop(job_id, None)
+        self._progress_callbacks.pop(job_id, None)
+        self._job_leadership_tracker.release_leadership(job_id)
+        self._job_dc_managers.pop(job_id, None)
+
+        reporter_tasks = self._job_reporter_tasks.pop(job_id, None)
+        self._cancel_reporter_tasks(reporter_tasks)
+
+        self._job_stats_crdt.pop(job_id, None)
+
+        state_reporter_tasks = self._modular_state.pop_job_reporter_tasks(job_id)
+        self._cancel_reporter_tasks(state_reporter_tasks)
+
+        if self._job_router:
+            self._job_router.cleanup_job_state(job_id)
+
+    async def _job_cleanup_loop(self) -> None:
         while self._running:
             try:
                 await asyncio.sleep(self._job_cleanup_interval)
 
                 now = time.monotonic()
-                jobs_to_remove = []
-
-                for job_id, job in list(self._job_manager.items()):
-                    if job.status in terminal_states:
-                        age = now - getattr(job, "timestamp", now)
-                        if age > self._job_max_age:
-                            jobs_to_remove.append(job_id)
+                jobs_to_remove = self._get_expired_terminal_jobs(now)
 
                 for job_id in jobs_to_remove:
-                    self._job_manager.delete_job(job_id)
-                    self._workflow_dc_results.pop(job_id, None)
-                    self._job_workflow_ids.pop(job_id, None)
-                    self._progress_callbacks.pop(job_id, None)
-                    self._job_leadership_tracker.release_leadership(job_id)
-                    self._job_dc_managers.pop(job_id, None)
-
-                    reporter_tasks = self._job_reporter_tasks.pop(job_id, None)
-                    if reporter_tasks:
-                        for task in reporter_tasks.values():
-                            if task and not task.done():
-                                task.cancel()
-
-                    self._job_stats_crdt.pop(job_id, None)
-
-                    state_reporter_tasks = self._modular_state.pop_job_reporter_tasks(
-                        job_id
-                    )
-                    if state_reporter_tasks:
-                        for task in state_reporter_tasks.values():
-                            if task and not task.done():
-                                task.cancel()
-
-                    if self._job_router:
-                        self._job_router.cleanup_job_state(job_id)
+                    self._cleanup_single_job(job_id)
 
             except asyncio.CancelledError:
                 break
