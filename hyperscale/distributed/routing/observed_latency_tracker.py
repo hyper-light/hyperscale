@@ -4,13 +4,14 @@ Observed latency tracker for adaptive route learning (AD-45).
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from time import monotonic
 
 from .observed_latency_state import ObservedLatencyState
 
 
-@dataclass(slots=True)
+@dataclass
 class ObservedLatencyTracker:
     """
     Gate-level tracker for observed latencies across datacenters.
@@ -22,27 +23,26 @@ class ObservedLatencyTracker:
     latency_cap_ms: float | None = None
 
     _latencies: dict[str, ObservedLatencyState] = field(default_factory=dict)
+    _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
-    def record_job_latency(
+    async def record_job_latency(
         self,
         datacenter_id: str,
         latency_ms: float,
         now: float | None = None,
     ) -> None:
-        """
-        Record observed job completion latency for a datacenter.
-        """
         capped_latency = self._cap_latency(latency_ms)
-        state = self._latencies.get(datacenter_id)
-        if state is None:
-            state = ObservedLatencyState(datacenter_id=datacenter_id)
-            self._latencies[datacenter_id] = state
+        async with self._lock:
+            state = self._latencies.get(datacenter_id)
+            if state is None:
+                state = ObservedLatencyState(datacenter_id=datacenter_id)
+                self._latencies[datacenter_id] = state
 
-        state.record_latency(
-            latency_ms=capped_latency,
-            alpha=self.alpha,
-            now=now,
-        )
+            state.record_latency(
+                latency_ms=capped_latency,
+                alpha=self.alpha,
+                now=now,
+            )
 
     def get_observed_latency(self, datacenter_id: str) -> tuple[float, float]:
         """
