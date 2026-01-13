@@ -5,9 +5,15 @@ Loads environment settings, defines constants, and provides configuration
 for timeouts, intervals, retry policies, and health monitoring.
 """
 
+from __future__ import annotations
+
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from hyperscale.distributed.env import Env
 
 
 def _get_os_cpus() -> int:
