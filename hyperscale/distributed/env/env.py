@@ -294,6 +294,10 @@ class Env(BaseModel):
         2.0  # Seconds between orphan grace period checks
     )
 
+    GATE_DEAD_PEER_REAP_INTERVAL: StrictFloat = 120.0
+    GATE_DEAD_PEER_CHECK_INTERVAL: StrictFloat = 10.0
+    GATE_QUORUM_STEPDOWN_CONSECUTIVE_FAILURES: StrictInt = 3
+
     SPILLOVER_MAX_WAIT_SECONDS: StrictFloat = 60.0
     SPILLOVER_MAX_LATENCY_PENALTY_MS: StrictFloat = 100.0
     SPILLOVER_MIN_IMPROVEMENT_RATIO: StrictFloat = 0.5
@@ -724,6 +728,9 @@ class Env(BaseModel):
             # Gate orphan grace period settings (Section 7)
             "GATE_ORPHAN_GRACE_PERIOD": float,
             "GATE_ORPHAN_CHECK_INTERVAL": float,
+            "GATE_DEAD_PEER_REAP_INTERVAL": float,
+            "GATE_DEAD_PEER_CHECK_INTERVAL": float,
+            "GATE_QUORUM_STEPDOWN_CONSECUTIVE_FAILURES": int,
             # Overload detection settings (AD-18)
             "OVERLOAD_EMA_ALPHA": float,
             "OVERLOAD_CURRENT_WINDOW": int,

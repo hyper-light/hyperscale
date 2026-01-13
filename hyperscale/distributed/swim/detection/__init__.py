@@ -15,6 +15,11 @@ from .incarnation_tracker import (
     MAX_INCARNATION_JUMP,
 )
 
+from .incarnation_store import (
+    IncarnationStore,
+    IncarnationRecord,
+)
+
 from .suspicion_state import SuspicionState
 
 from .suspicion_manager import SuspicionManager
@@ -48,38 +53,26 @@ from .hierarchical_failure_detector import (
 
 
 __all__ = [
-    # Incarnation tracking
-    'IncarnationTracker',
-    'MAX_INCARNATION',
-    'MAX_INCARNATION_JUMP',
-
-    # Legacy suspicion management
-    'SuspicionState',
-    'SuspicionManager',
-
-    # Indirect probing
-    'PendingIndirectProbe',
-    'IndirectProbeManager',
-
-    # Probe scheduling
-    'ProbeScheduler',
-
-    # Timing wheel (global layer)
-    'TimingWheel',
-    'TimingWheelConfig',
-    'TimingWheelBucket',
-    'WheelEntry',
-
-    # Job suspicion (job layer)
-    'JobSuspicionManager',
-    'JobSuspicionConfig',
-    'JobSuspicion',
-
-    # Hierarchical failure detection
-    'HierarchicalFailureDetector',
-    'HierarchicalConfig',
-    'NodeStatus',
-    'FailureSource',
-    'FailureEvent',
+    "IncarnationTracker",
+    "MAX_INCARNATION",
+    "MAX_INCARNATION_JUMP",
+    "IncarnationStore",
+    "IncarnationRecord",
+    "SuspicionState",
+    "SuspicionManager",
+    "PendingIndirectProbe",
+    "IndirectProbeManager",
+    "ProbeScheduler",
+    "TimingWheel",
+    "TimingWheelConfig",
+    "TimingWheelBucket",
+    "WheelEntry",
+    "JobSuspicionManager",
+    "JobSuspicionConfig",
+    "JobSuspicion",
+    "HierarchicalFailureDetector",
+    "HierarchicalConfig",
+    "NodeStatus",
+    "FailureSource",
+    "FailureEvent",
 ]
-

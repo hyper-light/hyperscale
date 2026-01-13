@@ -581,14 +581,18 @@ class ManagerHealthMonitor:
         """
         self._global_dead_workers.add(worker_id)
 
-        # Clear all job suspicions for this worker
         keys_to_remove = [key for key in self._job_suspicions if key[1] == worker_id]
         for key in keys_to_remove:
             del self._job_suspicions[key]
 
-        # Clear from job-specific dead sets (global death supersedes)
         for job_dead_set in self._job_dead_workers.values():
             job_dead_set.discard(worker_id)
+
+        progress_keys_to_remove = [
+            key for key in self._state._worker_job_last_progress if key[0] == worker_id
+        ]
+        for key in progress_keys_to_remove:
+            self._state._worker_job_last_progress.pop(key, None)
 
         self._task_runner.run(
             self._logger.log,

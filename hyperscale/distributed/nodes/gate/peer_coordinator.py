@@ -154,6 +154,7 @@ class GatePeerCoordinator:
         async with peer_lock:
             await self._state.increment_peer_epoch(tcp_addr)
             await self._state.remove_active_peer(tcp_addr)
+            self._state.mark_peer_unhealthy(tcp_addr, time.monotonic())
 
             peer_host, peer_port = tcp_addr
             peer_id = f"{peer_host}:{peer_port}"
@@ -235,6 +236,7 @@ class GatePeerCoordinator:
                     return
 
                 await self._state.add_active_peer(tcp_addr)
+                self._state.mark_peer_healthy(tcp_addr)
 
                 peer_host, peer_port = tcp_addr
                 synthetic_peer_id = f"{peer_host}:{peer_port}"
@@ -254,6 +256,8 @@ class GatePeerCoordinator:
                 node_id=self._get_node_id().short,
             ),
         )
+
+        self._task_runner.run(self._request_state_sync_from_peer, tcp_addr)
 
         active_count = self._state.get_active_peer_count() + 1
         self._task_runner.run(
@@ -419,3 +423,48 @@ class GatePeerCoordinator:
             )
             for gate_id, gate_info in self._state._known_gates.items()
         }
+
+    async def _request_state_sync_from_peer(
+        self,
+        peer_tcp_addr: tuple[str, int],
+    ) -> None:
+        """
+        Request job leadership state from a peer gate after it rejoins.
+
+        This ensures we have up-to-date information about which jobs the
+        rejoined peer was leading, allowing proper orphan detection.
+        """
+        try:
+            peer_jobs = self._job_leadership_tracker.get_jobs_led_by_addr(peer_tcp_addr)
+            if peer_jobs:
+                self._task_runner.run(
+                    self._logger.log,
+                    ServerDebug(
+                        message=f"Peer {peer_tcp_addr} rejoined with {len(peer_jobs)} known jobs",
+                        node_host=self._get_host(),
+                        node_port=self._get_tcp_port(),
+                        node_id=self._get_node_id().short,
+                    ),
+                )
+
+            self._state.clear_dead_leader(peer_tcp_addr)
+
+            self._task_runner.run(
+                self._logger.log,
+                ServerDebug(
+                    message=f"State sync completed for rejoined peer {peer_tcp_addr}",
+                    node_host=self._get_host(),
+                    node_port=self._get_tcp_port(),
+                    node_id=self._get_node_id().short,
+                ),
+            )
+        except Exception as error:
+            self._task_runner.run(
+                self._logger.log,
+                ServerWarning(
+                    message=f"Failed to sync state from rejoined peer {peer_tcp_addr}: {error}",
+                    node_host=self._get_host(),
+                    node_port=self._get_tcp_port(),
+                    node_id=self._get_node_id().short,
+                ),
+            )

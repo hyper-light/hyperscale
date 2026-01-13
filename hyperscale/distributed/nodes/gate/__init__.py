@@ -19,6 +19,7 @@ Coordinators:
 - cancellation_coordinator: Job/workflow cancellation
 - peer_coordinator: Gate peer management
 - health_coordinator: Datacenter health monitoring
+- orphan_job_coordinator: Orphaned job detection and takeover
 """
 
 from .config import GateConfig, create_gate_config
@@ -32,6 +33,7 @@ from .stats_coordinator import GateStatsCoordinator
 from .cancellation_coordinator import GateCancellationCoordinator
 from .peer_coordinator import GatePeerCoordinator
 from .health_coordinator import GateHealthCoordinator
+from .orphan_job_coordinator import GateOrphanJobCoordinator
 
 # Handlers
 from .handlers import (
@@ -55,6 +57,7 @@ __all__ = [
     "GateCancellationCoordinator",
     "GatePeerCoordinator",
     "GateHealthCoordinator",
+    "GateOrphanJobCoordinator",
     # Handlers
     "GatePingHandler",
     "GateJobHandler",

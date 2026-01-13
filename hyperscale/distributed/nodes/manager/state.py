@@ -295,6 +295,20 @@ class ManagerState:
         self._peer_state_locks.pop(peer_addr, None)
         self._peer_state_epoch.pop(peer_addr, None)
 
+    def remove_worker_state(self, worker_id: str) -> None:
+        """Remove all state associated with a dead worker to prevent memory leaks."""
+        self._dispatch_semaphores.pop(worker_id, None)
+        self._worker_latency_samples.pop(worker_id, None)
+        self._worker_circuits.pop(worker_id, None)
+        self._worker_unhealthy_since.pop(worker_id, None)
+        self._worker_deadlines.pop(worker_id, None)
+
+        progress_keys_to_remove = [
+            key for key in self._worker_job_last_progress if key[0] == worker_id
+        ]
+        for key in progress_keys_to_remove:
+            self._worker_job_last_progress.pop(key, None)
+
     def get_quorum_metrics(self) -> dict:
         """Get quorum-related metrics."""
         return {

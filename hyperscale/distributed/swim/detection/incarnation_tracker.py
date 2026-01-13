@@ -73,21 +73,21 @@ class IncarnationTracker:
     self_incarnation: int = 0
     node_states: dict[tuple[str, int], NodeState] = field(default_factory=dict)
 
-    # Resource limits
     max_nodes: int = 10000
-    """Maximum number of nodes to track before eviction."""
-
     dead_node_retention_seconds: float = 3600.0
-    """How long to retain dead node state for proper refutation."""
 
-    # Callbacks for eviction events
+    zombie_detection_window_seconds: float = 60.0
+    minimum_rejoin_incarnation_bump: int = 5
+
     _on_node_evicted: Callable[[tuple[str, int], NodeState], None] | None = None
 
-    # Stats for monitoring
     _eviction_count: int = 0
     _cleanup_count: int = 0
+    _zombie_rejections: int = 0
 
-    # Logger for structured logging (optional)
+    _death_timestamps: dict[tuple[str, int], float] = field(default_factory=dict)
+    _death_incarnations: dict[tuple[str, int], int] = field(default_factory=dict)
+
     _logger: LoggerProtocol | None = None
     _node_host: str = ""
     _node_port: int = 0
@@ -95,6 +95,11 @@ class IncarnationTracker:
 
     def __post_init__(self):
         self._lock = asyncio.Lock()
+        if not hasattr(self, "_death_timestamps"):
+            self._death_timestamps = {}
+        if not hasattr(self, "_death_incarnations"):
+            self._death_incarnations = {}
+        self._zombie_rejections = 0
 
     def set_logger(
         self,
@@ -434,7 +439,6 @@ class IncarnationTracker:
             b"DEAD": 0,
             b"JOIN": 0,
         }
-        # Snapshot to avoid dict mutation during iteration
         for state in list(self.node_states.values()):
             status_counts[state.status] = status_counts.get(state.status, 0) + 1
 
@@ -446,6 +450,8 @@ class IncarnationTracker:
             "dead_nodes": status_counts.get(b"DEAD", 0),
             "total_evictions": self._eviction_count,
             "total_cleanups": self._cleanup_count,
+            "zombie_rejections": self._zombie_rejections,
+            "active_death_records": len(self._death_timestamps),
         }
 
     # =========================================================================
@@ -605,3 +611,99 @@ class IncarnationTracker:
     def get_unconfirmed_nodes(self) -> list[tuple[str, int]]:
         """Get all nodes in UNCONFIRMED state."""
         return self.get_nodes_by_state(b"UNCONFIRMED")
+
+    def record_node_death(
+        self,
+        node: tuple[str, int],
+        incarnation_at_death: int,
+        timestamp: float | None = None,
+    ) -> None:
+        """
+        Record when a node was marked DEAD for zombie detection.
+
+        Args:
+            node: The node address that died
+            incarnation_at_death: The incarnation number when the node died
+            timestamp: Death timestamp (defaults to now)
+        """
+        if timestamp is None:
+            timestamp = time.monotonic()
+
+        self._death_timestamps[node] = timestamp
+        self._death_incarnations[node] = incarnation_at_death
+
+    def clear_death_record(self, node: tuple[str, int]) -> None:
+        """Clear death record for a node that has successfully rejoined."""
+        self._death_timestamps.pop(node, None)
+        self._death_incarnations.pop(node, None)
+
+    def is_potential_zombie(
+        self,
+        node: tuple[str, int],
+        claimed_incarnation: int,
+    ) -> bool:
+        """
+        Check if a rejoining node might be a zombie.
+
+        A node is considered a potential zombie if:
+        1. It was recently marked DEAD (within zombie_detection_window)
+        2. Its claimed incarnation is not sufficiently higher than its death incarnation
+
+        Args:
+            node: The node attempting to rejoin
+            claimed_incarnation: The incarnation the node claims to have
+
+        Returns:
+            True if the node should be rejected as a potential zombie
+        """
+        death_timestamp = self._death_timestamps.get(node)
+        if death_timestamp is None:
+            return False
+
+        now = time.monotonic()
+        time_since_death = now - death_timestamp
+
+        if time_since_death > self.zombie_detection_window_seconds:
+            self.clear_death_record(node)
+            return False
+
+        death_incarnation = self._death_incarnations.get(node, 0)
+        required_incarnation = death_incarnation + self.minimum_rejoin_incarnation_bump
+
+        if claimed_incarnation < required_incarnation:
+            self._zombie_rejections += 1
+            return True
+
+        return False
+
+    def get_required_rejoin_incarnation(self, node: tuple[str, int]) -> int:
+        """
+        Get the minimum incarnation required for a node to rejoin.
+
+        Returns:
+            Minimum incarnation number, or 0 if no death record exists
+        """
+        death_incarnation = self._death_incarnations.get(node, 0)
+        if death_incarnation == 0:
+            return 0
+        return death_incarnation + self.minimum_rejoin_incarnation_bump
+
+    async def cleanup_death_records(self) -> int:
+        """
+        Remove death records older than zombie_detection_window.
+
+        Returns:
+            Number of records cleaned up
+        """
+        now = time.monotonic()
+        cutoff = now - self.zombie_detection_window_seconds
+        to_remove = [
+            node
+            for node, timestamp in self._death_timestamps.items()
+            if timestamp < cutoff
+        ]
+
+        for node in to_remove:
+            self.clear_death_record(node)
+
+        return len(to_remove)

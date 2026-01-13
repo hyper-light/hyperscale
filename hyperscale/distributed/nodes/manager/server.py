@@ -885,10 +885,8 @@ class ManagerServer(HealthAwareServer):
             self._task_runner.run(self._handle_worker_failure, worker_id)
             return
 
-        # Check if manager peer
         manager_tcp_addr = self._manager_state._manager_udp_to_tcp.get(node_addr)
         if manager_tcp_addr:
-            self._manager_state._dead_managers.add(manager_tcp_addr)
             self._task_runner.run(
                 self._handle_manager_peer_failure, node_addr, manager_tcp_addr
             )
@@ -971,34 +969,41 @@ class ManagerServer(HealthAwareServer):
     async def _handle_worker_failure(self, worker_id: str) -> None:
         self._health_monitor.handle_worker_failure(worker_id)
 
-        if not self._workflow_dispatcher or not self._job_manager:
-            return
+        if self._workflow_dispatcher and self._job_manager:
+            running_sub_workflows = (
+                self._job_manager.get_running_sub_workflows_on_worker(worker_id)
+            )
 
-        running_sub_workflows = self._job_manager.get_running_sub_workflows_on_worker(
-            worker_id
-        )
+            for job_id, workflow_id, sub_token in running_sub_workflows:
+                requeued = await self._workflow_dispatcher.requeue_workflow(sub_token)
 
-        if not running_sub_workflows:
-            return
+                if requeued:
+                    await self._udp_logger.log(
+                        ServerInfo(
+                            message=f"Requeued workflow {workflow_id[:8]}... from failed worker {worker_id[:8]}...",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
+                else:
+                    await self._udp_logger.log(
+                        ServerWarning(
+                            message=f"Failed to requeue workflow {workflow_id[:8]}... from failed worker {worker_id[:8]}... - not found in pending",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
 
-        for job_id, workflow_id, sub_token in running_sub_workflows:
-            await self._workflow_dispatcher.requeue_workflow(sub_token)
-
-            await self._udp_logger.log(
-                ServerInfo(
-                    message=f"Requeued workflow {workflow_id[:8]}... from failed worker {worker_id[:8]}...",
-                    node_host=self._host,
-                    node_port=self._tcp_port,
-                    node_id=self._node_id.short,
+            if running_sub_workflows and self._worker_disseminator:
+                await self._worker_disseminator.broadcast_workflow_reassignments(
+                    failed_worker_id=worker_id,
+                    reason="worker_dead",
+                    reassignments=running_sub_workflows,
                 )
-            )
 
-        if self._worker_disseminator:
-            await self._worker_disseminator.broadcast_workflow_reassignments(
-                failed_worker_id=worker_id,
-                reason="worker_dead",
-                reassignments=running_sub_workflows,
-            )
+        self._manager_state.remove_worker_state(worker_id)
 
     async def _handle_manager_peer_failure(
         self,
@@ -1132,14 +1137,20 @@ class ManagerServer(HealthAwareServer):
         if not self.is_leader():
             return
 
-        # Find jobs led by the failed manager and take them over
-        jobs_to_takeover = []
-        for job_id, leader_addr in self._manager_state._job_leader_addrs.items():
-            if leader_addr == failed_addr:
-                jobs_to_takeover.append(job_id)
+        jobs_to_takeover = [
+            job_id
+            for job_id, leader_addr in list(
+                self._manager_state._job_leader_addrs.items()
+            )
+            if leader_addr == failed_addr
+        ]
 
         for job_id in jobs_to_takeover:
-            self._leases.claim_job_leadership(job_id, (self._host, self._tcp_port))
+            self._leases.claim_job_leadership(
+                job_id,
+                (self._host, self._tcp_port),
+                force_takeover=True,
+            )
             await self._udp_logger.log(
                 ServerInfo(
                     message=f"Took over leadership for job {job_id[:8]}...",
@@ -1389,32 +1400,35 @@ class ManagerServer(HealthAwareServer):
                         query_response = WorkflowQueryResponse.load(response)
                         worker_workflow_ids = set(query_response.workflow_ids or [])
 
-                        # Find workflows we think are on this worker
                         manager_tracked_ids: set[str] = set()
                         for job in self._job_manager.iter_jobs():
-                            for wf_id, wf in job.workflows.items():
-                                if (
-                                    wf.worker_id == worker_id
-                                    and wf.status == WorkflowStatus.RUNNING
-                                ):
-                                    manager_tracked_ids.add(wf_id)
+                            for sub_wf_token, sub_wf in job.sub_workflows.items():
+                                if sub_wf.worker_id == worker_id:
+                                    parent_wf = job.workflows.get(
+                                        sub_wf.parent_token.workflow_token or ""
+                                    )
+                                    if (
+                                        parent_wf
+                                        and parent_wf.status == WorkflowStatus.RUNNING
+                                    ):
+                                        manager_tracked_ids.add(sub_wf_token)
 
-                        # Workflows we track but worker doesn't have = orphaned
-                        orphaned = manager_tracked_ids - worker_workflow_ids
+                        orphaned_sub_workflows = (
+                            manager_tracked_ids - worker_workflow_ids
+                        )
 
-                        for orphaned_id in orphaned:
+                        for orphaned_token in orphaned_sub_workflows:
                             await self._udp_logger.log(
                                 ServerWarning(
-                                    message=f"Orphaned workflow {orphaned_id[:8]}... detected on worker {worker_id[:8]}..., scheduling retry",
+                                    message=f"Orphaned sub-workflow {orphaned_token[:8]}... detected on worker {worker_id[:8]}..., scheduling retry",
                                     node_host=self._host,
                                     node_port=self._tcp_port,
                                     node_id=self._node_id.short,
                                 )
                             )
-                            # Re-queue for dispatch
                             if self._workflow_dispatcher:
                                 await self._workflow_dispatcher.requeue_workflow(
-                                    orphaned_id
+                                    orphaned_token
                                 )
 
                     except Exception as worker_error:
@@ -2005,15 +2019,22 @@ class ManagerServer(HealthAwareServer):
 
     async def _scan_for_orphaned_jobs(self) -> None:
         """Scan for orphaned jobs from dead managers."""
-        for dead_addr in self._manager_state._dead_managers:
+        dead_managers_snapshot = list(self._manager_state._dead_managers)
+        job_leader_addrs_snapshot = list(self._manager_state._job_leader_addrs.items())
+
+        for dead_addr in dead_managers_snapshot:
             jobs_to_takeover = [
                 job_id
-                for job_id, leader_addr in self._manager_state._job_leader_addrs.items()
+                for job_id, leader_addr in job_leader_addrs_snapshot
                 if leader_addr == dead_addr
             ]
 
             for job_id in jobs_to_takeover:
-                self._leases.claim_job_leadership(job_id, (self._host, self._tcp_port))
+                self._leases.claim_job_leadership(
+                    job_id,
+                    (self._host, self._tcp_port),
+                    force_takeover=True,
+                )
 
     async def _resume_timeout_tracking_for_all_jobs(self) -> None:
         """Resume timeout tracking for all jobs as new leader."""

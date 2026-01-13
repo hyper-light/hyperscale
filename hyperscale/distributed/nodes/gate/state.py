@@ -99,6 +99,10 @@ class GateRuntimeState:
         self._gate_state: GateStateEnum = GateStateEnum.SYNCING
         self._state_version: int = 0
 
+        self._gate_peer_unhealthy_since: dict[tuple[str, int], float] = {}
+        self._dead_gate_peers: set[tuple[str, int]] = set()
+        self._dead_gate_timestamps: dict[tuple[str, int], float] = {}
+
         # Throughput tracking (AD-19)
         self._forward_throughput_count: int = 0
         self._forward_throughput_interval_start: float = 0.0
@@ -302,3 +306,28 @@ class GateRuntimeState:
     def is_active(self) -> bool:
         """Check if the gate is in ACTIVE state."""
         return self._gate_state == GateStateEnum.ACTIVE
+
+    def mark_peer_unhealthy(self, peer_addr: tuple[str, int], timestamp: float) -> None:
+        self._gate_peer_unhealthy_since[peer_addr] = timestamp
+
+    def mark_peer_healthy(self, peer_addr: tuple[str, int]) -> None:
+        self._gate_peer_unhealthy_since.pop(peer_addr, None)
+
+    def mark_peer_dead(self, peer_addr: tuple[str, int], timestamp: float) -> None:
+        self._dead_gate_peers.add(peer_addr)
+        self._dead_gate_timestamps[peer_addr] = timestamp
+
+    def cleanup_dead_peer(self, peer_addr: tuple[str, int]) -> None:
+        self._dead_gate_peers.discard(peer_addr)
+        self._dead_gate_timestamps.pop(peer_addr, None)
+        self._gate_peer_unhealthy_since.pop(peer_addr, None)
+        self.remove_peer_lock(peer_addr)
+
+    def is_peer_dead(self, peer_addr: tuple[str, int]) -> bool:
+        return peer_addr in self._dead_gate_peers
+
+    def get_unhealthy_peers(self) -> dict[tuple[str, int], float]:
+        return dict(self._gate_peer_unhealthy_since)
+
+    def get_dead_peer_timestamps(self) -> dict[tuple[str, int], float]:
+        return dict(self._dead_gate_timestamps)

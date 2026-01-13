@@ -66,17 +66,34 @@ class JoinHandler(BaseHandler):
         if self._server.udp_target_is_self(target):
             return self._ack(embed_state=False)
 
-        # Process join within context
         async with await self._server.context_with_value(target):
             nodes = self._server.read_nodes()
-
-            # Check if rejoin
             is_rejoin = target in nodes
 
-            # Clear stale state
+            incarnation_tracker = self._server.incarnation_tracker
+            claimed_incarnation = incarnation_tracker.get_node_incarnation(target)
+
+            if is_rejoin and incarnation_tracker.is_potential_zombie(
+                target, claimed_incarnation
+            ):
+                required_incarnation = (
+                    incarnation_tracker.get_required_rejoin_incarnation(target)
+                )
+                self._server.increment_metric("joins_rejected_zombie")
+                self._server.audit_log.record(
+                    AuditEventType.NODE_REJOIN,
+                    node=target,
+                    source=source_addr,
+                    extra={
+                        "rejected": True,
+                        "reason": "potential_zombie",
+                        "required_incarnation": required_incarnation,
+                    },
+                )
+                return self._nack(b"zombie_rejected")
+
             await self._server.clear_stale_state(target)
 
-            # Record audit event
             event_type = (
                 AuditEventType.NODE_REJOIN if is_rejoin else AuditEventType.NODE_JOINED
             )
@@ -86,23 +103,28 @@ class JoinHandler(BaseHandler):
                 source=source_addr,
             )
 
-            # Add to membership
             await self._server.write_context(target, b"OK")
 
-            # Propagate join to other nodes
             await self._propagate_join(target, target_addr_bytes)
 
-            # Update probe scheduler
             self._server.probe_scheduler.add_member(target)
 
-            # AD-29: Confirm both sender and joining node
             await self._server.confirm_peer(source_addr)
             await self._server.confirm_peer(target)
 
-            # Update incarnation tracker
-            await self._server.incarnation_tracker.update_node(
-                target, b"OK", 0, time.monotonic()
+            rejoin_incarnation = incarnation_tracker.get_required_rejoin_incarnation(
+                target
             )
+            if rejoin_incarnation > 0:
+                await incarnation_tracker.update_node(
+                    target, b"OK", rejoin_incarnation, time.monotonic()
+                )
+            else:
+                await incarnation_tracker.update_node(
+                    target, b"OK", 0, time.monotonic()
+                )
+
+            incarnation_tracker.clear_death_record(target)
 
             return self._ack()
 

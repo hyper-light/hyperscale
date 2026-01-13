@@ -34,6 +34,7 @@ See tracker.py for within-DC correlation (workers within a manager).
 import time
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import Callable
 
 
 class CorrelationSeverity(Enum):
@@ -84,17 +85,21 @@ class CorrelationDecision:
         if self.severity in (CorrelationSeverity.MEDIUM, CorrelationSeverity.HIGH):
             return True
         # Also delay if multiple secondary signals indicate network-wide issues
-        secondary_signals = sum([
-            self.latency_correlated,
-            self.extension_correlated,
-            self.lhm_correlated,
-        ])
+        secondary_signals = sum(
+            [
+                self.latency_correlated,
+                self.extension_correlated,
+                self.lhm_correlated,
+            ]
+        )
         return secondary_signals >= 2
 
     @property
     def likely_network_issue(self) -> bool:
         """Check if the issue is likely network-related rather than DC failure."""
-        return self.latency_correlated or (self.extension_correlated and self.lhm_correlated)
+        return self.latency_correlated or (
+            self.extension_correlated and self.lhm_correlated
+        )
 
 
 @dataclass(slots=True)
@@ -283,7 +288,9 @@ class DCStateInfo:
         now = time.monotonic()
         window_start = now - window_seconds
         if self.state_entered_at >= window_start:
-            total_transitions = self.failure_count_in_window + self.recovery_count_in_window
+            total_transitions = (
+                self.failure_count_in_window + self.recovery_count_in_window
+            )
             return total_transitions >= threshold
         return False
 
@@ -336,28 +343,26 @@ class CrossDCCorrelationDetector:
         """
         self._config = config or CrossDCCorrelationConfig()
 
-        # Recent failures: dc_id -> list of failure records
         self._failure_records: dict[str, list[DCFailureRecord]] = {}
-
-        # Per-DC state tracking
         self._dc_states: dict[str, DCStateInfo] = {}
-
-        # Extension tracking: dc_id -> list of extension records
         self._extension_records: dict[str, list[ExtensionRecord]] = {}
-
-        # Known datacenters for fraction calculation
         self._known_datacenters: set[str] = set()
-
-        # Last correlation backoff timestamp
         self._last_correlation_time: float = 0.0
 
-        # Statistics
         self._total_failures_recorded: int = 0
         self._correlation_events_detected: int = 0
         self._flap_events_detected: int = 0
         self._latency_correlation_events: int = 0
         self._extension_correlation_events: int = 0
         self._lhm_correlation_events: int = 0
+
+        self._partition_healed_callbacks: list[Callable[[list[str], float], None]] = []
+        self._partition_detected_callbacks: list[
+            Callable[[list[str], float], None]
+        ] = []
+        self._partition_healed_count: int = 0
+        self._last_partition_healed_time: float = 0.0
+        self._was_in_partition: bool = False
 
     def add_datacenter(self, datacenter_id: str) -> None:
         """
@@ -438,7 +443,8 @@ class CrossDCCorrelationDetector:
         # Count failures in flap detection window
         window_start = now - self._config.flap_detection_window_seconds
         state.failure_count_in_window = sum(
-            1 for r in self._failure_records[datacenter_id]
+            1
+            for r in self._failure_records[datacenter_id]
             if r.timestamp >= window_start
         )
 
@@ -550,7 +556,9 @@ class CrossDCCorrelationDetector:
         state = self._dc_states[datacenter_id]
 
         # Add sample
-        sample = LatencySample(timestamp=now, latency_ms=latency_ms, probe_type=probe_type)
+        sample = LatencySample(
+            timestamp=now, latency_ms=latency_ms, probe_type=probe_type
+        )
         state.latency_samples.append(sample)
 
         # Trim old samples outside the window
@@ -564,7 +572,9 @@ class CrossDCCorrelationDetector:
             latencies = [s.latency_ms for s in state.latency_samples]
             state.avg_latency_ms = sum(latencies) / len(latencies)
             state.max_latency_ms = max(latencies)
-            state.latency_elevated = state.avg_latency_ms >= self._config.latency_elevated_threshold_ms
+            state.latency_elevated = (
+                state.avg_latency_ms >= self._config.latency_elevated_threshold_ms
+            )
         else:
             # Not enough samples yet
             state.avg_latency_ms = latency_ms
@@ -618,11 +628,15 @@ class CrossDCCorrelationDetector:
         # Trim old records
         window_start = now - self._config.extension_window_seconds
         self._extension_records[datacenter_id] = [
-            r for r in self._extension_records[datacenter_id] if r.timestamp >= window_start
+            r
+            for r in self._extension_records[datacenter_id]
+            if r.timestamp >= window_start
         ]
 
         # Count unique workers with extensions in this DC
-        unique_workers = set(r.worker_id for r in self._extension_records[datacenter_id])
+        unique_workers = set(
+            r.worker_id for r in self._extension_records[datacenter_id]
+        )
         state = self._dc_states[datacenter_id]
         state.active_extensions = len(unique_workers)
 
@@ -676,7 +690,9 @@ class CrossDCCorrelationDetector:
         window_start = now - self._config.correlation_window_seconds
 
         # Check if we're still in backoff from previous correlation
-        if (now - self._last_correlation_time) < self._config.correlation_backoff_seconds:
+        if (
+            now - self._last_correlation_time
+        ) < self._config.correlation_backoff_seconds:
             if self._last_correlation_time > 0:
                 return CorrelationDecision(
                     severity=CorrelationSeverity.MEDIUM,
@@ -698,7 +714,8 @@ class CrossDCCorrelationDetector:
         # But also consider recent unconfirmed failures if they're clustered
         # This helps detect rapidly developing situations
         unconfirmed_recent = [
-            dc for dc in recent_failing_dcs
+            dc
+            for dc in recent_failing_dcs
             if dc not in confirmed_failing_dcs and dc not in flapping_dcs
         ]
 
@@ -843,7 +860,8 @@ class CrossDCCorrelationDetector:
             List of datacenter IDs that are flapping.
         """
         return [
-            dc_id for dc_id, state in self._dc_states.items()
+            dc_id
+            for dc_id, state in self._dc_states.items()
             if state.current_state == DCHealthState.FLAPPING
         ]
 
@@ -891,7 +909,9 @@ class CrossDCCorrelationDetector:
                 total_avg_latency += state.avg_latency_ms
                 dcs_with_samples += 1
 
-        avg_latency = total_avg_latency / dcs_with_samples if dcs_with_samples > 0 else 0.0
+        avg_latency = (
+            total_avg_latency / dcs_with_samples if dcs_with_samples > 0 else 0.0
+        )
         fraction_elevated = dcs_with_elevated_latency / known_dc_count
 
         correlated = fraction_elevated >= self._config.latency_correlation_fraction
@@ -924,7 +944,9 @@ class CrossDCCorrelationDetector:
                 dcs_with_extensions += 1
 
         fraction_with_extensions = dcs_with_extensions / known_dc_count
-        correlated = fraction_with_extensions >= self._config.extension_correlation_fraction
+        correlated = (
+            fraction_with_extensions >= self._config.extension_correlation_fraction
+        )
 
         return {
             "correlated": correlated,
@@ -1052,9 +1074,8 @@ class CrossDCCorrelationDetector:
             "extension_correlation_events": self._extension_correlation_events,
             "lhm_correlation_events": self._lhm_correlation_events,
             "state_counts": state_counts,
-            "in_backoff": (
-                time.monotonic() - self._last_correlation_time
-            ) < self._config.correlation_backoff_seconds,
+            "in_backoff": (time.monotonic() - self._last_correlation_time)
+            < self._config.correlation_backoff_seconds,
             # Secondary correlation current state
             "latency_correlated": latency_metrics["correlated"],
             "avg_latency_ms": latency_metrics["avg_latency_ms"],
@@ -1082,4 +1103,104 @@ class CrossDCCorrelationDetector:
                 "enable_lhm_correlation": self._config.enable_lhm_correlation,
                 "lhm_stressed_threshold": self._config.lhm_stressed_threshold,
             },
+            "partition_healed_count": self._partition_healed_count,
+            "last_partition_healed_time": self._last_partition_healed_time,
+            "was_in_partition": self._was_in_partition,
         }
+
+    def register_partition_healed_callback(
+        self,
+        callback: Callable[[list[str], float], None],
+    ) -> None:
+        """Register a callback to be invoked when a partition heals."""
+        self._partition_healed_callbacks.append(callback)
+
+    def register_partition_detected_callback(
+        self,
+        callback: Callable[[list[str], float], None],
+    ) -> None:
+        """Register a callback to be invoked when a partition is detected."""
+        self._partition_detected_callbacks.append(callback)
+
+    def check_partition_healed(self) -> bool:
+        """
+        Check if a previously detected partition has healed.
+
+        Returns True if:
+        1. We were previously in a partition state (MEDIUM or HIGH correlation)
+        2. All DCs have recovered to HEALTHY state
+        3. No correlation is currently detected
+
+        Returns:
+            True if partition has healed, False otherwise
+        """
+        if not self._was_in_partition:
+            return False
+
+        confirmed_failing = self._get_confirmed_failing_dcs()
+        flapping = self._get_flapping_dcs()
+
+        if confirmed_failing or flapping:
+            return False
+
+        all_healthy = all(
+            state.current_state == DCHealthState.HEALTHY
+            for state in self._dc_states.values()
+        )
+
+        if not all_healthy:
+            return False
+
+        decision = self.check_correlation("")
+        if decision.severity in (CorrelationSeverity.MEDIUM, CorrelationSeverity.HIGH):
+            return False
+
+        now = time.monotonic()
+        self._was_in_partition = False
+        self._last_partition_healed_time = now
+        self._partition_healed_count += 1
+
+        healed_datacenters = list(self._known_datacenters)
+        for callback in self._partition_healed_callbacks:
+            try:
+                callback(healed_datacenters, now)
+            except Exception:
+                pass
+
+        return True
+
+    def mark_partition_detected(self, affected_datacenters: list[str]) -> None:
+        """
+        Mark that a partition has been detected.
+
+        Called when check_correlation returns MEDIUM or HIGH severity.
+        This enables partition healed detection.
+
+        Args:
+            affected_datacenters: List of datacenter IDs affected by the partition
+        """
+        was_already_partitioned = self._was_in_partition
+        self._was_in_partition = True
+
+        if not was_already_partitioned:
+            now = time.monotonic()
+            for callback in self._partition_detected_callbacks:
+                try:
+                    callback(affected_datacenters, now)
+                except Exception:
+                    pass
+
+    def is_in_partition(self) -> bool:
+        """Check if we are currently in a partition state."""
+        return self._was_in_partition
+
+    def get_time_since_partition_healed(self) -> float | None:
+        """
+        Get time since the last partition healed.
+
+        Returns:
+            Seconds since last partition healed, or None if never healed
+        """
+        if self._last_partition_healed_time == 0.0:
+            return None
+        return time.monotonic() - self._last_partition_healed_time

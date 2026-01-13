@@ -55,7 +55,7 @@ class ManagerConfig:
     cancelled_workflow_cleanup_interval_seconds: float = 60.0
 
     # Recovery settings (from env)
-    recovery_max_concurrent: int = 5
+    recovery_max_concurrent: int = 20
     recovery_jitter_min_seconds: float = 0.1
     recovery_jitter_max_seconds: float = 1.0
 

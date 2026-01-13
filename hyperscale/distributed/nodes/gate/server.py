@@ -488,6 +488,13 @@ class GateServer(HealthAwareServer):
         self._orphan_check_interval: float = env.GATE_ORPHAN_CHECK_INTERVAL
         self._orphan_check_task: asyncio.Task | None = None
 
+        self._dead_peer_reap_interval: float = env.GATE_DEAD_PEER_REAP_INTERVAL
+        self._dead_peer_check_interval: float = env.GATE_DEAD_PEER_CHECK_INTERVAL
+        self._quorum_stepdown_consecutive_failures: int = (
+            env.GATE_QUORUM_STEPDOWN_CONSECUTIVE_FAILURES
+        )
+        self._consecutive_quorum_failures: int = 0
+
         # Job timeout tracker (AD-34)
         self._job_timeout_tracker = GateJobTimeoutTracker(
             gate=self,
@@ -754,6 +761,21 @@ class GateServer(HealthAwareServer):
             confirm_manager_for_dc=self._confirm_manager_for_dc,
         )
 
+        self._orphan_job_coordinator = GateOrphanJobCoordinator(
+            state=self._modular_state,
+            logger=self._udp_logger,
+            task_runner=self._task_runner,
+            job_hash_ring=self._job_hash_ring,
+            job_leadership_tracker=self._job_leadership_tracker,
+            job_manager=self._job_manager,
+            get_node_id=lambda: self._node_id,
+            get_node_addr=lambda: (self._host, self._tcp_port),
+            send_tcp=self._send_tcp,
+            get_active_peers=lambda: self._active_gate_peers,
+            orphan_check_interval_seconds=self._orphan_check_interval,
+            orphan_grace_period_seconds=self._orphan_grace_period,
+        )
+
     def _init_handlers(self) -> None:
         """Initialize handler instances with dependencies."""
         self._ping_handler = GatePingHandler(
@@ -947,6 +969,7 @@ class GateServer(HealthAwareServer):
         self._task_runner.run(self._rate_limit_cleanup_loop)
         self._task_runner.run(self._batch_stats_loop)
         self._task_runner.run(self._windowed_stats_push_loop)
+        self._task_runner.run(self._dead_peer_reap_loop)
 
         # Discovery maintenance (AD-28)
         self._discovery_maintenance_task = asyncio.create_task(
@@ -969,18 +992,15 @@ class GateServer(HealthAwareServer):
         )
         await self._idempotency_cache.start()
 
-        # Initialize coordinators and handlers
         self._init_coordinators()
         self._init_handlers()
 
-        # Wire orphan job coordinator to lease manager callback
         if self._orphan_job_coordinator:
             self._job_lease_manager._on_lease_expired = (
                 self._orphan_job_coordinator.on_lease_expired
             )
             await self._orphan_job_coordinator.start()
 
-        # Register with managers
         if self._datacenter_managers:
             await self._register_with_managers()
 
@@ -1014,6 +1034,9 @@ class GateServer(HealthAwareServer):
 
         await self._dc_health_monitor.stop()
         await self._job_timeout_tracker.stop()
+
+        if self._orphan_job_coordinator is not None:
+            await self._orphan_job_coordinator.stop()
 
         if self._idempotency_cache is not None:
             await self._idempotency_cache.close()
@@ -1848,9 +1871,20 @@ class GateServer(HealthAwareServer):
             self._active_gate_peers.add(tcp_addr)
 
     async def _handle_job_leader_failure(self, tcp_addr: tuple[str, int]) -> None:
-        """Handle job leader failure - takeover orphaned jobs."""
-        if self._peer_coordinator:
-            await self._peer_coordinator.handle_job_leader_failure(tcp_addr)
+        if self._orphan_job_coordinator:
+            orphaned_job_ids = self._orphan_job_coordinator.mark_jobs_orphaned_by_gate(
+                tcp_addr
+            )
+            if orphaned_job_ids:
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerInfo(
+                        message=f"Marked {len(orphaned_job_ids)} jobs as orphaned from failed gate {tcp_addr}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    ),
+                )
 
     def _on_gate_become_leader(self) -> None:
         """Called when this gate becomes the cluster leader."""
@@ -3034,6 +3068,79 @@ class GateServer(HealthAwareServer):
                 break
             except Exception as error:
                 await self.handle_exception(error, "discovery_maintenance_loop")
+
+    async def _dead_peer_reap_loop(self) -> None:
+        while self._running:
+            try:
+                await asyncio.sleep(self._dead_peer_check_interval)
+
+                now = time.monotonic()
+                reap_threshold = now - self._dead_peer_reap_interval
+
+                peers_to_reap = [
+                    peer_addr
+                    for peer_addr, unhealthy_since in self._modular_state.get_unhealthy_peers().items()
+                    if unhealthy_since < reap_threshold
+                ]
+
+                for peer_addr in peers_to_reap:
+                    self._modular_state.mark_peer_dead(peer_addr, now)
+                    await self._modular_state.remove_active_peer(peer_addr)
+
+                    self._task_runner.run(
+                        self._udp_logger.log,
+                        ServerInfo(
+                            message=f"Reaped dead gate peer {peer_addr[0]}:{peer_addr[1]}",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        ),
+                    )
+
+                cleanup_threshold = now - (self._dead_peer_reap_interval * 2)
+                peers_to_cleanup = [
+                    peer_addr
+                    for peer_addr, dead_since in self._modular_state.get_dead_peer_timestamps().items()
+                    if dead_since < cleanup_threshold
+                ]
+
+                for peer_addr in peers_to_cleanup:
+                    self._modular_state.cleanup_dead_peer(peer_addr)
+
+                await self._check_quorum_status()
+
+            except asyncio.CancelledError:
+                break
+            except Exception as error:
+                await self.handle_exception(error, "dead_peer_reap_loop")
+
+    async def _check_quorum_status(self) -> None:
+        active_peer_count = self._modular_state.get_active_peer_count() + 1
+        known_gate_count = len(self._gate_peers) + 1
+        quorum_size = known_gate_count // 2 + 1
+
+        if active_peer_count < quorum_size:
+            self._consecutive_quorum_failures += 1
+
+            if (
+                self._consecutive_quorum_failures
+                >= self._quorum_stepdown_consecutive_failures
+                and self._leader_election.state.is_leader()
+            ):
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerWarning(
+                        message=f"Quorum lost ({active_peer_count}/{known_gate_count} active, "
+                        f"need {quorum_size}). Stepping down as leader after "
+                        f"{self._consecutive_quorum_failures} consecutive failures.",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    ),
+                )
+                await self._leader_election._step_down()
+        else:
+            self._consecutive_quorum_failures = 0
 
     # =========================================================================
     # Coordinator Accessors

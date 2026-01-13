@@ -1013,12 +1013,13 @@ class JobManager:
         self,
         worker_id: str,
     ) -> list[tuple[str, str, str]]:
+        jobs_snapshot = list(self._jobs.values())
         return [
             (job.job_id, wf.token.workflow_id or "", sub.token_str)
-            for job in self._jobs.values()
-            for wf in job.workflows.values()
+            for job in jobs_snapshot
+            for wf in list(job.workflows.values())
             if wf.status == WorkflowStatus.RUNNING
-            for sub in job.sub_workflows.values()
+            for sub in list(job.sub_workflows.values())
             if sub.worker_id == worker_id and sub.result is None
         ]
 

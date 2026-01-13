@@ -56,9 +56,8 @@ class GateConfig:
     # Throughput tracking (AD-19)
     throughput_interval_seconds: float = 10.0
 
-    # Orphan job tracking
-    orphan_grace_period_seconds: float = 120.0
-    orphan_check_interval_seconds: float = 30.0
+    orphan_grace_period_seconds: float = 30.0
+    orphan_check_interval_seconds: float = 15.0
 
     # Timeout tracking (AD-34)
     timeout_check_interval_seconds: float = 15.0
@@ -91,6 +90,10 @@ class GateConfig:
 
     # Job ledger configuration (AD-38)
     ledger_data_dir: Path | None = None
+
+    dead_peer_reap_interval_seconds: float = 120.0
+    dead_peer_check_interval_seconds: float = 10.0
+    quorum_stepdown_consecutive_failures: int = 3
 
 
 def create_gate_config(

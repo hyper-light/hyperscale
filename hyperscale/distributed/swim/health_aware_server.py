@@ -1882,15 +1882,16 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             node=node,
             incarnation=incarnation,
         )
+        now = time.monotonic()
         await self._incarnation_tracker.update_node(
             node,
             b"DEAD",
             incarnation,
-            time.monotonic(),
+            now,
         )
+        self._incarnation_tracker.record_node_death(node, incarnation, now)
         self.queue_gossip_update("dead", node, incarnation)
 
-        # Update probe scheduler to stop probing this dead node
         self.update_probe_scheduler_membership()
 
         # Invoke registered callbacks (composition pattern)

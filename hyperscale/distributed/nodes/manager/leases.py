@@ -80,34 +80,42 @@ class ManagerLeaseCoordinator:
         self,
         job_id: str,
         tcp_addr: tuple[str, int],
+        force_takeover: bool = False,
     ) -> bool:
         """
         Claim leadership for a job.
 
-        Only succeeds if no current leader or we are the leader.
+        Only succeeds if no current leader, we are the leader, or force_takeover is True.
 
         Args:
             job_id: Job ID to claim
             tcp_addr: This manager's TCP address
+            force_takeover: If True, forcibly take over from failed leader (increments fencing token)
 
         Returns:
             True if leadership claimed successfully
         """
         current_leader = self._state._job_leaders.get(job_id)
 
-        if current_leader is None or current_leader == self._node_id:
+        can_claim = (
+            current_leader is None or current_leader == self._node_id or force_takeover
+        )
+
+        if can_claim:
             self._state._job_leaders[job_id] = self._node_id
             self._state._job_leader_addrs[job_id] = tcp_addr
 
-            # Initialize fencing token and layer version if new
             if job_id not in self._state._job_fencing_tokens:
                 self._state._job_fencing_tokens[job_id] = 1
                 self._state._job_layer_version[job_id] = 1
+            elif force_takeover:
+                self._state._job_fencing_tokens[job_id] += 1
 
+            action = "Took over" if force_takeover else "Claimed"
             self._task_runner.run(
                 self._logger.log,
                 ServerDebug(
-                    message=f"Claimed leadership for job {job_id[:8]}...",
+                    message=f"{action} leadership for job {job_id[:8]}... (fence={self._state._job_fencing_tokens.get(job_id, 0)})",
                     node_host=self._config.host,
                     node_port=self._config.tcp_port,
                     node_id=self._node_id,
