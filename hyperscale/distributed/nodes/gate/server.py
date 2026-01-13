@@ -2349,9 +2349,26 @@ class GateServer(HealthAwareServer):
         """Record request latency for load shedding."""
         self._overload_detector.record_latency(latency_ms)
 
-    def _record_dc_job_stats(self, dc_id: str, job_id: str, stats: dict) -> None:
-        """Record DC job stats."""
-        pass
+    async def _record_dc_job_stats(
+        self,
+        job_id: str,
+        datacenter_id: str,
+        completed: int,
+        failed: int,
+        rate: float,
+        status: str,
+    ) -> None:
+        timestamp = int(time.monotonic() * 1000)
+
+        async with self._job_stats_crdt_lock:
+            if job_id not in self._job_stats_crdt:
+                self._job_stats_crdt[job_id] = JobStatsCRDT(job_id=job_id)
+
+            crdt = self._job_stats_crdt[job_id]
+            crdt.record_completed(datacenter_id, completed)
+            crdt.record_failed(datacenter_id, failed)
+            crdt.record_rate(datacenter_id, rate, timestamp)
+            crdt.record_status(datacenter_id, status, timestamp)
 
     def _handle_update_by_tier(
         self,
