@@ -4456,22 +4456,6 @@ class ManagerServer(HealthAwareServer):
     # Helper Methods - Job Submission
     # =========================================================================
 
-    def _select_timeout_strategy(self, submission: JobSubmission) -> TimeoutStrategy:
-        """Select appropriate timeout strategy based on submission."""
-        if submission.gate_addr:
-            return GateCoordinatedTimeout(
-                send_tcp=self._send_to_peer,
-                logger=self._udp_logger,
-                node_id=self._node_id.short,
-                task_runner=self._task_runner,
-            )
-        return LocalAuthorityTimeout(
-            cancel_job=self._cancellation.cancel_job,
-            logger=self._udp_logger,
-            node_id=self._node_id.short,
-            task_runner=self._task_runner,
-        )
-
     async def _broadcast_job_leadership(
         self,
         job_id: str,
