@@ -666,6 +666,124 @@ After refactoring, verify the calling code still works:
 
 ---
 
+## Phase 5.8: Dead Computation Detection
+
+**Objective**: Find computed values that are never used (silent logic bugs).
+
+### The Problem
+
+When refactoring, computed values can become orphaned - computed but never passed to consumers:
+
+```python
+# BROKEN: final_status computed but never used
+async def _handle_job_completion(self, job_id: str):
+    job = self._get_job(job_id)
+    final_status = self._determine_final_job_status(job)  # Computed!
+    workflow_results, errors = self._aggregate_results(job)
+    
+    await self._send_completion(job_id, workflow_results, errors)  # final_status missing!
+
+# The downstream method re-invents the logic differently:
+async def _send_completion(self, job_id, results, errors):
+    final_status = "FAILED" if errors else "COMPLETED"  # Different semantics!
+```
+
+This is particularly insidious because:
+1. Code compiles and runs
+2. LSP shows no errors
+3. Tests may pass (if they don't check status semantics)
+4. Bug only surfaces in production edge cases
+
+### Step 5.8a: Trace All Computed Values
+
+For each method, list all local variables that are assigned:
+
+```bash
+grep -n "^\s*[a-z_]* = " method_body.py
+```
+
+Build assignment table:
+
+| Line | Variable | Computation | Used Where? |
+|------|----------|-------------|-------------|
+| 4579 | `final_status` | `_determine_final_job_status(job)` | ??? |
+| 4580 | `workflow_results` | `_aggregate_workflow_results(job)` | Line 4587 ✓ |
+| 4578 | `elapsed_seconds` | `job.elapsed_seconds()` | Line 4591 ✓ |
+
+### Step 5.8b: Verify Each Computation Is Used
+
+For each computed variable:
+
+1. **Search for usage** in the same method after assignment
+2. **If passed to another method**, verify the receiving method's signature accepts it
+3. **If returned**, verify caller uses the return value
+
+```bash
+# For variable 'final_status' assigned at line N
+# Search for usage after line N
+awk 'NR>N && /final_status/' method_body.py
+```
+
+### Step 5.8c: Cross-Method Data Flow
+
+When method A computes a value and calls method B:
+
+```
+Method A computes: final_status, workflow_results, errors
+Method A calls: _send_completion(job_id, workflow_results, errors)
+
+MISMATCH: final_status computed but not passed!
+```
+
+Build flow table:
+
+| Computed in Caller | Passed to Callee? | Callee Parameter |
+|-------------------|-------------------|------------------|
+| `final_status` | **NO** ❌ | (missing) |
+| `workflow_results` | YES ✓ | `workflow_results` |
+| `errors` | YES ✓ | `errors` |
+
+### Step 5.8d: Semantic Divergence Detection
+
+When a value is re-computed in a callee instead of being passed:
+
+```python
+# Caller's computation:
+final_status = self._determine_final_job_status(job)
+# Based on: job.workflows_failed count
+
+# Callee's re-computation:
+final_status = "FAILED" if errors else "COMPLETED"
+# Based on: presence of error strings
+```
+
+**These have different semantics!**
+- Original: FAILED only if ALL workflows failed
+- Re-computed: FAILED if ANY error string exists
+
+**Detection**: Search callee for assignments to the same variable name:
+```bash
+grep "final_status = " callee_method.py
+```
+
+If found, this is likely a semantic divergence bug.
+
+### Step 5.8e: Fix Patterns
+
+| Issue | Fix |
+|-------|-----|
+| Value computed but not passed | Add parameter to callee, pass value |
+| Value re-computed in callee | Remove re-computation, use passed value |
+| Callee doesn't need value | Remove computation from caller |
+
+### Output
+
+- Every computed value is either used locally, passed to callees, or returned
+- No semantic divergence between caller computation and callee re-computation
+- Clear data flow from computation to consumption
+
+---
+
 ## Phase 6: Clean Up Dead Code
 
 **Objective**: Remove orphaned implementations.
