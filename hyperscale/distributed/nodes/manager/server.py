@@ -4071,15 +4071,16 @@ class ManagerServer(HealthAwareServer):
 
             # Add all cancelled workflows to our bucket
             for wf_id in notification.cancelled_workflows:
-                if wf_id not in self._manager_state._cancelled_workflows:
-                    self._manager_state._cancelled_workflows[wf_id] = (
+                if not self._manager_state.has_cancelled_workflow(wf_id):
+                    self._manager_state.set_cancelled_workflow(
+                        wf_id,
                         CancelledWorkflowInfo(
                             job_id=notification.job_id,
                             workflow_id=wf_id,
                             cancelled_at=notification.timestamp or time.monotonic(),
                             request_id=notification.request_id,
                             dependents=[],
-                        )
+                        ),
                     )
 
             return b"OK"
