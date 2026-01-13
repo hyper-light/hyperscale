@@ -2300,7 +2300,7 @@ class ManagerServer(HealthAwareServer):
         Args:
             worker_id: The worker node ID that missed its deadline
         """
-        worker = self._manager_state._workers.get(worker_id)
+        worker = self._manager_state.get_worker(worker_id)
         if worker is None:
             self._manager_state._worker_deadlines.pop(worker_id, None)
             return
@@ -2814,7 +2814,7 @@ class ManagerServer(HealthAwareServer):
                     continue
 
                 if workflow.status == WorkflowStatus.RUNNING and workflow.worker_id:
-                    worker = self._manager_state._workers.get(workflow.worker_id)
+                    worker = self._manager_state.get_worker(workflow.worker_id)
                     if not worker:
                         workflow_errors[workflow_id] = (
                             f"Worker {workflow.worker_id} not found"
@@ -3087,7 +3087,7 @@ class ManagerServer(HealthAwareServer):
                     denial_reason="Worker not registered",
                 ).dump()
 
-            worker = self._manager_state._workers.get(worker_id)
+            worker = self._manager_state.get_worker(worker_id)
             if not worker:
                 return HealthcheckExtensionResponse(
                     granted=False,
