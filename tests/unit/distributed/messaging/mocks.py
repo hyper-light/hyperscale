@@ -123,8 +123,8 @@ class MockIncarnationTracker:
             return self._nodes[node][1]
         return 0
 
-    def get_required_rejoin_incarnation(self, node: tuple[str, int]) -> int | None:
-        return None
+    def get_required_rejoin_incarnation(self, node: tuple[str, int]) -> int:
+        return 0
 
 
 @dataclass
