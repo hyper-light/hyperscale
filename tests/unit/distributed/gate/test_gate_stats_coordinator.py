@@ -84,146 +84,72 @@ class MockJobStatus:
 # =============================================================================
 
 
+def create_coordinator(
+    state: GateRuntimeState | None = None,
+    get_job_callback=None,
+    get_job_status=None,
+    get_all_running_jobs=None,
+    send_tcp=None,
+    windowed_stats=None,
+) -> GateStatsCoordinator:
+    return GateStatsCoordinator(
+        state=state or GateRuntimeState(),
+        logger=MockLogger(),
+        task_runner=MockTaskRunner(),
+        windowed_stats=windowed_stats or MockWindowedStatsCollector(),
+        get_job_callback=get_job_callback or (lambda x: None),
+        get_job_status=get_job_status or (lambda x: None),
+        get_all_running_jobs=get_all_running_jobs or (lambda: []),
+        send_tcp=send_tcp or AsyncMock(),
+    )
+
+
 class TestClassifyUpdateTierHappyPath:
-    """Tests for classify_update_tier happy path."""
-
     def test_completed_status_is_immediate(self):
-        """COMPLETED status is always immediate."""
-        state = GateRuntimeState()
-        coordinator = GateStatsCoordinator(
-            state=state,
-            logger=MockLogger(),
-            task_runner=MockTaskRunner(),
-            windowed_stats=MockWindowedStatsCollector(),
-            get_job_callback=lambda x: None,
-            get_job_status=lambda x: None,
-            send_tcp=AsyncMock(),
-        )
-
+        coordinator = create_coordinator()
         tier = coordinator.classify_update_tier(
             "job-1", "running", JobStatus.COMPLETED.value
         )
         assert tier == UpdateTier.IMMEDIATE.value
 
     def test_failed_status_is_immediate(self):
-        """FAILED status is always immediate."""
-        state = GateRuntimeState()
-        coordinator = GateStatsCoordinator(
-            state=state,
-            logger=MockLogger(),
-            task_runner=MockTaskRunner(),
-            windowed_stats=MockWindowedStatsCollector(),
-            get_job_callback=lambda x: None,
-            get_job_status=lambda x: None,
-            send_tcp=AsyncMock(),
-        )
-
+        coordinator = create_coordinator()
         tier = coordinator.classify_update_tier(
             "job-1", "running", JobStatus.FAILED.value
         )
         assert tier == UpdateTier.IMMEDIATE.value
 
     def test_cancelled_status_is_immediate(self):
-        """CANCELLED status is always immediate."""
-        state = GateRuntimeState()
-        coordinator = GateStatsCoordinator(
-            state=state,
-            logger=MockLogger(),
-            task_runner=MockTaskRunner(),
-            windowed_stats=MockWindowedStatsCollector(),
-            get_job_callback=lambda x: None,
-            get_job_status=lambda x: None,
-            send_tcp=AsyncMock(),
-        )
-
+        coordinator = create_coordinator()
         tier = coordinator.classify_update_tier(
             "job-1", "running", JobStatus.CANCELLED.value
         )
         assert tier == UpdateTier.IMMEDIATE.value
 
     def test_first_running_is_immediate(self):
-        """First transition to RUNNING is immediate."""
-        state = GateRuntimeState()
-        coordinator = GateStatsCoordinator(
-            state=state,
-            logger=MockLogger(),
-            task_runner=MockTaskRunner(),
-            windowed_stats=MockWindowedStatsCollector(),
-            get_job_callback=lambda x: None,
-            get_job_status=lambda x: None,
-            send_tcp=AsyncMock(),
-        )
-
+        coordinator = create_coordinator()
         tier = coordinator.classify_update_tier("job-1", None, JobStatus.RUNNING.value)
         assert tier == UpdateTier.IMMEDIATE.value
 
     def test_status_change_is_immediate(self):
-        """Any status change is immediate."""
-        state = GateRuntimeState()
-        coordinator = GateStatsCoordinator(
-            state=state,
-            logger=MockLogger(),
-            task_runner=MockTaskRunner(),
-            windowed_stats=MockWindowedStatsCollector(),
-            get_job_callback=lambda x: None,
-            get_job_status=lambda x: None,
-            send_tcp=AsyncMock(),
-        )
-
+        coordinator = create_coordinator()
         tier = coordinator.classify_update_tier("job-1", "submitted", "running")
         assert tier == UpdateTier.IMMEDIATE.value
 
     def test_progress_within_status_is_periodic(self):
-        """Progress update within same status is periodic."""
-        state = GateRuntimeState()
-        coordinator = GateStatsCoordinator(
-            state=state,
-            logger=MockLogger(),
-            task_runner=MockTaskRunner(),
-            windowed_stats=MockWindowedStatsCollector(),
-            get_job_callback=lambda x: None,
-            get_job_status=lambda x: None,
-            send_tcp=AsyncMock(),
-        )
-
+        coordinator = create_coordinator()
         tier = coordinator.classify_update_tier("job-1", "running", "running")
         assert tier == UpdateTier.PERIODIC.value
 
 
 class TestClassifyUpdateTierEdgeCases:
-    """Tests for classify_update_tier edge cases."""
-
     def test_none_to_non_running_is_immediate(self):
-        """First transition to non-RUNNING is immediate if status changes."""
-        state = GateRuntimeState()
-        coordinator = GateStatsCoordinator(
-            state=state,
-            logger=MockLogger(),
-            task_runner=MockTaskRunner(),
-            windowed_stats=MockWindowedStatsCollector(),
-            get_job_callback=lambda x: None,
-            get_job_status=lambda x: None,
-            send_tcp=AsyncMock(),
-        )
-
-        # None to submitted - still a change
+        coordinator = create_coordinator()
         tier = coordinator.classify_update_tier("job-1", None, "submitted")
         assert tier == UpdateTier.IMMEDIATE.value
 
     def test_same_final_status_is_immediate(self):
-        """Even if no change, final statuses are immediate."""
-        state = GateRuntimeState()
-        coordinator = GateStatsCoordinator(
-            state=state,
-            logger=MockLogger(),
-            task_runner=MockTaskRunner(),
-            windowed_stats=MockWindowedStatsCollector(),
-            get_job_callback=lambda x: None,
-            get_job_status=lambda x: None,
-            send_tcp=AsyncMock(),
-        )
-
-        # Already completed, still completed
+        coordinator = create_coordinator()
         tier = coordinator.classify_update_tier(
             "job-1",
             JobStatus.COMPLETED.value,

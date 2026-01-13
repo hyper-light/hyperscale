@@ -156,12 +156,14 @@ class GateCancellationHandler:
                     retry_after_seconds=retry_after,
                 ).dump()
 
+            timestamp: float = 0.0
             try:
                 cancel_request = JobCancelRequest.load(data)
                 job_id = cancel_request.job_id
                 fence_token = cancel_request.fence_token
                 requester_id = cancel_request.requester_id
                 reason = cancel_request.reason
+                timestamp = cancel_request.timestamp
                 use_ad20 = True
             except Exception:
                 cancel = CancelJob.load(data)
@@ -229,14 +231,13 @@ class GateCancellationHandler:
                         fence_token: int = fence_token,
                         reason: str = reason,
                         manager_addr: tuple[str, int] = manager_addr,
+                        timestamp: float = timestamp,
                     ):
                         if use_ad20:
                             cancel_data = JobCancelRequest(
                                 job_id=job_id,
                                 requester_id=requester_id,
-                                timestamp=cancel_request.timestamp
-                                if "cancel_request" in dir()
-                                else 0,
+                                timestamp=timestamp,
                                 fence_token=fence_token,
                                 reason=reason,
                             ).dump()
