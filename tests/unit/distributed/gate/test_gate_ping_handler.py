@@ -22,6 +22,7 @@ from hyperscale.distributed.models import GateState as GateStateEnum
 @dataclass
 class MockLogger:
     """Mock logger for testing."""
+
     messages: list[str] = field(default_factory=list)
 
     async def log(self, *args, **kwargs):
@@ -31,6 +32,7 @@ class MockLogger:
 @dataclass
 class MockNodeId:
     """Mock node ID."""
+
     full: str = "gate-001"
     datacenter: str = "global"
 
@@ -38,6 +40,7 @@ class MockNodeId:
 @dataclass
 class MockPingRequest:
     """Mock ping request."""
+
     request_id: str = "req-123"
 
     @classmethod
@@ -48,6 +51,7 @@ class MockPingRequest:
 @dataclass
 class MockDCHealthStatus:
     """Mock DC health status."""
+
     health: str = "healthy"
     available_capacity: int = 100
     manager_count: int = 3
@@ -57,6 +61,7 @@ class MockDCHealthStatus:
 @dataclass
 class MockManagerHeartbeat:
     """Mock manager heartbeat."""
+
     is_leader: bool = True
     tcp_host: str = "10.0.0.1"
     tcp_port: int = 8000
@@ -92,8 +97,9 @@ class TestGatePingHandlerHappyPath:
 
         # Mock the PingRequest.load method
         import hyperscale.distributed.nodes.gate.handlers.tcp_ping as ping_module
+
         original_load = None
-        if hasattr(ping_module, 'PingRequest'):
+        if hasattr(ping_module, "PingRequest"):
             original_load = ping_module.PingRequest.load
 
         try:
@@ -143,8 +149,8 @@ class TestGatePingHandlerHappyPath:
     async def test_includes_active_peers(self):
         """Handler includes active peer gates."""
         state = GateRuntimeState()
-        state.add_active_peer(("10.0.0.2", 9000))
-        state.add_active_peer(("10.0.0.3", 9000))
+        await state.add_active_peer(("10.0.0.2", 9000))
+        await state.add_active_peer(("10.0.0.3", 9000))
 
         handler = GatePingHandler(
             state=state,
@@ -198,7 +204,7 @@ class TestGatePingHandlerNegativePath:
         )
 
         # Should return error response
-        assert result == b'error'
+        assert result == b"error"
 
 
 class TestGatePingHandlerFailureMode:
@@ -233,7 +239,7 @@ class TestGatePingHandlerFailureMode:
         )
 
         # Should return error response
-        assert result == b'error'
+        assert result == b"error"
 
 
 # =============================================================================
@@ -438,14 +444,16 @@ class TestGatePingHandlerConcurrency:
         )
 
         # Send many concurrent pings
-        results = await asyncio.gather(*[
-            handler.handle_ping(
-                addr=(f"10.0.0.{i}", 8000),
-                data=b"ping_data",
-                clock_time=12345 + i,
-            )
-            for i in range(100)
-        ])
+        results = await asyncio.gather(
+            *[
+                handler.handle_ping(
+                    addr=(f"10.0.0.{i}", 8000),
+                    data=b"ping_data",
+                    clock_time=12345 + i,
+                )
+                for i in range(100)
+            ]
+        )
 
         # All should complete (either with response or error)
         assert len(results) == 100
