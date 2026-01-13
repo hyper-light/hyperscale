@@ -769,7 +769,8 @@ class TestStarvationFairness:
         assert high_shed == 0
         assert low_shed == 1000
 
-    def test_rate_limiter_per_client_fairness(self):
+    @pytest.mark.asyncio
+    async def test_rate_limiter_per_client_fairness(self):
         """Test rate limiter provides per-client fairness."""
         config = RateLimitConfig(
             default_bucket_size=10,
@@ -779,14 +780,15 @@ class TestStarvationFairness:
 
         # Client 1 exhausts their limit
         for _ in range(20):
-            limiter.check_rate_limit("client-1", "operation")
+            await limiter.check_rate_limit("client-1", "operation")
 
         # Client 2 should still have full quota
         for _ in range(10):
-            result = limiter.check_rate_limit("client-2", "operation")
+            result = await limiter.check_rate_limit("client-2", "operation")
             assert result.allowed is True
 
-    def test_per_operation_fairness(self):
+    @pytest.mark.asyncio
+    async def test_per_operation_fairness(self):
         """Test different operations have independent limits."""
         config = RateLimitConfig(
             default_bucket_size=10,
@@ -800,11 +802,11 @@ class TestStarvationFairness:
 
         # Exhaust low_rate_op
         for _ in range(10):
-            limiter.check_rate_limit("client-1", "low_rate_op")
+            await limiter.check_rate_limit("client-1", "low_rate_op")
 
         # high_rate_op should still work
         for _ in range(50):
-            result = limiter.check_rate_limit("client-1", "high_rate_op")
+            result = await limiter.check_rate_limit("client-1", "high_rate_op")
             assert result.allowed is True
 
 
