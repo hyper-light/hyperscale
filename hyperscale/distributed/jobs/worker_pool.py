@@ -255,8 +255,58 @@ class WorkerPool:
         return False
 
     def get_healthy_worker_ids(self) -> list[str]:
-        """Get list of all healthy worker node IDs."""
         return [node_id for node_id in self._workers if self.is_worker_healthy(node_id)]
+
+    def get_worker_health_bucket(self, node_id: str) -> str:
+        worker = self._workers.get(node_id)
+        if not worker:
+            return "UNHEALTHY"
+
+        if not self.is_worker_healthy(node_id):
+            return "UNHEALTHY"
+
+        overload_state = worker.overload_state
+
+        if overload_state == "healthy":
+            return "HEALTHY"
+        elif overload_state == "busy":
+            return "BUSY"
+        elif overload_state == "stressed":
+            return "DEGRADED"
+        elif overload_state == "overloaded":
+            return "UNHEALTHY"
+
+        return "HEALTHY"
+
+    def get_worker_health_state_counts(self) -> dict[str, int]:
+        counts = {"healthy": 0, "busy": 0, "stressed": 0, "overloaded": 0}
+
+        for node_id, worker in self._workers.items():
+            if not self.is_worker_healthy(node_id):
+                continue
+
+            overload_state = worker.overload_state
+            if overload_state in counts:
+                counts[overload_state] += 1
+            else:
+                counts["healthy"] += 1
+
+        return counts
+
+    def get_workers_by_health_bucket(self) -> dict[str, list[str]]:
+        buckets: dict[str, list[str]] = {
+            "HEALTHY": [],
+            "BUSY": [],
+            "DEGRADED": [],
+            "UNHEALTHY": [],
+        }
+
+        for node_id in self._workers:
+            bucket = self.get_worker_health_bucket(node_id)
+            if bucket in buckets:
+                buckets[bucket].append(node_id)
+
+        return buckets
 
     # =========================================================================
     # Three-Signal Health Model (AD-19)
@@ -394,27 +444,25 @@ class WorkerPool:
             worker.heartbeat = heartbeat
             worker.last_seen = time.monotonic()
 
-            # Update cores from heartbeat (authoritative source)
             old_available = worker.available_cores
             worker.available_cores = heartbeat.available_cores
             worker.total_cores = heartbeat.available_cores + len(
                 heartbeat.active_workflows
             )
 
-            # Clear any reservations that are now confirmed
             worker.reserved_cores = 0
 
-            # Signal if cores became available
+            worker.overload_state = getattr(
+                heartbeat, "health_overload_state", "healthy"
+            )
+
             if worker.available_cores > old_available:
                 self._cores_available.set()
 
-            # Update three-signal health state (AD-19)
             health_state = self._worker_health.get(node_id)
             if health_state:
-                # Heartbeat received = liveness success
                 health_state.update_liveness(success=True)
 
-                # Update readiness from heartbeat data
                 health_state.update_readiness(
                     accepting=worker.available_cores > 0,
                     capacity=worker.available_cores,
@@ -501,40 +549,41 @@ class WorkerPool:
         self,
         cores_needed: int,
     ) -> list[tuple[str, int]]:
-        """
-        Select workers to satisfy core requirement.
-
-        Uses a greedy algorithm to pack workflows onto workers
-        while respecting available cores.
-
-        Must be called with allocation lock held.
-        """
         allocations: list[tuple[str, int]] = []
         remaining = cores_needed
 
-        # Get healthy workers sorted by available cores (descending)
-        healthy_workers = [
-            (node_id, worker)
-            for node_id, worker in self._workers.items()
-            if self.is_worker_healthy(node_id)
-        ]
-        healthy_workers.sort(
-            key=lambda x: x[1].available_cores - x[1].reserved_cores,
-            reverse=True,
-        )
+        bucket_priority = ["HEALTHY", "BUSY", "DEGRADED"]
 
-        for node_id, worker in healthy_workers:
+        workers_by_bucket: dict[str, list[tuple[str, WorkerStatus]]] = {
+            bucket: [] for bucket in bucket_priority
+        }
+
+        for node_id, worker in self._workers.items():
+            bucket = self.get_worker_health_bucket(node_id)
+            if bucket in workers_by_bucket:
+                workers_by_bucket[bucket].append((node_id, worker))
+
+        for bucket in bucket_priority:
             if remaining <= 0:
                 break
 
-            available = worker.available_cores - worker.reserved_cores
-            if available <= 0:
-                continue
+            bucket_workers = workers_by_bucket[bucket]
+            bucket_workers.sort(
+                key=lambda x: x[1].available_cores - x[1].reserved_cores,
+                reverse=True,
+            )
 
-            # Allocate as many cores as possible from this worker
-            to_allocate = min(available, remaining)
-            allocations.append((node_id, to_allocate))
-            remaining -= to_allocate
+            for node_id, worker in bucket_workers:
+                if remaining <= 0:
+                    break
+
+                available = worker.available_cores - worker.reserved_cores
+                if available <= 0:
+                    continue
+
+                to_allocate = min(available, remaining)
+                allocations.append((node_id, to_allocate))
+                remaining -= to_allocate
 
         return allocations
 
