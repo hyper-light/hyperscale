@@ -112,16 +112,16 @@ class ManagerHealthMonitor:
         registry: "ManagerRegistry",
         logger: "Logger",
         node_id: str,
-        task_runner,
+        task_runner: "TaskRunner",
     ) -> None:
-        self._state = state
-        self._config = config
-        self._registry = registry
-        self._logger = logger
-        self._node_id = node_id
-        self._task_runner = task_runner
-        self._latency_max_age = 60.0
-        self._latency_max_count = 30
+        self._state: "ManagerState" = state
+        self._config: "ManagerConfig" = config
+        self._registry: "ManagerRegistry" = registry
+        self._logger: "Logger" = logger
+        self._node_id: str = node_id
+        self._task_runner: "TaskRunner" = task_runner
+        self._latency_max_age: float = 60.0
+        self._latency_max_count: int = 30
 
         # AD-18: Hybrid overload detector for manager self-health
         self._overload_detector = HybridOverloadDetector()
