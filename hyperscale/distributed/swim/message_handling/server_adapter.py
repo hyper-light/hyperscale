@@ -62,9 +62,8 @@ class ServerAdapter:
 
     # === Peer Confirmation (AD-29) ===
 
-    def confirm_peer(self, peer: tuple[str, int]) -> bool:
-        """Mark a peer as confirmed."""
-        return self._server.confirm_peer(peer)
+    async def confirm_peer(self, peer: tuple[str, int]) -> bool:
+        return await self._server.confirm_peer(peer)
 
     def is_peer_confirmed(self, peer: tuple[str, int]) -> bool:
         """Check if a peer has been confirmed."""
