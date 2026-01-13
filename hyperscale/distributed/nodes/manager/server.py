@@ -772,6 +772,9 @@ class ManagerServer(HealthAwareServer):
         self._peer_job_state_sync_task = self._create_background_task(
             self._peer_job_state_sync_loop(), "peer_job_state_sync"
         )
+        self._resource_sample_task = self._create_background_task(
+            self._resource_sample_loop(), "resource_sample"
+        )
 
     async def _cancel_background_tasks(self) -> None:
         """Cancel all background tasks."""
