@@ -915,6 +915,15 @@ class ManagerState:
     def set_cancellation_initiated_at(self, job_id: str, timestamp: float) -> None:
         self._cancellation_initiated_at[job_id] = timestamp
 
+    def clear_cancellation_initiated_at(self, job_id: str) -> None:
+        self._cancellation_initiated_at.pop(job_id, None)
+
+    def clear_cancellation_pending_workflows(self, job_id: str) -> None:
+        self._cancellation_pending_workflows.pop(job_id, None)
+
+    def clear_cancellation_completion_events(self, job_id: str) -> None:
+        self._cancellation_completion_events.pop(job_id, None)
+
     # =========================================================================
     # Single-Access Field Accessors
     # =========================================================================
