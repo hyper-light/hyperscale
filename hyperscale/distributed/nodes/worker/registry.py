@@ -172,7 +172,7 @@ class WorkerRegistry:
             return circuit.circuit_state == CircuitState.OPEN
         return False
 
-    def get_circuit_status(self, manager_id: str | None = None) -> dict:
+    def get_circuit_status(self, manager_id: str | None = None) -> dict[str, Any]:
         """Get circuit breaker status for a specific manager or summary."""
         if manager_id:
             if not (circuit := self._manager_circuits.get(manager_id)):
