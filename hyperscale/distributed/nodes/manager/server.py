@@ -4569,7 +4569,9 @@ class ManagerServer(HealthAwareServer):
         """Handle job completion with notification and cleanup."""
         job = self._job_manager.get_job_by_id(job_id)
         if not job:
-            return await self._send_job_completion_to_gate(job_id, [], [], 0, 0, 0.0)
+            return await self._send_job_completion_to_gate(
+                job_id, JobStatus.COMPLETED.value, [], [], 0, 0, 0.0
+            )
 
         async with job.lock:
             job.status = JobStatus.COMPLETED.value
@@ -4581,6 +4583,7 @@ class ManagerServer(HealthAwareServer):
 
         await self._send_job_completion_to_gate(
             job_id,
+            final_status,
             workflow_results,
             errors,
             total_completed,
@@ -4646,14 +4649,13 @@ class ManagerServer(HealthAwareServer):
     async def _send_job_completion_to_gate(
         self,
         job_id: str,
+        final_status: str,
         workflow_results: list[WorkflowResult],
         errors: list[str],
         total_completed: int,
         total_failed: int,
         elapsed_seconds: float,
     ) -> None:
-        final_status = JobStatus.FAILED.value if errors else JobStatus.COMPLETED.value
-
         await self._notify_gate_of_completion(
             job_id,
             final_status,
