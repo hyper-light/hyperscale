@@ -641,20 +641,20 @@ class TestWorkerExecutorEdgeCases:
         # Should not raise
         await executor.free_cores("non-existent")
 
-    def test_many_throughput_samples(self):
-        """Test with many throughput samples."""
+    @pytest.mark.asyncio
+    async def test_many_throughput_samples(self):
         allocator = MockCoreAllocator()
         logger = MagicMock()
         state = MockWorkerState()
         executor = WorkerExecutor(allocator, logger, state)
 
         for i in range(1000):
-            executor.record_throughput_event(float(i % 10 + 1))
+            await executor.record_throughput_event(float(i % 10 + 1))
 
         assert len(state._completion_times) == 50
 
-    def test_throughput_negative_time(self):
-        """Test throughput with negative completion time."""
+    @pytest.mark.asyncio
+    async def test_throughput_negative_time(self):
         allocator = MockCoreAllocator()
         logger = MagicMock()
         state = MockWorkerState()
