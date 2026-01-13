@@ -3074,41 +3074,48 @@ class GateServer(HealthAwareServer):
             except Exception as error:
                 await self.handle_exception(error, "windowed_stats_push_loop")
 
+    def _decay_discovery_failures(self) -> None:
+        for dc_discovery in self._dc_manager_discovery.values():
+            dc_discovery.decay_failures()
+        self._peer_discovery.decay_failures()
+
+    def _get_stale_manager_addrs(self, stale_cutoff: float) -> list[tuple[str, int]]:
+        return [
+            manager_addr
+            for manager_addr, last_status in self._manager_last_status.items()
+            if last_status < stale_cutoff
+        ]
+
+    async def _cleanup_stale_manager(self, manager_addr: tuple[str, int]) -> None:
+        self._manager_last_status.pop(manager_addr, None)
+        await self._clear_manager_backpressure(manager_addr)
+        self._manager_negotiated_caps.pop(manager_addr, None)
+
+        for dc_id in list(self._datacenter_manager_status.keys()):
+            dc_managers = self._datacenter_manager_status.get(dc_id)
+            if dc_managers and manager_addr in dc_managers:
+                dc_managers.pop(manager_addr, None)
+
+        health_keys_to_remove = [
+            key for key in self._manager_health if key[1] == manager_addr
+        ]
+        for key in health_keys_to_remove:
+            self._manager_health.pop(key, None)
+
     async def _discovery_maintenance_loop(self) -> None:
-        """Discovery maintenance loop (AD-28)."""
         stale_manager_threshold = 300.0
         while self._running:
             try:
                 await asyncio.sleep(self._discovery_failure_decay_interval)
 
-                for dc_discovery in self._dc_manager_discovery.values():
-                    dc_discovery.decay_failures()
-
-                self._peer_discovery.decay_failures()
+                self._decay_discovery_failures()
 
                 now = time.monotonic()
                 stale_cutoff = now - stale_manager_threshold
-                stale_manager_addrs = [
-                    manager_addr
-                    for manager_addr, last_status in self._manager_last_status.items()
-                    if last_status < stale_cutoff
-                ]
+                stale_manager_addrs = self._get_stale_manager_addrs(stale_cutoff)
 
                 for manager_addr in stale_manager_addrs:
-                    self._manager_last_status.pop(manager_addr, None)
-                    await self._clear_manager_backpressure(manager_addr)
-                    self._manager_negotiated_caps.pop(manager_addr, None)
-
-                    for dc_id in list(self._datacenter_manager_status.keys()):
-                        dc_managers = self._datacenter_manager_status.get(dc_id)
-                        if dc_managers and manager_addr in dc_managers:
-                            dc_managers.pop(manager_addr, None)
-
-                    health_keys_to_remove = [
-                        key for key in self._manager_health if key[1] == manager_addr
-                    ]
-                    for key in health_keys_to_remove:
-                        self._manager_health.pop(key, None)
+                    await self._cleanup_stale_manager(manager_addr)
 
                 await self._dispatch_time_tracker.cleanup_stale_entries()
                 await self._observed_latency_tracker.cleanup_stale_entries()
