@@ -449,9 +449,9 @@ class JobStatsCRDT:
         )
 
 
-class ThreadSafeJobStatsCRDT:
+class AsyncSafeJobStatsCRDT:
     """
-    Async-safe wrapper around JobStatsCRDT for concurrent access.
+    Async-safe wrapper around JobStatsCRDT for concurrent coroutine access.
 
     Provides asyncio.Lock protection around merge operations to prevent
     race conditions when multiple coroutines merge stats concurrently.
