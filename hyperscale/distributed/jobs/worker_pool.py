@@ -705,7 +705,111 @@ class WorkerPool:
         )
 
     async def _log_critical(self, message: str) -> None:
-        """Log a critical-level message."""
         await self._logger.log(
             WorkerPoolCritical(message=message, **self._get_log_context())
         )
+
+    async def register_remote_worker(self, update: WorkerStateUpdate) -> bool:
+        async with self._registration_lock:
+            worker_id = update.worker_id
+
+            if worker_id in self._workers:
+                return False
+
+            if worker_id in self._remote_workers:
+                existing = self._remote_workers[worker_id]
+                existing.total_cores = update.total_cores
+                existing.available_cores = update.available_cores
+                existing.last_seen = time.monotonic()
+                return True
+
+            from hyperscale.distributed.models import NodeInfo
+
+            node_info = NodeInfo(
+                node_id=worker_id,
+                role="worker",
+                host=update.host,
+                port=update.tcp_port,
+                datacenter=update.datacenter,
+                udp_port=update.udp_port,
+            )
+
+            registration = WorkerRegistration(
+                node=node_info,
+                total_cores=update.total_cores,
+                available_cores=update.available_cores,
+                memory_mb=0,
+            )
+
+            worker = WorkerStatus(
+                worker_id=worker_id,
+                state=WorkerState.HEALTHY.value,
+                registration=registration,
+                last_seen=time.monotonic(),
+                total_cores=update.total_cores,
+                available_cores=update.available_cores,
+                is_remote=True,
+                owner_manager_id=update.owner_manager_id,
+            )
+
+            self._remote_workers[worker_id] = worker
+
+            addr = (update.host, update.tcp_port)
+            self._remote_addr_to_worker[addr] = worker_id
+
+            return True
+
+    async def deregister_remote_worker(self, worker_id: str) -> bool:
+        async with self._registration_lock:
+            worker = self._remote_workers.pop(worker_id, None)
+            if not worker:
+                return False
+
+            if worker.registration:
+                addr = (worker.registration.node.host, worker.registration.node.port)
+                self._remote_addr_to_worker.pop(addr, None)
+
+            return True
+
+    def get_remote_worker(self, worker_id: str) -> WorkerStatus | None:
+        return self._remote_workers.get(worker_id)
+
+    def is_worker_local(self, worker_id: str) -> bool:
+        return worker_id in self._workers
+
+    def is_worker_remote(self, worker_id: str) -> bool:
+        return worker_id in self._remote_workers
+
+    def iter_remote_workers(self) -> list[WorkerStatus]:
+        return list(self._remote_workers.values())
+
+    def iter_all_workers(self) -> list[WorkerStatus]:
+        return list(self._workers.values()) + list(self._remote_workers.values())
+
+    def get_local_worker_count(self) -> int:
+        return len(self._workers)
+
+    def get_remote_worker_count(self) -> int:
+        return len(self._remote_workers)
+
+    def get_total_worker_count(self) -> int:
+        return len(self._workers) + len(self._remote_workers)
+
+    async def cleanup_remote_workers_for_manager(self, manager_id: str) -> int:
+        async with self._registration_lock:
+            to_remove = [
+                worker_id
+                for worker_id, worker in self._remote_workers.items()
+                if getattr(worker, "owner_manager_id", None) == manager_id
+            ]
+
+            for worker_id in to_remove:
+                worker = self._remote_workers.pop(worker_id, None)
+                if worker and worker.registration:
+                    addr = (
+                        worker.registration.node.host,
+                        worker.registration.node.port,
+                    )
+                    self._remote_addr_to_worker.pop(addr, None)
+
+            return len(to_remove)
