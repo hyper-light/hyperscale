@@ -77,16 +77,20 @@ class WorkflowDispatchHandler:
                     error=f"Queue depth limit reached: {current_pending}/{max_pending} pending",
                 ).dump()
 
-            # Validate fence token for at-most-once dispatch (walrus for single lookup)
-            if dispatch.fence_token <= (current := self._server._workflow_fence_tokens.get(dispatch.workflow_id, -1)):
+            token_accepted = (
+                await self._server._worker_state.update_workflow_fence_token(
+                    dispatch.workflow_id, dispatch.fence_token
+                )
+            )
+            if not token_accepted:
+                current = await self._server._worker_state.get_workflow_fence_token(
+                    dispatch.workflow_id
+                )
                 return WorkflowDispatchAck(
                     workflow_id=dispatch.workflow_id,
                     accepted=False,
                     error=f"Stale fence token: {dispatch.fence_token} <= {current}",
                 ).dump()
-
-            # Update fence token tracking
-            self._server._workflow_fence_tokens[dispatch.workflow_id] = dispatch.fence_token
 
             # Atomic core allocation
             allocation_result = await self._server._core_allocator.allocate(
@@ -98,7 +102,8 @@ class WorkflowDispatchHandler:
                 return WorkflowDispatchAck(
                     workflow_id=dispatch.workflow_id,
                     accepted=False,
-                    error=allocation_result.error or f"Failed to allocate {dispatch.cores} cores",
+                    error=allocation_result.error
+                    or f"Failed to allocate {dispatch.cores} cores",
                 ).dump()
 
             allocation_succeeded = True
