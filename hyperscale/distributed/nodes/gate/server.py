@@ -1986,12 +1986,30 @@ class GateServer(HealthAwareServer):
         """Get manager count for a DC."""
         return len(self._datacenter_managers.get(dc_id, []))
 
+    async def _suspect_manager_for_dc(
+        self,
+        dc_id: str,
+        manager_addr: tuple[str, int],
+    ) -> None:
+        incarnation = 0
+        health_state = self._datacenter_manager_status.get(dc_id, {}).get(manager_addr)
+        if health_state:
+            incarnation = getattr(health_state, "incarnation", 0)
+
+        detector = self.get_hierarchical_detector()
+        if detector:
+            await detector.suspect_job(
+                job_id=dc_id,
+                node=manager_addr,
+                incarnation=incarnation,
+                from_node=(self._host, self._udp_port),
+            )
+
     async def _confirm_manager_for_dc(
         self,
         dc_id: str,
         manager_addr: tuple[str, int],
     ) -> None:
-        """Confirm manager is alive for a DC."""
         incarnation = 0
         health_state = self._datacenter_manager_status.get(dc_id, {}).get(manager_addr)
         if health_state:
