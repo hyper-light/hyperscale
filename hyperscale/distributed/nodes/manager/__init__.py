@@ -27,7 +27,10 @@ from .health import (
 from .leadership import ManagerLeadershipCoordinator
 from .stats import ManagerStatsCoordinator, ProgressState, BackpressureLevel
 from .discovery import ManagerDiscoveryCoordinator
-from .load_shedding import ManagerLoadShedder, RequestPriority, OverloadState
+from .load_shedding import ManagerLoadShedder, RequestPriority, OverloadStateTracker
+
+# Backwards compatibility alias
+OverloadState = OverloadStateTracker
 from .rate_limiting import ManagerRateLimitingCoordinator
 from .version_skew import ManagerVersionSkewHandler
 
