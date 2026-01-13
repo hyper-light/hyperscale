@@ -2023,6 +2023,396 @@ async def _process_complex_case(self):
 
 ---
 
+## Phase 6.5: Runtime Correctness Validation (CRITICAL - NO SHORTCUTS)
+
+**Objective**: Verify that changes do not introduce race conditions, memory leaks, dropped errors, or unbounded queues.
+
+**NO SHORTCUTS**: These are silent killers that compile and run but cause production failures. Every check must be performed on BOTH initial analysis AND after any fix.
+
+### The Problem
+
+These four categories of bugs are particularly insidious because:
+- They pass all type checks and LSP diagnostics
+- They may not surface in unit tests
+- They cause intermittent or delayed failures in production
+- They can be introduced by seemingly correct refactors
+
+### Step 6.5a: Race Condition Detection
+
+**What to look for:**
+
+1. **Shared mutable state accessed without locks**:
+   ```python
+   # DANGEROUS: Multiple async tasks modifying same dict
+   self._workers[worker_id] = worker  # No lock!
+   
+   # SAFE: Protected by lock
+   async with self._workers_lock:
+       self._workers[worker_id] = worker
+   ```
+
+2. **Check-then-act patterns without atomicity**:
+   ```python
+   # DANGEROUS: Race between check and act
+   if worker_id not in self._workers:
+       self._workers[worker_id] = create_worker()  # Another task may have added it!
+   
+   # SAFE: Use setdefault or lock
+   self._workers.setdefault(worker_id, create_worker())
+   ```
+
+3. **Event wait without timeout**:
+   ```python
+   # DANGEROUS: Can hang forever if event never set
+   await event.wait()
+   
+   # SAFE: Timeout with handling
+   try:
+       await asyncio.wait_for(event.wait(), timeout=30.0)
+   except asyncio.TimeoutError:
+       # Handle timeout case
+   ```
+
+4. **Concurrent iteration and modification**:
+   ```python
+   # DANGEROUS: Dict modified while iterating
+   for worker_id in self._workers:
+       if should_remove(worker_id):
+           del self._workers[worker_id]  # RuntimeError!
+   
+   # SAFE: Iterate over copy
+   for worker_id in list(self._workers.keys()):
+       if should_remove(worker_id):
+           del self._workers[worker_id]
+   ```
+
+**Detection Commands:**
+
+```bash
+# Find dict/set modifications in loops
+grep -n "for.*in self\._[a-z_]*:" server.py | while read line; do
+    linenum=$(echo $line | cut -d: -f1)
+    # Check if there's a del/pop/clear in the following 20 lines
+    sed -n "$((linenum+1)),$((linenum+20))p" server.py | grep -q "del\|\.pop\|\.clear\|\.discard" && echo "Potential concurrent modification at line $linenum"
+done
+
+# Find check-then-act patterns
+grep -n "if.*not in self\._" server.py
+
+# Find await without timeout
+grep -n "await.*\.wait()" server.py | grep -v "wait_for"
+```
+
+**Validation Matrix:**
+
+| Line | Pattern | Shared State | Protected? | Fix Required? |
+|------|---------|--------------|------------|---------------|
+| 1234 | check-then-act | `_workers` | No | **YES** |
+| 2456 | concurrent iteration | `_jobs` | Yes (uses list()) | No |
+
+### Step 6.5b: Memory Leak Detection
+
+**What to look for:**
+
+1. **Unbounded collection growth**:
+   ```python
+   # DANGEROUS: Never cleaned up
+   self._completed_jobs[job_id] = result  # Grows forever!
+   
+   # SAFE: Cleanup after TTL or limit
+   self._completed_jobs[job_id] = result
+   self._task_runner.run(self._cleanup_completed_job, job_id, delay=300.0)
+   ```
+
+2. **Event/Future references held after completion**:
+   ```python
+   # DANGEROUS: Completion events accumulate
+   self._completion_events[job_id] = asyncio.Event()
+   # ...job completes...
+   event.set()  # Event still in dict!
+   
+   # SAFE: Remove after use
+   event = self._completion_events.pop(job_id, None)
+   if event:
+       event.set()
+   ```
+
+3. **Callback references not cleaned up**:
+   ```python
+   # DANGEROUS: Callbacks accumulate
+   self._job_callbacks[job_id] = callback_addr
+   # ...job completes, callback invoked...
+   # callback_addr still in dict!
+   
+   # SAFE: Clean up in job cleanup path
+   def _cleanup_job_state(self, job_id):
+       self._job_callbacks.pop(job_id, None)
+       self._completion_events.pop(job_id, None)
+       # etc.
+   ```
+
+4. **Task references without cleanup**:
+   ```python
+   # DANGEROUS: Task references accumulate
+   self._pending_tasks[task_id] = asyncio.create_task(work())
+   
+   # SAFE: Remove when done
+   task = asyncio.create_task(work())
+   task.add_done_callback(lambda t: self._pending_tasks.pop(task_id, None))
+   self._pending_tasks[task_id] = task
+   ```
+
+**Detection Commands:**
+
+```bash
+# Find collections that grow without cleanup
+grep -n "self\._[a-z_]*\[.*\] = " server.py > /tmp/additions.txt
+grep -n "self\._[a-z_]*\.pop\|del self\._[a-z_]*\[" server.py > /tmp/removals.txt
+# Compare: additions without corresponding removals are suspects
+
+# Find Event/Future creation
+grep -n "asyncio\.Event()\|asyncio\.Future()" server.py
+
+# Find where they're cleaned up
+grep -n "\.pop.*Event\|\.pop.*Future" server.py
+```
+
+**Validation Matrix:**
+
+| Collection | Adds At | Removes At | Cleanup Path Exists? | Fix Required? |
+|------------|---------|------------|---------------------|---------------|
+| `_completion_events` | L1234 | L1567 | Yes (job cleanup) | No |
+| `_pending_cancellations` | L2345 | **NEVER** | **NO** | **YES** |
+
+### Step 6.5c: Dropped Error Detection
+
+**What to look for:**
+
+1. **Empty except blocks**:
+   ```python
+   # DANGEROUS: Error swallowed silently
+   try:
+       risky_operation()
+   except Exception:
+       pass  # BUG: What happened?
+   
+   # SAFE: Log at minimum
+   try:
+       risky_operation()
+   except Exception as e:
+       await self._logger.log(ServerError(message=str(e), ...))
+   ```
+
+2. **Fire-and-forget tasks without error handling**:
+   ```python
+   # DANGEROUS: Task errors go nowhere
+   asyncio.create_task(self._background_work())  # If it fails, who knows?
+   
+   # SAFE: Use task runner with error handling
+   self._task_runner.run(self._background_work)  # Runner logs errors
+   ```
+
+3. **Callbacks that can fail silently**:
+   ```python
+   # DANGEROUS: Callback failure not detected
+   for callback in self._callbacks:
+       callback(result)  # If one fails, others still run but error lost
+   
+   # SAFE: Wrap each callback
+   for callback in self._callbacks:
+       try:
+           callback(result)
+       except Exception as e:
+           await self._logger.log(...)
+   ```
+
+4. **Ignored return values from fallible operations**:
+   ```python
+   # DANGEROUS: Error in returned tuple ignored
+   result = await self._send_message(addr, msg)  # Returns (success, error)
+   # Never check result!
+   
+   # SAFE: Check result
+   success, error = await self._send_message(addr, msg)
+   if not success:
+       await self._handle_send_failure(addr, error)
+   ```
+
+**Detection Commands:**
+
+```bash
+# Find empty except blocks
+grep -n "except.*:" server.py | while read line; do
+    linenum=$(echo $line | cut -d: -f1)
+    nextline=$((linenum + 1))
+    sed -n "${nextline}p" server.py | grep -q "^\s*pass\s*$" && echo "Empty except at line $linenum"
+done
+
+# Find fire-and-forget tasks
+grep -n "asyncio\.create_task\|asyncio\.ensure_future" server.py
+
+# Find except Exception with only logging (OK) vs pass (BAD)
+grep -A1 "except Exception" server.py | grep "pass"
+```
+
+**Validation Matrix:**
+
+| Line | Pattern | Error Handled? | Fix Required? |
+|------|---------|----------------|---------------|
+| 1234 | empty except | No | **YES** |
+| 2345 | fire-and-forget | Uses task_runner | No |
+
+### Step 6.5d: Unbounded Queue / Backpressure Violation Detection
+
+**What to look for:**
+
+1. **Queues without maxsize**:
+   ```python
+   # DANGEROUS: Can grow without bound
+   self._work_queue = asyncio.Queue()  # No limit!
+   
+   # SAFE: Bounded queue
+   self._work_queue = asyncio.Queue(maxsize=1000)
+   ```
+
+2. **Producer faster than consumer without backpressure**:
+   ```python
+   # DANGEROUS: Unbounded accumulation
+   async def _receive_messages(self):
+       while True:
+           msg = await self._socket.recv()
+           self._pending_messages.append(msg)  # Never bounded!
+   
+   # SAFE: Apply backpressure
+   async def _receive_messages(self):
+       while True:
+           if len(self._pending_messages) > MAX_PENDING:
+               await asyncio.sleep(0.1)  # Backpressure
+               continue
+           msg = await self._socket.recv()
+           self._pending_messages.append(msg)
+   ```
+
+3. **Retry loops without limits**:
+   ```python
+   # DANGEROUS: Infinite retries can exhaust memory
+   while not success:
+       try:
+           result = await operation()
+           success = True
+       except Exception:
+           await asyncio.sleep(1)
+           # Loop forever, accumulating state each iteration?
+   
+   # SAFE: Limited retries
+   for attempt in range(MAX_RETRIES):
+       try:
+           result = await operation()
+           break
+       except Exception:
+           if attempt == MAX_RETRIES - 1:
+               raise
+           await asyncio.sleep(1)
+   ```
+
+4. **Accumulating work without processing limits**:
+   ```python
+   # DANGEROUS: Process everything at once
+   pending_jobs = await self._get_all_pending_jobs()  # Could be millions!
+   for job in pending_jobs:
+       await self._process(job)
+   
+   # SAFE: Batch processing
+   async for batch in self._get_pending_jobs_batched(batch_size=100):
+       for job in batch:
+           await self._process(job)
+   ```
+
+**Detection Commands:**
+
+```bash
+# Find unbounded queues
+grep -n "asyncio\.Queue()" server.py | grep -v "maxsize"
+
+# Find append/add without size checks
+grep -n "\.append\|\.add(" server.py
+
+# Find while True loops
+grep -n "while True:" server.py
+
+# Find retry patterns
+grep -n "while not\|while.*retry\|for.*attempt" server.py
+```
+
+**Validation Matrix:**
+
+| Line | Pattern | Bounded? | Backpressure? | Fix Required? |
+|------|---------|----------|---------------|---------------|
+| 1234 | Queue() | No maxsize | N/A | **YES** |
+| 2345 | append in loop | No check | No | **YES** |
+
+### Step 6.5e: Comprehensive Scan Pattern
+
+For each file being modified, run ALL detection commands:
+
+```bash
+#!/bin/bash
+# runtime_correctness_scan.sh <file>
+
+FILE=$1
+
+echo "=== Race Condition Scan ==="
+grep -n "for.*in self\._[a-z_]*:" "$FILE"
+grep -n "if.*not in self\._" "$FILE"
+grep -n "await.*\.wait()" "$FILE" | grep -v "wait_for"
+
+echo "=== Memory Leak Scan ==="
+echo "Collections that add without remove:"
+grep -n "self\._[a-z_]*\[.*\] = " "$FILE"
+
+echo "=== Dropped Error Scan ==="
+grep -B1 -A1 "except.*:" "$FILE" | grep -A1 "except" | grep "pass"
+grep -n "asyncio\.create_task\|asyncio\.ensure_future" "$FILE"
+
+echo "=== Unbounded Queue Scan ==="
+grep -n "asyncio\.Queue()" "$FILE" | grep -v "maxsize"
+grep -n "while True:" "$FILE"
+```
+
+### Step 6.5f: Fix Patterns (NO SHORTCUTS)
+
+| Issue | Wrong Fix (Shortcut) | Correct Fix |
+|-------|---------------------|-------------|
+| Race condition | Add `# TODO: add lock` comment | Add actual lock or use atomic operation |
+| Memory leak | Add `# TODO: cleanup` comment | Implement cleanup in appropriate lifecycle hook |
+| Dropped error | Change `except: pass` to `except: pass  # intentional` | Log error or re-raise appropriately |
+| Unbounded queue | Add `# Note: queue is bounded by rate limiter` | Add actual maxsize parameter |
+
+### Step 6.5g: Integration with Other Phases
+
+**Run BEFORE Phase 7 (Verify Completeness):**
+- All race conditions identified and fixed
+- All memory leak paths have cleanup
+- All errors are handled or logged
+- All queues are bounded with backpressure
+
+**Run AFTER any Phase 5 fix:**
+- Verify the fix didn't introduce new race conditions
+- Verify the fix didn't create new leak paths
+- Verify the fix didn't swallow errors
+- Verify the fix didn't create unbounded accumulation
+
+### Output
+
+- Zero race conditions (all shared state properly protected)
+- Zero memory leaks (all collections have cleanup paths)
+- Zero dropped errors (all exceptions handled or logged)
+- Zero unbounded queues (all collections have size limits or backpressure)
+
+**BLOCKING**: Phase 6.5 cannot pass with ANY violations. These are production-critical bugs.
+
+---
+
 ## Phase 7: Verify Completeness (NO SHORTCUTS)
 
 **Objective**: Ensure refactor is complete and correct.
