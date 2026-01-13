@@ -15,6 +15,7 @@ from hyperscale.reporting.common.results_types import WorkflowStats
 from .message import Message
 
 if TYPE_CHECKING:
+    from hyperscale.core.jobs.workers.stage_priority import StagePriority
     from hyperscale.distributed.models.coordinates import NetworkCoordinate
 
 
