@@ -4611,7 +4611,7 @@ class ManagerServer(HealthAwareServer):
                 total_failed=total_failed,
                 errors=errors,
                 elapsed_seconds=elapsed_seconds,
-                fence_token=self._leases.get_job_fencing_token(job_id),
+                fence_token=self._leases.get_fence_token(job_id),
             )
 
             try:
