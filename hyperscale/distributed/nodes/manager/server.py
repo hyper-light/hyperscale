@@ -4653,46 +4653,71 @@ class ManagerServer(HealthAwareServer):
         elapsed_seconds: float,
     ) -> None:
         final_status = JobStatus.FAILED.value if errors else JobStatus.COMPLETED.value
-        origin_gate_addr = self._manager_state._job_origin_gates.get(job_id)
 
-        if origin_gate_addr:
-            final_result = JobFinalResult(
-                job_id=job_id,
-                datacenter=self._node_id.datacenter,
-                status=final_status,
-                workflow_results=workflow_results,
-                total_completed=total_completed,
-                total_failed=total_failed,
-                errors=errors,
-                elapsed_seconds=elapsed_seconds,
-                fence_token=self._leases.get_fence_token(job_id),
+        await self._notify_gate_of_completion(
+            job_id,
+            final_status,
+            workflow_results,
+            total_completed,
+            total_failed,
+            errors,
+            elapsed_seconds,
+        )
+        await self._cleanup_job_state(job_id)
+        await self._log_job_completion(
+            job_id, final_status, total_completed, total_failed
+        )
+
+    async def _notify_gate_of_completion(
+        self,
+        job_id: str,
+        final_status: str,
+        workflow_results: list[WorkflowResult],
+        total_completed: int,
+        total_failed: int,
+        errors: list[str],
+        elapsed_seconds: float,
+    ) -> None:
+        origin_gate_addr = self._manager_state._job_origin_gates.get(job_id)
+        if not origin_gate_addr:
+            return
+
+        final_result = JobFinalResult(
+            job_id=job_id,
+            datacenter=self._node_id.datacenter,
+            status=final_status,
+            workflow_results=workflow_results,
+            total_completed=total_completed,
+            total_failed=total_failed,
+            errors=errors,
+            elapsed_seconds=elapsed_seconds,
+            fence_token=self._leases.get_fence_token(job_id),
+        )
+
+        try:
+            await self._send_to_peer(
+                origin_gate_addr, "job_final_result", final_result.dump(), timeout=5.0
+            )
+        except Exception as send_error:
+            await self._udp_logger.log(
+                ServerWarning(
+                    message=f"Failed to send job completion to gate: {send_error}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
             )
 
-            try:
-                await self._send_to_peer(
-                    origin_gate_addr,
-                    "job_final_result",
-                    final_result.dump(),
-                    timeout=5.0,
-                )
-            except Exception as send_error:
-                await self._udp_logger.log(
-                    ServerWarning(
-                        message=f"Failed to send job completion to gate: {send_error}",
-                        node_host=self._host,
-                        node_port=self._tcp_port,
-                        node_id=self._node_id.short,
-                    )
-                )
-
+    async def _cleanup_job_state(self, job_id: str) -> None:
         self._leases.clear_job_leases(job_id)
         self._health_monitor.cleanup_job_progress(job_id)
         self._health_monitor.clear_job_suspicions(job_id)
         self._manager_state.clear_job_state(job_id)
+        await self._job_manager.remove_job_by_id(job_id)
 
-        if job:
-            await self._job_manager.remove_job(job.token)
-
+    async def _log_job_completion(
+        self, job_id: str, final_status: str, total_completed: int, total_failed: int
+    ) -> None:
         await self._udp_logger.log(
             ServerInfo(
                 message=f"Job {job_id[:8]}... {final_status.lower()} ({total_completed} completed, {total_failed} failed)",
