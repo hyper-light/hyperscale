@@ -498,6 +498,7 @@ class ManagerServer(HealthAwareServer):
         self._unified_timeout_task: asyncio.Task | None = None
         self._deadline_enforcement_task: asyncio.Task | None = None
         self._peer_job_state_sync_task: asyncio.Task | None = None
+        self._resource_sample_task: asyncio.Task | None = None
 
     def _init_address_mappings(self) -> None:
         """Initialize UDP to TCP address mappings."""
