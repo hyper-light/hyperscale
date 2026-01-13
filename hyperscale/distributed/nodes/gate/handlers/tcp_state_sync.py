@@ -33,8 +33,9 @@ from ..state import GateRuntimeState
 
 if TYPE_CHECKING:
     from hyperscale.distributed.swim.core import NodeId
-    from hyperscale.distributed.tracking import JobLeadershipTracker, GateJobManager
-    from hyperscale.distributed.versioning import VersionedClock
+    from hyperscale.distributed.jobs import JobLeadershipTracker
+    from hyperscale.distributed.jobs.gates import GateJobManager
+    from hyperscale.distributed.server.events.lamport_clock import VersionedStateClock
     from taskex import TaskRunner
 
 
