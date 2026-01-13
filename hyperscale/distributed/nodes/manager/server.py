@@ -3615,10 +3615,7 @@ class ManagerServer(HealthAwareServer):
             # Apply context snapshot
             context_dict = cloudpickle.loads(sync.context_snapshot)
 
-            if sync.job_id not in self._manager_state._job_contexts:
-                self._manager_state._job_contexts[sync.job_id] = Context()
-
-            context = self._manager_state._job_contexts[sync.job_id]
+            context = self._manager_state.get_or_create_job_context(sync.job_id)
             for workflow_name, values in context_dict.items():
                 await context.from_dict(workflow_name, values)
 
@@ -4124,8 +4121,7 @@ class ManagerServer(HealthAwareServer):
             )
 
             # Initialize context for this job
-            if announcement.job_id not in self._manager_state._job_contexts:
-                self._manager_state._job_contexts[announcement.job_id] = Context()
+            self._manager_state.get_or_create_job_context(announcement.job_id)
 
             if announcement.job_id not in self._manager_state._job_layer_version:
                 self._manager_state._job_layer_version[announcement.job_id] = 0
@@ -4538,10 +4534,7 @@ class ManagerServer(HealthAwareServer):
         timestamps_bytes: bytes,
     ) -> None:
         """Apply context updates from workflow completion."""
-        context = self._manager_state._job_contexts.get(job_id)
-        if not context:
-            context = Context()
-            self._manager_state._job_contexts[job_id] = context
+        context = self._manager_state.get_or_create_job_context(job_id)
 
         updates = cloudpickle.loads(updates_bytes)
         timestamps = cloudpickle.loads(timestamps_bytes) if timestamps_bytes else {}
