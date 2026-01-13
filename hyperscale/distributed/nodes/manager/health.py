@@ -285,6 +285,89 @@ class ManagerHealthMonitor:
     def get_worker_health_state_counts(self) -> dict[str, int]:
         return self._registry.get_worker_health_state_counts()
 
+    def _log_worker_health_transition(
+        self,
+        worker_id: str,
+        previous_state: str,
+        new_state: str,
+    ) -> None:
+        is_degradation = self._is_health_degradation(previous_state, new_state)
+
+        if is_degradation:
+            self._task_runner.run(
+                self._logger.log,
+                ServerWarning(
+                    message=f"Worker {worker_id[:8]}... health degraded: {previous_state} -> {new_state}",
+                    node_host=self._config.host,
+                    node_port=self._config.tcp_port,
+                    node_id=self._node_id,
+                ),
+            )
+        else:
+            self._task_runner.run(
+                self._logger.log,
+                ServerDebug(
+                    message=f"Worker {worker_id[:8]}... health improved: {previous_state} -> {new_state}",
+                    node_host=self._config.host,
+                    node_port=self._config.tcp_port,
+                    node_id=self._node_id,
+                ),
+            )
+
+    def _is_health_degradation(self, previous_state: str, new_state: str) -> bool:
+        state_severity = {"healthy": 0, "busy": 1, "stressed": 2, "overloaded": 3}
+        previous_severity = state_severity.get(previous_state, 0)
+        new_severity = state_severity.get(new_state, 0)
+        return new_severity > previous_severity
+
+    def _check_aggregate_health_alerts(self) -> None:
+        counts = self._registry.get_worker_health_state_counts()
+        total_workers = sum(counts.values())
+
+        if total_workers == 0:
+            return
+
+        overloaded_count = counts.get("overloaded", 0)
+        stressed_count = counts.get("stressed", 0)
+        busy_count = counts.get("busy", 0)
+        healthy_count = counts.get("healthy", 0)
+
+        overloaded_ratio = overloaded_count / total_workers
+        non_healthy_ratio = (
+            overloaded_count + stressed_count + busy_count
+        ) / total_workers
+
+        if healthy_count == 0 and total_workers > 0:
+            self._task_runner.run(
+                self._logger.log,
+                ServerWarning(
+                    message=f"ALERT: All {total_workers} workers in non-healthy state (overloaded={overloaded_count}, stressed={stressed_count}, busy={busy_count})",
+                    node_host=self._config.host,
+                    node_port=self._config.tcp_port,
+                    node_id=self._node_id,
+                ),
+            )
+        elif overloaded_ratio >= 0.5:
+            self._task_runner.run(
+                self._logger.log,
+                ServerWarning(
+                    message=f"ALERT: Majority workers overloaded ({overloaded_count}/{total_workers} = {overloaded_ratio:.0%})",
+                    node_host=self._config.host,
+                    node_port=self._config.tcp_port,
+                    node_id=self._node_id,
+                ),
+            )
+        elif non_healthy_ratio >= 0.8:
+            self._task_runner.run(
+                self._logger.log,
+                ServerWarning(
+                    message=f"ALERT: High worker stress ({non_healthy_ratio:.0%} non-healthy: overloaded={overloaded_count}, stressed={stressed_count}, busy={busy_count})",
+                    node_host=self._config.host,
+                    node_port=self._config.tcp_port,
+                    node_id=self._node_id,
+                ),
+            )
+
     def is_worker_responsive(self, worker_id: str, job_id: str) -> bool:
         """
         Check if worker is responsive for a job (AD-30).
