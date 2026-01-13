@@ -2820,13 +2820,14 @@ class ManagerServer(HealthAwareServer):
 
                 # Mark pending workflows as cancelled
                 for workflow_id in removed_pending:
-                    self._manager_state._cancelled_workflows[workflow_id] = (
+                    self._manager_state.set_cancelled_workflow(
+                        workflow_id,
                         CancelledWorkflowInfo(
                             workflow_id=workflow_id,
                             job_id=job_id,
                             cancelled_at=timestamp,
                             reason=reason,
-                        )
+                        ),
                     )
 
             # Step 3: Cancel ALL running sub-workflows on workers
