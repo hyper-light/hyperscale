@@ -1007,12 +1007,9 @@ class ManagerServer(HealthAwareServer):
     ) -> None:
         peer_lock = await self._manager_state.get_peer_state_lock(tcp_addr)
         async with peer_lock:
-            self._manager_state._peer_state_epoch[tcp_addr] = (
-                self._manager_state._peer_state_epoch.get(tcp_addr, 0) + 1
-            )
-            self._manager_state._active_manager_peers.discard(tcp_addr)
-            self._manager_state._dead_managers.add(tcp_addr)
-            self._manager_state._dead_manager_timestamps[tcp_addr] = time.monotonic()
+            self._manager_state.increment_peer_state_epoch(tcp_addr)
+            self._manager_state.remove_active_manager_peer(tcp_addr)
+            self._manager_state.add_dead_manager(tcp_addr, time.monotonic())
 
         await self._udp_logger.log(
             ServerInfo(
@@ -1034,7 +1031,7 @@ class ManagerServer(HealthAwareServer):
         peer_lock = await self._manager_state.get_peer_state_lock(tcp_addr)
 
         async with peer_lock:
-            initial_epoch = self._manager_state._peer_state_epoch.get(tcp_addr, 0)
+            initial_epoch = self._manager_state.get_peer_state_epoch(tcp_addr)
 
         async with self._recovery_semaphore:
             jitter = random.uniform(
