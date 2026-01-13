@@ -1623,11 +1623,10 @@ class ManagerServer(HealthAwareServer):
                         JobStatus.FAILED.value,
                         JobStatus.CANCELLED.value,
                     )
-                    # Use timestamp as proxy for completion time (updated when status changes)
-                    time_since_completion = (
-                        current_time - job.timestamp if job.timestamp > 0 else 0
-                    )
-                    if is_terminal and time_since_completion > retention_seconds:
+                    if not is_terminal or job.completed_at <= 0:
+                        continue
+                    time_since_completion = current_time - job.completed_at
+                    if time_since_completion > retention_seconds:
                         self._cleanup_job(job.job_id)
                         jobs_cleaned += 1
 
