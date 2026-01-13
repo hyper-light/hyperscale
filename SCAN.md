@@ -535,6 +535,143 @@ Any method > 20 lines should be scrutinized for delegation opportunities.
 
 ---
 
+## Phase 11: Dead Import Detection
+
+**Objective**: Remove imports that were orphaned by modular refactoring.
+
+### The Problem
+
+When logic moves from server to handlers/coordinators, the imports often stay behind:
+
+```python
+# In server.py (BEFORE refactor):
+from hyperscale.distributed.models import JobCancelRequest, JobCancelResponse
+# ... used in server methods
+
+# In server.py (AFTER refactor):
+from hyperscale.distributed.models import JobCancelRequest, JobCancelResponse  # DEAD
+# ... logic moved to tcp_cancellation.py handler
+
+# In tcp_cancellation.py:
+from hyperscale.distributed.models import JobCancelRequest, JobCancelResponse  # ACTIVE
+```
+
+Dead imports cause:
+- **Slower startup** - unnecessary module loading
+- **Confusion** - suggests server uses these types when it doesn't
+- **Merge conflicts** - imports change frequently, dead ones create noise
+- **Circular import risk** - unused imports can create hidden dependency cycles
+
+### Step 11a: Extract All Imports
+
+```python
+import re
+
+with open('server.py', 'r') as f:
+    content = f.read()
+
+# Find import section (before class definition)
+class_start = content.find('class ')
+import_section = content[:class_start]
+
+# Extract all imported names
+imported_names = set()
+
+# Multi-line: from X import (A, B, C)
+for block in re.findall(r'from\s+[\w.]+\s+import\s+\(([\s\S]*?)\)', import_section):
+    for name, alias in re.findall(r'(\w+)(?:\s+as\s+(\w+))?', block):
+        imported_names.add(alias if alias else name)
+
+# Single-line: from X import A, B
+for line in re.findall(r'from\s+[\w.]+\s+import\s+([^(\n]+)', import_section):
+    for name, alias in re.findall(r'(\w+)(?:\s+as\s+(\w+))?', line):
+        imported_names.add(alias if alias else name)
+
+# Direct: import X
+for name in re.findall(r'^import\s+(\w+)', import_section, re.MULTILINE):
+    imported_names.add(name)
+
+print(f"Found {len(imported_names)} imported names")
+```
+
+### Step 11b: Check Usage in Code Body
+
+```python
+# Code after imports (class definition onward)
+code_section = content[class_start:]
+
+unused = []
+for name in imported_names:
+    if name == 'TYPE_CHECKING':
+        continue
+    
+    # Word boundary match to avoid partial matches
+    pattern = r'\b' + re.escape(name) + r'\b'
+    if not re.search(pattern, code_section):
+        unused.append(name)
+
+print(f"Potentially unused: {len(unused)}")
+for name in sorted(unused):
+    print(f"  {name}")
+```
+
+### Step 11c: Verify Against Modular Files
+
+For each unused import, check if it's used in handlers/coordinators:
+
+```bash
+# For each unused import
+grep -l "ImportName" handlers/*.py coordinators/*.py state.py
+```
+
+**Classification**:
+
+| Found In | Action |
+|----------|--------|
+| Handler/Coordinator (imported there) | Remove from server - it's properly imported where used |
+| Handler/Coordinator (NOT imported) | Bug - handler needs the import, add it there |
+| Nowhere in gate module | Remove from server - truly dead |
+| Only in TYPE_CHECKING block | Keep if used in type hints, remove otherwise |
+
+### Step 11d: Remove Dead Imports
+
+Group removals by source module to minimize diff churn:
+
+```python
+# Before:
+from hyperscale.distributed.models import (
+    JobCancelRequest,      # DEAD
+    JobCancelResponse,     # DEAD
+    JobSubmission,         # USED
+    JobStatus,             # USED
+)
+
+# After:
+from hyperscale.distributed.models import (
+    JobSubmission,
+    JobStatus,
+)
+```
+
+### Step 11e: Verify No Breakage
+
+1. **Run LSP diagnostics** - catch any "undefined name" errors
+2. **Check TYPE_CHECKING imports** - some imports only used in type hints
+3. **Search for string references** - `getattr(module, "ClassName")` patterns
+
+```bash
+# Find string references to class names
+grep -n "\"ClassName\"\|'ClassName'" server.py
+```
+
+### Step 11f: Commit
+
+Commit message should note:
+- Number of dead imports removed
+- Root cause (modular refactor moved usage to X)
+
+---
+
 ## Example Application
 
 **Input**: `fence_token=self._leases.get_job_fencing_token(job_id)` at line 4629
