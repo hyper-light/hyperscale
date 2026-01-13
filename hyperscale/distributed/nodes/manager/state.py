@@ -353,12 +353,529 @@ class ManagerState:
         }
 
     def record_workflow_latency(self, latency_ms: float) -> None:
-        """Record workflow completion latency for SLO tracking."""
         self._workflow_latency_digest.add(latency_ms)
 
     def get_workflow_latency_observation(self) -> "LatencyObservation | None":
-        """Get aggregated workflow latency observation for SLO reporting."""
-
         return self._workflow_latency_digest.get_recent_observation(
             target_id="workflows"
         )
+
+    # =========================================================================
+    # Worker Accessors (16 direct accesses)
+    # =========================================================================
+
+    def get_worker(self, worker_id: str) -> WorkerRegistration | None:
+        return self._workers.get(worker_id)
+
+    def get_all_workers(self) -> dict[str, WorkerRegistration]:
+        return self._workers
+
+    def iter_workers(self) -> list[tuple[str, WorkerRegistration]]:
+        return list(self._workers.items())
+
+    def add_worker(self, worker_id: str, worker: WorkerRegistration) -> None:
+        self._workers[worker_id] = worker
+
+    def remove_worker(self, worker_id: str) -> WorkerRegistration | None:
+        return self._workers.pop(worker_id, None)
+
+    def has_worker(self, worker_id: str) -> bool:
+        return worker_id in self._workers
+
+    def get_worker_count(self) -> int:
+        return len(self._workers)
+
+    def get_worker_ids(self) -> list[str]:
+        return list(self._workers.keys())
+
+    def get_worker_id_from_addr(self, addr: tuple[str, int]) -> str | None:
+        return self._worker_addr_to_id.get(addr)
+
+    def set_worker_addr_mapping(self, addr: tuple[str, int], worker_id: str) -> None:
+        self._worker_addr_to_id[addr] = worker_id
+
+    def remove_worker_addr_mapping(self, addr: tuple[str, int]) -> None:
+        self._worker_addr_to_id.pop(addr, None)
+
+    # =========================================================================
+    # State Version Accessors (9 direct accesses)
+    # =========================================================================
+
+    @property
+    def state_version(self) -> int:
+        return self._state_version
+
+    def set_state_version(self, version: int) -> None:
+        self._state_version = version
+
+    def set_state_version_if_higher(self, version: int) -> bool:
+        if version > self._state_version:
+            self._state_version = version
+            return True
+        return False
+
+    # =========================================================================
+    # Active Manager Peers Accessors (8 direct accesses)
+    # =========================================================================
+
+    def get_active_manager_peers(self) -> set[tuple[str, int]]:
+        return self._active_manager_peers
+
+    def get_active_manager_peer_ids(self) -> set[str]:
+        return self._active_manager_peer_ids
+
+    # =========================================================================
+    # Job Timeout Strategies Accessors (7 direct accesses)
+    # =========================================================================
+
+    def get_job_timeout_strategy(self, job_id: str) -> "TimeoutStrategy | None":
+        return self._job_timeout_strategies.get(job_id)
+
+    def set_job_timeout_strategy(
+        self, job_id: str, strategy: "TimeoutStrategy"
+    ) -> None:
+        self._job_timeout_strategies[job_id] = strategy
+
+    def iter_job_timeout_strategies(
+        self,
+    ) -> list[tuple[str, "TimeoutStrategy"]]:
+        return list(self._job_timeout_strategies.items())
+
+    # =========================================================================
+    # Job Contexts Accessors (7 direct accesses)
+    # =========================================================================
+
+    def get_job_context(self, job_id: str) -> "Context | None":
+        return self._job_contexts.get(job_id)
+
+    def set_job_context(self, job_id: str, context: "Context") -> None:
+        self._job_contexts[job_id] = context
+
+    def has_job_context(self, job_id: str) -> bool:
+        return job_id in self._job_contexts
+
+    # =========================================================================
+    # Cancelled Workflows Accessors (7 direct accesses)
+    # =========================================================================
+
+    def get_cancelled_workflow(self, workflow_id: str) -> CancelledWorkflowInfo | None:
+        return self._cancelled_workflows.get(workflow_id)
+
+    def set_cancelled_workflow(
+        self, workflow_id: str, info: CancelledWorkflowInfo
+    ) -> None:
+        self._cancelled_workflows[workflow_id] = info
+
+    def has_cancelled_workflow(self, workflow_id: str) -> bool:
+        return workflow_id in self._cancelled_workflows
+
+    def iter_cancelled_workflows(self) -> list[tuple[str, CancelledWorkflowInfo]]:
+        return list(self._cancelled_workflows.items())
+
+    # =========================================================================
+    # Known Manager Peers Accessors (6 direct accesses)
+    # =========================================================================
+
+    def get_known_manager_peer(self, peer_id: str) -> ManagerInfo | None:
+        return self._known_manager_peers.get(peer_id)
+
+    def set_known_manager_peer(self, peer_id: str, info: ManagerInfo) -> None:
+        self._known_manager_peers[peer_id] = info
+
+    def remove_known_manager_peer(self, peer_id: str) -> ManagerInfo | None:
+        return self._known_manager_peers.pop(peer_id, None)
+
+    def iter_known_manager_peers(self) -> list[tuple[str, ManagerInfo]]:
+        return list(self._known_manager_peers.items())
+
+    def get_known_manager_peer_values(self) -> list[ManagerInfo]:
+        return list(self._known_manager_peers.values())
+
+    # =========================================================================
+    # Known Gates Accessors (6 direct accesses)
+    # =========================================================================
+
+    def get_known_gate(self, gate_id: str) -> GateInfo | None:
+        return self._known_gates.get(gate_id)
+
+    def set_known_gate(self, gate_id: str, info: GateInfo) -> None:
+        self._known_gates[gate_id] = info
+
+    def remove_known_gate(self, gate_id: str) -> GateInfo | None:
+        return self._known_gates.pop(gate_id, None)
+
+    def iter_known_gates(self) -> list[tuple[str, GateInfo]]:
+        return list(self._known_gates.items())
+
+    def get_known_gate_values(self) -> list[GateInfo]:
+        return list(self._known_gates.values())
+
+    # =========================================================================
+    # Job Leaders Accessors (6 direct accesses)
+    # =========================================================================
+
+    def get_job_leader(self, job_id: str) -> str | None:
+        return self._job_leaders.get(job_id)
+
+    def set_job_leader(self, job_id: str, leader_id: str) -> None:
+        self._job_leaders[job_id] = leader_id
+
+    def has_job_leader(self, job_id: str) -> bool:
+        return job_id in self._job_leaders
+
+    def get_job_leader_addr(self, job_id: str) -> tuple[str, int] | None:
+        return self._job_leader_addrs.get(job_id)
+
+    def set_job_leader_addr(self, job_id: str, addr: tuple[str, int]) -> None:
+        self._job_leader_addrs[job_id] = addr
+
+    def iter_job_leaders(self) -> list[tuple[str, str]]:
+        return list(self._job_leaders.items())
+
+    # =========================================================================
+    # Worker Health Accessors (5 direct accesses each)
+    # =========================================================================
+
+    def get_worker_unhealthy_since(self, worker_id: str) -> float | None:
+        return self._worker_unhealthy_since.get(worker_id)
+
+    def set_worker_unhealthy_since(self, worker_id: str, timestamp: float) -> None:
+        self._worker_unhealthy_since[worker_id] = timestamp
+
+    def clear_worker_unhealthy_since(self, worker_id: str) -> None:
+        self._worker_unhealthy_since.pop(worker_id, None)
+
+    def get_worker_deadline(self, worker_id: str) -> float | None:
+        return self._worker_deadlines.get(worker_id)
+
+    def set_worker_deadline(self, worker_id: str, deadline: float) -> None:
+        self._worker_deadlines[worker_id] = deadline
+
+    def clear_worker_deadline(self, worker_id: str) -> None:
+        self._worker_deadlines.pop(worker_id, None)
+
+    def iter_worker_deadlines(self) -> list[tuple[str, float]]:
+        return list(self._worker_deadlines.items())
+
+    # =========================================================================
+    # Manager Peer Health Accessors (5 direct accesses)
+    # =========================================================================
+
+    def get_peer_state_epoch(self, peer_addr: tuple[str, int]) -> int:
+        return self._peer_state_epoch.get(peer_addr, 0)
+
+    def set_peer_state_epoch(self, peer_addr: tuple[str, int], epoch: int) -> None:
+        self._peer_state_epoch[peer_addr] = epoch
+
+    def get_manager_tcp_from_udp(
+        self, udp_addr: tuple[str, int]
+    ) -> tuple[str, int] | None:
+        return self._manager_udp_to_tcp.get(udp_addr)
+
+    def set_manager_udp_to_tcp_mapping(
+        self, udp_addr: tuple[str, int], tcp_addr: tuple[str, int]
+    ) -> None:
+        self._manager_udp_to_tcp[udp_addr] = tcp_addr
+
+    def get_dead_managers(self) -> set[tuple[str, int]]:
+        return self._dead_managers
+
+    def add_dead_manager(self, addr: tuple[str, int], timestamp: float) -> None:
+        self._dead_managers.add(addr)
+        self._dead_manager_timestamps[addr] = timestamp
+
+    def remove_dead_manager(self, addr: tuple[str, int]) -> None:
+        self._dead_managers.discard(addr)
+        self._dead_manager_timestamps.pop(addr, None)
+
+    def get_dead_manager_timestamp(self, addr: tuple[str, int]) -> float | None:
+        return self._dead_manager_timestamps.get(addr)
+
+    # =========================================================================
+    # Gate Leader Accessors (5 direct accesses)
+    # =========================================================================
+
+    @property
+    def current_gate_leader_addr(self) -> tuple[str, int] | None:
+        return self._current_gate_leader_addr
+
+    def set_current_gate_leader(
+        self, gate_id: str | None, addr: tuple[str, int] | None
+    ) -> None:
+        self._current_gate_leader_id = gate_id
+        self._current_gate_leader_addr = addr
+
+    @property
+    def current_gate_leader_id(self) -> str | None:
+        return self._current_gate_leader_id
+
+    # =========================================================================
+    # Job Origin Gates Accessors (4 direct accesses)
+    # =========================================================================
+
+    def get_job_origin_gate(self, job_id: str) -> tuple[str, int] | None:
+        return self._job_origin_gates.get(job_id)
+
+    def set_job_origin_gate(self, job_id: str, addr: tuple[str, int]) -> None:
+        self._job_origin_gates[job_id] = addr
+
+    # =========================================================================
+    # Job Layer Version Accessors (4 direct accesses)
+    # =========================================================================
+
+    def get_job_layer_version(self, job_id: str) -> int:
+        return self._job_layer_version.get(job_id, 0)
+
+    def set_job_layer_version(self, job_id: str, version: int) -> None:
+        self._job_layer_version[job_id] = version
+
+    def increment_job_layer_version(self, job_id: str) -> int:
+        current = self._job_layer_version.get(job_id, 0)
+        self._job_layer_version[job_id] = current + 1
+        return current + 1
+
+    # =========================================================================
+    # Gate UDP to TCP Mapping Accessors (4 direct accesses)
+    # =========================================================================
+
+    def get_gate_tcp_from_udp(
+        self, udp_addr: tuple[str, int]
+    ) -> tuple[str, int] | None:
+        return self._gate_udp_to_tcp.get(udp_addr)
+
+    def set_gate_udp_to_tcp_mapping(
+        self, udp_addr: tuple[str, int], tcp_addr: tuple[str, int]
+    ) -> None:
+        self._gate_udp_to_tcp[udp_addr] = tcp_addr
+
+    # =========================================================================
+    # Quorum Failure Accessors (4 direct accesses)
+    # =========================================================================
+
+    @property
+    def consecutive_quorum_failures(self) -> int:
+        return self._consecutive_quorum_failures
+
+    def increment_quorum_failures(self) -> int:
+        self._consecutive_quorum_failures += 1
+        return self._consecutive_quorum_failures
+
+    def reset_quorum_failures(self) -> None:
+        self._consecutive_quorum_failures = 0
+
+    # =========================================================================
+    # Primary Gate Accessors (3 direct accesses)
+    # =========================================================================
+
+    @property
+    def primary_gate_id(self) -> str | None:
+        return self._primary_gate_id
+
+    def set_primary_gate_id(self, gate_id: str | None) -> None:
+        self._primary_gate_id = gate_id
+
+    # =========================================================================
+    # Job Callbacks Accessors (3 direct accesses)
+    # =========================================================================
+
+    def get_job_callback(self, job_id: str) -> tuple[str, int] | None:
+        return self._job_callbacks.get(job_id)
+
+    def set_job_callback(self, job_id: str, addr: tuple[str, int]) -> None:
+        self._job_callbacks[job_id] = addr
+
+    # =========================================================================
+    # Dispatch Throughput Accessors (3 direct accesses each)
+    # =========================================================================
+
+    @property
+    def dispatch_throughput_count(self) -> int:
+        return self._dispatch_throughput_count
+
+    def increment_dispatch_throughput_count(self) -> None:
+        self._dispatch_throughput_count += 1
+
+    def reset_dispatch_throughput(
+        self, interval_start: float, last_value: float
+    ) -> None:
+        self._dispatch_throughput_count = 0
+        self._dispatch_throughput_interval_start = interval_start
+        self._dispatch_throughput_last_value = last_value
+
+    @property
+    def dispatch_throughput_interval_start(self) -> float:
+        return self._dispatch_throughput_interval_start
+
+    @property
+    def dispatch_throughput_last_value(self) -> float:
+        return self._dispatch_throughput_last_value
+
+    # =========================================================================
+    # Workflow Retries Accessors (2 direct accesses)
+    # =========================================================================
+
+    def get_workflow_retry(
+        self, workflow_id: str
+    ) -> tuple[int, bytes, set[str]] | None:
+        return self._workflow_retries.get(workflow_id)
+
+    def set_workflow_retry(
+        self, workflow_id: str, retry_data: tuple[int, bytes, set[str]]
+    ) -> None:
+        self._workflow_retries[workflow_id] = retry_data
+
+    def remove_workflow_retry(self, workflow_id: str) -> None:
+        self._workflow_retries.pop(workflow_id, None)
+
+    def iter_workflow_retries_for_job(
+        self, job_id: str
+    ) -> list[tuple[str, tuple[int, bytes, set[str]]]]:
+        return [
+            (wf_id, data)
+            for wf_id, data in self._workflow_retries.items()
+            if wf_id.startswith(f"{job_id}:")
+        ]
+
+    # =========================================================================
+    # Workflow Completion Events Accessors (2 direct accesses)
+    # =========================================================================
+
+    def get_workflow_completion_event(self, workflow_id: str) -> asyncio.Event | None:
+        return self._workflow_completion_events.get(workflow_id)
+
+    def set_workflow_completion_event(
+        self, workflow_id: str, event: asyncio.Event
+    ) -> None:
+        self._workflow_completion_events[workflow_id] = event
+
+    def remove_workflow_completion_event(self, workflow_id: str) -> None:
+        self._workflow_completion_events.pop(workflow_id, None)
+
+    # =========================================================================
+    # Progress Callbacks Accessors (2 direct accesses)
+    # =========================================================================
+
+    def get_progress_callback(self, job_id: str) -> tuple[str, int] | None:
+        return self._progress_callbacks.get(job_id)
+
+    def set_progress_callback(self, job_id: str, addr: tuple[str, int]) -> None:
+        self._progress_callbacks[job_id] = addr
+
+    # =========================================================================
+    # Peer Manager Health States Accessors (2 direct accesses)
+    # =========================================================================
+
+    def get_peer_manager_health_state(self, peer_id: str) -> str | None:
+        return self._peer_manager_health_states.get(peer_id)
+
+    def set_peer_manager_health_state(self, peer_id: str, state: str) -> None:
+        self._peer_manager_health_states[peer_id] = state
+
+    # =========================================================================
+    # Job Submissions Accessors (2 direct accesses)
+    # =========================================================================
+
+    def get_job_submission(self, job_id: str) -> JobSubmission | None:
+        return self._job_submissions.get(job_id)
+
+    def set_job_submission(self, job_id: str, submission: JobSubmission) -> None:
+        self._job_submissions[job_id] = submission
+
+    # =========================================================================
+    # Healthy Gate IDs Accessors (2 direct accesses)
+    # =========================================================================
+
+    def get_healthy_gate_ids(self) -> set[str]:
+        return self._healthy_gate_ids
+
+    def add_healthy_gate_id(self, gate_id: str) -> None:
+        self._healthy_gate_ids.add(gate_id)
+
+    def remove_healthy_gate_id(self, gate_id: str) -> None:
+        self._healthy_gate_ids.discard(gate_id)
+
+    # =========================================================================
+    # Cancellation Accessors (2 direct accesses each)
+    # =========================================================================
+
+    def get_cancellation_pending_workflows(self, job_id: str) -> set[str]:
+        return self._cancellation_pending_workflows.get(job_id, set())
+
+    def add_cancellation_pending_workflow(self, job_id: str, workflow_id: str) -> None:
+        self._cancellation_pending_workflows[job_id].add(workflow_id)
+
+    def remove_cancellation_pending_workflow(
+        self, job_id: str, workflow_id: str
+    ) -> None:
+        if job_id in self._cancellation_pending_workflows:
+            self._cancellation_pending_workflows[job_id].discard(workflow_id)
+
+    def get_cancellation_errors(self, job_id: str) -> list[str]:
+        return self._cancellation_errors.get(job_id, [])
+
+    def add_cancellation_error(self, job_id: str, error: str) -> None:
+        self._cancellation_errors[job_id].append(error)
+
+    def get_cancellation_completion_event(self, job_id: str) -> asyncio.Event | None:
+        return self._cancellation_completion_events.get(job_id)
+
+    def set_cancellation_completion_event(
+        self, job_id: str, event: asyncio.Event
+    ) -> None:
+        self._cancellation_completion_events[job_id] = event
+
+    def get_cancellation_initiated_at(self, job_id: str) -> float | None:
+        return self._cancellation_initiated_at.get(job_id)
+
+    def set_cancellation_initiated_at(self, job_id: str, timestamp: float) -> None:
+        self._cancellation_initiated_at[job_id] = timestamp
+
+    # =========================================================================
+    # Single-Access Field Accessors
+    # =========================================================================
+
+    def get_manager_peer_unhealthy_since(self, peer_id: str) -> float | None:
+        return self._manager_peer_unhealthy_since.get(peer_id)
+
+    def set_manager_peer_unhealthy_since(self, peer_id: str, timestamp: float) -> None:
+        self._manager_peer_unhealthy_since[peer_id] = timestamp
+
+    def clear_manager_peer_unhealthy_since(self, peer_id: str) -> None:
+        self._manager_peer_unhealthy_since.pop(peer_id, None)
+
+    def get_gate_unhealthy_since(self, gate_id: str) -> float | None:
+        return self._gate_unhealthy_since.get(gate_id)
+
+    def set_gate_unhealthy_since(self, gate_id: str, timestamp: float) -> None:
+        self._gate_unhealthy_since[gate_id] = timestamp
+
+    def clear_gate_unhealthy_since(self, gate_id: str) -> None:
+        self._gate_unhealthy_since.pop(gate_id, None)
+
+    def get_gate_negotiated_caps(self, gate_id: str) -> NegotiatedCapabilities | None:
+        return self._gate_negotiated_caps.get(gate_id)
+
+    def set_gate_negotiated_caps(
+        self, gate_id: str, caps: NegotiatedCapabilities
+    ) -> None:
+        self._gate_negotiated_caps[gate_id] = caps
+
+    @property
+    def dc_leader_manager_id(self) -> str | None:
+        return self._dc_leader_manager_id
+
+    def set_dc_leader_manager_id(self, manager_id: str | None) -> None:
+        self._dc_leader_manager_id = manager_id
+
+    def get_client_callback(self, job_id: str) -> tuple[str, int] | None:
+        return self._client_callbacks.get(job_id)
+
+    def set_client_callback(self, job_id: str, addr: tuple[str, int]) -> None:
+        self._client_callbacks[job_id] = addr
+
+    @property
+    def manager_state_enum(self) -> ManagerStateEnum:
+        return self._manager_state
+
+    def set_manager_state_enum(self, state: ManagerStateEnum) -> None:
+        self._manager_state = state
