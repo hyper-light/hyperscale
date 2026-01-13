@@ -417,6 +417,9 @@ class TestHandleCancelJobFailureModes:
         async def failing_send(addr, msg_type, data, timeout=None):
             raise ConnectionError("Connection refused")
 
+        async def mock_check_rate_limit(client_id, op):
+            return (True, 0)
+
         state = GateRuntimeState()
         handler = GateCancellationHandler(
             state=state,
@@ -427,7 +430,7 @@ class TestHandleCancelJobFailureModes:
             get_node_id=lambda: MockNodeId(),
             get_host=lambda: "127.0.0.1",
             get_tcp_port=lambda: 9000,
-            check_rate_limit=lambda client_id, op: (True, 0),
+            check_rate_limit=mock_check_rate_limit,
             send_tcp=failing_send,
             get_available_datacenters=lambda: ["dc-east"],
         )
