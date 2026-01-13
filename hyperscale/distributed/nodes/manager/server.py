@@ -1398,7 +1398,6 @@ class ManagerServer(HealthAwareServer):
     async def _scan_worker_for_orphans(
         self, worker_id: str, worker_addr: tuple[str, int]
     ) -> None:
-        """Scan a single worker for orphaned workflows and requeue them."""
         worker_workflow_ids = await self._query_worker_active_workflows(worker_addr)
         if worker_workflow_ids is None:
             return
