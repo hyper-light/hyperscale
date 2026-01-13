@@ -640,6 +640,55 @@ grep -l "ImportName" handlers/*.py coordinators/*.py state.py
 
 If the import represents a message type (e.g., `JobCancelRequest`), the server likely needs a handler for it. Missing handler = missing feature, not dead import.
 
+### Step 11c.1: Cross-Reference with SCENARIOS.md
+
+For imports classified as "Nowhere in gate module", verify against SCENARIOS.md before removing.
+
+**SCENARIOS.md is the behavior source of truth.** It documents expected message flows:
+
+```
+# Example from SCENARIOS.md:
+# "18.1 Job Cancellation
+#  - Client requests cancellation - Verify CancelJob handling
+#  - Cancellation to managers - Verify gate forwards to all DCs
+#  - Cancellation acknowledgment - Verify CancelAck handling"
+```
+
+**For each "nowhere" import:**
+
+1. **Search SCENARIOS.md** for the type name:
+   ```bash
+   grep -n "ImportName" SCENARIOS.md
+   ```
+
+2. **Classification**:
+
+   | SCENARIOS.md Status | Action |
+   |---------------------|--------|
+   | Listed in scenario | **UNIMPLEMENTED FEATURE** - handler is missing, implement it |
+   | Not mentioned | Likely truly dead - safe to remove |
+   | Mentioned but as internal/helper | Check if used transitively by other handlers |
+
+3. **If unimplemented**: Create a tracking issue or TODO before removing the import. The import is a breadcrumb pointing to missing functionality.
+
+**Example analysis**:
+```
+Import: JobCancelRequest
+In module: NO
+In SCENARIOS.md: YES - "18.1 Job Cancellation - Verify CancelJob handling"
+Verdict: UNIMPLEMENTED or delegated to handler
+
+Import: CorrelationSeverity  
+In module: NO
+In SCENARIOS.md: YES - "3.7 Cross-DC Correlation Detector"
+Verdict: Check if health_coordinator handles this
+
+Import: JitterStrategy
+In module: NO
+In SCENARIOS.md: NO
+Verdict: Likely dead import from unused retry config
+```
+
 ### Step 11d: Remove Dead Imports
 
 Group removals by source module to minimize diff churn:
