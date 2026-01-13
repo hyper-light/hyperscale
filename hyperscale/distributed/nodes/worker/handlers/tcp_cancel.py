@@ -32,7 +32,7 @@ class WorkflowCancelHandler:
         Args:
             server: WorkerServer instance for state access
         """
-        self._server = server
+        self._server: "WorkerServer" = server
 
     async def handle(
         self,
@@ -57,8 +57,12 @@ class WorkflowCancelHandler:
             request = WorkflowCancelRequest.load(data)
 
             # Workflow not found - already completed/cancelled (walrus for single lookup)
-            if not (progress := self._server._active_workflows.get(request.workflow_id)):
-                return self._build_already_completed_response(request.job_id, request.workflow_id)
+            if not (
+                progress := self._server._active_workflows.get(request.workflow_id)
+            ):
+                return self._build_already_completed_response(
+                    request.job_id, request.workflow_id
+                )
 
             # Safety check: verify workflow belongs to specified job
             if progress.job_id != request.job_id:
@@ -120,9 +124,7 @@ class WorkflowCancelHandler:
                 error=str(error),
             ).dump()
 
-    def _build_already_completed_response(
-        self, job_id: str, workflow_id: str
-    ) -> bytes:
+    def _build_already_completed_response(self, job_id: str, workflow_id: str) -> bytes:
         """Build response for already completed workflow."""
         return WorkflowCancelResponse(
             job_id=job_id,
