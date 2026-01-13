@@ -18,6 +18,7 @@ from hyperscale.distributed.models import (
     DatacenterStatus,
     ManagerHeartbeat,
 )
+from hyperscale.distributed.routing import DatacenterCandidate
 from hyperscale.distributed.health import ManagerHealthState
 from hyperscale.distributed.datacenters import DatacenterHealthManager
 from hyperscale.distributed.swim.health import (
