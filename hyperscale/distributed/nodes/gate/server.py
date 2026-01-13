@@ -2470,7 +2470,7 @@ class GateServer(HealthAwareServer):
         total_cores: int,
     ) -> None:
         """Broadcast manager discovery to peer gates."""
-        if not self._active_gate_peers:
+        if not self._modular_state.has_active_peers():
             return
 
         broadcast = ManagerDiscoveryBroadcast(
@@ -2484,7 +2484,7 @@ class GateServer(HealthAwareServer):
             total_cores=total_cores,
         )
 
-        for peer_addr in self._active_gate_peers:
+        for peer_addr in self._modular_state.iter_active_peers():
             try:
                 await self.send_tcp(
                     peer_addr,
@@ -2630,7 +2630,7 @@ class GateServer(HealthAwareServer):
                 )
                 continue
 
-        for gate_id, gate_info in list(self._known_gates.items()):
+        for gate_id, gate_info in list(self._modular_state.iter_known_gates()):
             if gate_id == self._node_id.full:
                 continue
             try:
