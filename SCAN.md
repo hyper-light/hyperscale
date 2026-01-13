@@ -1192,6 +1192,138 @@ overload_state = self._load_shedder.get_current_state()
 | `iter_active_workers()` | `get_workers().values()` | Same data, different naming convention |
 | `get_overload_state()` | `get_current_state()` | Same return type, default args use tracked metrics |
 
+### Step 3.5h.4: Enum Member Validation (MANDATORY - CRITICAL)
+
+**STATUS: MANDATORY** - This step MUST be executed. Enum member access bugs cause `AttributeError` at runtime.
+
+**The Problem:**
+
+Import aliases hide the actual enum being used, making invalid member access hard to detect:
+
+```python
+# In imports:
+from hyperscale.distributed.models import ManagerState as ManagerStateEnum
+
+# In code - LOOKS valid but ISN'T:
+self._manager_state.set_manager_state_enum(ManagerStateEnum.OFFLINE)
+# ManagerState has: ACTIVE, DRAINING, SYNCING
+# OFFLINE does NOT exist! This is WorkerState.OFFLINE
+```
+
+**Why This Is Missed:**
+- Method existence check passes (`set_manager_state_enum` exists)
+- Attribute scanner doesn't check enum members
+- Import alias hides the actual enum name
+
+**Solution: Enum Member Validation with Alias Resolution**
+
+```python
+import ast
+import re
+from pathlib import Path
+
+def extract_enums(file_path: str) -> dict[str, set[str]]:
+    """Extract all enum classes and their members."""
+    with open(file_path) as f:
+        tree = ast.parse(f.read())
+    
+    enums = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef):
+            is_enum = any(
+                (isinstance(base, ast.Name) and base.id == 'Enum') or
+                (isinstance(base, ast.Attribute) and base.attr == 'Enum')
+                for base in node.bases
+            )
+            if is_enum:
+                members = {
+                    target.id
+                    for item in node.body
+                    if isinstance(item, ast.Assign)
+                    for target in item.targets
+                    if isinstance(target, ast.Name)
+                }
+                enums[node.name] = members
+    return enums
+
+def extract_import_aliases(file_path: str) -> dict[str, str]:
+    """Extract import aliases (alias -> original name)."""
+    with open(file_path) as f:
+        tree = ast.parse(f.read())
+    
+    aliases = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                aliases[alias.asname or alias.name] = alias.name
+    return aliases
+
+def scan_enum_access(server_path: str, enums: dict[str, set[str]]):
+    """Scan for invalid enum member accesses with alias support."""
+    aliases = extract_import_aliases(server_path)
+    
+    # Map used names to original enum names
+    alias_to_enum = {
+        alias: original
+        for alias, original in aliases.items()
+        if original in enums
+    }
+    # Include direct names
+    for enum_name in enums:
+        alias_to_enum.setdefault(enum_name, enum_name)
+    
+    violations = []
+    with open(server_path) as f:
+        lines = f.readlines()
+    
+    for line_num, line in enumerate(lines, 1):
+        for used_name, original_name in alias_to_enum.items():
+            pattern = re.compile(rf'\b{re.escape(used_name)}\.([A-Z_][A-Z0-9_]*)\b')
+            for match in pattern.finditer(line):
+                member = match.group(1)
+                if member not in enums[original_name]:
+                    violations.append((line_num, used_name, original_name, member, enums[original_name]))
+    
+    return violations
+```
+
+**Usage:**
+
+```bash
+python3 << 'EOF'
+# Collect all enums from models
+all_enums = {}
+for py_file in Path("hyperscale/distributed/models").glob("*.py"):
+    all_enums.update(extract_enums(str(py_file)))
+
+# Scan server
+violations = scan_enum_access("hyperscale/distributed/nodes/manager/server.py", all_enums)
+for line, used, original, member, valid in violations:
+    print(f"Line {line}: {used}.{member} - does not exist on {original}!")
+    print(f"  Valid members: {', '.join(sorted(valid))}")
+EOF
+```
+
+**Example Output:**
+
+```
+Line 711: ManagerStateEnum.OFFLINE - does not exist on ManagerState!
+  Valid members: ACTIVE, DRAINING, SYNCING
+```
+
+**Fix Patterns:**
+
+| Invalid Access | Root Cause | Fix |
+|----------------|------------|-----|
+| `ManagerStateEnum.OFFLINE` | Wrong enum | Use `DRAINING` or add `OFFLINE` to `ManagerState` |
+| `JobStatus.COMPLETE` | Typo | Use `JobStatus.COMPLETED` |
+| `WorkerState.STOPPED` | Member doesn't exist | Use `WorkerState.OFFLINE` or add `STOPPED` |
+
+**Integration:**
+
+Add to Phase 7 verification checklist:
+- [ ] Re-run Phase 3.5h.4 scanner: **ZERO** enum member violations
+
 ### Step 3.5i: Integration with CI/Build
 
 **Pre-commit Hook:**
