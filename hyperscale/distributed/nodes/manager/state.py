@@ -424,6 +424,12 @@ class ManagerState:
     def get_active_manager_peer_ids(self) -> set[str]:
         return self._active_manager_peer_ids
 
+    def add_active_manager_peer(self, addr: tuple[str, int]) -> None:
+        self._active_manager_peers.add(addr)
+
+    def remove_active_manager_peer(self, addr: tuple[str, int]) -> None:
+        self._active_manager_peers.discard(addr)
+
     # =========================================================================
     # Job Timeout Strategies Accessors (7 direct accesses)
     # =========================================================================
