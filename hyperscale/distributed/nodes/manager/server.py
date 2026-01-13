@@ -600,8 +600,7 @@ class ManagerServer(HealthAwareServer):
     @property
     def _quorum_size(self) -> int:
         """Calculate required quorum size."""
-        total_managers = len(self._manager_state._active_manager_peers) + 1
-        return (total_managers // 2) + 1
+        return (self._manager_state.get_active_peer_count() // 2) + 1
 
     # =========================================================================
     # Lifecycle Methods
@@ -862,12 +861,13 @@ class ManagerServer(HealthAwareServer):
     def _on_peer_confirmed(self, peer: tuple[str, int]) -> None:
         """Handle peer confirmation via SWIM (AD-29)."""
         # Check if manager peer
-        tcp_addr = self._manager_state._manager_udp_to_tcp.get(peer)
+        tcp_addr = self._manager_state.get_manager_tcp_from_udp(peer)
         if tcp_addr:
-            for peer_id, peer_info in self._manager_state._known_manager_peers.items():
+            for peer_id, peer_info in self._manager_state.iter_known_manager_peers():
                 if (peer_info.udp_host, peer_info.udp_port) == peer:
-                    self._manager_state._active_manager_peer_ids.add(peer_id)
-                    self._manager_state._active_manager_peers.add(tcp_addr)
+                    self._task_runner.run(
+                        self._manager_state.add_active_peer, tcp_addr, peer_id
+                    )
                     break
 
     def _on_node_dead(self, node_addr: tuple[str, int]) -> None:
