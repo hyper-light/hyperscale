@@ -634,27 +634,29 @@ class TestWorkerStateBackpressure:
 class TestWorkerStateThroughputTracking:
     """Test throughput tracking methods (AD-19)."""
 
-    def test_record_completion(self):
+    @pytest.mark.asyncio
+    async def test_record_completion(self):
         """Test recording a workflow completion."""
         allocator = MockCoreAllocator()
         state = WorkerState(allocator)
 
-        state.record_completion(1.5)
+        await state.record_completion(1.5)
 
         assert state._throughput_completions == 1
         assert len(state._completion_times) == 1
         assert state._completion_times[0] == 1.5
 
-    def test_record_completion_max_samples(self):
+    @pytest.mark.asyncio
+    async def test_record_completion_max_samples(self):
         """Test completion times max samples limit."""
         allocator = MockCoreAllocator()
         state = WorkerState(allocator)
 
         for i in range(60):
-            state.record_completion(float(i))
+            await state.record_completion(float(i))
 
         assert len(state._completion_times) == 50
-        assert state._completion_times[0] == 10.0  # First 10 removed
+        assert state._completion_times[0] == 10.0
 
     def test_get_throughput_initial(self):
         """Test initial throughput."""
@@ -672,24 +674,25 @@ class TestWorkerStateThroughputTracking:
         expected = state.get_expected_throughput()
         assert expected == 0.0
 
-    def test_get_expected_throughput_with_samples(self):
+    @pytest.mark.asyncio
+    async def test_get_expected_throughput_with_samples(self):
         """Test expected throughput calculation."""
         allocator = MockCoreAllocator()
         state = WorkerState(allocator)
 
-        # Record 10 completions, each taking 2 seconds
         for _ in range(10):
-            state.record_completion(2.0)
+            await state.record_completion(2.0)
 
         expected = state.get_expected_throughput()
-        assert expected == 0.5  # 1 / 2.0 = 0.5 per second
+        assert expected == 0.5
 
-    def test_get_expected_throughput_zero_duration(self):
+    @pytest.mark.asyncio
+    async def test_get_expected_throughput_zero_duration(self):
         """Test expected throughput with zero duration."""
         allocator = MockCoreAllocator()
         state = WorkerState(allocator)
 
-        state.record_completion(0.0)
+        await state.record_completion(0.0)
 
         expected = state.get_expected_throughput()
         assert expected == 0.0
