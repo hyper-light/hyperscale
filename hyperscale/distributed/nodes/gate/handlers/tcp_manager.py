@@ -25,7 +25,9 @@ from hyperscale.distributed.protocol.version import (
 )
 from hyperscale.distributed.reliability import BackpressureLevel, BackpressureSignal
 from hyperscale.distributed.discovery.security import RoleValidator
-from hyperscale.distributed.discovery.security.role_validator import NodeRole as SecurityNodeRole
+from hyperscale.distributed.discovery.security.role_validator import (
+    NodeRole as SecurityNodeRole,
+)
 from hyperscale.distributed.server.protocol.utils import get_peer_certificate_der
 from hyperscale.logging import Logger
 from hyperscale.logging.hyperscale_logging_models import (
@@ -128,28 +130,31 @@ class GateManagerHandler:
             datacenter_id = status.datacenter
             manager_addr = (status.tcp_host, status.tcp_port)
 
-            if datacenter_id not in self._state._datacenter_manager_status:
-                self._state._datacenter_manager_status[datacenter_id] = {}
-            self._state._datacenter_manager_status[datacenter_id][manager_addr] = status
-            self._state._manager_last_status[manager_addr] = time.monotonic()
+            await self._state.update_manager_status(
+                datacenter_id, manager_addr, status, time.monotonic()
+            )
 
-            self._record_manager_heartbeat(datacenter_id, manager_addr, status.node_id, status.version)
+            self._record_manager_heartbeat(
+                datacenter_id, manager_addr, status.node_id, status.version
+            )
 
             if status.backpressure_level > 0 or status.backpressure_delay_ms > 0:
                 backpressure_signal = BackpressureSignal(
                     level=BackpressureLevel(status.backpressure_level),
                     suggested_delay_ms=status.backpressure_delay_ms,
                 )
-                self._handle_manager_backpressure_signal(manager_addr, datacenter_id, backpressure_signal)
+                self._handle_manager_backpressure_signal(
+                    manager_addr, datacenter_id, backpressure_signal
+                )
             elif manager_addr in self._state._manager_backpressure:
                 self._state._manager_backpressure[manager_addr] = BackpressureLevel.NONE
                 self._update_dc_backpressure(datacenter_id)
 
-            return b'ok'
+            return b"ok"
 
         except Exception as error:
             await handle_exception(error, "manager_status_update")
-            return b'error'
+            return b"error"
 
     async def handle_register(
         self,
@@ -186,18 +191,18 @@ class GateManagerHandler:
                     self._logger.log,
                     ServerWarning(
                         message=f"Manager {heartbeat.node_id} rejected: cluster_id mismatch "
-                                f"(manager={heartbeat.cluster_id}, gate={self._env.CLUSTER_ID})",
+                        f"(manager={heartbeat.cluster_id}, gate={self._env.CLUSTER_ID})",
                         node_host=self._get_host(),
                         node_port=self._get_tcp_port(),
                         node_id=self._get_node_id().short,
-                    )
+                    ),
                 )
                 return ManagerRegistrationResponse(
                     accepted=False,
                     gate_id=self._get_node_id().full,
                     healthy_gates=[],
                     error=f"Cluster isolation violation: manager cluster_id '{heartbeat.cluster_id}' "
-                          f"does not match gate cluster_id '{self._env.CLUSTER_ID}'",
+                    f"does not match gate cluster_id '{self._env.CLUSTER_ID}'",
                     protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
                     protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
                 ).dump()
@@ -207,18 +212,18 @@ class GateManagerHandler:
                     self._logger.log,
                     ServerWarning(
                         message=f"Manager {heartbeat.node_id} rejected: environment_id mismatch "
-                                f"(manager={heartbeat.environment_id}, gate={self._env.ENVIRONMENT_ID})",
+                        f"(manager={heartbeat.environment_id}, gate={self._env.ENVIRONMENT_ID})",
                         node_host=self._get_host(),
                         node_port=self._get_tcp_port(),
                         node_id=self._get_node_id().short,
-                    )
+                    ),
                 )
                 return ManagerRegistrationResponse(
                     accepted=False,
                     gate_id=self._get_node_id().full,
                     healthy_gates=[],
                     error=f"Environment isolation violation: manager environment_id '{heartbeat.environment_id}' "
-                          f"does not match gate environment_id '{self._env.ENVIRONMENT_ID}'",
+                    f"does not match gate environment_id '{self._env.ENVIRONMENT_ID}'",
                     protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
                     protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
                 ).dump()
@@ -241,7 +246,7 @@ class GateManagerHandler:
                             node_host=self._get_host(),
                             node_port=self._get_tcp_port(),
                             node_id=self._get_node_id().short,
-                        )
+                        ),
                     )
                     return ManagerRegistrationResponse(
                         accepted=False,
@@ -252,7 +257,9 @@ class GateManagerHandler:
                         protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
                     ).dump()
 
-                if not self._role_validator.is_allowed(claims.role, SecurityNodeRole.GATE):
+                if not self._role_validator.is_allowed(
+                    claims.role, SecurityNodeRole.GATE
+                ):
                     self._task_runner.run(
                         self._logger.log,
                         ServerWarning(
@@ -260,7 +267,7 @@ class GateManagerHandler:
                             node_host=self._get_host(),
                             node_port=self._get_tcp_port(),
                             node_id=self._get_node_id().short,
-                        )
+                        ),
                     )
                     return ManagerRegistrationResponse(
                         accepted=False,
@@ -271,7 +278,9 @@ class GateManagerHandler:
                         protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
                     ).dump()
             else:
-                if not self._role_validator.is_allowed(SecurityNodeRole.MANAGER, SecurityNodeRole.GATE):
+                if not self._role_validator.is_allowed(
+                    SecurityNodeRole.MANAGER, SecurityNodeRole.GATE
+                ):
                     self._task_runner.run(
                         self._logger.log,
                         ServerWarning(
@@ -279,7 +288,7 @@ class GateManagerHandler:
                             node_host=self._get_host(),
                             node_port=self._get_tcp_port(),
                             node_id=self._get_node_id().short,
-                        )
+                        ),
                     )
                     return ManagerRegistrationResponse(
                         accepted=False,
@@ -292,11 +301,13 @@ class GateManagerHandler:
 
             # Protocol version negotiation (AD-25)
             manager_version = ProtocolVersion(
-                major=getattr(heartbeat, 'protocol_version_major', 1),
-                minor=getattr(heartbeat, 'protocol_version_minor', 0),
+                major=getattr(heartbeat, "protocol_version_major", 1),
+                minor=getattr(heartbeat, "protocol_version_minor", 0),
             )
-            manager_caps_str = getattr(heartbeat, 'capabilities', '')
-            manager_capabilities = set(manager_caps_str.split(',')) if manager_caps_str else set()
+            manager_caps_str = getattr(heartbeat, "capabilities", "")
+            manager_capabilities = (
+                set(manager_caps_str.split(",")) if manager_caps_str else set()
+            )
 
             manager_node_caps = NodeCapabilities(
                 protocol_version=manager_version,
@@ -304,18 +315,20 @@ class GateManagerHandler:
                 node_version=heartbeat.node_id,
             )
 
-            negotiated = negotiate_capabilities(self._node_capabilities, manager_node_caps)
+            negotiated = negotiate_capabilities(
+                self._node_capabilities, manager_node_caps
+            )
 
             if not negotiated.compatible:
                 self._task_runner.run(
                     self._logger.log,
                     ServerWarning(
                         message=f"Manager registration rejected: incompatible protocol version "
-                                f"{manager_version} (we are {CURRENT_PROTOCOL_VERSION})",
+                        f"{manager_version} (we are {CURRENT_PROTOCOL_VERSION})",
                         node_host=self._get_host(),
                         node_port=self._get_tcp_port(),
                         node_id=self._get_node_id().short,
-                    )
+                    ),
                 )
                 return ManagerRegistrationResponse(
                     accepted=False,
@@ -330,7 +343,9 @@ class GateManagerHandler:
 
             if datacenter_id not in self._state._datacenter_manager_status:
                 self._state._datacenter_manager_status[datacenter_id] = {}
-            self._state._datacenter_manager_status[datacenter_id][manager_addr] = heartbeat
+            self._state._datacenter_manager_status[datacenter_id][manager_addr] = (
+                heartbeat
+            )
             self._state._manager_last_status[manager_addr] = time.monotonic()
 
             if datacenter_id not in self._datacenter_managers:
@@ -338,28 +353,32 @@ class GateManagerHandler:
             if manager_addr not in self._datacenter_managers[datacenter_id]:
                 self._datacenter_managers[datacenter_id].append(manager_addr)
 
-            self._record_manager_heartbeat(datacenter_id, manager_addr, heartbeat.node_id, heartbeat.version)
+            self._record_manager_heartbeat(
+                datacenter_id, manager_addr, heartbeat.node_id, heartbeat.version
+            )
 
             if heartbeat.backpressure_level > 0 or heartbeat.backpressure_delay_ms > 0:
                 backpressure_signal = BackpressureSignal(
                     level=BackpressureLevel(heartbeat.backpressure_level),
                     suggested_delay_ms=heartbeat.backpressure_delay_ms,
                 )
-                self._handle_manager_backpressure_signal(manager_addr, datacenter_id, backpressure_signal)
+                self._handle_manager_backpressure_signal(
+                    manager_addr, datacenter_id, backpressure_signal
+                )
 
             self._task_runner.run(
                 self._logger.log,
                 ServerInfo(
                     message=f"Manager registered: {heartbeat.node_id} from DC {datacenter_id} "
-                            f"({heartbeat.worker_count} workers, protocol {manager_version}, "
-                            f"{len(negotiated.common_features)} features)",
+                    f"({heartbeat.worker_count} workers, protocol {manager_version}, "
+                    f"{len(negotiated.common_features)} features)",
                     node_host=self._get_host(),
                     node_port=self._get_tcp_port(),
                     node_id=self._get_node_id().short,
-                )
+                ),
             )
 
-            negotiated_caps_str = ','.join(sorted(negotiated.common_features))
+            negotiated_caps_str = ",".join(sorted(negotiated.common_features))
             response = ManagerRegistrationResponse(
                 accepted=True,
                 gate_id=self._get_node_id().full,
@@ -375,9 +394,9 @@ class GateManagerHandler:
                 manager_addr,
                 None,
                 heartbeat.worker_count,
-                getattr(heartbeat, 'healthy_worker_count', heartbeat.worker_count),
+                getattr(heartbeat, "healthy_worker_count", heartbeat.worker_count),
                 heartbeat.available_cores,
-                getattr(heartbeat, 'total_cores', 0),
+                getattr(heartbeat, "total_cores", 0),
             )
 
             return response.dump()
@@ -420,7 +439,9 @@ class GateManagerHandler:
             manager_addr = tuple(broadcast.manager_tcp_addr)
 
             dc_managers = self._datacenter_managers.setdefault(datacenter_id, [])
-            dc_manager_status = self._state._datacenter_manager_status.setdefault(datacenter_id, {})
+            dc_manager_status = self._state._datacenter_manager_status.setdefault(
+                datacenter_id, {}
+            )
 
             if manager_addr not in dc_managers:
                 dc_managers.append(manager_addr)
@@ -438,7 +459,7 @@ class GateManagerHandler:
                         node_host=self._get_host(),
                         node_port=self._get_tcp_port(),
                         node_id=self._get_node_id().short,
-                    )
+                    ),
                 )
 
             synthetic_heartbeat = ManagerHeartbeat(
@@ -458,8 +479,8 @@ class GateManagerHandler:
             dc_manager_status[manager_addr] = synthetic_heartbeat
             self._state._manager_last_status[manager_addr] = time.monotonic()
 
-            return b'ok'
+            return b"ok"
 
         except Exception as error:
             await handle_exception(error, "manager_discovery")
-            return b'error'
+            return b"error"
