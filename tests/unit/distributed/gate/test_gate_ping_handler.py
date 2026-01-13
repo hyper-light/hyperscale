@@ -197,10 +197,13 @@ class TestGatePingHandlerNegativePath:
             get_datacenter_managers=lambda: {},
         )
 
+        async def mock_handle_exception(error, context):
+            pass
+
         result = await handler.handle_ping(
             addr=("10.0.0.1", 8000),
             data=b"invalid_data",
-            clock_time=12345,
+            handle_exception=mock_handle_exception,
         )
 
         # Should return error response
