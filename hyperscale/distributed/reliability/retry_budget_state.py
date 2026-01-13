@@ -19,7 +19,7 @@ class RetryBudgetState:
     consumed: int = 0
     per_workflow_consumed: dict[str, int] = field(default_factory=dict)
 
-    def can_retry(self, workflow_id: str):
+    def can_retry(self, workflow_id: str) -> tuple[bool, str]:
         """
         Check if workflow can retry.
 
@@ -38,14 +38,14 @@ class RetryBudgetState:
 
         return True, "allowed"
 
-    def consume_retry(self, workflow_id: str):
+    def consume_retry(self, workflow_id: str) -> None:
         """Record a retry attempt."""
         self.consumed += 1
         self.per_workflow_consumed[workflow_id] = (
             self.per_workflow_consumed.get(workflow_id, 0) + 1
         )
 
-    def get_remaining(self):
+    def get_remaining(self) -> int:
         """Get remaining job-level retries."""
         return max(0, self.total_budget - self.consumed)
 
