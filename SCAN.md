@@ -867,6 +867,213 @@ If found, this is likely a semantic divergence bug.
 
 ---
 
+## Phase 5.9: Cyclomatic Complexity Scanning and Validation
+
+**Objective**: Systematically scan ALL methods/functions for cyclomatic complexity violations and fix them.
+
+### The Problem
+
+High cyclomatic complexity makes code:
+- Hard to understand and maintain
+- Prone to bugs in edge cases
+- Difficult to test comprehensively
+- Error-prone during refactoring
+
+```python
+# HIGH COMPLEXITY (CC=8+): Multiple nested loops, conditionals, exception handlers
+async def _orphan_scan_loop(self) -> None:
+    while self._running:                    # +1
+        try:                                # +1
+            if not should_scan:             # +1
+                continue
+            for worker_id, worker in ...:   # +1
+                try:                        # +1
+                    if not response:        # +1
+                        continue
+                    for job in ...:         # +1
+                        for sub_wf in ...:  # +1
+                            if sub_wf...:   # +1
+                                if parent:  # +1
+                    for orphaned in ...:    # +1
+                        if dispatcher:      # +1
+                except Exception:           # +1
+        except CancelledError:              # +1
+        except Exception:                   # +1
+```
+
+### Step 5.9a: Automated Complexity Scan
+
+Run complexity analysis on all methods:
+
+```python
+import ast
+import sys
+
+def calculate_complexity(node: ast.AST) -> int:
+    """Calculate cyclomatic complexity of an AST node."""
+    complexity = 1  # Base complexity
+    
+    for child in ast.walk(node):
+        # Each decision point adds 1
+        if isinstance(child, (ast.If, ast.While, ast.For, ast.AsyncFor)):
+            complexity += 1
+        elif isinstance(child, ast.ExceptHandler):
+            complexity += 1
+        elif isinstance(child, ast.BoolOp):
+            # Each 'and'/'or' adds to complexity
+            complexity += len(child.values) - 1
+        elif isinstance(child, ast.comprehension):
+            # List/dict/set comprehensions with conditions
+            complexity += len(child.ifs)
+        elif isinstance(child, ast.Match):
+            complexity += len(child.cases) - 1
+    
+    return complexity
+
+def scan_file(filepath: str, max_complexity: int = 4) -> list[tuple[str, int, int]]:
+    """Scan file for methods exceeding complexity threshold."""
+    with open(filepath) as f:
+        tree = ast.parse(f.read())
+    
+    violations = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            cc = calculate_complexity(node)
+            if cc > max_complexity:
+                violations.append((node.name, node.lineno, cc))
+    
+    return violations
+
+# Usage
+violations = scan_file("server.py", max_complexity=4)
+for name, line, cc in violations:
+    print(f"Line {line}: {name}() has CC={cc} (max: 4)")
+```
+
+### Step 5.9b: Build Violation Report
+
+| Method | Line | Complexity | Max Allowed | Violation |
+|--------|------|------------|-------------|-----------|
+| `_orphan_scan_loop` | 1349 | 15 | 4 | **YES** |
+| `_handle_job_completion` | 2500 | 8 | 4 | **YES** |
+| `_process_heartbeat` | 3200 | 3 | 4 | NO |
+
+### Step 5.9c: Complexity Reduction Patterns
+
+| Anti-Pattern | Refactored Pattern | Complexity Reduction |
+|--------------|-------------------|---------------------|
+| Nested loops | Extract inner loop to helper method | -N per loop extracted |
+| Multiple exception handlers | Single handler with type dispatch | -N+1 |
+| Nested conditionals | Guard clauses (early returns) | -N per level flattened |
+| Complex boolean expressions | Extract to predicate methods | -N per expression |
+| Loop with conditional continue | Filter before loop | -1 |
+
+**Example - Extract Inner Loop:**
+
+```python
+# BEFORE (CC=8): Nested loops in main method
+async def _orphan_scan_loop(self):
+    while running:
+        for worker in workers:
+            for job in jobs:
+                for sub_wf in job.sub_workflows:
+                    if condition:
+                        process(sub_wf)
+
+# AFTER (CC=3 + CC=3): Split into focused methods
+async def _orphan_scan_loop(self):
+    while running:
+        for worker in workers:
+            await self._scan_worker_for_orphans(worker)
+
+async def _scan_worker_for_orphans(self, worker):
+    worker_workflow_ids = await self._query_worker_workflows(worker)
+    manager_tracked_ids = self._get_manager_tracked_ids_for_worker(worker.id)
+    orphaned = manager_tracked_ids - worker_workflow_ids
+    await self._handle_orphaned_workflows(orphaned)
+```
+
+**Example - Guard Clauses:**
+
+```python
+# BEFORE (CC=4): Nested conditionals
+if response:
+    if not isinstance(response, Exception):
+        if parsed := parse(response):
+            process(parsed)
+
+# AFTER (CC=3): Guard clauses
+if not response or isinstance(response, Exception):
+    return
+parsed = parse(response)
+if not parsed:
+    return
+process(parsed)
+```
+
+### Step 5.9d: Refactoring Workflow
+
+For each violation:
+
+1. **Identify extraction boundaries**: Find logically cohesive blocks
+2. **Name the extracted method**: Clear verb+noun describing the action
+3. **Pass minimum required parameters**: Don't pass entire objects if only one field needed
+4. **Preserve error handling semantics**: Exceptions should propagate correctly
+5. **Run LSP diagnostics**: Verify no broken references
+6. **Re-calculate complexity**: Verify both original and extracted are ≤4
+
+### Step 5.9e: Post-Refactor Validation (MANDATORY)
+
+After EVERY complexity-reducing refactor:
+
+1. **LSP Diagnostics**: `lsp_diagnostics(file="server.py", severity="error")`
+2. **Variable Scope Audit**: All variables in extracted methods are either:
+   - Parameters passed to the method
+   - Instance attributes (self._X)
+   - Locally computed
+3. **Attribute Access Validation**: Run Phase 3.5g scanner on modified methods
+4. **Method Existence Check**: All called methods exist on their targets
+
+```bash
+# Quick validation command
+lsp_diagnostics && echo "Diagnostics clean" || echo "ERRORS FOUND"
+```
+
+### Step 5.9f: Complexity Limits
+
+| Complexity | Action Required |
+|------------|-----------------|
+| 1-3 | Acceptable, no action |
+| 4 | Maximum allowed - document why if borderline |
+| 5-6 | **MUST refactor** - extract helper methods |
+| 7+ | **CRITICAL** - requires significant decomposition |
+
+### Step 5.9g: Documentation Requirements
+
+For methods at CC=4 (borderline):
+- Add comment explaining why complexity is necessary
+- Document which decision points could be extracted if needed
+
+```python
+async def _process_complex_case(self):
+    """
+    Process complex case with multiple validations.
+    
+    Complexity: 4 (at limit)
+    Decision points: auth check, rate limit, validation, dispatch
+    Note: Could extract validation to separate method if complexity grows
+    """
+```
+
+### Output
+
+- Zero methods with CC > 4
+- All extracted methods have clear single responsibility
+- Post-refactor integrity verified via LSP
+- No broken attribute accesses introduced
+
+---
+
 ## Phase 6: Clean Up Dead Code
 
 **Objective**: Remove orphaned implementations.
