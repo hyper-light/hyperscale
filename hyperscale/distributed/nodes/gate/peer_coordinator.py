@@ -32,7 +32,9 @@ if TYPE_CHECKING:
     from hyperscale.distributed.swim.core import NodeId
     from hyperscale.distributed.hash_ring import ConsistentHashRing
     from hyperscale.distributed.jobs import JobLeadershipTracker
-    from hyperscale.distributed.jobs.job_forwarding_tracker import JobForwardingTracker
+    from hyperscale.distributed.jobs.gates.job_forwarding_tracker import (
+        JobForwardingTracker,
+    )
     from hyperscale.distributed.server.events.lamport_clock import VersionedStateClock
     from taskex import TaskRunner
 

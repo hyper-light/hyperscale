@@ -49,7 +49,7 @@ class RetryBudgetState:
         """Get remaining job-level retries."""
         return max(0, self.total_budget - self.consumed)
 
-    def get_workflow_remaining(self, workflow_id: str):
+    def get_workflow_remaining(self, workflow_id: str) -> int:
         """Get remaining retries for specific workflow."""
         workflow_consumed = self.per_workflow_consumed.get(workflow_id, 0)
         return max(0, self.per_workflow_max - workflow_consumed)
