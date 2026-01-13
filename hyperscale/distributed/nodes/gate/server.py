@@ -2026,7 +2026,7 @@ class GateServer(HealthAwareServer):
         udp_addr: tuple[str, int],
     ) -> None:
         """Handle gate peer heartbeat from SWIM."""
-        self._gate_peer_info[udp_addr] = heartbeat
+        self._modular_state.set_gate_peer_heartbeat(udp_addr, heartbeat)
 
         if heartbeat.node_id and heartbeat.tcp_host and heartbeat.tcp_port:
             await self._job_hash_ring.add_node(
@@ -2049,7 +2049,7 @@ class GateServer(HealthAwareServer):
 
     def _get_known_gates_for_piggyback(self) -> list[GateInfo]:
         """Get known gates for SWIM piggyback."""
-        return list(self._known_gates.values())
+        return self._modular_state.get_all_known_gates()
 
     def _get_job_leaderships_for_piggyback(
         self,
