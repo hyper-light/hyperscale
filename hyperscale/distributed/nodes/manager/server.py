@@ -4206,10 +4206,7 @@ class ManagerServer(HealthAwareServer):
         try:
             transfer = JobLeaderGateTransfer.load(data)
 
-            # Use fence token for consistency
-            current_fence = self._manager_state._job_fencing_tokens.get(
-                transfer.job_id, 0
-            )
+            current_fence = self._leases.get_fence_token(transfer.job_id)
             if transfer.fence_token < current_fence:
                 return JobLeaderGateTransferAck(
                     job_id=transfer.job_id,
@@ -4217,15 +4214,13 @@ class ManagerServer(HealthAwareServer):
                     accepted=False,
                 ).dump()
 
-            # Update origin gate
             self._manager_state._job_origin_gates[transfer.job_id] = (
                 transfer.new_gate_addr
             )
 
-            if transfer.fence_token > current_fence:
-                self._manager_state._job_fencing_tokens[transfer.job_id] = (
-                    transfer.fence_token
-                )
+            self._leases.update_fence_token_if_higher(
+                transfer.job_id, transfer.fence_token
+            )
 
             await self._udp_logger.log(
                 ServerInfo(
