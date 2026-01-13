@@ -345,18 +345,11 @@ class GateHealthCoordinator:
         return best_heartbeat, alive_count, len(manager_statuses)
 
     def count_active_datacenters(self) -> int:
-        """
-        Count datacenters that are not in UNHEALTHY state.
-
-        Uses the health classification system which incorporates heartbeat
-        freshness, manager availability, and other health signals.
-
-        Returns:
-            Number of active (healthy or degraded) datacenters
-        """
         count = 0
-        for datacenter_id in self._datacenter_managers:
-            status = self._dc_health_manager.get_datacenter_health(datacenter_id)
+        for (
+            datacenter_id,
+            status,
+        ) in self._dc_health_manager.get_all_datacenter_health().items():
             if status.health != DatacenterHealth.UNHEALTHY.value:
                 count += 1
         return count
