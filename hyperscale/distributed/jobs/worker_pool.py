@@ -513,11 +513,7 @@ class WorkerPool:
             if elapsed >= timeout:
                 return None
 
-            # Use a local event for this specific wait to avoid race conditions
-            # The pattern is: check inside lock, only wait if not satisfied
-            should_wait = False
-
-            async with self._allocation_lock:
+            async with self._cores_condition:
                 allocations = self._select_workers_for_allocation(cores_needed)
                 total_allocated = sum(cores for _, cores in allocations)
 
