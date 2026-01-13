@@ -4713,7 +4713,8 @@ class ManagerServer(HealthAwareServer):
         self._health_monitor.cleanup_job_progress(job_id)
         self._health_monitor.clear_job_suspicions(job_id)
         self._manager_state.clear_job_state(job_id)
-        await self._job_manager.remove_job_by_id(job_id)
+        job_token = self._job_manager.create_job_token(job_id)
+        await self._job_manager.remove_job(job_token)
 
     async def _log_job_completion(
         self, job_id: str, final_status: str, total_completed: int, total_failed: int
