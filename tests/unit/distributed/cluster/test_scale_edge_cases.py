@@ -596,7 +596,8 @@ class TestStateCorruptionRecovery:
 class TestThunderingHerdBurst:
     """Tests for thundering herd and burst traffic scenarios."""
 
-    def test_burst_traffic_rate_limiting(self):
+    @pytest.mark.asyncio
+    async def test_burst_traffic_rate_limiting(self):
         """Test rate limiter handles burst traffic correctly."""
         config = RateLimitConfig(
             default_bucket_size=100,
@@ -608,7 +609,7 @@ class TestThunderingHerdBurst:
         burst_results = []
         for client_id in range(100):
             for _ in range(5):
-                result = limiter.check_rate_limit(
+                result = await limiter.check_rate_limit(
                     f"client-{client_id}",
                     "burst_operation",
                 )
@@ -618,7 +619,8 @@ class TestThunderingHerdBurst:
         allowed_count = sum(burst_results)
         assert allowed_count == 500  # All 500 requests allowed
 
-    def test_sustained_burst_depletion(self):
+    @pytest.mark.asyncio
+    async def test_sustained_burst_depletion(self):
         """Test sustained burst depletes token buckets."""
         config = RateLimitConfig(
             default_bucket_size=50,
@@ -629,7 +631,7 @@ class TestThunderingHerdBurst:
         # Single client, sustained burst
         results = []
         for _ in range(100):
-            result = limiter.check_rate_limit("client-1", "operation")
+            result = await limiter.check_rate_limit("client-1", "operation")
             results.append(result.allowed)
 
         allowed = sum(results)
@@ -676,7 +678,7 @@ class TestThunderingHerdBurst:
         )
 
         async def check_rate_limit(client_id: str) -> bool:
-            result = limiter.check_rate_limit(client_id, "concurrent_op")
+            result = await limiter.check_rate_limit(client_id, "concurrent_op")
             return result.allowed
 
         # 50 concurrent checks from same client
