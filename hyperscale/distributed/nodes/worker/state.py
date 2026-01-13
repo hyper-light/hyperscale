@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 
 from hyperscale.distributed.models import (
     ManagerInfo,
+    WorkflowDispatch,
     WorkflowProgress,
     PendingTransfer,
 )
@@ -58,7 +59,7 @@ class WorkerState:
         self._workflow_job_leader: dict[str, tuple[str, int]] = {}
         self._workflow_fence_tokens: dict[str, int] = {}
         self._workflow_cores_completed: dict[str, set[int]] = {}
-        self._pending_workflows: list = []
+        self._pending_workflows: list[WorkflowDispatch] = []
         self._workflow_start_times: dict[str, float] = {}
         self._workflow_timeout_seconds: dict[str, float] = {}
 
@@ -364,7 +365,7 @@ class WorkerState:
         async with self._get_counter_lock():
             self._transfer_metrics_rejected_other += 1
 
-    def get_transfer_metrics(self) -> dict:
+    def get_transfer_metrics(self) -> dict[str, int]:
         """Get transfer metrics summary."""
         return {
             "received": self._transfer_metrics_received,
