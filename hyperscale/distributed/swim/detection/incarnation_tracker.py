@@ -494,16 +494,6 @@ class IncarnationTracker:
 
             return False
 
-        if node not in self.node_states:
-            self.node_states[node] = NodeState(
-                status=b"UNCONFIRMED",
-                incarnation=0,
-                last_update_time=timestamp,
-            )
-            return True
-
-        return False
-
     async def confirm_node(
         self,
         node: tuple[str, int],

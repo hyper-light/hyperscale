@@ -299,7 +299,6 @@ class ManagerState:
 
     def remove_worker_state(self, worker_id: str) -> None:
         """Remove all state associated with a dead worker to prevent memory leaks."""
-        self._dispatch_semaphores.pop(worker_id, None)
         self._worker_latency_samples.pop(worker_id, None)
         self._worker_circuits.pop(worker_id, None)
         self._worker_unhealthy_since.pop(worker_id, None)
