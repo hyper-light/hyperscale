@@ -1141,7 +1141,10 @@ class WorkerServer(HealthAwareServer):
     # =========================================================================
 
     async def _handle_dispatch_execution(
-        self, dispatch, addr: tuple[str, int], allocation_result
+        self,
+        dispatch: WorkflowDispatch,
+        addr: tuple[str, int],
+        allocation_result: AllocationResult,
     ) -> bytes:
         """Handle the execution phase of a workflow dispatch."""
         result = await self._workflow_executor.handle_dispatch_execution(
