@@ -121,16 +121,23 @@ class ManagerRegistry:
         self,
         worker_id: str,
         health_state: str,
-    ) -> None:
+    ) -> tuple[str | None, str]:
         """
         Update worker health state from heartbeat (AD-17).
 
         Args:
             worker_id: Worker node ID
             health_state: Health state: "healthy", "busy", "stressed", "overloaded"
+
+        Returns:
+            Tuple of (previous_state, new_state) - previous_state is None if first update
         """
-        if worker_id in self._state._workers:
-            self._state._worker_health_states[worker_id] = health_state
+        if worker_id not in self._state._workers:
+            return (None, health_state)
+
+        previous_state = self._state._worker_health_states.get(worker_id)
+        self._state._worker_health_states[worker_id] = health_state
+        return (previous_state, health_state)
 
     def get_worker_health_state(self, worker_id: str) -> str:
         """
