@@ -600,8 +600,10 @@ class TestIntegrationScenarios:
         # Find a job that maps to gate-1
         test_job_id = "job-for-gate1"
         # Ensure the job maps to gate-1 by checking
+        counter = 0
         while await hash_ring.get_owner_id(test_job_id) != "gate-1":
-            test_job_id = f"job-{hash(test_job_id)}"
+            counter += 1
+            test_job_id = f"job-test-{counter}"
 
         # Gate-1 receives and stores job
         job = GlobalJobStatus(
