@@ -851,9 +851,7 @@ class WorkflowDispatch(Message):
     def load_context(self) -> dict[str, Any]:
         if not self.context:
             return {}
-        if self.context[0:1] == b"\x01":
-            return Message.load(zlib.decompress(self.context[1:]))
-        return Message.load(self.context[1:])
+        return Message.load(self.context)
 
 
 @dataclass(slots=True)
