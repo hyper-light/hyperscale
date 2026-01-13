@@ -68,6 +68,7 @@ class GateRuntimeState:
         self._manager_backpressure: dict[tuple[str, int], BackpressureLevel] = {}
         self._backpressure_delay_ms: int = 0
         self._dc_backpressure: dict[str, BackpressureLevel] = {}
+        self._backpressure_lock: asyncio.Lock | None = None
 
         # Protocol negotiation
         self._manager_negotiated_caps: dict[
@@ -115,6 +116,7 @@ class GateRuntimeState:
         self._counter_lock = asyncio.Lock()
         self._lock_creation_lock = asyncio.Lock()
         self._manager_state_lock = asyncio.Lock()
+        self._backpressure_lock = asyncio.Lock()
 
     def _get_counter_lock(self) -> asyncio.Lock:
         if self._counter_lock is None:
