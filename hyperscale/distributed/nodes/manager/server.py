@@ -2215,6 +2215,11 @@ class ManagerServer(HealthAwareServer):
             )
             self._probe_scheduler.add_member(worker_udp_addr)
 
+            if self._worker_disseminator:
+                await self._worker_disseminator.broadcast_worker_registered(
+                    registration
+                )
+
             # Build response with known managers
             healthy_managers = [
                 self._manager_state._known_manager_peers[peer_id]
