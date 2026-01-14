@@ -2105,6 +2105,7 @@ class GateServer(HealthAwareServer):
                 JobStatus.COMPLETED.value,
                 JobStatus.FAILED.value,
                 JobStatus.CANCELLED.value,
+                JobStatus.TIMEOUT.value,
             }
             if job.status in terminal_statuses:
                 await self._logger.log(
@@ -2448,6 +2449,7 @@ class GateServer(HealthAwareServer):
                 JobStatus.COMPLETED.value,
                 JobStatus.FAILED.value,
                 JobStatus.CANCELLED.value,
+                JobStatus.TIMEOUT.value,
             }
 
             if (
