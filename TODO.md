@@ -76,6 +76,7 @@ Systematic bug fixes for the Hyperscale distributed performance testing framewor
 - [x] **Task 32**: Add explicit progress percentage calculation in gate (added _calculate_progress_percentage to tcp_job.py, added progress_percentage field to GlobalJobStatus)
 - [x] **Task 33**: Add recovery path for manager dies with pending stats (added export_checkpoint/import_checkpoint to StatsBuffer, wired into ManagerStateSync and ManagerStateSnapshot)
 - [x] **Task 34**: Add ReporterResultPush forwarding path in gate (verified - already implemented via Task 59)
+- [x] **Task 38**: Add reporter task creation and result dispatch in gate (added _dispatch_to_reporters to server.py, called from _complete_job)
 
 ---
 
