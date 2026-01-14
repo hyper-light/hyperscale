@@ -43,7 +43,8 @@ class ClusterFactory:
         return await self._create_from_counts(spec)
 
     async def _create_from_counts(self, spec: ClusterSpec) -> TestCluster:
-        env_overrides = spec.env_overrides or {}
+        env_overrides = dict(spec.env_overrides or {})
+        env_overrides.setdefault("WORKER_MAX_CORES", spec.cores_per_worker)
         self._env = Env.model_validate(env_overrides)
         cluster = TestCluster(config=spec)
         datacenter_ids = _build_datacenter_ids(spec.dc_count)
