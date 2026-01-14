@@ -516,16 +516,98 @@ class ManagerStateSync:
 
         return None
 
-    async def _apply_manager_peer_state(self, snapshot: ManagerStateSnapshot) -> None:
+    async def _reconcile_peer_leadership(
+        self,
+        peer_addr: tuple[str, int],
+        snapshot: ManagerStateSnapshot,
+    ) -> None:
+        if not snapshot.is_leader:
+            return
+
+        peer_term = snapshot.term
+        local_term = self._get_term()
+
+        if peer_term < local_term:
+            self._task_runner.run(
+                self._logger.log,
+                ServerDebug(
+                    message=(
+                        f"State sync ignored peer leader {snapshot.node_id[:8]}... "
+                        f"term {peer_term} < local {local_term}"
+                    ),
+                    node_host=self._config.host,
+                    node_port=self._config.tcp_port,
+                    node_id=self._node_id,
+                ),
+            )
+            return
+
+        if self._is_leader():
+            should_yield = self._should_yield_to_peer(peer_addr, peer_term)
+            if should_yield:
+                self._task_runner.run(
+                    self._logger.log,
+                    ServerWarning(
+                        message=(
+                            f"Split-brain resolved: yielding to peer leader "
+                            f"{snapshot.node_id[:8]}... term {peer_term}"
+                        ),
+                        node_host=self._config.host,
+                        node_port=self._config.tcp_port,
+                        node_id=self._node_id,
+                    ),
+                )
+                await self._step_down()
+                self._set_dc_leader(snapshot.node_id)
+            else:
+                self._task_runner.run(
+                    self._logger.log,
+                    ServerWarning(
+                        message=(
+                            f"Split-brain detected: retaining leadership over "
+                            f"peer {snapshot.node_id[:8]}... term {peer_term}"
+                        ),
+                        node_host=self._config.host,
+                        node_port=self._config.tcp_port,
+                        node_id=self._node_id,
+                    ),
+                )
+            return
+
+        await self._handle_elected(peer_addr, peer_term)
+        self._set_dc_leader(snapshot.node_id)
+        self._task_runner.run(
+            self._logger.log,
+            ServerInfo(
+                message=(
+                    f"State sync updated leader to {snapshot.node_id[:8]}... "
+                    f"term {peer_term}"
+                ),
+                node_host=self._config.host,
+                node_port=self._config.tcp_port,
+                node_id=self._node_id,
+            ),
+        )
+
+    async def _apply_manager_peer_state(
+        self,
+        peer_addr: tuple[str, int],
+        snapshot: ManagerStateSnapshot,
+    ) -> None:
         """
         Apply manager peer state snapshot to local state.
 
         Args:
+            peer_addr: Peer manager TCP address
             snapshot: Manager state snapshot
         """
+        await self._reconcile_peer_leadership(peer_addr, snapshot)
+
         for job_id, fence_token in snapshot.job_fence_tokens.items():
             current_token = self._state._job_fencing_tokens.get(job_id, -1)
             if fence_token > current_token:
+                previous_leader = self._state._job_leaders.get(job_id)
+                previous_addr = self._state._job_leader_addrs.get(job_id)
                 self._state._job_fencing_tokens[job_id] = fence_token
 
                 leader_id = snapshot.job_leaders.get(job_id)
@@ -533,6 +615,7 @@ class ManagerStateSync:
                     self._state._job_leaders[job_id] = leader_id
 
                 leader_addr = snapshot.job_leader_addrs.get(job_id)
+                leader_addr_tuple: tuple[str, int] | None = None
                 if leader_addr:
                     leader_addr_tuple = (
                         tuple(leader_addr)
@@ -549,10 +632,49 @@ class ManagerStateSync:
                     if incoming_layer_version > current_layer_version:
                         self._state._job_layer_version[job_id] = incoming_layer_version
 
+                self._task_runner.run(
+                    self._logger.log,
+                    ServerDebug(
+                        message=(
+                            f"State sync accepted job {job_id[:8]}... "
+                            f"fence {current_token} -> {fence_token}, "
+                            f"leader {previous_leader} -> {leader_id}, "
+                            f"addr {previous_addr} -> {leader_addr_tuple}"
+                        ),
+                        node_host=self._config.host,
+                        node_port=self._config.tcp_port,
+                        node_id=self._node_id,
+                    ),
+                )
+            else:
+                self._task_runner.run(
+                    self._logger.log,
+                    ServerDebug(
+                        message=(
+                            f"State sync rejected stale fence for job {job_id[:8]}... "
+                            f"token {fence_token} <= {current_token}"
+                        ),
+                        node_host=self._config.host,
+                        node_port=self._config.tcp_port,
+                        node_id=self._node_id,
+                    ),
+                )
+
+        if self._state.set_state_version_if_higher(snapshot.version):
+            self._task_runner.run(
+                self._logger.log,
+                ServerDebug(
+                    message=f"State sync updated state version to {snapshot.version}",
+                    node_host=self._config.host,
+                    node_port=self._config.tcp_port,
+                    node_id=self._node_id,
+                ),
+            )
+
         self._task_runner.run(
             self._logger.log,
             ServerDebug(
-                message=f"Applied manager peer state (version {snapshot.state_version})",
+                message=f"Applied manager peer state (version {snapshot.version})",
                 node_host=self._config.host,
                 node_port=self._config.tcp_port,
                 node_id=self._node_id,

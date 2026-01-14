@@ -318,13 +318,28 @@ class GateStatsCoordinator:
         if not self._has_job(job_id):
             return
 
-        if not (callback := self._get_progress_callback(job_id)):
+        callbacks = self._get_progress_callbacks(job_id)
+        if not callbacks:
             return
 
         if not (job := self._get_job_status(job_id)):
             return
 
-        await self._send_batch_push(job_id, job, callback)
+        for callback in callbacks:
+            try:
+                await self._send_batch_push(job_id, job, callback)
+            except Exception as error:
+                await self._logger.log(
+                    ServerError(
+                        message=(
+                            "Failed to replay batch stats update for job "
+                            f"{job_id}: {error}"
+                        ),
+                        node_host=self._node_host,
+                        node_port=self._node_port,
+                        node_id=self._node_id,
+                    )
+                )
 
     async def batch_stats_update(self) -> None:
         running_jobs = self._get_all_running_jobs()
