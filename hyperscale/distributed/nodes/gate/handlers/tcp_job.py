@@ -586,7 +586,27 @@ class GateJobHandler:
 
             progress = JobProgress.load(data)
 
-            if not self._job_manager.has_job(progress.job_id):
+            job = self._job_manager.get_job(progress.job_id)
+            if job and self._is_terminal_status(job.status):
+                await self._logger.log(
+                    ServerInfo(
+                        message=(
+                            "Discarding progress update for terminal job "
+                            f"{progress.job_id} (status={job.status})"
+                        ),
+                        node_host=self._get_host(),
+                        node_port=self._get_tcp_port(),
+                        node_id=self._get_node_id().short,
+                    )
+                )
+                await self._release_job_lease(progress.job_id)
+                return JobProgressAck(
+                    gate_id=self._get_node_id().full,
+                    is_leader=self._is_leader(),
+                    healthy_gates=self._get_healthy_gates(),
+                ).dump()
+
+            if job is None:
                 forwarded = await self._forward_job_progress_to_peers(progress)
                 if forwarded:
                     return JobProgressAck(
@@ -618,25 +638,6 @@ class GateJobHandler:
 
             job = self._job_manager.get_job(progress.job_id)
             if job:
-                if self._is_terminal_status(job.status):
-                    await self._logger.log(
-                        ServerInfo(
-                            message=(
-                                "Discarding progress update for terminal job "
-                                f"{progress.job_id} (status={job.status})"
-                            ),
-                            node_host=self._get_host(),
-                            node_port=self._get_tcp_port(),
-                            node_id=self._get_node_id().short,
-                        )
-                    )
-                    await self._release_job_lease(progress.job_id)
-                    return JobProgressAck(
-                        gate_id=self._get_node_id().full,
-                        is_leader=self._is_leader(),
-                        healthy_gates=self._get_healthy_gates(),
-                    ).dump()
-
                 old_status = job.status
 
                 for idx, dc_prog in enumerate(job.datacenters):
