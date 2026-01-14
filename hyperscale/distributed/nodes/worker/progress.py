@@ -244,8 +244,18 @@ class WorkerProgressReporter:
             circuit.record_error()
             return False
 
-        except Exception:
+        except Exception as error:
             circuit.record_error()
+            if self._logger:
+                self._task_runner.run(
+                    self._logger.log,
+                    ServerDebug(
+                        message=f"Progress send to {manager_addr} failed: {error}",
+                        node_host="worker",
+                        node_port=0,
+                        node_id="worker",
+                    ),
+                )
             return False
 
     async def send_progress_to_all_managers(
@@ -288,8 +298,18 @@ class WorkerProgressReporter:
                     else:
                         circuit.record_error()
 
-                except Exception:
+                except Exception as error:
                     circuit.record_error()
+                    if self._logger:
+                        self._task_runner.run(
+                            self._logger.log,
+                            ServerDebug(
+                                message=f"Broadcast progress to manager failed: {error}",
+                                node_host="worker",
+                                node_port=0,
+                                node_id="worker",
+                            ),
+                        )
 
     async def send_final_result(
         self,
@@ -551,8 +571,17 @@ class WorkerProgressReporter:
                     )
                 )
 
-        except Exception:
-            pass
+        except Exception as error:
+            if data != b"ok" and self._logger:
+                self._task_runner.run(
+                    self._logger.log,
+                    ServerDebug(
+                        message=f"ACK parse failed (non-legacy payload): {error}",
+                        node_host="worker",
+                        node_port=0,
+                        node_id="worker",
+                    ),
+                )
 
     def _enqueue_pending_result(self, final_result: WorkflowFinalResult) -> None:
         now = time.monotonic()
@@ -665,8 +694,18 @@ class WorkerProgressReporter:
                 if response and isinstance(response, bytes) and response != b"error":
                     self._registry.get_or_create_circuit(manager_id).record_success()
                     return True
-            except Exception:
+            except Exception as error:
                 self._registry.get_or_create_circuit(manager_id).record_error()
+                if self._logger:
+                    self._task_runner.run(
+                        self._logger.log,
+                        ServerDebug(
+                            message=f"Final result send to {manager_addr} failed: {error}",
+                            node_host="worker",
+                            node_port=0,
+                            node_id="worker",
+                        ),
+                    )
                 continue
 
         return False
