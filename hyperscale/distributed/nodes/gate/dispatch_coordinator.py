@@ -42,7 +42,7 @@ from hyperscale.logging.hyperscale_logging_models import (
 if TYPE_CHECKING:
     from hyperscale.distributed.nodes.gate.state import GateRuntimeState
     from hyperscale.distributed.jobs.gates import GateJobManager, GateJobTimeoutTracker
-    from hyperscale.distributed.routing import GateJobRouter, DispatchTimeTracker
+    from hyperscale.distributed.routing import DispatchTimeTracker
     from hyperscale.distributed.health import CircuitBreakerManager
     from hyperscale.distributed.swim.core import ErrorStats
     from hyperscale.logging import Logger
@@ -96,7 +96,6 @@ class GateDispatchCoordinator:
         self._logger: "Logger" = logger
         self._task_runner: "TaskRunner" = task_runner
         self._job_manager: "GateJobManager" = job_manager
-        self._job_router: "GateJobRouter | None" = job_router
         self._job_timeout_tracker: "GateJobTimeoutTracker" = job_timeout_tracker
         self._dispatch_time_tracker: "DispatchTimeTracker" = dispatch_time_tracker
         self._circuit_breaker_manager: "CircuitBreakerManager" = circuit_breaker_manager
@@ -708,8 +707,6 @@ class GateDispatchCoordinator:
                     self._suspect_manager_for_dc, datacenter, manager_addr
                 )
 
-        if self._job_router:
-            self._job_router.record_dispatch_failure(job_id, datacenter)
         return (False, f"All managers in {datacenter} failed to accept job", None)
 
     async def _try_fallback_dispatch(
