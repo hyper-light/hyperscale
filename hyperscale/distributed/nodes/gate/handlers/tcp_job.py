@@ -281,7 +281,7 @@ class GateJobHandler:
                     return JobAck(
                         job_id=submission.job_id,
                         accepted=False,
-                        error="Idempotency wait timed out, please retry",
+                        error="Idempotency wait timed out, retry submission",
                         protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
                         protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
                         capabilities=negotiated_caps_str,
