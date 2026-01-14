@@ -1013,9 +1013,6 @@ class GateServer(HealthAwareServer):
         if self._idempotency_cache is not None:
             await self._idempotency_cache.close()
 
-        if self._job_ledger is not None:
-            await self._job_ledger.close()
-
         await super().stop(
             drain_timeout=drain_timeout,
             broadcast_leave=broadcast_leave,
