@@ -24,7 +24,9 @@ Usage:
 from typing import Callable
 
 from hyperscale.distributed.server import tcp
-from hyperscale.distributed.server.server.mercury_sync_base_server import MercurySyncBaseServer
+from hyperscale.distributed.server.server.mercury_sync_base_server import (
+    MercurySyncBaseServer,
+)
 from hyperscale.distributed.models import (
     JobStatusPush,
     ReporterResultPush,
@@ -102,7 +104,7 @@ class HyperscaleClient(MercurySyncBaseServer):
 
     def __init__(
         self,
-        host: str = '127.0.0.1',
+        host: str = "127.0.0.1",
         port: int = 8500,
         env: Env | None = None,
         managers: list[tuple[str, int]] | None = None,
@@ -161,6 +163,7 @@ class HyperscaleClient(MercurySyncBaseServer):
         self._tracker = ClientJobTracker(
             state=self._state,
             logger=self._logger,
+            poll_gate_for_status=self._poll_gate_for_job_status,
         )
         self._submitter = ClientJobSubmitter(
             state=self._state,
@@ -250,7 +253,7 @@ class HyperscaleClient(MercurySyncBaseServer):
 
     async def start(self) -> None:
         """Start the client and begin listening for push notifications."""
-        init_context = {'nodes': {}}
+        init_context = {"nodes": {}}
         await self.start_server(init_context=init_context)
 
     async def stop(self) -> None:
@@ -524,4 +527,6 @@ class HyperscaleClient(MercurySyncBaseServer):
         clock_time: int,
     ) -> bytes:
         """Handle manager leader transfer notification."""
-        return await self._manager_leader_transfer_handler.handle(addr, data, clock_time)
+        return await self._manager_leader_transfer_handler.handle(
+            addr, data, clock_time
+        )
