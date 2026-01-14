@@ -3574,7 +3574,14 @@ class GateServer(HealthAwareServer):
         workflow_results: dict[str, WorkflowResultPush],
         is_test_workflow: bool,
     ) -> tuple[
-        list[WorkflowStats], list[WorkflowDCResult], str, bool, list[str], float
+        list[WorkflowStats],
+        list[WorkflowDCResult],
+        str,
+        bool,
+        list[str],
+        float,
+        int,
+        int,
     ]:
         all_workflow_stats: list[WorkflowStats] = []
         per_dc_results: list[WorkflowDCResult] = []
@@ -3582,6 +3589,8 @@ class GateServer(HealthAwareServer):
         has_failure = False
         error_messages: list[str] = []
         max_elapsed = 0.0
+        completed_datacenters = 0
+        failed_datacenters = 0
 
         for datacenter, dc_push in workflow_results.items():
             workflow_name = dc_push.workflow_name
@@ -3591,7 +3600,11 @@ class GateServer(HealthAwareServer):
                 self._build_per_dc_result(datacenter, dc_push, is_test_workflow)
             )
 
-            if dc_push.status == "FAILED":
+            status_value = dc_push.status.upper()
+            if status_value == "COMPLETED":
+                completed_datacenters += 1
+            else:
+                failed_datacenters += 1
                 has_failure = True
                 if dc_push.error:
                     error_messages.append(f"{datacenter}: {dc_push.error}")
@@ -3606,6 +3619,8 @@ class GateServer(HealthAwareServer):
             has_failure,
             error_messages,
             max_elapsed,
+            completed_datacenters,
+            failed_datacenters,
         )
 
     def _prepare_final_results(
@@ -3652,12 +3667,21 @@ class GateServer(HealthAwareServer):
             has_failure,
             error_messages,
             max_elapsed,
+            completed_datacenters,
+            failed_datacenters,
         ) = self._aggregate_workflow_results(workflow_results, is_test_workflow)
 
         if not all_workflow_stats:
             return
 
         status = "FAILED" if has_failure else "COMPLETED"
+        if (
+            self._allow_partial_workflow_results
+            and has_failure
+            and completed_datacenters > 0
+            and failed_datacenters > 0
+        ):
+            status = "PARTIAL"
         error = "; ".join(error_messages) if error_messages else None
         results_to_send = self._prepare_final_results(
             all_workflow_stats, is_test_workflow
