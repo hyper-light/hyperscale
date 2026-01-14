@@ -292,12 +292,15 @@ class GateStatsCoordinator:
                 callbacks.append(state_callback)
         return callbacks
 
-    async def _send_batch_push(
+    async def _send_batch_push_to_callbacks(
         self,
         job_id: str,
         job: GlobalJobStatus,
-        callback: tuple[str, int],
+        callbacks: list[tuple[str, int]],
     ) -> None:
+        if not callbacks:
+            return
+
         batch_push = self._build_job_batch_push(job_id, job)
         payload = batch_push.dump()
         sequence = await self._state.record_client_update(
@@ -305,14 +308,16 @@ class GateStatsCoordinator:
             "job_batch_push",
             payload,
         )
-        delivered = await self._send_periodic_push_with_retry(
-            callback,
-            "job_batch_push",
-            payload,
-            timeout=2.0,
-        )
-        if delivered:
-            await self._state.set_client_update_position(job_id, callback, sequence)
+
+        for callback in callbacks:
+            delivered = await self._send_periodic_push_with_retry(
+                callback,
+                "job_batch_push",
+                payload,
+                timeout=2.0,
+            )
+            if delivered:
+                await self._state.set_client_update_position(job_id, callback, sequence)
 
     async def send_progress_replay(self, job_id: str) -> None:
         if not self._has_job(job_id):
@@ -325,21 +330,19 @@ class GateStatsCoordinator:
         if not (job := self._get_job_status(job_id)):
             return
 
-        for callback in callbacks:
-            try:
-                await self._send_batch_push(job_id, job, callback)
-            except Exception as error:
-                await self._logger.log(
-                    ServerError(
-                        message=(
-                            "Failed to replay batch stats update for job "
-                            f"{job_id}: {error}"
-                        ),
-                        node_host=self._node_host,
-                        node_port=self._node_port,
-                        node_id=self._node_id,
-                    )
+        try:
+            await self._send_batch_push_to_callbacks(job_id, job, callbacks)
+        except Exception as error:
+            await self._logger.log(
+                ServerError(
+                    message=(
+                        f"Failed to replay batch stats update for job {job_id}: {error}"
+                    ),
+                    node_host=self._node_host,
+                    node_port=self._node_port,
+                    node_id=self._node_id,
                 )
+            )
 
     async def batch_stats_update(self) -> None:
         running_jobs = self._get_all_running_jobs()

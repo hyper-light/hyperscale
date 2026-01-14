@@ -244,6 +244,39 @@ class ManagerStateSync:
             environment_id=self._config.environment_id,
         )
 
+    def _update_registration_from_snapshot(
+        self,
+        registration: WorkerRegistration,
+        snapshot: WorkerStateSnapshot,
+        should_update_mapping: bool,
+    ) -> None:
+        registration.total_cores = snapshot.total_cores
+        registration.available_cores = snapshot.available_cores
+        registration.node.version = snapshot.version
+
+        if snapshot.host and snapshot.tcp_port > 0:
+            incoming_udp_port = snapshot.udp_port or snapshot.tcp_port
+            if (
+                registration.node.host != snapshot.host
+                or registration.node.port != snapshot.tcp_port
+                or registration.node.udp_port != incoming_udp_port
+            ):
+                if should_update_mapping:
+                    old_tcp_addr = (registration.node.host, registration.node.port)
+                    old_udp_addr = (registration.node.host, registration.node.udp_port)
+                    self._state._worker_addr_to_id.pop(old_tcp_addr, None)
+                    self._state._worker_addr_to_id.pop(old_udp_addr, None)
+
+                registration.node.host = snapshot.host
+                registration.node.port = snapshot.tcp_port
+                registration.node.udp_port = incoming_udp_port
+
+                if should_update_mapping:
+                    new_tcp_addr = (registration.node.host, registration.node.port)
+                    new_udp_addr = (registration.node.host, registration.node.udp_port)
+                    self._state._worker_addr_to_id[new_tcp_addr] = snapshot.node_id
+                    self._state._worker_addr_to_id[new_udp_addr] = snapshot.node_id
+
     def _resolve_worker_registration(
         self,
         snapshot: WorkerStateSnapshot,
