@@ -28,6 +28,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable
 
+from hyperscale.distributed.swim.core.protocols import LoggerProtocol
+
 
 # Message format: single byte type + payload
 OOB_PROBE = b"\x01"  # Health probe request
