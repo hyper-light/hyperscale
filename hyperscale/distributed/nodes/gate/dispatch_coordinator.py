@@ -135,6 +135,23 @@ class GateDispatchCoordinator:
             observed_latency_tracker
         )
 
+    def _get_observed_rtt_ms(
+        self,
+        datacenter_id: str,
+        default_rtt_ms: float,
+        min_confidence: float = 0.3,
+    ) -> float:
+        if self._observed_latency_tracker is None:
+            return default_rtt_ms
+
+        observed_ms, confidence = self._observed_latency_tracker.get_observed_latency(
+            datacenter_id
+        )
+        if confidence < min_confidence or observed_ms <= 0.0:
+            return default_rtt_ms
+
+        return observed_ms
+
     def _is_terminal_status(self, status: str) -> bool:
         return status in (
             JobStatus.COMPLETED.value,
