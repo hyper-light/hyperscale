@@ -2356,7 +2356,8 @@ class GateServer(HealthAwareServer):
                 "successful_dcs": global_result.successful_datacenters,
                 "failed_dcs": global_result.failed_datacenters,
             },
-            "aps": global_result.total_completed / max(global_result.elapsed_seconds, 1.0),
+            "aps": global_result.total_completed
+            / max(global_result.elapsed_seconds, 1.0),
             "elapsed": global_result.elapsed_seconds,
             "results": [],
         }
@@ -5242,7 +5243,10 @@ class GateServer(HealthAwareServer):
 
     async def _check_quorum_status(self) -> None:
         active_peer_count = self._modular_state.get_active_peer_count() + 1
-        known_gate_count = len(self._gate_peers) + 1
+        known_gate_count = max(
+            self._modular_state.get_known_gate_count() + 1,
+            len(self._gate_peers) + 1,
+        )
         quorum_size = known_gate_count // 2 + 1
 
         if active_peer_count < quorum_size:

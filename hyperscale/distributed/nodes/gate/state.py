@@ -673,9 +673,10 @@ class GateRuntimeState:
         return self._known_gates.get(gate_id)
 
     def get_all_known_gates(self) -> list[GateInfo]:
-        """Get all known gates."""
         return list(self._known_gates.values())
 
+    def get_known_gate_count(self) -> int:
+        return len(self._known_gates)
+
     def iter_known_gates(self):
-        """Iterate over known gates as (gate_id, gate_info) pairs."""
         return self._known_gates.items()
