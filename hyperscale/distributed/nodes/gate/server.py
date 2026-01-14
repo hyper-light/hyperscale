@@ -3595,6 +3595,250 @@ class GateServer(HealthAwareServer):
             return [all_workflow_stats[0]]
         return all_workflow_stats
 
+    def _collect_job_workflow_stats(
+        self, per_dc_results: list[JobFinalResult]
+    ) -> list[WorkflowStats]:
+        """Collect workflow stats from per-DC job results."""
+        workflow_stats: list[WorkflowStats] = []
+        for dc_result in per_dc_results:
+            for workflow_result in dc_result.workflow_results:
+                workflow_stats.extend(workflow_result.results)
+        return workflow_stats
+
+    def _collect_timing_stats(
+        self, workflow_stats: list[WorkflowStats]
+    ) -> list[dict[str, float | int]]:
+        """Collect timing statistics from workflow stats."""
+        timing_stats: list[dict[str, float | int]] = []
+        for workflow_stat in workflow_stats:
+            results = workflow_stat.get("results")
+            if not isinstance(results, list):
+                continue
+            for result_set in results:
+                if not isinstance(result_set, dict):
+                    continue
+                timings = result_set.get("timings")
+                if not isinstance(timings, dict):
+                    continue
+                for timing_stat in timings.values():
+                    if isinstance(timing_stat, dict):
+                        timing_stats.append(timing_stat)
+        return timing_stats
+
+    def _extract_timing_metric(
+        self,
+        timing_stats: dict[str, float | int],
+        keys: tuple[str, ...],
+    ) -> float | None:
+        for key in keys:
+            if isinstance((value := timing_stats.get(key)), (int, float)):
+                return float(value)
+        return None
+
+    def _median_timing_metric(
+        self,
+        timing_stats: list[dict[str, float | int]],
+        keys: tuple[str, ...],
+    ) -> float:
+        values = [
+            value
+            for timing_stat in timing_stats
+            if (value := self._extract_timing_metric(timing_stat, keys)) is not None
+        ]
+        if not values:
+            return 0.0
+        return float(statistics.median(values))
+
+    def _build_aggregated_job_stats(
+        self, per_dc_results: list[JobFinalResult]
+    ) -> AggregatedJobStats:
+        total_completed = sum(result.total_completed for result in per_dc_results)
+        total_failed = sum(result.total_failed for result in per_dc_results)
+        total_requests = total_completed + total_failed
+
+        all_workflow_stats = self._collect_job_workflow_stats(per_dc_results)
+        timing_stats = self._collect_timing_stats(all_workflow_stats)
+
+        average_latency_ms = self._median_timing_metric(
+            timing_stats,
+            ("mean", "avg", "average"),
+        )
+        p50_latency_ms = self._median_timing_metric(
+            timing_stats,
+            ("p50", "med", "median"),
+        )
+        p95_latency_ms = self._median_timing_metric(timing_stats, ("p95",))
+        p99_latency_ms = self._median_timing_metric(timing_stats, ("p99",))
+        if average_latency_ms <= 0.0 and p50_latency_ms > 0.0:
+            average_latency_ms = p50_latency_ms
+
+        overall_rate = sum(
+            float(workflow_stat["aps"])
+            for workflow_stat in all_workflow_stats
+            if isinstance(workflow_stat.get("aps"), (int, float))
+        )
+
+        return AggregatedJobStats(
+            total_requests=total_requests,
+            successful_requests=total_completed,
+            failed_requests=total_failed,
+            overall_rate=overall_rate,
+            avg_latency_ms=average_latency_ms,
+            p50_latency_ms=p50_latency_ms,
+            p95_latency_ms=p95_latency_ms,
+            p99_latency_ms=p99_latency_ms,
+        )
+
+    def _build_missing_dc_result(
+        self, job_id: str, datacenter: str, fence_token: int
+    ) -> JobFinalResult:
+        return JobFinalResult(
+            job_id=job_id,
+            datacenter=datacenter,
+            status="FAILED",
+            workflow_results=[],
+            total_completed=0,
+            total_failed=0,
+            errors=[f"Missing final result from DC {datacenter}"],
+            elapsed_seconds=0.0,
+            fence_token=fence_token,
+        )
+
+    def _build_global_job_result(
+        self,
+        job_id: str,
+        per_dc_results: dict[str, JobFinalResult],
+        target_dcs: set[str],
+    ) -> GlobalJobResult:
+        expected_dcs = target_dcs or set(per_dc_results.keys())
+        missing_dcs = expected_dcs - set(per_dc_results.keys())
+        max_fence_token = max(
+            (result.fence_token for result in per_dc_results.values()),
+            default=0,
+        )
+
+        ordered_results: list[JobFinalResult] = []
+        errors: list[str] = []
+        successful_datacenters = 0
+        failed_datacenters = 0
+        max_elapsed = 0.0
+
+        for datacenter in sorted(per_dc_results.keys()):
+            dc_result = per_dc_results[datacenter]
+            ordered_results.append(dc_result)
+
+            status_value = dc_result.status.upper()
+            if status_value == "COMPLETED":
+                successful_datacenters += 1
+            else:
+                failed_datacenters += 1
+                if dc_result.errors:
+                    errors.extend(
+                        [f"{datacenter}: {error}" for error in dc_result.errors]
+                    )
+                else:
+                    errors.append(
+                        f"{datacenter}: reported status {dc_result.status} without error details"
+                    )
+
+            if dc_result.elapsed_seconds > max_elapsed:
+                max_elapsed = dc_result.elapsed_seconds
+
+        for datacenter in sorted(missing_dcs):
+            missing_result = self._build_missing_dc_result(
+                job_id, datacenter, max_fence_token
+            )
+            ordered_results.append(missing_result)
+            failed_datacenters += 1
+            errors.append(f"{datacenter}: missing final result")
+
+        total_completed = sum(result.total_completed for result in ordered_results)
+        total_failed = sum(result.total_failed for result in ordered_results)
+
+        expected_count = len(expected_dcs)
+        reported_count = len(per_dc_results)
+        if expected_count and reported_count < expected_count:
+            status = "PARTIAL"
+        elif failed_datacenters == 0:
+            status = "COMPLETED"
+        elif successful_datacenters == 0:
+            status = "FAILED"
+        else:
+            status = "PARTIAL"
+
+        aggregated_stats = self._build_aggregated_job_stats(ordered_results)
+
+        return GlobalJobResult(
+            job_id=job_id,
+            status=status,
+            per_datacenter_results=ordered_results,
+            aggregated=aggregated_stats,
+            total_completed=total_completed,
+            total_failed=total_failed,
+            successful_datacenters=successful_datacenters,
+            failed_datacenters=failed_datacenters,
+            errors=errors,
+            elapsed_seconds=max_elapsed,
+        )
+
+    async def _record_job_final_result(
+        self, result: JobFinalResult
+    ) -> GlobalJobResult | None:
+        async with self._job_manager.lock_job(result.job_id):
+            if not self._job_manager.has_job(result.job_id):
+                return None
+
+            current_fence = self._job_manager.get_fence_token(result.job_id)
+            if result.fence_token < current_fence:
+                return None
+            if result.fence_token > current_fence:
+                self._job_manager.set_fence_token(result.job_id, result.fence_token)
+
+            self._job_manager.set_dc_result(result.job_id, result.datacenter, result)
+
+            if result.job_id in self._job_global_result_sent:
+                return None
+
+            target_dcs = set(self._job_manager.get_target_dcs(result.job_id))
+            if target_dcs and not self._job_manager.all_dcs_reported(result.job_id):
+                return None
+
+            per_dc_results = self._job_manager.get_all_dc_results(result.job_id)
+
+        return self._build_global_job_result(result.job_id, per_dc_results, target_dcs)
+
+    async def _push_global_job_result(self, result: GlobalJobResult) -> None:
+        callback = self._job_manager.get_callback(result.job_id)
+        if not callback:
+            return
+
+        try:
+            await self.send_tcp(
+                callback,
+                "global_job_result",
+                result.dump(),
+                timeout=5.0,
+            )
+            self._job_global_result_sent.add(result.job_id)
+        except Exception as send_error:
+            await self._udp_logger.log(
+                ServerWarning(
+                    message=(
+                        "Failed to send global job result to client "
+                        f"{callback}: {send_error}"
+                    ),
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+
+    async def _maybe_push_global_job_result(self, result: JobFinalResult) -> None:
+        global_result = await self._record_job_final_result(result)
+        if not global_result:
+            return
+        await self._push_global_job_result(global_result)
+
     async def _aggregate_and_forward_workflow_result(
         self,
         job_id: str,
