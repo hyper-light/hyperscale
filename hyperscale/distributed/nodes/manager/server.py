@@ -3106,30 +3106,67 @@ class ManagerServer(HealthAwareServer):
         data: bytes,
         clock_time: int,
     ) -> bytes:
-        """Handle state sync request."""
+        """Handle state sync request from peer managers or workers."""
         try:
             request = StateSyncRequest.load(data)
 
-            # Build state snapshot
+            self._task_runner.run(
+                self._logger.log,
+                ServerInfo(
+                    message=f"State sync request from {request.requester_id[:8]}... role={request.requester_role} since_version={request.since_version}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                ),
+            )
+
+            current_version = self._manager_state.state_version
+            is_ready = (
+                self._manager_state.manager_state_enum != ManagerStateEnum.INITIALIZING
+            )
+
+            if request.since_version >= current_version:
+                return StateSyncResponse(
+                    responder_id=self._node_id.full,
+                    current_version=current_version,
+                    responder_ready=is_ready,
+                ).dump()
+
             snapshot = ManagerStateSnapshot(
                 node_id=self._node_id.full,
-                state_version=self._manager_state.state_version,
-                manager_state=self._manager_state.manager_state_enum.value,
-                job_count=self._job_manager.job_count,
-                worker_count=self._manager_state.get_worker_count(),
+                datacenter=self._config.datacenter_id,
+                is_leader=self._leadership_coordinator.is_leader(),
+                term=self._leadership_coordinator._get_term(),
+                version=current_version,
+                workers=self._build_worker_snapshots(),
+                jobs=dict(self._manager_state._job_progress),
+                job_leaders=dict(self._manager_state._job_leaders),
+                job_leader_addrs=dict(self._manager_state._job_leader_addrs),
+                job_layer_versions=dict(self._manager_state._job_layer_versions),
+                job_contexts=self._serialize_job_contexts(),
             )
 
             return StateSyncResponse(
                 responder_id=self._node_id.full,
-                version=self._manager_state.state_version,
-                snapshot=snapshot.dump(),
+                current_version=current_version,
+                responder_ready=is_ready,
+                manager_state=snapshot,
             ).dump()
 
         except Exception as error:
+            self._task_runner.run(
+                self._logger.log,
+                ServerWarning(
+                    message=f"State sync request failed: {error}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                ),
+            )
             return StateSyncResponse(
                 responder_id=self._node_id.full,
-                version=0,
-                error=str(error),
+                current_version=0,
+                responder_ready=False,
             ).dump()
 
     @tcp.receive()
