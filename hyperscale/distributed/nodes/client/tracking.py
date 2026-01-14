@@ -207,8 +207,15 @@ class ClientJobTracker:
                 if event:
                     event.set()
 
-        except Exception:
-            pass
+        except Exception as poll_error:
+            await self._logger.log(
+                ServerDebug(
+                    message=f"Status poll failed for job {job_id[:8]}...: {poll_error}",
+                    node_host="client",
+                    node_port=0,
+                    node_id="tracker",
+                )
+            )
 
     def get_job_status(self, job_id: str) -> ClientJobResult | None:
         """
