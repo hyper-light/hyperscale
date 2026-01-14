@@ -38,6 +38,10 @@ class GateStatsCoordinator:
     - Push windowed stats to clients
     """
 
+    FINAL_STATUS_MAX_RETRIES: int = 3
+    FINAL_STATUS_BASE_DELAY_SECONDS: float = 0.1
+    FINAL_STATUS_MAX_DELAY_SECONDS: float = 1.0
+
     def __init__(
         self,
         state: "GateRuntimeState",
@@ -48,6 +52,7 @@ class GateStatsCoordinator:
         get_job_status: Callable[[str], GlobalJobStatus | None],
         get_all_running_jobs: Callable[[], list[tuple[str, GlobalJobStatus]]],
         send_tcp: Callable,
+        forward_status_push_to_peers: ForwardStatusPushFunc | None = None,
     ) -> None:
         self._state: "GateRuntimeState" = state
         self._logger: "Logger" = logger
@@ -61,6 +66,9 @@ class GateStatsCoordinator:
             get_all_running_jobs
         )
         self._send_tcp: Callable = send_tcp
+        self._forward_status_push_to_peers: ForwardStatusPushFunc | None = (
+            forward_status_push_to_peers
+        )
 
     def classify_update_tier(
         self,
