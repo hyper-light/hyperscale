@@ -4049,7 +4049,7 @@ class GateServer(HealthAwareServer):
         return JobFinalResult(
             job_id=job_id,
             datacenter=datacenter,
-            status="FAILED",
+            status=JobStatus.TIMEOUT.value,
             workflow_results=[],
             total_completed=0,
             total_failed=0,
