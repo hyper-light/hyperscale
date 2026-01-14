@@ -237,8 +237,20 @@ class WorkerCancellationHandler:
                             if response.status == "CANCELLED":
                                 workflows_to_cancel.append(workflow_id)
 
-                    except Exception:
-                        pass
+                    except Exception as poll_error:
+                        if self._logger:
+                            task_runner_run(
+                                self._logger.log,
+                                ServerDebug(
+                                    message=(
+                                        f"Cancellation poll failed for workflow {workflow_id} "
+                                        f"via manager {manager_addr[0]}:{manager_addr[1]}: {poll_error}"
+                                    ),
+                                    node_host=node_host,
+                                    node_port=node_port,
+                                    node_id=node_id_short,
+                                ),
+                            )
 
                 # Signal cancellation for workflows manager says are cancelled
                 for workflow_id in workflows_to_cancel:
