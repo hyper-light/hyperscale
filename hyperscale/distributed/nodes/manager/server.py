@@ -3155,7 +3155,7 @@ class ManagerServer(HealthAwareServer):
 
         except Exception as error:
             self._task_runner.run(
-                self._logger.log,
+                self._udp_logger.log,
                 ServerWarning(
                     message=f"State sync request failed: {error}",
                     node_host=self._host,
