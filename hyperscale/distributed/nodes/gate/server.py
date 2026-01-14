@@ -3050,6 +3050,7 @@ class GateServer(HealthAwareServer):
         self._progress_callbacks.pop(job_id, None)
         self._job_leadership_tracker.release_leadership(job_id)
         self._job_dc_managers.pop(job_id, None)
+        self._job_submissions.pop(job_id, None)
 
         reporter_tasks = self._job_reporter_tasks.pop(job_id, None)
         self._cancel_reporter_tasks(reporter_tasks)
@@ -3058,6 +3059,8 @@ class GateServer(HealthAwareServer):
 
         state_reporter_tasks = self._modular_state.pop_job_reporter_tasks(job_id)
         self._cancel_reporter_tasks(state_reporter_tasks)
+
+        self._task_runner.run(self._windowed_stats.cleanup_job_windows, job_id)
 
         if self._job_router:
             self._job_router.cleanup_job_state(job_id)
