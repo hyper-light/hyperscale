@@ -2310,7 +2310,94 @@ class GateServer(HealthAwareServer):
                 None,
             )
 
+            self._task_runner.run(
+                self._dispatch_to_reporters,
+                job_id,
+                global_result,
+            )
+
         return True
+
+    async def _dispatch_to_reporters(
+        self,
+        job_id: str,
+        global_result: GlobalJobResult,
+    ) -> None:
+        """
+        Dispatch job results to configured reporters (Task 38).
+
+        Creates reporter tasks for each configured reporter type
+        and submits the results.
+        """
+        submission = self._job_submissions.get(
+            job_id
+        ) or self._modular_state._job_submissions.get(job_id)
+        if not submission or not submission.reporting_configs:
+            return
+
+        try:
+            reporter_configs = cloudpickle.loads(submission.reporting_configs)
+        except Exception as config_error:
+            await self._udp_logger.log(
+                ServerWarning(
+                    message=f"Failed to load reporter configs for job {job_id[:8]}...: {config_error}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            return
+
+        workflow_stats: WorkflowStats = {
+            "workflow": job_id,
+            "stats": {
+                "total_completed": global_result.total_completed,
+                "total_failed": global_result.total_failed,
+                "successful_dcs": global_result.successful_datacenters,
+                "failed_dcs": global_result.failed_datacenters,
+            },
+            "aps": global_result.total_completed / max(global_result.elapsed_seconds, 1.0),
+            "elapsed": global_result.elapsed_seconds,
+            "results": [],
+        }
+
+        for reporter_config in reporter_configs:
+            reporter_type = getattr(reporter_config, "reporter_type", None)
+            reporter_type_name = reporter_type.name if reporter_type else "unknown"
+
+            async def submit_to_reporter(
+                config: object,
+                stats: WorkflowStats,
+                r_type: str,
+            ) -> None:
+                try:
+                    reporter = Reporter(config)
+                    await reporter.connect()
+                    await reporter.submit_workflow_results(stats)
+                    await self._udp_logger.log(
+                        ServerDebug(
+                            message=f"Submitted results for job {job_id[:8]}... to {r_type}",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
+                except Exception as submit_error:
+                    await self._udp_logger.log(
+                        ServerWarning(
+                            message=f"Failed to submit results for job {job_id[:8]}... to {r_type}: {submit_error}",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
+
+            self._task_runner.run(
+                submit_to_reporter,
+                reporter_config,
+                workflow_stats,
+                reporter_type_name,
+            )
 
     async def handle_global_timeout(
         self,
