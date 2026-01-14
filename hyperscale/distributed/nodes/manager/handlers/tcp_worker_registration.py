@@ -21,6 +21,7 @@ if TYPE_CHECKING:
     import asyncio
     from hyperscale.distributed.nodes.manager.state import ManagerState
     from hyperscale.distributed.nodes.manager.config import ManagerConfig
+    from hyperscale.distributed.taskex import TaskRunner
     from hyperscale.logging import Logger
 
 
@@ -39,14 +40,14 @@ class WorkerRegistrationHandler:
         logger: "Logger",
         role_validator: RoleValidator,
         node_id: str,
-        task_runner,
+        task_runner: "TaskRunner",
     ) -> None:
-        self._state = state
-        self._config = config
-        self._logger = logger
-        self._role_validator = role_validator
-        self._node_id = node_id
-        self._task_runner = task_runner
+        self._state: "ManagerState" = state
+        self._config: "ManagerConfig" = config
+        self._logger: "Logger" = logger
+        self._role_validator: RoleValidator = role_validator
+        self._node_id: str = node_id
+        self._task_runner: "TaskRunner" = task_runner
 
     async def handle(
         self,
@@ -79,7 +80,7 @@ class WorkerRegistrationHandler:
                         node_host=self._config.host,
                         node_port=self._config.tcp_port,
                         node_id=self._node_id,
-                    )
+                    ),
                 )
                 return RegistrationResponse(
                     accepted=False,
@@ -98,7 +99,7 @@ class WorkerRegistrationHandler:
                         node_host=self._config.host,
                         node_port=self._config.tcp_port,
                         node_id=self._node_id,
-                    )
+                    ),
                 )
                 return RegistrationResponse(
                     accepted=False,
@@ -127,7 +128,7 @@ class WorkerRegistrationHandler:
                             node_host=self._config.host,
                             node_port=self._config.tcp_port,
                             node_id=self._node_id,
-                        )
+                        ),
                     )
                     return RegistrationResponse(
                         accepted=False,
@@ -146,7 +147,7 @@ class WorkerRegistrationHandler:
                         node_host=self._config.host,
                         node_port=self._config.tcp_port,
                         node_id=self._node_id,
-                    )
+                    ),
                 )
                 return RegistrationResponse(
                     accepted=False,
@@ -172,7 +173,7 @@ class WorkerRegistrationHandler:
                     node_host=self._config.host,
                     node_port=self._config.tcp_port,
                     node_id=self._node_id,
-                )
+                ),
             )
 
             return RegistrationResponse(
