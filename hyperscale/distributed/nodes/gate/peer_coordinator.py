@@ -283,12 +283,15 @@ class GatePeerCoordinator:
             ),
         )
 
-    async def cleanup_dead_peer(self, peer_addr: tuple[str, int]) -> None:
+    async def cleanup_dead_peer(self, peer_addr: tuple[str, int]) -> set[str]:
         """
         Clean up tracking for a reaped peer gate.
 
         Args:
             peer_addr: TCP address of the dead peer
+
+        Returns:
+            Set of gate IDs removed from runtime state.
         """
         udp_addr: tuple[str, int] | None = None
         peer_heartbeat: GateHeartbeat | None = None
@@ -314,6 +317,8 @@ class GatePeerCoordinator:
         await self._job_hash_ring.remove_node(gate_id)
         self._job_forwarding_tracker.unregister_peer(gate_id)
 
+        gate_ids_to_remove = self._state.cleanup_dead_peer(peer_addr)
+
         self._task_runner.run(
             self._logger.log,
             ServerDebug(
@@ -326,6 +331,8 @@ class GatePeerCoordinator:
                 node_id=self._get_node_id().short,
             ),
         )
+
+        return gate_ids_to_remove
 
     async def handle_gate_heartbeat(
         self,
