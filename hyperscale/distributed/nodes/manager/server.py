@@ -1537,6 +1537,65 @@ class ManagerServer(HealthAwareServer):
                     )
                 )
 
+    async def _windowed_stats_flush_loop(self) -> None:
+        """Flush closed windowed stats and push to gates."""
+        flush_interval = self._config.stats_push_interval_ms / 1000.0
+
+        while self._running:
+            try:
+                await asyncio.sleep(flush_interval)
+                if not self._running:
+                    break
+                await self._flush_windowed_stats()
+            except asyncio.CancelledError:
+                break
+            except Exception as error:
+                await self._udp_logger.log(
+                    ServerError(
+                        message=f"Windowed stats flush error: {error}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+
+    async def _flush_windowed_stats(self) -> None:
+        windowed_stats = await self._windowed_stats.flush_closed_windows(
+            aggregate=False
+        )
+        if not windowed_stats:
+            return
+
+        for stats_push in windowed_stats:
+            await self._push_windowed_stats_to_gate(stats_push)
+
+    async def _push_windowed_stats_to_gate(
+        self,
+        stats_push: WindowedStatsPush,
+    ) -> None:
+        origin_gate_addr = self._manager_state.get_job_origin_gate(stats_push.job_id)
+        if not origin_gate_addr:
+            return
+
+        stats_push.datacenter = self._node_id.datacenter
+
+        try:
+            await self._send_to_peer(
+                origin_gate_addr,
+                "windowed_stats_push",
+                stats_push.dump(),
+                timeout=self._config.tcp_timeout_short_seconds,
+            )
+        except Exception as error:
+            await self._udp_logger.log(
+                ServerWarning(
+                    message=f"Failed to send windowed stats to gate: {error}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+
     async def _gate_heartbeat_loop(self) -> None:
         """
         Periodically send ManagerHeartbeat to gates via TCP.
