@@ -256,7 +256,8 @@ class GateJobHandler:
         submission: JobSubmission | None = None
         idempotency_key: IdempotencyKey | None = None
         lease_acquired = False
-        lease_duration: float | None = None
+        lease_duration: float = 0.0
+        fence_token: int = 0
 
         try:
             client_id = f"{addr[0]}:{addr[1]}"
