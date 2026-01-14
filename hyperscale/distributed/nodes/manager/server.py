@@ -467,6 +467,7 @@ class ManagerServer(HealthAwareServer):
             probe_timeout=fed_config["probe_timeout"],
             suspicion_timeout=fed_config["suspicion_timeout"],
             max_consecutive_failures=fed_config["max_consecutive_failures"],
+            on_probe_error=self._on_federated_probe_error,
         )
 
         # Gate circuit breaker
@@ -1031,6 +1032,22 @@ class ManagerServer(HealthAwareServer):
             self._handle_worker_dead_for_job_reassignment,
             job_id,
             worker_id,
+        )
+
+    def _on_federated_probe_error(
+        self,
+        error_message: str,
+        affected_datacenters: list[str],
+    ) -> None:
+        self._task_runner.run(
+            self._udp_logger.log,
+            ServerWarning(
+                message=f"Federated health probe error: {error_message} "
+                f"(DCs: {affected_datacenters})",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            ),
         )
 
     async def _handle_worker_dead_for_job_reassignment(
