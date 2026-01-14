@@ -86,6 +86,13 @@ class GateRuntimeState:
         self._job_reporter_tasks: dict[str, dict[str, asyncio.Task]] = {}
         self._job_lease_renewal_tokens: dict[str, str] = {}
 
+        # JobProgress sequence tracking for ordering/dedup (Task 31)
+        # Key: (job_id, datacenter_id) -> last_seen_sequence
+        self._job_progress_sequences: dict[tuple[str, str], int] = {}
+        # Key: (job_id, datacenter_id) -> set of seen (fence_token, timestamp) pairs for dedup
+        self._job_progress_seen: dict[tuple[str, str], set[tuple[int, float]]] = {}
+        self._job_progress_lock: asyncio.Lock | None = None
+
         # Cancellation state
         self._cancellation_completion_events: dict[str, asyncio.Event] = {}
         self._cancellation_errors: dict[str, list[str]] = defaultdict(list)
@@ -124,6 +131,7 @@ class GateRuntimeState:
         self._lock_creation_lock = asyncio.Lock()
         self._manager_state_lock = asyncio.Lock()
         self._backpressure_lock = asyncio.Lock()
+        self._job_progress_lock = asyncio.Lock()
 
     def _get_counter_lock(self) -> asyncio.Lock:
         if self._counter_lock is None:
