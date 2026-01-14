@@ -344,6 +344,7 @@ class GateJobHandler:
             target_dcs = primary_dcs
 
             if not target_dcs:
+                await self._release_job_lease(submission.job_id)
                 return JobAck(
                     job_id=submission.job_id,
                     accepted=False,
@@ -358,6 +359,11 @@ class GateJobHandler:
             )
             self._job_manager.set_job(submission.job_id, job)
             self._job_manager.set_target_dcs(submission.job_id, set(target_dcs))
+            if lease_result.lease is not None:
+                self._job_manager.set_fence_token(
+                    submission.job_id,
+                    lease_result.lease.fence_token,
+                )
 
             try:
                 workflows: list[tuple[str, list[str], object]] = cloudpickle.loads(
