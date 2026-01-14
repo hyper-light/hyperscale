@@ -297,7 +297,12 @@ class JobSuspicionManager:
 
         except asyncio.CancelledError:
             # Normal cancellation (refutation or cleanup)
-            pass
+            import sys
+
+            print(
+                f"[JobSuspicionManager] suspicion timer cancelled for {suspicion.job_id}, node {suspicion.node}",
+                file=sys.stderr,
+            )
 
     async def _handle_expiration(self, suspicion: JobSuspicion) -> None:
         """Handle suspicion expiration - declare node dead for this job."""
