@@ -956,12 +956,6 @@ class GateServer(HealthAwareServer):
         # Start timeout tracker (AD-34)
         await self._job_timeout_tracker.start()
 
-        # Initialize job router (AD-36)
-        self._job_router = GateJobRouter(
-            coordinate_tracker=self._coordinate_tracker,
-            get_datacenter_candidates=self._build_datacenter_candidates,
-        )
-
         self._idempotency_cache = GateIdempotencyCache(
             config=self._idempotency_config,
             task_runner=self._task_runner,
