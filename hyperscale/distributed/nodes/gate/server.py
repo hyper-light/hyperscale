@@ -1619,7 +1619,6 @@ class GateServer(HealthAwareServer):
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
-        transport: asyncio.Transport,
     ):
         """Handle job leadership manager transfer notification from manager (AD-31)."""
         try:
@@ -1717,7 +1716,6 @@ class GateServer(HealthAwareServer):
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
-        transport: asyncio.Transport,
     ):
         """Handle windowed stats push from Manager."""
         try:
