@@ -23,7 +23,7 @@ This file lists **current verified issues only**. All items below were confirmed
 
 | File | Lines | Issue |
 |------|-------|-------|
-| `distributed/discovery/security/role_validator.py` | 332-415 | Certificate parse failures return default claims instead of rejecting |
+| `distributed/discovery/security/role_validator.py` | 332-421 | Certificate parse failures return default claims instead of rejecting |
 
 **Why this matters:** Scenario 41.23 requires cluster/env mismatch rejection and role validation. On parse failures, defaults are returned (cluster/env/role), which can allow invalid identities to pass role checks.
 
