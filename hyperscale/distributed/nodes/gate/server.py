@@ -426,6 +426,7 @@ class GateServer(HealthAwareServer):
         self._orphan_grace_period: float = env.GATE_ORPHAN_GRACE_PERIOD
         self._orphan_check_interval: float = env.GATE_ORPHAN_CHECK_INTERVAL
         self._orphan_check_task: asyncio.Task | None = None
+        self._resource_sampling_token: str | None = None
 
         self._dead_peer_reap_interval: float = env.GATE_DEAD_PEER_REAP_INTERVAL
         self._dead_peer_check_interval: float = env.GATE_DEAD_PEER_CHECK_INTERVAL
