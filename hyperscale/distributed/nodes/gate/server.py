@@ -140,7 +140,7 @@ from hyperscale.distributed.jobs import (
     WindowedStatsPush,
     JobLeadershipTracker,
 )
-from hyperscale.distributed.ledger import JobLedger
+
 from hyperscale.distributed.idempotency import (
     GateIdempotencyCache,
     create_idempotency_config_from_env,
@@ -161,7 +161,6 @@ from hyperscale.distributed.discovery.security.role_validator import (
     RoleValidator,
 )
 from hyperscale.distributed.routing import (
-    GateJobRouter,
     DatacenterCandidate,
     DispatchTimeTracker,
     ObservedLatencyTracker,
