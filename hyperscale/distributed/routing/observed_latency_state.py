@@ -8,10 +8,16 @@ from dataclasses import dataclass
 from time import monotonic
 
 
+import statistics
+from collections import deque
+from typing import Deque
+
+
 @dataclass(slots=True)
 class ObservedLatencyState:
     """
     Tracks observed job completion latency per datacenter using EWMA.
+    Includes percentile tracking and jitter detection (Task 61).
     """
 
     datacenter_id: str
@@ -19,6 +25,22 @@ class ObservedLatencyState:
     sample_count: int = 0
     last_update: float = 0.0
     ewma_variance: float = 0.0
+
+    # Percentile tracking (Task 61)
+    # We keep a sliding window of recent samples for percentile calculation
+    _recent_samples: Deque[float] | None = None
+    _max_samples: int = 100
+    p50_ms: float = 0.0
+    p95_ms: float = 0.0
+    p99_ms: float = 0.0
+
+    # Jitter tracking (Task 61)
+    jitter_ms: float = 0.0  # Running jitter (mean absolute deviation)
+    _last_latency_ms: float = 0.0
+
+    def __post_init__(self) -> None:
+        if self._recent_samples is None:
+            object.__setattr__(self, "_recent_samples", deque(maxlen=self._max_samples))
 
     def record_latency(
         self,
