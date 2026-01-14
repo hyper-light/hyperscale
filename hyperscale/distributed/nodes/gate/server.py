@@ -2793,6 +2793,23 @@ class GateServer(HealthAwareServer):
             peer_id, peer_coordinate, rtt_ms
         )
 
+    def _get_datacenter_candidates_for_router(self) -> list[DatacenterCandidate]:
+        datacenter_ids = list(self._datacenter_managers.keys())
+        candidates = self._health_coordinator.build_datacenter_candidates(
+            datacenter_ids
+        )
+
+        for candidate in candidates:
+            predicted_rtt = candidate.rtt_ucb_ms
+            blended = self._blended_scorer.get_latency_for_scoring(
+                datacenter_id=candidate.datacenter_id,
+                predicted_rtt_ms=predicted_rtt,
+                use_blending=True,
+            )
+            candidate.rtt_ucb_ms = blended
+
+        return candidates
+
     async def _handle_gate_peer_failure(
         self,
         udp_addr: tuple[str, int],
