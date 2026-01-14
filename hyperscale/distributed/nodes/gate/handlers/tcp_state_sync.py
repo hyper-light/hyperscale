@@ -244,6 +244,67 @@ class GateStateSyncHandler:
                 new_fence_token=0,
             ).dump()
 
+    async def _forward_job_final_result_to_leader(
+        self,
+        job_id: str,
+        leader_addr: tuple[str, int],
+        data: bytes,
+    ) -> bool:
+        if await self._peer_circuit_breaker.is_circuit_open(leader_addr):
+            await self._logger.log(
+                ServerWarning(
+                    message=(
+                        f"Circuit open for leader gate {leader_addr}, "
+                        f"cannot forward final result for {job_id[:8]}..."
+                    ),
+                    node_host=self._get_host(),
+                    node_port=self._get_tcp_port(),
+                    node_id=self._get_node_id().short,
+                )
+            )
+            return False
+
+        retry_config = RetryConfig(
+            max_attempts=3,
+            base_delay=0.5,
+            max_delay=3.0,
+            jitter=JitterStrategy.FULL,
+            retryable_exceptions=(ConnectionError, TimeoutError, OSError, RuntimeError),
+        )
+        retry_executor = RetryExecutor(retry_config)
+        circuit = await self._peer_circuit_breaker.get_circuit(leader_addr)
+
+        async def send_result() -> None:
+            response, _ = await self._send_tcp(
+                leader_addr,
+                "job_final_result",
+                data,
+                timeout=3.0,
+            )
+            if response not in (b"ok", b"forwarded"):
+                raise RuntimeError(
+                    f"Unexpected response from leader gate {leader_addr}: {response}"
+                )
+
+        try:
+            await retry_executor.run(send_result)
+            circuit.record_success()
+            return True
+        except Exception as error:
+            circuit.record_failure()
+            await self._logger.log(
+                ServerWarning(
+                    message=(
+                        f"Failed to forward final result for job {job_id[:8]}... "
+                        f"to leader gate {leader_addr}: {error}"
+                    ),
+                    node_host=self._get_host(),
+                    node_port=self._get_tcp_port(),
+                    node_id=self._get_node_id().short,
+                )
+            )
+            return False
+
     async def handle_job_final_result(
         self,
         addr: tuple[str, int],

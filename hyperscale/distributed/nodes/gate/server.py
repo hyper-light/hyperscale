@@ -2720,6 +2720,38 @@ class GateServer(HealthAwareServer):
 
         return UpdateTier.PERIODIC.value
 
+    async def _replay_job_status_to_callback(self, job_id: str) -> None:
+        if not self._stats_coordinator:
+            return
+
+        try:
+            await self._stats_coordinator.send_immediate_update(
+                job_id,
+                "reconnect",
+                None,
+            )
+            await self._stats_coordinator.send_progress_replay(job_id)
+            await self._stats_coordinator.push_windowed_stats_for_job(job_id)
+            await self._replay_pending_workflow_results(job_id)
+        except Exception as error:
+            await self.handle_exception(error, "replay_job_status_to_callback")
+
+    async def _replay_pending_workflow_results(self, job_id: str) -> None:
+        async with self._workflow_dc_results_lock:
+            workflow_results = self._workflow_dc_results.get(job_id, {})
+            results_snapshot = {
+                workflow_id: dict(dc_results)
+                for workflow_id, dc_results in workflow_results.items()
+            }
+
+        for workflow_id, dc_results in results_snapshot.items():
+            if dc_results:
+                await self._forward_aggregated_workflow_result(
+                    job_id,
+                    workflow_id,
+                    dc_results,
+                )
+
     async def _send_immediate_update(
         self,
         job_id: str,
