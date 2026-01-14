@@ -263,18 +263,18 @@ This document catalogs all identified issues across the distributed node impleme
   - `handle_job_leadership_notification` → wired at gate server line 1366
 - Either the method was already removed or the original scan had an error
 
-### 3.7 Manager Leadership Loss Handler Is Stubbed
+### 3.7 Manager Leadership Loss Handler Is Stubbed ✅ FIXED
 
-| File | Lines | Issue |
-|------|-------|-------|
-| `distributed/nodes/manager/server.py` | 990-992 | `_on_manager_lose_leadership()` is `pass` |
+| File | Lines | Issue | Status |
+|------|-------|-------|--------|
+| `distributed/nodes/manager/server.py` | 990-1016 | `_on_manager_lose_leadership()` was `pass` | ✅ Fixed |
 
-**Why this matters:** When a manager loses leadership, leader-only sync and reconciliation tasks keep running. This can cause conflicting state updates and violate scenario 15.3 (quorum recovery) and 33.2 (manager split).
-
-**Fix (actionable):**
-- Stop leader-only background tasks started in `_on_manager_become_leader()` (state sync, orphan scan, timeout resume).
-- Clear leader-only flags or demote manager state to follower.
-- Emit a leadership change log entry so the transition is observable.
+**Fix implemented:**
+- Added `_handle_leadership_loss()` async method to properly handle demotion
+- Logs leadership loss event for observability
+- Stops timeout tracking for all led jobs via `strategy.stop_tracking(job_id, "leadership_lost")`
+- Individual stop failures are logged but don't prevent other jobs from being stopped
+- One-shot sync tasks (`_sync_state_from_workers`, `_sync_state_from_manager_peers`, etc.) don't need stopping - they complete naturally
 
 ### 3.8 Background Loops Swallow Exceptions Without Logging
 
