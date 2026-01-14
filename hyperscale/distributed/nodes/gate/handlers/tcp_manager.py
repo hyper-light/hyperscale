@@ -16,6 +16,7 @@ from hyperscale.distributed.models import (
     ManagerDiscoveryBroadcast,
     ManagerHeartbeat,
     ManagerRegistrationResponse,
+    ReporterResultPush,
 )
 from hyperscale.distributed.protocol.version import (
     CURRENT_PROTOCOL_VERSION,
