@@ -355,6 +355,48 @@ class StatsBuffer:
 
         self._archive_dirty = False
 
+    def export_checkpoint(self) -> list[tuple[float, float]]:
+        """
+        Export pending stats as a checkpoint for recovery (Task 33).
+
+        Returns a list of (timestamp, value) tuples from the HOT tier.
+        WARM and COLD tiers are aggregated and less critical for recovery.
+        """
+        return [(entry.timestamp, entry.value) for entry in self._hot]
+
+    def import_checkpoint(self, checkpoint: list[tuple[float, float]]) -> int:
+        """
+        Import stats from a checkpoint during recovery (Task 33).
+
+        Only imports entries that are newer than our current oldest entry
+        to avoid duplicating data.
+
+        Args:
+            checkpoint: List of (timestamp, value) tuples
+
+        Returns:
+            Number of entries imported
+        """
+        if not checkpoint:
+            return 0
+
+        oldest_timestamp = float("inf")
+        if self._hot:
+            oldest_timestamp = self._hot[0].timestamp
+
+        imported = 0
+        for timestamp, value in checkpoint:
+            if timestamp >= oldest_timestamp:
+                continue
+            entry = StatsEntry(timestamp=timestamp, value=value)
+            self._hot.appendleft(entry)
+            imported += 1
+
+        if imported > 0:
+            self._archive_dirty = True
+
+        return imported
+
 
 @dataclass(slots=True)
 class BackpressureSignal:
