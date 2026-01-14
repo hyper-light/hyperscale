@@ -1492,6 +1492,7 @@ class GlobalJobStatus(Message):
     resolution_details: str = ""
     timestamp: float = 0.0  # Monotonic time when job was submitted
     fence_token: int = 0
+    progress_percentage: float = 0.0  # Progress as percentage (0.0-100.0)
 
 
 @dataclass(slots=True)
