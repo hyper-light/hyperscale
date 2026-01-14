@@ -833,6 +833,8 @@ class GateServer(HealthAwareServer):
             job_manager=self._job_manager,
             job_leadership_tracker=self._job_leadership_tracker,
             versioned_clock=self._versioned_clock,
+            peer_circuit_breaker=self._peer_gate_circuit_breaker,
+            send_tcp=self._send_tcp,
             get_node_id=lambda: self._node_id,
             get_host=lambda: self._host,
             get_tcp_port=lambda: self._tcp_port,

@@ -181,6 +181,12 @@ class ManagerState:
             self._resource_creation_lock = asyncio.Lock()
         return self._resource_creation_lock
 
+    async def get_peer_manager_health_lock(self) -> asyncio.Lock:
+        async with self._get_resource_creation_lock():
+            if self._peer_manager_health_lock is None:
+                self._peer_manager_health_lock = asyncio.Lock()
+            return self._peer_manager_health_lock
+
     async def get_peer_state_lock(self, peer_addr: tuple[str, int]) -> asyncio.Lock:
         async with self._get_resource_creation_lock():
             if peer_addr not in self._peer_state_locks:
