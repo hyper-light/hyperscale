@@ -11,50 +11,43 @@ This document contains **current** findings only. Previously fixed items are lis
 
 | Severity | Count | Status |
 |----------|-------|--------|
-| **High Priority** | 1 | 🔴 Needs Fix (blocked - requires architectural wiring) |
-| **Medium Priority** | 1 | 🟡 Needs Fix (blocked - requires architectural wiring) |
+| **High Priority** | 0 | 🟢 All Fixed or N/A |
+| **Medium Priority** | 0 | 🟢 All Fixed |
 | **Low Priority** | 0 | 🟢 All Fixed |
 
 ---
 
-## 1. Blocked Issues (Require Architectural Wiring)
+## 1. Not Applicable Issues
 
-### 1.1 Job Routing State Cleanup Missing - BLOCKED
+### 1.1 Job Routing State Cleanup - N/A
 
 | File | Lines | Issue |
 |------|-------|-------|
-| `distributed/nodes/gate/server.py` | 4918-4950 | `_cleanup_single_job` never calls job router cleanup |
 | `distributed/routing/gate_job_router.py` | 334-336 | `cleanup_job_state()` exists but is unused |
 
-**Why this matters:** Per-job routing state accumulates indefinitely, violating cleanup requirements and SCENARIOS 1.2/1.4.
+**Status:** Not Applicable
 
-**Why blocked:** `GateJobRouter` is defined but never instantiated in `GateServer`. Requires:
-1. Add `_job_router: GateJobRouter` field to server
-2. Initialize in `__init__`
-3. Wire up routing calls
-4. Then call `self._job_router.cleanup_job_state(job_id)` in `_cleanup_single_job`
+**Why N/A:** `GateJobRouter` is a complete routing system (AD-36) that was designed but **never integrated** into `GateServer`. Since the router is not instantiated, there is no routing state being tracked and therefore nothing to clean up. The cleanup call would be needed only if/when `GateJobRouter` is integrated.
 
-### 1.2 Spillover Evaluation Uses Hardcoded RTT Values - BLOCKED
-
-| File | Lines | Issue |
-|------|-------|-------|
-| `distributed/nodes/gate/dispatch_coordinator.py` | 612-619 | `primary_rtt_ms=10.0` and `rtt_ms=50.0` hardcoded |
-
-**Why this matters:** Spillover decisions are made using fixed RTTs instead of measured latency, skewing routing decisions (SCENARIOS 6.2).
-
-**Why blocked:** `GateDispatchCoordinator` doesn't have access to latency/coordinate trackers. Requires:
-1. Add latency tracker parameter to coordinator `__init__`
-2. Wire tracker from server to coordinator
-3. Replace hardcoded values with measured RTTs
+**Future work:** If `GateJobRouter` is integrated, add `self._job_router.cleanup_job_state(job_id)` to `_cleanup_single_job`.
 
 ---
 
 ## 2. Completed Fixes (This Session)
 
-### 2.1 Dispatch Time Tracker Remove Job - FIXED
+### 2.1 Spillover Evaluation Hardcoded RTT - FIXED
+- **File**: `distributed/nodes/gate/dispatch_coordinator.py`
+- **Fix**: Added `observed_latency_tracker` parameter and `_get_observed_rtt_ms()` helper method
+- **Changes**:
+  - Added `ObservedLatencyTracker` import and parameter to `__init__`
+  - Created `_get_observed_rtt_ms(datacenter_id, default_rtt_ms, min_confidence=0.3)` method
+  - Replaced hardcoded `rtt_ms = 50.0` with tracker lookup (fallback to 50.0)
+  - Replaced hardcoded `primary_rtt_ms=10.0` with tracker lookup (fallback to 10.0)
+  - Wired `observed_latency_tracker` from `GateServer` to coordinator
+
+### 2.2 Dispatch Time Tracker Remove Job - FIXED
 - **File**: `distributed/nodes/gate/server.py`
 - **Fix**: Added `await self._dispatch_time_tracker.remove_job(job_id)` to `_cleanup_single_job`
-- **Lines**: After line 4949
 
 ---
 
@@ -63,16 +56,16 @@ This document contains **current** findings only. Previously fixed items are lis
 The following issues were already fixed in the codebase:
 
 ### High Priority
-- **1.1 Job Final Result Forwarding**: Uses `_record_and_send_client_update` with retry support (lines 2106-2114)
+- **Job Final Result Forwarding**: Uses `_record_and_send_client_update` with retry support (lines 2106-2114)
 
 ### Medium Priority
-- **2.1 Worker Discovery Maintenance Loop**: Logs exceptions with context (lines 71-87)
-- **2.2 Worker Cancellation Poll Loop**: Logs per-workflow and outer loop exceptions (lines 240-253, 276-286)
-- **2.3 Client Job Status Polling**: Logs poll exceptions with job_id (lines 210-218)
-- **2.4 Windowed Stats Missing Callback**: Logs and calls cleanup (lines 438-448)
+- **Worker Discovery Maintenance Loop**: Logs exceptions with context (lines 71-87)
+- **Worker Cancellation Poll Loop**: Logs per-workflow and outer loop exceptions (lines 240-253, 276-286)
+- **Client Job Status Polling**: Logs poll exceptions with job_id (lines 210-218)
+- **Windowed Stats Missing Callback**: Logs and calls cleanup (lines 438-448)
 
 ### Low Priority
-- **3.1 Cancellation Response Parse Fallback**: Logs parse failure before fallback (lines 2515-2526)
+- **Cancellation Response Parse Fallback**: Logs parse failure before fallback (lines 2515-2526)
 
 ---
 
