@@ -54,81 +54,88 @@ def _select_nodes(
     runtime: ScenarioRuntime, role: str, dc_id: str | None
 ) -> list[object]:
     cluster = runtime.require_cluster()
-    if role == "gate":
-        return list(cluster.gates)
-    if role == "manager":
-        if dc_id:
-            return list(cluster.managers.get(dc_id, []))
-        nodes: list[object] = []
-        for managers in cluster.managers.values():
-            nodes.extend(managers)
-        return nodes
-    if role == "worker":
-        if dc_id:
-            return list(cluster.workers.get(dc_id, []))
-        nodes = []
-        for workers in cluster.workers.values():
-            nodes.extend(workers)
-        return nodes
-    raise ValueError(f"Unknown role '{role}'")
+    match role:
+        case "gate":
+            return list(cluster.gates)
+        case "manager":
+            if dc_id:
+                return list(cluster.managers.get(dc_id, []))
+            nodes: list[object] = []
+            for managers in cluster.managers.values():
+                nodes.extend(managers)
+            return nodes
+        case "worker":
+            if dc_id:
+                return list(cluster.workers.get(dc_id, []))
+            nodes: list[object] = []
+            for workers in cluster.workers.values():
+                nodes.extend(workers)
+            return nodes
+        case _:
+            raise ValueError(f"Unknown role '{role}'")
 
 
 def _resolve_target(runtime: ScenarioRuntime, action: ActionSpec) -> object:
     target_name = action.params.get("target")
     if not target_name:
         raise ValueError("assert_condition requires target")
-    if target_name == "status_updates":
-        return runtime.callbacks.status_updates
-    if target_name == "progress_updates":
-        return runtime.callbacks.progress_updates
-    if target_name == "workflow_results":
-        return runtime.callbacks.workflow_results
-    if target_name == "reporter_results":
-        return runtime.callbacks.reporter_results
-    if target_name == "job_ids":
-        return runtime.job_ids
-    if target_name == "last_job_id":
-        return runtime.last_job_id
-    cluster = runtime.require_cluster()
-    if target_name == "cluster_gate_count":
-        return len(cluster.gates)
-    if target_name == "cluster_manager_count":
-        return len(cluster.get_all_managers())
-    if target_name == "cluster_worker_count":
-        return len(cluster.get_all_workers())
-    if target_name == "cluster_datacenters":
-        datacenter_ids = set(cluster.managers.keys()) | set(cluster.workers.keys())
-        return sorted(datacenter_ids)
-    if target_name == "gate_leader":
-        return cluster.get_gate_leader()
-    if target_name == "manager_leader":
-        datacenter_id = action.params.get("dc_id")
-        if not datacenter_id:
-            raise ValueError("manager_leader requires dc_id")
-        return cluster.get_manager_leader(datacenter_id)
-    if target_name == "node_attribute":
-        role = action.params.get("role")
-        if not role:
-            raise ValueError("node_attribute requires role")
-        path = action.params.get("path")
-        if not path:
-            raise ValueError("node_attribute requires path")
-        dc_id = action.params.get("dc_id")
-        nodes = _select_nodes(runtime, role, dc_id)
-        if not nodes:
-            raise ValueError(f"No nodes found for role '{role}'")
-        all_nodes = bool(action.params.get("all_nodes"))
-        if all_nodes:
-            return [_resolve_path(node, path) for node in nodes]
-        index = int(action.params.get("index", 0))
-        try:
-            node = nodes[index]
-        except IndexError as error:
-            raise IndexError(
-                f"Node index {index} out of range for role '{role}'"
-            ) from error
-        return _resolve_path(node, path)
-    raise ValueError(f"Unknown assert target '{target_name}'")
+    match target_name:
+        case "status_updates":
+            return runtime.callbacks.status_updates
+        case "progress_updates":
+            return runtime.callbacks.progress_updates
+        case "workflow_results":
+            return runtime.callbacks.workflow_results
+        case "reporter_results":
+            return runtime.callbacks.reporter_results
+        case "job_ids":
+            return runtime.job_ids
+        case "last_job_id":
+            return runtime.last_job_id
+        case "cluster_gate_count":
+            cluster = runtime.require_cluster()
+            return len(cluster.gates)
+        case "cluster_manager_count":
+            cluster = runtime.require_cluster()
+            return len(cluster.get_all_managers())
+        case "cluster_worker_count":
+            cluster = runtime.require_cluster()
+            return len(cluster.get_all_workers())
+        case "cluster_datacenters":
+            cluster = runtime.require_cluster()
+            datacenter_ids = set(cluster.managers.keys()) | set(cluster.workers.keys())
+            return sorted(datacenter_ids)
+        case "gate_leader":
+            return runtime.require_cluster().get_gate_leader()
+        case "manager_leader":
+            datacenter_id = action.params.get("dc_id")
+            if not datacenter_id:
+                raise ValueError("manager_leader requires dc_id")
+            return runtime.require_cluster().get_manager_leader(datacenter_id)
+        case "node_attribute":
+            role = action.params.get("role")
+            if not role:
+                raise ValueError("node_attribute requires role")
+            path = action.params.get("path")
+            if not path:
+                raise ValueError("node_attribute requires path")
+            dc_id = action.params.get("dc_id")
+            nodes = _select_nodes(runtime, role, dc_id)
+            if not nodes:
+                raise ValueError(f"No nodes found for role '{role}'")
+            all_nodes = bool(action.params.get("all_nodes"))
+            if all_nodes:
+                return [_resolve_path(node, path) for node in nodes]
+            index = int(action.params.get("index", 0))
+            try:
+                node = nodes[index]
+            except IndexError as error:
+                raise IndexError(
+                    f"Node index {index} out of range for role '{role}'"
+                ) from error
+            return _resolve_path(node, path)
+        case _:
+            raise ValueError(f"Unknown assert target '{target_name}'")
 
 
 async def run(runtime: ScenarioRuntime, action: ActionSpec) -> ActionOutcome:
