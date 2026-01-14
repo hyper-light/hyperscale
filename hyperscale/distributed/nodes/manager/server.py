@@ -990,6 +990,31 @@ class ManagerServer(HealthAwareServer):
     def _on_manager_lose_leadership(self) -> None:
         self._task_runner.run(self._handle_leadership_loss)
 
+    async def _handle_leadership_loss(self) -> None:
+        await self._udp_logger.log(
+            ServerInfo(
+                message="Lost SWIM cluster leadership - pausing leader-only tasks",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+
+        for job_id in self._leases.get_led_job_ids():
+            strategy = self._manager_state.get_job_timeout_strategy(job_id)
+            if strategy:
+                try:
+                    await strategy.stop_tracking(job_id, "leadership_lost")
+                except Exception as error:
+                    await self._udp_logger.log(
+                        ServerWarning(
+                            message=f"Failed to stop timeout tracking for job {job_id[:8]}...: {error}",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
+
     def _on_worker_globally_dead(self, worker_id: str) -> None:
         """Handle worker global death (AD-30)."""
         self._health_monitor.on_global_death(worker_id)
