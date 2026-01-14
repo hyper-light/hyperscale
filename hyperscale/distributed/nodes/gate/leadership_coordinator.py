@@ -13,6 +13,12 @@ from hyperscale.distributed.models import (
     JobLeadershipAck,
     JobLeaderGateTransfer,
     JobLeaderGateTransferAck,
+    LeaseTransfer,
+    LeaseTransferAck,
+)
+from hyperscale.logging.hyperscale_logging_models import (
+    ServerDebug,
+    ServerWarning,
 )
 
 if TYPE_CHECKING:
