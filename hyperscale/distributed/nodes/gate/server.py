@@ -693,6 +693,7 @@ class GateServer(HealthAwareServer):
             job_timeout_tracker=self._job_timeout_tracker,
             dispatch_time_tracker=self._dispatch_time_tracker,
             circuit_breaker_manager=self._circuit_breaker_manager,
+            job_lease_manager=self._job_lease_manager,
             datacenter_managers=self._datacenter_managers,
             check_rate_limit=self._check_rate_limit_for_operation,
             should_shed_request=self._should_shed_request,
@@ -3230,6 +3231,19 @@ class GateServer(HealthAwareServer):
         last_sequence: int,
     ) -> None:
         if not self._stats_coordinator:
+            return
+
+        if not self._job_manager.has_job(job_id):
+            await self._udp_logger.log(
+                ServerWarning(
+                    message=(
+                        f"Skipped callback replay for missing job {job_id[:8]}..."
+                    ),
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
             return
 
         try:

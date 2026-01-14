@@ -353,6 +353,8 @@ class WorkflowProgressAck(Message):
             "backpressure_level": self.backpressure_level,
             "backpressure_delay_ms": self.backpressure_delay_ms,
             "backpressure_batch_only": self.backpressure_batch_only,
+            "message_id": self._message_id,
+            "sender_incarnation": self._sender_incarnation,
         }
 
     def __setstate__(self, state: object) -> None:
@@ -364,6 +366,8 @@ class WorkflowProgressAck(Message):
             backpressure_level = state.get("backpressure_level", 0)
             backpressure_delay_ms = state.get("backpressure_delay_ms", 0)
             backpressure_batch_only = state.get("backpressure_batch_only", False)
+            message_id = state.get("message_id")
+            sender_incarnation = state.get("sender_incarnation")
         elif isinstance(state, (list, tuple)):
             values = list(state)
             manager_id = values[0] if len(values) > 0 else ""

@@ -427,7 +427,7 @@ class ManagerHealthMonitor:
 
     # ========== AD-30: Job Suspicion Management ==========
 
-    def suspect_job(
+    async def suspect_job(
         self,
         job_id: str,
         worker_id: str,
@@ -444,15 +444,16 @@ class ManagerHealthMonitor:
             timeout_seconds: Optional custom timeout
         """
         key = (job_id, worker_id)
-        if key in self._job_suspicions:
-            return  # Already suspected
+        async with self._health_state_lock:
+            if key in self._job_suspicions:
+                return  # Already suspected
 
-        timeout = timeout_seconds or self._config.job_responsiveness_threshold_seconds
-        self._job_suspicions[key] = JobSuspicion(
-            job_id=job_id,
-            worker_id=worker_id,
-            timeout_seconds=timeout,
-        )
+            timeout = timeout_seconds or self._config.job_responsiveness_threshold_seconds
+            self._job_suspicions[key] = JobSuspicion(
+                job_id=job_id,
+                worker_id=worker_id,
+                timeout_seconds=timeout,
+            )
 
         self._task_runner.run(
             self._logger.log,
@@ -464,7 +465,7 @@ class ManagerHealthMonitor:
             ),
         )
 
-    def confirm_job_suspicion(self, job_id: str, worker_id: str) -> None:
+    async def confirm_job_suspicion(self, job_id: str, worker_id: str) -> None:
         """
         Add confirmation to job suspicion (does NOT reschedule per AD-30).
 
@@ -473,10 +474,11 @@ class ManagerHealthMonitor:
             worker_id: Suspected worker
         """
         key = (job_id, worker_id)
-        if suspicion := self._job_suspicions.get(key):
-            suspicion.add_confirmation()
+        async with self._health_state_lock:
+            if suspicion := self._job_suspicions.get(key):
+                suspicion.add_confirmation()
 
-    def refute_job_suspicion(self, job_id: str, worker_id: str) -> None:
+    async def refute_job_suspicion(self, job_id: str, worker_id: str) -> None:
         """
         Refute job suspicion (worker proved responsive).
 
@@ -485,9 +487,13 @@ class ManagerHealthMonitor:
             worker_id: Worker to clear suspicion for
         """
         key = (job_id, worker_id)
-        if key in self._job_suspicions:
-            del self._job_suspicions[key]
+        cleared = False
+        async with self._health_state_lock:
+            if key in self._job_suspicions:
+                del self._job_suspicions[key]
+                cleared = True
 
+        if cleared:
             self._task_runner.run(
                 self._logger.log,
                 ServerDebug(
@@ -498,7 +504,7 @@ class ManagerHealthMonitor:
                 ),
             )
 
-    def check_job_suspicion_expiry(self) -> list[tuple[str, str]]:
+    async def check_job_suspicion_expiry(self) -> list[tuple[str, str]]:
         """
         Check for expired job suspicions and declare workers dead.
 
