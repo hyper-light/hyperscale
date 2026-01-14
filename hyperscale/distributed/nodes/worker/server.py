@@ -1305,7 +1305,7 @@ class WorkerServer(HealthAwareServer):
                     send_tcp=self.send_tcp,
                 )
             except Exception as exc:
-                await self._logger.log(
+                await self._udp_logger.log(
                     f"Failed to report progress for workflow {workflow_id}: {exc}",
                     level="debug",
                 )
