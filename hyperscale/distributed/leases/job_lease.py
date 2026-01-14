@@ -64,6 +64,7 @@ class JobLeaseManager:
         "_cleanup_interval",
         "_cleanup_task",
         "_on_lease_expired",
+        "_on_error",
         "_running",
     )
 
@@ -73,6 +74,7 @@ class JobLeaseManager:
         default_duration: float = 30.0,
         cleanup_interval: float = 10.0,
         on_lease_expired: Callable[[JobLease], None] | None = None,
+        on_error: Callable[[str, Exception], None] | None = None,
     ) -> None:
         self._node_id = node_id
         self._leases: dict[str, JobLease] = {}
@@ -82,6 +84,7 @@ class JobLeaseManager:
         self._cleanup_interval = cleanup_interval
         self._cleanup_task: asyncio.Task[None] | None = None
         self._on_lease_expired = on_lease_expired
+        self._on_error = on_error
         self._running = False
 
     @property
@@ -279,12 +282,24 @@ class JobLeaseManager:
                         for lease in expired:
                             try:
                                 self._on_lease_expired(lease)
-                            except Exception:
-                                pass
+                            except Exception as callback_error:
+                                if self._on_error:
+                                    try:
+                                        self._on_error(
+                                            f"Lease expiry callback failed for job {lease.job_id}",
+                                            callback_error,
+                                        )
+                                    except Exception:
+                                        pass
                     await asyncio.sleep(self._cleanup_interval)
                 except asyncio.CancelledError:
                     break
-                except Exception:
+                except Exception as loop_error:
+                    if self._on_error:
+                        try:
+                            self._on_error("Lease cleanup loop error", loop_error)
+                        except Exception:
+                            pass
                     await asyncio.sleep(self._cleanup_interval)
 
         self._cleanup_task = asyncio.create_task(cleanup_loop())
