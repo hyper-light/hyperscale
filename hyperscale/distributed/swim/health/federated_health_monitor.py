@@ -474,11 +474,18 @@ class FederatedHealthMonitor:
                 continue
 
             if state.last_ack_received == 0.0:
-                continue
+                if state.last_probe_sent == 0.0:
+                    continue
+                time_since_first_probe = now - state.last_probe_sent
+                if time_since_first_probe <= ack_grace_period:
+                    continue
+                reference_time = state.last_probe_sent
+            else:
+                reference_time = state.last_ack_received
 
-            time_since_last_ack = now - state.last_ack_received
+            time_since_reference = now - reference_time
 
-            if time_since_last_ack > ack_grace_period:
+            if time_since_reference > ack_grace_period:
                 old_reachability = state.reachability
 
                 if state.reachability == DCReachability.REACHABLE:
