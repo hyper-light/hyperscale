@@ -279,6 +279,7 @@ class GateJobManager:
         job.total_failed = total_failed
         job.completed_datacenters = completed_dcs
         job.failed_datacenters = failed_dcs
+        job.errors = errors
         job.overall_rate = sum(rates) if rates else 0.0
 
         # Calculate elapsed time
@@ -287,14 +288,25 @@ class GateJobManager:
 
         # Determine overall status
         if len(dc_results) == len(target_dcs) and len(target_dcs) > 0:
-            # All DCs have reported
+            resolution_details = ""
             if failed_dcs == len(target_dcs):
                 job.status = JobStatus.FAILED.value
+                resolution_details = "all_failed"
             elif completed_dcs == len(target_dcs):
                 job.status = JobStatus.COMPLETED.value
+                resolution_details = "all_completed"
+            elif completed_dcs > failed_dcs:
+                job.status = JobStatus.COMPLETED.value
+                resolution_details = "majority_completed"
+            elif failed_dcs > completed_dcs:
+                job.status = JobStatus.FAILED.value
+                resolution_details = "majority_failed"
             else:
-                # Mixed results - some completed, some failed
-                job.status = JobStatus.COMPLETED.value  # Partial success
+                job.status = JobStatus.FAILED.value
+                resolution_details = "split_default_failed"
+
+            if resolution_details:
+                job.resolution_details = resolution_details
 
         return job
 
