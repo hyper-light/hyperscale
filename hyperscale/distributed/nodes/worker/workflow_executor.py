@@ -188,20 +188,24 @@ class WorkerWorkflowExecutor:
         cancel_event = asyncio.Event()
         self._state._workflow_cancel_events[workflow_id] = cancel_event
 
-        run = task_runner_run(
-            self._execute_workflow,
-            dispatch,
-            progress,
-            cancel_event,
-            vus_for_workflow,
-            len(allocated_cores),
-            increment_version,
-            node_id_full,
-            node_host,
-            node_port,
-            send_final_result_callback,
-            alias=f"workflow:{workflow_id}",
-        )
+        try:
+            run = task_runner_run(
+                self._execute_workflow,
+                dispatch,
+                progress,
+                cancel_event,
+                vus_for_workflow,
+                len(allocated_cores),
+                increment_version,
+                node_id_full,
+                node_host,
+                node_port,
+                send_final_result_callback,
+                alias=f"workflow:{workflow_id}",
+            )
+        except Exception:
+            await self._core_allocator.free(dispatch.workflow_id)
+            raise
 
         # Store token for cancellation
         self._state._workflow_tokens[workflow_id] = run.token
