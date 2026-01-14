@@ -539,7 +539,7 @@ class GateDispatchCoordinator:
         self,
         ack: JobAck,
         manager_addr: tuple[str, int],
-        circuit,
+        circuit: "ErrorStats",
     ) -> tuple[bool, str | None]:
         """Process dispatch acknowledgment from manager."""
         if ack.accepted:
