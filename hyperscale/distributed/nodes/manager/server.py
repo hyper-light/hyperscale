@@ -2854,7 +2854,7 @@ class ManagerServer(HealthAwareServer):
 
                 worker = self._manager_state.get_worker(sub_workflow.token.worker_id)
                 if worker:
-                    worker_addr = (worker.node.host, worker.node.tcp_port)
+                    worker_addr = (worker.node.host, worker.node.port)
                     workflows_to_cancel.append(
                         (workflow_id, sub_workflow.token.worker_id, worker_addr)
                     )
