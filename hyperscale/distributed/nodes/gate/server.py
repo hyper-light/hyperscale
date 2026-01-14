@@ -2115,6 +2115,80 @@ class GateServer(HealthAwareServer):
         """Send TCP message and return response."""
         return await self.send_tcp(addr, message_type, data, timeout=timeout)
 
+    async def _deliver_client_update(
+        self,
+        job_id: str,
+        callback: tuple[str, int],
+        sequence: int,
+        message_type: str,
+        payload: bytes,
+        timeout: float = 5.0,
+        log_failure: bool = True,
+    ) -> bool:
+        last_error: Exception | None = None
+        for attempt in range(GateStatsCoordinator.CALLBACK_PUSH_MAX_RETRIES):
+            try:
+                await self._send_tcp(
+                    callback,
+                    message_type,
+                    payload,
+                    timeout=timeout,
+                )
+                await self._modular_state.set_client_update_position(
+                    job_id,
+                    callback,
+                    sequence,
+                )
+                return True
+            except Exception as error:
+                last_error = error
+                if attempt < GateStatsCoordinator.CALLBACK_PUSH_MAX_RETRIES - 1:
+                    delay = min(
+                        GateStatsCoordinator.CALLBACK_PUSH_BASE_DELAY_SECONDS
+                        * (2**attempt),
+                        GateStatsCoordinator.CALLBACK_PUSH_MAX_DELAY_SECONDS,
+                    )
+                    await asyncio.sleep(delay)
+
+        if log_failure:
+            await self._udp_logger.log(
+                ServerWarning(
+                    message=(
+                        f"Failed to deliver {message_type} for job {job_id[:8]}... "
+                        f"after {GateStatsCoordinator.CALLBACK_PUSH_MAX_RETRIES} retries: "
+                        f"{last_error}"
+                    ),
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+        return False
+
+    async def _record_and_send_client_update(
+        self,
+        job_id: str,
+        callback: tuple[str, int],
+        message_type: str,
+        payload: bytes,
+        timeout: float = 5.0,
+        log_failure: bool = True,
+    ) -> bool:
+        sequence = await self._modular_state.record_client_update(
+            job_id,
+            message_type,
+            payload,
+        )
+        return await self._deliver_client_update(
+            job_id,
+            callback,
+            sequence,
+            message_type,
+            payload,
+            timeout=timeout,
+            log_failure=log_failure,
+        )
+
     def _confirm_peer(self, peer_addr: tuple[str, int]) -> None:
         """Confirm a peer via SWIM."""
         self.confirm_peer(peer_addr)

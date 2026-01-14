@@ -594,13 +594,6 @@ class ManagerStateSync:
         peer_addr: tuple[str, int],
         snapshot: ManagerStateSnapshot,
     ) -> None:
-        """
-        Apply manager peer state snapshot to local state.
-
-        Args:
-            peer_addr: Peer manager TCP address
-            snapshot: Manager state snapshot
-        """
         await self._reconcile_peer_leadership(peer_addr, snapshot)
 
         for job_id, fence_token in snapshot.job_fence_tokens.items():
