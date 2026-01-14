@@ -186,7 +186,8 @@ class GateRuntimeState:
 
             peer_tcp_host = heartbeat.tcp_host or udp_addr[0]
             peer_tcp_port = heartbeat.tcp_port or udp_addr[1]
-            if (peer_tcp_host, peer_tcp_port) == peer_addr:
+            peer_tcp_addr = (peer_tcp_host, peer_tcp_port)
+            if peer_tcp_addr == peer_addr:
                 udp_addrs_to_remove.add(udp_addr)
 
         for udp_addr in udp_addrs_to_remove:

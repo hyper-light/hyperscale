@@ -200,10 +200,8 @@ class Env(BaseModel):
     CANCELLED_WORKFLOW_CLEANUP_INTERVAL: StrictFloat = (
         60.0  # Seconds between cleanup checks
     )
-    
-    CANCELLED_WORKFLOW_TIMEOUT: StrictFloat = (
-        60.0
-    )
+
+    CANCELLED_WORKFLOW_TIMEOUT: StrictFloat = 60.0
 
     # Client Leadership Transfer Settings (Section 9)
     CLIENT_ORPHAN_GRACE_PERIOD: StrictFloat = (
@@ -301,6 +299,8 @@ class Env(BaseModel):
         5.0  # Standard timeout for job dispatch, result forwarding
     )
     GATE_TCP_TIMEOUT_FORWARD: StrictFloat = 3.0  # Timeout for forwarding to peers
+    GATE_WORKFLOW_RESULT_TIMEOUT_SECONDS: StrictFloat = 300.0
+    GATE_ALLOW_PARTIAL_WORKFLOW_RESULTS: StrictBool = False
 
     # Gate Orphan Job Grace Period Settings (Section 7)
     # Grace period before marking orphaned jobs as failed when job leader manager dies

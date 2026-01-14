@@ -3451,6 +3451,18 @@ class GateServer(HealthAwareServer):
         except asyncio.CancelledError:
             return
 
+        await self._udp_logger.log(
+            ServerWarning(
+                message=(
+                    "Workflow result timeout expired for job "
+                    f"{job_id} workflow {workflow_id}"
+                ),
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+
         await self._handle_workflow_result_timeout(job_id, workflow_id)
 
     def _build_missing_workflow_result(

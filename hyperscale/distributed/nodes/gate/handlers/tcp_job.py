@@ -13,8 +13,11 @@ import time
 from typing import TYPE_CHECKING, Awaitable, Callable
 
 from hyperscale.distributed.models import (
+    GateJobLeaderTransfer,
     GlobalJobStatus,
     JobAck,
+    JobLeaderGateTransfer,
+    JobLeaderGateTransferAck,
     JobProgress,
     JobProgressAck,
     JobStatus,
