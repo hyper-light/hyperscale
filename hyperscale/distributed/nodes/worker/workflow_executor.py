@@ -119,6 +119,7 @@ class WorkerWorkflowExecutor:
         node_id_full: str,
         node_host: str,
         node_port: int,
+        send_final_result_callback: callable,
     ) -> bytes:
         """
         Handle the execution phase of a workflow dispatch.
@@ -133,6 +134,9 @@ class WorkerWorkflowExecutor:
             task_runner_run: Function to run tasks via TaskRunner
             increment_version: Function to increment state version
             node_id_full: Full node identifier
+            node_host: Worker host address
+            node_port: Worker port
+            send_final_result_callback: Callback to send final result to manager
 
         Returns:
             Serialized WorkflowDispatchAck
@@ -184,7 +188,6 @@ class WorkerWorkflowExecutor:
         cancel_event = asyncio.Event()
         self._state._workflow_cancel_events[workflow_id] = cancel_event
 
-        # Start execution task
         run = task_runner_run(
             self._execute_workflow,
             dispatch,
@@ -196,6 +199,7 @@ class WorkerWorkflowExecutor:
             node_id_full,
             node_host,
             node_port,
+            send_final_result_callback,
             alias=f"workflow:{workflow_id}",
         )
 
