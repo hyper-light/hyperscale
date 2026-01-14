@@ -123,10 +123,21 @@ class GateJobRouter:
         affected_datacenters: list[str],
     ) -> int:
         """Reset routing state for jobs in partitioned datacenters."""
-        if not affected_datacenters:
-            return 0
+        return len(
+            self.reset_primary_for_partitioned_datacenters_with_jobs(
+                affected_datacenters
+            )
+        )
 
-        return self._state_manager.reset_primary_for_datacenters(
+    def reset_primary_for_partitioned_datacenters_with_jobs(
+        self,
+        affected_datacenters: list[str],
+    ) -> list[str]:
+        """Reset routing state for partitioned datacenters and return job IDs."""
+        if not affected_datacenters:
+            return []
+
+        return self._state_manager.reset_primary_for_datacenters_with_jobs(
             set(affected_datacenters)
         )
 

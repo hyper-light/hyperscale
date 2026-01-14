@@ -48,6 +48,7 @@ from hyperscale.distributed.models import (
     JobAck,
     JobStatus,
     JobFinalResult,
+    JobStatusPush,
     JobCancellationComplete,
     WorkflowDispatch,
     WorkflowDispatchAck,

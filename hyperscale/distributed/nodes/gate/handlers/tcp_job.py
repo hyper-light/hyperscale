@@ -505,15 +505,15 @@ class GateJobHandler:
                 self._dispatch_job_to_datacenters, submission, target_dcs
             )
 
-            if lease_duration is None:
-                lease_duration = lease_result.lease.lease_duration
-
-            self._task_runner.run(
-                self._renew_job_lease,
-                submission.job_id,
-                lease_duration,
-                alias=f"job-lease-renewal-{submission.job_id}",
-            )
+            if submission.job_id not in self._state._job_lease_renewal_tokens:
+                run = self._task_runner.run(
+                    self._renew_job_lease,
+                    submission.job_id,
+                    lease_duration,
+                    alias=f"job-lease-renewal-{submission.job_id}",
+                )
+                if run:
+                    self._state._job_lease_renewal_tokens[submission.job_id] = run.token
 
             return ack_response
 

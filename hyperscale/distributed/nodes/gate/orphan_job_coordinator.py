@@ -63,6 +63,10 @@ class GateOrphanJobCoordinator:
     - Background loop runs via TaskRunner for proper lifecycle management
     """
 
+    CALLBACK_PUSH_MAX_RETRIES: int = 3
+    CALLBACK_PUSH_BASE_DELAY_SECONDS: float = 0.5
+    CALLBACK_PUSH_MAX_DELAY_SECONDS: float = 2.0
+
     __slots__ = (
         "_state",
         "_logger",
@@ -74,6 +78,7 @@ class GateOrphanJobCoordinator:
         "_get_node_addr",
         "_send_tcp",
         "_get_active_peers",
+        "_forward_status_push_to_peers",
         "_orphan_check_interval_seconds",
         "_orphan_grace_period_seconds",
         "_orphan_timeout_seconds",
