@@ -17,19 +17,22 @@ This document contains **current** findings only. Previously fixed items are lis
 
 ---
 
-## 1. Not Applicable Issues
+## 1. Completed Integration (AD-51)
 
-### 1.1 Job Routing State Cleanup - N/A
+### 1.1 Job Routing State Cleanup - FIXED
 
 | File | Lines | Issue |
 |------|-------|-------|
-| `distributed/routing/gate_job_router.py` | 334-336 | `cleanup_job_state()` exists but is unused |
+| `distributed/routing/gate_job_router.py` | 334-336 | `cleanup_job_state()` now wired |
 
-**Status:** Not Applicable
+**Status:** FIXED (AD-51 Unified Health-Aware Routing)
 
-**Why N/A:** `GateJobRouter` is a complete routing system (AD-36) that was designed but **never integrated** into `GateServer`. Since the router is not instantiated, there is no routing state being tracked and therefore nothing to clean up. The cleanup call would be needed only if/when `GateJobRouter` is integrated.
-
-**Future work:** If `GateJobRouter` is integrated, add `self._job_router.cleanup_job_state(job_id)` to `_cleanup_single_job`.
+**Changes:**
+- `GateJobRouter` now instantiated in `GateServer.__init__` (line ~770)
+- `_select_datacenters_with_fallback()` uses `_job_router.route_job()` for routing decisions
+- `_cleanup_single_job()` calls `_job_router.cleanup_job_state(job_id)` (line ~5000)
+- Dispatch failures recorded via `record_dispatch_failure` callback in `GateDispatchCoordinator`
+- Routing decisions logged with bucket, reason, and fallback info
 
 ---
 
