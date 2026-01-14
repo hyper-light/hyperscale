@@ -92,6 +92,7 @@ class ManagerStateSync:
         self._set_dc_leader: Callable[[str | None], None] = set_dc_leader_fn or (
             lambda _leader_id: None
         )
+        self._worker_state_lock: asyncio.Lock = asyncio.Lock()
 
     async def _noop_async(self, *_: Any) -> None:
         return None
