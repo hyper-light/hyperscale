@@ -4,6 +4,8 @@ TCP handler for job status push notifications.
 Handles JobStatusPush and JobBatchPush messages from gates/managers.
 """
 
+import asyncio
+
 from hyperscale.distributed.models import JobStatusPush, JobBatchPush
 from hyperscale.distributed.nodes.client.state import ClientState
 from hyperscale.logging import Logger
