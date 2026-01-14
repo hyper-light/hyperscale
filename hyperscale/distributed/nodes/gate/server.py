@@ -711,6 +711,8 @@ class GateServer(HealthAwareServer):
             get_node_host=lambda: self._host,
             get_node_port=lambda: self._tcp_port,
             get_node_id_short=lambda: self._node_id.short,
+            capacity_aggregator=self._capacity_aggregator,
+            spillover_evaluator=self._spillover_evaluator,
         )
 
         self._peer_coordinator = GatePeerCoordinator(

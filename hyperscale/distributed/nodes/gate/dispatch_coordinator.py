@@ -576,6 +576,68 @@ class GateDispatchCoordinator:
 
         self._increment_version()
 
+    def _evaluate_spillover(
+        self,
+        job_id: str,
+        primary_dc: str,
+        fallback_dcs: list[str],
+        job_cores_required: int,
+    ) -> str | None:
+        """
+        Evaluate if job should spillover to a fallback DC based on capacity.
+
+        Uses SpilloverEvaluator (AD-43) to check if a fallback DC would provide
+        better wait times than the primary DC.
+
+        Args:
+            job_id: Job identifier for logging
+            primary_dc: Primary datacenter ID
+            fallback_dcs: List of fallback datacenter IDs
+            job_cores_required: Number of cores required for the job
+
+        Returns:
+            Spillover datacenter ID if spillover recommended, None otherwise
+        """
+        if self._spillover_evaluator is None or self._capacity_aggregator is None:
+            return None
+
+        if not fallback_dcs:
+            return None
+
+        primary_capacity = self._capacity_aggregator.get_capacity(primary_dc)
+        if primary_capacity.can_serve_immediately(job_cores_required):
+            return None
+
+        fallback_capacities: list[tuple] = []
+        for fallback_dc in fallback_dcs:
+            fallback_capacity = self._capacity_aggregator.get_capacity(fallback_dc)
+            rtt_ms = 50.0
+            fallback_capacities.append((fallback_capacity, rtt_ms))
+
+        decision = self._spillover_evaluator.evaluate(
+            job_cores_required=job_cores_required,
+            primary_capacity=primary_capacity,
+            fallback_capacities=fallback_capacities,
+            primary_rtt_ms=10.0,
+        )
+
+        if decision.should_spillover and decision.spillover_dc:
+            self._task_runner.run(
+                self._logger.log,
+                ServerInfo(
+                    message=f"Job {job_id}: Spillover from {primary_dc} to {decision.spillover_dc} "
+                    f"(primary_wait={decision.primary_wait_seconds:.1f}s, "
+                    f"spillover_wait={decision.spillover_wait_seconds:.1f}s, "
+                    f"reason={decision.reason})",
+                    node_host=self._get_node_host(),
+                    node_port=self._get_node_port(),
+                    node_id=self._get_node_id_short(),
+                ),
+            )
+            return decision.spillover_dc
+
+        return None
+
     async def _dispatch_job_with_fallback(
         self,
         submission: JobSubmission,
@@ -588,18 +650,31 @@ class GateDispatchCoordinator:
         fallback_queue = list(fallback_dcs)
         job_id = submission.job_id
 
+        job_cores = getattr(submission, "cores_required", 1)
+
         for datacenter in primary_dcs:
+            spillover_dc = self._evaluate_spillover(
+                job_id=job_id,
+                primary_dc=datacenter,
+                fallback_dcs=fallback_queue,
+                job_cores_required=job_cores,
+            )
+
+            target_dc = spillover_dc if spillover_dc else datacenter
+            if spillover_dc and spillover_dc in fallback_queue:
+                fallback_queue.remove(spillover_dc)
+
             success, _, accepting_manager = await self._try_dispatch_to_dc(
-                job_id, datacenter, submission
+                job_id, target_dc, submission
             )
 
             if success:
-                successful.append(datacenter)
-                self._record_dc_manager_for_job(job_id, datacenter, accepting_manager)
+                successful.append(target_dc)
+                self._record_dc_manager_for_job(job_id, target_dc, accepting_manager)
                 continue
 
             fallback_dc, fallback_manager = await self._try_fallback_dispatch(
-                job_id, datacenter, submission, fallback_queue
+                job_id, target_dc, submission, fallback_queue
             )
 
             if fallback_dc:
