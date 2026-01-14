@@ -373,7 +373,6 @@ class WorkerWorkflowExecutor:
                     name="worker_events",
                 )
 
-        # Build final result for sending
         final_result = WorkflowFinalResult(
             job_id=dispatch.job_id,
             workflow_id=dispatch.workflow_id,
@@ -386,7 +385,7 @@ class WorkerWorkflowExecutor:
             worker_available_cores=self._core_allocator.available_cores,
         )
 
-        return (progress, error, final_result)
+        await send_final_result_callback(final_result)
 
     async def monitor_workflow_progress(
         self,
