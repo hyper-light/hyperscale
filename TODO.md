@@ -78,6 +78,7 @@ Systematic bug fixes for the Hyperscale distributed performance testing framewor
 - [x] **Task 34**: Add ReporterResultPush forwarding path in gate (verified - already implemented via Task 59)
 - [x] **Task 38**: Add reporter task creation and result dispatch in gate (added _dispatch_to_reporters to server.py, called from _complete_job)
 - [x] **Task 41**: Add LeaseTransfer sender in gate code (added _send_lease_transfer to leadership_coordinator.py, called during transfer_leadership)
+- [x] **Task 62**: Connection storm mitigation - add explicit connection caps (added is_at_capacity to ServerState, reject in connection_made)
 
 ---
 
