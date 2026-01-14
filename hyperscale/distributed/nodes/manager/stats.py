@@ -86,9 +86,9 @@ class ManagerStatsCoordinator:
 
         self._windowed_stats: "WindowedStatsCollector" = windowed_stats
 
-    def record_dispatch(self) -> None:
+    async def record_dispatch(self) -> None:
         """Record a workflow dispatch for throughput tracking."""
-        self._state._dispatch_throughput_count += 1
+        await self._state.increment_dispatch_throughput_count()
 
     def get_dispatch_throughput(self) -> float:
         """

@@ -267,7 +267,12 @@ class GateStateSyncHandler:
             base_delay=0.5,
             max_delay=3.0,
             jitter=JitterStrategy.FULL,
-            retryable_exceptions=(ConnectionError, TimeoutError, OSError, RuntimeError),
+            retryable_exceptions=(
+                ConnectionError,
+                TimeoutError,
+                OSError,
+                RuntimeError,
+            ),
         )
         retry_executor = RetryExecutor(retry_config)
         circuit = await self._peer_circuit_breaker.get_circuit(leader_addr)
