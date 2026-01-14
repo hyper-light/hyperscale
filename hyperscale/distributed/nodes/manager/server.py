@@ -1073,7 +1073,10 @@ class ManagerServer(HealthAwareServer):
                 failed_worker_id=failed_worker_id,
             )
 
-            if reassignment_token.worker_id == failed_worker_id:
+            if (
+                reassignment_token.worker_id == failed_worker_id
+                or not reassignment_token.worker_id
+            ):
                 requeued = await self._workflow_dispatcher.requeue_workflow(
                     sub_workflow_token
                 )
@@ -1116,12 +1119,15 @@ class ManagerServer(HealthAwareServer):
                         )
                     )
             elif reassignment_token.worker_id:
-                dispatch_state_updated = (
-                    await self._workflow_dispatcher.mark_workflow_assigned(
-                        job_id=job_id,
-                        workflow_id=workflow_id,
-                    )
+                unassigned = await self._workflow_dispatcher.unassign_workflow(
+                    job_id=job_id,
+                    workflow_id=workflow_id,
                 )
+                assigned = await self._workflow_dispatcher.mark_workflow_assigned(
+                    job_id=job_id,
+                    workflow_id=workflow_id,
+                )
+                dispatch_state_updated = unassigned or assigned
 
         if applied or dispatch_state_updated:
             new_worker_id = (
