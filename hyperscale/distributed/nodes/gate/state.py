@@ -163,8 +163,16 @@ class GateRuntimeState:
         self._peer_state_locks.pop(peer_addr, None)
         self._peer_state_epoch.pop(peer_addr, None)
 
+    def cleanup_peer_tcp_tracking(self, peer_addr: tuple[str, int]) -> None:
+        """Remove TCP-address-keyed tracking data for a peer."""
+        self._gate_peer_unhealthy_since.pop(peer_addr, None)
+        self._dead_gate_peers.discard(peer_addr)
+        self._dead_gate_timestamps.pop(peer_addr, None)
+        self._active_gate_peers.discard(peer_addr)
+        self.remove_peer_lock(peer_addr)
+
     def cleanup_peer_tracking(self, peer_addr: tuple[str, int]) -> set[str]:
-        """Remove tracking data for a peer address."""
+        """Remove TCP and UDP tracking data for a peer address."""
         udp_addrs_to_remove = {
             udp_addr
             for udp_addr, tcp_addr in list(self._gate_udp_to_tcp.items())
@@ -189,11 +197,7 @@ class GateRuntimeState:
             self._gate_udp_to_tcp.pop(udp_addr, None)
             self._gate_peer_info.pop(udp_addr, None)
 
-        self._gate_peer_unhealthy_since.pop(peer_addr, None)
-        self._dead_gate_peers.discard(peer_addr)
-        self._dead_gate_timestamps.pop(peer_addr, None)
-        self._active_gate_peers.discard(peer_addr)
-        self.remove_peer_lock(peer_addr)
+        self.cleanup_peer_tcp_tracking(peer_addr)
 
         return gate_ids_to_remove
 
