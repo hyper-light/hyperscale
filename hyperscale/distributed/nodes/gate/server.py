@@ -1857,6 +1857,46 @@ class GateServer(HealthAwareServer):
         try:
             push: WindowedStatsPush = cloudpickle.loads(data)
 
+            if not self._job_manager.has_job(push.job_id):
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerDebug(
+                        message=(
+                            "Discarding windowed stats for unknown job "
+                            f"{push.job_id} from DC {push.datacenter}"
+                        ),
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    ),
+                )
+                return b"discarded"
+
+            job = self._job_manager.get_job(push.job_id)
+            terminal_states = {
+                JobStatus.COMPLETED.value,
+                JobStatus.FAILED.value,
+                JobStatus.CANCELLED.value,
+                JobStatus.TIMEOUT.value,
+            }
+
+            if not job or job.status in terminal_states:
+                status = job.status if job else "missing"
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerDebug(
+                        message=(
+                            "Discarding windowed stats for job "
+                            f"{push.job_id} in terminal state {status} "
+                            f"from DC {push.datacenter}"
+                        ),
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    ),
+                )
+                return b"discarded"
+
             for worker_stat in push.per_worker_stats:
                 progress = WorkflowProgress(
                     job_id=push.job_id,

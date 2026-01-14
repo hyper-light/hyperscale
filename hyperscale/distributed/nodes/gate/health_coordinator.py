@@ -97,6 +97,7 @@ class GateHealthCoordinator:
         self._on_partition_detected: Callable[[list[str]], None] | None = (
             on_partition_detected
         )
+        self._partitioned_datacenters: set[str] = set()
 
         self._cross_dc_correlation.register_partition_healed_callback(
             self._handle_partition_healed
