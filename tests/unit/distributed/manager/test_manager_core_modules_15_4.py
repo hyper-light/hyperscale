@@ -92,7 +92,6 @@ def mock_task_runner():
 
 @pytest.fixture
 def stats_buffer():
-    """Create a stats buffer for backpressure tests."""
     return StatsBuffer(
         StatsBufferConfig(
             hot_max_entries=100,
@@ -105,7 +104,6 @@ def stats_buffer():
 
 @pytest.fixture
 def windowed_stats():
-    """Create a windowed stats collector."""
     return WindowedStatsCollector()
 
 

@@ -47,6 +47,9 @@ class GateStatsCoordinator:
         self,
         state: "GateRuntimeState",
         logger: "Logger",
+        node_host: str,
+        node_port: int,
+        node_id: str,
         task_runner: "TaskRunner",
         windowed_stats: WindowedStatsCollector,
         get_job_callback: Callable[[str], tuple[str, int] | None],
@@ -58,6 +61,9 @@ class GateStatsCoordinator:
     ) -> None:
         self._state: "GateRuntimeState" = state
         self._logger: "Logger" = logger
+        self._node_host: str = node_host
+        self._node_port: int = node_port
+        self._node_id: str = node_id
         self._task_runner: "TaskRunner" = task_runner
         self._windowed_stats: WindowedStatsCollector = windowed_stats
         self._get_job_callback: Callable[[str], tuple[str, int] | None] = (
