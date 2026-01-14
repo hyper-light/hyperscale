@@ -13,7 +13,7 @@ from pathlib import Path
 
 from hyperscale.core.graph.workflow import Workflow
 from hyperscale.distributed.swim import HealthAwareServer, ManagerStateEmbedder
-from hyperscale.distributed.swim.core import ErrorStats
+from hyperscale.distributed.swim.core import ErrorStats, CircuitState
 from hyperscale.distributed.swim.detection import HierarchicalConfig
 from hyperscale.distributed.swim.health import FederatedHealthMonitor
 from hyperscale.distributed.env import Env
@@ -1449,7 +1449,7 @@ class ManagerServer(HealthAwareServer):
         heartbeat: WorkerHeartbeat,
         source_addr: tuple[str, int],
     ) -> None:
-        self._health_monitor.handle_worker_heartbeat(heartbeat, source_addr)
+        await self._health_monitor.handle_worker_heartbeat(heartbeat, source_addr)
 
         worker_id = heartbeat.node_id
         if self._manager_state.has_worker(worker_id):
