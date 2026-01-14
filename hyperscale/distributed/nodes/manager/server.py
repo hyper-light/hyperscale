@@ -3121,6 +3121,61 @@ class ManagerServer(HealthAwareServer):
         try:
             registration = ManagerPeerRegistration.load(data)
 
+            if registration.cluster_id != self._config.cluster_id:
+                await self._udp_logger.log(
+                    ServerWarning(
+                        message=(
+                            f"Manager {registration.node.node_id} rejected: cluster_id mismatch"
+                        ),
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+                return ManagerPeerRegistrationResponse(
+                    accepted=False,
+                    manager_id=self._node_id.full,
+                    is_leader=self.is_leader(),
+                    term=self._leader_election.state.current_term,
+                    known_peers=self._manager_state.get_known_manager_peer_values(),
+                    error="Cluster isolation violation: manager cluster_id mismatch",
+                ).dump()
+
+            if registration.environment_id != self._config.environment_id:
+                await self._udp_logger.log(
+                    ServerWarning(
+                        message=(
+                            f"Manager {registration.node.node_id} rejected: environment_id mismatch"
+                        ),
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+                return ManagerPeerRegistrationResponse(
+                    accepted=False,
+                    manager_id=self._node_id.full,
+                    is_leader=self.is_leader(),
+                    term=self._leader_election.state.current_term,
+                    known_peers=self._manager_state.get_known_manager_peer_values(),
+                    error="Environment isolation violation: manager environment_id mismatch",
+                ).dump()
+
+            mtls_error = await self._validate_mtls_claims(
+                addr,
+                "Manager",
+                registration.node.node_id,
+            )
+            if mtls_error:
+                return ManagerPeerRegistrationResponse(
+                    accepted=False,
+                    manager_id=self._node_id.full,
+                    is_leader=self.is_leader(),
+                    term=self._leader_election.state.current_term,
+                    known_peers=self._manager_state.get_known_manager_peer_values(),
+                    error=mtls_error,
+                ).dump()
+
             self._registry.register_manager_peer(registration.node)
 
             # Add to SWIM
@@ -3146,6 +3201,10 @@ class ManagerServer(HealthAwareServer):
         except Exception as error:
             return ManagerPeerRegistrationResponse(
                 accepted=False,
+                manager_id=self._node_id.full,
+                is_leader=self.is_leader(),
+                term=self._leader_election.state.current_term,
+                known_peers=self._manager_state.get_known_manager_peer_values(),
                 error=str(error),
             ).dump()
 

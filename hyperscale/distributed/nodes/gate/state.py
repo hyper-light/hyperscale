@@ -93,6 +93,11 @@ class GateRuntimeState:
         # Progress callbacks
         self._progress_callbacks: dict[str, tuple[str, int]] = {}
 
+        self._client_update_history_limit: int = 200
+        self._job_update_sequences: dict[str, int] = {}
+        self._job_update_history: dict[str, list[tuple[int, str, bytes, float]]] = {}
+        self._job_client_update_positions: dict[str, dict[tuple[str, int], int]] = {}
+
         # Lease state (legacy)
         self._leases: dict[str, DatacenterLease] = {}
         self._fence_token: int = 0

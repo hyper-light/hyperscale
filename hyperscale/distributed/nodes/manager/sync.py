@@ -158,7 +158,7 @@ class ManagerStateSync:
 
                 if response and not isinstance(response, Exception):
                     sync_response = StateSyncResponse.load(response)
-                    if sync_response.worker_state:
+                    if sync_response.responder_ready and sync_response.worker_state:
                         return sync_response.worker_state
 
             except Exception as sync_error:
@@ -194,7 +194,6 @@ class ManagerStateSync:
         self,
         snapshot: WorkerStateSnapshot,
     ) -> WorkerRegistration | None:
-        """Build a worker registration from a state snapshot."""
         if not snapshot.host or snapshot.tcp_port <= 0:
             self._task_runner.run(
                 self._logger.log,
