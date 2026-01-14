@@ -1150,6 +1150,31 @@ class JobManager:
                 return True
             return False
 
+    async def get_stored_dispatched_context(
+        self,
+        job_id: str,
+        workflow_id: str,
+    ) -> tuple[bytes, int] | None:
+        """
+        Get stored dispatched context for a workflow (FIX 2.6).
+
+        On requeue after worker failure, we should reuse the original dispatched
+        context to maintain consistency rather than recomputing fresh context.
+
+        Returns (context_bytes, layer_version) if found, None otherwise.
+        """
+        job_token = self.create_job_token(job_id)
+        job = self._jobs.get(str(job_token))
+        if not job:
+            return None
+
+        async with job.lock:
+            for sub_wf in job.sub_workflows.values():
+                parent_workflow_id = sub_wf.parent_token.workflow_id
+                if parent_workflow_id == workflow_id and sub_wf.dispatched_context:
+                    return (sub_wf.dispatched_context, sub_wf.dispatched_version)
+            return None
+
     # =========================================================================
     # Iteration Helpers
     # =========================================================================
