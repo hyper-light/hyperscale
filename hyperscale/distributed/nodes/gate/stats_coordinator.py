@@ -53,6 +53,7 @@ class GateStatsCoordinator:
         get_job_callback: Callable[[str], tuple[str, int] | None],
         get_job_status: Callable[[str], GlobalJobStatus | None],
         get_all_running_jobs: Callable[[], list[tuple[str, GlobalJobStatus]]],
+        has_job: Callable[[str], bool],
         send_tcp: Callable,
         forward_status_push_to_peers: ForwardStatusPushFunc | None = None,
     ) -> None:
@@ -67,6 +68,7 @@ class GateStatsCoordinator:
         self._get_all_running_jobs: Callable[[], list[tuple[str, GlobalJobStatus]]] = (
             get_all_running_jobs
         )
+        self._has_job: Callable[[str], bool] = has_job
         self._send_tcp: Callable = send_tcp
         self._forward_status_push_to_peers: ForwardStatusPushFunc | None = (
             forward_status_push_to_peers
