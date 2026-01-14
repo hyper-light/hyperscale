@@ -192,9 +192,8 @@ class ManagerRegistry:
             if worker_id in unhealthy_ids:
                 continue
 
-            # Skip workers with open circuit breakers
             if circuit := self._state._worker_circuits.get(worker_id):
-                if circuit.is_open():
+                if circuit.circuit_state != CircuitState.CLOSED:
                     continue
 
             # Skip workers without capacity
