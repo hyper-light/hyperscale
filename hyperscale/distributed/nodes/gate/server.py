@@ -1873,7 +1873,6 @@ class GateServer(HealthAwareServer):
         manager_addr: tuple[str, int],
         incarnation: int,
     ) -> None:
-        """Handle manager global death (AD-30)."""
         self._task_runner.run(
             self._udp_logger.log,
             ServerInfo(
@@ -1882,6 +1881,10 @@ class GateServer(HealthAwareServer):
                 node_port=self._tcp_port,
                 node_id=self._node_id.short,
             ),
+        )
+        self._task_runner.run(
+            self._circuit_breaker_manager.remove_circuit,
+            manager_addr,
         )
 
     def _on_manager_dead_for_dc(
