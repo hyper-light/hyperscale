@@ -405,23 +405,51 @@ class FederatedHealthMonitor:
         except Exception:
             self._handle_probe_failure(state)
 
+    def _check_ack_timeouts(self) -> None:
+        """
+        Check all DCs for ack timeout and transition to SUSPECTED/UNREACHABLE.
+
+        This handles the case where probes are sent successfully but no ack arrives.
+        Without this, a DC could remain REACHABLE indefinitely after its last ack.
+        """
+        now = time.monotonic()
+        ack_grace_period = self.probe_timeout * self.max_consecutive_failures
+
+        for state in self._dc_health.values():
+            if state.reachability == DCReachability.UNREACHABLE:
+                continue
+
+            if state.last_ack_received == 0.0:
+                continue
+
+            time_since_last_ack = now - state.last_ack_received
+
+            if time_since_last_ack > ack_grace_period:
+                old_reachability = state.reachability
+
+                if state.reachability == DCReachability.REACHABLE:
+                    state.reachability = DCReachability.SUSPECTED
+                    state.suspected_at = now
+                elif state.reachability == DCReachability.SUSPECTED:
+                    if now - state.suspected_at > self.suspicion_timeout:
+                        state.reachability = DCReachability.UNREACHABLE
+
+                if state.reachability != old_reachability and self._on_dc_health_change:
+                    self._on_dc_health_change(state.datacenter, state.effective_health)
+
     def _handle_probe_failure(self, state: DCHealthState) -> None:
-        """Handle a failed probe."""
         state.consecutive_failures += 1
 
         old_reachability = state.reachability
 
         if state.consecutive_failures >= self.max_consecutive_failures:
             if state.reachability == DCReachability.REACHABLE:
-                # Transition to suspected
                 state.reachability = DCReachability.SUSPECTED
                 state.suspected_at = time.monotonic()
             elif state.reachability == DCReachability.SUSPECTED:
-                # Check if suspicion timeout expired
                 if time.monotonic() - state.suspected_at > self.suspicion_timeout:
                     state.reachability = DCReachability.UNREACHABLE
 
-        # Notify on change
         if state.reachability != old_reachability and self._on_dc_health_change:
             self._on_dc_health_change(state.datacenter, state.effective_health)
 
