@@ -2239,7 +2239,6 @@ class ManagerServer(HealthAwareServer):
         return len(worker_ids)
 
     def _get_active_job_workflows_by_worker(self, job: JobInfo) -> dict[str, list[str]]:
-        """Map workers to active workflow IDs for a job."""
         workflow_ids_by_worker: dict[str, set[str]] = {}
         for sub_workflow in job.sub_workflows.values():
             if sub_workflow.result is not None:

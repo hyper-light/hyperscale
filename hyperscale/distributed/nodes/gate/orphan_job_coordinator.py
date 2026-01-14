@@ -410,24 +410,12 @@ class GateOrphanJobCoordinator:
                         elapsed_seconds=getattr(job, "elapsed_seconds", 0.0),
                         is_final=True,
                     )
-                    try:
-                        await self._send_tcp(
-                            callback,
-                            "job_status_push",
-                            push.dump(),
-                            5.0,
-                        )
-                    except Exception as error:
-                        await self._logger.log(
-                            ServerWarning(
-                                message=(
-                                    f"Failed to send orphan timeout status for job {job_id[:8]}...: {error}"
-                                ),
-                                node_host=self._get_node_addr()[0],
-                                node_port=self._get_node_addr()[1],
-                                node_id=self._get_node_id().short,
-                            )
-                        )
+                    await self._send_job_status_push_with_retry(
+                        job_id,
+                        callback,
+                        push.dump(),
+                        allow_peer_forwarding=True,
+                    )
                 return
 
             await self._logger.log(

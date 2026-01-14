@@ -62,6 +62,13 @@ class ManagerStateSync:
         node_id: str,
         task_runner: "TaskRunner",
         send_tcp: SendFunc,
+        is_leader_fn: Callable[[], bool] | None = None,
+        get_term_fn: Callable[[], int] | None = None,
+        handle_elected_fn: Callable[[tuple[str, int], int], Coroutine[Any, Any, None]]
+        | None = None,
+        should_yield_fn: Callable[[tuple[str, int], int], bool] | None = None,
+        step_down_fn: Callable[[], Coroutine[Any, Any, None]] | None = None,
+        set_dc_leader_fn: Callable[[str | None], None] | None = None,
     ) -> None:
         self._state: "ManagerState" = state
         self._config: "ManagerConfig" = config
@@ -70,6 +77,20 @@ class ManagerStateSync:
         self._node_id: str = node_id
         self._task_runner: "TaskRunner" = task_runner
         self._send_tcp: SendFunc = send_tcp
+        self._is_leader: Callable[[], bool] = is_leader_fn or (lambda: False)
+        self._get_term: Callable[[], int] = get_term_fn or (lambda: 0)
+        self._handle_elected: Callable[
+            [tuple[str, int], int], Coroutine[Any, Any, None]
+        ] = handle_elected_fn or self._noop_async
+        self._should_yield_to_peer: Callable[[tuple[str, int], int], bool] = (
+            should_yield_fn or (lambda _peer_addr, _peer_term: False)
+        )
+        self._step_down: Callable[[], Coroutine[Any, Any, None]] = (
+            step_down_fn or self._noop_async
+        )
+        self._set_dc_leader: Callable[[str | None], None] = set_dc_leader_fn or (
+            lambda _leader_id: None
+        )
 
     async def sync_state_from_workers(self) -> None:
         """

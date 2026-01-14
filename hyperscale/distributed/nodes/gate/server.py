@@ -3344,6 +3344,28 @@ class GateServer(HealthAwareServer):
             )
             return False
 
+    def register_partition_detected_callback(
+        self,
+        callback: Callable[[list[str]], None],
+    ) -> None:
+        """Register a callback invoked when partitions are detected."""
+        self._partition_detected_callbacks.append(callback)
+
+    def register_partition_healed_callback(
+        self,
+        callback: Callable[[list[str]], None],
+    ) -> None:
+        """Register a callback invoked when partitions are healed."""
+        self._partition_healed_callbacks.append(callback)
+
+    def _notify_partition_reroute(self, job_ids: list[str]) -> None:
+        for job_id in job_ids:
+            self._task_runner.run(
+                self._send_immediate_update,
+                job_id,
+                "partition_reroute",
+            )
+
     def _on_dc_health_change(self, datacenter: str, new_health: str) -> None:
         """Handle DC health change."""
         self._task_runner.run(
