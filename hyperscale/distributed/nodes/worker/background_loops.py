@@ -169,8 +169,17 @@ class WorkerBackgroundLoops:
 
             except asyncio.CancelledError:
                 break
-            except Exception:
-                pass
+            except Exception as error:
+                if self._logger:
+                    task_runner_run(
+                        self._logger.log,
+                        ServerWarning(
+                            message=f"Error in dead_manager_reap_loop: {error}",
+                            node_host=node_host,
+                            node_port=node_port,
+                            node_id=node_id_short,
+                        ),
+                    )
 
     async def run_orphan_check_loop(
         self,
