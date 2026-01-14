@@ -426,6 +426,13 @@ class TimingWheel:
                         f"Timing wheel advance loop error: {advance_error}",
                         advance_error,
                     )
+                else:
+                    import sys
+
+                    print(
+                        f"[TimingWheel] advance loop error: {advance_error}",
+                        file=sys.stderr,
+                    )
 
     def start(self) -> None:
         """Start the timing wheel advancement loop."""
