@@ -351,8 +351,9 @@ class GateStateSyncHandler:
                 await self._logger.log(
                     ServerWarning(
                         message=(
-                            f"Leader gate {leader_id[:8]}... for job {result.job_id[:8]}... "
-                            "has no known address; attempting peer forward."
+                            f"Leader gate {leader_id[:8]}... for job "
+                            f"{result.job_id[:8]}... has no known address; "
+                            "attempting peer forward."
                         ),
                         node_host=self._get_host(),
                         node_port=self._get_tcp_port(),

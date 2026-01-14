@@ -90,6 +90,12 @@ class ManagerStatsCoordinator:
         """Record a workflow dispatch for throughput tracking."""
         await self._state.increment_dispatch_throughput_count()
 
+    async def refresh_dispatch_throughput(self) -> float:
+        """Refresh throughput counters for the current interval."""
+        return await self._state.update_dispatch_throughput(
+            self._config.throughput_interval_seconds
+        )
+
     def get_dispatch_throughput(self) -> float:
         """
         Calculate current dispatch throughput (AD-19).
@@ -102,21 +108,14 @@ class ManagerStatsCoordinator:
         interval_seconds = self._config.throughput_interval_seconds
 
         elapsed = now - interval_start
+        if elapsed <= 0 or interval_start <= 0:
+            return self._state._dispatch_throughput_last_value
 
         if elapsed >= interval_seconds:
-            # Calculate throughput for completed interval
-            count = self._state._dispatch_throughput_count
-            throughput = count / elapsed if elapsed > 0 else 0.0
+            return self._state._dispatch_throughput_last_value
 
-            # Reset for next interval
-            self._state._dispatch_throughput_count = 0
-            self._state._dispatch_throughput_interval_start = now
-            self._state._dispatch_throughput_last_value = throughput
-
-            return throughput
-
-        # Return last calculated value during interval
-        return self._state._dispatch_throughput_last_value
+        count = self._state._dispatch_throughput_count
+        return count / elapsed
 
     def get_expected_throughput(self) -> float:
         """
