@@ -628,6 +628,20 @@ class ManagerServer(HealthAwareServer):
                 logger=self._udp_logger,
             )
 
+        ledger_base_dir = (
+            self._config.wal_data_dir
+            if self._config.wal_data_dir is not None
+            else Path(self._env.MERCURY_SYNC_LOGS_DIRECTORY)
+        )
+        ledger_path = ledger_base_dir / f"manager-idempotency-{self._node_id.short}.wal"
+        self._idempotency_ledger = ManagerIdempotencyLedger(
+            config=self._idempotency_config,
+            wal_path=ledger_path,
+            task_runner=self._task_runner,
+            logger=self._udp_logger,
+        )
+        await self._idempotency_ledger.start()
+
         # Update node capabilities with proper version
         self._node_capabilities = NodeCapabilities.current(
             node_version=f"manager-{self._node_id.short}"
@@ -701,6 +715,9 @@ class ManagerServer(HealthAwareServer):
 
         # Cancel background tasks
         await self._cancel_background_tasks()
+
+        if self._idempotency_ledger is not None:
+            await self._idempotency_ledger.close()
 
         if self._node_wal is not None:
             await self._node_wal.close()
