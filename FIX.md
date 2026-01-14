@@ -1,482 +1,10 @@
-# Hyperscale Distributed System - Code Analysis & Required Fixes
+# FIX.md (Current Scenario Rescan)
 
-This document catalogs all identified issues across the distributed node implementations, including duplicate code, stub methods, incorrect attribute references, and half-implemented functionality.
+Last updated: 2026-01-14
+Scope: Full re-scan of `SCENARIOS.md` against current implementation.
 
----
-
-## Table of Contents
-
-1. [Critical Issues (Must Fix - Runtime Errors)](#1-critical-issues-must-fix---runtime-errors)
-2. [High Priority Issues](#2-high-priority-issues)
-3. [Medium Priority Issues](#3-medium-priority-issues)
-4. [Low Priority Issues](#4-low-priority-issues)
-5. [Duplicate Class Definitions](#5-duplicate-class-definitions)
-6. [Stub Methods Requiring Implementation](#6-stub-methods-requiring-implementation)
-7. [Dead Code to Remove](#7-dead-code-to-remove)
-8. [Previous Session Fixes (Completed)](#8-previous-session-fixes-completed)
-
----
-
-## 1. Critical Issues (Must Fix - Runtime Errors)
-
-**All critical issues have been fixed in Session 4.**
-
-### 1.1 Gate Server - Wrong Attribute Names ✅ FIXED
-
-| File | Line | Issue | Status |
-|------|------|-------|--------|
-| `nodes/gate/server.py` | 2105, 2117 | `self._logger` → `self._udp_logger` | ✅ Fixed |
-| `nodes/gate/server.py` | 3034 | `self._state` → `self._modular_state` | ✅ Fixed |
-| `nodes/gate/server.py` | 984 | `self._coordinate_tracker` may not be initialized | Verify parent class init |
-
-### 1.2 Manager Server - Wrong Attribute Name ✅ FIXED
-
-| File | Line | Issue | Status |
-|------|------|-------|--------|
-| `nodes/manager/server.py` | 1164 | `self._leadership_coordinator` → `self._leadership` | ✅ Fixed |
-
-### 1.3 Worker Server - Properties Defined Inside `__init__` ✅ FIXED
-
-| File | Lines | Issue | Status |
-|------|-------|-------|--------|
-| `nodes/worker/server.py` | 199-204 | Properties moved to class level | ✅ Fixed |
-
-### 1.4 Gate Handler - Method Name Mismatch ✅ FIXED
-
-| File | Line | Issue | Status |
-|------|------|-------|--------|
-| `nodes/gate/handlers/tcp_cancellation.py` | 298 | Renamed to `handle_cancellation_complete()` | ✅ Fixed |
-
----
-
-## 2. High Priority Issues
-
-**Most high priority issues have been fixed in Session 4. New high-priority findings are listed below.**
-
-### 2.1 Manager Server - Duplicate Method Definition ✅ FIXED
-
-| File | Lines | Issue | Status |
-|------|-------|-------|--------|
-| `nodes/manager/server.py` | 4459-4473 | Second (incorrect) `_select_timeout_strategy()` removed | ✅ Fixed |
-| `nodes/manager/server.py` | 2295-2311 | First (correct) `_select_timeout_strategy()` kept | ✅ Fixed |
-
-**Analysis:** The first implementation (passing `self` to timeout strategies) was correct. The second was passing incorrect parameters that didn't match constructor signatures.
-
-### 2.2 Manager Server - Missing Attribute Initialization ✅ FIXED
-
-| File | Line | Issue | Status |
-|------|------|-------|--------|
-| `nodes/manager/server.py` | 501 | Added `self._resource_sample_task: asyncio.Task | None = None` | ✅ Fixed |
-
-### 2.3 Gate Server - Stub Method ✅ FIXED
-
-| File | Lines | Issue | Status |
-|------|-------|-------|--------|
-| `nodes/gate/server.py` | 2352-2370 | `_record_dc_job_stats()` fully implemented | ✅ Fixed |
-
-**Implementation:** Now properly records job stats to `_job_stats_crdt` with:
-- `completed` count via `JobStatsCRDT.record_completed()`
-- `failed` count via `JobStatsCRDT.record_failed()`
-- `rate` via `JobStatsCRDT.record_rate()`
-- `status` via `JobStatsCRDT.record_status()`
-
----
-
-### 2.4 Federated Health Monitor - Missing Ack Timeout Handling ✅ FIXED
-
-| File | Lines | Issue | Status |
-|------|-------|-------|--------|
-| `distributed/swim/health/federated_health_monitor.py` | 351-382, 404-432 | Probe failures only recorded when `_send_udp` fails; missing `xack` never transitions DC to `SUSPECTED/UNREACHABLE` | ✅ Fixed |
-
-**Fix implemented:**
-- Added `_check_ack_timeouts()` method that checks all DCs for ack timeout
-- Called after each probe in `_probe_loop` 
-- Uses `ack_grace_period = probe_timeout * max_consecutive_failures` to detect silent failures
-- Transitions DC to SUSPECTED/UNREACHABLE when last_ack_received exceeds grace period
-
-### 2.5 Multi-Gate Submit Storm Can Create Duplicate Jobs in a DC ✅ FIXED
-
-| File | Lines | Issue | Status |
-|------|-------|-------|--------|
-| `distributed/datacenters/manager_dispatcher.py` | 171-240 | Dispatch falls back to any manager if leader unknown | ✅ Fixed via leader fencing |
-| `distributed/nodes/manager/server.py` | 4560-4740 | `job_submission` accepts jobs on any ACTIVE manager without leader fencing | ✅ Fixed |
-| `distributed/leases/job_lease.py` | 101-150 | Gate leases are local only (no cross-gate fencing) | N/A (covered by leader fencing) |
-
-**Fix implemented:**
-- Added leader fencing check in `job_submission` handler on manager
-- Non-leader managers now reject job submissions with error: "Not DC leader, retry at leader: {addr}"
-- Response includes leader hint address for client/gate retry
-
-### 2.6 Workflow Requeue Ignores Stored Dispatched Context ✅ FIXED
-
-| File | Lines | Issue | Status |
-|------|-------|-------|--------|
-| `distributed/jobs/workflow_dispatcher.py` | 607-664, 1194-1212 | Requeue resets dispatch state but always recomputes context via `get_context_for_workflow` | ✅ Fixed |
-| `distributed/jobs/job_manager.py` | 1136-1149 | Dispatched context is stored but never reused on requeue | ✅ Fixed |
-
-**Fix implemented:**
-- Added `get_stored_dispatched_context(job_id, workflow_id)` method to `JobManager`
-- Returns `(context_bytes, layer_version)` tuple if stored context exists
-- Modified `_dispatch_workflow` in `WorkflowDispatcher` to prefer stored context
-- Only recomputes fresh context when no stored context is available
-
-### 2.7 Gate Quorum Size Fixed to Static Seed List
-
-| File | Lines | Issue |
-|------|-------|-------|
-| `distributed/nodes/gate/server.py` | 5244-5249 | Quorum size computed from `self._gate_peers` (static seed list), not current membership |
-
-**Why this matters:** Dynamic membership (new gates joining, dead peers removed) never affects quorum size, so leaders may step down incorrectly or fail to step down when they should.
-
-**Fix (actionable):**
-- Replace `known_gate_count = len(self._gate_peers) + 1` with a dynamic count derived from runtime state (e.g., `_modular_state.get_active_peer_count()` plus self, or a tracked known gate set).
-- Optionally support an explicit config override for fixed-size clusters, but default to dynamic membership.
-- Update quorum logging to include active/known counts from the same source used to compute quorum.
-
-### 2.8 Job Progress Ordering Uses Fence Token Instead of Per-Update Sequence ✅ FIXED
-
-| File | Lines | Issue | Status |
-|------|-------|-------|--------|
-| `distributed/nodes/gate/state.py` | 324-361 | `check_and_record_progress` uses `fence_token` for ordering and `timestamp` for dedup | ✅ Fixed |
-| `distributed/models/distributed.py` | 1459-1471 | `JobProgress` has no monotonic sequence for per-update ordering | ✅ Fixed |
-
-**Why this matters:** `fence_token` is for leadership safety, not progress sequencing. Out-of-order progress with the same fence token is accepted, which breaks scenario 7.2 and can regress job status.
-
-**Fix implemented:**
-- Added `progress_sequence: int = 0` field to `JobProgress` in `models/distributed.py`
-- Added `_job_progress_sequences` tracking dict to `JobManager` with methods:
-  - `get_next_progress_sequence(job_id)` - async increment and return
-  - `get_current_progress_sequence(job_id)` - read without increment
-  - `cleanup_progress_sequence(job_id)` - cleanup on job completion
-- Updated `check_and_record_progress()` in gate state.py to use `progress_sequence` instead of `fence_token`
-- Updated `handle_progress()` in tcp_job.py to pass `progress_sequence` to the check method
-- Updated `to_wire_progress()` in `JobInfo` to accept `progress_sequence` parameter
-- Added cleanup in `complete_job()` to remove progress sequence tracking
-
-### 2.9 Job Completion Ignores Missing Target Datacenters ✅ FIXED
-
-| File | Lines | Issue | Status |
-|------|-------|-------|--------|
-| `distributed/nodes/gate/handlers/tcp_job.py` | 783-813 | Job completion computed using `len(job.datacenters)` instead of `target_dcs` | ✅ Fixed |
-
-**Why this matters:** If a target DC never reports progress, the job can be marked complete as soon as all reporting DCs are terminal, violating multi-DC completion rules.
-
-**Fix implemented:**
-- Completion check now verifies all target DCs have reported: `target_dcs <= reported_dc_ids`
-- Only marks job complete when both conditions are met:
-  1. All target DCs have reported progress
-  2. All reported DCs are in terminal status
-- If target DCs are missing but all reported DCs are terminal, logs a warning and waits for timeout tracker
-- Uses `target_dc_count` instead of `len(job.datacenters)` for final status calculations
-- Fallback behavior (no target_dcs) unchanged for backward compatibility
-
----
-
-## 3. Medium Priority Issues
-
-### 3.1 Manager Server - Incomplete Job Completion Handler ✅ VERIFIED COMPLETE
-
-| File | Lines | Issue | Status |
-|------|-------|-------|--------|
-| `nodes/manager/server.py` | 5595-5620 | `_handle_job_completion()` | ✅ Already implemented |
-
-**Verified implementation:**
-- ✅ Push completion notification to origin gate/client - via `_notify_gate_of_completion()` (line 5687)
-- ✅ Clean up reporter tasks - via `_manager_state.clear_job_state()` (line 5745)
-- ✅ Handle workflow result aggregation - via `_aggregate_workflow_results()` (line 5608-5609)
-- ✅ Update job status to COMPLETED - at line 5604
-
-**Note:** Original line numbers in FIX.md were stale. The functionality is fully implemented in the current codebase.
-
-### 3.2 Manager Server - Duplicate Heartbeat Processing ✅ FIXED
-
-| File | Lines | Issue | Status |
-|------|-------|-------|--------|
-| `nodes/manager/server.py` | 1455-1464 | Worker heartbeat via SWIM embedding | Already has dedup |
-| `nodes/manager/server.py` | 4320-4349 | Worker heartbeat via TCP handler | ✅ Fixed |
-
-**Analysis:**
-- `WorkerPool.process_heartbeat()` already has version-based deduplication (lines 445-449)
-- SWIM path calls `_health_monitor.handle_worker_heartbeat()` for health state updates
-- TCP path was missing the health monitoring call
-
-**Fix implemented:**
-- Added `_health_monitor.handle_worker_heartbeat()` call to TCP handler
-- Added worker existence check before calling `process_heartbeat()` (matching SWIM path)
-- Both paths now use identical processing logic
-
-### 3.3 Gate Server - Duplicate Health Classification Logic ✅ VERIFIED NO ISSUE
-
-| File | Lines | Issue | Status |
-|------|-------|-------|--------|
-| `nodes/gate/server.py` | 2090-2093 | `_classify_datacenter_health()` calls `_log_health_transitions()` | ✅ No longer exists |
-| `nodes/gate/server.py` | 2095-2098 | `_get_all_datacenter_health()` also calls `_log_health_transitions()` | ✅ No longer exists |
-
-**Verification:**
-- `_classify_datacenter_health()` (now line 3004) delegates to `_dc_health_manager.get_datacenter_health(dc_id)` - no `_log_health_transitions()` call
-- `_get_all_datacenter_health()` (now line 3007) delegates to `_dc_health_manager.get_all_datacenter_health()` - no `_log_health_transitions()` call
-- `_log_health_transitions()` is only called once at line 5237 in `dead_peer_reap_loop`
-- The original issue (duplicate logging) no longer exists - code was likely refactored previously
-
-### 3.4 Gate Server - Duplicate Datacenter Selection Logic ✅ VERIFIED INTENTIONAL DESIGN
-
-| File | Lines | Issue | Status |
-|------|-------|-------|--------|
-| `nodes/gate/server.py` | 3045-3074 | `_select_datacenters_with_fallback()` | ✅ Modern implementation |
-| `nodes/gate/server.py` | 3108-3136 | `_legacy_select_datacenters()` | ✅ Explicit fallback |
-
-**Verification:**
-- This is an **intentional migration pattern**, not duplicate code
-- `_select_datacenters_with_fallback()` uses `_job_router` if available (modern path)
-- Falls back to `_legacy_select_datacenters()` only when no `_job_router`
-- `_legacy_select_datacenters()` can also delegate to `_health_coordinator` if available
-- Only runs inline legacy logic when no coordinator exists
-- This layered fallback enables gradual migration without breaking existing deployments
-- **No action needed** - keep both methods for backward compatibility
-
-### 3.5 Client - Stub Orphan Check Loop ✅ FIXED
-
-| File | Lines | Issue | Status |
-|------|-------|-------|--------|
-| `nodes/client/leadership.py` | 371-450 | `orphan_check_loop()` had incorrect attributes | ✅ Fixed |
-
-**Fix implemented:**
-- Original implementation used non-existent attributes (`gate_id`, `tcp_host`, `tcp_port`)
-- Fixed to use correct model attributes (`gate_addr`, `manager_addr`)
-- Fixed `OrphanedJobInfo` construction to use correct parameters
-- Added second loop to check manager-only leaders (no gate leader)
-- Added proper error logging (was swallowing exceptions silently)
-- Removed unused `ServerInfo` import
-
-### 3.6 Gate Handler - Unused Method ✅ VERIFIED NO ISSUE
-
-| File | Lines | Issue | Status |
-|------|-------|-------|--------|
-| `nodes/gate/handlers/tcp_state_sync.py` | 153-217 | `handle_state_sync_response()` defined but never called | ✅ Method doesn't exist |
-
-**Verification:**
-- `handle_state_sync_response` does not exist in the file
-- The handlers that DO exist are all properly wired:
-  - `handle_state_sync_request` → wired at gate server line 1289
-  - `handle_lease_transfer` → wired at gate server line 1303
-  - `handle_job_final_result` → wired at gate server line 1341
-  - `handle_job_leadership_notification` → wired at gate server line 1366
-- Either the method was already removed or the original scan had an error
-
-### 3.7 Manager Leadership Loss Handler Is Stubbed ✅ FIXED
-
-| File | Lines | Issue | Status |
-|------|-------|-------|--------|
-| `distributed/nodes/manager/server.py` | 990-1016 | `_on_manager_lose_leadership()` was `pass` | ✅ Fixed |
-
-**Fix implemented:**
-- Added `_handle_leadership_loss()` async method to properly handle demotion
-- Logs leadership loss event for observability
-- Stops timeout tracking for all led jobs via `strategy.stop_tracking(job_id, "leadership_lost")`
-- Individual stop failures are logged but don't prevent other jobs from being stopped
-- One-shot sync tasks (`_sync_state_from_workers`, `_sync_state_from_manager_peers`, etc.) don't need stopping - they complete naturally
-
-### 3.8 Background Loops Swallow Exceptions Without Logging ✅ FIXED
-
-| File | Lines | Issue | Status |
-|------|-------|-------|--------|
-| `distributed/nodes/worker/background_loops.py` | 170-173, 250-253, 285-288, 354-357 | `except Exception: pass` hides failures | ✅ Fixed - all 4 loops now log errors |
-| `distributed/nodes/worker/backpressure.py` | 97-100 | Overload polling loop suppresses errors | ✅ Fixed - now logs via ServerWarning |
-| `distributed/nodes/worker/progress.py` | 554-555 | Progress ACK parsing errors swallowed | ✓ Intentional for legacy `b"ok"` compatibility |
-| `distributed/nodes/worker/handlers/tcp_progress.py` | 65-67 | ACK parse errors ignored | ✓ Already has comment explaining legacy compatibility |
-| `distributed/nodes/gate/leadership_coordinator.py` | 137-145 | Leadership announcement errors unlogged | ✅ Fixed - now logs at debug level |
-| `distributed/nodes/gate/server.py` | 3827-3833 | DC leader announcement errors swallowed | ✅ Fixed - now logs at debug level |
-
-**Fix implemented:**
-- Worker background loops now log errors via `ServerWarning` instead of silent `pass`
-- Backpressure polling loop now logs errors
-- Leadership/DC announcement failures logged at debug level (best-effort patterns)
-- ACK parsing in `progress.py` and `tcp_progress.py` intentionally ignore parse errors for backward compatibility with legacy `b"ok"` responses
-
----
-
-## 4. Low Priority Issues
-
-### 4.1 Manager Server - Inconsistent Status Comparison ✅ VERIFIED NO ISSUE
-
-| File | Line | Issue | Status |
-|------|------|-------|--------|
-| `nodes/manager/server.py` | 3966 | Uses `JobStatus.CANCELLED.value` inconsistently | ✅ No longer present |
-
-**Verification:**
-- All 17 uses of `JobStatus.XXX` in the file consistently use `.value`
-- Comparisons: `job.status == JobStatus.CANCELLED.value`
-- Assignments: `job.status = JobStatus.COMPLETED.value`
-- Pattern is already standardized
-
-### 4.2 Gate Server - Unused Job Ledger ⏸️ DEFERRED (requires user decision)
-
-| File | Lines | Issue | Status |
-|------|-------|-------|--------|
-| `nodes/gate/server.py` | 897-905 | Job ledger created but never used | ⏸️ Needs user decision |
-
-**Analysis:**
-- `_job_ledger` is created if `_ledger_data_dir` is configured (line 896-905)
-- Properly closed in `stop()` (line 1044-1045)
-- No actual read/write operations on the ledger anywhere in the file
-- Might be intended for future durability features
-
-**Options:**
-1. Remove initialization code (breaks future ledger support)
-2. Keep as-is (harmless if `_ledger_data_dir` is None by default)
-3. Implement ledger usage for job state persistence
-
-### 4.3 Gate Server - Unnecessary Conditional Check ✓ ACCEPTED (defensive pattern)
-
-| File | Lines | Issue | Status |
-|------|-------|-------|--------|
-| `nodes/gate/server.py` | 997, 1038, 2823 | `if self._orphan_job_coordinator:` always True | ✓ Keeping as defensive |
-
-**Analysis:**
-- `_orphan_job_coordinator` is always initialized in `_init_coordinators()` (line 761-775)
-- Checks are technically unnecessary but harmless
-- Defensive checks protect against future initialization order changes
-- No performance impact (simple None check)
-- **Decision**: Keep as defensive pattern - not worth the risk of removal
-
-### 4.4 Gate Handlers - Unnecessary Defensive Checks ✅ VERIFIED NO ISSUE
-
-| File | Lines | Issue | Status |
-|------|-------|-------|--------|
-| `nodes/gate/handlers/tcp_job.py` | 361, 366, 375, 380, 401 | `"submission" in dir()` checks | ✅ Don't exist |
-| `nodes/gate/handlers/tcp_cancellation.py` | 237-239 | `"cancel_request" in dir()` check | ✅ Doesn't exist |
-
-**Verification:**
-- Searched entire `hyperscale/distributed/` for `in dir()` patterns
-- Only one occurrence in `swim/core/metrics.py` for legitimate introspection
-- The defensive checks mentioned were either removed previously or never existed
-
----
-
-## 5. Duplicate Class Definitions
-
-These duplicate class names create confusion and potential import conflicts.
-
-### 5.1 Critical Duplicates (Should Consolidate)
-
-| Class | File 1 | File 2 | Recommendation |
-|-------|--------|--------|----------------|
-| `LeaseManager` | `leases/job_lease.py:57` | `datacenters/lease_manager.py:39` | Rename to `JobLeaseManager` and `DatacenterLeaseManager` |
-| `NodeRole` | `discovery/security/role_validator.py:16` | `models/distributed.py:27` | Consolidate to models |
-| `Env` | `taskex/env.py:9` | `env/env.py:10` | Remove `taskex/env.py`, use main Env |
-| `ManagerInfo` | `models/distributed.py:189` | `datacenters/datacenter_health_manager.py:41` | Rename datacenter version to `DatacenterManagerInfo` |
-| `OverloadState` | `nodes/manager/load_shedding.py:32` (class) | `reliability/overload.py:20` (Enum) | Consolidate to single Enum |
-
-### 5.2 Other Duplicates (Lower Priority)
-
-| Class | Count | Notes |
-|-------|-------|-------|
-| `BackpressureLevel` | 2 | Different contexts |
-| `ClientState` | 2 | Different contexts |
-| `DCHealthState` | 2 | Different contexts |
-| `ExtensionTracker` | 2 | Different contexts |
-| `GatePeerState` | 2 | Different contexts |
-| `HealthPiggyback` | 2 | Different contexts |
-| `HealthSignals` | 2 | Different contexts |
-| `JobSuspicion` | 2 | Different contexts |
-| `ManagerState` | 2 | Different contexts |
-| `NodeHealthTracker` | 2 | Different contexts |
-| `NodeStatus` | 2 | Different contexts |
-| `ProgressState` | 2 | Different contexts |
-| `QueueFullError` | 2 | Different contexts |
-| `RetryDecision` | 2 | Different contexts |
-
----
-
-## 6. Stub Methods Requiring Implementation ✅ ALL RESOLVED
-
-Based on grep for `pass$` at end of methods (excluding exception handlers).
-
-### 6.1 High Priority Stubs ✅ ALL FIXED
-
-| File | Line | Method | Status |
-|------|------|--------|--------|
-| `nodes/gate/server.py` | 2354 | `_record_dc_job_stats()` | ✅ Fixed in Session 4 |
-| `nodes/client/leadership.py` | 259 | `orphan_check_loop()` | ✅ Fixed in 3.5 (wrong attributes corrected) |
-
-### 6.2 Timeout Strategy Stubs ✅ VERIFIED IMPLEMENTED
-
-| File | Lines | Methods | Status |
-|------|-------|---------|--------|
-| `jobs/timeout_strategy.py` | 58, 73, 88, 108, 127, 149, 163, 177 | Multiple timeout strategy methods | ✅ All implemented |
-
-### 6.3 Acceptable `pass` Statements
-
-Many `pass` statements are in exception handlers where silently ignoring errors is intentional:
-- Connection cleanup during shutdown
-- Non-critical logging failures
-- Timeout handling
-- Resource cleanup
-
----
-
-## 7. Dead Code to Remove ✅ ALL RESOLVED
-
-### 7.1 Dead Code Status
-
-| File | Lines | Description | Status |
-|------|-------|-------------|--------|
-| `nodes/manager/server.py` | 2295-2311 | First `_select_timeout_strategy()` (duplicate) | ✅ Removed in Session 4 |
-| `nodes/gate/handlers/tcp_state_sync.py` | 153-217 | `handle_state_sync_response()` (never called) | ✅ Method doesn't exist (verified 3.6) |
-| `nodes/gate/server.py` | 892-901 | Job ledger initialization (never used) | ⏸️ Deferred - may be for future use (4.2) |
-
-### 7.2 Recently Removed
-
-| File | Description |
-|------|-------------|
-| `routing/consistent_hash.py` | **DELETED** - was buggy duplicate of `jobs/gates/consistent_hash_ring.py` |
-
----
-
-## 8. Previous Session Fixes (Completed)
-
-### Session 1 Fixes (All Completed)
-
-| ID | Severity | Category | Location | Status |
-|----|----------|----------|----------|--------|
-| F1 | CRITICAL | Missing Method | windowed_stats_collector.py | ✅ FIXED |
-| F2 | CRITICAL | Missing Method | windowed_stats_collector.py | ✅ FIXED |
-| F3 | CRITICAL | Missing Method | windowed_stats_collector.py | ✅ FIXED |
-| F4 | MEDIUM | Race Condition | stats_coordinator.py | ✅ FIXED |
-| F5 | MEDIUM | Race Condition | crdt.py | ✅ FIXED |
-| F6 | MEDIUM | Race Condition | windowed_stats_collector.py | ✅ FIXED |
-| F7 | LOW | Blocking Call | tcp_windowed_stats.py | ✅ FIXED |
-| F8 | LOW | Observability | gate/server.py | ✅ FIXED |
-| F9 | LOW | Race Condition | gate/server.py | ✅ FIXED |
-
-### Session 2: Comprehensive Scenario Tracing (All Completed)
-
-All 35+ issues from Categories A-F have been fixed:
-- **A: Manager Registration & Discovery** - 3 issues ✅
-- **B: Job Dispatch & Routing** - 7 issues ✅
-- **C: Health Detection & Circuit Breaker** - 6 issues ✅
-- **D: Overload & Backpressure** - 6 issues ✅
-- **E: Worker Registration & Core Allocation** - 6 issues ✅
-- **F: Workflow Dispatch & Execution** - 6 issues ✅
-
-### Session 3: Import Path Fixes (All Completed)
-
-| Issue | Files | Status |
-|-------|-------|--------|
-| Phantom `hyperscale.distributed.hash_ring` | `peer_coordinator.py`, `orphan_job_coordinator.py` | ✅ Fixed → `jobs.gates.consistent_hash_ring` |
-| Phantom `from taskex import` | 7 gate files | ✅ Fixed → `hyperscale.distributed.taskex` |
-| Wrong `ErrorStats` path | `tcp_job.py` | ✅ Fixed → `swim.core` |
-| Wrong `GateInfo` path | `tcp_job.py` | ✅ Fixed → `models` |
-
-### Session 3: ConsistentHashRing Improvements (Completed)
-
-| Improvement | Status |
-|-------------|--------|
-| Made async with `asyncio.Lock` | ✅ |
-| Added input validation (`replicas >= 1`) | ✅ |
-| Added `get_backup()` method | ✅ |
-| Optimized `remove_node()` from O(n×replicas) to O(n) | ✅ |
-| Deleted redundant `routing/consistent_hash.py` | ✅ |
+This file reflects **current** findings only. Previously reported items that have been fixed or moved
+have been removed to prevent confusion.
 
 ---
 
@@ -484,21 +12,94 @@ All 35+ issues from Categories A-F have been fixed:
 
 | Severity | Count | Status |
 |----------|-------|--------|
-| **Critical (runtime errors)** | 5 | 🔴 Needs Fix |
-| **High Priority** | 9 | 🔴 Needs Fix |
-| **Medium Priority** | 8 | 🟡 Should Fix |
-| **Low Priority** | 4 | 🟢 Can Wait |
-| **Duplicate Classes** | 15+ | 🟡 Should Consolidate |
-| **Stub Methods** | 10+ | 🟡 Needs Implementation |
-| **Dead Code** | 3 | 🟢 Should Remove |
+| **High Priority** | 2 | 🔴 Needs Fix |
+| **Medium Priority** | 4 | 🟡 Should Fix |
+| **Low Priority** | 0 | 🟢 Can Wait |
 
 ---
 
-## Recommended Fix Order
+## 1. High Priority Issues
 
-1. **Fix all Critical issues first** (Section 1) - these cause runtime crashes
-2. **Fix High Priority issues** (Section 2) - duplicate methods, missing initializations
-3. **Address Medium Priority issues** (Section 3) - incomplete functionality
-4. **Clean up Low Priority issues and dead code** (Sections 4, 7)
-5. **Consolidate duplicate class definitions** (Section 5) - can be done incrementally
-6. **Implement stub methods** (Section 6) - as needed for features
+### 1.1 Worker Background Loops Swallow Exceptions
+
+| File | Lines | Issue |
+|------|-------|-------|
+| `distributed/nodes/worker/background_loops.py` | 170-173, 250-253, 285-288, 354-357 | `except Exception: pass` hides failures in reap/orphan/discovery/progress loops |
+
+**Why this matters:** These loops are critical to recovery, orphan handling, and backpressure. Silent failures violate soak/chaos scenarios and the “never swallow errors” rule.
+
+**Fix (actionable):**
+- Replace `except Exception: pass` with `await logger.log(...)` (or `task_runner_run(logger.log, ...)`) including loop name and context.
+- Add basic throttling (e.g., exponential backoff or log sampling) to avoid spam during repeated failures.
+
+### 1.2 Federated Health Probe Loop Hides Exceptions
+
+| File | Lines | Issue |
+|------|-------|-------|
+| `distributed/swim/health/federated_health_monitor.py` | 369-373 | Probe loop catches `Exception` and only sleeps, no logging |
+
+**Why this matters:** Cross-DC health is foundational for routing and failover. Silent probe errors create false health and delay detection during partitions.
+
+**Fix (actionable):**
+- Log the exception with context (datacenter list and probe interval).
+- Optionally increment a failure counter and trigger backoff if repeated errors occur.
+
+---
+
+## 2. Medium Priority Issues
+
+### 2.1 Worker Overload Polling Suppresses Errors
+
+| File | Lines | Issue |
+|------|-------|-------|
+| `distributed/nodes/worker/backpressure.py` | 97-100 | Overload polling loop suppresses unexpected exceptions |
+
+**Why this matters:** If resource sampling breaks, overload detection becomes stale without any visibility.
+
+**Fix (actionable):**
+- Log exceptions with CPU/memory getter context.
+- Continue loop after logging to keep sampling alive.
+
+### 2.2 Progress ACK Parsing Errors Are Silent
+
+| File | Lines | Issue |
+|------|-------|-------|
+| `distributed/nodes/worker/progress.py` | 554-555 | ACK parse failures ignored without logging |
+| `distributed/nodes/worker/handlers/tcp_progress.py` | 65-67 | ACK parse failures ignored without logging |
+
+**Why this matters:** If managers send malformed ACKs, backpressure and leader updates won’t apply and the issue is invisible.
+
+**Fix (actionable):**
+- Log parse errors at debug level when payload is not legacy `b"ok"`.
+- Keep backward compatibility by skipping logs for the legacy response.
+
+### 2.3 Lease Expiry Callback Errors Are Dropped
+
+| File | Lines | Issue |
+|------|-------|-------|
+| `distributed/leases/job_lease.py` | 276-283 | Exceptions from `on_lease_expired` are swallowed |
+
+**Why this matters:** If a gate fails to process lease expiry, orphan handling and reassignment can silently fail.
+
+**Fix (actionable):**
+- Log exceptions with lease/job identifiers and continue cleanup.
+- Consider isolating per-lease failure without skipping remaining expiries.
+
+### 2.4 Cross-DC Correlation Callback Errors Are Dropped
+
+| File | Lines | Issue |
+|------|-------|-------|
+| `distributed/datacenters/cross_dc_correlation.py` | 1167-1172, 1189-1195 | Partition healed/detected callbacks swallow exceptions |
+
+**Why this matters:** Partition detection events are key for gating eviction and routing. Silent callback failures can suppress alerts or policy changes.
+
+**Fix (actionable):**
+- Log callback failures with the affected datacenter list and severity.
+- Keep callbacks isolated so one failure doesn’t block others.
+
+---
+
+## Notes
+
+- The re-scan confirms that previously reported issues around federated ACK timeouts, progress ordering, target DC completion, quorum sizing, and manager leadership loss handling are now resolved in the current codebase.
+- This document intentionally focuses on current, actionable gaps with direct scenario impact.
