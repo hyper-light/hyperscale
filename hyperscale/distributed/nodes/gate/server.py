@@ -5057,9 +5057,8 @@ class GateServer(HealthAwareServer):
                 ]
 
                 for peer_addr in peers_to_reap:
+                    self._modular_state.cleanup_peer_tcp_tracking(peer_addr)
                     self._modular_state.mark_peer_dead(peer_addr, now)
-                    self._modular_state.mark_peer_healthy(peer_addr)
-                    await self._modular_state.remove_active_peer(peer_addr)
 
                     self._task_runner.run(
                         self._udp_logger.log,

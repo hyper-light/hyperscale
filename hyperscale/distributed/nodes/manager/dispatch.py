@@ -301,9 +301,10 @@ class ManagerDispatchCoordinator:
             version=version,
         )
 
-        # Track pending provision
-        self._state._pending_provisions[workflow_id] = request
-        self._state._provision_confirmations[workflow_id] = {self._node_id}
+        async with self._provision_lock:
+            # Track pending provision atomically
+            self._state._pending_provisions[workflow_id] = request
+            self._state._provision_confirmations[workflow_id] = {self._node_id}
 
         # Send to all active peers
         peers = list(self._state._active_manager_peers)
@@ -324,9 +325,11 @@ class ManagerDispatchCoordinator:
                         confirmation.confirmed
                         and confirmation.workflow_id == workflow_id
                     ):
-                        self._state._provision_confirmations[workflow_id].add(
-                            confirmation.confirming_node
-                        )
+                        async with self._provision_lock:
+                            if workflow_id in self._state._provision_confirmations:
+                                self._state._provision_confirmations[workflow_id].add(
+                                    confirmation.confirming_node
+                                )
                         self._task_runner.run(
                             self._logger.log,
                             ServerDebug(
@@ -348,13 +351,14 @@ class ManagerDispatchCoordinator:
                     ),
                 )
 
-        # Check quorum
-        confirmed = self._state._provision_confirmations.get(workflow_id, set())
-        quorum_achieved = len(confirmed) >= quorum_size
+        # Check quorum and cleanup atomically
+        async with self._provision_lock:
+            confirmed = self._state._provision_confirmations.get(workflow_id, set())
+            quorum_achieved = len(confirmed) >= quorum_size
 
-        # Cleanup
-        self._state._pending_provisions.pop(workflow_id, None)
-        self._state._provision_confirmations.pop(workflow_id, None)
+            # Cleanup
+            self._state._pending_provisions.pop(workflow_id, None)
+            self._state._provision_confirmations.pop(workflow_id, None)
 
         return quorum_achieved
 

@@ -383,6 +383,8 @@ class WorkflowProgressAck(Message):
                 backpressure_level = values[3] if len(values) > 3 else 0
                 backpressure_delay_ms = values[4] if len(values) > 4 else 0
                 backpressure_batch_only = values[5] if len(values) > 5 else False
+            message_id = values[7] if len(values) > 7 else None
+            sender_incarnation = values[8] if len(values) > 8 else None
         else:
             raise TypeError("Unsupported WorkflowProgressAck state")
 
@@ -393,6 +395,11 @@ class WorkflowProgressAck(Message):
 
         if isinstance(job_leader_addr, list):
             job_leader_addr = tuple(job_leader_addr)
+
+        if message_id is not None:
+            self.message_id = message_id
+        if sender_incarnation is not None:
+            self.sender_incarnation = sender_incarnation
 
         self.manager_id = manager_id
         self.is_leader = is_leader

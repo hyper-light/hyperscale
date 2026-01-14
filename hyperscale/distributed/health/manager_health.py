@@ -233,6 +233,26 @@ class ManagerHealthState:
         async with self._state_lock:
             self._apply_readiness_update(has_quorum, accepting, worker_count)
 
+    async def update_from_heartbeat_async(
+        self,
+        success: bool,
+        has_quorum: bool,
+        accepting: bool,
+        worker_count: int,
+    ) -> None:
+        """
+        Update liveness and readiness from a manager heartbeat.
+
+        Args:
+            success: Whether the heartbeat/probe succeeded
+            has_quorum: Whether manager has quorum for decisions
+            accepting: Whether manager is accepting new jobs
+            worker_count: Number of active workers available
+        """
+        async with self._state_lock:
+            self._apply_liveness_update(success)
+            self._apply_readiness_update(has_quorum, accepting, worker_count)
+
     def _apply_progress_update(
         self,
         jobs_accepted: int,
