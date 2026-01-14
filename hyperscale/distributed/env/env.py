@@ -629,6 +629,8 @@ class Env(BaseModel):
         1000  # Max tracked destinations (LRU evicted)
     )
 
+    MTLS_STRICT_MODE: StrictStr = "false"
+
     @classmethod
     def types_map(cls) -> Dict[str, Callable[[str], PrimaryType]]:
         return {
