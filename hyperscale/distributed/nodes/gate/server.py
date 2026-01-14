@@ -692,6 +692,7 @@ class GateServer(HealthAwareServer):
             get_udp_port=lambda: self._udp_port,
             confirm_peer=self._confirm_peer,
             handle_job_leader_failure=self._handle_job_leader_failure,
+            remove_peer_circuit=self._peer_gate_circuit_breaker.remove_circuit,
             is_leader=self.is_leader,
         )
 
@@ -3495,6 +3496,7 @@ class GateServer(HealthAwareServer):
         self._manager_last_status.pop(manager_addr, None)
         await self._clear_manager_backpressure(manager_addr)
         self._manager_negotiated_caps.pop(manager_addr, None)
+        await self._circuit_breaker_manager.remove_circuit(manager_addr)
 
         for dc_id in list(self._datacenter_manager_status.keys()):
             dc_managers = self._datacenter_manager_status.get(dc_id)

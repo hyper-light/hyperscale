@@ -82,12 +82,9 @@ class ManagerStatsCoordinator:
         self._progress_state_since: float = time.monotonic()
 
         # AD-23: Stats buffer tracking for backpressure
-        self._stats_buffer_count: int = 0
-        self._stats_buffer_high_watermark: int = config.stats_buffer_high_watermark
-        self._stats_buffer_critical_watermark: int = (
-            config.stats_buffer_critical_watermark
-        )
-        self._stats_buffer_reject_watermark: int = config.stats_buffer_reject_watermark
+        self._stats_buffer: StatsBuffer = stats_buffer
+
+        self._windowed_stats: "WindowedStatsCollector" = windowed_stats
 
     def record_dispatch(self) -> None:
         """Record a workflow dispatch for throughput tracking."""
