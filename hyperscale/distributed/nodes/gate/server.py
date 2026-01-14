@@ -3613,15 +3613,6 @@ class GateServer(HealthAwareServer):
         )
 
     def _on_partition_detected(self, affected_datacenters: list[str]) -> None:
-        """Handle partition detection routing updates."""
-        routing_reset_jobs: list[str] = []
-        if self._job_router:
-            routing_reset_jobs = (
-                self._job_router.reset_primary_for_partitioned_datacenters_with_jobs(
-                    affected_datacenters
-                )
-            )
-
         for callback in self._partition_detected_callbacks:
             try:
                 callback(affected_datacenters)
