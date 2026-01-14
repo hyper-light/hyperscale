@@ -95,6 +95,7 @@ class GateDispatchCoordinator:
         capacity_aggregator: DatacenterCapacityAggregator | None = None,
         spillover_evaluator: SpilloverEvaluator | None = None,
         observed_latency_tracker: "ObservedLatencyTracker | None" = None,
+        record_dispatch_failure: Callable[[str, str], None] | None = None,
     ) -> None:
         self._state: "GateRuntimeState" = state
         self._logger: "Logger" = logger
