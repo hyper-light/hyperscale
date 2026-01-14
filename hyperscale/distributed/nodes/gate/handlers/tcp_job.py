@@ -85,7 +85,9 @@ class GateJobHandler:
         quorum_size: Callable[[], int],
         select_datacenters_with_fallback: Callable,
         get_healthy_gates: Callable[[], list["GateInfo"]],
-        broadcast_job_leadership: Callable[[str, int], "asyncio.Task"],
+        broadcast_job_leadership: Callable[
+            [str, int, tuple[str, int] | None], Awaitable[None]
+        ],
         dispatch_job_to_datacenters: Callable,
         forward_job_progress_to_peers: Callable,
         record_request_latency: Callable[[float], None],
@@ -147,9 +149,9 @@ class GateJobHandler:
             select_datacenters_with_fallback
         )
         self._get_healthy_gates: Callable[[], list["GateInfo"]] = get_healthy_gates
-        self._broadcast_job_leadership: Callable[[str, int], "asyncio.Task"] = (
-            broadcast_job_leadership
-        )
+        self._broadcast_job_leadership: Callable[
+            [str, int, tuple[str, int] | None], Awaitable[None]
+        ] = broadcast_job_leadership
         self._dispatch_job_to_datacenters: Callable = dispatch_job_to_datacenters
         self._forward_job_progress_to_peers: Callable = forward_job_progress_to_peers
         self._record_request_latency: Callable[[float], None] = record_request_latency
@@ -342,6 +344,7 @@ class GateJobHandler:
             await self._broadcast_job_leadership(
                 submission.job_id,
                 len(target_dcs),
+                submission.callback_addr,
             )
 
             self._quorum_circuit.record_success()
