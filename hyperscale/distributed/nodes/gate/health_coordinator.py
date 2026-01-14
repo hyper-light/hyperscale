@@ -93,6 +93,9 @@ class GateHealthCoordinator:
         self._confirm_manager_for_dc: Callable[
             [str, tuple[str, int]], "asyncio.Task"
         ] = confirm_manager_for_dc
+        self._capacity_aggregator: DatacenterCapacityAggregator | None = (
+            capacity_aggregator
+        )
         self._on_partition_healed: Callable[[list[str]], None] | None = (
             on_partition_healed
         )
