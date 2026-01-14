@@ -2678,6 +2678,43 @@ class GateServer(HealthAwareServer):
 
         return False
 
+    async def _forward_job_final_result_to_peers(self, data: bytes) -> bool:
+        for gate_id, gate_info in list(self._modular_state.iter_known_gates()):
+            if gate_id == self._node_id.full:
+                continue
+
+            gate_addr = (gate_info.tcp_host, gate_info.tcp_port)
+            if await self._peer_gate_circuit_breaker.is_circuit_open(gate_addr):
+                continue
+
+            circuit = await self._peer_gate_circuit_breaker.get_circuit(gate_addr)
+            try:
+                response = await self.send_tcp(
+                    gate_addr,
+                    "job_final_result",
+                    data,
+                    timeout=3.0,
+                )
+                if response and response[0] == b"ok":
+                    circuit.record_success()
+                    return True
+                elif response and response[0] == b"forwarded":
+                    circuit.record_success()
+                    return True
+            except Exception as forward_error:
+                circuit.record_failure()
+                await self._udp_logger.log(
+                    ServerDebug(
+                        message=f"Failed to forward job final result to gate: {forward_error}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+                continue
+
+        return False
+
     async def _pop_workflow_results(
         self, job_id: str, workflow_id: str
     ) -> dict[str, WorkflowResultPush]:
