@@ -453,20 +453,11 @@ class FederatedHealthMonitor:
                         [datacenter],
                     )
                 except Exception as callback_error:
-                    import sys
-
-                    print(
-                        f"[FederatedHealthMonitor] on_probe_error callback failed: {callback_error}, "
-                        f"original error: {error}",
-                        file=sys.stderr,
+                    await self._log_error(
+                        f"on_probe_error callback failed: {callback_error}, original error: {error}"
                     )
             else:
-                import sys
-
-                print(
-                    f"[FederatedHealthMonitor] probe to {datacenter} failed: {error}",
-                    file=sys.stderr,
-                )
+                await self._log_error(f"Probe to {datacenter} failed: {error}")
 
     def _check_ack_timeouts(self) -> None:
         """
