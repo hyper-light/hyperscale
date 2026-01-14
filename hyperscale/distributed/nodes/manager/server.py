@@ -3852,6 +3852,58 @@ class ManagerServer(HealthAwareServer):
                 )
             )
 
+            if not self._job_manager or not self._workflow_dispatcher:
+                return b"not_ready"
+
+            applied_reassignments = 0
+            requeued_workflows = 0
+
+            for job_id, workflow_id, sub_workflow_token in batch.reassignments:
+                try:
+                    reassignment_token = TrackingToken.parse(sub_workflow_token)
+                except ValueError as error:
+                    await self._udp_logger.log(
+                        ServerWarning(
+                            message=(
+                                "Workflow reassignment parse error: "
+                                f"{sub_workflow_token} ({error})"
+                            ),
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
+                    continue
+
+                if reassignment_token.worker_id == batch.failed_worker_id:
+                    requeued = await self._workflow_dispatcher.requeue_workflow(
+                        sub_workflow_token
+                    )
+                    if requeued:
+                        requeued_workflows += 1
+
+                applied = await self._job_manager.apply_workflow_reassignment(
+                    job_id=job_id,
+                    workflow_id=workflow_id,
+                    sub_workflow_token=sub_workflow_token,
+                    failed_worker_id=batch.failed_worker_id,
+                )
+                if applied:
+                    applied_reassignments += 1
+
+            if applied_reassignments or requeued_workflows:
+                await self._udp_logger.log(
+                    ServerDebug(
+                        message=(
+                            "Applied workflow reassignment updates: "
+                            f"applied={applied_reassignments}, requeued={requeued_workflows}"
+                        ),
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+
             return b"accepted"
 
         except Exception as error:
