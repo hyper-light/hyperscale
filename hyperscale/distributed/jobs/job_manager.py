@@ -1270,13 +1270,12 @@ class JobManager:
             if not job:
                 return False
 
-            # Clean up lookup mappings to prevent memory leaks
             for wf_token_str in job.workflows:
                 self._workflow_to_job.pop(wf_token_str, None)
             for sub_wf_token_str in job.sub_workflows:
                 self._sub_workflow_to_job.pop(sub_wf_token_str, None)
 
-            # Clean up fence token tracking
             self._job_fence_tokens.pop(job_id, None)
+            self._job_progress_sequences.pop(job_id, None)
 
             return True
