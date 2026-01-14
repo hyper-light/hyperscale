@@ -90,6 +90,9 @@ def create_coordinator(
     return GateStatsCoordinator(
         state=state or GateRuntimeState(),
         logger=MockLogger(),
+        node_host="127.0.0.1",
+        node_port=9000,
+        node_id="gate-test",
         task_runner=MockTaskRunner(),
         windowed_stats=windowed_stats or MockWindowedStatsCollector(),
         get_job_callback=get_job_callback or (lambda x: None),
