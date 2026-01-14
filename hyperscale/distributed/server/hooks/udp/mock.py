@@ -13,6 +13,6 @@ class UDPServer(ABC):
         addr: tuple[str, int],
         target: str,
         res: T,
-        tmeout: int | float | None = None
+        timeout: int | float | None = None
     ):
         pass
