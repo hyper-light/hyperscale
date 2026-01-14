@@ -1222,7 +1222,7 @@ class ManagerServer(HealthAwareServer):
     # =========================================================================
 
     async def _handle_worker_failure(self, worker_id: str) -> None:
-        self._health_monitor.handle_worker_failure(worker_id)
+        await self._health_monitor.handle_worker_failure(worker_id)
 
         if self._workflow_dispatcher and self._job_manager:
             running_sub_workflows = (
