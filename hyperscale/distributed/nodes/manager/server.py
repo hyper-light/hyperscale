@@ -855,17 +855,19 @@ class ManagerServer(HealthAwareServer):
 
     async def _register_with_manager(self, manager_addr: tuple[str, int]) -> bool:
         """Register with a single peer manager."""
+        manager_info = ManagerInfo(
+            node_id=self._node_id.full,
+            tcp_host=self._host,
+            tcp_port=self._tcp_port,
+            udp_host=self._host,
+            udp_port=self._udp_port,
+            datacenter=self._node_id.datacenter,
+            is_leader=self.is_leader(),
+        )
         registration = ManagerPeerRegistration(
-            node=self.node_info,
-            manager_info=ManagerInfo(
-                node_id=self._node_id.full,
-                tcp_host=self._host,
-                tcp_port=self._tcp_port,
-                udp_host=self._host,
-                udp_port=self._udp_port,
-                datacenter=self._node_id.datacenter,
-                is_leader=self.is_leader(),
-            ),
+            node=manager_info,
+            term=self._leader_election.state.current_term,
+            is_leader=self.is_leader(),
             cluster_id=self._config.cluster_id,
             environment_id=self._config.environment_id,
         )

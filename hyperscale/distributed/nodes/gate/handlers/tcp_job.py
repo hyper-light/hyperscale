@@ -349,18 +349,35 @@ class GateJobHandler:
                     f"Job lease held by {lease_result.current_owner} "
                     f"(expires in {lease_result.expires_in:.1f}s)"
                 )
-                return JobAck(
+                error_ack = JobAck(
                     job_id=submission.job_id,
                     accepted=False,
                     error=error_message,
+                    protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+                    protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+                    capabilities=negotiated_caps_str,
                 ).dump()
+                if idempotency_key is not None and self._idempotency_cache is not None:
+                    await self._idempotency_cache.reject(idempotency_key, error_ack)
+                return error_ack
+
+            lease = lease_result.lease
+            if lease is None:
+                error_ack = JobAck(
+                    job_id=submission.job_id,
+                    accepted=False,
+                    error="Lease acquisition did not return a lease",
+                    protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+                    protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+                    capabilities=negotiated_caps_str,
+                ).dump()
+                if idempotency_key is not None and self._idempotency_cache is not None:
+                    await self._idempotency_cache.reject(idempotency_key, error_ack)
+                return error_ack
 
             lease_acquired = True
-            lease_duration = (
-                lease_result.lease.lease_duration
-                if lease_result.lease is not None
-                else None
-            )
+            lease_duration = lease.lease_duration
+            fence_token = lease.fence_token
 
             if self._quorum_circuit.circuit_state == CircuitState.OPEN:
                 await self._release_job_lease(submission.job_id)

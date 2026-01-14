@@ -1567,8 +1567,11 @@ class GateServer(HealthAwareServer):
                 )
                 return response.dump()
 
+            existing_callback = self._progress_callbacks.get(job_id)
             self._job_manager.set_callback(job_id, request.callback_addr)
             self._progress_callbacks[job_id] = request.callback_addr
+            if existing_callback != request.callback_addr:
+                self._increment_version()
 
             await self._replay_job_status_to_callback(job_id)
 
