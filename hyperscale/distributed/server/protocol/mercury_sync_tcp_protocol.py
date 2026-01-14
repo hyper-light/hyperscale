@@ -56,6 +56,11 @@ class MercurySyncTCPProtocol(asyncio.Protocol, Generic[T]):
         return (bytes(self._receive_buffer), self._receive_buffer_closed)
 
     def connection_made(self, transport: asyncio.Transport):
+        if self.server_state.is_at_capacity():
+            self.server_state.reject_connection()
+            transport.close()
+            return
+
         self.connections.add(self)
         self.transport = transport
         self.flow = FlowControl(transport)
