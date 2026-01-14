@@ -82,6 +82,53 @@ This document catalogs all identified issues across the distributed node impleme
 
 ---
 
+### 2.4 Federated Health Monitor - Missing Ack Timeout Handling
+
+| File | Lines | Issue |
+|------|-------|-------|
+| `distributed/swim/health/federated_health_monitor.py` | 351-382, 404-432 | Probe failures only recorded when `_send_udp` fails; missing `xack` never transitions DC to `SUSPECTED/UNREACHABLE` |
+
+**Why this matters:** A DC can remain `REACHABLE` indefinitely after the last ack, so partitions or silent drops won’t be detected.
+
+**Fix (actionable):**
+- Track per-DC outstanding probe deadlines (e.g., `last_probe_sent` + `probe_timeout`).
+- In `_probe_loop` or `_probe_datacenter`, if the last probe deadline expires without an ack, call `_handle_probe_failure()`.
+- Alternatively, compare `time.monotonic() - state.last_ack_received` against `probe_timeout` or a configured “ack grace” and treat it as a failure.
+- Log unexpected exceptions in `_probe_loop` instead of silent sleep (see `distributed/swim/health/federated_health_monitor.py:345`).
+
+### 2.5 Multi-Gate Submit Storm Can Create Duplicate Jobs in a DC
+
+| File | Lines | Issue |
+|------|-------|-------|
+| `distributed/datacenters/manager_dispatcher.py` | 171-240 | Dispatch falls back to any manager if leader unknown |
+| `distributed/nodes/manager/server.py` | 4560-4740 | `job_submission` accepts jobs on any ACTIVE manager without leader fencing |
+| `distributed/leases/job_lease.py` | 101-150 | Gate leases are local only (no cross-gate fencing) |
+
+**Why this matters:** Concurrent submissions through multiple gates can hit different managers in the same DC, creating duplicate jobs because non-leader managers accept submissions.
+
+**Fix (actionable):**
+- Require leader fencing for `job_submission` on managers:
+  - Reject if not DC leader, OR
+  - Require a leader term/fence token from the gate and validate against current leader term.
+- In `ManagerDispatcher`, when leader is unknown, perform a leader discovery/confirmation step before dispatching, or hard-fail to force retry.
+- Optionally add a `leader_only` flag to `job_submission` and reject with a retry hint when called on non-leader managers.
+
+### 2.6 Workflow Requeue Ignores Stored Dispatched Context
+
+| File | Lines | Issue |
+|------|-------|-------|
+| `distributed/jobs/workflow_dispatcher.py` | 607-664, 1194-1212 | Requeue resets dispatch state but always recomputes context via `get_context_for_workflow` |
+| `distributed/jobs/job_manager.py` | 1136-1149 | Dispatched context is stored but never reused on requeue |
+
+**Why this matters:** Re-dispatched workflows can observe a newer context version than the original dispatch, causing inconsistent behavior during retries or reassignment.
+
+**Fix (actionable):**
+- Add a `get_sub_workflow_dispatched_context()` accessor in `JobManager` to return `dispatched_context` + `dispatched_version`.
+- In `WorkflowDispatcher`, when requeuing a workflow, prefer the stored `dispatched_context` if it exists (especially after worker failure) and include the original `context_version`.
+- Only recompute context when no dispatched context exists or when an explicit re-dispatch with updated context is required.
+
+---
+
 ## 3. Medium Priority Issues
 
 ### 3.1 Manager Server - Incomplete Job Completion Handler
@@ -312,7 +359,7 @@ All 35+ issues from Categories A-F have been fixed:
 | Severity | Count | Status |
 |----------|-------|--------|
 | **Critical (runtime errors)** | 5 | 🔴 Needs Fix |
-| **High Priority** | 3 | 🔴 Needs Fix |
+| **High Priority** | 6 | 🔴 Needs Fix |
 | **Medium Priority** | 6 | 🟡 Should Fix |
 | **Low Priority** | 4 | 🟢 Can Wait |
 | **Duplicate Classes** | 15+ | 🟡 Should Consolidate |
