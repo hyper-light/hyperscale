@@ -176,6 +176,7 @@ class GateStatsCoordinator:
         allow_peer_forwarding: bool,
     ) -> bool:
         last_error: Exception | None = None
+        peer_forward_attempted = False
 
         for attempt in range(self.CALLBACK_PUSH_MAX_RETRIES):
             try:
@@ -191,19 +192,24 @@ class GateStatsCoordinator:
                     await asyncio.sleep(delay)
 
         if allow_peer_forwarding and self._forward_status_push_to_peers:
+            peer_forward_attempted = True
             try:
                 forwarded = await self._forward_status_push_to_peers(job_id, push_data)
             except Exception as forward_error:
                 last_error = forward_error
             else:
                 if forwarded:
-                    return False
+                    return True
+
+        forward_note = ""
+        if peer_forward_attempted:
+            forward_note = " and peer forwarding failed"
 
         await self._logger.log(
             ServerError(
                 message=(
                     f"Failed to deliver status push for job {job_id} after "
-                    f"{self.CALLBACK_PUSH_MAX_RETRIES} retries: {last_error}"
+                    f"{self.CALLBACK_PUSH_MAX_RETRIES} retries{forward_note}: {last_error}"
                 ),
                 node_host=self._node_host,
                 node_port=self._node_port,
