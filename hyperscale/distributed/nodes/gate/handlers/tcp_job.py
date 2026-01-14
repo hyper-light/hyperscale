@@ -10,7 +10,7 @@ Handles client-facing job operations:
 import asyncio
 import cloudpickle
 import time
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Awaitable, Callable
 
 from hyperscale.distributed.models import (
     GlobalJobStatus,
@@ -410,7 +410,7 @@ class GateJobHandler:
         self,
         addr: tuple[str, int],
         data: bytes,
-        gather_job_status: Callable[[str], "asyncio.Task"],
+        gather_job_status: Callable[[str], Awaitable[GlobalJobStatus]],
     ) -> bytes:
         """
         Handle job status request from client.
