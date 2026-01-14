@@ -4,7 +4,7 @@ TCP handler for state sync requests.
 Handles state synchronization requests from peer managers and workers.
 """
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 from hyperscale.distributed.models import (
     StateSyncRequest,
@@ -17,7 +17,10 @@ from hyperscale.logging.hyperscale_logging_models import ServerDebug
 if TYPE_CHECKING:
     from hyperscale.distributed.nodes.manager.state import ManagerState
     from hyperscale.distributed.nodes.manager.config import ManagerConfig
+    from hyperscale.distributed.taskex import TaskRunner
     from hyperscale.logging import Logger
+
+GetStateSnapshotFunc = Callable[[], ManagerStateSnapshot]
 
 
 class StateSyncRequestHandler:
@@ -34,15 +37,15 @@ class StateSyncRequestHandler:
         config: "ManagerConfig",
         logger: "Logger",
         node_id: str,
-        task_runner,
-        get_state_snapshot,  # Callable to get current state snapshot
+        task_runner: "TaskRunner",
+        get_state_snapshot: GetStateSnapshotFunc,
     ) -> None:
-        self._state = state
-        self._config = config
-        self._logger = logger
-        self._node_id = node_id
-        self._task_runner = task_runner
-        self._get_state_snapshot = get_state_snapshot
+        self._state: "ManagerState" = state
+        self._config: "ManagerConfig" = config
+        self._logger: "Logger" = logger
+        self._node_id: str = node_id
+        self._task_runner: "TaskRunner" = task_runner
+        self._get_state_snapshot: GetStateSnapshotFunc = get_state_snapshot
 
     async def handle(
         self,
@@ -71,7 +74,7 @@ class StateSyncRequestHandler:
                     node_host=self._config.host,
                     node_port=self._config.tcp_port,
                     node_id=self._node_id,
-                )
+                ),
             )
 
             # Get current state snapshot
