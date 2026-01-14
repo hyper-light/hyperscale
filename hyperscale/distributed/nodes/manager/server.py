@@ -2603,6 +2603,48 @@ class ManagerServer(HealthAwareServer):
 
         return None
 
+    async def _validate_mtls_claims(
+        self,
+        addr: tuple[str, int],
+        peer_label: str,
+        peer_id: str,
+    ) -> str | None:
+        transport = self._tcp_server_request_transports.get(addr)
+        cert_der = get_peer_certificate_der(transport) if transport else None
+        if cert_der is not None:
+            claims = RoleValidator.extract_claims_from_cert(
+                cert_der,
+                default_cluster=self._config.cluster_id,
+                default_environment=self._config.environment_id,
+            )
+            validation_result = self._role_validator.validate_claims(claims)
+            if not validation_result.allowed:
+                await self._udp_logger.log(
+                    ServerWarning(
+                        message=(
+                            f"{peer_label} {peer_id} rejected: {validation_result.reason}"
+                        ),
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+                return f"Certificate validation failed: {validation_result.reason}"
+            return None
+
+        if self._config.mtls_strict_mode:
+            await self._udp_logger.log(
+                ServerWarning(
+                    message=f"{peer_label} {peer_id} rejected: no certificate in strict mode",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            return "mTLS strict mode requires valid certificate"
+
+        return None
+
     # =========================================================================
     # TCP Handlers
     # =========================================================================

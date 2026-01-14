@@ -344,6 +344,46 @@ class WorkflowProgressAck(Message):
     backpressure_delay_ms: int = 0  # Suggested delay before next update (milliseconds)
     backpressure_batch_only: bool = False  # Should sender switch to batch mode?
 
+    def __getstate__(self) -> dict[str, object]:
+        return {
+            "manager_id": self.manager_id,
+            "is_leader": self.is_leader,
+            "healthy_managers": self.healthy_managers,
+            "job_leader_addr": self.job_leader_addr,
+            "backpressure_level": self.backpressure_level,
+            "backpressure_delay_ms": self.backpressure_delay_ms,
+            "backpressure_batch_only": self.backpressure_batch_only,
+        }
+
+    def __setstate__(self, state: object) -> None:
+        if isinstance(state, dict):
+            manager_id = state.get("manager_id", "")
+            is_leader = state.get("is_leader", False)
+            healthy_managers = state.get("healthy_managers", [])
+            job_leader_addr = state.get("job_leader_addr")
+            backpressure_level = state.get("backpressure_level", 0)
+            backpressure_delay_ms = state.get("backpressure_delay_ms", 0)
+            backpressure_batch_only = state.get("backpressure_batch_only", False)
+        elif isinstance(state, (list, tuple)):
+            values = list(state)
+            manager_id = values[0] if len(values) > 0 else ""
+            is_leader = values[1] if len(values) > 1 else False
+            healthy_managers = values[2] if len(values) > 2 else []
+            job_leader_addr = values[3] if len(values) > 3 else None
+            backpressure_level = values[4] if len(values) > 4 else 0
+            backpressure_delay_ms = values[5] if len(values) > 5 else 0
+            backpressure_batch_only = values[6] if len(values) > 6 else False
+        else:
+            raise TypeError("Unsupported WorkflowProgressAck state")
+
+        self.manager_id = manager_id
+        self.is_leader = is_leader
+        self.healthy_managers = healthy_managers
+        self.job_leader_addr = job_leader_addr
+        self.backpressure_level = backpressure_level
+        self.backpressure_delay_ms = backpressure_delay_ms
+        self.backpressure_batch_only = backpressure_batch_only
+
 
 # =============================================================================
 # Gate Node Identity and Discovery (Manager <-> Gate)

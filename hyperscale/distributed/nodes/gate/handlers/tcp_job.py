@@ -436,14 +436,11 @@ class GateJobHandler:
                 status=JobStatus.SUBMITTED.value,
                 datacenters=[],
                 timestamp=time.monotonic(),
+                fence_token=fence_token,
             )
             self._job_manager.set_job(submission.job_id, job)
             self._job_manager.set_target_dcs(submission.job_id, set(target_dcs))
-            if lease_result.lease is not None:
-                self._job_manager.set_fence_token(
-                    submission.job_id,
-                    lease_result.lease.fence_token,
-                )
+            self._job_manager.set_fence_token(submission.job_id, fence_token)
 
             try:
                 workflows: list[tuple[str, list[str], object]] = cloudpickle.loads(
