@@ -171,10 +171,16 @@ class ErrorStats:
     @property
     def circuit_state(self) -> CircuitState:
         """Get current circuit state, transitioning to half-open if appropriate."""
+        now = time.monotonic()
         if self._circuit_state == CircuitState.OPEN and self._circuit_opened_at:
-            elapsed = time.monotonic() - self._circuit_opened_at
+            elapsed = now - self._circuit_opened_at
             if elapsed >= self.half_open_after:
-                self._circuit_state = CircuitState.HALF_OPEN
+                self._prune_old_entries(now)
+                error_count = len(self._timestamps)
+                if self._should_open_circuit(error_count):
+                    self._circuit_opened_at = now
+                else:
+                    self._circuit_state = CircuitState.HALF_OPEN
         return self._circuit_state
 
     @property

@@ -233,6 +233,17 @@ class ManagerHealthState:
         async with self._state_lock:
             self._apply_readiness_update(has_quorum, accepting, worker_count)
 
+    def _apply_progress_update(
+        self,
+        jobs_accepted: int,
+        workflows_dispatched: int,
+        expected_throughput: float | None = None,
+    ) -> None:
+        self.jobs_accepted_last_interval = jobs_accepted
+        self.workflows_dispatched_last_interval = workflows_dispatched
+        if expected_throughput is not None:
+            self.expected_throughput = expected_throughput
+
     def update_progress(
         self,
         jobs_accepted: int,
@@ -247,10 +258,24 @@ class ManagerHealthState:
             workflows_dispatched: Number of workflows dispatched in the last interval
             expected_throughput: Expected workflow throughput (per interval)
         """
-        self.jobs_accepted_last_interval = jobs_accepted
-        self.workflows_dispatched_last_interval = workflows_dispatched
-        if expected_throughput is not None:
-            self.expected_throughput = expected_throughput
+        self._apply_progress_update(
+            jobs_accepted, workflows_dispatched, expected_throughput
+        )
+
+    async def update_progress_async(
+        self,
+        jobs_accepted: int,
+        workflows_dispatched: int,
+        expected_throughput: float | None = None,
+    ) -> None:
+        async with self._state_lock:
+            self._apply_progress_update(
+                jobs_accepted, workflows_dispatched, expected_throughput
+            )
+
+    async def get_diagnostics_async(self) -> dict:
+        async with self._state_lock:
+            return self.get_diagnostics()
 
     def get_diagnostics(self) -> dict:
         """

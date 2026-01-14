@@ -3955,12 +3955,28 @@ class GateServer(HealthAwareServer):
                 ]
 
                 for peer_addr in peers_to_cleanup:
+                    if self._peer_coordinator:
+                        await self._peer_coordinator.cleanup_dead_peer(peer_addr)
+
                     gate_ids_to_remove = self._modular_state.cleanup_dead_peer(
                         peer_addr
                     )
                     for gate_id in gate_ids_to_remove:
                         await self._versioned_clock.remove_entity(gate_id)
                     await self._peer_gate_circuit_breaker.remove_circuit(peer_addr)
+
+                    self._task_runner.run(
+                        self._udp_logger.log,
+                        ServerDebug(
+                            message=(
+                                "Completed dead peer cleanup for gate "
+                                f"{peer_addr[0]}:{peer_addr[1]}"
+                            ),
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        ),
+                    )
 
                 await self._check_quorum_status()
 
