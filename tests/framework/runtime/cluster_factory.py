@@ -267,7 +267,7 @@ class ClusterFactory:
         env_overrides = dict(spec.env_overrides or {})
         if node_overrides:
             env_overrides.update(node_overrides)
-        return Env(**env_overrides)
+        return Env.model_validate(env_overrides)
 
     async def _start_cluster(
         self,
