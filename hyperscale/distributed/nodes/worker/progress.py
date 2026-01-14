@@ -62,10 +62,12 @@ class WorkerProgressReporter:
         registry: "WorkerRegistry",
         state: "WorkerState",
         logger: "Logger | None" = None,
+        task_runner_run: callable | None = None,
     ) -> None:
         self._registry: "WorkerRegistry" = registry
         self._state: "WorkerState" = state
         self._logger: "Logger | None" = logger
+        self._task_runner_run: callable | None = task_runner_run
         self._pending_results: deque[PendingResult] = deque(
             maxlen=self.MAX_PENDING_RESULTS
         )
@@ -570,8 +572,8 @@ class WorkerProgressReporter:
                 )
 
         except Exception as error:
-            if data != b"ok" and self._logger:
-                self._task_runner.run(
+            if data != b"ok" and self._logger and self._task_runner_run:
+                self._task_runner_run(
                     self._logger.log,
                     ServerDebug(
                         message=f"ACK parse failed (non-legacy payload): {error}",
