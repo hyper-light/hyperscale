@@ -3233,7 +3233,8 @@ class ManagerServer(HealthAwareServer):
                 jobs=dict(self._manager_state._job_progress),
                 job_leaders=dict(self._manager_state._job_leaders),
                 job_leader_addrs=dict(self._manager_state._job_leader_addrs),
-                job_layer_versions=dict(self._manager_state._job_layer_versions),
+                job_fence_tokens=dict(self._manager_state._job_fencing_tokens),
+                job_layer_versions=dict(self._manager_state._job_layer_version),
                 job_contexts=self._serialize_job_contexts(),
             )
 

@@ -2658,6 +2658,26 @@ class GateServer(HealthAwareServer):
                 if addr_tuple not in dc_managers:
                     dc_managers.append(addr_tuple)
 
+        async with self._workflow_dc_results_lock:
+            for job_id, workflow_results in snapshot.workflow_dc_results.items():
+                job_results = self._workflow_dc_results.setdefault(job_id, {})
+                for workflow_id, dc_results in workflow_results.items():
+                    workflow_entries = job_results.setdefault(workflow_id, {})
+                    for dc_id, result in dc_results.items():
+                        if dc_id not in workflow_entries:
+                            workflow_entries[dc_id] = result
+
+        for job_id, callback_addr in snapshot.progress_callbacks.items():
+            callback_tuple = (
+                tuple(callback_addr)
+                if isinstance(callback_addr, list)
+                else callback_addr
+            )
+            if job_id not in self._modular_state._progress_callbacks:
+                self._modular_state._progress_callbacks[job_id] = callback_tuple
+            if job_id not in self._progress_callbacks:
+                self._progress_callbacks[job_id] = callback_tuple
+
         self._job_leadership_tracker.merge_from_snapshot(
             job_leaders=snapshot.job_leaders,
             job_leader_addrs=snapshot.job_leader_addrs,
