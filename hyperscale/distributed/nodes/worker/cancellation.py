@@ -14,7 +14,7 @@ from hyperscale.distributed.models import (
     WorkflowCancellationResponse,
     WorkflowStatus,
 )
-from hyperscale.logging.hyperscale_logging_models import ServerInfo
+from hyperscale.logging.hyperscale_logging_models import ServerDebug, ServerInfo
 
 if TYPE_CHECKING:
     from hyperscale.logging import Logger
