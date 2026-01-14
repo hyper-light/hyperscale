@@ -16,7 +16,7 @@ Key responsibilities:
 import asyncio
 import random
 import time
-from typing import TYPE_CHECKING, Callable, Awaitable
+from typing import TYPE_CHECKING, Any, Callable, Awaitable
 
 from hyperscale.distributed.models import (
     JobLeadershipAnnouncement,
