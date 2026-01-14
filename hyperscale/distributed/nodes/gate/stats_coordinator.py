@@ -126,7 +126,6 @@ class GateStatsCoordinator:
         if not (job := self._get_job_status(job_id)):
             return
 
-        # Build status push message
         is_final = job.status in (
             JobStatus.COMPLETED.value,
             JobStatus.FAILED.value,
@@ -147,10 +146,55 @@ class GateStatsCoordinator:
             is_final=is_final,
         )
 
-        try:
-            await self._send_tcp(callback, "job_status_push", push.dump())
-        except Exception:
-            pass  # Best effort - don't fail on push errors
+        push_data = push.dump()
+
+        if is_final:
+            await self._send_final_status_with_retry(job_id, callback, push_data)
+        else:
+            try:
+                await self._send_tcp(callback, "job_status_push", push_data)
+            except Exception:
+                pass
+
+    async def _send_final_status_with_retry(
+        self,
+        job_id: str,
+        callback: tuple[str, int],
+        push_data: bytes,
+    ) -> None:
+        """
+        Send final status push with retry and peer-forwarding on failure.
+
+        Final statuses (completed, failed, cancelled) are critical for clients
+        waiting on job completion. This method retries with exponential backoff
+        and falls back to peer-forwarding if direct delivery fails.
+        """
+        last_error: Exception | None = None
+
+        for attempt in range(self.FINAL_STATUS_MAX_RETRIES):
+            try:
+                await self._send_tcp(callback, "job_status_push", push_data)
+                return
+            except Exception as send_error:
+                last_error = send_error
+                if attempt < self.FINAL_STATUS_MAX_RETRIES - 1:
+                    delay = min(
+                        self.FINAL_STATUS_BASE_DELAY_SECONDS * (2**attempt),
+                        self.FINAL_STATUS_MAX_DELAY_SECONDS,
+                    )
+                    await asyncio.sleep(delay)
+
+        if self._forward_status_push_to_peers:
+            forwarded = await self._forward_status_push_to_peers(job_id, push_data)
+            if forwarded:
+                return
+
+        await self._logger.log(
+            {
+                "level": "warning",
+                "message": f"Failed to deliver final status for job {job_id} after {self.FINAL_STATUS_MAX_RETRIES} retries and peer-forwarding: {last_error}",
+            }
+        )
 
     async def batch_stats_update(self) -> None:
         """
