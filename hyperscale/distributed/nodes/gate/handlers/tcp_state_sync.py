@@ -345,7 +345,8 @@ class GateStateSyncHandler:
             )
 
             leader_id = self._job_leadership_tracker.get_leader(result.job_id)
-            if leader_id and leader_id != self._get_node_id().full:
+            is_job_leader = self._job_leadership_tracker.is_leader(result.job_id)
+            if leader_id and not is_job_leader:
                 leader_addr = self._job_leadership_tracker.get_leader_addr(
                     result.job_id
                 )
@@ -375,6 +376,17 @@ class GateStateSyncHandler:
                     forwarded = await forward_final_result(data)
                     if forwarded:
                         return b"forwarded"
+                    await self._logger.log(
+                        ServerWarning(
+                            message=(
+                                "Failed to forward job final result for "
+                                f"{result.job_id[:8]}... to peer gates"
+                            ),
+                            node_host=self._get_host(),
+                            node_port=self._get_tcp_port(),
+                            node_id=self._get_node_id().short,
+                        )
+                    )
                 return b"error"
 
             job_exists = self._job_manager.get_job(result.job_id) is not None
@@ -383,6 +395,17 @@ class GateStateSyncHandler:
                     forwarded = await forward_final_result(data)
                     if forwarded:
                         return b"forwarded"
+                    await self._logger.log(
+                        ServerWarning(
+                            message=(
+                                "Failed to forward final result for unknown job "
+                                f"{result.job_id[:8]}... to peer gates"
+                            ),
+                            node_host=self._get_host(),
+                            node_port=self._get_tcp_port(),
+                            node_id=self._get_node_id().short,
+                        )
+                    )
                 return b"unknown_job"
 
             current_fence = self._job_manager.get_fence_token(result.job_id)

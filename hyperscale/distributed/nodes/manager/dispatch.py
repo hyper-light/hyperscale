@@ -5,6 +5,7 @@ Handles worker allocation, quorum coordination, and dispatch tracking.
 Implements AD-17 smart dispatch with health bucket selection.
 """
 
+import asyncio
 import time
 from typing import Any, Callable, Coroutine, TYPE_CHECKING
 
