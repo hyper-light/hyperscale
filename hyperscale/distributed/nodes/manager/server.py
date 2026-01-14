@@ -2238,6 +2238,156 @@ class ManagerServer(HealthAwareServer):
         }
         return len(worker_ids)
 
+    def _get_active_job_workflows_by_worker(self, job: JobInfo) -> dict[str, list[str]]:
+        """Map workers to active workflow IDs for a job."""
+        workflow_ids_by_worker: dict[str, set[str]] = {}
+        for sub_workflow in job.sub_workflows.values():
+            if sub_workflow.result is not None:
+                continue
+
+            worker_id = sub_workflow.worker_id
+            if not worker_id:
+                continue
+
+            workflow_id = (
+                sub_workflow.parent_token.workflow_id or sub_workflow.token.workflow_id
+            )
+            if not workflow_id:
+                continue
+
+            workflow_info = job.workflows.get(str(sub_workflow.parent_token))
+            if workflow_info and workflow_info.status != WorkflowStatus.RUNNING:
+                continue
+
+            workflow_ids_by_worker.setdefault(worker_id, set()).add(workflow_id)
+
+        return {
+            worker_id: list(workflow_ids)
+            for worker_id, workflow_ids in workflow_ids_by_worker.items()
+        }
+
+    def _get_worker_registration_for_transfer(
+        self, worker_id: str
+    ) -> WorkerRegistration | None:
+        if (registration := self._manager_state.get_worker(worker_id)) is not None:
+            return registration
+
+        worker_status = self._worker_pool.get_worker(worker_id)
+        if worker_status and worker_status.registration:
+            return worker_status.registration
+
+        return None
+
+    async def _notify_workers_job_leader_transfer(
+        self,
+        job_id: str,
+        old_leader_id: str | None,
+    ) -> None:
+        job = self._job_manager.get_job_by_id(job_id)
+        if not job:
+            await self._udp_logger.log(
+                ServerWarning(
+                    message=(
+                        "Skipped worker leader transfer; job not found: "
+                        f"{job_id[:8]}..."
+                    ),
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            return
+
+        async with job.lock:
+            workflows_by_worker = self._get_active_job_workflows_by_worker(job)
+
+        if not workflows_by_worker:
+            return
+
+        fence_token = self._leases.get_fence_token(job_id)
+
+        for worker_id, workflow_ids in workflows_by_worker.items():
+            worker_registration = self._get_worker_registration_for_transfer(worker_id)
+            if worker_registration is None:
+                await self._udp_logger.log(
+                    ServerWarning(
+                        message=(
+                            "Cannot notify worker of leader transfer; "
+                            f"worker {worker_id[:8]}... not registered for job {job_id[:8]}..."
+                        ),
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+                continue
+
+            worker_addr = (
+                worker_registration.node.host,
+                worker_registration.node.port,
+            )
+            transfer = JobLeaderWorkerTransfer(
+                job_id=job_id,
+                workflow_ids=workflow_ids,
+                new_manager_id=self._node_id.full,
+                new_manager_addr=(self._host, self._tcp_port),
+                fence_token=fence_token,
+                old_manager_id=old_leader_id,
+            )
+
+            try:
+                response = await self._send_to_worker(
+                    worker_addr,
+                    "job_leader_worker_transfer",
+                    transfer.dump(),
+                    timeout=self._config.tcp_timeout_standard_seconds,
+                )
+            except Exception as error:
+                await self._udp_logger.log(
+                    ServerWarning(
+                        message=(
+                            "Leader transfer notification failed for job "
+                            f"{job_id[:8]}... to worker {worker_id[:8]}...: {error}"
+                        ),
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+                continue
+
+            if isinstance(response, Exception) or response is None:
+                error_message = (
+                    str(response) if isinstance(response, Exception) else "no response"
+                )
+                await self._udp_logger.log(
+                    ServerWarning(
+                        message=(
+                            "Leader transfer notification missing response for job "
+                            f"{job_id[:8]}... worker {worker_id[:8]}...: {error_message}"
+                        ),
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+                continue
+
+            ack = JobLeaderWorkerTransferAck.load(response)
+            if not ack.accepted:
+                await self._udp_logger.log(
+                    ServerWarning(
+                        message=(
+                            "Worker rejected leader transfer for job "
+                            f"{job_id[:8]}... worker {worker_id[:8]}...: "
+                            f"{ack.rejection_reason}"
+                        ),
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+
     def _has_quorum_available(self) -> bool:
         """Check if quorum is available."""
         active_count = self._manager_state.get_active_peer_count()

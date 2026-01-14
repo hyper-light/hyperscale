@@ -248,6 +248,54 @@ class GateOrphanJobCoordinator:
                 ),
             )
 
+    async def _send_job_status_push_with_retry(
+        self,
+        job_id: str,
+        callback: tuple[str, int],
+        push_data: bytes,
+        allow_peer_forwarding: bool = True,
+    ) -> None:
+        last_error: Exception | None = None
+
+        for attempt in range(self.CALLBACK_PUSH_MAX_RETRIES):
+            try:
+                await self._send_tcp(
+                    callback,
+                    "job_status_push",
+                    push_data,
+                    5.0,
+                )
+                return
+            except Exception as send_error:
+                last_error = send_error
+                if attempt < self.CALLBACK_PUSH_MAX_RETRIES - 1:
+                    delay = min(
+                        self.CALLBACK_PUSH_BASE_DELAY_SECONDS * (2**attempt),
+                        self.CALLBACK_PUSH_MAX_DELAY_SECONDS,
+                    )
+                    await asyncio.sleep(delay)
+
+        if allow_peer_forwarding and self._forward_status_push_to_peers:
+            try:
+                forwarded = await self._forward_status_push_to_peers(job_id, push_data)
+            except Exception as forward_error:
+                last_error = forward_error
+            else:
+                if forwarded:
+                    return
+
+        await self._logger.log(
+            ServerWarning(
+                message=(
+                    f"Failed to deliver orphan timeout status for job {job_id[:8]}... "
+                    f"after {self.CALLBACK_PUSH_MAX_RETRIES} retries: {last_error}"
+                ),
+                node_host=self._get_node_addr()[0],
+                node_port=self._get_node_addr()[1],
+                node_id=self._get_node_id().short,
+            )
+        )
+
     async def _orphan_check_loop(self) -> None:
         """
         Periodically check for orphaned jobs and attempt takeover.
