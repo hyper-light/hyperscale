@@ -4327,10 +4327,12 @@ class ManagerServer(HealthAwareServer):
         try:
             heartbeat = WorkerHeartbeat.load(data)
 
-            # Process heartbeat via WorkerPool
-            await self._worker_pool.process_heartbeat(heartbeat.node_id, heartbeat)
+            await self._health_monitor.handle_worker_heartbeat(heartbeat, addr)
 
-            # Trigger dispatch for active jobs
+            worker_id = heartbeat.node_id
+            if self._manager_state.has_worker(worker_id):
+                await self._worker_pool.process_heartbeat(worker_id, heartbeat)
+
             if self._workflow_dispatcher:
                 for job_id, submission in self._manager_state.iter_job_submissions():
                     await self._workflow_dispatcher.try_dispatch(job_id, submission)
