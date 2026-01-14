@@ -284,7 +284,7 @@ class GateStateSyncHandler:
                 data,
                 timeout=3.0,
             )
-            if response not in (b"ok", b"forwarded"):
+            if response not in (b"ok", b"forwarded", b"already_completed"):
                 raise RuntimeError(
                     f"Unexpected response from leader gate {leader_addr}: {response}"
                 )
