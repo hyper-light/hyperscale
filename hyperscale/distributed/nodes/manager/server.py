@@ -2802,7 +2802,7 @@ class ManagerServer(HealthAwareServer):
                 worker_addr,
                 "cancel_workflow",
                 cancel_data,
-                timeout=self._env.CANC,
+                timeout=self._env.CANCELLED_WORKFLOW_TIMEOUT,
             )
 
             if not isinstance(response, bytes):

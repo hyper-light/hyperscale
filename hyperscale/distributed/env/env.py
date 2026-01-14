@@ -883,6 +883,7 @@ class Env(BaseModel):
             "OUTGOING_QUEUE_SIZE": int,
             "OUTGOING_OVERFLOW_SIZE": int,
             "OUTGOING_MAX_DESTINATIONS": int,
+            "CANCELLED_WORKFLOW_TIMEOUT": float,
         }
 
     def get_swim_init_context(self) -> dict:

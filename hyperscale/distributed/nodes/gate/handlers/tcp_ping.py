@@ -41,17 +41,17 @@ class GatePingHandler:
         get_all_job_ids: Callable,
         get_datacenter_managers: Callable,
     ) -> None:
-        self._state = state
-        self._logger = logger
-        self._get_node_id = get_node_id
-        self._get_host = get_host
-        self._get_tcp_port = get_tcp_port
-        self._is_leader = is_leader
-        self._get_current_term = get_current_term
-        self._classify_dc_health = classify_dc_health
-        self._count_active_dcs = count_active_dcs
-        self._get_all_job_ids = get_all_job_ids
-        self._get_datacenter_managers = get_datacenter_managers
+        self._state: "GateRuntimeState" = state
+        self._logger: "Logger" = logger
+        self._get_node_id: Callable = get_node_id
+        self._get_host: Callable = get_host
+        self._get_tcp_port: Callable = get_tcp_port
+        self._is_leader: Callable = is_leader
+        self._get_current_term: Callable = get_current_term
+        self._classify_dc_health: Callable = classify_dc_health
+        self._count_active_dcs: Callable = count_active_dcs
+        self._get_all_job_ids: Callable = get_all_job_ids
+        self._get_datacenter_managers: Callable = get_datacenter_managers
 
     async def handle_ping(
         self,
