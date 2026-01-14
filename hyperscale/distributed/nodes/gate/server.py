@@ -339,6 +339,9 @@ class GateServer(HealthAwareServer):
         self._workflow_result_timeout_seconds: float = getattr(
             env, "GATE_WORKFLOW_RESULT_TIMEOUT_SECONDS", 300.0
         )
+        self._allow_partial_workflow_results: bool = getattr(
+            env, "GATE_ALLOW_PARTIAL_WORKFLOW_RESULTS", False
+        )
         self._workflow_result_timeout_tokens: dict[str, dict[str, str]] = {}
         self._job_workflow_ids: dict[str, set[str]] = {}
 

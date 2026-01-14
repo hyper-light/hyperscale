@@ -367,7 +367,7 @@ class GatePeerCoordinator:
         elif self._state._gate_udp_to_tcp[udp_addr] != peer_tcp_addr:
             old_tcp_addr = self._state._gate_udp_to_tcp[udp_addr]
             await self._state.remove_active_peer(old_tcp_addr)
-            self._state.cleanup_peer_tracking(old_tcp_addr)
+            self._state.cleanup_peer_tcp_tracking(old_tcp_addr)
             self._state._gate_udp_to_tcp[udp_addr] = peer_tcp_addr
 
         self._peer_discovery.add_peer(
