@@ -174,6 +174,49 @@ class GateJobHandler:
             JobStatus.TIMEOUT.value,
         )
 
+    def _calculate_progress_percentage(
+        self,
+        job: GlobalJobStatus,
+        target_dc_count: int,
+    ) -> float:
+        """
+        Calculate job progress percentage based on datacenter completion.
+
+        Calculation strategy:
+        - Each target DC contributes equally to progress (100% / target_dc_count)
+        - Terminal DCs (completed/failed/cancelled/timeout) contribute 100%
+        - Running DCs contribute based on (completed + failed) / max if we had prior data
+        - If no data, running DCs contribute 0%
+
+        Returns:
+            Progress percentage between 0.0 and 100.0
+        """
+        if target_dc_count == 0:
+            return 0.0
+
+        if self._is_terminal_status(job.status):
+            return 100.0
+
+        dc_weight = 100.0 / target_dc_count
+        total_progress = 0.0
+
+        terminal_statuses = {
+            JobStatus.COMPLETED.value,
+            JobStatus.FAILED.value,
+            JobStatus.CANCELLED.value,
+            JobStatus.TIMEOUT.value,
+        }
+
+        for dc_progress in job.datacenters:
+            if dc_progress.status in terminal_statuses:
+                total_progress += dc_weight
+            else:
+                total_done = dc_progress.total_completed + dc_progress.total_failed
+                if total_done > 0:
+                    total_progress += dc_weight * 0.5
+
+        return min(100.0, max(0.0, total_progress))
+
     def _pop_lease_renewal_token(self, job_id: str) -> str | None:
         return self._state._job_lease_renewal_tokens.pop(job_id, None)
 
@@ -715,6 +758,12 @@ class GateJobHandler:
                 job.total_failed = sum(p.total_failed for p in job.datacenters)
                 job.overall_rate = sum(p.overall_rate for p in job.datacenters)
                 job.timestamp = time.monotonic()
+
+                target_dcs = self._job_manager.get_target_dcs(progress.job_id)
+                target_dc_count = len(target_dcs) if target_dcs else len(job.datacenters)
+                job.progress_percentage = self._calculate_progress_percentage(
+                    job, target_dc_count
+                )
 
                 await self._record_dc_job_stats(
                     job_id=progress.job_id,
