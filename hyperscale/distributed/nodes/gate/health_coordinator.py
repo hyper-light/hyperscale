@@ -463,6 +463,9 @@ class GateHealthCoordinator:
         Creates DatacenterCandidate objects with health and capacity info
         for the job router to use in datacenter selection.
 
+        Integrates DatacenterCapacityAggregator (AD-43) to enrich candidates
+        with aggregated capacity metrics from manager heartbeats.
+
         Args:
             datacenter_ids: List of datacenter IDs to build candidates for
 
@@ -483,13 +486,26 @@ class GateHealthCoordinator:
             if datacenter_id in self._partitioned_datacenters:
                 health_bucket = DatacenterHealth.DEGRADED.value.upper()
 
+            available_cores = status.available_capacity
+            total_cores = status.available_capacity + status.queue_depth
+            queue_depth = status.queue_depth
+
+            if self._capacity_aggregator is not None:
+                capacity = self._capacity_aggregator.get_capacity(
+                    datacenter_id, health_bucket.lower()
+                )
+                if capacity.total_cores > 0:
+                    available_cores = capacity.available_cores
+                    total_cores = capacity.total_cores
+                    queue_depth = capacity.pending_workflow_count
+
             candidates.append(
                 DatacenterCandidate(
                     datacenter_id=datacenter_id,
                     health_bucket=health_bucket,
-                    available_cores=status.available_capacity,
-                    total_cores=status.available_capacity + status.queue_depth,
-                    queue_depth=status.queue_depth,
+                    available_cores=available_cores,
+                    total_cores=total_cores,
+                    queue_depth=queue_depth,
                     lhm_multiplier=1.0,
                     circuit_breaker_pressure=0.0,
                     total_managers=status.manager_count,

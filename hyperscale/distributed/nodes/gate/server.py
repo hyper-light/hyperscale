@@ -751,6 +751,7 @@ class GateServer(HealthAwareServer):
             get_host=lambda: self._host,
             get_tcp_port=lambda: self._tcp_port,
             confirm_manager_for_dc=self._confirm_manager_for_dc,
+            capacity_aggregator=self._capacity_aggregator,
             on_partition_healed=self._on_partition_healed,
             on_partition_detected=self._on_partition_detected,
         )
