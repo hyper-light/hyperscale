@@ -2116,7 +2116,18 @@ class GateServer(HealthAwareServer):
                     sequence,
                 )
                 return b"ok"
-            except Exception:
+            except Exception as forward_error:
+                await self._udp_logger.log(
+                    ServerWarning(
+                        message=(
+                            f"Failed to forward job_final_result for job {result.job_id[:8]}... "
+                            f"to callback {callback[0]}:{callback[1]}: {forward_error}"
+                        ),
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
                 return b"forwarded"
 
         except Exception as error:
