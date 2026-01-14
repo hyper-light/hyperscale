@@ -282,27 +282,36 @@ class ManagerStateSync:
             ),
         )
 
-    def get_state_snapshot(self) -> ManagerStateSnapshot:
-        """
-        Generate current state snapshot for sync responses.
-
-        Returns:
-            ManagerStateSnapshot with current state
-        """
+    def get_state_snapshot(
+        self,
+        datacenter: str,
+        is_leader: bool,
+        term: int,
+    ) -> ManagerStateSnapshot:
         worker_snapshots = [
             WorkerStateSnapshot(
                 worker_id=worker_id,
-                active_workflows=[],  # Would populate from actual state
-                total_cores=reg.node.total_cores,
-                available_cores=reg.node.total_cores,  # Would calculate actual
+                host=reg.node.host,
+                tcp_port=reg.node.port,
+                udp_port=reg.node.udp_port or reg.node.port,
+                active_workflows={
+                    wf_id: wf
+                    for wf_id, wf in self._state._workflow_progress.items()
+                    if wf.worker_id == worker_id
+                },
             )
             for worker_id, reg in self._state._workers.items()
         ]
 
         return ManagerStateSnapshot(
-            manager_id=self._node_id,
-            state_version=self._state._state_version,
-            worker_snapshots=worker_snapshots,
-            job_count=len(self._state._job_submissions),
-            is_leader=False,  # Would check actual leader state
+            node_id=self._node_id,
+            datacenter=datacenter,
+            is_leader=is_leader,
+            term=term,
+            version=self._state._state_version,
+            workers=worker_snapshots,
+            jobs=dict(self._state._job_progress),
+            job_leaders=dict(self._state._job_leaders),
+            job_leader_addrs=dict(self._state._job_leader_addrs),
+            job_layer_versions=dict(self._state._job_layer_versions),
         )
