@@ -18,6 +18,10 @@ from hyperscale.distributed.models import (
     JobStatus,
     GlobalJobStatus,
 )
+from hyperscale.distributed.capacity import (
+    DatacenterCapacityAggregator,
+    SpilloverEvaluator,
+)
 from hyperscale.distributed.protocol.version import (
     ProtocolVersion,
     CURRENT_PROTOCOL_VERSION,
@@ -86,6 +90,8 @@ class GateDispatchCoordinator:
         get_node_host: Callable[[], str],
         get_node_port: Callable[[], int],
         get_node_id_short: Callable[[], str],
+        capacity_aggregator: DatacenterCapacityAggregator | None = None,
+        spillover_evaluator: SpilloverEvaluator | None = None,
     ) -> None:
         self._state: "GateRuntimeState" = state
         self._logger: "Logger" = logger
@@ -119,6 +125,10 @@ class GateDispatchCoordinator:
         self._get_node_host: Callable[[], str] = get_node_host
         self._get_node_port: Callable[[], int] = get_node_port
         self._get_node_id_short: Callable[[], str] = get_node_id_short
+        self._capacity_aggregator: DatacenterCapacityAggregator | None = (
+            capacity_aggregator
+        )
+        self._spillover_evaluator: SpilloverEvaluator | None = spillover_evaluator
 
     def _is_terminal_status(self, status: str) -> bool:
         return status in (
