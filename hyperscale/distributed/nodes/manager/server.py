@@ -3606,6 +3606,16 @@ class ManagerServer(HealthAwareServer):
 
             # Cluster isolation validation (AD-28)
             if registration.cluster_id != self._env.CLUSTER_ID:
+                await self._udp_logger.log(
+                    ServerWarning(
+                        message=(
+                            f"Gate {registration.node_id} rejected: cluster_id mismatch"
+                        ),
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
                 return GateRegistrationResponse(
                     accepted=False,
                     manager_id=self._node_id.full,
@@ -3617,6 +3627,16 @@ class ManagerServer(HealthAwareServer):
                 ).dump()
 
             if registration.environment_id != self._env.ENVIRONMENT_ID:
+                await self._udp_logger.log(
+                    ServerWarning(
+                        message=(
+                            f"Gate {registration.node_id} rejected: environment_id mismatch"
+                        ),
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
                 return GateRegistrationResponse(
                     accepted=False,
                     manager_id=self._node_id.full,

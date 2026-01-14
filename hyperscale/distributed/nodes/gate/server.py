@@ -2097,6 +2097,9 @@ class GateServer(HealthAwareServer):
 
     async def _complete_job(self, job_id: str, result: object) -> bool:
         """Complete a job and notify client."""
+        if not isinstance(result, JobFinalResult):
+            return False
+
         async with self._job_manager.lock_job(job_id):
             job = self._job_manager.get_job(job_id)
             if not job:
@@ -2133,10 +2136,31 @@ class GateServer(HealthAwareServer):
                 )
                 return False
 
-            job.status = JobStatus.COMPLETED.value
-            self._job_manager.set_job(job_id, job)
+            previous_status = job.status
 
-        await self._send_immediate_update(job_id, "completed", None)
+        global_result = await self._record_job_final_result(result)
+        if global_result:
+            await self._push_global_job_result(global_result)
+
+            async with self._job_manager.lock_job(job_id):
+                job = self._job_manager.get_job(job_id)
+                if job:
+                    job.status = global_result.status
+                    job.total_completed = global_result.total_completed
+                    job.total_failed = global_result.total_failed
+                    job.completed_datacenters = global_result.successful_datacenters
+                    job.failed_datacenters = global_result.failed_datacenters
+                    job.errors = list(global_result.errors)
+                    job.elapsed_seconds = global_result.elapsed_seconds
+                    self._job_manager.set_job(job_id, job)
+
+            self._handle_update_by_tier(
+                job_id,
+                previous_status,
+                global_result.status,
+                None,
+            )
+
         return True
 
     async def handle_global_timeout(
