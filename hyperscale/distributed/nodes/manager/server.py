@@ -2440,9 +2440,9 @@ class ManagerServer(HealthAwareServer):
             if not worker_id:
                 continue
 
-            workflow_id = (
-                sub_workflow.parent_token.workflow_id or sub_workflow.token.workflow_id
-            )
+            workflow_id = sub_workflow.parent_token.workflow_id
+            if not workflow_id:
+                workflow_id = sub_workflow.token.workflow_id
             if not workflow_id:
                 continue
 
