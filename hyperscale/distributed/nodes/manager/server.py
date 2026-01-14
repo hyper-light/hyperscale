@@ -614,6 +614,25 @@ class ManagerServer(HealthAwareServer):
         """Calculate required quorum size."""
         return (self._manager_state.get_active_peer_count() // 2) + 1
 
+    def _get_manager_health_state_snapshot(self) -> str:
+        return self._manager_health_state_snapshot
+
+    async def _get_manager_health_state(self) -> str:
+        async with self._manager_health_state_lock:
+            return self._manager_health_state
+
+    async def _set_manager_health_state(self, new_state: str) -> tuple[str, str, bool]:
+        async with self._manager_health_state_lock:
+            if new_state == self._manager_health_state:
+                return self._manager_health_state, new_state, False
+
+            previous_state = self._manager_health_state
+            self._previous_manager_health_state = previous_state
+            self._manager_health_state = new_state
+            self._manager_health_state_snapshot = new_state
+
+        return previous_state, new_state, True
+
     # =========================================================================
     # Lifecycle Methods
     # =========================================================================
