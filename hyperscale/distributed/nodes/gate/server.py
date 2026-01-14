@@ -2689,16 +2689,13 @@ class GateServer(HealthAwareServer):
 
             circuit = await self._peer_gate_circuit_breaker.get_circuit(gate_addr)
             try:
-                response = await self.send_tcp(
+                response, _ = await self.send_tcp(
                     gate_addr,
                     "job_final_result",
                     data,
                     timeout=3.0,
                 )
-                if response and response[0] == b"ok":
-                    circuit.record_success()
-                    return True
-                elif response and response[0] == b"forwarded":
+                if response in (b"ok", b"forwarded"):
                     circuit.record_success()
                     return True
             except Exception as forward_error:
