@@ -1767,6 +1767,32 @@ class GateServer(HealthAwareServer):
             await self.handle_exception(error, "windowed_stats_push")
             return b"error"
 
+    @tcp.receive()
+    async def job_status_push_forward(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ):
+        """Handle forwarded job status push from peer gate."""
+        try:
+            push = JobStatusPush.load(data)
+            job_id = push.job_id
+
+            callback = self._job_manager.get_callback(job_id)
+            if not callback:
+                return b"no_callback"
+
+            try:
+                await self._send_tcp(callback, "job_status_push", data)
+                return b"ok"
+            except Exception:
+                return b"forwarded"
+
+        except Exception as error:
+            await self.handle_exception(error, "job_status_push_forward")
+            return b"error"
+
     # =========================================================================
     # Helper Methods (Required by Handlers and Coordinators)
     # =========================================================================
