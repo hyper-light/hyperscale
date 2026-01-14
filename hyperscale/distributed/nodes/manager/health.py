@@ -124,6 +124,9 @@ class ManagerHealthMonitor:
         self._latency_max_age: float = 60.0
         self._latency_max_count: int = 30
 
+        # Lock for health state mutations to prevent race conditions
+        self._health_state_lock: asyncio.Lock = asyncio.Lock()
+
         # AD-18: Hybrid overload detector for manager self-health
         self._overload_detector: HybridOverloadDetector = HybridOverloadDetector()
 
@@ -138,7 +141,7 @@ class ManagerHealthMonitor:
         # Lock for health state mutations (lazily created)
         self._health_state_lock: asyncio.Lock | None = None
 
-    def handle_worker_heartbeat(
+    async def handle_worker_heartbeat(
         self,
         heartbeat: WorkerHeartbeat,
         source_addr: tuple[str, int],
@@ -152,17 +155,18 @@ class ManagerHealthMonitor:
         """
         worker_id = heartbeat.node_id
 
-        # Clear unhealthy tracking if worker is alive
-        self._state._worker_unhealthy_since.pop(worker_id, None)
+        async with self._health_state_lock:
+            # Clear unhealthy tracking if worker is alive
+            self._state._worker_unhealthy_since.pop(worker_id, None)
 
-        # Update deadline if worker provided one
-        if hasattr(heartbeat, "deadline") and heartbeat.deadline:
-            self._state._worker_deadlines[worker_id] = heartbeat.deadline
+            # Update deadline if worker provided one
+            if hasattr(heartbeat, "deadline") and heartbeat.deadline:
+                self._state._worker_deadlines[worker_id] = heartbeat.deadline
 
-        worker_health_state = getattr(heartbeat, "health_overload_state", "healthy")
-        previous_state, new_state = self._registry.update_worker_health_state(
-            worker_id, worker_health_state
-        )
+            worker_health_state = getattr(heartbeat, "health_overload_state", "healthy")
+            previous_state, new_state = self._registry.update_worker_health_state(
+                worker_id, worker_health_state
+            )
 
         if previous_state and previous_state != new_state:
             self._log_worker_health_transition(worker_id, previous_state, new_state)
@@ -178,15 +182,16 @@ class ManagerHealthMonitor:
             ),
         )
 
-    def handle_worker_failure(self, worker_id: str) -> None:
+    async def handle_worker_failure(self, worker_id: str) -> None:
         """
         Handle worker failure detected by SWIM.
 
         Args:
             worker_id: Failed worker ID
         """
-        if worker_id not in self._state._worker_unhealthy_since:
-            self._state._worker_unhealthy_since[worker_id] = time.monotonic()
+        async with self._health_state_lock:
+            if worker_id not in self._state._worker_unhealthy_since:
+                self._state._worker_unhealthy_since[worker_id] = time.monotonic()
 
         self._task_runner.run(
             self._logger.log,
@@ -198,14 +203,15 @@ class ManagerHealthMonitor:
             ),
         )
 
-    def handle_worker_recovery(self, worker_id: str) -> None:
+    async def handle_worker_recovery(self, worker_id: str) -> None:
         """
         Handle worker recovery detected by SWIM.
 
         Args:
             worker_id: Recovered worker ID
         """
-        self._state._worker_unhealthy_since.pop(worker_id, None)
+        async with self._health_state_lock:
+            self._state._worker_unhealthy_since.pop(worker_id, None)
 
         self._task_runner.run(
             self._logger.log,

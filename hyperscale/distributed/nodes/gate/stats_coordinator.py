@@ -304,9 +304,6 @@ class GateStatsCoordinator:
         job: GlobalJobStatus,
         callbacks: list[tuple[str, int]],
     ) -> None:
-        if not callbacks:
-            return
-
         unique_callbacks = list(dict.fromkeys(callbacks))
         if not unique_callbacks:
             return

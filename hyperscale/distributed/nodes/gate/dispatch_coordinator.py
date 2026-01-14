@@ -311,61 +311,135 @@ class GateDispatchCoordinator:
             JobAck with acceptance status
         """
         client_id = f"{addr[0]}:{addr[1]}"
+        negotiated_caps = ""
+        lease_acquired = False
+        lease_duration = 0.0
+        fence_token = 0
 
-        # Validate rate limit and load (AD-22, AD-24)
-        if rejection := await self._check_rate_and_load(client_id, submission.job_id):
-            return rejection
+        try:
+            # Validate rate limit and load (AD-22, AD-24)
+            if rejection := await self._check_rate_and_load(
+                client_id, submission.job_id
+            ):
+                return rejection
 
-        # Validate protocol version (AD-25)
-        rejection, negotiated = self._check_protocol_version(submission)
-        if rejection:
-            return rejection
+            # Validate protocol version (AD-25)
+            rejection, negotiated_caps = self._check_protocol_version(submission)
+            if rejection:
+                return rejection
 
-        # Check circuit breaker and quorum
-        if rejection := self._check_circuit_and_quorum(submission.job_id):
-            return rejection
+            lease_result = await self._job_lease_manager.acquire(submission.job_id)
+            if not lease_result.success:
+                current_owner = lease_result.current_owner or "unknown"
+                error_message = (
+                    f"Job lease held by {current_owner} "
+                    f"(expires in {lease_result.expires_in:.1f}s)"
+                )
+                return JobAck(
+                    job_id=submission.job_id,
+                    accepted=False,
+                    error=error_message,
+                    protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+                    protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+                    capabilities=negotiated_caps,
+                )
 
-        # Select datacenters (AD-36)
-        primary_dcs, _, worst_health = self._select_datacenters(
-            submission.datacenter_count,
-            submission.datacenters if submission.datacenters else None,
-            job_id=submission.job_id,
-        )
+            lease = lease_result.lease
+            if lease is None:
+                return JobAck(
+                    job_id=submission.job_id,
+                    accepted=False,
+                    error="Lease acquisition did not return a lease",
+                    protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+                    protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+                    capabilities=negotiated_caps,
+                )
 
-        if worst_health == "initializing":
-            return JobAck(
-                job_id=submission.job_id, accepted=False, error="initializing"
+            lease_acquired = True
+            lease_duration = lease.lease_duration
+            fence_token = lease.fence_token
+
+            # Check circuit breaker and quorum
+            if rejection := self._check_circuit_and_quorum(submission.job_id):
+                await self._release_job_lease(submission.job_id)
+                return rejection
+
+            # Select datacenters (AD-36)
+            primary_dcs, _, worst_health = self._select_datacenters(
+                submission.datacenter_count,
+                submission.datacenters if submission.datacenters else None,
+                job_id=submission.job_id,
             )
-        if not primary_dcs:
+
+            if worst_health == "initializing":
+                await self._release_job_lease(submission.job_id)
+                return JobAck(
+                    job_id=submission.job_id, accepted=False, error="initializing"
+                )
+            if not primary_dcs:
+                await self._release_job_lease(submission.job_id)
+                return JobAck(
+                    job_id=submission.job_id,
+                    accepted=False,
+                    error="No available datacenters",
+                )
+
+            # Setup job tracking
+            self._setup_job_tracking(submission, primary_dcs, fence_token)
+
+            # Assume and broadcast leadership
+            self._assume_leadership(
+                submission.job_id,
+                len(primary_dcs),
+                initial_token=fence_token,
+            )
+            await self._broadcast_leadership(
+                submission.job_id,
+                len(primary_dcs),
+                submission.callback_addr,
+            )
+            self._quorum_circuit.record_success()
+
+            # Dispatch in background
+            self._task_runner.run(self.dispatch_job, submission, primary_dcs)
+
+            if submission.job_id not in self._state._job_lease_renewal_tokens:
+                run = self._task_runner.run(
+                    self._renew_job_lease,
+                    submission.job_id,
+                    lease_duration,
+                    alias=f"job-lease-renewal-{submission.job_id}",
+                )
+                if run:
+                    self._state._job_lease_renewal_tokens[submission.job_id] = run.token
+
+            return JobAck(
+                job_id=submission.job_id,
+                accepted=True,
+                queued_position=self._job_manager.job_count(),
+                protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+                protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+                capabilities=negotiated_caps,
+            )
+        except Exception as error:
+            if lease_acquired:
+                await self._release_job_lease(submission.job_id)
+            await self._logger.log(
+                ServerError(
+                    message=f"Job submission error: {error}",
+                    node_host=self._get_node_host(),
+                    node_port=self._get_node_port(),
+                    node_id=self._get_node_id_short(),
+                )
+            )
             return JobAck(
                 job_id=submission.job_id,
                 accepted=False,
-                error="No available datacenters",
+                error=str(error),
+                protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+                protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+                capabilities=negotiated_caps,
             )
-
-        # Setup job tracking
-        self._setup_job_tracking(submission, primary_dcs)
-
-        # Assume and broadcast leadership
-        self._assume_leadership(submission.job_id, len(primary_dcs))
-        await self._broadcast_leadership(
-            submission.job_id,
-            len(primary_dcs),
-            submission.callback_addr,
-        )
-        self._quorum_circuit.record_success()
-
-        # Dispatch in background
-        self._task_runner.run(self.dispatch_job, submission, primary_dcs)
-
-        return JobAck(
-            job_id=submission.job_id,
-            accepted=True,
-            queued_position=self._job_manager.job_count(),
-            protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
-            protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
-            capabilities=negotiated,
-        )
 
     async def dispatch_job(
         self,
