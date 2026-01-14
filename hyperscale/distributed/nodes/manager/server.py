@@ -2843,9 +2843,13 @@ class ManagerServer(HealthAwareServer):
             )
 
             return WorkflowProgressAck(
-                workflow_id="",
-                received=False,
-                error=str(error),
+                manager_id=self._node_id.full,
+                is_leader=self.is_leader(),
+                healthy_managers=self._get_healthy_managers(),
+                job_leader_addr=None,
+                backpressure_level=0,
+                backpressure_delay_ms=0,
+                backpressure_batch_only=False,
             ).dump()
 
     def _record_workflow_latency_from_results(self, results: list[dict]) -> None:
