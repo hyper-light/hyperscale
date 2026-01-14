@@ -79,7 +79,16 @@ class JobStatusPushHandler:
 
             return b"ok"
 
-        except Exception:
+        except Exception as error:
+            if self._logger:
+                await self._logger.log(
+                    ServerWarning(
+                        message=f"Job status push handling failed: {error}",
+                        node_host="client",
+                        node_port=0,
+                        node_id="client",
+                    )
+                )
             return b"error"
 
 
@@ -146,5 +155,14 @@ class JobBatchPushHandler:
 
             return b"ok"
 
-        except Exception:
+        except Exception as error:
+            if self._logger:
+                await self._logger.log(
+                    ServerWarning(
+                        message=f"Job batch push handling failed: {error}",
+                        node_host="client",
+                        node_port=0,
+                        node_id="client",
+                    )
+                )
             return b"error"
