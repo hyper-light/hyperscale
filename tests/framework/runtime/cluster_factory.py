@@ -8,19 +8,41 @@ from hyperscale.distributed.nodes.worker import WorkerServer
 
 from tests.framework.runtime.test_cluster import TestCluster
 from tests.framework.specs.cluster_spec import ClusterSpec
+from tests.framework.specs.node_spec import NodeSpec
 
 
 def _build_datacenter_ids(dc_count: int) -> list[str]:
     return [f"DC-{chr(65 + index)}" for index in range(dc_count)]
 
 
+def _group_node_specs(
+    node_specs: list[NodeSpec],
+) -> tuple[list[NodeSpec], list[NodeSpec], list[NodeSpec]]:
+    gate_specs: list[NodeSpec] = []
+    manager_specs: list[NodeSpec] = []
+    worker_specs: list[NodeSpec] = []
+    for node_spec in node_specs:
+        if node_spec.node_type == "gate":
+            gate_specs.append(node_spec)
+        elif node_spec.node_type == "manager":
+            manager_specs.append(node_spec)
+        elif node_spec.node_type == "worker":
+            worker_specs.append(node_spec)
+        else:
+            raise ValueError(f"Unknown node_type '{node_spec.node_type}'")
+    return gate_specs, manager_specs, worker_specs
+
+
 class ClusterFactory:
     def __init__(self) -> None:
-        self._env = None
+        self._env: Env | None = None
 
     async def create_cluster(self, spec: ClusterSpec) -> TestCluster:
         if spec.nodes:
-            raise ValueError("Node-level cluster specs are not supported yet")
+            return await self._create_from_nodes(spec)
+        return await self._create_from_counts(spec)
+
+    async def _create_from_counts(self, spec: ClusterSpec) -> TestCluster:
         env_overrides = spec.env_overrides or {}
         self._env = Env(**env_overrides)
         cluster = TestCluster(config=spec)
@@ -117,6 +139,142 @@ class ClusterFactory:
                     seed_managers=seed_managers,
                 )
                 cluster.workers[datacenter_id].append(worker)
+        await self._start_cluster(cluster, spec, all_gate_tcp)
+        return cluster
+
+    async def _create_from_nodes(self, spec: ClusterSpec) -> TestCluster:
+        node_specs = spec.nodes or []
+        gate_specs, manager_specs, worker_specs = _group_node_specs(node_specs)
+        if not gate_specs:
+            raise ValueError("Node specs must include at least one gate")
+        self._env = Env(**(spec.env_overrides or {}))
+        cluster = TestCluster(config=spec)
+        datacenter_ids = sorted(
+            {
+                node_spec.dc_id
+                for node_spec in manager_specs + worker_specs
+                if node_spec.dc_id
+            }
+        )
+        manager_tcp_addrs: dict[str, list[tuple[str, int]]] = {
+            datacenter_id: [] for datacenter_id in datacenter_ids
+        }
+        manager_udp_addrs: dict[str, list[tuple[str, int]]] = {
+            datacenter_id: [] for datacenter_id in datacenter_ids
+        }
+        for manager_spec in manager_specs:
+            datacenter_id = manager_spec.dc_id
+            if not datacenter_id:
+                raise ValueError("Manager node specs require dc_id")
+            manager_tcp_addrs[datacenter_id].append(
+                (manager_spec.host, manager_spec.tcp_port)
+            )
+            manager_udp_addrs[datacenter_id].append(
+                (manager_spec.host, manager_spec.udp_port)
+            )
+        all_gate_tcp = [
+            (gate_spec.host, gate_spec.tcp_port) for gate_spec in gate_specs
+        ]
+        all_gate_udp = [
+            (gate_spec.host, gate_spec.udp_port) for gate_spec in gate_specs
+        ]
+        for gate_spec in gate_specs:
+            gate_env = self._build_env(spec, gate_spec.env_overrides)
+            gate_peers = gate_spec.gate_peers or [
+                addr
+                for addr in all_gate_tcp
+                if addr != (gate_spec.host, gate_spec.tcp_port)
+            ]
+            gate_udp_peers = gate_spec.gate_udp_peers or [
+                addr
+                for addr in all_gate_udp
+                if addr != (gate_spec.host, gate_spec.udp_port)
+            ]
+            gate = GateServer(
+                host=gate_spec.host,
+                tcp_port=gate_spec.tcp_port,
+                udp_port=gate_spec.udp_port,
+                env=gate_env,
+                gate_peers=gate_peers,
+                gate_udp_peers=gate_udp_peers,
+                datacenter_managers=manager_tcp_addrs,
+                datacenter_manager_udp=manager_udp_addrs,
+            )
+            cluster.gates.append(gate)
+        for datacenter_id in datacenter_ids:
+            cluster.managers[datacenter_id] = []
+            cluster.workers[datacenter_id] = []
+        for manager_spec in manager_specs:
+            datacenter_id = manager_spec.dc_id
+            if not datacenter_id:
+                raise ValueError("Manager node specs require dc_id")
+            manager_env = self._build_env(spec, manager_spec.env_overrides)
+            dc_manager_tcp = manager_tcp_addrs[datacenter_id]
+            dc_manager_udp = manager_udp_addrs[datacenter_id]
+            manager_peers = manager_spec.manager_peers or [
+                addr
+                for addr in dc_manager_tcp
+                if addr != (manager_spec.host, manager_spec.tcp_port)
+            ]
+            manager_udp_peers = manager_spec.manager_udp_peers or [
+                addr
+                for addr in dc_manager_udp
+                if addr != (manager_spec.host, manager_spec.udp_port)
+            ]
+            manager = ManagerServer(
+                host=manager_spec.host,
+                tcp_port=manager_spec.tcp_port,
+                udp_port=manager_spec.udp_port,
+                env=manager_env,
+                dc_id=datacenter_id,
+                manager_peers=manager_peers,
+                manager_udp_peers=manager_udp_peers,
+                gate_addrs=all_gate_tcp,
+                gate_udp_addrs=all_gate_udp,
+            )
+            cluster.managers[datacenter_id].append(manager)
+        for worker_spec in worker_specs:
+            datacenter_id = worker_spec.dc_id
+            if not datacenter_id:
+                raise ValueError("Worker node specs require dc_id")
+            worker_env = self._build_env(spec, worker_spec.env_overrides)
+            seed_managers = worker_spec.seed_managers or manager_tcp_addrs.get(
+                datacenter_id, []
+            )
+            if not seed_managers:
+                raise ValueError(
+                    f"Worker node requires seed managers for '{datacenter_id}'"
+                )
+            total_cores = worker_spec.total_cores or spec.cores_per_worker
+            worker = WorkerServer(
+                host=worker_spec.host,
+                tcp_port=worker_spec.tcp_port,
+                udp_port=worker_spec.udp_port,
+                env=worker_env,
+                dc_id=datacenter_id,
+                total_cores=total_cores,
+                seed_managers=seed_managers,
+            )
+            if datacenter_id not in cluster.workers:
+                cluster.workers[datacenter_id] = []
+            cluster.workers[datacenter_id].append(worker)
+        await self._start_cluster(cluster, spec, all_gate_tcp)
+        return cluster
+
+    def _build_env(
+        self, spec: ClusterSpec, node_overrides: dict[str, str] | None
+    ) -> Env:
+        env_overrides = dict(spec.env_overrides or {})
+        if node_overrides:
+            env_overrides.update(node_overrides)
+        return Env(**env_overrides)
+
+    async def _start_cluster(
+        self,
+        cluster: TestCluster,
+        spec: ClusterSpec,
+        gate_addrs: list[tuple[str, int]],
+    ) -> None:
         await asyncio.gather(*[gate.start() for gate in cluster.gates])
         await asyncio.gather(
             *[manager.start() for manager in cluster.get_all_managers()]
@@ -128,10 +286,9 @@ class ClusterFactory:
             host="127.0.0.1",
             port=spec.client_port,
             env=self._env,
-            gates=all_gate_tcp,
+            gates=gate_addrs,
         )
         await cluster.client.start()
-        return cluster
 
     async def teardown_cluster(self, cluster: TestCluster) -> None:
         if cluster.client:
