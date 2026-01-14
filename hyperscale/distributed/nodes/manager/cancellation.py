@@ -144,13 +144,155 @@ class ManagerCancellationCoordinator:
                 workflow_id=workflow_id,
                 job_id=job_id,
                 cancelled_at=time.time(),
-                reason=reason,
+                request_id=reason,
+                dependents=[],
             )
 
-        # In the full implementation, this would:
-        # 1. Look up the worker running this workflow
-        # 2. Send WorkflowCancelRequest to that worker
-        # 3. Handle retry logic if worker is unreachable
+        try:
+            workflow_token = TrackingToken.parse(workflow_id)
+        except ValueError as error:
+            await self._record_workflow_cancellation_failure(
+                job_id,
+                workflow_id,
+                f"Invalid workflow token: {error}",
+            )
+            return
+
+        if not workflow_token.worker_id:
+            await self._record_workflow_cancellation_failure(
+                job_id,
+                workflow_id,
+                "Workflow token missing worker id for cancellation",
+            )
+            return
+
+        worker = self._state.get_worker(workflow_token.worker_id)
+        if not worker:
+            await self._record_workflow_cancellation_failure(
+                job_id,
+                workflow_id,
+                f"Worker {workflow_token.worker_id} not found for workflow cancellation",
+            )
+            return
+
+        cancel_request = WorkflowCancelRequest(
+            job_id=job_id,
+            workflow_id=workflow_id,
+            requester_id=self._node_id,
+            timestamp=time.time(),
+            reason=reason,
+        )
+
+        response = await self._send_to_worker(
+            (worker.node.host, worker.node.port),
+            "cancel_workflow",
+            cancel_request.dump(),
+            timeout=self._config.tcp_timeout_standard_seconds,
+        )
+
+        if not isinstance(response, bytes):
+            if isinstance(response, Exception):
+                error_message = (
+                    f"Failed to send cancellation to worker {workflow_token.worker_id}:"
+                    f" {response}"
+                )
+            else:
+                error_message = (
+                    f"No response from worker {workflow_token.worker_id} for workflow"
+                    f" {workflow_id}"
+                )
+            await self._record_workflow_cancellation_failure(
+                job_id,
+                workflow_id,
+                error_message,
+            )
+            return
+
+        try:
+            cancel_response = WorkflowCancelResponse.load(response)
+        except Exception as error:
+            await self._record_workflow_cancellation_failure(
+                job_id,
+                workflow_id,
+                f"Failed to parse cancellation response: {error}",
+            )
+            return
+
+        if cancel_response.success:
+            if cancel_response.already_completed:
+                await self._finalize_workflow_cancellation(
+                    job_id,
+                    workflow_id,
+                    success=True,
+                    errors=[],
+                )
+            return
+
+        error_message = cancel_response.error or "Worker reported cancellation failure"
+        await self._record_workflow_cancellation_failure(
+            job_id,
+            workflow_id,
+            error_message,
+        )
+
+    async def _finalize_workflow_cancellation(
+        self,
+        job_id: str,
+        workflow_id: str,
+        success: bool,
+        errors: list[str],
+    ) -> None:
+        """
+        Record workflow cancellation completion.
+
+        Args:
+            job_id: Job ID
+            workflow_id: Workflow ID
+            success: Whether cancellation succeeded
+            errors: Cancellation errors
+        """
+        notification = WorkflowCancellationComplete(
+            job_id=job_id,
+            workflow_id=workflow_id,
+            success=success,
+            errors=errors,
+            cancelled_at=time.monotonic(),
+            node_id=self._node_id,
+        )
+        await self.handle_workflow_cancelled(notification)
+
+    async def _record_workflow_cancellation_failure(
+        self,
+        job_id: str,
+        workflow_id: str,
+        error_message: str,
+    ) -> None:
+        """
+        Record a workflow cancellation failure.
+
+        Args:
+            job_id: Job ID
+            workflow_id: Workflow ID
+            error_message: Error message to record
+        """
+        self._task_runner.run(
+            self._logger.log,
+            ServerWarning(
+                message=(
+                    f"Workflow {workflow_id[:8]}... cancellation failed:"
+                    f" {error_message}"
+                ),
+                node_host=self._config.host,
+                node_port=self._config.tcp_port,
+                node_id=self._node_id,
+            ),
+        )
+        await self._finalize_workflow_cancellation(
+            job_id,
+            workflow_id,
+            success=False,
+            errors=[error_message],
+        )
 
     async def handle_workflow_cancelled(
         self,
