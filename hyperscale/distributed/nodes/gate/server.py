@@ -3252,6 +3252,7 @@ class GateServer(HealthAwareServer):
 
                 for peer_addr in peers_to_cleanup:
                     self._modular_state.cleanup_dead_peer(peer_addr)
+                    await self._peer_gate_circuit_breaker.remove_circuit(peer_addr)
 
                 await self._check_quorum_status()
 
