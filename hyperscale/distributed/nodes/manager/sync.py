@@ -7,7 +7,7 @@ for retry delays to prevent thundering herd.
 """
 
 import asyncio
-from typing import TYPE_CHECKING
+from typing import Any, Callable, Coroutine, TYPE_CHECKING
 
 from hyperscale.distributed.models import (
     StateSyncRequest,
@@ -19,7 +19,12 @@ from hyperscale.distributed.reliability import (
     calculate_jittered_delay,
     JitterStrategy,
 )
-from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerDebug, ServerWarning, ServerError
+from hyperscale.logging.hyperscale_logging_models import (
+    ServerInfo,
+    ServerDebug,
+    ServerWarning,
+    ServerError,
+)
 
 if TYPE_CHECKING:
     from hyperscale.distributed.nodes.manager.state import ManagerState
@@ -75,7 +80,7 @@ class ManagerStateSync:
                 node_host=self._config.host,
                 node_port=self._config.tcp_port,
                 node_id=self._node_id,
-            )
+            ),
         )
 
         request = StateSyncRequest(
@@ -131,7 +136,7 @@ class ManagerStateSync:
                         node_host=self._config.host,
                         node_port=self._config.tcp_port,
                         node_id=self._node_id,
-                    )
+                    ),
                 )
 
             if attempt < max_retries - 1:
@@ -163,7 +168,7 @@ class ManagerStateSync:
                 node_host=self._config.host,
                 node_port=self._config.tcp_port,
                 node_id=self._node_id,
-            )
+            ),
         )
 
     async def sync_state_from_manager_peers(self) -> None:
@@ -184,7 +189,7 @@ class ManagerStateSync:
                 node_host=self._config.host,
                 node_port=self._config.tcp_port,
                 node_id=self._node_id,
-            )
+            ),
         )
 
         request = StateSyncRequest(
@@ -239,7 +244,7 @@ class ManagerStateSync:
                         node_host=self._config.host,
                         node_port=self._config.tcp_port,
                         node_id=self._node_id,
-                    )
+                    ),
                 )
 
             if attempt < max_retries - 1:
@@ -271,7 +276,7 @@ class ManagerStateSync:
                 node_host=self._config.host,
                 node_port=self._config.tcp_port,
                 node_id=self._node_id,
-            )
+            ),
         )
 
     def get_state_snapshot(self) -> ManagerStateSnapshot:
