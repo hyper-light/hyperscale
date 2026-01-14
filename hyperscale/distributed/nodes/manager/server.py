@@ -353,15 +353,6 @@ class ManagerServer(HealthAwareServer):
             else 0,
         )
 
-        # Stats coordinator
-        self._stats = ManagerStatsCoordinator(
-            state=self._manager_state,
-            config=self._config,
-            logger=self._udp_logger,
-            node_id=self._node_id.short,
-            task_runner=self._task_runner,
-        )
-
         # Discovery coordinator
         self._discovery = ManagerDiscoveryCoordinator(
             state=self._manager_state,
