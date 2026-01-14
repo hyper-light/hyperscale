@@ -97,6 +97,20 @@ class ManagerStateSync:
     async def _noop_async(self, *_: Any) -> None:
         return None
 
+    def _normalize_job_leader_addr(
+        self,
+        leader_addr: tuple[str, int] | list[str | int] | None,
+    ) -> tuple[str, int] | None:
+        if leader_addr is None:
+            return None
+
+        if isinstance(leader_addr, list):
+            if len(leader_addr) != 2:
+                return None
+            return (str(leader_addr[0]), int(leader_addr[1]))
+
+        return leader_addr
+
     async def sync_state_from_workers(self) -> None:
         """
         Synchronize state from all known workers.
