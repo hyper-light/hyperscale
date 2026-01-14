@@ -238,12 +238,13 @@ class ClusterFactory:
             if not datacenter_id:
                 raise ValueError("Worker node specs require dc_id")
             worker_overrides = dict(worker_spec.env_overrides or {})
-            if worker_spec.total_cores is not None:
-                worker_overrides.setdefault("WORKER_MAX_CORES", worker_spec.total_cores)
-            worker_env = self._build_env(spec, worker_overrides)
-            seed_managers = worker_spec.seed_managers or manager_tcp_addrs.get(
-                datacenter_id, []
+            worker_cores = (
+                worker_spec.total_cores
+                if worker_spec.total_cores is not None
+                else spec.cores_per_worker
             )
+            worker_overrides.setdefault("WORKER_MAX_CORES", worker_cores)
+
             if not seed_managers:
                 raise ValueError(
                     f"Worker node requires seed managers for '{datacenter_id}'"
