@@ -1305,7 +1305,6 @@ class GateServer(HealthAwareServer):
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
-        transport: asyncio.Transport,
     ):
         """Receive final job status from manager (AD-34 lifecycle cleanup)."""
         try:
@@ -1322,7 +1321,6 @@ class GateServer(HealthAwareServer):
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
-        transport: asyncio.Transport,
     ):
         """Handle workflow result push from manager."""
         try:
@@ -1374,7 +1372,6 @@ class GateServer(HealthAwareServer):
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
-        transport: asyncio.Transport,
     ):
         """Handle client callback registration for job reconnection."""
         try:
@@ -1436,7 +1433,6 @@ class GateServer(HealthAwareServer):
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
-        transport: asyncio.Transport,
     ):
         """Handle workflow status query from client."""
         try:
@@ -1476,7 +1472,6 @@ class GateServer(HealthAwareServer):
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
-        transport: asyncio.Transport,
     ):
         """Handle datacenter list request from client."""
         try:
@@ -1541,7 +1536,6 @@ class GateServer(HealthAwareServer):
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
-        transport: asyncio.Transport,
     ):
         """Handle job leadership announcement from peer gate."""
         try:
@@ -1587,7 +1581,6 @@ class GateServer(HealthAwareServer):
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
-        transport: asyncio.Transport,
     ):
         """Handle DC leader announcement from peer gate."""
         try:
