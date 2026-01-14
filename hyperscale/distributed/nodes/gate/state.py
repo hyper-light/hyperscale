@@ -163,6 +163,14 @@ class GateRuntimeState:
         self._peer_state_locks.pop(peer_addr, None)
         self._peer_state_epoch.pop(peer_addr, None)
 
+    def cleanup_peer_tracking(self, peer_addr: tuple[str, int]) -> None:
+        """Remove TCP-address-keyed tracking data for a peer."""
+        self._gate_peer_unhealthy_since.pop(peer_addr, None)
+        self._dead_gate_peers.discard(peer_addr)
+        self._dead_gate_timestamps.pop(peer_addr, None)
+        self._active_gate_peers.discard(peer_addr)
+        self.remove_peer_lock(peer_addr)
+
     def is_peer_active(self, peer_addr: tuple[str, int]) -> bool:
         """Check if a peer is in the active set."""
         return peer_addr in self._active_gate_peers
@@ -410,11 +418,7 @@ class GateRuntimeState:
                     gate_ids_to_remove.add(heartbeat.node_id)
 
         # Clean up TCP-address-keyed structures
-        self._dead_gate_peers.discard(peer_addr)
-        self._dead_gate_timestamps.pop(peer_addr, None)
-        self._gate_peer_unhealthy_since.pop(peer_addr, None)
-        self._active_gate_peers.discard(peer_addr)
-        self.remove_peer_lock(peer_addr)
+        self.cleanup_peer_tracking(peer_addr)
 
         # Clean up UDP-address-keyed structures
         for udp_addr in udp_addrs_to_remove:
