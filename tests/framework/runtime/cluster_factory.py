@@ -237,10 +237,10 @@ class ClusterFactory:
             datacenter_id = worker_spec.dc_id
             if not datacenter_id:
                 raise ValueError("Worker node specs require dc_id")
-            seed_manager_addresses = worker_spec.seed_managers or manager_tcp_addrs.get(
+            manager_seed_addresses = worker_spec.seed_managers or manager_tcp_addrs.get(
                 datacenter_id, []
             )
-            if not seed_manager_addresses:
+            if not manager_seed_addresses:
                 raise ValueError(
                     f"Worker node requires seed managers for '{datacenter_id}'"
                 )
@@ -258,11 +258,12 @@ class ClusterFactory:
                 udp_port=worker_spec.udp_port,
                 env=worker_env,
                 dc_id=datacenter_id,
-                seed_managers=seed_manager_addresses,
+                seed_managers=manager_seed_addresses,
             )
             if datacenter_id not in cluster.workers:
                 cluster.workers[datacenter_id] = []
             cluster.workers[datacenter_id].append(worker)
+
         await self._start_cluster(cluster, spec, all_gate_tcp)
         return cluster
 
