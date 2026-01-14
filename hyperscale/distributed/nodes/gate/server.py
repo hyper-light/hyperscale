@@ -426,6 +426,9 @@ class GateServer(HealthAwareServer):
         )
         self._blended_scorer = BlendedLatencyScorer(self._observed_latency_tracker)
 
+        # Vivaldi coordinate tracking (AD-35)
+        self._coordinate_tracker = CoordinateTracker()
+
         # Manager dispatcher
         self._manager_dispatcher = ManagerDispatcher(
             dispatch_timeout=5.0,
