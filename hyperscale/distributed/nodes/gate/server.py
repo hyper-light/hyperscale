@@ -1909,16 +1909,26 @@ class GateServer(HealthAwareServer):
                     old_manager_id=transfer.old_manager_id,
                     old_manager_addr=old_manager_addr,
                 )
-                try:
-                    await self._send_tcp(
-                        callback,
-                        "receive_manager_job_leader_transfer",
-                        manager_transfer.dump(),
-                    )
-                except Exception as error:
-                    await self.handle_exception(
-                        error,
-                        "job_leader_manager_transfer_notify_client",
+                payload = manager_transfer.dump()
+                delivered = await self._record_and_send_client_update(
+                    transfer.job_id,
+                    callback,
+                    "receive_manager_job_leader_transfer",
+                    payload,
+                    timeout=5.0,
+                    log_failure=False,
+                )
+                if not delivered:
+                    await self._udp_logger.log(
+                        ServerWarning(
+                            message=(
+                                "Failed to deliver manager leader transfer to "
+                                f"client {callback} for job {transfer.job_id[:8]}..."
+                            ),
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
                     )
 
             return JobLeaderManagerTransferAck(
