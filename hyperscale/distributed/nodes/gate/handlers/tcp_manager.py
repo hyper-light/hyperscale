@@ -73,6 +73,8 @@ class GateManagerHandler:
             [tuple[str, int], str], Awaitable[None]
         ],
         broadcast_manager_discovery: Callable,
+        send_tcp: Callable | None = None,
+        get_progress_callback: Callable[[str], tuple[str, int] | None] | None = None,
     ) -> None:
         """
         Initialize the manager handler.
@@ -94,6 +96,8 @@ class GateManagerHandler:
             update_dc_backpressure: Async callback to update DC backpressure
             set_manager_backpressure_none: Async callback to clear manager backpressure
             broadcast_manager_discovery: Callback to broadcast discovery
+            send_tcp: Callback to send TCP messages
+            get_progress_callback: Callback to get client callback for a job
         """
         self._state: GateRuntimeState = state
         self._logger: Logger = logger
@@ -121,6 +125,10 @@ class GateManagerHandler:
             [tuple[str, int], str], Awaitable[None]
         ] = set_manager_backpressure_none
         self._broadcast_manager_discovery: Callable = broadcast_manager_discovery
+        self._send_tcp: Callable | None = send_tcp
+        self._get_progress_callback: Callable[
+            [str], tuple[str, int] | None
+        ] | None = get_progress_callback
 
     async def handle_status_update(
         self,
