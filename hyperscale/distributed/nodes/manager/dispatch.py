@@ -155,6 +155,12 @@ class ManagerDispatchCoordinator:
                             ),
                         )
                         await self._state.increment_dispatch_failure_count()
+                        if circuit := self._state._worker_circuits.get(worker_id):
+                            circuit.record_error()
+                            if circuit.is_open():
+                                self._state.setdefault_worker_unhealthy_since(
+                                    worker_id, time.monotonic()
+                                )
                     return ack
 
                 self._task_runner.run(
