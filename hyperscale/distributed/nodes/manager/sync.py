@@ -458,7 +458,7 @@ class ManagerStateSync:
         for peer_addr in peers:
             snapshot = await self._request_manager_peer_state(peer_addr, request)
             if snapshot:
-                await self._apply_manager_peer_state(snapshot)
+                await self._apply_manager_peer_state(peer_addr, snapshot)
 
     async def _request_manager_peer_state(
         self,
