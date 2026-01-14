@@ -509,3 +509,73 @@ class GateManagerHandler:
         except Exception as error:
             await handle_exception(error, "manager_discovery")
             return b"error"
+
+    async def handle_reporter_result_push(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        handle_exception: Callable,
+    ) -> bytes:
+        """
+        Handle reporter result push from manager.
+
+        Forwards the result to the registered client callback for the job.
+
+        Args:
+            addr: Manager address
+            data: Serialized ReporterResultPush
+            handle_exception: Callback for exception handling
+
+        Returns:
+            b'ok' on success, b'error' on failure, b'no_callback' if no client
+        """
+        try:
+            push = ReporterResultPush.load(data)
+
+            self._task_runner.run(
+                self._logger.log,
+                ServerInfo(
+                    message=(
+                        f"Received reporter result for job {push.job_id[:8]}... "
+                        f"(type={push.reporter_type}, success={push.success}, "
+                        f"from {push.source}/{push.datacenter})"
+                    ),
+                    node_host=self._get_host(),
+                    node_port=self._get_tcp_port(),
+                    node_id=self._get_node_id().short,
+                ),
+            )
+
+            if self._get_progress_callback is None or self._send_tcp is None:
+                return b"no_callback"
+
+            callback_addr = self._get_progress_callback(push.job_id)
+            if callback_addr is None:
+                return b"no_callback"
+
+            try:
+                await self._send_tcp(
+                    callback_addr,
+                    "reporter_result_push",
+                    data,
+                    timeout=5.0,
+                )
+                return b"ok"
+            except Exception as forward_error:
+                self._task_runner.run(
+                    self._logger.log,
+                    ServerWarning(
+                        message=(
+                            f"Failed to forward reporter result for job {push.job_id[:8]}... "
+                            f"to client {callback_addr}: {forward_error}"
+                        ),
+                        node_host=self._get_host(),
+                        node_port=self._get_tcp_port(),
+                        node_id=self._get_node_id().short,
+                    ),
+                )
+                return b"forward_failed"
+
+        except Exception as error:
+            await handle_exception(error, "reporter_result_push")
+            return b"error"
