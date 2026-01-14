@@ -2127,14 +2127,48 @@ class GateServer(HealthAwareServer):
         """Confirm a peer via SWIM."""
         self.confirm_peer(peer_addr)
 
-    async def _complete_job(self, job_id: str, result: object) -> None:
+    async def _complete_job(self, job_id: str, result: object) -> bool:
         """Complete a job and notify client."""
-        job = self._job_manager.get_job(job_id)
-        if job:
+        async with self._job_manager.lock_job(job_id):
+            job = self._job_manager.get_job(job_id)
+            if not job:
+                await self._logger.log(
+                    ServerWarning(
+                        message=(
+                            "Final result received for unknown job "
+                            f"{job_id[:8]}...; skipping completion"
+                        ),
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+                return False
+
+            terminal_statuses = {
+                JobStatus.COMPLETED.value,
+                JobStatus.FAILED.value,
+                JobStatus.CANCELLED.value,
+            }
+            if job.status in terminal_statuses:
+                await self._logger.log(
+                    ServerDebug(
+                        message=(
+                            "Duplicate final result for job "
+                            f"{job_id[:8]}... ignored (status={job.status})"
+                        ),
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+                return False
+
             job.status = JobStatus.COMPLETED.value
             self._job_manager.set_job(job_id, job)
 
         await self._send_immediate_update(job_id, "completed", None)
+        return True
 
     async def _gather_job_status(self, job_id: str) -> GlobalJobStatus:
         async with self._job_manager.lock_job(job_id):
