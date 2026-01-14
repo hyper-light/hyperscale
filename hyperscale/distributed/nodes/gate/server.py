@@ -761,9 +761,7 @@ class GateServer(HealthAwareServer):
 
         self._job_router = GateJobRouter(
             coordinate_tracker=self._coordinate_tracker,
-            get_datacenter_candidates=lambda: self._health_coordinator.build_datacenter_candidates(
-                list(self._datacenter_managers.keys())
-            ),
+            get_datacenter_candidates=self._get_datacenter_candidates_for_router,
         )
 
         self._orphan_job_coordinator = GateOrphanJobCoordinator(
