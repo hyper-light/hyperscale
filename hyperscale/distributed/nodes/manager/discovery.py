@@ -269,7 +269,7 @@ class ManagerDiscoveryCoordinator:
                     ),
                 )
 
-    def get_discovery_metrics(self) -> dict:
+    def get_discovery_metrics(self) -> dict[str, int]:
         """Get discovery-related metrics."""
         return {
             "worker_peer_count": self._worker_discovery.peer_count(),

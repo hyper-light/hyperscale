@@ -185,7 +185,7 @@ class ManagerLeadershipCoordinator:
         else:
             return "no_quorum"
 
-    def get_leadership_metrics(self) -> dict:
+    def get_leadership_metrics(self) -> dict[str, Any]:
         return {
             "is_leader": self._is_leader(),
             "current_term": self._get_term(),

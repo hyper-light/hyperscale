@@ -337,7 +337,7 @@ class ManagerDispatchCoordinator:
 
         return quorum_achieved
 
-    def get_dispatch_metrics(self) -> dict:
+    def get_dispatch_metrics(self) -> dict[str, int]:
         return {
             "throughput_count": self._state._dispatch_throughput_count,
             "failure_count": self._state._dispatch_failure_count,

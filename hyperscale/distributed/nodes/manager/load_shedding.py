@@ -254,7 +254,7 @@ class ManagerLoadShedder:
         """Get current overload state."""
         return self._overload.get_state()
 
-    def get_metrics(self) -> dict:
+    def get_metrics(self) -> dict[str, Any]:
         """Get load shedding metrics."""
         return {
             "overload_state": self._overload.get_state(),

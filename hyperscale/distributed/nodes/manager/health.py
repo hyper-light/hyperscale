@@ -736,7 +736,7 @@ class ManagerHealthMonitor:
         """
         return self._overload_detector.get_state(cpu_percent, memory_percent).value
 
-    def get_overload_diagnostics(self) -> dict:
+    def get_overload_diagnostics(self) -> dict[str, Any]:
         """
         Get hybrid overload detector diagnostics (AD-18).
 
@@ -745,7 +745,7 @@ class ManagerHealthMonitor:
         """
         return self._overload_detector.get_diagnostics()
 
-    def get_health_metrics(self) -> dict:
+    def get_health_metrics(self) -> dict[str, Any]:
         """Get health-related metrics."""
         overload_diag = self._overload_detector.get_diagnostics()
         return {
@@ -984,7 +984,7 @@ class HealthcheckExtensionManager:
         """Get current deadline for a worker."""
         return self._worker_deadlines.get(worker_id)
 
-    def get_metrics(self) -> dict:
+    def get_metrics(self) -> dict[str, int]:
         """Get extension manager metrics."""
         return {
             "tracked_workers": len(self._extension_trackers),

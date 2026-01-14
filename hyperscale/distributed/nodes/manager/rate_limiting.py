@@ -280,7 +280,7 @@ class ManagerRateLimitingCoordinator:
                 pass
             self._cleanup_task = None
 
-    def get_metrics(self) -> dict:
+    def get_metrics(self) -> dict[str, dict[str, Any]]:
         """Get rate limiting metrics."""
         server_metrics = self._server_limiter.get_metrics()
         cooperative_metrics = self._cooperative_limiter.get_metrics()
