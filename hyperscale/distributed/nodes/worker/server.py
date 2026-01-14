@@ -230,6 +230,7 @@ class WorkerServer(HealthAwareServer):
         self._orphan_check_task: asyncio.Task | None = None
         self._discovery_maintenance_task: asyncio.Task | None = None
         self._overload_poll_task: asyncio.Task | None = None
+        self._pending_result_retry_task: asyncio.Task | None = None
 
         # Debounced cores notification (AD-38 fix: single in-flight task, coalesced updates)
         self._pending_cores_notification: int | None = None
@@ -634,6 +635,15 @@ class WorkerServer(HealthAwareServer):
             "progress_flush",
         )
         self._lifecycle_manager.add_background_task(self._progress_flush_task)
+
+        self._pending_result_retry_task = self._create_background_task(
+            self._run_pending_result_retry_loop(
+                get_healthy_managers=lambda: self._registry._healthy_manager_ids,
+                send_tcp=self.send_tcp,
+            ),
+            "pending_result_retry",
+        )
+        self._lifecycle_manager.add_background_task(self._pending_result_retry_task)
 
         self._dead_manager_reap_task = self._create_background_task(
             self._background_loops.run_dead_manager_reap_loop(
