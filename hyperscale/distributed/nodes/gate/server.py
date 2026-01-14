@@ -4076,13 +4076,15 @@ class GateServer(HealthAwareServer):
         successful_datacenters = 0
         failed_datacenters = 0
         max_elapsed = 0.0
+        normalized_statuses: list[str] = []
 
         for datacenter in sorted(per_dc_results.keys()):
             dc_result = per_dc_results[datacenter]
             ordered_results.append(dc_result)
 
-            status_value = dc_result.status.upper()
-            if status_value == "COMPLETED":
+            status_value = self._normalize_final_status(dc_result.status)
+            normalized_statuses.append(status_value)
+            if status_value == JobStatus.COMPLETED.value:
                 successful_datacenters += 1
             else:
                 failed_datacenters += 1
@@ -4106,20 +4108,14 @@ class GateServer(HealthAwareServer):
             ordered_results.append(missing_result)
             failed_datacenters += 1
             errors.append(f"{datacenter}: missing final result")
+            normalized_statuses.append(
+                self._normalize_final_status(missing_result.status)
+            )
 
         total_completed = sum(result.total_completed for result in ordered_results)
         total_failed = sum(result.total_failed for result in ordered_results)
 
-        expected_count = len(expected_dcs)
-        reported_count = len(per_dc_results)
-        if expected_count and reported_count < expected_count:
-            status = "PARTIAL"
-        elif failed_datacenters == 0:
-            status = "COMPLETED"
-        elif successful_datacenters == 0:
-            status = "FAILED"
-        else:
-            status = "PARTIAL"
+        status = self._resolve_global_result_status(normalized_statuses)
 
         aggregated_stats = self._build_aggregated_job_stats(ordered_results)
 

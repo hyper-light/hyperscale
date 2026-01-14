@@ -376,6 +376,14 @@ class WorkflowProgressAck(Message):
         else:
             raise TypeError("Unsupported WorkflowProgressAck state")
 
+        if healthy_managers is None:
+            healthy_managers = []
+        elif isinstance(healthy_managers, tuple):
+            healthy_managers = list(healthy_managers)
+
+        if isinstance(job_leader_addr, list):
+            job_leader_addr = tuple(job_leader_addr)
+
         self.manager_id = manager_id
         self.is_leader = is_leader
         self.healthy_managers = healthy_managers

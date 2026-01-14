@@ -370,6 +370,7 @@ class GateJobManager:
             JobStatus.COMPLETED.value,
             JobStatus.FAILED.value,
             JobStatus.CANCELLED.value,
+            JobStatus.TIMEOUT.value,
         }
         to_remove: list[str] = []
 
