@@ -156,7 +156,7 @@ class ManagerState:
         self._dispatch_throughput_last_value: float = 0.0
         self._dispatch_failure_count: int = 0
 
-        self._workflow_latency_digest = TimeWindowedTDigest()
+        self._workflow_latency_digest: TimeWindowedTDigest = TimeWindowedTDigest()
 
         # Background tasks
         self._dead_node_reap_task: asyncio.Task | None = None
