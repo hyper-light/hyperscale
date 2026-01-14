@@ -66,6 +66,7 @@ class GateDispatchCoordinator:
         job_timeout_tracker: "GateJobTimeoutTracker",
         dispatch_time_tracker: "DispatchTimeTracker",
         circuit_breaker_manager: "CircuitBreakerManager",
+        job_lease_manager: JobLeaseManager,
         datacenter_managers: dict[str, list[tuple[str, int]]],
         check_rate_limit: Callable,
         should_shed_request: Callable,
