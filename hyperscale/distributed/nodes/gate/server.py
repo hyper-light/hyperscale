@@ -1340,6 +1340,8 @@ class GateServer(HealthAwareServer):
                 ),
             )
 
+            workflow_results: dict[str, WorkflowResultPush] = {}
+
             async with self._workflow_dc_results_lock:
                 if push.job_id not in self._workflow_dc_results:
                     self._workflow_dc_results[push.job_id] = {}
@@ -1361,7 +1363,7 @@ class GateServer(HealthAwareServer):
                     if not job_results and push.job_id in self._workflow_dc_results:
                         del self._workflow_dc_results[push.job_id]
 
-            if should_aggregate and workflow_results:
+            if workflow_results:
                 await self._forward_aggregated_workflow_result(
                     push.job_id, push.workflow_id, workflow_results
                 )
