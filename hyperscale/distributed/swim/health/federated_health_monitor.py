@@ -179,6 +179,7 @@ class FederatedHealthMonitor:
     _on_dc_leader_change: (
         Callable[[str, str, tuple[str, int], tuple[str, int], int], None] | None
     ) = None  # (dc, leader_node_id, tcp_addr, udp_addr, term)
+    on_probe_error: Callable[[str, list[str]], None] | None = None
 
     # State
     _dc_health: dict[str, DCHealthState] = field(default_factory=dict)
