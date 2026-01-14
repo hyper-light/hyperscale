@@ -475,6 +475,9 @@ class GateHealthCoordinator:
                 if correlation_decision.should_delay_eviction:
                     health_bucket = DatacenterHealth.DEGRADED.value.upper()
 
+            if datacenter_id in self._partitioned_datacenters:
+                health_bucket = DatacenterHealth.DEGRADED.value.upper()
+
             candidates.append(
                 DatacenterCandidate(
                     datacenter_id=datacenter_id,
