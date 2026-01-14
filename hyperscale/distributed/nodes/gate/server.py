@@ -834,6 +834,8 @@ class GateServer(HealthAwareServer):
             update_dc_backpressure=self._update_dc_backpressure,
             set_manager_backpressure_none=self._set_manager_backpressure_none,
             broadcast_manager_discovery=self._broadcast_manager_discovery,
+            send_tcp=self._send_tcp,
+            get_progress_callback=self._get_progress_callback_for_job,
         )
 
         self._cancellation_handler = GateCancellationHandler(
@@ -3101,6 +3103,13 @@ class GateServer(HealthAwareServer):
                 is_leader=self.is_leader(),
             )
         ]
+
+    def _get_progress_callback_for_job(self, job_id: str) -> tuple[str, int] | None:
+        """Get the client callback address for a job."""
+        callback = self._progress_callbacks.get(job_id)
+        if callback is None:
+            callback = self._modular_state._progress_callbacks.get(job_id)
+        return callback
 
     async def _broadcast_job_leadership(
         self,
