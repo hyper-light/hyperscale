@@ -11,7 +11,7 @@ Handles gate-to-gate peer management including:
 import asyncio
 import random
 import time
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Awaitable, Callable
 
 from hyperscale.distributed.models import (
     GateHeartbeat,
@@ -69,6 +69,7 @@ class GatePeerCoordinator:
         get_udp_port: Callable[[], int],
         confirm_peer: Callable[[tuple[str, int]], None],
         handle_job_leader_failure: Callable[[tuple[str, int]], "asyncio.Task"],
+        remove_peer_circuit: Callable[[tuple[str, int]], Awaitable[None]],
         is_leader: Callable[[], bool] | None = None,
     ) -> None:
         """

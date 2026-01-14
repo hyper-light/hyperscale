@@ -9,6 +9,11 @@ import time
 from enum import Enum
 from typing import TYPE_CHECKING, Any
 
+from hyperscale.distributed.reliability import (
+    BackpressureLevel as StatsBackpressureLevel,
+    BackpressureSignal,
+    StatsBuffer,
+)
 from hyperscale.logging.hyperscale_logging_models import ServerDebug, ServerWarning
 
 if TYPE_CHECKING:
