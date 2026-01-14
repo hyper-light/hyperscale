@@ -2286,7 +2286,10 @@ class ManagerServer(HealthAwareServer):
             try:
                 request = StateSyncRequest(
                     requester_id=self._node_id.full,
-                    requester_version=self._manager_state.state_version,
+                    requester_role="manager",
+                    cluster_id=self._config.cluster_id,
+                    environment_id=self._config.environment_id,
+                    since_version=self._manager_state.state_version,
                 )
 
                 worker_addr = (worker.node.host, worker.node.port)
@@ -2324,7 +2327,10 @@ class ManagerServer(HealthAwareServer):
             try:
                 request = StateSyncRequest(
                     requester_id=self._node_id.full,
-                    requester_version=self._manager_state.state_version,
+                    requester_role="manager",
+                    cluster_id=self._config.cluster_id,
+                    environment_id=self._config.environment_id,
+                    since_version=self._manager_state.state_version,
                 )
 
                 response = await self.send_tcp(
