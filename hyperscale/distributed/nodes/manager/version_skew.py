@@ -55,8 +55,7 @@ class ManagerVersionSkewHandler:
         self._node_id: str = node_id
         self._task_runner: "TaskRunner" = task_runner
 
-        # Our capabilities
-        self._local_capabilities = NodeCapabilities.current(
+        self._local_capabilities: NodeCapabilities = NodeCapabilities.current(
             node_version=f"hyperscale-manager-{config.version}"
             if hasattr(config, "version")
             else "hyperscale-manager"
