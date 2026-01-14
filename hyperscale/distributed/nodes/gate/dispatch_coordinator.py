@@ -616,14 +616,15 @@ class GateDispatchCoordinator:
         fallback_capacities: list[tuple] = []
         for fallback_dc in fallback_dcs:
             fallback_capacity = self._capacity_aggregator.get_capacity(fallback_dc)
-            rtt_ms = 50.0
+            rtt_ms = self._get_observed_rtt_ms(fallback_dc, default_rtt_ms=50.0)
             fallback_capacities.append((fallback_capacity, rtt_ms))
 
+        primary_rtt_ms = self._get_observed_rtt_ms(primary_dc, default_rtt_ms=10.0)
         decision = self._spillover_evaluator.evaluate(
             job_cores_required=job_cores_required,
             primary_capacity=primary_capacity,
             fallback_capacities=fallback_capacities,
-            primary_rtt_ms=10.0,
+            primary_rtt_ms=primary_rtt_ms,
         )
 
         if decision.should_spillover and decision.spillover_dc:
