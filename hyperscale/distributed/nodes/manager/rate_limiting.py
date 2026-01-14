@@ -90,14 +90,12 @@ class ManagerRateLimitingCoordinator:
             inactive_cleanup_seconds=config.rate_limit_cleanup_interval_seconds,
         )
 
-        # Server-side rate limiter (for incoming requests)
-        self._server_limiter = ServerRateLimiter(
+        self._server_limiter: ServerRateLimiter = ServerRateLimiter(
             overload_detector=overload_detector,
             adaptive_config=adaptive_config,
         )
 
-        # Cooperative rate limiter (for outbound requests to gates/peers)
-        self._cooperative_limiter = CooperativeRateLimiter(
+        self._cooperative_limiter: CooperativeRateLimiter = CooperativeRateLimiter(
             default_backoff=1.0,
         )
 

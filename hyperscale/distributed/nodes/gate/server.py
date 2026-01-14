@@ -576,8 +576,8 @@ class GateServer(HealthAwareServer):
 
         # Role validator (AD-28)
         self._role_validator = RoleValidator(
-            cluster_id=env.get("CLUSTER_ID", "hyperscale"),
-            environment_id=env.get("ENVIRONMENT_ID", "default"),
+            cluster_id=env.CLUSTER_ID,
+            environment_id=env.ENVIRONMENT_ID,
             strict_mode=env.get("MTLS_STRICT_MODE", "false").lower() == "true",
         )
 
