@@ -1454,6 +1454,11 @@ class JobProgress(Message):
     - collected_at: Unix timestamp when stats were aggregated at the manager.
       Used for time-aligned aggregation across DCs at the gate.
     - timestamp: Monotonic timestamp for local ordering (not cross-node comparable).
+
+    Ordering fields:
+    - progress_sequence: Per-job per-datacenter monotonic counter incremented on
+      each progress update. Used by gates to reject out-of-order updates.
+    - fence_token: Leadership fencing token (NOT for progress ordering).
     """
 
     job_id: str  # Job identifier
@@ -1468,7 +1473,9 @@ class JobProgress(Message):
     collected_at: float = 0.0  # Unix timestamp when aggregated (cross-DC alignment)
     # Aggregated step stats across all workflows in the job
     step_stats: list["StepStats"] = field(default_factory=list)
-    fence_token: int = 0  # Fencing token for at-most-once semantics
+    fence_token: int = 0  # Fencing token for at-most-once semantics (leadership safety)
+    # Per-update sequence for ordering (incremented by manager on each progress update)
+    progress_sequence: int = 0
 
 
 @dataclass(slots=True)
