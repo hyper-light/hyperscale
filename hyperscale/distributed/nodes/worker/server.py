@@ -237,7 +237,6 @@ class WorkerServer(HealthAwareServer):
         # Event logger for crash forensics (AD-47)
         self._event_logger: Logger | None = None
 
-        # UI updates controller for RemoteGraphManager
         from hyperscale.ui.interface_updates_controller import (
             InterfaceUpdatesController,
         )
