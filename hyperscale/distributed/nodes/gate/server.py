@@ -1050,10 +1050,11 @@ class GateServer(HealthAwareServer):
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
-        transport: asyncio.Transport,
     ):
         """Handle manager registration."""
-        if self._manager_handler:
+        if self._manager_handler and (
+            transport := self._tcp_server_request_transports.get(addr)
+        ):
             return await self._manager_handler.handle_register(
                 addr, data, transport, self.handle_exception
             )
