@@ -445,6 +445,13 @@ class FederatedHealthMonitor:
                         f"original error: {error}",
                         file=sys.stderr,
                     )
+            else:
+                import sys
+
+                print(
+                    f"[FederatedHealthMonitor] probe to {datacenter} failed: {error}",
+                    file=sys.stderr,
+                )
 
     def _check_ack_timeouts(self) -> None:
         """
