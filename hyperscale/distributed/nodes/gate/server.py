@@ -1233,7 +1233,11 @@ class GateServer(HealthAwareServer):
 
         if self._state_sync_handler:
             return await self._state_sync_handler.handle_job_final_result(
-                addr, data, self._complete_job, self.handle_exception
+                addr,
+                data,
+                self._complete_job,
+                self.handle_exception,
+                self._forward_job_final_result_to_peers,
             )
         return b"error"
 
