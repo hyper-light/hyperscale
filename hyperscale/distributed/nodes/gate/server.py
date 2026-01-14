@@ -2031,11 +2031,36 @@ class GateServer(HealthAwareServer):
             if not callback:
                 return b"no_callback"
 
-            try:
-                await self._send_tcp(callback, "job_status_push", data)
-                return b"ok"
-            except Exception:
+            max_retries = GateStatsCoordinator.CALLBACK_PUSH_MAX_RETRIES
+            base_delay = GateStatsCoordinator.CALLBACK_PUSH_BASE_DELAY_SECONDS
+            max_delay = GateStatsCoordinator.CALLBACK_PUSH_MAX_DELAY_SECONDS
+            last_error: Exception | None = None
+
+            for attempt in range(max_retries):
+                try:
+                    await self._send_tcp(callback, "job_status_push", data)
+                    return b"ok"
+                except Exception as send_error:
+                    last_error = send_error
+                    if attempt < max_retries - 1:
+                        delay = min(base_delay * (2**attempt), max_delay)
+                        await asyncio.sleep(delay)
+
+            if await self._forward_job_status_push_to_peers(job_id, data):
                 return b"forwarded"
+
+            await self._udp_logger.log(
+                ServerWarning(
+                    message=(
+                        f"Failed to deliver forwarded status push for job {job_id} "
+                        f"after {max_retries} retries: {last_error}"
+                    ),
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            return b"error"
 
         except Exception as error:
             await self.handle_exception(error, "job_status_push_forward")

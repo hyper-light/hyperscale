@@ -1548,6 +1548,8 @@ class ManagerServer(HealthAwareServer):
             try:
                 await asyncio.sleep(self._config.batch_push_interval_seconds)
 
+                await self._stats.refresh_dispatch_throughput()
+
                 # Push aggregated stats
                 await self._stats.push_batch_stats()
 
