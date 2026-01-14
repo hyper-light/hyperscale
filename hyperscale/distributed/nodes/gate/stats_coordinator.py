@@ -5,7 +5,8 @@ Provides tiered update classification, batch stats loops, and windowed
 stats aggregation following the REFACTOR.md pattern.
 """
 
-from typing import TYPE_CHECKING, Callable
+import asyncio
+from typing import TYPE_CHECKING, Callable, Coroutine, Any
 
 from hyperscale.distributed.models import (
     JobStatus,
@@ -21,6 +22,9 @@ if TYPE_CHECKING:
     from hyperscale.distributed.nodes.gate.state import GateRuntimeState
     from hyperscale.logging import Logger
     from hyperscale.distributed.taskex import TaskRunner
+
+
+ForwardStatusPushFunc = Callable[[str, bytes], Coroutine[Any, Any, bool]]
 
 
 class GateStatsCoordinator:
