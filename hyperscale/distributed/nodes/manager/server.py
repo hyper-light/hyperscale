@@ -3979,7 +3979,7 @@ class ManagerServer(HealthAwareServer):
             # Dispatch workflows
             await self._dispatch_job_workflows(submission, workflows)
 
-            return JobAck(
+            ack_response = JobAck(
                 job_id=submission.job_id,
                 accepted=True,
                 queued_position=self._job_manager.job_count,
@@ -3987,6 +3987,15 @@ class ManagerServer(HealthAwareServer):
                 protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
                 capabilities=negotiated_caps_str,
             ).dump()
+
+            if (
+                idempotency_reserved
+                and idempotency_key is not None
+                and self._idempotency_ledger is not None
+            ):
+                await self._idempotency_ledger.commit(idempotency_key, ack_response)
+
+            return ack_response
 
         except Exception as error:
             await self._udp_logger.log(
@@ -3997,11 +4006,18 @@ class ManagerServer(HealthAwareServer):
                     node_id=self._node_id.short,
                 )
             )
-            return JobAck(
+            error_ack = JobAck(
                 job_id="unknown",
                 accepted=False,
                 error=str(error),
             ).dump()
+            if (
+                idempotency_reserved
+                and idempotency_key is not None
+                and self._idempotency_ledger is not None
+            ):
+                await self._idempotency_ledger.reject(idempotency_key, error_ack)
+            return error_ack
 
     @tcp.receive()
     async def job_global_timeout(
