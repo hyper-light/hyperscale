@@ -1,7 +1,7 @@
 # Hyperscale Distributed Bug Fixes TODO
 
 **Generated**: 2026-01-14  
-**Progress**: 40/64 completed (63%)
+**Progress**: 49/64 completed (77%)
 
 ---
 
@@ -63,15 +63,19 @@ Systematic bug fixes for the Hyperscale distributed performance testing framewor
 - [x] **Task 16**: Add job_status_push retry/peer-forward on failure (verified - already implemented in stats_coordinator.py)
 - [x] **Task 17**: Invoke progress callbacks on batch updates (verified - already implemented in stats_coordinator.py)
 - [x] **Task 18**: Add client poll-on-reconnect or replay mechanism (verified - already implemented with last_sequence)
+- [x] **Task 36**: Implement mixed final status resolution across DCs (verified - already implemented in _resolve_global_result_status)
+- [x] **Task 40**: Integrate job lease acquisition/renewal in gate submission (verified - already implemented in tcp_job.py)
+- [x] **Task 43**: Manager validate cluster/environment on registration (verified - already implemented in handle_register)
+- [x] **Task 45**: WorkflowProgressAck structure compatibility (verified - structure matches producer/consumer)
+- [x] **Task 48**: Workflow reassignment updates dispatch state (verified - already implemented in _apply_workflow_reassignment_state)
+- [x] **Task 49**: Worker state sync applies to local state (verified - already implemented in sync.py _apply_worker_state)
+- [x] **Task 50**: Manager job leader transfer notification to workers (verified - already implemented in _notify_workers_job_leader_transfer)
+- [x] **Task 54**: Peer state sync reconciles fence tokens (verified - already implemented in update_fence_token_if_higher)
+- [x] **Task 59**: Reporter results end-to-end path (implemented reporter_result_push handler in gate)
 
 ---
 
-## High Priority Tasks (10 remaining)
-
-### Task 36: Implement mixed final status resolution across DCs
-**Status:** Pending  
-**Priority:** HIGH  
-**Files:** `hyperscale/distributed/nodes/gate/` directory
+## High Priority Tasks (1 remaining)
 
 **Problem:**  
 When job runs across multiple DCs, they may report different final statuses (one COMPLETED, one FAILED). Need resolution logic.
