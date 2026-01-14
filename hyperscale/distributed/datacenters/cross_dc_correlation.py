@@ -334,12 +334,18 @@ class CrossDCCorrelationDetector:
         detector.record_recovery("dc-west")
     """
 
-    def __init__(self, config: CrossDCCorrelationConfig | None = None):
+    def __init__(
+        self,
+        config: CrossDCCorrelationConfig | None = None,
+        on_callback_error: Callable[[str, list[str], Exception], None] | None = None,
+    ):
         """
         Initialize the correlation detector.
 
         Args:
             config: Configuration for correlation detection.
+            on_callback_error: Called when partition callbacks fail.
+                Receives (event_type, affected_dcs, exception).
         """
         self._config = config or CrossDCCorrelationConfig()
 
