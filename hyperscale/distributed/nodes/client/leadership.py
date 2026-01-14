@@ -374,6 +374,17 @@ class ClientLeadershipTracker:
         check_interval_seconds: float,
         running_flag: asyncio.Event | None = None,
     ) -> None:
+        """
+        Background loop to detect orphaned jobs.
+
+        Checks leader timestamps and marks jobs as orphaned if no leader
+        update has been received within the grace period.
+
+        Args:
+            grace_period_seconds: Time without update before job is orphaned
+            check_interval_seconds: How often to check for orphans
+            running_flag: Optional event to control loop (stops when cleared)
+        """
         while running_flag is None or running_flag.is_set():
             try:
                 await asyncio.sleep(check_interval_seconds)
@@ -381,26 +392,65 @@ class ClientLeadershipTracker:
                 now = time.monotonic()
                 orphan_threshold = now - grace_period_seconds
 
+                # Check gate leaders for staleness
                 for job_id, leader_info in list(self._state._gate_job_leaders.items()):
                     if (
                         leader_info.last_updated < orphan_threshold
                         and not self._state.is_job_orphaned(job_id)
                     ):
+                        # Get any manager leader info for this job
+                        last_known_manager: tuple[str, int] | None = None
+                        datacenter_id = ""
+                        for (
+                            jid,
+                            dc_id,
+                        ), mgr_info in self._state._manager_job_leaders.items():
+                            if jid == job_id:
+                                last_known_manager = mgr_info.manager_addr
+                                datacenter_id = dc_id
+                                break
+
                         orphan_info = OrphanedJobInfo(
                             job_id=job_id,
-                            last_leader_id=leader_info.gate_id,
-                            last_leader_addr=(
-                                leader_info.tcp_host,
-                                leader_info.tcp_port,
-                            ),
-                            orphaned_at=now,
-                            last_updated=leader_info.last_updated,
+                            orphan_timestamp=now,
+                            last_known_gate=leader_info.gate_addr,
+                            last_known_manager=last_known_manager,
+                            datacenter_id=datacenter_id,
                         )
                         self._state.mark_job_orphaned(job_id, orphan_info)
 
+                        stale_duration = now - leader_info.last_updated
                         await self._logger.log(
                             ServerWarning(
-                                message=f"Job {job_id[:8]}... orphaned: no leader update for {now - leader_info.last_updated:.1f}s",
+                                message=f"Job {job_id[:8]}... orphaned: no leader update for {stale_duration:.1f}s",
+                                node_host="client",
+                                node_port=0,
+                                node_id="client",
+                            )
+                        )
+
+                # Also check manager leaders that have no corresponding gate leader
+                for (job_id, datacenter_id), manager_info in list(
+                    self._state._manager_job_leaders.items()
+                ):
+                    if (
+                        manager_info.last_updated < orphan_threshold
+                        and job_id not in self._state._gate_job_leaders
+                        and not self._state.is_job_orphaned(job_id)
+                    ):
+                        orphan_info = OrphanedJobInfo(
+                            job_id=job_id,
+                            orphan_timestamp=now,
+                            last_known_gate=None,
+                            last_known_manager=manager_info.manager_addr,
+                            datacenter_id=datacenter_id,
+                        )
+                        self._state.mark_job_orphaned(job_id, orphan_info)
+
+                        stale_duration = now - manager_info.last_updated
+                        await self._logger.log(
+                            ServerWarning(
+                                message=f"Job {job_id[:8]}... orphaned (manager only): no update for {stale_duration:.1f}s",
                                 node_host="client",
                                 node_port=0,
                                 node_id="client",
@@ -409,5 +459,13 @@ class ClientLeadershipTracker:
 
             except asyncio.CancelledError:
                 break
-            except Exception:
-                pass
+            except Exception as error:
+                # Log errors instead of swallowing silently
+                await self._logger.log(
+                    ServerWarning(
+                        message=f"Error in orphan_check_loop: {error}",
+                        node_host="client",
+                        node_port=0,
+                        node_id="client",
+                    )
+                )
