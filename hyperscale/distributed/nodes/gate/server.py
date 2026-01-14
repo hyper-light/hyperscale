@@ -2743,7 +2743,7 @@ class GateServer(HealthAwareServer):
             if await self._peer_gate_circuit_breaker.is_circuit_open(peer_addr):
                 await self._udp_logger.log(
                     ServerDebug(
-                        message=f"Skip DC leader announcement to peer {peer_addr} due to open circuit",
+                        message=f"Skipping DC leader announcement to peer {peer_addr} due to open circuit",
                         node_host=self._host,
                         node_port=self._tcp_port,
                         node_id=self._node_id.short,
