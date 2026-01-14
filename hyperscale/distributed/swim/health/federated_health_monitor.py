@@ -377,8 +377,14 @@ class FederatedHealthMonitor:
                             f"Federated health probe loop error: {error}",
                             list(self._dc_health.keys()),
                         )
-                    except Exception:
-                        pass
+                    except Exception as callback_error:
+                        import sys
+
+                        print(
+                            f"[FederatedHealthMonitor] on_probe_error callback failed: {callback_error}, "
+                            f"original error: {error}",
+                            file=sys.stderr,
+                        )
                 await asyncio.sleep(1.0)
 
     async def _probe_datacenter(self, datacenter: str) -> None:
@@ -419,8 +425,14 @@ class FederatedHealthMonitor:
                         f"Probe to {datacenter} failed: {error}",
                         [datacenter],
                     )
-                except Exception:
-                    pass
+                except Exception as callback_error:
+                    import sys
+
+                    print(
+                        f"[FederatedHealthMonitor] on_probe_error callback failed: {callback_error}, "
+                        f"original error: {error}",
+                        file=sys.stderr,
+                    )
 
     def _check_ack_timeouts(self) -> None:
         """

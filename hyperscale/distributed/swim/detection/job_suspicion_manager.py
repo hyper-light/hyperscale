@@ -333,8 +333,14 @@ class JobSuspicionManager:
                             f"on_expired callback failed for job {suspicion.job_id}, node {suspicion.node}",
                             callback_error,
                         )
-                    except Exception:
-                        pass
+                    except Exception as error_callback_error:
+                        import sys
+
+                        print(
+                            f"[JobSuspicionManager] on_error callback failed: {error_callback_error}, "
+                            f"original callback error: {callback_error}",
+                            file=sys.stderr,
+                        )
 
     async def confirm_suspicion(
         self,
