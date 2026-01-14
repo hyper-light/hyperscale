@@ -247,14 +247,13 @@ class WorkerProgressReporter:
         except Exception as error:
             circuit.record_error()
             if self._logger:
-                self._task_runner.run(
-                    self._logger.log,
+                await self._logger.log(
                     ServerDebug(
                         message=f"Progress send to {manager_addr} failed: {error}",
                         node_host="worker",
                         node_port=0,
                         node_id="worker",
-                    ),
+                    )
                 )
             return False
 
@@ -301,14 +300,13 @@ class WorkerProgressReporter:
                 except Exception as error:
                     circuit.record_error()
                     if self._logger:
-                        self._task_runner.run(
-                            self._logger.log,
+                        await self._logger.log(
                             ServerDebug(
                                 message=f"Broadcast progress to manager failed: {error}",
                                 node_host="worker",
                                 node_port=0,
                                 node_id="worker",
-                            ),
+                            )
                         )
 
     async def send_final_result(
@@ -697,14 +695,13 @@ class WorkerProgressReporter:
             except Exception as error:
                 self._registry.get_or_create_circuit(manager_id).record_error()
                 if self._logger:
-                    self._task_runner.run(
-                        self._logger.log,
+                    await self._logger.log(
                         ServerDebug(
                             message=f"Final result send to {manager_addr} failed: {error}",
                             node_host="worker",
                             node_port=0,
                             node_id="worker",
-                        ),
+                        )
                     )
                 continue
 
