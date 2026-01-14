@@ -242,15 +242,6 @@ class ManagerCancellationCoordinator:
         success: bool,
         errors: list[str],
     ) -> None:
-        """
-        Record workflow cancellation completion.
-
-        Args:
-            job_id: Job ID
-            workflow_id: Workflow ID
-            success: Whether cancellation succeeded
-            errors: Cancellation errors
-        """
         notification = WorkflowCancellationComplete(
             job_id=job_id,
             workflow_id=workflow_id,
@@ -267,14 +258,6 @@ class ManagerCancellationCoordinator:
         workflow_id: str,
         error_message: str,
     ) -> None:
-        """
-        Record a workflow cancellation failure.
-
-        Args:
-            job_id: Job ID
-            workflow_id: Workflow ID
-            error_message: Error message to record
-        """
         self._task_runner.run(
             self._logger.log,
             ServerWarning(

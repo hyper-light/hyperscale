@@ -268,10 +268,32 @@ class ManagerStateSync:
         Args:
             snapshot: Manager state snapshot
         """
-        # In full implementation, this would:
-        # 1. Merge job metadata (retry counts, etc)
-        # 2. Update fencing tokens if higher
-        # 3. Reconcile leadership information
+        for job_id, fence_token in snapshot.job_fence_tokens.items():
+            current_token = self._state._job_fencing_tokens.get(job_id, -1)
+            if fence_token > current_token:
+                self._state._job_fencing_tokens[job_id] = fence_token
+
+                leader_id = snapshot.job_leaders.get(job_id)
+                if leader_id:
+                    self._state._job_leaders[job_id] = leader_id
+
+                leader_addr = snapshot.job_leader_addrs.get(job_id)
+                if leader_addr:
+                    leader_addr_tuple = (
+                        tuple(leader_addr)
+                        if isinstance(leader_addr, list)
+                        else leader_addr
+                    )
+                    self._state._job_leader_addrs[job_id] = leader_addr_tuple
+
+                incoming_layer_version = snapshot.job_layer_versions.get(job_id)
+                if incoming_layer_version is not None:
+                    current_layer_version = self._state._job_layer_version.get(
+                        job_id, 0
+                    )
+                    if incoming_layer_version > current_layer_version:
+                        self._state._job_layer_version[job_id] = incoming_layer_version
+
         self._task_runner.run(
             self._logger.log,
             ServerDebug(

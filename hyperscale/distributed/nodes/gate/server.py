@@ -1357,6 +1357,23 @@ class GateServer(HealthAwareServer):
         """Receive final job status from manager (AD-34 lifecycle cleanup)."""
         try:
             report = JobFinalStatus.load(data)
+            dedup_key = (report.job_id, report.datacenter)
+            if dedup_key in self._job_final_statuses:
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerWarning(
+                        message=(
+                            "Duplicate final status ignored for job "
+                            f"{report.job_id} from DC {report.datacenter}"
+                        ),
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    ),
+                )
+                return b"ok"
+
+            self._job_final_statuses[dedup_key] = report.timestamp
             await self._job_timeout_tracker.handle_final_status(report)
             return b"ok"
         except Exception as error:
@@ -3351,6 +3368,12 @@ class GateServer(HealthAwareServer):
         self._job_manager.delete_job(job_id)
         async with self._workflow_dc_results_lock:
             self._workflow_dc_results.pop(job_id, None)
+        if self._job_final_statuses:
+            keys_to_remove = [
+                key for key in self._job_final_statuses.keys() if key[0] == job_id
+            ]
+            for key in keys_to_remove:
+                self._job_final_statuses.pop(key, None)
         self._job_workflow_ids.pop(job_id, None)
         self._progress_callbacks.pop(job_id, None)
         self._job_leadership_tracker.release_leadership(job_id)
