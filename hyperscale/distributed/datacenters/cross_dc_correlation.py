@@ -360,6 +360,9 @@ class CrossDCCorrelationDetector:
         self._partition_detected_callbacks: list[
             Callable[[list[str], float], None]
         ] = []
+        self._on_callback_error: Callable[[str, list[str], Exception], None] | None = (
+            None
+        )
         self._partition_healed_count: int = 0
         self._last_partition_healed_time: float = 0.0
         self._was_in_partition: bool = False
