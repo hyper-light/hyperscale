@@ -16,7 +16,7 @@ from hyperscale.distributed.models import (
 )
 from hyperscale.distributed.nodes.client.state import ClientState
 from hyperscale.logging import Logger
-from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerWarning
+from hyperscale.logging.hyperscale_logging_models import ServerWarning
 
 
 class ClientLeadershipTracker:
