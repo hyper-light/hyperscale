@@ -234,17 +234,19 @@ This document catalogs all identified issues across the distributed node impleme
 - This layered fallback enables gradual migration without breaking existing deployments
 - **No action needed** - keep both methods for backward compatibility
 
-### 3.5 Client - Stub Orphan Check Loop
+### 3.5 Client - Stub Orphan Check Loop ✅ FIXED
 
-| File | Lines | Issue |
-|------|-------|-------|
-| `nodes/client/leadership.py` | 235-259 | `orphan_check_loop()` is stub (just `pass`) |
+| File | Lines | Issue | Status |
+|------|-------|-------|--------|
+| `nodes/client/leadership.py` | 371-450 | `orphan_check_loop()` had incorrect attributes | ✅ Fixed |
 
-**Missing functionality:**
-- Loop with `asyncio.sleep(check_interval_seconds)`
-- Check leader `last_updated` timestamps
-- Mark jobs as orphaned if grace_period exceeded
-- Log orphan detections
+**Fix implemented:**
+- Original implementation used non-existent attributes (`gate_id`, `tcp_host`, `tcp_port`)
+- Fixed to use correct model attributes (`gate_addr`, `manager_addr`)
+- Fixed `OrphanedJobInfo` construction to use correct parameters
+- Added second loop to check manager-only leaders (no gate leader)
+- Added proper error logging (was swallowing exceptions silently)
+- Removed unused `ServerInfo` import
 
 ### 3.6 Gate Handler - Unused Method
 
