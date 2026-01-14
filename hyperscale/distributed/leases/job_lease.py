@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -281,16 +282,22 @@ class JobLeaseManager:
                     if self._on_lease_expired:
                         for lease in expired:
                             try:
-                                self._on_lease_expired(lease)
-                            except Exception as callback_error:
-                                if self._on_error:
-                                    try:
-                                        self._on_error(
-                                            f"Lease expiry callback failed for job {lease.job_id}",
-                                            callback_error,
-                                        )
-                                    except Exception:
-                                        pass
+                                                self._on_lease_expired(lease)
+                                            except Exception as callback_error:
+                                                if self._on_error:
+                                                    try:
+                                                        self._on_error(
+                                                            f"Lease expiry callback failed for job {lease.job_id}",
+                                                            callback_error,
+                                                        )
+                                                    except Exception as handler_error:
+                                                        print(
+                                                            f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] "
+                                                            f"CRITICAL: lease expiry error handler failed: {handler_error}, "
+                                                            f"original_error={callback_error}, "
+                                                            f"job_id={lease.job_id}",
+                                                            file=sys.stderr,
+                                                        )
                     await asyncio.sleep(self._cleanup_interval)
                 except asyncio.CancelledError:
                     break
