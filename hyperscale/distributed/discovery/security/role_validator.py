@@ -310,6 +310,7 @@ class RoleValidator:
         cert_der: bytes,
         default_cluster: str = "",
         default_environment: str = "",
+        strict: bool = False,
     ) -> CertificateClaims:
         """
         Extract claims from a DER-encoded certificate.
@@ -330,41 +331,48 @@ class RoleValidator:
             cert_der: DER-encoded certificate bytes
             default_cluster: Default cluster if not in cert
             default_environment: Default environment if not in cert
+            strict: If True, raise CertificateParseError on parse failures instead of returning defaults
 
         Returns:
             CertificateClaims extracted from certificate
 
         Raises:
-            ValueError: If certificate cannot be parsed or required fields are missing
+            CertificateParseError: If strict=True and certificate cannot be parsed or required fields missing
         """
+        parse_errors: list[str] = []
+
         try:
-            # Parse DER-encoded certificate
             cert = x509.load_der_x509_certificate(cert_der, default_backend())
 
-            # Extract cluster_id from CN (Common Name)
             cluster_id = default_cluster
             try:
                 cn_attribute = cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)
                 if cn_attribute:
-                    cluster_id = cn_attribute[0].value
-            except Exception:
-                pass
+                    cluster_id = str(cn_attribute[0].value)
+                elif strict:
+                    parse_errors.append("CN (cluster_id) not found in certificate")
+            except Exception as cn_error:
+                parse_errors.append(f"Failed to extract CN: {cn_error}")
 
-            # Extract role from OU (Organizational Unit)
-            role = NodeRole.CLIENT  # Default fallback
+            role: NodeRole | None = None
             try:
                 ou_attribute = cert.subject.get_attributes_for_oid(
                     NameOID.ORGANIZATIONAL_UNIT_NAME
                 )
                 if ou_attribute:
-                    role_str = ou_attribute[0].value.lower()
-                    # Map OU value to NodeRole
+                    role_str = str(ou_attribute[0].value).lower()
                     if role_str in {r.value for r in NodeRole}:
                         role = NodeRole(role_str)
-            except Exception:
-                pass
+                    elif strict:
+                        parse_errors.append(f"Invalid role in OU: {role_str}")
+                elif strict:
+                    parse_errors.append("OU (role) not found in certificate")
+            except Exception as ou_error:
+                parse_errors.append(f"Failed to extract OU: {ou_error}")
 
-            # Extract node_id, datacenter_id, region_id from SAN
+            if role is None:
+                role = NodeRole.CLIENT
+
             node_id = "unknown"
             datacenter_id = ""
             region_id = ""
@@ -375,9 +383,7 @@ class RoleValidator:
                 )
                 san_values = san_extension.value
 
-                # Parse DNS names in SAN
                 for dns_name in san_values.get_values_for_type(x509.DNSName):
-                    # Expected format: "node=<id>", "dc=<dc_id>", "region=<region_id>"
                     if dns_name.startswith("node="):
                         node_id = dns_name[5:]
                     elif dns_name.startswith("dc="):
@@ -385,27 +391,26 @@ class RoleValidator:
                     elif dns_name.startswith("region="):
                         region_id = dns_name[7:]
             except x509.ExtensionNotFound:
-                # SAN is optional, use defaults
                 pass
-            except Exception:
-                # If SAN parsing fails, continue with defaults
-                pass
+            except Exception as san_error:
+                parse_errors.append(f"Failed to parse SAN: {san_error}")
 
-            # Extract environment_id from custom extension OID
-            # Using OID 1.3.6.1.4.1.99999.1 as example (would be registered in production)
             environment_id = default_environment
             try:
-                # Try to get custom extension for environment
-                # Note: This would need a registered OID in production
                 custom_oid = x509.ObjectIdentifier("1.3.6.1.4.1.99999.1")
                 env_extension = cert.extensions.get_extension_for_oid(custom_oid)
                 environment_id = env_extension.value.value.decode("utf-8")
             except x509.ExtensionNotFound:
-                # Custom extension is optional
                 pass
-            except Exception:
-                # If custom extension parsing fails, use default
-                pass
+            except Exception as env_error:
+                parse_errors.append(
+                    f"Failed to parse environment extension: {env_error}"
+                )
+
+            if strict and parse_errors:
+                raise CertificateParseError(
+                    f"Certificate parse errors: {'; '.join(parse_errors)}"
+                )
 
             return CertificateClaims(
                 cluster_id=cluster_id,
@@ -416,9 +421,14 @@ class RoleValidator:
                 region_id=region_id,
             )
 
+        except CertificateParseError:
+            raise
         except Exception as parse_error:
-            # If certificate parsing fails completely, return defaults
-            # In strict production, this should raise an error
+            if strict:
+                raise CertificateParseError(
+                    f"Failed to parse certificate: {parse_error}",
+                    parse_error=parse_error,
+                )
             return CertificateClaims(
                 cluster_id=default_cluster,
                 environment_id=default_environment,
