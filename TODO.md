@@ -1,7 +1,7 @@
 # Hyperscale Distributed Bug Fixes TODO
 
 **Generated**: 2026-01-14  
-**Progress**: 56/64 completed (88%)
+**Progress**: 57/64 completed (89%)
 
 ---
 
@@ -79,6 +79,7 @@ Systematic bug fixes for the Hyperscale distributed performance testing framewor
 - [x] **Task 38**: Add reporter task creation and result dispatch in gate (added _dispatch_to_reporters to server.py, called from _complete_job)
 - [x] **Task 41**: Add LeaseTransfer sender in gate code (added _send_lease_transfer to leadership_coordinator.py, called during transfer_leadership)
 - [x] **Task 62**: Connection storm mitigation - add explicit connection caps (added is_at_capacity to ServerState, reject in connection_made)
+- [x] **Task 63**: Protocol size violations - send structured error response (added to_error_response to FrameTooLargeError, send before close)
 
 ---
 
