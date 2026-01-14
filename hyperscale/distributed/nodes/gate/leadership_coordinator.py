@@ -257,13 +257,102 @@ class GateLeadershipCoordinator:
             if response and not isinstance(response, Exception):
                 ack = JobLeaderGateTransferAck.load(response)
                 if ack.accepted:
-                    # Relinquish leadership
                     self._leadership_tracker.relinquish(job_id)
+
+                    target_dcs = self._state._job_dc_managers.get(job_id, {}).keys()
+                    for datacenter in target_dcs:
+                        self._task_runner.run(
+                            self._send_lease_transfer,
+                            job_id,
+                            datacenter,
+                            new_leader_id,
+                            new_leader_addr,
+                            new_token,
+                        )
                     return True
 
             return False
 
         except Exception:
+            return False
+
+    async def _send_lease_transfer(
+        self,
+        job_id: str,
+        datacenter: str,
+        new_gate_id: str,
+        new_gate_addr: tuple[str, int],
+        fence_token: int,
+    ) -> bool:
+        """
+        Send lease transfer to new leader gate (Task 41).
+
+        Args:
+            job_id: Job identifier
+            datacenter: Datacenter the lease is for
+            new_gate_id: New leader gate ID
+            new_gate_addr: New leader gate address
+            fence_token: New fence token
+
+        Returns:
+            True if transfer succeeded
+        """
+        node_id = self._get_node_id()
+        transfer = LeaseTransfer(
+            job_id=job_id,
+            datacenter=datacenter,
+            from_gate=node_id.full,
+            to_gate=new_gate_id,
+            new_fence_token=fence_token,
+            version=self._state._state_version,
+        )
+
+        try:
+            response, _ = await self._send_tcp(
+                new_gate_addr,
+                "lease_transfer",
+                transfer.dump(),
+                timeout=5.0,
+            )
+
+            if response and not isinstance(response, Exception):
+                ack = LeaseTransferAck.load(response)
+                if ack.accepted:
+                    self._task_runner.run(
+                        self._logger.log,
+                        ServerDebug(
+                            message=f"Lease transfer for job {job_id[:8]}... "
+                            f"DC {datacenter} to {new_gate_id[:8]}... succeeded",
+                            node_host=self._get_node_addr()[0],
+                            node_port=self._get_node_addr()[1],
+                            node_id=node_id.short,
+                        ),
+                    )
+                    return True
+
+            self._task_runner.run(
+                self._logger.log,
+                ServerWarning(
+                    message=f"Lease transfer for job {job_id[:8]}... "
+                    f"DC {datacenter} to {new_gate_id[:8]}... rejected",
+                    node_host=self._get_node_addr()[0],
+                    node_port=self._get_node_addr()[1],
+                    node_id=node_id.short,
+                ),
+            )
+            return False
+
+        except Exception as transfer_error:
+            self._task_runner.run(
+                self._logger.log,
+                ServerWarning(
+                    message=f"Lease transfer for job {job_id[:8]}... "
+                    f"DC {datacenter} failed: {transfer_error}",
+                    node_host=self._get_node_addr()[0],
+                    node_port=self._get_node_addr()[1],
+                    node_id=node_id.short,
+                ),
+            )
             return False
 
     def handle_leadership_transfer(
