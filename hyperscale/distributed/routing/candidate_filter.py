@@ -55,6 +55,10 @@ class DatacenterCandidate:
     worker_overload_ratio: float = 0.0
     overloaded_worker_count: int = 0
 
+    # SLO constraints (Task 60)
+    estimated_latency_ms: float = 0.0
+    estimated_throughput_rps: float = 0.0
+
 
 @dataclass(slots=True)
 class ManagerCandidate:
@@ -101,9 +105,13 @@ class CandidateFilter:
         self,
         heartbeat_stale_threshold_seconds: float = 60.0,
         default_rtt_ms: float = 100.0,
+        slo_max_latency_ms: float | None = None,
+        slo_min_throughput_rps: float | None = None,
     ) -> None:
         self._heartbeat_stale_threshold = heartbeat_stale_threshold_seconds
         self._default_rtt_ms = default_rtt_ms
+        self._slo_max_latency_ms = slo_max_latency_ms
+        self._slo_min_throughput_rps = slo_min_throughput_rps
 
     def filter_datacenters(
         self,
