@@ -525,6 +525,11 @@ class GateDispatchCoordinator:
             job.status = JobStatus.FAILED.value
             job.failed_datacenters = len(target_dcs)
             self._quorum_circuit.record_error()
+
+            if self._record_dispatch_failure:
+                for datacenter_id in target_dcs:
+                    self._record_dispatch_failure(submission.job_id, datacenter_id)
+
             self._task_runner.run(
                 self._logger.log,
                 ServerError(
