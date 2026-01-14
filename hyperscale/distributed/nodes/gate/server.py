@@ -255,10 +255,6 @@ class GateServer(HealthAwareServer):
         # Store reference to env
         self.env = env
 
-        # Job ledger configuration (AD-38)
-        self._ledger_data_dir = ledger_data_dir
-        self._job_ledger: JobLedger | None = None
-
         # Create modular runtime state
         self._modular_state = GateRuntimeState()
         client_update_history_limit = int(
