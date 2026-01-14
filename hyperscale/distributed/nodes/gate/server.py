@@ -1036,7 +1036,6 @@ class GateServer(HealthAwareServer):
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
-        transport: asyncio.Transport,
     ):
         """Handle manager status update via TCP."""
         if self._manager_handler:
