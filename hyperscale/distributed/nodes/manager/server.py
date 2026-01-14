@@ -2240,16 +2240,16 @@ class ManagerServer(HealthAwareServer):
     def _get_dispatch_throughput(self) -> float:
         """Get current dispatch throughput."""
         current_time = time.monotonic()
-        elapsed = current_time - self._manager_state.dispatch_throughput_interval_start
+        interval_start = self._manager_state.dispatch_throughput_interval_start
+        elapsed = current_time - interval_start
 
-        if elapsed >= self._config.throughput_interval_seconds and elapsed > 0:
-            throughput = self._manager_state.dispatch_throughput_count / elapsed
-            self._manager_state.reset_dispatch_throughput(current_time, throughput)
-            return throughput
+        if elapsed <= 0 or interval_start <= 0:
+            return self._manager_state.dispatch_throughput_last_value
 
-        if elapsed > 0:
-            return self._manager_state.dispatch_throughput_count / elapsed
-        return self._manager_state.dispatch_throughput_last_value
+        if elapsed >= self._config.throughput_interval_seconds:
+            return self._manager_state.dispatch_throughput_last_value
+
+        return self._manager_state.dispatch_throughput_count / elapsed
 
     def _get_expected_dispatch_throughput(self) -> float:
         """Get expected dispatch throughput."""
