@@ -756,6 +756,7 @@ class GateServer(HealthAwareServer):
             get_node_addr=lambda: (self._host, self._tcp_port),
             send_tcp=self._send_tcp,
             get_active_peers=lambda: self._modular_state.get_active_peers(),
+            forward_status_push_to_peers=self._forward_job_status_push_to_peers,
             orphan_check_interval_seconds=self._orphan_check_interval,
             orphan_grace_period_seconds=self._orphan_grace_period,
         )

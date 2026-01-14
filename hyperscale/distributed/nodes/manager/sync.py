@@ -180,6 +180,162 @@ class ManagerStateSync:
 
         return None
 
+    def _derive_worker_health_state(self, snapshot: WorkerStateSnapshot) -> str:
+        """Derive overload state label from a worker snapshot."""
+        if snapshot.state == WorkerState.HEALTHY.value:
+            return "healthy" if snapshot.available_cores > 0 else "busy"
+        if snapshot.state == WorkerState.DEGRADED.value:
+            return "stressed"
+        return "overloaded"
+
+    def _build_worker_registration_from_snapshot(
+        self,
+        snapshot: WorkerStateSnapshot,
+    ) -> WorkerRegistration | None:
+        """Build a worker registration from a state snapshot."""
+        if not snapshot.host or snapshot.tcp_port <= 0:
+            self._task_runner.run(
+                self._logger.log,
+                ServerWarning(
+                    message=(
+                        f"Worker sync missing address info for {snapshot.node_id[:8]}..."
+                    ),
+                    node_host=self._config.host,
+                    node_port=self._config.tcp_port,
+                    node_id=self._node_id,
+                ),
+            )
+            return None
+
+        node_info = NodeInfo(
+            node_id=snapshot.node_id,
+            role=NodeRole.WORKER,
+            host=snapshot.host,
+            port=snapshot.tcp_port,
+            udp_port=snapshot.udp_port or snapshot.tcp_port,
+            datacenter=self._config.datacenter_id,
+            version=snapshot.version,
+        )
+
+        return WorkerRegistration(
+            node=node_info,
+            total_cores=snapshot.total_cores,
+            available_cores=snapshot.available_cores,
+            memory_mb=0,
+            available_memory_mb=0,
+            cluster_id=self._config.cluster_id,
+            environment_id=self._config.environment_id,
+        )
+
+    def _resolve_worker_registration(
+        self,
+        snapshot: WorkerStateSnapshot,
+        worker_status: WorkerStatus | None,
+    ) -> WorkerRegistration | None:
+        """Resolve or create a worker registration for state sync."""
+        registration = self._registry.get_worker(snapshot.node_id)
+        if registration:
+            registration.total_cores = snapshot.total_cores
+            registration.available_cores = snapshot.available_cores
+            registration.node.version = snapshot.version
+            return registration
+
+        if worker_status and worker_status.registration:
+            registration = worker_status.registration
+            registration.total_cores = snapshot.total_cores
+            registration.available_cores = snapshot.available_cores
+            registration.node.version = snapshot.version
+            self._registry.register_worker(registration)
+            return registration
+
+        registration = self._build_worker_registration_from_snapshot(snapshot)
+        if registration is None:
+            return None
+
+        self._registry.register_worker(registration)
+        return registration
+
+    async def _apply_worker_pool_snapshot(
+        self,
+        worker_pool: "WorkerPool",
+        worker_status: WorkerStatus,
+        registration: WorkerRegistration,
+        snapshot: WorkerStateSnapshot,
+        health_state: str,
+    ) -> None:
+        """Apply snapshot data to the worker pool state."""
+        queue_depth = len(snapshot.active_workflows)
+        heartbeat = WorkerHeartbeat(
+            node_id=snapshot.node_id,
+            state=snapshot.state,
+            available_cores=snapshot.available_cores,
+            queue_depth=queue_depth,
+            cpu_percent=0.0,
+            memory_percent=0.0,
+            version=snapshot.version,
+            active_workflows={
+                workflow_id: progress.status
+                for workflow_id, progress in snapshot.active_workflows.items()
+            },
+            tcp_host=registration.node.host,
+            tcp_port=registration.node.port,
+        )
+
+        async with worker_pool._cores_condition:
+            old_available = worker_status.available_cores
+            worker_status.heartbeat = heartbeat
+            worker_status.last_seen = time.monotonic()
+            worker_status.state = snapshot.state
+            worker_status.available_cores = snapshot.available_cores
+            worker_status.total_cores = snapshot.total_cores
+            worker_status.queue_depth = queue_depth
+            worker_status.cpu_percent = 0.0
+            worker_status.memory_percent = 0.0
+            worker_status.reserved_cores = 0
+            worker_status.overload_state = health_state
+
+            if worker_status.available_cores > old_available:
+                worker_pool._cores_condition.notify_all()
+
+            pool_health = worker_pool._worker_health.get(worker_status.worker_id)
+            if pool_health:
+                accepting = (
+                    snapshot.state == WorkerState.HEALTHY.value
+                    and worker_status.available_cores > 0
+                )
+                pool_health.update_liveness(success=True)
+                pool_health.update_readiness(
+                    accepting=accepting,
+                    capacity=worker_status.available_cores,
+                )
+
+    async def _remove_worker_from_sync(
+        self,
+        worker_id: str,
+        worker_key: str,
+        snapshot_version: int,
+        worker_pool: "WorkerPool | None",
+    ) -> None:
+        """Remove a worker during state sync when marked offline."""
+        registration = self._registry.get_worker(worker_id)
+        if registration:
+            self._registry.unregister_worker(worker_id)
+
+        if worker_pool:
+            await worker_pool.deregister_worker(worker_id)
+
+        await self._state._versioned_clock.update_entity(worker_key, snapshot_version)
+
+        self._task_runner.run(
+            self._logger.log,
+            ServerWarning(
+                message=f"Removed offline worker {worker_id[:8]}... from sync",
+                node_host=self._config.host,
+                node_port=self._config.tcp_port,
+                node_id=self._node_id,
+            ),
+        )
+
     async def _apply_worker_state(self, snapshot: WorkerStateSnapshot) -> None:
         """
         Apply worker state snapshot to local state.
@@ -191,6 +347,15 @@ class ManagerStateSync:
         worker_key = f"worker:{worker_id}"
         worker_pool = self._registry._worker_pool
         worker_status = worker_pool.get_worker(worker_id) if worker_pool else None
+
+        if snapshot.state == WorkerState.OFFLINE.value:
+            await self._remove_worker_from_sync(
+                worker_id,
+                worker_key,
+                snapshot.version,
+                worker_pool,
+            )
+            return
 
         if (
             worker_status
@@ -229,66 +394,25 @@ class ManagerStateSync:
             )
             return
 
-        registration = self._registry.get_worker(worker_id)
-        if not registration:
-            self._task_runner.run(
-                self._logger.log,
-                ServerWarning(
-                    message=(
-                        f"Worker state sync received for unknown worker "
-                        f"{worker_id[:8]}..."
-                    ),
-                    node_host=self._config.host,
-                    node_port=self._config.tcp_port,
-                    node_id=self._node_id,
-                ),
-            )
+        registration = self._resolve_worker_registration(snapshot, worker_status)
+        if registration is None:
             return
 
-        registration.total_cores = snapshot.total_cores
-        registration.available_cores = snapshot.available_cores
+        health_state = self._derive_worker_health_state(snapshot)
+        self._state._worker_health_states[worker_id] = health_state
+
+        if snapshot.state == WorkerState.HEALTHY.value:
+            self._state.clear_worker_unhealthy_since(worker_id)
 
         if worker_pool:
-            if worker_status is None:
-                await worker_pool.register_worker(registration)
-                worker_status = worker_pool.get_worker(worker_id)
-
-            if worker_status:
-                heartbeat = WorkerHeartbeat(
-                    node_id=worker_id,
-                    state=snapshot.state,
-                    available_cores=snapshot.available_cores,
-                    queue_depth=0,
-                    cpu_percent=0.0,
-                    memory_percent=0.0,
-                    version=snapshot.version,
-                    active_workflows={
-                        workflow_id: progress.status
-                        for workflow_id, progress in snapshot.active_workflows.items()
-                    },
-                    tcp_host=registration.node.host,
-                    tcp_port=registration.node.port,
-                )
-
-                async with worker_pool._cores_condition:
-                    old_available = worker_status.available_cores
-                    worker_status.heartbeat = heartbeat
-                    worker_status.last_seen = time.monotonic()
-                    worker_status.state = snapshot.state
-                    worker_status.available_cores = snapshot.available_cores
-                    worker_status.total_cores = snapshot.total_cores
-                    worker_status.reserved_cores = 0
-
-                    if worker_status.available_cores > old_available:
-                        worker_pool._cores_condition.notify_all()
-
-                    health_state = worker_pool._worker_health.get(worker_id)
-                    if health_state:
-                        health_state.update_liveness(success=True)
-                        health_state.update_readiness(
-                            accepting=worker_status.available_cores > 0,
-                            capacity=worker_status.available_cores,
-                        )
+            worker_status = await worker_pool.register_worker(registration)
+            await self._apply_worker_pool_snapshot(
+                worker_pool,
+                worker_status,
+                registration,
+                snapshot,
+                health_state,
+            )
 
         await self._state._versioned_clock.update_entity(worker_key, snapshot.version)
 
