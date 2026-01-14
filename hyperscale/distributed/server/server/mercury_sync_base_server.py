@@ -231,9 +231,11 @@ class MercurySyncBaseServer(Generic[T]):
         self._model_handler_map: dict[bytes, bytes] = {}
         self.tcp_client_response_models: dict[bytes, type[Message]] = {}
         self.tcp_server_request_models: dict[bytes, type[Message]] = {}
+        self._tcp_server_request_transports: dict[str, asyncio.Transport] = {}
+        self._tcp_client_response_transports: dict[str, asyncio.Transport] = {}
+        
         self.udp_client_response_models: dict[bytes, type[Message]] = {}
         self.udp_server_request_models: dict[bytes, type[Message]] = {}
-        self._tcp_request_transports: dict[str, asyncio.Transport] = {}
 
         self.tcp_handlers: dict[
             bytes,
