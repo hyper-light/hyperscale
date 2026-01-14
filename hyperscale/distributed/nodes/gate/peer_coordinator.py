@@ -94,6 +94,7 @@ class GatePeerCoordinator:
             get_udp_port: Callback to get this gate's UDP port
             confirm_peer: Callback to confirm peer in SWIM layer
             handle_job_leader_failure: Callback to handle job leader failure
+            remove_peer_circuit: Callback to clear peer circuit breakers
         """
         self._state: GateRuntimeState = state
         self._logger: Logger = logger
@@ -114,6 +115,9 @@ class GatePeerCoordinator:
         self._confirm_peer: Callable[[tuple[str, int]], None] = confirm_peer
         self._handle_job_leader_failure: Callable[[tuple[str, int]], "asyncio.Task"] = (
             handle_job_leader_failure
+        )
+        self._remove_peer_circuit: Callable[[tuple[str, int]], Awaitable[None]] = (
+            remove_peer_circuit
         )
         self._is_leader: Callable[[], bool] = is_leader or (lambda: False)
 
@@ -176,6 +180,8 @@ class GatePeerCoordinator:
                 await self._job_hash_ring.remove_node(peer_id)
 
             self._job_forwarding_tracker.unregister_peer(real_peer_id)
+
+        await self._remove_peer_circuit(tcp_addr)
 
         self._task_runner.run(
             self._logger.log,

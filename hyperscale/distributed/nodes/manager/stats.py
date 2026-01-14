@@ -17,6 +17,8 @@ from hyperscale.distributed.reliability import (
 from hyperscale.logging.hyperscale_logging_models import ServerDebug, ServerWarning
 
 if TYPE_CHECKING:
+    from hyperscale.distributed.jobs import WindowedStatsCollector
+    from hyperscale.distributed.models import WorkflowProgress
     from hyperscale.distributed.nodes.manager.state import ManagerState
     from hyperscale.distributed.nodes.manager.config import ManagerConfig
     from hyperscale.distributed.taskex import TaskRunner
@@ -67,6 +69,8 @@ class ManagerStatsCoordinator:
         logger: "Logger",
         node_id: str,
         task_runner: "TaskRunner",
+        stats_buffer: StatsBuffer,
+        windowed_stats: "WindowedStatsCollector",
     ) -> None:
         self._state: "ManagerState" = state
         self._config: "ManagerConfig" = config
