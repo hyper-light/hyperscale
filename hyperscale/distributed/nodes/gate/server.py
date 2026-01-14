@@ -2745,6 +2745,10 @@ class GateServer(HealthAwareServer):
 
         broadcast_count = 0
         for peer_addr in self._modular_state.iter_active_peers():
+            if await self._peer_gate_circuit_breaker.is_circuit_open(peer_addr):
+                continue
+
+            circuit = await self._peer_gate_circuit_breaker.get_circuit(peer_addr)
             try:
                 await self.send_tcp(
                     peer_addr,
@@ -2752,8 +2756,10 @@ class GateServer(HealthAwareServer):
                     announcement.dump(),
                     timeout=2.0,
                 )
+                circuit.record_success()
                 broadcast_count += 1
             except Exception:
+                circuit.record_failure()
                 # Best effort - peer may be down
                 pass
 
