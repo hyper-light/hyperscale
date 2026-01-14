@@ -3737,7 +3737,8 @@ class GateServer(HealthAwareServer):
                     )
                 else:
                     errors.append(
-                        f"{datacenter}: reported status {dc_result.status} without error details"
+                        f"{datacenter}: reported status {dc_result.status} "
+                        "without error details"
                     )
 
             if dc_result.elapsed_seconds > max_elapsed:
