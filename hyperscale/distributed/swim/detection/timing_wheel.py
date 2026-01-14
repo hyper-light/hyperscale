@@ -117,12 +117,14 @@ class TimingWheel:
         self,
         config: TimingWheelConfig | None = None,
         on_expired: Callable[[NodeAddress, SuspicionState], None] | None = None,
+        on_error: Callable[[str, Exception], None] | None = None,
     ) -> None:
         if config is None:
             config = TimingWheelConfig()
 
         self._config = config
         self._on_expired = on_expired
+        self._on_error = on_error
 
         # Create wheel buckets
         self._coarse_wheel: list[TimingWheelBucket] = [
