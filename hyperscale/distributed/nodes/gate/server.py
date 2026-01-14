@@ -260,6 +260,12 @@ class GateServer(HealthAwareServer):
 
         # Create modular runtime state
         self._modular_state = GateRuntimeState()
+        client_update_history_limit = int(
+            getattr(env, "GATE_CLIENT_UPDATE_HISTORY_LIMIT", 200)
+        )
+        self._modular_state.set_client_update_history_limit(
+            max(1, client_update_history_limit)
+        )
 
         # Datacenter -> manager addresses mapping
         self._datacenter_managers = datacenter_managers or {}
