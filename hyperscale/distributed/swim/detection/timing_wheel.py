@@ -120,6 +120,10 @@ class TimingWheel:
         config: TimingWheelConfig | None = None,
         on_expired: Callable[[NodeAddress, SuspicionState], None] | None = None,
         on_error: Callable[[str, Exception], None] | None = None,
+        logger: LoggerProtocol | None = None,
+        node_host: str = "",
+        node_port: int = 0,
+        node_id: str = "",
     ) -> None:
         if config is None:
             config = TimingWheelConfig()
@@ -127,6 +131,10 @@ class TimingWheel:
         self._config = config
         self._on_expired = on_expired
         self._on_error = on_error
+        self._logger = logger
+        self._node_host = node_host
+        self._node_port = node_port
+        self._node_id = node_id
 
         # Create wheel buckets
         self._coarse_wheel: list[TimingWheelBucket] = [
