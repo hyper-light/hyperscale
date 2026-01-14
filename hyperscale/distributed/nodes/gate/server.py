@@ -2310,10 +2310,13 @@ class GateServer(HealthAwareServer):
         self,
         job_id: str,
         target_dc_count: int,
+        callback_addr: tuple[str, int] | None = None,
     ) -> None:
         if self._leadership_coordinator:
+            if callback_addr is None:
+                callback_addr = self._job_manager.get_callback(job_id)
             await self._leadership_coordinator.broadcast_leadership(
-                job_id, target_dc_count
+                job_id, target_dc_count, callback_addr
             )
 
     async def _dispatch_job_to_datacenters(

@@ -5,7 +5,7 @@ Coordinates job submission and dispatch to datacenter managers.
 """
 
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING
 
 import cloudpickle
@@ -72,7 +72,9 @@ class GateDispatchCoordinator:
         quorum_circuit: "ErrorStats",
         select_datacenters: Callable,
         assume_leadership: Callable,
-        broadcast_leadership: Callable,
+        broadcast_leadership: Callable[
+            [str, int, tuple[str, int] | None], Awaitable[None]
+        ],
         send_tcp: Callable,
         increment_version: Callable,
         confirm_manager_for_dc: Callable,
