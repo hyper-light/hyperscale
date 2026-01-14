@@ -2208,6 +2208,9 @@ class ManagerStateSnapshot(Message):
         default_factory=dict
     )  # job_id -> layer version
     job_contexts: bytes = b""  # Serialized contexts (cloudpickle)
+    # Pending stats checkpoint for recovery (Task 33)
+    # List of (timestamp, value) tuples from the stats buffer
+    pending_stats_checkpoint: list[tuple[float, float]] = field(default_factory=list)
 
 
 @dataclass(slots=True)
