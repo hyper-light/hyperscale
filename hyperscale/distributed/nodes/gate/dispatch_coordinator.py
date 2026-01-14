@@ -94,6 +94,7 @@ class GateDispatchCoordinator:
         get_node_id_short: Callable[[], str],
         capacity_aggregator: DatacenterCapacityAggregator | None = None,
         spillover_evaluator: SpilloverEvaluator | None = None,
+        observed_latency_tracker: "ObservedLatencyTracker | None" = None,
     ) -> None:
         self._state: "GateRuntimeState" = state
         self._logger: "Logger" = logger
@@ -130,6 +131,9 @@ class GateDispatchCoordinator:
             capacity_aggregator
         )
         self._spillover_evaluator: SpilloverEvaluator | None = spillover_evaluator
+        self._observed_latency_tracker: "ObservedLatencyTracker | None" = (
+            observed_latency_tracker
+        )
 
     def _is_terminal_status(self, status: str) -> bool:
         return status in (
