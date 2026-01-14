@@ -75,11 +75,6 @@ class GateIdempotencyCache(Generic[T]):
         job_id: str,
         source_gate_id: str,
     ) -> tuple[bool, IdempotencyEntry[T] | None]:
-        """
-        Atomically check if key exists, inserting PENDING entry if not.
-
-        Returns (True, entry) if key existed, (False, None) if newly inserted.
-        """
         should_wait = False
         evicted_waiters: list[asyncio.Future[T]] = []
 
