@@ -2619,6 +2619,15 @@ class GateServer(HealthAwareServer):
         job_leaders, job_leader_addrs, job_fencing_tokens = (
             self._job_leadership_tracker.to_snapshot()
         )
+        progress_callbacks = dict(self._modular_state._progress_callbacks)
+        progress_callbacks.update(self._progress_callbacks)
+        workflow_dc_results = {
+            job_id: {
+                workflow_id: dict(dc_results)
+                for workflow_id, dc_results in workflow_results.items()
+            }
+            for job_id, workflow_results in self._workflow_dc_results.items()
+        }
         return GateStateSnapshot(
             node_id=self._node_id.full,
             version=self._state_version,
@@ -2629,6 +2638,8 @@ class GateServer(HealthAwareServer):
             job_leader_addrs=job_leader_addrs,
             job_fencing_tokens=job_fencing_tokens,
             job_dc_managers=dict(self._job_dc_managers),
+            workflow_dc_results=workflow_dc_results,
+            progress_callbacks=progress_callbacks,
         )
 
     async def _apply_gate_state_snapshot(

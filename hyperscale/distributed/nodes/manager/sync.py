@@ -335,5 +335,6 @@ class ManagerStateSync:
             jobs=dict(self._state._job_progress),
             job_leaders=dict(self._state._job_leaders),
             job_leader_addrs=dict(self._state._job_leader_addrs),
-            job_layer_versions=dict(self._state._job_layer_versions),
+            job_fence_tokens=dict(self._state._job_fencing_tokens),
+            job_layer_versions=dict(self._state._job_layer_version),
         )
