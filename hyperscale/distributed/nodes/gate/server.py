@@ -3827,10 +3827,17 @@ class GateServer(HealthAwareServer):
                 )
                 circuit.record_success()
                 broadcast_count += 1
-            except Exception:
+            except Exception as error:
                 circuit.record_failure()
-                # Best effort - peer may be down
-                pass
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerDebug(
+                        message=f"Failed DC leader announcement to {peer_addr}: {error}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    ),
+                )
 
         if broadcast_count > 0:
             await self._udp_logger.log(
