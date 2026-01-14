@@ -1251,3 +1251,139 @@ Race Conditions Under Load
 - Result submission - Final results sent
 - Health state update - Marked unhealthy before shutdown
 ---
+
+41. Multi-Gate Multi-DC Job Submission Simulation (3 Gates, 3 DCs)
+41.1 Topology Bootstrap and Peer Confirmation (AD-29, AD-46)
+- All 3 gates start concurrently - Unconfirmed peers not suspected during startup
+- Managers start before gates - Confirmed on first successful heartbeat
+- Unconfirmed peer never responds - Removed without DEAD transition
+- Gossip about unconfirmed peer - NodeState remains UNCONFIRMED until direct ACK
+- NodeState memory bound - Updates for same node remain O(1)
+
+41.2 Dispatch Retry Data Preservation (AD-9)
+- Retry dispatch uses original bytes - VUs/timeouts/context identical across retries
+- Failed worker exclusion - Retry avoids failed worker set
+- Retry after partial ACK - No double execution, one workflow instance
+- Corrupted original bytes - Retry rejected with validation error
+- Concurrent retries - Only one active dispatch per workflow
+
+41.3 Fencing Tokens and Leadership Safety (AD-10, AD-13)
+- Leader gate dispatches with current term - Worker accepts
+- Stale leader dispatch - Worker rejects stale fencing token
+- Leadership transfer mid-dispatch - New leader increments token and takes over
+- Split-brain partition - Both leaders step down, no duplicate job completion
+- Cancellation from stale leader - Rejected by manager/worker
+
+41.4 State Sync Retries and Leadership Recovery (AD-11, AD-12)
+- Leader change - Sync from workers and peer managers with backoff
+- Peer manager unreachable - Sync continues with remaining peers
+- Backoff jitter - No thundering herd when peers recover
+- Sync race with shutdown - No deadlock between sync and stop
+- Sync after partial state - Missing peers logged but job continues
+
+41.5 Idempotent Job Submission Across Gates (AD-40)
+- Same idempotency key to two gates - One job created, duplicate returns cached
+- Pending entry wait - Second request blocks until first resolves
+- Key expiry during retry - Treated as new submission after TTL
+- Same key, different payload - Rejected or returns cached original response
+- Idempotency cache cleanup - Entries evicted without memory growth
+
+41.6 Capacity-Aware Spillover (AD-43)
+- Primary DC lacks cores - Spillover to DC with immediate capacity
+- Primary wait time below threshold - Queue at primary, no spillover
+- Spillover latency penalty too high - Reject spillover despite capacity
+- Stale capacity heartbeat - Gate degrades confidence, avoids spillover
+- Core freeing schedule - Estimated wait time matches dispatch order
+
+41.7 Adaptive Route Learning (AD-45, AD-36)
+- Initial routing uses RTT UCB - No observed samples yet
+- Observed latency samples accumulate - Confidence increases, blended score shifts
+- Stale observations - Confidence decays to 0 after max staleness
+- Late latency sample - Does not override newer sample ordering
+- Routing hysteresis - Avoids oscillation under mixed scores
+
+41.8 Retry Budgets and Best-Effort Completion (AD-44)
+- Job retry budget shared - Total retries capped across workflows
+- Per-workflow cap enforced - One workflow cannot consume entire budget
+- Budget exhausted - Workflow marked failed without further retries
+- Best-effort min_dcs met - Job completes with partial results
+- Best-effort deadline hit - Completion with available results only
+
+41.9 Explicit Backpressure and Load Shedding (AD-23, AD-37, AD-22, AD-32)
+- Manager signals THROTTLE - Worker increases progress flush interval
+- Manager signals BATCH - Worker batches progress updates
+- Manager signals REJECT - Non-critical updates dropped, control unaffected
+- CRITICAL messages under overload - Never shed by InFlightTracker
+- Stats buffer bounds - Hot/Warm/Cold retention prevents memory growth
+
+41.10 Durability and WAL Boundaries (AD-38, AD-39)
+- Job create/cancel committed globally - Survives gate crash
+- Workflow dispatch committed regionally - Survives manager crash
+- WAL backpressure - Producer blocked or error surfaced
+- WAL recovery - Replayed entries yield consistent state
+- Data-plane stats - Fire-and-forget, no durability requirement
+
+41.11 Workflow Context Propagation and Recovery (AD-49)
+- Context from workflow A to B across DCs - Dependent receives correct context
+- Worker dies mid-workflow - Re-dispatch uses stored dispatched_context
+- Context update arrives late - Dependent dispatch waits or retries
+- Context snapshot during leader transfer - New leader resumes with version
+- Empty context - Dispatch still proceeds with defaults
+
+41.12 Cross-Manager Worker Visibility (AD-48)
+- Worker registers with Manager A - B/C learn via TCP broadcast
+- Missed broadcast - Gossip piggyback eventually converges
+- Stale incarnation update - Rejected by remote manager
+- Owner manager down - Remote workers marked unusable for scheduling
+- Manager joins late - Full worker list requested and applied
+
+41.13 Resource Guards and Leak Prevention (AD-41)
+- CPU exceeds warn threshold - Warning emitted, no throttle
+- CPU exceeds throttle threshold - Throughput reduced
+- Memory exceeds kill threshold - Workflow terminated gracefully
+- Process tree monitoring - Child processes included in totals
+- High uncertainty - Enforcement delayed until confidence improves
+
+41.14 SLO-Aware Health and Routing (AD-42)
+- p95 exceeds threshold - DC health shifts to DEGRADED
+- T-Digest merge across managers - Percentiles stable across merges
+- Sparse samples - Routing falls back to RTT-based scoring
+- SLO data stale - Excluded from routing score contribution
+- SLO violation with good RTT - Routing avoids violating DC
+
+41.15 Manager Health Aggregation Alerts (AD-50)
+- Leader manager overloaded - ALERT fired once per transition
+- Majority overloaded - ALERT fired with peer counts
+- High non-healthy ratio - WARNING emitted
+- Peer recovery - INFO emitted, alert clears
+- No peers - Aggregation skipped without error
+
+41.16 Worker Event Logging (AD-47)
+- Worker job lifecycle events logged - Start/complete/fail captured
+- Action events under load - Logging does not block execution
+- Event log overflow - Drops events without worker slowdown
+- Log rotation - Old logs archived, retention enforced
+- Crash forensics - Last events show active job and action
+
+41.17 Hierarchical Failure Detection and Gossip Callbacks (AD-30, AD-31)
+- Gossip-informed death - _on_node_dead_callbacks invoked on gossip update
+- Timer starvation case - Suspicion expires despite frequent confirmations
+- Job-layer suspicion - Node dead for one job, alive globally
+- Refutation race - Higher incarnation clears suspicion
+- Global death clears job suspicions - All per-job states removed
+
+41.18 Rate Limiting and Version Skew (AD-24, AD-25)
+- Client rate limit exceeded - 429 with Retry-After returned
+- Server-side limit enforced - Per-client token bucket honored
+- Mixed protocol versions - Feature negotiation uses min version
+- Unknown fields ignored - Forward compatibility maintained
+- Major version mismatch - Connection rejected
+
+41.19 Deadlock and Lock Ordering
+- Gate leadership transfer + state sync - No lock inversion deadlock
+- Manager job lock + context update - Avoids lock ordering cycles
+- Retry budget update + cleanup loop - No deadlock under contention
+- WAL backpressure + shutdown - Shutdown completes without blocking
+- Cancellation + timeout loops - No deadlock when both fire
+
+---
