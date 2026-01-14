@@ -52,25 +52,22 @@ class WorkerDisseminator:
         logger: "Logger",
         node_id: str,
         datacenter: str,
-        task_runner: Any,
-        send_tcp: Callable[
-            [tuple[str, int], str, bytes, float],
-            Coroutine[Any, Any, bytes | None],
-        ],
+        task_runner: "TaskRunner",
+        send_tcp: SendTcpFunc,
         gossip_buffer: WorkerStateGossipBuffer,
     ) -> None:
-        self._state = state
-        self._config = config
-        self._worker_pool = worker_pool
-        self._logger = logger
-        self._node_id = node_id
-        self._datacenter = datacenter
-        self._task_runner = task_runner
-        self._send_tcp = send_tcp
-        self._gossip_buffer = gossip_buffer
+        self._state: "ManagerState" = state
+        self._config: "ManagerConfig" = config
+        self._worker_pool: "WorkerPool" = worker_pool
+        self._logger: "Logger" = logger
+        self._node_id: str = node_id
+        self._datacenter: str = datacenter
+        self._task_runner: "TaskRunner" = task_runner
+        self._send_tcp: SendTcpFunc = send_tcp
+        self._gossip_buffer: WorkerStateGossipBuffer = gossip_buffer
 
         self._worker_incarnations: dict[str, int] = {}
-        self._incarnation_lock = asyncio.Lock()
+        self._incarnation_lock: asyncio.Lock = asyncio.Lock()
 
     async def _get_next_incarnation(self, worker_id: str) -> int:
         async with self._incarnation_lock:
