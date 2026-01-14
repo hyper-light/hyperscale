@@ -788,16 +788,20 @@ class GateJobHandler:
                     1 for p in job.datacenters if p.status in terminal_statuses
                 )
 
-                all_target_dcs_reported = (
-                    target_dcs and target_dcs <= reported_dc_ids
-                )
+                all_target_dcs_reported = target_dcs and target_dcs <= reported_dc_ids
                 all_reported_dcs_terminal = terminal_dcs == len(job.datacenters)
 
                 job_can_complete = (
-                    all_target_dcs_reported and all_reported_dcs_terminal
-                ) if target_dcs else all_reported_dcs_terminal
+                    (all_target_dcs_reported and all_reported_dcs_terminal)
+                    if target_dcs
+                    else all_reported_dcs_terminal
+                )
 
-                if not all_target_dcs_reported and all_reported_dcs_terminal and target_dcs:
+                if (
+                    not all_target_dcs_reported
+                    and all_reported_dcs_terminal
+                    and target_dcs
+                ):
                     missing_dcs = target_dcs - reported_dc_ids
                     self._task_runner.run(
                         self._logger.log,
