@@ -424,23 +424,7 @@ class GateRuntimeState:
         Returns:
             Set of gate IDs cleaned up from peer metadata.
         """
-        udp_addrs_to_remove: list[tuple[str, int]] = []
-        gate_ids_to_remove: set[str] = set()
-
-        for udp_addr, tcp_addr in list(self._gate_udp_to_tcp.items()):
-            if tcp_addr == peer_addr:
-                udp_addrs_to_remove.append(udp_addr)
-                heartbeat = self._gate_peer_info.get(udp_addr)
-                if heartbeat and heartbeat.node_id:
-                    gate_ids_to_remove.add(heartbeat.node_id)
-
-        # Clean up TCP-address-keyed structures
-        self.cleanup_peer_tracking(peer_addr)
-
-        # Clean up UDP-address-keyed structures
-        for udp_addr in udp_addrs_to_remove:
-            self._gate_udp_to_tcp.pop(udp_addr, None)
-            self._gate_peer_info.pop(udp_addr, None)
+        gate_ids_to_remove = self.cleanup_peer_tracking(peer_addr)
 
         # Clean up gate_id-keyed structures
         for gate_id in gate_ids_to_remove:
