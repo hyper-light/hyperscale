@@ -72,5 +72,13 @@ class ReporterResultPushHandler:
 
             return b"ok"
 
-        except Exception:
+        except Exception as handler_error:
+            await self._logger.log(
+                ServerWarning(
+                    message=f"Reporter result push handler error: {handler_error}, payload_length={len(data)}",
+                    node_host="client",
+                    node_port=0,
+                    node_id="client",
+                )
+            )
             return b"error"
