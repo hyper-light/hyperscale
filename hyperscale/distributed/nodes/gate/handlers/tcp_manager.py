@@ -94,22 +94,32 @@ class GateManagerHandler:
             set_manager_backpressure_none: Async callback to clear manager backpressure
             broadcast_manager_discovery: Callback to broadcast discovery
         """
-        self._state = state
-        self._logger = logger
-        self._task_runner = task_runner
-        self._env = env
-        self._datacenter_managers = datacenter_managers
-        self._role_validator = role_validator
-        self._node_capabilities = node_capabilities
-        self._get_node_id = get_node_id
-        self._get_host = get_host
-        self._get_tcp_port = get_tcp_port
-        self._get_healthy_gates = get_healthy_gates
-        self._record_manager_heartbeat = record_manager_heartbeat
-        self._handle_manager_backpressure_signal = handle_manager_backpressure_signal
-        self._update_dc_backpressure = update_dc_backpressure
-        self._set_manager_backpressure_none = set_manager_backpressure_none
-        self._broadcast_manager_discovery = broadcast_manager_discovery
+        self._state: GateRuntimeState = state
+        self._logger: Logger = logger
+        self._task_runner: "TaskRunner" = task_runner
+        self._env: "Env" = env
+        self._datacenter_managers: dict[str, list[tuple[str, int]]] = (
+            datacenter_managers
+        )
+        self._role_validator: RoleValidator = role_validator
+        self._node_capabilities: NodeCapabilities = node_capabilities
+        self._get_node_id: Callable[[], "NodeId"] = get_node_id
+        self._get_host: Callable[[], str] = get_host
+        self._get_tcp_port: Callable[[], int] = get_tcp_port
+        self._get_healthy_gates: Callable[[], list[GateInfo]] = get_healthy_gates
+        self._record_manager_heartbeat: Callable[
+            [str, tuple[str, int], str, int], None
+        ] = record_manager_heartbeat
+        self._handle_manager_backpressure_signal: Callable[
+            [tuple[str, int], str, BackpressureSignal], Awaitable[None]
+        ] = handle_manager_backpressure_signal
+        self._update_dc_backpressure: Callable[[str], Awaitable[None]] = (
+            update_dc_backpressure
+        )
+        self._set_manager_backpressure_none: Callable[
+            [tuple[str, int], str], Awaitable[None]
+        ] = set_manager_backpressure_none
+        self._broadcast_manager_discovery: Callable = broadcast_manager_discovery
 
     async def handle_status_update(
         self,

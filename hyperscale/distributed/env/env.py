@@ -200,6 +200,10 @@ class Env(BaseModel):
     CANCELLED_WORKFLOW_CLEANUP_INTERVAL: StrictFloat = (
         60.0  # Seconds between cleanup checks
     )
+    
+    CANCELLED_WORKFLOW_TIMEOUT: StrictFloat = (
+        60.0
+    )
 
     # Client Leadership Transfer Settings (Section 9)
     CLIENT_ORPHAN_GRACE_PERIOD: StrictFloat = (
