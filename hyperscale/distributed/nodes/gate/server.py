@@ -376,6 +376,10 @@ class GateServer(HealthAwareServer):
 
         # Reporter tasks
         self._job_reporter_tasks: dict[str, dict[str, asyncio.Task]] = {}
+        self._job_aggregated_workflow_stats: dict[
+            str, dict[str, list[WorkflowStats]]
+        ] = {}
+        self._jobs_with_reporter_submissions: set[str] = set()
 
         # CRDT stats (AD-14)
         self._job_stats_crdt: dict[str, JobStatsCRDT] = {}
