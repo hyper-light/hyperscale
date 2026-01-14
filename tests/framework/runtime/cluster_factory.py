@@ -262,7 +262,7 @@ class ClusterFactory:
         return cluster
 
     def _build_env(
-        self, spec: ClusterSpec, node_overrides: dict[str, str] | None
+        self, spec: ClusterSpec, node_overrides: dict[str, PrimaryType] | None
     ) -> Env:
         env_overrides = dict(spec.env_overrides or {})
         if node_overrides:
