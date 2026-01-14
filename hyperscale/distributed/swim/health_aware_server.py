@@ -854,6 +854,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             config=config,
             on_global_death=on_global_death,
             on_job_death=on_job_death,
+            on_error=self._on_hierarchical_detector_error,
             get_n_members=self._get_member_count,
             get_job_n_members=get_job_n_members,
             get_lhm_multiplier=self._get_lhm_multiplier,
