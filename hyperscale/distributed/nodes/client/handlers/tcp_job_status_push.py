@@ -117,14 +117,32 @@ class JobBatchPushHandler:
 
             job = self._state._jobs.get(push.job_id)
             if not job:
-                return b"ok"  # Job not tracked, ignore
+                return b"ok"
 
-            # Update job status with batch stats
             job.status = push.status
             job.total_completed = push.total_completed
             job.total_failed = push.total_failed
             job.overall_rate = push.overall_rate
             job.elapsed_seconds = push.elapsed_seconds
+
+            progress_callback = self._state._progress_callbacks.get(push.job_id)
+            if progress_callback:
+                try:
+                    if asyncio.iscoroutinefunction(progress_callback):
+                        await progress_callback(push)
+                    else:
+                        loop = asyncio.get_running_loop()
+                        await loop.run_in_executor(None, progress_callback, push)
+                except Exception as callback_error:
+                    if self._logger:
+                        await self._logger.log(
+                            ServerWarning(
+                                message=f"Job batch progress callback error: {callback_error}",
+                                node_host="client",
+                                node_port=0,
+                                node_id="client",
+                            )
+                        )
 
             return b"ok"
 
