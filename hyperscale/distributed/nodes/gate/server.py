@@ -2613,16 +2613,22 @@ class GateServer(HealthAwareServer):
             if candidate.node_id == self._node_id.full:
                 continue
 
+            gate_addr = (candidate.tcp_host, candidate.tcp_port)
+            if await self._peer_gate_circuit_breaker.is_circuit_open(gate_addr):
+                continue
+
+            circuit = await self._peer_gate_circuit_breaker.get_circuit(gate_addr)
             try:
-                gate_addr = (candidate.tcp_host, candidate.tcp_port)
                 await self.send_tcp(
                     gate_addr,
                     "workflow_result_push",
                     push.dump(),
                     timeout=3.0,
                 )
+                circuit.record_success()
                 return True
             except Exception as push_error:
+                circuit.record_failure()
                 await self._udp_logger.log(
                     ServerDebug(
                         message=f"Failed to push result to candidate gate: {push_error}",
@@ -2636,16 +2642,23 @@ class GateServer(HealthAwareServer):
         for gate_id, gate_info in list(self._modular_state.iter_known_gates()):
             if gate_id == self._node_id.full:
                 continue
+
+            gate_addr = (gate_info.tcp_host, gate_info.tcp_port)
+            if await self._peer_gate_circuit_breaker.is_circuit_open(gate_addr):
+                continue
+
+            circuit = await self._peer_gate_circuit_breaker.get_circuit(gate_addr)
             try:
-                gate_addr = (gate_info.tcp_host, gate_info.tcp_port)
                 await self.send_tcp(
                     gate_addr,
                     "workflow_result_push",
                     push.dump(),
                     timeout=3.0,
                 )
+                circuit.record_success()
                 return True
             except Exception as fallback_push_error:
+                circuit.record_failure()
                 await self._udp_logger.log(
                     ServerDebug(
                         message=f"Failed to push result to fallback gate: {fallback_push_error}",
