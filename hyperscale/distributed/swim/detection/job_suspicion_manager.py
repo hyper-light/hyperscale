@@ -18,6 +18,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable
 
+from hyperscale.distributed.swim.core.protocols import LoggerProtocol
+
 from .suspicion_state import SuspicionState
 
 
