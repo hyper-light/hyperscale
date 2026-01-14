@@ -368,8 +368,16 @@ class FederatedHealthMonitor:
 
             except asyncio.CancelledError:
                 break
-            except Exception:
-                # Log error but continue probing
+            except Exception as error:
+                # Log error via callback if provided, continue probing
+                if self.on_probe_error:
+                    try:
+                        self.on_probe_error(
+                            f"Federated health probe loop error: {error}",
+                            list(self._dc_health.keys()),
+                        )
+                    except Exception:
+                        pass
                 await asyncio.sleep(1.0)
 
     async def _probe_datacenter(self, datacenter: str) -> None:
@@ -402,8 +410,16 @@ class FederatedHealthMonitor:
                 self._handle_probe_failure(state)
         except asyncio.TimeoutError:
             self._handle_probe_failure(state)
-        except Exception:
+        except Exception as error:
             self._handle_probe_failure(state)
+            if self.on_probe_error:
+                try:
+                    self.on_probe_error(
+                        f"Probe to {datacenter} failed: {error}",
+                        [datacenter],
+                    )
+                except Exception:
+                    pass
 
     def _check_ack_timeouts(self) -> None:
         """
