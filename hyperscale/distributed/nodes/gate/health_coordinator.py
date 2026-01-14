@@ -80,7 +80,7 @@ class GateHealthCoordinator:
         self._task_runner: "TaskRunner" = task_runner
         self._dc_health_manager: DatacenterHealthManager = dc_health_manager
         self._dc_health_monitor: FederatedHealthMonitor = dc_health_monitor
-        self._cross_dc_correlation: "CrossDCCorrelationDetector" = cross_dc_correlation
+        self._cross_dc_correlation: CrossDCCorrelationDetector = cross_dc_correlation
         self._dc_manager_discovery: dict[str, DiscoveryService] = dc_manager_discovery
         self._versioned_clock: "VersionedStateClock" = versioned_clock
         self._manager_dispatcher: "ManagerDispatcher" = manager_dispatcher
@@ -448,10 +448,18 @@ class GateHealthCoordinator:
         candidates: list[DatacenterCandidate] = []
         for datacenter_id in datacenter_ids:
             status = self.classify_datacenter_health(datacenter_id)
+            health_bucket = status.health.upper()
+            if status.health == DatacenterHealth.UNHEALTHY.value:
+                correlation_decision = self._cross_dc_correlation.check_correlation(
+                    datacenter_id
+                )
+                if correlation_decision.should_delay_eviction:
+                    health_bucket = DatacenterHealth.DEGRADED.value.upper()
+
             candidates.append(
                 DatacenterCandidate(
                     datacenter_id=datacenter_id,
-                    health_bucket=status.health.upper(),
+                    health_bucket=health_bucket,
                     available_cores=status.available_capacity,
                     total_cores=status.available_capacity + status.queue_depth,
                     queue_depth=status.queue_depth,
