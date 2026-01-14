@@ -165,7 +165,9 @@ from hyperscale.distributed.routing import (
     DispatchTimeTracker,
     ObservedLatencyTracker,
     BlendedLatencyScorer,
+    GateJobRouter,
 )
+from hyperscale.distributed.swim.coordinates import CoordinateTracker
 from hyperscale.distributed.capacity import (
     DatacenterCapacityAggregator,
     SpilloverEvaluator,
