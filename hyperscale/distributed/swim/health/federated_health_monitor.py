@@ -224,6 +224,29 @@ class FederatedHealthMonitor:
         self._on_dc_latency = on_dc_latency
         self._on_dc_leader_change = on_dc_leader_change
 
+    def set_logger(
+        self,
+        logger: LoggerProtocol,
+        node_host: str,
+        node_port: int,
+    ) -> None:
+        self._logger = logger
+        self._node_host = node_host
+        self._node_port = node_port
+
+    async def _log_error(self, message: str) -> None:
+        if self._logger:
+            from hyperscale.logging.hyperscale_logging_models import ServerError
+
+            await self._logger.log(
+                ServerError(
+                    message=message,
+                    node_host=self._node_host,
+                    node_port=self._node_port,
+                    node_id=self.node_id,
+                )
+            )
+
     def add_datacenter(
         self,
         datacenter: str,
