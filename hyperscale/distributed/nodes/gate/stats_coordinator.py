@@ -41,6 +41,8 @@ class GateStatsCoordinator:
     FINAL_STATUS_MAX_RETRIES: int = 3
     FINAL_STATUS_BASE_DELAY_SECONDS: float = 0.1
     FINAL_STATUS_MAX_DELAY_SECONDS: float = 1.0
+    PERIODIC_PUSH_MAX_RETRIES: int = 2
+    PERIODIC_PUSH_BASE_DELAY_SECONDS: float = 0.05
 
     def __init__(
         self,
