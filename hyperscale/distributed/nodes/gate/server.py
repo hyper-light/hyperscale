@@ -1252,6 +1252,7 @@ class GateServer(HealthAwareServer):
         clock_time: int,
     ):
         """Handle job final result from manager."""
+        result: JobFinalResult | None = None
         try:
             result = JobFinalResult.load(data)
             success = result.status in ("COMPLETED", "completed")
@@ -1276,13 +1277,19 @@ class GateServer(HealthAwareServer):
             )
 
         if self._state_sync_handler:
-            return await self._state_sync_handler.handle_job_final_result(
+            response = await self._state_sync_handler.handle_job_final_result(
                 addr,
                 data,
                 self._complete_job,
                 self.handle_exception,
                 self._forward_job_final_result_to_peers,
             )
+            if response == b"ok" and result is not None:
+                await self._forward_job_final_result_to_peer_callbacks(
+                    result.job_id,
+                    data,
+                )
+            return response
         return b"error"
 
     @tcp.receive()

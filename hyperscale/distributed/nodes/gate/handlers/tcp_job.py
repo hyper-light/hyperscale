@@ -164,6 +164,7 @@ class GateJobHandler:
             JobStatus.COMPLETED.value,
             JobStatus.FAILED.value,
             JobStatus.CANCELLED.value,
+            JobStatus.TIMEOUT.value,
         )
 
     async def _release_job_lease(self, job_id: str) -> None:
