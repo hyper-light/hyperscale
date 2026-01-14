@@ -560,11 +560,13 @@ class GateServer(HealthAwareServer):
             probe_timeout=fed_config["probe_timeout"],
             suspicion_timeout=fed_config["suspicion_timeout"],
             max_consecutive_failures=fed_config["max_consecutive_failures"],
+            on_probe_error=self._on_federated_probe_error,
         )
 
         # Cross-DC correlation detector
         self._cross_dc_correlation = CrossDCCorrelationDetector(
-            config=env.get_cross_dc_correlation_config()
+            config=env.get_cross_dc_correlation_config(),
+            on_callback_error=self._on_cross_dc_callback_error,
         )
         for datacenter_id in self._datacenter_managers.keys():
             self._cross_dc_correlation.add_datacenter(datacenter_id)
@@ -3667,11 +3669,43 @@ class GateServer(HealthAwareServer):
         )
 
     def _on_dc_latency(self, datacenter: str, latency_ms: float) -> None:
-        """Handle DC latency update."""
         self._cross_dc_correlation.record_latency(
             datacenter_id=datacenter,
             latency_ms=latency_ms,
             probe_type="federated",
+        )
+
+    def _on_federated_probe_error(
+        self,
+        error_message: str,
+        affected_datacenters: list[str],
+    ) -> None:
+        self._task_runner.run(
+            self._udp_logger.log,
+            ServerWarning(
+                message=f"Federated health probe error: {error_message} "
+                f"(DCs: {affected_datacenters})",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            ),
+        )
+
+    def _on_cross_dc_callback_error(
+        self,
+        event_type: str,
+        affected_datacenters: list[str],
+        error: Exception,
+    ) -> None:
+        self._task_runner.run(
+            self._udp_logger.log,
+            ServerWarning(
+                message=f"Cross-DC correlation callback error ({event_type}): {error} "
+                f"(DCs: {affected_datacenters})",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            ),
         )
 
     def _on_dc_leader_change(
