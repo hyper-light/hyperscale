@@ -91,6 +91,25 @@ def mock_task_runner():
 
 
 @pytest.fixture
+def stats_buffer():
+    """Create a stats buffer for backpressure tests."""
+    return StatsBuffer(
+        StatsBufferConfig(
+            hot_max_entries=100,
+            throttle_threshold=0.7,
+            batch_threshold=0.85,
+            reject_threshold=0.95,
+        )
+    )
+
+
+@pytest.fixture
+def windowed_stats():
+    """Create a windowed stats collector."""
+    return WindowedStatsCollector()
+
+
+@pytest.fixture
 def mock_worker_registration():
     """Create a mock worker registration."""
     node = MagicMock()

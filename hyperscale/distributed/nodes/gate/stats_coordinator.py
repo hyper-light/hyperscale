@@ -17,6 +17,7 @@ from hyperscale.distributed.models import (
     GlobalJobStatus,
 )
 from hyperscale.distributed.jobs import WindowedStatsCollector
+from hyperscale.logging.hyperscale_logging_models import ServerError
 
 if TYPE_CHECKING:
     from hyperscale.distributed.nodes.gate.state import GateRuntimeState

@@ -3197,6 +3197,14 @@ class GateServer(HealthAwareServer):
     ) -> bool:
         """Sync state from peer gate."""
         if await self._peer_gate_circuit_breaker.is_circuit_open(peer_tcp_addr):
+            await self._udp_logger.log(
+                ServerDebug(
+                    message=f"Skip state sync to peer gate {peer_tcp_addr} due to open circuit",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
             return False
 
         circuit = await self._peer_gate_circuit_breaker.get_circuit(peer_tcp_addr)
