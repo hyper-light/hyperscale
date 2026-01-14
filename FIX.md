@@ -120,6 +120,46 @@ This document catalogs all identified issues across the distributed node impleme
 - Modified `_dispatch_workflow` in `WorkflowDispatcher` to prefer stored context
 - Only recomputes fresh context when no stored context is available
 
+### 2.7 Gate Quorum Size Fixed to Static Seed List
+
+| File | Lines | Issue |
+|------|-------|-------|
+| `distributed/nodes/gate/server.py` | 5244-5249 | Quorum size computed from `self._gate_peers` (static seed list), not current membership |
+
+**Why this matters:** Dynamic membership (new gates joining, dead peers removed) never affects quorum size, so leaders may step down incorrectly or fail to step down when they should.
+
+**Fix (actionable):**
+- Replace `known_gate_count = len(self._gate_peers) + 1` with a dynamic count derived from runtime state (e.g., `_modular_state.get_active_peer_count()` plus self, or a tracked known gate set).
+- Optionally support an explicit config override for fixed-size clusters, but default to dynamic membership.
+- Update quorum logging to include active/known counts from the same source used to compute quorum.
+
+### 2.8 Job Progress Ordering Uses Fence Token Instead of Per-Update Sequence
+
+| File | Lines | Issue |
+|------|-------|-------|
+| `distributed/nodes/gate/state.py` | 324-361 | `check_and_record_progress` uses `fence_token` for ordering and `timestamp` for dedup |
+| `distributed/models/distributed.py` | 1459-1471 | `JobProgress` has no monotonic sequence for per-update ordering |
+
+**Why this matters:** `fence_token` is for leadership safety, not progress sequencing. Out-of-order progress with the same fence token is accepted, which breaks scenario 7.2 and can regress job status.
+
+**Fix (actionable):**
+- Add a per-job per-datacenter `progress_sequence` field to `JobProgress`, incremented by the manager on each progress update.
+- Change `check_and_record_progress` to reject updates with `progress_sequence` lower than the last seen.
+- Use `timestamp`/`collected_at` only for dedup and stats alignment, not ordering.
+
+### 2.9 Job Completion Ignores Missing Target Datacenters
+
+| File | Lines | Issue |
+|------|-------|-------|
+| `distributed/nodes/gate/handlers/tcp_job.py` | 783-813 | Job completion computed using `len(job.datacenters)` instead of `target_dcs` |
+
+**Why this matters:** If a target DC never reports progress, the job can be marked complete as soon as all reporting DCs are terminal, violating multi-DC completion rules.
+
+**Fix (actionable):**
+- Use `target_dcs` for completion checks when available; only mark complete when all target DCs have terminal status.
+- If `target_dcs` missing, keep current behavior but log a warning and rely on timeout tracker for missing DCs.
+- Consider a “missing DC timeout” that forces partial completion after a configured grace period.
+
 ---
 
 ## 3. Medium Priority Issues
