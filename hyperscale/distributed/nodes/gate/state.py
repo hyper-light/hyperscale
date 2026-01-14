@@ -384,6 +384,7 @@ class GateRuntimeState:
     def mark_peer_dead(self, peer_addr: tuple[str, int], timestamp: float) -> None:
         self._dead_gate_peers.add(peer_addr)
         self._dead_gate_timestamps[peer_addr] = timestamp
+        self._gate_peer_unhealthy_since.pop(peer_addr, None)
 
     def cleanup_dead_peer(self, peer_addr: tuple[str, int]) -> None:
         self._dead_gate_peers.discard(peer_addr)
