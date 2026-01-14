@@ -227,6 +227,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         # Uses polling instead of cancel/reschedule to avoid timer starvation
         self._hierarchical_detector = HierarchicalFailureDetector(
             on_global_death=self._on_suspicion_expired,
+            on_error=self._on_hierarchical_detector_error,
             get_n_members=self._get_member_count,
             get_lhm_multiplier=self._get_lhm_multiplier,
         )
@@ -1954,6 +1955,24 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                 callback(node)
             except Exception as e:
                 self._task_runner.run(self.handle_exception, e, "on_node_dead_callback")
+
+    def _on_hierarchical_detector_error(
+        self,
+        error_message: str,
+        error: Exception,
+    ) -> None:
+        if self._task_runner and self._udp_logger:
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerWarning(
+                    message=f"Hierarchical failure detector error: {error_message} - {error}",
+                    node_host=self._host,
+                    node_port=self._port,
+                    node_id=self._node_id.numeric_id
+                    if hasattr(self, "_node_id")
+                    else 0,
+                ),
+            )
 
     def queue_gossip_update(
         self,
