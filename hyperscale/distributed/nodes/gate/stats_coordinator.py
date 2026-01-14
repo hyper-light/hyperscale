@@ -219,17 +219,12 @@ class GateStatsCoordinator:
         return False
 
     async def batch_stats_update(self) -> None:
-        """
-        Process a batch of Tier 2 (Periodic) updates per AD-15.
-
-        Aggregates pending progress updates and pushes JobBatchPush messages
-        to clients that have registered callbacks. This is more efficient than
-        sending each update individually.
-        """
         running_jobs = self._get_all_running_jobs()
         jobs_with_callbacks: list[tuple[str, GlobalJobStatus, tuple[str, int]]] = []
 
         for job_id, job in running_jobs:
+            if not self._has_job(job_id):
+                continue
             if callback := self._get_job_callback(job_id):
                 jobs_with_callbacks.append((job_id, job, callback))
 
