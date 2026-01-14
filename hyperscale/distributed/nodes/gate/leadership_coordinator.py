@@ -133,7 +133,6 @@ class GateLeadershipCoordinator:
         peer_addr: tuple[str, int],
         announcement: JobLeadershipAnnouncement,
     ) -> None:
-        """Send leadership announcement to a peer gate."""
         try:
             await self._send_tcp(
                 peer_addr,
@@ -141,8 +140,16 @@ class GateLeadershipCoordinator:
                 announcement.dump(),
                 timeout=5.0,
             )
-        except Exception:
-            pass  # Best effort
+        except Exception as error:
+            self._task_runner.run(
+                self._logger.log,
+                ServerDebug(
+                    message=f"Failed to send leadership announcement to {peer_addr}: {error}",
+                    node_host=self._get_host(),
+                    node_port=self._get_tcp_port(),
+                    node_id=self._get_node_id(),
+                ),
+            )
 
     async def _send_leadership_transfer_to_client(
         self,
