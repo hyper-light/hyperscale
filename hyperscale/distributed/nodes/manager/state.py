@@ -909,10 +909,6 @@ class ManagerState:
     def iter_job_submissions(self) -> list[tuple[str, JobSubmission]]:
         return list(self._job_submissions.items())
 
-    # =========================================================================
-    # Job Reporter Task Accessors (2 direct accesses)
-    # =========================================================================
-
     def set_job_reporter_task(
         self, job_id: str, reporter_type: str, task: asyncio.Task
     ) -> None:
