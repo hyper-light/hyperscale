@@ -64,9 +64,12 @@ class WorkflowProgressHandler:
                 self._handle_backpressure(ack)
 
         except Exception as error:
-            if data != b"ok" and hasattr(self._server, "_task_runner"):
-                from hyperscale.logging.hyperscale_logging_models import ServerDebug
-
+            if (
+                data != b"ok"
+                and hasattr(self._server, "_task_runner")
+                and self._server._task_runner
+                and self._server._udp_logger
+            ):
                 self._server._task_runner.run(
                     self._server._udp_logger.log,
                     ServerDebug(
