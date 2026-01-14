@@ -55,6 +55,7 @@ from hyperscale.distributed.models import (
     GateState,
     GateHeartbeat,
     GateRegistrationRequest,
+    GlobalJobStatus,
     ManagerDiscoveryBroadcast,
     ManagerHeartbeat,
     JobSubmission,
