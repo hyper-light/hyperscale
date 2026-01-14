@@ -2594,16 +2594,6 @@ class GateServer(HealthAwareServer):
                     )
                 )
 
-            except Exception as discovery_error:
-                await self._udp_logger.log(
-                    ServerWarning(
-                        message=f"Failed to send manager discovery broadcast: {discovery_error}",
-                        node_host=self._host,
-                        node_port=self._tcp_port,
-                        node_id=self._node_id.short,
-                    )
-                )
-
     def _get_state_snapshot(self) -> GateStateSnapshot:
         job_leaders, job_leader_addrs, job_fencing_tokens = (
             self._job_leadership_tracker.to_snapshot()

@@ -38,11 +38,9 @@ class GateStatsCoordinator:
     - Push windowed stats to clients
     """
 
-    FINAL_STATUS_MAX_RETRIES: int = 3
-    FINAL_STATUS_BASE_DELAY_SECONDS: float = 0.1
-    FINAL_STATUS_MAX_DELAY_SECONDS: float = 1.0
-    PERIODIC_PUSH_MAX_RETRIES: int = 2
-    PERIODIC_PUSH_BASE_DELAY_SECONDS: float = 0.05
+    CALLBACK_PUSH_MAX_RETRIES: int = 3
+    CALLBACK_PUSH_BASE_DELAY_SECONDS: float = 0.5
+    CALLBACK_PUSH_MAX_DELAY_SECONDS: float = 2.0
 
     def __init__(
         self,
@@ -147,13 +145,12 @@ class GateStatsCoordinator:
 
         push_data = push.dump()
 
-        if is_final:
-            await self._send_final_status_with_retry(job_id, callback, push_data)
-        else:
-            try:
-                await self._send_tcp(callback, "job_status_push", push_data)
-            except Exception:
-                pass
+        await self._send_status_push_with_retry(
+            job_id,
+            callback,
+            push_data,
+            allow_peer_forwarding=True,
+        )
 
     async def _send_final_status_with_retry(
         self,
