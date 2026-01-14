@@ -316,7 +316,7 @@ class ManagerState:
         for key in progress_keys_to_remove:
             self._worker_job_last_progress.pop(key, None)
 
-    def get_quorum_metrics(self) -> dict:
+    def get_quorum_metrics(self) -> dict[str, int]:
         """Get quorum-related metrics."""
         return {
             "active_peer_count": len(self._active_manager_peers),
@@ -325,7 +325,7 @@ class ManagerState:
             "pending_provision_count": len(self._pending_provisions),
         }
 
-    def get_worker_metrics(self) -> dict:
+    def get_worker_metrics(self) -> dict[str, int]:
         """Get worker-related metrics."""
         return {
             "worker_count": len(self._workers),
@@ -333,7 +333,7 @@ class ManagerState:
             "worker_circuits_count": len(self._worker_circuits),
         }
 
-    def get_gate_metrics(self) -> dict:
+    def get_gate_metrics(self) -> dict[str, Any]:
         """Get gate-related metrics."""
         return {
             "known_gate_count": len(self._known_gates),
@@ -342,7 +342,7 @@ class ManagerState:
             "has_gate_leader": self._current_gate_leader_id is not None,
         }
 
-    def get_job_metrics(self) -> dict:
+    def get_job_metrics(self) -> dict[str, int]:
         """Get job-related metrics."""
         return {
             "job_leader_count": len(self._job_leaders),

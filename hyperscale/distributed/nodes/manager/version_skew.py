@@ -364,7 +364,7 @@ class ManagerVersionSkewHandler:
 
         return common
 
-    def get_version_metrics(self) -> dict:
+    def get_version_metrics(self) -> dict[str, Any]:
         """Get version skew metrics."""
         worker_versions: dict[str, int] = {}
         gate_versions: dict[str, int] = {}

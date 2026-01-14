@@ -261,7 +261,7 @@ class ManagerStatsCoordinator:
             ),
         )
 
-    def get_stats_metrics(self) -> dict:
+    def get_stats_metrics(self) -> dict[str, Any]:
         """Get stats-related metrics."""
         # Capture count before get_dispatch_throughput() which may reset it
         throughput_count = self._state._dispatch_throughput_count
