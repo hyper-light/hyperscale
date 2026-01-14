@@ -535,6 +535,8 @@ class GateServer(HealthAwareServer):
                 get_health_throughput=self._get_forward_throughput,
                 get_health_expected_throughput=self._get_expected_forward_throughput,
                 get_health_overload_state=lambda: self._gate_health_state,
+                get_coordinate=lambda: self._coordinate_tracker.get_coordinate(),
+                on_peer_coordinate=self._on_peer_coordinate_update,
             )
         )
 
