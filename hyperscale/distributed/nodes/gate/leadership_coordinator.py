@@ -82,6 +82,7 @@ class GateLeadershipCoordinator:
         self,
         job_id: str,
         target_dc_count: int,
+        callback_addr: tuple[str, int] | None = None,
     ) -> None:
         """
         Broadcast job leadership to peer gates.
@@ -89,6 +90,7 @@ class GateLeadershipCoordinator:
         Args:
             job_id: Job identifier
             target_dc_count: Number of target datacenters
+            callback_addr: Client callback address for leadership transfer
         """
         node_id = self._get_node_id()
         node_addr = self._get_node_addr()
@@ -110,6 +112,15 @@ class GateLeadershipCoordinator:
                 peer_addr,
                 announcement,
             )
+
+        if callback_addr:
+            transfer = GateJobLeaderTransfer(
+                job_id=job_id,
+                new_gate_id=node_id.full,
+                new_gate_addr=node_addr,
+                fence_token=fence_token,
+            )
+            await self._send_leadership_transfer_to_client(callback_addr, transfer)
 
     async def _send_leadership_announcement(
         self,

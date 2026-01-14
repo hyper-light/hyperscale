@@ -135,6 +135,7 @@ class GateOrphanJobCoordinator:
         self._get_active_peers = get_active_peers
         self._orphan_check_interval_seconds = orphan_check_interval_seconds
         self._orphan_grace_period_seconds = orphan_grace_period_seconds
+        self._orphan_timeout_seconds = orphan_timeout_seconds
         self._takeover_jitter_min_seconds = takeover_jitter_min_seconds
         self._takeover_jitter_max_seconds = takeover_jitter_max_seconds
         self._running = False
