@@ -1,9 +1,9 @@
-# FIX.md (Exhaustive Rescan)
+# FIX.md (In-Depth Rescan)
 
 Last updated: 2026-01-14
-Scope: Full rescan of `SCENARIOS.md` vs current implementation.
+Scope: Full in-depth rescan of `SCENARIOS.md` vs current implementation, including verification of previously reported fixes.
 
-This document contains **current** findings only. Items previously fixed or moved have been removed.
+This document contains **current** findings only. Previously fixed items are listed in Notes.
 
 ---
 
@@ -11,94 +11,88 @@ This document contains **current** findings only. Items previously fixed or move
 
 | Severity | Count | Status |
 |----------|-------|--------|
-| **High Priority** | 0 | 🟢 All Fixed |
-| **Medium Priority** | 0 | 🟢 All Fixed |
-| **Low Priority** | 0 | 🟢 None |
+| **High Priority** | 1 | 🔴 Needs Fix |
+| **Medium Priority** | 3 | 🟡 Should Fix |
+| **Low Priority** | 1 | 🟢 Can Wait |
 
 ---
 
-## Completed Fixes
+## 1. High Priority Issues
 
-### 1. High Priority (All Fixed)
+### 1.1 Job Final Result Forwarding Swallows Errors
 
-#### 1.1 Federated Health Probe Loop - FIXED
-- **File**: `distributed/swim/health/federated_health_monitor.py`
-- **Fix**: Added `on_probe_error` callback for probe loop and individual probe exceptions
-- **Changes**: Exception handlers invoke callback with error message and affected datacenters
+| File | Lines | Issue |
+|------|-------|-------|
+| `distributed/nodes/gate/server.py` | 2111-2121 | Forwarded final result errors return `b"forwarded"` with no logging |
 
-#### 1.2 Worker Progress Flush Errors - FIXED
-- **File**: `distributed/nodes/worker/execution.py`
-- **Fix**: Added logging for progress flush failures and loop errors
-- **Changes**: Uses ServerDebug for per-workflow failures, ServerWarning for loop errors
+**Why this matters:** Final job results can be silently dropped when a peer gate fails to forward results to the client callback, violating result delivery scenarios (SCENARIOS 9/10).
 
-#### 1.3 Worker Progress ACK Parsing - FIXED
-- **File**: `distributed/nodes/worker/progress.py`
-- **Fix**: Added logging for ACK parse failures when not legacy `b"ok"` payload
-- **Changes**: Added `task_runner_run` parameter for sync method logging
-
-#### 1.4 Client Push Handlers - FIXED
-- **Files**:
-  - `distributed/nodes/client/handlers/tcp_job_status_push.py`
-  - `distributed/nodes/client/handlers/tcp_windowed_stats.py`
-  - `distributed/nodes/client/handlers/tcp_workflow_result.py`
-- **Fix**: Added logging before returning `b"error"` on exception
-- **Changes**: All handlers now log exception details with ServerWarning
-
-#### 1.5 Failure Detection Callbacks - FIXED
-- **File**: `distributed/swim/detection/hierarchical_failure_detector.py`
-- **Fix**: Added `on_error` callback for callback failures and reconciliation errors
-- **Changes**: 
-  - `_on_global_death` callback errors now reported
-  - `_on_job_death` callback errors now reported
-  - Reconciliation loop errors now reported with cycle count
-
-### 2. Medium Priority (All Fixed)
-
-#### 2.1 Job Suspicion Expiration - FIXED
-- **File**: `distributed/swim/detection/job_suspicion_manager.py`
-- **Fix**: Added `on_error` callback for `on_expired` callback failures
-- **Changes**: Reports job_id and node on callback failure
-
-#### 2.2 Worker TCP Progress Handler - FIXED
-- **File**: `distributed/nodes/worker/handlers/tcp_progress.py`
-- **Fix**: Added logging for non-legacy ACK parse failures
-- **Changes**: Uses task_runner to log ServerDebug via server reference
-
-#### 2.3 Lease Expiry Callback - FIXED
-- **File**: `distributed/leases/job_lease.py`
-- **Fix**: Added `on_error` callback for lease expiry and cleanup loop errors
-- **Changes**: Reports job_id on callback failures, loop context on cleanup errors
-
-#### 2.4 Cross-DC Correlation Callbacks - FIXED
-- **File**: `distributed/datacenters/cross_dc_correlation.py`
-- **Fix**: Added `_on_callback_error` for partition healed/detected callback failures
-- **Changes**: Reports event type, affected datacenter list, and exception
+**Fix (actionable):**
+- Log the exception before returning `b"forwarded"` with job_id and callback address.
+- Optionally enqueue retry via `_deliver_client_update` rather than returning immediately.
 
 ---
 
-## Callback Wiring (Post-Fix Integration)
+## 2. Medium Priority Issues
 
-The following error callbacks have been wired to logging infrastructure in the calling code:
+### 2.1 Worker Discovery Maintenance Loop Swallows Errors
 
-### Gate Server (`distributed/nodes/gate/server.py`)
-- `FederatedHealthMonitor.on_probe_error` → `_on_federated_probe_error()` logs via task_runner
-- `CrossDCCorrelationDetector._on_callback_error` → `_on_cross_dc_callback_error()` logs via task_runner
+| File | Lines | Issue |
+|------|-------|-------|
+| `distributed/nodes/worker/discovery.py` | 54-70 | Discovery maintenance loop ignores exceptions |
 
-### Manager Server (`distributed/nodes/manager/server.py`)
-- `FederatedHealthMonitor.on_probe_error` → `_on_federated_probe_error()` logs via task_runner
+**Why this matters:** DNS discovery, failure decay, and cache cleanup can silently stop, leading to stale membership and missed recovery (SCENARIOS 2.2/24.1).
 
-### HealthAwareServer (`distributed/swim/health_aware_server.py`)
-- `HierarchicalFailureDetector.on_error` → `_on_hierarchical_detector_error()` logs via task_runner
-- Both constructor and `configure_hierarchical_detector()` method now wire the callback
+**Fix (actionable):**
+- Log exceptions with loop context (dns_names, failure_decay_interval).
+- Continue loop after logging; consider backoff on repeated failures.
 
-### HierarchicalFailureDetector (`distributed/swim/detection/hierarchical_failure_detector.py`)
-- `JobSuspicionManager.on_error` now receives the parent's `on_error` callback for propagation
+### 2.2 Worker Cancellation Poll Loop Swallows Errors
+
+| File | Lines | Issue |
+|------|-------|-------|
+| `distributed/nodes/worker/cancellation.py` | 227-241 | Per-workflow poll exceptions are ignored |
+
+**Why this matters:** Cancellation fallback can silently fail, leaving workflows running after manager cancellation (SCENARIOS 13.4/20.3).
+
+**Fix (actionable):**
+- Log exceptions with workflow_id and manager_addr.
+- Preserve current behavior but surface errors for diagnosis.
+
+### 2.3 Client Job Status Polling Swallows Errors
+
+| File | Lines | Issue |
+|------|-------|-------|
+| `distributed/nodes/client/tracking.py` | 187-210 | Status polling errors silently ignored |
+
+**Why this matters:** Client-side status can stall without visibility, hiding remote failures or protocol mismatches (SCENARIOS 8/9).
+
+**Fix (actionable):**
+- Log poll exceptions with job_id and gate address.
+- Optionally add retry backoff and increment a poll failure counter.
 
 ---
 
-## Notes
+## 3. Low Priority Issues
 
-- Previously reported issues around federated ACK timeouts, progress ordering, target DC completion, quorum sizing, and manager leadership loss handling are confirmed resolved in the current codebase.
-- All exception swallowing issues have been addressed with proper logging or callbacks.
-- Classes without direct logger access now expose error callbacks that callers can wire to their logging infrastructure.
-- Error callbacks are wired in the composition roots (Gate, Manager, HealthAwareServer) to ensure all errors are logged.
+### 3.1 Cancellation Response Parse Fallback Lacks Diagnostics
+
+| File | Lines | Issue |
+|------|-------|-------|
+| `distributed/nodes/gate/server.py` | 2516-2522 | `JobCancelResponse` parse failure is silently ignored before fallback |
+
+**Why this matters:** When cancellation responses are malformed, we lose the error context while falling back to `CancelAck` parsing.
+
+**Fix (actionable):**
+- Add debug logging for the parse failure before falling back to `CancelAck`.
+
+---
+
+## Notes (Verified Fixes)
+
+The following previously reported issues are confirmed fixed in current code:
+- Federated health probe loop now reports errors via `on_probe_error` and checks ack timeouts.
+- Worker progress flush and ACK parsing now log failures.
+- Client push handlers now log exceptions before returning `b"error"`.
+- Hierarchical failure detector and job suspicion manager now route errors via `on_error` callbacks.
+- Lease expiry and cross-DC correlation callbacks now surface errors via on-error handlers.
