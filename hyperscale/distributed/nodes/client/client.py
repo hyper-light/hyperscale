@@ -36,6 +36,7 @@ from hyperscale.distributed.models import (
     WorkflowStatusInfo,
     DatacenterListResponse,
     JobCancelResponse,
+    GlobalJobStatus,
 )
 from hyperscale.distributed.env.env import Env
 from hyperscale.distributed.reliability.rate_limiting import (
@@ -424,6 +425,34 @@ class HyperscaleClient(MercurySyncBaseServer):
     ) -> dict[tuple[str, int], DatacenterListResponse | Exception]:
         """Query all gates for datacenters (delegates to ClientDiscovery)."""
         return await self._discovery.get_datacenters_from_all_gates(timeout=timeout)
+
+    # =========================================================================
+    # Internal Helper Methods
+    # =========================================================================
+
+    async def _poll_gate_for_job_status(
+        self,
+        job_id: str,
+    ) -> GlobalJobStatus | None:
+        gate_addr = self._targets.get_gate_for_job(job_id)
+        if not gate_addr:
+            gate_addr = self._targets.get_next_gate()
+        if not gate_addr:
+            return None
+
+        try:
+            response_data, _ = await self.send_tcp(
+                gate_addr,
+                "job_status",
+                job_id.encode(),
+                timeout=5.0,
+            )
+            if response_data and response_data != b"":
+                return GlobalJobStatus.load(response_data)
+        except Exception:
+            pass
+
+        return None
 
     # =========================================================================
     # TCP Handlers - Delegate to Handler Classes
