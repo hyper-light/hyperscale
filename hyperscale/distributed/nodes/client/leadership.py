@@ -42,7 +42,133 @@ class ClientLeadershipTracker:
         self._state = state
         self._logger = logger
         self._leader_cache_ttl_seconds = leader_cache_ttl_seconds
-        self._query_leader_callback: Callable[[str], Awaitable[tuple[tuple[str, int], int] | None]] | None = None
+        self._query_leader_callback: (
+            Callable[[str], Awaitable[tuple[tuple[str, int], int] | None]] | None
+        ) = None
+
+    def set_query_leader_callback(
+        self,
+        callback: Callable[[str], Awaitable[tuple[tuple[str, int], int] | None]],
+    ) -> None:
+        """
+        Set callback for querying gate about current job leader.
+
+        The callback takes job_id and returns (leader_addr, fence_token) or None.
+
+        Args:
+            callback: Async function to query gate for leader info
+        """
+        self._query_leader_callback = callback
+
+    def is_leader_cache_valid(self, job_id: str) -> bool:
+        """
+        Check if cached leader info is still valid based on TTL.
+
+        Args:
+            job_id: Job identifier
+
+        Returns:
+            True if cache is valid and not expired
+        """
+        leader_info = self._state._gate_job_leaders.get(job_id)
+        if not leader_info:
+            return False
+
+        elapsed = time.monotonic() - leader_info.last_updated
+        return elapsed < self._leader_cache_ttl_seconds
+
+    async def handle_not_leader_response(
+        self,
+        job_id: str,
+        suggested_leader_addr: tuple[str, int] | None = None,
+        suggested_fence_token: int | None = None,
+    ) -> tuple[str, int] | None:
+        """
+        Handle a 'not leader' response from a gate.
+
+        If a suggested leader is provided, update the cache.
+        Otherwise, query the gate for the current leader.
+
+        Args:
+            job_id: Job identifier
+            suggested_leader_addr: Optional suggested leader address
+            suggested_fence_token: Optional fence token for suggested leader
+
+        Returns:
+            New leader address or None if unable to determine
+        """
+        if suggested_leader_addr and suggested_fence_token is not None:
+            is_valid, _ = self.validate_gate_fence_token(job_id, suggested_fence_token)
+            if is_valid:
+                self.update_gate_leader(
+                    job_id, suggested_leader_addr, suggested_fence_token
+                )
+                return suggested_leader_addr
+
+        return await self.query_gate_for_leader(job_id)
+
+    async def query_gate_for_leader(self, job_id: str) -> tuple[str, int] | None:
+        """
+        Query the gate for the current leader of a job.
+
+        Uses the registered callback to query the gate. If successful,
+        updates the local leader cache.
+
+        Args:
+            job_id: Job identifier
+
+        Returns:
+            Leader address or None if query failed
+        """
+        if not self._query_leader_callback:
+            await self._logger.log(
+                ServerWarning(
+                    message=f"Cannot query leader for job {job_id[:8]}...: no callback registered",
+                    node_host="client",
+                    node_port=0,
+                    node_id="client",
+                )
+            )
+            return None
+
+        try:
+            result = await self._query_leader_callback(job_id)
+            if result:
+                leader_addr, fence_token = result
+                is_valid, _ = self.validate_gate_fence_token(job_id, fence_token)
+                if is_valid:
+                    self.update_gate_leader(job_id, leader_addr, fence_token)
+                    return leader_addr
+                return leader_addr
+            return None
+        except Exception as error:
+            await self._logger.log(
+                ServerWarning(
+                    message=f"Failed to query leader for job {job_id[:8]}...: {error}",
+                    node_host="client",
+                    node_port=0,
+                    node_id="client",
+                )
+            )
+            return None
+
+    async def get_or_query_leader(self, job_id: str) -> tuple[str, int] | None:
+        """
+        Get cached leader if valid, otherwise query for current leader.
+
+        This is the main entry point for getting a leader address,
+        providing automatic fallback when cache is stale.
+
+        Args:
+            job_id: Job identifier
+
+        Returns:
+            Leader address or None if unable to determine
+        """
+        if self.is_leader_cache_valid(job_id):
+            return self.get_current_gate_leader(job_id)
+
+        return await self.query_gate_for_leader(job_id)
 
     def validate_gate_fence_token(
         self, job_id: str, new_fence_token: int
