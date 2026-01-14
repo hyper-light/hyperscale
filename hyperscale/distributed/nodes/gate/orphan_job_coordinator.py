@@ -320,16 +320,69 @@ class GateOrphanJobCoordinator:
             self._state.clear_orphaned_job(job_id)
             return
 
+        time_orphaned = time.monotonic() - orphaned_at
         new_owner = await self._job_hash_ring.get_node(job_id)
         if not new_owner:
-            self._task_runner.run(
-                self._logger.log,
+            if time_orphaned >= self._orphan_timeout_seconds:
+                job.status = JobStatus.FAILED.value
+                if getattr(job, "timestamp", 0) > 0:
+                    job.elapsed_seconds = time.monotonic() - job.timestamp
+                self._job_manager.set_job(job_id, job)
+                self._state.clear_orphaned_job(job_id)
+
+                await self._logger.log(
+                    ServerWarning(
+                        message=(
+                            f"Orphaned job {job_id[:8]}... failed after {time_orphaned:.1f}s without new owner"
+                        ),
+                        node_host=self._get_node_addr()[0],
+                        node_port=self._get_node_addr()[1],
+                        node_id=self._get_node_id().short,
+                    )
+                )
+
+                callback = self._job_manager.get_callback(job_id)
+                if callback:
+                    push = JobStatusPush(
+                        job_id=job_id,
+                        status=job.status,
+                        message=f"Job {job_id} failed (orphan timeout)",
+                        total_completed=getattr(job, "total_completed", 0),
+                        total_failed=getattr(job, "total_failed", 0),
+                        overall_rate=getattr(job, "overall_rate", 0.0),
+                        elapsed_seconds=getattr(job, "elapsed_seconds", 0.0),
+                        is_final=True,
+                    )
+                    try:
+                        await self._send_tcp(
+                            callback,
+                            "job_status_push",
+                            push.dump(),
+                            5.0,
+                        )
+                    except Exception as error:
+                        await self._logger.log(
+                            ServerWarning(
+                                message=(
+                                    f"Failed to send orphan timeout status for job {job_id[:8]}...: {error}"
+                                ),
+                                node_host=self._get_node_addr()[0],
+                                node_port=self._get_node_addr()[1],
+                                node_id=self._get_node_id().short,
+                            )
+                        )
+                return
+
+            await self._logger.log(
                 ServerWarning(
-                    message=f"No owner found in hash ring for orphaned job {job_id[:8]}...",
+                    message=(
+                        f"No owner found in hash ring for orphaned job {job_id[:8]}... "
+                        f"({time_orphaned:.1f}s orphaned)"
+                    ),
                     node_host=self._get_node_addr()[0],
                     node_port=self._get_node_addr()[1],
                     node_id=self._get_node_id().short,
-                ),
+                )
             )
             return
 
