@@ -232,6 +232,23 @@ class ManagerStatsCoordinator:
             worker_id: Worker identifier
             progress: Workflow progress update
         """
+        if not self._state.has_job_context(progress.job_id):
+            cleaned_windows = await self._windowed_stats.cleanup_job_windows(
+                progress.job_id
+            )
+            await self._logger.log(
+                ServerWarning(
+                    message=(
+                        "Skipping windowed stats for missing job "
+                        f"{progress.job_id[:8]}... (cleaned {cleaned_windows} windows)"
+                    ),
+                    node_host=self._config.host,
+                    node_port=self._config.tcp_port,
+                    node_id=self._node_id,
+                )
+            )
+            return
+
         self._stats_buffer.record(progress.rate_per_second or 0.0)
         await self._windowed_stats.record(worker_id, progress)
         await self._logger.log(
