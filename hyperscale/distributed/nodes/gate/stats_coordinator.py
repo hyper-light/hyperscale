@@ -343,32 +343,36 @@ class GateStatsCoordinator:
 
     async def batch_stats_update(self) -> None:
         running_jobs = self._get_all_running_jobs()
-        jobs_with_callbacks: list[tuple[str, GlobalJobStatus, tuple[str, int]]] = []
+        jobs_with_callbacks: list[
+            tuple[str, GlobalJobStatus, list[tuple[str, int]]]
+        ] = []
 
         for job_id, job in running_jobs:
             if not self._has_job(job_id):
                 continue
-            if callback := self._get_progress_callback(job_id):
-                jobs_with_callbacks.append((job_id, job, callback))
+            callbacks = self._get_progress_callbacks(job_id)
+            if callbacks:
+                jobs_with_callbacks.append((job_id, job, callbacks))
 
         if not jobs_with_callbacks:
             return
 
-        for job_id, job, callback in jobs_with_callbacks:
-            try:
-                await self._send_batch_push(job_id, job, callback)
-            except Exception as error:
-                await self._logger.log(
-                    ServerError(
-                        message=(
-                            "Failed to send batch stats update for job "
-                            f"{job_id}: {error}"
-                        ),
-                        node_host=self._node_host,
-                        node_port=self._node_port,
-                        node_id=self._node_id,
+        for job_id, job, callbacks in jobs_with_callbacks:
+            for callback in callbacks:
+                try:
+                    await self._send_batch_push(job_id, job, callback)
+                except Exception as error:
+                    await self._logger.log(
+                        ServerError(
+                            message=(
+                                "Failed to send batch stats update for job "
+                                f"{job_id}: {error}"
+                            ),
+                            node_host=self._node_host,
+                            node_port=self._node_port,
+                            node_id=self._node_id,
+                        )
                     )
-                )
 
     async def push_windowed_stats_for_job(self, job_id: str) -> None:
         await self._push_windowed_stats(job_id)

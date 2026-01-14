@@ -2963,6 +2963,30 @@ class ManagerServer(HealthAwareServer):
                 default_cluster=self._config.cluster_id,
                 default_environment=self._config.environment_id,
             )
+            if claims.cluster_id != self._config.cluster_id:
+                reason = f"Cluster mismatch: {claims.cluster_id} != {self._config.cluster_id}"
+                await self._udp_logger.log(
+                    ServerWarning(
+                        message=f"{peer_label} {peer_id} rejected: {reason}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+                return f"Certificate validation failed: {reason}"
+
+            if claims.environment_id != self._config.environment_id:
+                reason = f"Environment mismatch: {claims.environment_id} != {self._config.environment_id}"
+                await self._udp_logger.log(
+                    ServerWarning(
+                        message=f"{peer_label} {peer_id} rejected: {reason}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+                return f"Certificate validation failed: {reason}"
+
             validation_result = self._role_validator.validate_claims(claims)
             if not validation_result.allowed:
                 await self._udp_logger.log(
