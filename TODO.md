@@ -1,989 +1,716 @@
-# AD-38 to AD-45: Critical Fixes and Integration TODO
+# Hyperscale Distributed Bug Fixes TODO
 
-Generated: 2026-01-12
-Audit Reference: `docs/architecture/AUDIT_DISTRIBUTED_2026_01_11.md`
-
----
-
-## Priority Legend
-
-- **P0 (CRITICAL)**: Must fix immediately - causes data loss, crashes, memory leaks, or security issues
-- **P1 (HIGH)**: Should fix soon - causes significant degradation or incorrect behavior
-- **P2 (MEDIUM)**: Should fix - causes minor issues or technical debt
-- **P3 (LOW)**: Nice to have - code quality improvements
+**Generated**: 2026-01-14  
+**Progress**: 30/64 completed (47%)
 
 ---
 
-## Executive Summary
+## Overview
 
-| Category | Count | Highest Priority |
-|----------|-------|------------------|
-| Memory Leaks | 4 | P0 |
-| Race Conditions | 8 | P0 |
-| Silent Failures | 149 | P0 |
-| Orphaned Tasks | 59 | P0 |
-| Missing AD Integration | 6 ADs | P1 |
+Systematic bug fixes for the Hyperscale distributed performance testing framework across three node types: **Gate**, **Manager**, and **Worker**.
 
----
-
-# Part 1: Critical Fixes (P0)
-
-## Section 1.1: Memory Leaks
-
-### 1.1.1 [P0] Gate Server Missing Job Cleanup
-
-**File**: `hyperscale/distributed/nodes/gate/server.py`
-**Lines**: 2768-2777
-
-**Problem**: The `_job_cleanup_loop` removes completed jobs but fails to clean up two dictionaries, causing unbounded memory growth.
-
-**Current Code**:
-```python
-for job_id in jobs_to_remove:
-    self._job_manager.delete_job(job_id)
-    self._workflow_dc_results.pop(job_id, None)
-    self._job_workflow_ids.pop(job_id, None)
-    self._progress_callbacks.pop(job_id, None)
-    self._job_leadership_tracker.release_leadership(job_id)
-    self._job_dc_managers.pop(job_id, None)
-    # MISSING CLEANUP
-```
-
-**Fix**: Add cleanup for `_job_reporter_tasks` and `_job_stats_crdt` after line 2774:
-```python
-for job_id in jobs_to_remove:
-    self._job_manager.delete_job(job_id)
-    self._workflow_dc_results.pop(job_id, None)
-    self._job_workflow_ids.pop(job_id, None)
-    self._progress_callbacks.pop(job_id, None)
-    self._job_leadership_tracker.release_leadership(job_id)
-    self._job_dc_managers.pop(job_id, None)
-    
-    # Cancel and remove reporter tasks for this job
-    reporter_tasks = self._job_reporter_tasks.pop(job_id, None)
-    if reporter_tasks:
-        for task in reporter_tasks.values():
-            if task and not task.done():
-                task.cancel()
-    
-    # Remove CRDT stats for this job
-    self._job_stats_crdt.pop(job_id, None)
-```
-
-**References**:
-- `_job_reporter_tasks` initialized at line 418
-- `_job_stats_crdt` initialized at line 421
-- Manager server properly cleans up in `_cleanup_reporter_tasks()` at line 2030
+### Constraints
+- Do NOT modify `RemoteGraphManager`, `LocalServerPool`, or any classes in `hyperscale/core/`
+- Only modify files in `hyperscale/distributed/`
+- Use `asyncio.Lock`, NEVER threading locks
+- Follow modular delegation architecture - changes go in coordinator/handler classes, NOT directly in server.py
+- Use TaskRunner for background tasks, never raw asyncio tasks
 
 ---
 
-### 1.1.2 [P2] Unbounded Latency Sample Lists
+## Completed Tasks (30)
 
-**File**: `hyperscale/distributed/nodes/manager/state.py`
-**Lines**: 135-137
-
-**Problem**: Latency sample lists grow indefinitely without bounds.
-
-**Current Code**:
-```python
-self._gate_latency_samples: list[tuple[float, float]] = []
-self._peer_manager_latency_samples: dict[str, list[tuple[float, float]]] = {}
-self._worker_latency_samples: dict[str, list[tuple[float, float]]] = {}
-```
-
-**Fix**: Use bounded deques with max size:
-```python
-from collections import deque
-
-MAX_LATENCY_SAMPLES = 1000
-
-self._gate_latency_samples: deque[tuple[float, float]] = deque(maxlen=MAX_LATENCY_SAMPLES)
-self._peer_manager_latency_samples: dict[str, deque[tuple[float, float]]] = {}
-self._worker_latency_samples: dict[str, deque[tuple[float, float]]] = {}
-
-# Update getter methods to create bounded deques:
-def _get_peer_latency_samples(self, peer_id: str) -> deque[tuple[float, float]]:
-    if peer_id not in self._peer_manager_latency_samples:
-        self._peer_manager_latency_samples[peer_id] = deque(maxlen=MAX_LATENCY_SAMPLES)
-    return self._peer_manager_latency_samples[peer_id]
-```
-
----
-
-### 1.1.3 [P2] Lock Dictionaries Grow Unboundedly
-
-**Files**:
-- `hyperscale/distributed/nodes/manager/state.py:49, 61, 108`
-- `hyperscale/distributed/nodes/gate/state.py:44`
-- `hyperscale/distributed/nodes/worker/state.py:65, 162, 277`
-- `hyperscale/distributed/nodes/gate/models/gate_peer_state.py:80`
-
-**Problem**: Lock dictionaries are created on-demand but never removed when peers/jobs disconnect.
-
-**Fix**: Add cleanup methods and call them when peers/jobs are removed:
-```python
-def remove_peer_lock(self, peer_addr: tuple[str, int]) -> None:
-    """Remove lock when peer disconnects."""
-    self._peer_state_locks.pop(peer_addr, None)
-
-def remove_job_lock(self, job_id: str) -> None:
-    """Remove lock when job completes."""
-    self._job_locks.pop(job_id, None)
-```
-
-Call these in the appropriate cleanup paths (peer disconnect handlers, job cleanup loops).
+- [x] **Task 1**: Fix Gate parameter mismatch (handle_exception vs active_peer_count)
+- [x] **Task 2**: Fix Gate idempotency race condition - check_or_insert not atomic, TOCTOU vulnerability
+- [x] **Task 3**: Fix Gate _job_submissions memory leak
+- [x] **Task 4**: Fix Gate WindowedStatsCollector memory leak
+- [x] **Task 5**: Fix Gate WorkflowResultPush aggregation race - _cleanup_single_job has no lock
+- [x] **Task 6**: Fix Worker final results - pending result retry loop NEVER INVOKED
+- [x] **Task 7**: Fix Worker core leak on dispatch failure
+- [x] **Task 11**: Implement circuit breaker for gate-to-gate peer forwarding
+- [x] **Task 12**: Add CircuitBreakerManager.remove_circuit calls for dead managers and peers
+- [x] **Task 15**: Add retry logic for client callback pushes instead of best-effort swallow
+- [x] **Task 20**: Add GateJobLeaderTransfer emission from gate to client
+- [x] **Task 21**: Add ManagerJobLeaderTransfer emission from gate to client
+- [x] **Task 24**: Add guard against progress updates after job completion
+- [x] **Task 25**: Add windowed_stats job existence check before recording
+- [x] **Task 26**: Add timeout path for missing DC workflow results
+- [x] **Task 27**: Add exactly-once completion guard for duplicate final results
+- [x] **Task 28**: Add TCP handler for job_leader_gate_transfer in GateServer
+- [x] **Task 35**: Add GlobalJobResult aggregation path in gate
+- [x] **Task 37**: Global timeout trigger gate-side cancellation/completion
+- [x] **Task 39**: Add orphan job timeout -> failed path
+- [x] **Task 42**: Extend state sync to include workflow results, progress callbacks
+- [x] **Task 44**: Manager: Implement _cancel_workflow to send WorkflowCancelRequest
+- [x] **Task 46**: Manager: Wire stats backpressure to actual stats recording
+- [x] **Task 47**: Manager: Add windowed stats flush/push loop
+- [x] **Task 51**: Manager: Connect StatsBuffer recording to stats handling
+- [x] **Task 52**: Cross-DC correlation - wire check_correlation to gate routing
+- [x] **Task 53**: Partition callbacks - wire to routing changes in health coordinator
+- [x] **Task 55**: WorkflowResultPush - add fence tokens for stale rejection
+- [x] **Task 56**: Manager idempotency ledger - wire to job submission dedup
+- [x] **Task 57**: Gate idempotency wait_for_pending timeout -> duplicate jobs fix
+- [x] **Task 58**: Manager stats backpressure - wire to windowed stats
+- [x] **Task 64**: Gate process resource sampling loop - add ProcessResourceMonitor
 
 ---
 
-### 1.1.4 [P3] Inefficient Event History in HierarchicalFailureDetector
+## High Priority Tasks (20 remaining)
 
-**File**: `hyperscale/distributed/swim/detection/hierarchical_failure_detector.py`
-**Lines**: 740-744
+### Task 8: Fix Manager health state race condition
+**Status:** Pending  
+**Priority:** HIGH  
+**Files:** `hyperscale/distributed/nodes/manager/server.py`, health coordinator files
 
-**Problem**: Using `list.pop(0)` is O(n) for a bounded buffer.
+**Problem:**  
+Manager health state updates can race between the health monitoring loop and incoming health check responses. Multiple concurrent updates to health state can cause inconsistent state.
 
-**Current Code**:
-```python
-def _record_event(self, event: FailureEvent) -> None:
-    self._recent_events.append(event)
-    if len(self._recent_events) > self._max_event_history:
-        self._recent_events.pop(0)
-```
+**Requirements:**
+1. Find where manager health state is updated (likely in health coordinator or server.py)
+2. Add `asyncio.Lock` protection around health state mutations
+3. Ensure health state transitions are atomic
+4. Follow existing patterns in codebase for lock usage
 
-**Fix**: Use `collections.deque` with maxlen:
-```python
-from collections import deque
-
-# In __init__:
-self._recent_events: deque[FailureEvent] = deque(maxlen=self._max_event_history)
-
-# In _record_event:
-def _record_event(self, event: FailureEvent) -> None:
-    self._recent_events.append(event)  # Automatically drops oldest when full
-```
+**Commit message:** `Manager: Add lock protection for health state race condition`
 
 ---
 
-## Section 1.2: Race Conditions
+### Task 9: Fix Manager circuit breaker auto-transition bug
+**Status:** Pending  
+**Priority:** HIGH  
+**Files:** `hyperscale/distributed/nodes/manager/` directory
 
-### 1.2.1 [P0] Double-Checked Locking Race in Context
+**Problem:**  
+Circuit breaker may not properly auto-transition from HALF_OPEN to CLOSED on success, or from HALF_OPEN to OPEN on failure. The state machine transitions need verification and fixing.
 
-**File**: `hyperscale/distributed/server/context/context.py`
-**Lines**: 20-27
+**Requirements:**
+1. Find circuit breaker implementation in manager
+2. Verify state transitions:
+   - CLOSED → OPEN on failure threshold
+   - OPEN → HALF_OPEN after timeout
+   - HALF_OPEN → CLOSED on success
+   - HALF_OPEN → OPEN on failure
+3. Fix any missing or incorrect transitions
+4. Ensure proper success/failure tracking in each state
 
-**Problem**: First check is unprotected, allowing two coroutines to create different locks for the same key.
-
-**Current Code**:
-```python
-async def get_value_lock(self, key: str) -> asyncio.Lock:
-    if key in self._value_locks:  # RACE: Check without lock
-        return self._value_locks[key]
-    
-    async with self._value_locks_creation_lock:
-        if key not in self._value_locks:
-            self._value_locks[key] = asyncio.Lock()
-        return self._value_locks[key]
-```
-
-**Fix**: Always acquire the creation lock:
-```python
-async def get_value_lock(self, key: str) -> asyncio.Lock:
-    async with self._value_locks_creation_lock:
-        if key not in self._value_locks:
-            self._value_locks[key] = asyncio.Lock()
-        return self._value_locks[key]
-```
+**Commit message:** `Manager: Fix circuit breaker state auto-transitions`
 
 ---
 
-### 1.2.2 [P0] Unprotected Counter Increments in GateRuntimeState
+### Task 10: Fix Manager dispatch counter race
+**Status:** Pending  
+**Priority:** HIGH  
+**Files:** `hyperscale/distributed/nodes/manager/` directory
 
-**File**: `hyperscale/distributed/nodes/gate/state.py`
-**Lines**: 106-111, 186-189, 244-246, 261-264
+**Problem:**  
+Dispatch counter increments/decrements may race when multiple workflows are being dispatched or completed concurrently. This can lead to incorrect active workflow counts.
 
-**Problem**: Read-modify-write operations are not atomic, causing lost increments under concurrency.
+**Requirements:**
+1. Find dispatch counter/tracking in manager (likely in dispatch coordinator or job manager)
+2. Add `asyncio.Lock` protection around counter mutations
+3. Ensure increment and decrement operations are atomic
+4. Consider using a dedicated counter class if pattern is repeated
 
-**Affected Methods**:
-- `increment_peer_epoch()` (lines 106-111)
-- `next_fence_token()` (lines 186-189)
-- `record_forward()` (line 246)
-- `increment_state_version()` (lines 261-264)
-
-**Fix**: Add lock and make methods async:
-```python
-# Add to __init__:
-self._counter_lock = asyncio.Lock()
-
-# Update methods:
-async def increment_peer_epoch(self, peer_addr: tuple[str, int]) -> int:
-    async with self._counter_lock:
-        current_epoch = self._peer_state_epoch.get(peer_addr, 0)
-        new_epoch = current_epoch + 1
-        self._peer_state_epoch[peer_addr] = new_epoch
-        return new_epoch
-
-async def next_fence_token(self) -> int:
-    async with self._counter_lock:
-        self._fence_token_counter += 1
-        return self._fence_token_counter
-
-async def record_forward(self) -> None:
-    async with self._counter_lock:
-        self._forward_throughput_count += 1
-
-async def increment_state_version(self) -> int:
-    async with self._counter_lock:
-        self._state_version += 1
-        return self._state_version
-```
-
-**Note**: Update all callers to `await` these methods.
+**Commit message:** `Manager: Add lock protection for dispatch counter race`
 
 ---
 
-### 1.2.3 [P0] Unprotected Counter Increments in ClientState
+### Task 13: Add JobFinalResult peer-forwarding for gate resilience
+**Status:** Pending  
+**Priority:** HIGH  
+**Files:** `hyperscale/distributed/nodes/gate/` directory
 
-**File**: `hyperscale/distributed/nodes/client/state.py`
-**Lines**: 173-187
+**Problem:**  
+When a gate receives a JobFinalResult but the job's leader gate is a different peer, the result should be forwarded to the leader gate. Currently this may not happen, causing result loss.
 
-**Problem**: Four counter increment methods are not thread-safe.
+**Requirements:**
+1. Find where JobFinalResult is handled in gate (likely `tcp_job.py` or `server.py`)
+2. Check if current gate is the job leader
+3. If not leader, forward the result to the leader gate using circuit breaker pattern
+4. Handle forwarding failures with retry or error logging
+5. Use existing circuit breaker infrastructure (`CircuitBreakerManager`)
 
-**Affected Methods**:
-- `increment_gate_transfers()`
-- `increment_manager_transfers()`
-- `increment_rerouted()`
-- `increment_failed_leadership_change()`
-
-**Fix**: Add lock and make methods async (same pattern as 1.2.2):
-```python
-# Add to __init__:
-self._metrics_lock = asyncio.Lock()
-
-# Update methods:
-async def increment_gate_transfers(self) -> None:
-    async with self._metrics_lock:
-        self._gate_transfers_received += 1
-```
+**Commit message:** `Gate: Add JobFinalResult peer-forwarding for resilience`
 
 ---
 
-### 1.2.4 [P0] Unprotected Counter Increments in ManagerState
+### Task 14: Add immediate status replay after client reconnect/register_callback
+**Status:** Pending  
+**Priority:** HIGH  
+**Files:** `hyperscale/distributed/nodes/gate/` directory
 
-**File**: `hyperscale/distributed/nodes/manager/state.py`
-**Lines**: 174-192
+**Problem:**  
+When a client reconnects or registers a callback for a job, they may have missed status updates. The gate should immediately replay the current status to the client.
 
-**Problem**: Critical counters including fence_token are not protected.
+**Requirements:**
+1. Find where client callback registration happens in gate
+2. After successful registration, immediately send current job status to client
+3. Include: job status, progress, any pending results
+4. Handle the case where job doesn't exist (return error)
 
-**Affected Methods**:
-- `increment_fence_token()` - **CRITICAL: affects at-most-once semantics**
-- `increment_state_version()`
-- `increment_external_incarnation()`
-- `increment_context_lamport_clock()`
-
-**Fix**: Add lock and make methods async (same pattern as 1.2.2).
-
----
-
-### 1.2.5 [P0] Unprotected Counter Increment in WorkerState
-
-**File**: `hyperscale/distributed/nodes/worker/state.py`
-**Lines**: 108-111
-
-**Problem**: State version increment is not protected.
-
-**Fix**: Add lock and make method async (same pattern as 1.2.2).
+**Commit message:** `Gate: Add immediate status replay on client callback registration`
 
 ---
 
-### 1.2.6 [P1] TOCTOU Race in GateJobManager Fence Token
+### Task 16: Add job_status_push retry/peer-forward on failure
+**Status:** Pending  
+**Priority:** HIGH  
+**Files:** `hyperscale/distributed/nodes/gate/` directory
 
-**File**: `hyperscale/distributed/jobs/gates/gate_job_manager.py`
-**Lines**: 211-221
+**Problem:**  
+When `job_status_push` to a client fails, the update is lost. Should retry and/or forward to peer gates.
 
-**Problem**: Time-of-check-time-of-use race in fence token update.
+**Requirements:**
+1. Find `job_status_push` implementation in gate
+2. Add retry logic with exponential backoff (max 3 attempts)
+3. On final failure, if peer gates exist, try forwarding to them
+4. Log failures for debugging
+5. Use existing retry patterns in codebase if available
 
-**Fix**: Add lock or document that caller must hold job lock:
-```python
-async def update_fence_token_if_higher(self, job_id: str, token: int) -> bool:
-    """
-    Update fence token only if new token is higher.
-    
-    MUST be called with job lock held via lock_job(job_id).
-    """
-    async with self._fence_token_lock:
-        current = self._job_fence_tokens.get(job_id, 0)
-        if token > current:
-            self._job_fence_tokens[job_id] = token
-            return True
-        return False
-```
+**Commit message:** `Gate: Add retry and peer-forward for job_status_push failures`
 
 ---
 
-### 1.2.7 [P1] TOCTOU Race in JobManager.get_next_fence_token
+### Task 17: Invoke progress callbacks on batch updates
+**Status:** Pending  
+**Priority:** HIGH  
+**Files:** `hyperscale/distributed/nodes/gate/` directory
 
-**File**: `hyperscale/distributed/jobs/job_manager.py`
-**Lines**: 160-191
+**Problem:**  
+Progress callbacks may only be invoked on immediate pushes but not when batch updates are processed. This causes clients to miss progress updates.
 
-**Fix**: Add lock protection (same pattern as 1.2.6).
+**Requirements:**
+1. Find where batch progress updates are processed in gate
+2. Ensure progress callbacks are invoked for each batch item
+3. Consider batching callback invocations to reduce overhead
+4. Maintain ordering if possible
 
----
-
-### 1.2.8 [P2] TOCTOU Race in ConnectionPool.acquire
-
-**File**: `hyperscale/distributed/discovery/pool/connection_pool.py`
-**Lines**: 160-212
-
-**Problem**: Connection limits can be exceeded between releasing and re-acquiring lock.
-
-**Fix**: Re-check limits after creating connection:
-```python
-async def acquire(self, peer_id: str, timeout: float | None = None) -> PooledConnection[T]:
-    # ... create connection outside lock ...
-    
-    async with self._get_lock():
-        # RE-CHECK LIMITS after creating connection
-        if self._total_connections >= self.config.max_total_connections:
-            await self.close_fn(connection)
-            raise RuntimeError("Connection pool exhausted (limit reached during creation)")
-        
-        peer_connections = self._connections.get(peer_id, [])
-        if len(peer_connections) >= self.config.max_connections_per_peer:
-            await self.close_fn(connection)
-            raise RuntimeError(f"Max connections per peer reached for {peer_id}")
-        
-        # ... add connection ...
-```
+**Commit message:** `Gate: Invoke progress callbacks on batch updates`
 
 ---
 
-## Section 1.3: Silent/Dropped Failures
+### Task 18: Add client poll-on-reconnect or replay mechanism
+**Status:** Pending  
+**Priority:** HIGH  
+**Files:** `hyperscale/distributed/` directory
 
-### 1.3.1 [P0] Manager Server Background Tasks Without Error Handling
+**Problem:**  
+Clients may miss updates during disconnection. Need mechanism to catch up.
 
-**File**: `hyperscale/distributed/nodes/manager/server.py`
-**Lines**: 712-730
+**Requirements:**
+1. Find client connection handling in gate
+2. On client reconnect, trigger a status poll/replay
+3. Send all missed updates since last known state
+4. Use sequence numbers or timestamps to track what was missed
 
-**Problem**: 19 background tasks created with `asyncio.create_task()` without error callbacks. Any exception crashes silently.
-
-**Affected Tasks**:
-- `_dead_node_reap_task`
-- `_orphan_scan_task`
-- `_discovery_maintenance_task`
-- `_job_responsiveness_task`
-- `_stats_push_task`
-- `_gate_heartbeat_task`
-- `_rate_limit_cleanup_task`
-- `_job_cleanup_task`
-- `_unified_timeout_task`
-- `_deadline_enforcement_task`
-- `_peer_job_state_sync_task`
-- And 8 more...
-
-**Fix**: Create helper to add error callback:
-```python
-def _create_background_task(self, coro, name: str) -> asyncio.Task:
-    """Create background task with error logging."""
-    task = asyncio.create_task(coro, name=name)
-    task.add_done_callback(lambda t: self._handle_task_error(t, name))
-    return task
-
-def _handle_task_error(self, task: asyncio.Task, name: str) -> None:
-    """Log background task errors."""
-    if task.cancelled():
-        return
-    exc = task.exception()
-    if exc:
-        # Fire-and-forget logging (task runner handles async)
-        self._task_runner.run(
-            self._udp_logger.log(
-                ServerError(
-                    message=f"Background task '{name}' failed: {exc}",
-                    node_id=self._node_id.short,
-                    error_type=type(exc).__name__,
-                )
-            )
-        )
-
-# Usage in _start_background_tasks():
-self._dead_node_reap_task = self._create_background_task(
-    self._dead_node_reap_loop(), "dead_node_reap"
-)
-```
+**Commit message:** `Gate: Add client poll-on-reconnect replay mechanism`
 
 ---
 
-### 1.3.2 [P0] Worker Server Background Tasks Without Error Handling
+### Task 19: Add client-side fallback to query gate for leader on missed transfers
+**Status:** Pending  
+**Priority:** HIGH  
+**Files:** `hyperscale/distributed/` directory
 
-**File**: `hyperscale/distributed/nodes/worker/server.py`
-**Lines**: 532, 546, 558, 577, 589, 597, 986
+**Problem:**  
+If client misses a leader transfer notification, they may send to wrong leader.
 
-**Problem**: 7 background tasks without error callbacks.
+**Requirements:**
+1. Find client job interaction code
+2. Add mechanism to query gate for current leader
+3. On "not leader" response, query for correct leader
+4. Cache leader info with TTL
 
-**Fix**: Apply same pattern as 1.3.1.
-
----
-
-### 1.3.3 [P0] WAL Writer Tasks Without Error Handling
-
-**File**: `hyperscale/distributed/ledger/wal/wal_writer.py`
-**Lines**: 155, 297
-
-**Problem**: WAL writer and state change tasks fail silently, compromising durability.
-
-**Fix**: Apply same pattern as 1.3.1.
+**Commit message:** `Distributed: Add client fallback to query gate for job leader`
 
 ---
 
-### 1.3.4 [P1] Replace All Bare `except Exception: pass` Blocks
+### Task 22: Fix dead peer reaping - remove from _gate_peer_unhealthy_since
+**Status:** Pending  
+**Priority:** HIGH  
+**Files:** `hyperscale/distributed/nodes/gate/` directory
 
-**Count**: 149 instances across 65+ files
+**Problem:**  
+When a peer is marked as dead and removed, it may not be removed from `_gate_peer_unhealthy_since` tracking dict, causing memory leak and stale data.
 
-**Critical Files** (prioritize these):
-| File | Count | Risk |
-|------|-------|------|
-| `nodes/manager/server.py` | 5 | Infrastructure |
-| `nodes/gate/server.py` | 8 | Infrastructure |
-| `nodes/worker/progress.py` | 6 | Data loss |
-| `server/server/mercury_sync_base_server.py` | 12 | Networking |
-| `encryption/aes_gcm.py` | 4 | **SECURITY** |
-| `taskex/task_runner.py` | 5 | Task execution |
-| `taskex/run.py` | 5 | Task execution |
+**Requirements:**
+1. Find where peers are removed/cleaned up in gate
+2. Ensure `_gate_peer_unhealthy_since` is also cleaned up
+3. Also clean up any other peer-related tracking dicts
+4. Add cleanup to all peer removal paths
 
-**Fix Pattern**: Replace with logging at minimum:
-```python
-# Before:
-except Exception:
-    pass
-
-# After:
-except Exception as error:
-    await self._logger.log(
-        ServerError(
-            message=f"Operation failed in {context}: {error}",
-            error_type=type(error).__name__,
-        )
-    )
-```
-
-**For cleanup paths where we truly want to continue**:
-```python
-except Exception as error:
-    # Intentionally continue cleanup despite error
-    await self._logger.log(
-        ServerWarning(
-            message=f"Cleanup error (continuing): {error}",
-        )
-    )
-```
+**Commit message:** `Gate: Fix dead peer cleanup to include unhealthy_since tracking`
 
 ---
 
-### 1.3.5 [P1] Callback Error Swallowing
+### Task 23: Fix peer cleanup to fully purge UDP-TCP mapping
+**Status:** Pending  
+**Priority:** HIGH  
+**Files:** `hyperscale/distributed/nodes/gate/` directory
 
-**Files** (11 total):
-| File | Line |
-|------|------|
-| `nodes/client/handlers/tcp_job_status_push.py` | 60 |
-| `nodes/client/handlers/tcp_windowed_stats.py` | 66 |
-| `nodes/client/handlers/tcp_reporter_result.py` | 61 |
-| `nodes/client/handlers/tcp_workflow_result.py` | 96 |
-| `swim/detection/job_suspicion_manager.py` | 324 |
-| `swim/detection/timing_wheel.py` | 373 |
-| `swim/health/peer_health_awareness.py` | 209, 215 |
-| `swim/gossip/health_gossip_buffer.py` | 263 |
-| `swim/gossip/gossip_buffer.py` | 347 |
-| `leases/job_lease.py` | 282 |
+**Problem:**  
+When a peer is removed, the UDP-to-TCP address mapping may not be fully purged, causing stale mappings and potential routing errors.
 
-**Fix**: Log callback errors before continuing:
-```python
-# Before:
-try:
-    await callback(data)
-except Exception:
-    pass
+**Requirements:**
+1. Find UDP-TCP mapping storage in gate (likely in peer coordinator or state)
+2. Find all peer removal/cleanup code paths
+3. Ensure UDP-TCP mapping is removed in all cleanup paths
+4. Consider creating a unified peer cleanup method if scattered
 
-# After:
-try:
-    await callback(data)
-except Exception as error:
-    await self._logger.log(
-        ServerWarning(
-            message=f"Callback error (user code): {error}",
-            error_type=type(error).__name__,
-        )
-    )
-```
+**Commit message:** `Gate: Fully purge UDP-TCP mapping on peer cleanup`
 
 ---
 
-### 1.3.6 [P2] asyncio.gather Without return_exceptions
+### Task 36: Implement mixed final status resolution across DCs
+**Status:** Pending  
+**Priority:** HIGH  
+**Files:** `hyperscale/distributed/nodes/gate/` directory
 
-**Files**:
-- `hyperscale/distributed/nodes/client/discovery.py`
-- `hyperscale/distributed/nodes/worker/lifecycle.py`
-- `hyperscale/distributed/discovery/dns/resolver.py`
-- `hyperscale/distributed/taskex/task.py`
-- `hyperscale/distributed/taskex/task_runner.py`
+**Problem:**  
+When job runs across multiple DCs, they may report different final statuses (one COMPLETED, one FAILED). Need resolution logic.
 
-**Fix**: Add `return_exceptions=True` to cleanup/parallel operations:
-```python
-# Before:
-results = await asyncio.gather(*tasks)
+**Requirements:**
+1. Find where multi-DC job status is aggregated in gate
+2. Implement status resolution rules:
+   - Any FAILED → overall FAILED
+   - Any CANCELLED → overall CANCELLED (unless FAILED)
+   - All COMPLETED → overall COMPLETED
+   - Timeout → overall TIMEOUT
+3. Record per-DC status in final result for debugging
+4. Handle partial responses (some DCs didn't respond)
 
-# After (for cleanup paths):
-results = await asyncio.gather(*tasks, return_exceptions=True)
-for result in results:
-    if isinstance(result, Exception):
-        await self._logger.log(ServerWarning(message=f"Parallel task error: {result}"))
-```
-
----
-
-# Part 2: AD Component Integration (P1-P2)
-
-## Section 2.1: Integration Status Matrix
-
-| Component | Gate | Manager | Worker | Status |
-|-----------|------|---------|--------|--------|
-| **AD-38 WAL** | Optional | Yes | N/A | Partial |
-| **AD-38 JobLedger** | Optional | No | N/A | Missing |
-| **AD-40 Idempotency** | No | No | N/A | **Missing** |
-| **AD-41 Resources** | No | No | No | **Missing** |
-| **AD-42 SLO/TDigest** | No | No | No | **Missing** |
-| **AD-43 Capacity** | No | No | N/A | **Missing** |
-| **AD-44 Retry Budget** | N/A | No | N/A | **Missing** |
-| **AD-44 Best-Effort** | No | N/A | N/A | **Missing** |
-| **AD-45 Route Learning** | No | N/A | N/A | **Missing** |
+**Commit message:** `Gate: Implement mixed final status resolution across DCs`
 
 ---
 
-## Section 2.2: AD-40 Idempotency Integration
+### Task 40: Integrate job lease acquisition/renewal in gate submission
+**Status:** Pending  
+**Priority:** HIGH  
+**Files:** `hyperscale/distributed/nodes/gate/` directory
 
-### 2.2.1 [P1] Integrate AD-40 Idempotency into Gate Server
+**Problem:**  
+Job submission should acquire a lease for distributed coordination. Leases should be renewed periodically.
 
-**Files to Modify**:
-- `hyperscale/distributed/nodes/gate/server.py`
-- `hyperscale/distributed/nodes/gate/handlers/tcp_job.py`
+**Requirements:**
+1. Find lease management code in `distributed/` (likely in `leasing/` directory)
+2. On job submission in gate:
+   - Acquire lease for the job
+   - Store lease token with job info
+   - Start renewal loop using TaskRunner
+3. On job completion:
+   - Release the lease
+   - Stop renewal loop
+4. Handle lease acquisition failures
 
-**Implementation**:
-
-1. Add to `GateServer.__init__()`:
-```python
-from hyperscale.distributed.idempotency import GateIdempotencyCache
-
-self._idempotency_cache: GateIdempotencyCache[JobAck] = GateIdempotencyCache(
-    max_size=env.IDEMPOTENCY_CACHE_MAX_SIZE,
-    ttl_seconds=env.IDEMPOTENCY_CACHE_TTL,
-)
-```
-
-2. Modify job submission handler to check idempotency:
-```python
-async def _handle_job_submission(self, submission: JobSubmission, ...) -> JobAck:
-    # Check idempotency cache first
-    if submission.idempotency_key:
-        cached = await self._idempotency_cache.get(submission.idempotency_key)
-        if cached and cached.status == IdempotencyStatus.COMMITTED:
-            return cached.result
-        
-        if cached and cached.status == IdempotencyStatus.PENDING:
-            # Wait for in-flight request to complete
-            return await self._idempotency_cache.wait_for_completion(
-                submission.idempotency_key
-            )
-        
-        # Mark as pending
-        await self._idempotency_cache.mark_pending(
-            submission.idempotency_key,
-            job_id=job_id,
-            source_gate_id=self._node_id.full,
-        )
-    
-    try:
-        result = await self._process_job_submission(submission, ...)
-        
-        if submission.idempotency_key:
-            await self._idempotency_cache.commit(submission.idempotency_key, result)
-        
-        return result
-    except Exception as error:
-        if submission.idempotency_key:
-            await self._idempotency_cache.reject(
-                submission.idempotency_key,
-                JobAck(success=False, error=str(error)),
-            )
-        raise
-```
+**Commit message:** `Gate: Integrate job lease acquisition and renewal`
 
 ---
 
-## Section 2.3: AD-44 Retry Budgets Integration
+### Task 43: Manager: Add cluster/environment/mTLS validation
+**Status:** Pending  
+**Priority:** HIGH  
+**Files:** `hyperscale/distributed/nodes/manager/` directory
 
-### 2.3.1 [P1] Integrate AD-44 Retry Budgets into WorkflowDispatcher
+**Problem:**  
+Manager should validate that incoming connections are from the same cluster/environment and have valid mTLS credentials.
 
-**Files to Modify**:
-- `hyperscale/distributed/jobs/workflow_dispatcher.py`
-- `hyperscale/distributed/nodes/manager/server.py`
+**Requirements:**
+1. Find where manager accepts connections (likely in `server.py` or connection handler)
+2. Add cluster ID validation - reject connections from different clusters
+3. Add environment validation - reject prod/staging mismatch
+4. Ensure mTLS is properly validated (if configured)
+5. Log rejected connections with reason
 
-**Implementation**:
-
-1. Add to `WorkflowDispatcher.__init__()`:
-```python
-from hyperscale.distributed.reliability import RetryBudgetManager, ReliabilityConfig
-
-self._retry_budget_manager = RetryBudgetManager(
-    config=ReliabilityConfig.from_env(env),
-)
-```
-
-2. Check budget before retry:
-```python
-async def _retry_workflow(self, workflow_id: str, job_id: str, ...) -> bool:
-    # Check retry budget before attempting
-    if not self._retry_budget_manager.try_consume(job_id):
-        await self._logger.log(
-            ServerWarning(
-                message=f"Retry budget exhausted for job {job_id}, failing workflow {workflow_id}",
-            )
-        )
-        return False
-    
-    # Proceed with retry
-    return await self._dispatch_workflow(...)
-```
-
-3. Record outcomes:
-```python
-async def _handle_workflow_result(self, result: WorkflowResult) -> None:
-    if result.success:
-        self._retry_budget_manager.record_success(result.job_id)
-    else:
-        self._retry_budget_manager.record_failure(result.job_id)
-```
+**Commit message:** `Manager: Add cluster/environment/mTLS validation`
 
 ---
 
-## Section 2.4: AD-41 Resource Guards Integration
+### Task 45: Manager: Fix WorkflowProgressAck structure mismatch
+**Status:** Pending  
+**Priority:** HIGH  
+**Files:** `hyperscale/distributed/nodes/manager/` and `hyperscale/distributed/models/` directories
 
-### 2.4.1 [P2] Integrate AD-41 Resource Guards into Worker
+**Problem:**  
+WorkflowProgressAck message structure may not match what's expected by receivers, causing deserialization failures.
 
-**Files to Modify**:
-- `hyperscale/distributed/nodes/worker/server.py`
-- `hyperscale/distributed/nodes/worker/heartbeat.py`
+**Requirements:**
+1. Find `WorkflowProgressAck` model in `distributed/models`
+2. Find where it's created in manager
+3. Find where it's consumed (likely in gate or worker)
+4. Ensure all fields match between producer and consumer
+5. Fix any mismatches in field names, types, or optionality
 
-**Implementation**:
-
-1. Add resource monitor to worker:
-```python
-from hyperscale.distributed.resources import ProcessResourceMonitor
-
-self._resource_monitor = ProcessResourceMonitor(
-    smoothing_alpha=0.2,
-    process_noise=0.01,
-    measurement_noise=0.1,
-)
-```
-
-2. Include in heartbeat:
-```python
-async def _build_heartbeat(self) -> WorkerHeartbeat:
-    metrics = await self._resource_monitor.sample()
-    
-    return WorkerHeartbeat(
-        worker_id=self._node_id.full,
-        # ... existing fields ...
-        cpu_percent=metrics.cpu_percent,
-        cpu_uncertainty=metrics.cpu_uncertainty,
-        memory_percent=metrics.memory_percent,
-        memory_uncertainty=metrics.memory_uncertainty,
-    )
-```
+**Commit message:** `Manager: Fix WorkflowProgressAck structure alignment`
 
 ---
 
-## Section 2.5: AD-42 SLO Tracking Integration
+### Task 48: Manager: Implement workflow reassignment to dispatch state
+**Status:** Pending  
+**Priority:** HIGH  
+**Files:** `hyperscale/distributed/nodes/manager/` directory
 
-### 2.5.1 [P2] Integrate AD-42 SLO Tracking into Manager
+**Problem:**  
+When a worker fails, its workflows need to be reassigned. The reassignment needs to update dispatch state properly.
 
-**Files to Modify**:
-- `hyperscale/distributed/nodes/manager/state.py`
-- `hyperscale/distributed/nodes/manager/server.py`
+**Requirements:**
+1. Find workflow reassignment logic in manager
+2. When reassigning:
+   - Update dispatch state to remove old worker assignment
+   - Add new worker assignment
+   - Update workflow tracking token if needed
+   - Notify gate of reassignment
+3. Handle case where no workers are available
+4. Ensure atomic state updates
 
-**Implementation**:
-
-1. Add TDigest to manager state:
-```python
-from hyperscale.distributed.slo import TimeWindowedTDigest, SLOConfig
-
-self._latency_digest = TimeWindowedTDigest(
-    config=SLOConfig.from_env(env),
-    window_size_seconds=60.0,
-)
-```
-
-2. Record workflow latencies:
-```python
-async def _handle_workflow_complete(self, result: WorkflowFinalResult) -> None:
-    self._latency_digest.add(result.duration_ms, time.time())
-```
-
-3. Include SLO summary in heartbeat:
-```python
-async def _build_heartbeat(self) -> ManagerHeartbeat:
-    slo_summary = self._latency_digest.get_summary()
-    
-    return ManagerHeartbeat(
-        # ... existing fields ...
-        slo_p50_ms=slo_summary.p50,
-        slo_p95_ms=slo_summary.p95,
-        slo_p99_ms=slo_summary.p99,
-        slo_compliance=slo_summary.compliance_level,
-    )
-```
+**Commit message:** `Manager: Implement workflow reassignment with dispatch state update`
 
 ---
 
-## Section 2.6: AD-43 Capacity Spillover Integration
+### Task 49: Manager: Implement _apply_worker_state in sync.py
+**Status:** Pending  
+**Priority:** HIGH  
+**Files:** `hyperscale/distributed/nodes/manager/sync.py` and related files
 
-### 2.6.1 [P2] Integrate AD-43 Capacity Spillover into Gate
+**Problem:**  
+`_apply_worker_state` method in `sync.py` may be a stub or incomplete. It needs to properly apply synced worker state.
 
-**Files to Modify**:
-- `hyperscale/distributed/nodes/gate/routing.py`
-- `hyperscale/distributed/nodes/gate/server.py`
+**Requirements:**
+1. Find `_apply_worker_state` in manager `sync.py`
+2. Implement full worker state application:
+   - Update worker registry with synced workers
+   - Update worker health states
+   - Update worker capacity/load info
+   - Handle worker removals (in sync but not local)
+   - Handle new workers (in sync but not known locally)
+3. Ensure thread-safe updates
 
-**Implementation**:
-
-1. Add capacity aggregator:
-```python
-from hyperscale.distributed.capacity import (
-    DatacenterCapacityAggregator,
-    SpilloverEvaluator,
-)
-
-self._capacity_aggregator = DatacenterCapacityAggregator()
-self._spillover_evaluator = SpilloverEvaluator.from_env(env)
-```
-
-2. Update capacity from manager heartbeats:
-```python
-async def _handle_manager_heartbeat(self, heartbeat: ManagerHeartbeat) -> None:
-    self._capacity_aggregator.update_manager(
-        dc_id=heartbeat.dc_id,
-        manager_id=heartbeat.manager_id,
-        available_cores=heartbeat.available_cores,
-        pending_workflows=heartbeat.pending_workflows,
-        estimated_wait_ms=heartbeat.estimated_wait_ms,
-    )
-```
-
-3. Evaluate spillover before routing:
-```python
-async def _route_job(self, submission: JobSubmission) -> str:
-    primary_dc = self._select_primary_dc(submission)
-    primary_capacity = self._capacity_aggregator.get_dc_capacity(primary_dc)
-    
-    decision = self._spillover_evaluator.evaluate(
-        primary_capacity=primary_capacity,
-        fallback_capacities=self._get_fallback_capacities(primary_dc),
-        workflow_count=submission.workflow_count,
-    )
-    
-    if decision.should_spillover:
-        return decision.target_dc
-    
-    return primary_dc
-```
+**Commit message:** `Manager: Implement _apply_worker_state for sync`
 
 ---
 
-## Section 2.7: AD-45 Route Learning Integration
+### Task 50: Manager: Add job leader transfer sender to workers
+**Status:** Pending  
+**Priority:** HIGH  
+**Files:** `hyperscale/distributed/nodes/manager/` directory
 
-### 2.7.1 [P2] Integrate AD-45 Route Learning into Gate
+**Problem:**  
+When job leadership transfers (manager failover), workers need to be notified of the new leader so they can send results to the right place.
 
-**Files to Modify**:
-- `hyperscale/distributed/nodes/gate/server.py`
-- `hyperscale/distributed/routing/gate_job_router.py`
+**Requirements:**
+1. Find where job leader transfer happens in manager
+2. After transfer, send notification to all workers assigned to that job
+3. Notification should include: new leader address, new fencing token
+4. Handle case where worker is unreachable
+5. Use existing message types if available (`JobLeaderTransfer` or similar)
 
-**Implementation**:
-
-1. Add observed latency tracker:
-```python
-from hyperscale.distributed.routing import (
-    ObservedLatencyTracker,
-    BlendedLatencyScorer,
-    DispatchTimeTracker,
-)
-
-self._dispatch_time_tracker = DispatchTimeTracker()
-self._observed_latency_tracker = ObservedLatencyTracker(
-    alpha=env.ROUTE_LEARNING_EWMA_ALPHA,
-    min_samples_for_confidence=env.ROUTE_LEARNING_MIN_SAMPLES,
-    max_staleness_seconds=env.ROUTE_LEARNING_MAX_STALENESS_SECONDS,
-)
-self._blended_scorer = BlendedLatencyScorer(self._observed_latency_tracker)
-```
-
-2. Record dispatch time:
-```python
-async def _dispatch_to_dc(self, job_id: str, dc_id: str, ...) -> bool:
-    self._dispatch_time_tracker.record_dispatch(job_id, dc_id)
-    # ... dispatch logic ...
-```
-
-3. Record completion latency:
-```python
-async def _handle_job_complete(self, job_id: str, dc_id: str) -> None:
-    latency_ms = self._dispatch_time_tracker.get_latency(job_id, dc_id)
-    if latency_ms is not None:
-        self._observed_latency_tracker.record_job_latency(dc_id, latency_ms)
-```
-
-4. Use blended scoring in router:
-```python
-def score_datacenter(self, dc_id: str, rtt_ucb_ms: float) -> float:
-    return self._blended_scorer.get_blended_latency(dc_id, rtt_ucb_ms)
-```
+**Commit message:** `Manager: Add job leader transfer notification to workers`
 
 ---
 
-# Part 3: Verification Checklist
+### Task 54: Manager peer state sync - reconcile leadership/fence tokens
+**Status:** Pending  
+**Priority:** HIGH  
+**Files:** `hyperscale/distributed/nodes/manager/` directory
+
+**Problem:**  
+When manager syncs state with peers, leadership and fence tokens may conflict and need reconciliation.
+
+**Requirements:**
+1. Find peer state sync in manager
+2. When syncing:
+   - Compare fence tokens - higher token wins
+   - Reconcile leadership based on term/election state
+   - Handle split-brain scenarios
+   - Update local state to match reconciled state
+3. Log reconciliation decisions for debugging
+
+**Commit message:** `Manager: Reconcile leadership/fence tokens in peer state sync`
+
+---
+
+### Task 59: Reporter submission flow - complete distributed path
+**Status:** Pending  
+**Priority:** HIGH  
+**Files:** `hyperscale/distributed/` directory
+
+**Problem:**  
+Reporter result submission in distributed mode may be incomplete - results may not flow properly from workers through managers to gate to client.
+
+**Requirements:**
+1. Trace the reporter result flow:
+   - Worker generates reporter results
+   - Worker sends to manager
+   - Manager aggregates and sends to gate
+   - Gate forwards to client
+2. Find and fix any gaps in this flow
+3. Add `ReporterResultPush` message handling if missing
+4. Ensure results are not lost on node failures
+
+**Commit message:** `Distributed: Complete reporter result submission flow`
+
+---
+
+## Medium Priority Tasks (14 remaining)
+
+### Task 29: Integrate DatacenterCapacityAggregator into routing/dispatch
+**Status:** Pending  
+**Priority:** MEDIUM  
+**Files:** `hyperscale/distributed/routing/` directory
+
+**Problem:**  
+`DatacenterCapacityAggregator` exists but may not be wired into routing decisions.
+
+**Requirements:**
+1. Find `DatacenterCapacityAggregator` implementation
+2. Wire capacity data into routing decision logic
+3. Use capacity info to avoid overloaded DCs
+4. Add fallback behavior when capacity data is stale
+
+**Commit message:** `Routing: Integrate DatacenterCapacityAggregator into dispatch`
+
+---
+
+### Task 30: Integrate SpilloverEvaluator into routing decisions
+**Status:** Pending  
+**Priority:** MEDIUM  
+**Files:** `hyperscale/distributed/routing/` directory
+
+**Problem:**  
+`SpilloverEvaluator` exists but may not be used in routing.
+
+**Requirements:**
+1. Find `SpilloverEvaluator` implementation
+2. Wire into routing decision logic
+3. Trigger spillover when primary DC is overloaded
+4. Log spillover events for debugging
+
+**Commit message:** `Routing: Integrate SpilloverEvaluator into decisions`
+
+---
+
+### Task 31: Add ordering/dedup for JobProgress beyond fence token
+**Status:** Pending  
+**Priority:** MEDIUM  
+**Files:** `hyperscale/distributed/nodes/gate/` directory
+
+**Problem:**  
+JobProgress updates may arrive out of order or duplicated. Fence token helps but may not be sufficient.
+
+**Requirements:**
+1. Find JobProgress handling in gate
+2. Add sequence number tracking per job
+3. Reject out-of-order updates (or reorder if buffering is acceptable)
+4. Deduplicate based on sequence + fence token
+
+**Commit message:** `Gate: Add ordering and dedup for JobProgress updates`
+
+---
+
+### Task 32: Add explicit progress percentage calculation in gate
+**Status:** Pending  
+**Priority:** MEDIUM  
+**Files:** `hyperscale/distributed/nodes/gate/` directory
+
+**Problem:**  
+Progress percentage may not be calculated or may be inaccurate.
+
+**Requirements:**
+1. Find where progress is tracked in gate
+2. Calculate percentage based on completed/total work units
+3. Handle multi-DC jobs (aggregate progress across DCs)
+4. Include in progress callbacks to client
+
+**Commit message:** `Gate: Add explicit progress percentage calculation`
+
+---
+
+### Task 33: Add recovery path for manager dies with pending stats
+**Status:** Pending  
+**Priority:** MEDIUM  
+**Files:** `hyperscale/distributed/nodes/manager/` directory
+
+**Problem:**  
+If manager dies with pending stats, those stats are lost.
+
+**Requirements:**
+1. Find stats buffering in manager
+2. Add periodic checkpoint of pending stats
+3. On manager recovery, reload checkpointed stats
+4. Or: forward stats to peer manager before death
+
+**Commit message:** `Manager: Add recovery path for pending stats on failure`
+
+---
+
+### Task 34: Add ReporterResultPush forwarding path in gate
+**Status:** Pending  
+**Priority:** MEDIUM  
+**Files:** `hyperscale/distributed/nodes/gate/` directory
+
+**Problem:**  
+`ReporterResultPush` may not have a proper forwarding path in gate.
+
+**Requirements:**
+1. Find `ReporterResultPush` handling in gate
+2. Add forwarding to registered client callbacks
+3. Handle case where client is disconnected
+4. Buffer results if needed for reconnecting clients
+
+**Commit message:** `Gate: Add ReporterResultPush forwarding path`
+
+---
+
+### Task 38: Add reporter task creation and result dispatch in gate
+**Status:** Pending  
+**Priority:** MEDIUM  
+**Files:** `hyperscale/distributed/nodes/gate/` directory
+
+**Problem:**  
+Reporter tasks may not be properly created or results may not be dispatched.
+
+**Requirements:**
+1. Find reporter task handling in gate
+2. Ensure tasks are created when job requests reporting
+3. Dispatch results to appropriate handlers
+4. Clean up reporter tasks on job completion
+
+**Commit message:** `Gate: Add reporter task creation and result dispatch`
+
+---
+
+### Task 41: Add LeaseTransfer sender in gate code
+**Status:** Pending  
+**Priority:** MEDIUM  
+**Files:** `hyperscale/distributed/nodes/gate/` directory
+
+**Problem:**  
+When job leadership transfers between gates, lease should transfer too.
+
+**Requirements:**
+1. Find where gate leadership transfer happens
+2. Add lease transfer as part of the handoff
+3. Include lease token and expiry in transfer
+4. Handle transfer failures gracefully
+
+**Commit message:** `Gate: Add LeaseTransfer sender for leadership handoff`
+
+---
+
+### Task 60: Routing SLO-constraint gating - filter by SLO targets
+**Status:** Pending  
+**Priority:** MEDIUM  
+**Files:** `hyperscale/distributed/routing/` directory
+
+**Problem:**  
+Routing may not respect SLO constraints when selecting destinations.
+
+**Requirements:**
+1. Find routing decision logic
+2. Add SLO constraint checking (latency, throughput targets)
+3. Filter out destinations that can't meet SLO
+4. Fallback behavior when no destination meets SLO
+
+**Commit message:** `Routing: Add SLO-constraint gating for destination selection`
+
+---
+
+### Task 61: Latency handling - add percentile/jitter control
+**Status:** Pending  
+**Priority:** MEDIUM  
+**Files:** `hyperscale/distributed/` directory
+
+**Problem:**  
+Latency tracking may not include percentile calculations or jitter handling.
+
+**Requirements:**
+1. Find latency tracking code
+2. Add percentile calculations (p50, p95, p99)
+3. Add jitter detection and smoothing
+4. Use in routing and health decisions
+
+**Commit message:** `Distributed: Add latency percentile and jitter control`
+
+---
+
+### Task 62: Connection storm mitigation - add explicit connection caps
+**Status:** Pending  
+**Priority:** MEDIUM  
+**Files:** `hyperscale/distributed/` directory
+
+**Problem:**  
+Connection storms can overwhelm nodes. Need explicit caps.
+
+**Requirements:**
+1. Find connection acceptance code in each node type
+2. Add configurable connection limits
+3. Reject new connections when at limit
+4. Add backoff/retry guidance in rejection response
+
+**Commit message:** `Distributed: Add connection storm mitigation with explicit caps`
+
+---
+
+### Task 63: Protocol size violations - send structured error response
+**Status:** Pending  
+**Priority:** MEDIUM  
+**Files:** `hyperscale/distributed/` directory
+
+**Problem:**  
+When protocol messages exceed size limits, error response may not be helpful.
+
+**Requirements:**
+1. Find message size validation code
+2. On size violation, send structured error with:
+   - Actual size vs limit
+   - Which field is too large (if detectable)
+   - Suggested remediation
+3. Log violations for debugging
+
+**Commit message:** `Distributed: Add structured error response for protocol size violations`
+
+---
+
+## Verification Checklist
 
 After implementing fixes, verify:
 
-## Critical Fixes (P0)
-- [ ] Gate server job cleanup removes `_job_reporter_tasks` and `_job_stats_crdt`
-- [ ] All counter increment methods in state.py files are async and locked
-- [ ] Context.get_value_lock() always acquires creation lock
-- [ ] All 19 manager server background tasks have error callbacks
-- [ ] All 7 worker server background tasks have error callbacks
-- [ ] WAL writer tasks have error callbacks
+### High Priority
+- [ ] All Manager race conditions fixed with asyncio.Lock
+- [ ] Circuit breaker state transitions are correct
+- [ ] JobFinalResult forwards to leader gate
+- [ ] Client reconnect replays missed status
+- [ ] Dead peer cleanup removes all tracking data
+- [ ] Multi-DC status resolution works correctly
+- [ ] Job leases are acquired and renewed
+- [ ] Manager validates cluster/environment
+- [ ] WorkflowProgressAck structure matches consumers
+- [ ] Workflow reassignment updates dispatch state
+- [ ] Worker state sync applies correctly
+- [ ] Job leader transfers notify workers
+- [ ] Peer sync reconciles fence tokens
+- [ ] Reporter results flow end-to-end
 
-## High Priority (P1)
-- [ ] No bare `except Exception: pass` blocks in critical files
-- [ ] Callback error handlers log before continuing
-- [ ] AD-40 idempotency prevents duplicate job processing
-- [ ] AD-44 retry budgets are checked before dispatch retries
-
-## Medium Priority (P2)
-- [ ] Latency sample lists use bounded deques
-- [ ] Lock dictionaries have cleanup methods
-- [ ] asyncio.gather() uses return_exceptions in cleanup paths
-- [ ] AD-41 resource metrics appear in worker heartbeats
-- [ ] AD-42 SLO summaries appear in manager heartbeats
-- [ ] AD-43 capacity data influences routing decisions
-- [ ] AD-45 observed latency is recorded and used for scoring
-
----
-
-# Appendix A: Files Requiring Most Attention
-
-| Priority | File | Issues |
-|----------|------|--------|
-| P0 | `nodes/gate/server.py` | Memory leak, 8 silent failures |
-| P0 | `nodes/manager/server.py` | 19 unhandled background tasks, 5 silent failures |
-| P0 | `nodes/manager/state.py` | 4 race conditions |
-| P0 | `nodes/gate/state.py` | 4 race conditions |
-| P0 | `nodes/worker/server.py` | 7 unhandled background tasks |
-| P0 | `server/context/context.py` | Double-checked locking race |
-| P1 | `server/server/mercury_sync_base_server.py` | 12 silent failures |
-| P1 | `taskex/task_runner.py` | 5 silent failures |
-| P1 | `encryption/aes_gcm.py` | 4 silent failures (**security risk**) |
+### Medium Priority
+- [ ] DatacenterCapacityAggregator influences routing
+- [ ] SpilloverEvaluator triggers when needed
+- [ ] JobProgress is ordered and deduplicated
+- [ ] Progress percentage is calculated correctly
+- [ ] Manager stats survive failure
+- [ ] ReporterResultPush reaches clients
+- [ ] Reporter tasks are created properly
+- [ ] LeaseTransfer happens on gate handoff
+- [ ] SLO constraints gate routing
+- [ ] Latency percentiles are tracked
+- [ ] Connection limits prevent storms
+- [ ] Protocol size errors are helpful
 
 ---
 
-# Appendix B: Original AD Implementation Plan
+## Notes
 
-(Retained from original TODO.md for reference)
-
-## Dependency Analysis
-
-| AD | Title | Dependencies | Blocking For |
-|----|-------|--------------|--------------|
-| AD-40 | Idempotent Job Submissions | AD-38 (VSR), AD-39 (WAL) | None |
-| AD-41 | Resource Guards | None | AD-42 (optional prediction integration) |
-| AD-42 | SLO-Aware Health & Routing | AD-41 (for resource prediction) | None |
-| AD-43 | Capacity-Aware Spillover | AD-36 (existing) | None |
-| AD-44 | Retry Budgets & Best-Effort | None | None |
-| AD-45 | Adaptive Route Learning | AD-36 (existing) | None |
-
-## Parallel Execution Tracks
-
-```
-TIME ──────────────────────────────────────────────────────────────────►
-
-TRACK A (Idempotency)      TRACK B (Resource Monitoring)   TRACK C (Routing)        TRACK D (Reliability)
-─────────────────────      ──────────────────────────────  ──────────────────────   ─────────────────────
-
-┌──────────────────┐       ┌──────────────────────┐       ┌──────────────────┐     ┌──────────────────┐
-│    AD-40         │       │      AD-41           │       │    AD-43         │     │    AD-44         │
-│  Idempotency     │       │  Resource Guards     │       │   Spillover      │     │  Retry Budgets   │
-│  (Gate+Manager)  │       │  (Worker→Manager→    │       │   (Gate)         │     │  (Gate+Manager)  │
-│                  │       │   Gate Aggregation)  │       │                  │     │                  │
-└──────────────────┘       └──────────┬───────────┘       └──────────────────┘     └──────────────────┘
-                                      │
-                                      │ resource prediction
-                                      ▼
-                           ┌──────────────────────┐       ┌──────────────────┐
-                           │      AD-42           │       │    AD-45         │
-                           │   SLO-Aware Health   │       │ Adaptive Route   │
-                           │  (T-Digest, SWIM)    │       │    Learning      │
-                           └──────────────────────┘       └──────────────────┘
-```
-
-## File Structure Summary
-
-```
-hyperscale/distributed/
-├── idempotency/                    # AD-40 ✅ IMPLEMENTED
-│   ├── __init__.py
-│   ├── idempotency_key.py
-│   ├── gate_cache.py
-│   └── manager_ledger.py
-│
-├── resources/                      # AD-41 ✅ IMPLEMENTED
-│   ├── __init__.py
-│   ├── scalar_kalman_filter.py
-│   ├── adaptive_kalman_filter.py
-│   ├── process_resource_monitor.py
-│   ├── manager_cluster_view.py
-│   ├── manager_local_view.py
-│   ├── manager_resource_gossip.py
-│   └── worker_resource_report.py
-│
-├── slo/                            # AD-42 ✅ IMPLEMENTED
-│   ├── __init__.py
-│   ├── tdigest.py
-│   ├── time_windowed_digest.py
-│   ├── slo_config.py
-│   ├── slo_summary.py
-│   └── resource_aware_predictor.py
-│
-├── capacity/                       # AD-43 ✅ IMPLEMENTED
-│   ├── __init__.py
-│   ├── active_dispatch.py
-│   ├── execution_time_estimator.py
-│   ├── datacenter_capacity.py
-│   ├── capacity_aggregator.py
-│   ├── spillover_config.py
-│   ├── spillover_decision.py
-│   └── spillover_evaluator.py
-│
-├── reliability/                    # AD-44 ✅ IMPLEMENTED
-│   ├── __init__.py
-│   ├── retry_budget_state.py
-│   ├── retry_budget_manager.py
-│   ├── best_effort_state.py
-│   ├── best_effort_manager.py
-│   └── reliability_config.py
-│
-└── routing/
-    ├── observed_latency_state.py           # AD-45 ✅ IMPLEMENTED
-    ├── observed_latency_tracker.py         # AD-45 ✅ IMPLEMENTED
-    ├── blended_latency_scorer.py           # AD-45 ✅ IMPLEMENTED
-    ├── blended_scoring_config.py           # AD-45 ✅ IMPLEMENTED
-    ├── dispatch_time_tracker.py            # AD-45 ✅ IMPLEMENTED
-    └── datacenter_routing_score_extended.py # AD-45 ✅ IMPLEMENTED
-```
-
-**Status**: All AD-38 through AD-45 components are **IMPLEMENTED** as standalone modules. Integration into node servers (Gate, Manager, Worker) is **PENDING** as documented in Part 2 of this TODO.
+- All changes must pass `lsp_diagnostics` before committing
+- Run integration tests after completing related task groups
+- Use TaskRunner for background tasks, never raw asyncio tasks
+- Follow existing code patterns in each file
+- One class per file rule applies
+- Memory leaks are unacceptable - always clean up
