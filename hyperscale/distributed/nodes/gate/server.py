@@ -4947,6 +4947,7 @@ class GateServer(HealthAwareServer):
         self._cancel_reporter_tasks(state_reporter_tasks)
 
         self._task_runner.run(self._windowed_stats.cleanup_job_windows, job_id)
+        await self._dispatch_time_tracker.remove_job(job_id)
 
     async def _job_cleanup_loop(self) -> None:
         while self._running:
