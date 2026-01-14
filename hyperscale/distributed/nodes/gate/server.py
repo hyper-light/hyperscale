@@ -2971,7 +2971,7 @@ class GateServer(HealthAwareServer):
 
         return jobs_to_remove
 
-    def _cancel_reporter_tasks(self, tasks: dict | None) -> None:
+    def _cancel_reporter_tasks(self, tasks: dict[str, asyncio.Task] | None) -> None:
         if not tasks:
             return
         for task in tasks.values():
