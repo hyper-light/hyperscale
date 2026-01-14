@@ -2073,7 +2073,7 @@ class GateServer(HealthAwareServer):
 
     def _categorize_datacenters_by_health(
         self,
-        dc_health: dict,
+        dc_health: dict[str, DatacenterStatus],
     ) -> tuple[list[str], list[str], list[str]]:
         healthy = [
             dc
