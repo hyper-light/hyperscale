@@ -74,7 +74,7 @@ class GateJobHandler:
         job_leadership_tracker: "JobLeadershipTracker",
         quorum_circuit: "ErrorStats",
         load_shedder: "LoadShedder",
-        job_lease_manager: object,
+        job_lease_manager: JobLeaseManager,
         idempotency_cache: GateIdempotencyCache[bytes] | None,
         get_node_id: Callable[[], "NodeId"],
         get_host: Callable[[], str],
@@ -134,7 +134,7 @@ class GateJobHandler:
         self._job_leadership_tracker: "JobLeadershipTracker" = job_leadership_tracker
         self._quorum_circuit: "ErrorStats" = quorum_circuit
         self._load_shedder: "LoadShedder" = load_shedder
-        self._job_lease_manager: object = job_lease_manager
+        self._job_lease_manager: JobLeaseManager = job_lease_manager
         self._idempotency_cache: GateIdempotencyCache[bytes] | None = idempotency_cache
         self._get_node_id: Callable[[], "NodeId"] = get_node_id
         self._get_host: Callable[[], str] = get_host
