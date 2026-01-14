@@ -64,6 +64,9 @@ class ManagerDispatchCoordinator:
         self._send_to_worker: SendFunc = send_to_worker
         self._send_to_peer: SendFunc = send_to_peer
 
+        # Lock for atomic provision tracking operations
+        self._provision_lock: asyncio.Lock = asyncio.Lock()
+
     async def dispatch_workflow(
         self,
         job_id: str,
