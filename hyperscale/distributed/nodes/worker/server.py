@@ -508,7 +508,7 @@ class WorkerServer(HealthAwareServer):
         # Join SWIM cluster with all known managers for healthchecks
         for manager_info in list(self._registry._known_managers.values()):
             manager_udp_addr = (manager_info.udp_host, manager_info.udp_port)
-            self.join([manager_udp_addr])
+            await self.join_cluster(manager_udp_addr)
 
         # Start SWIM probe cycle
         self.start_probe_cycle()
