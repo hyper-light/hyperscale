@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 
 from hyperscale.distributed.models import WorkflowProgressAck
 from hyperscale.distributed.reliability import BackpressureLevel, BackpressureSignal
+from hyperscale.logging.hyperscale_logging_models import ServerDebug
 
 if TYPE_CHECKING:
     from ..server import WorkerServer
@@ -63,8 +64,18 @@ class WorkflowProgressHandler:
                 self._handle_backpressure(ack)
 
         except Exception as error:
-            if data != b"ok":
-                pass
+            if data != b"ok" and hasattr(self._server, "_task_runner"):
+                from hyperscale.logging.hyperscale_logging_models import ServerDebug
+
+                self._server._task_runner.run(
+                    self._server._udp_logger.log,
+                    ServerDebug(
+                        message=f"ACK parse failed (non-legacy payload): {error}",
+                        node_host="worker",
+                        node_port=0,
+                        node_id="worker",
+                    ),
+                )
 
     def _update_known_managers(self, ack: WorkflowProgressAck) -> None:
         """Update known managers from ack response."""
