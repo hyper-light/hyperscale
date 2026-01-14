@@ -123,32 +123,38 @@ class GateJobHandler:
             record_dc_job_stats: Callback to record DC stats
             handle_update_by_tier: Callback for tiered update handling
         """
-        self._state = state
-        self._logger = logger
-        self._task_runner = task_runner
-        self._job_manager = job_manager
-        self._job_router = job_router
-        self._job_leadership_tracker = job_leadership_tracker
-        self._quorum_circuit = quorum_circuit
-        self._load_shedder = load_shedder
-        self._job_lease_manager = job_lease_manager
-        self._idempotency_cache = idempotency_cache
-        self._get_node_id = get_node_id
-        self._get_host = get_host
-        self._get_tcp_port = get_tcp_port
-        self._is_leader = is_leader
-        self._check_rate_limit = check_rate_limit
-        self._should_shed_request = should_shed_request
-        self._has_quorum_available = has_quorum_available
-        self._quorum_size = quorum_size
-        self._select_datacenters_with_fallback = select_datacenters_with_fallback
-        self._get_healthy_gates = get_healthy_gates
-        self._broadcast_job_leadership = broadcast_job_leadership
-        self._dispatch_job_to_datacenters = dispatch_job_to_datacenters
-        self._forward_job_progress_to_peers = forward_job_progress_to_peers
-        self._record_request_latency = record_request_latency
-        self._record_dc_job_stats = record_dc_job_stats
-        self._handle_update_by_tier = handle_update_by_tier
+        self._state: GateRuntimeState = state
+        self._logger: Logger = logger
+        self._task_runner: "TaskRunner" = task_runner
+        self._job_manager: "GateJobManager" = job_manager
+        self._job_router: "GateJobRouter" = job_router
+        self._job_leadership_tracker: "JobLeadershipTracker" = job_leadership_tracker
+        self._quorum_circuit: "ErrorStats" = quorum_circuit
+        self._load_shedder: "LoadShedder" = load_shedder
+        self._job_lease_manager: object = job_lease_manager
+        self._idempotency_cache: GateIdempotencyCache[bytes] | None = idempotency_cache
+        self._get_node_id: Callable[[], "NodeId"] = get_node_id
+        self._get_host: Callable[[], str] = get_host
+        self._get_tcp_port: Callable[[], int] = get_tcp_port
+        self._is_leader: Callable[[], bool] = is_leader
+        self._check_rate_limit: Callable[[str, str], tuple[bool, float]] = (
+            check_rate_limit
+        )
+        self._should_shed_request: Callable[[str], bool] = should_shed_request
+        self._has_quorum_available: Callable[[], bool] = has_quorum_available
+        self._quorum_size: Callable[[], int] = quorum_size
+        self._select_datacenters_with_fallback: Callable = (
+            select_datacenters_with_fallback
+        )
+        self._get_healthy_gates: Callable[[], list["GateInfo"]] = get_healthy_gates
+        self._broadcast_job_leadership: Callable[[str, int], "asyncio.Task"] = (
+            broadcast_job_leadership
+        )
+        self._dispatch_job_to_datacenters: Callable = dispatch_job_to_datacenters
+        self._forward_job_progress_to_peers: Callable = forward_job_progress_to_peers
+        self._record_request_latency: Callable[[float], None] = record_request_latency
+        self._record_dc_job_stats: Callable = record_dc_job_stats
+        self._handle_update_by_tier: Callable = handle_update_by_tier
 
     async def handle_submission(
         self,
