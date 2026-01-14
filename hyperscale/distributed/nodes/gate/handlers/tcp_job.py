@@ -56,7 +56,7 @@ if TYPE_CHECKING:
     from hyperscale.distributed.jobs.gates import GateJobManager
     from hyperscale.distributed.jobs import JobLeadershipTracker
     from hyperscale.distributed.reliability import LoadShedder
-    from hyperscale.distributed.routing import GateJobRouter
+
     from hyperscale.distributed.models import GateInfo
     from hyperscale.distributed.taskex import TaskRunner
 
@@ -74,7 +74,6 @@ class GateJobHandler:
         logger: Logger,
         task_runner: "TaskRunner",
         job_manager: "GateJobManager",
-        job_router: "GateJobRouter",
         job_leadership_tracker: "JobLeadershipTracker",
         quorum_circuit: "ErrorStats",
         load_shedder: "LoadShedder",
@@ -108,7 +107,6 @@ class GateJobHandler:
             logger: Async logger instance
             task_runner: Background task executor
             job_manager: Job management service
-            job_router: Job routing service
             job_leadership_tracker: Per-job leadership tracker
             quorum_circuit: Quorum operation circuit breaker
             load_shedder: Load shedding manager
@@ -136,7 +134,6 @@ class GateJobHandler:
         self._logger: Logger = logger
         self._task_runner: "TaskRunner" = task_runner
         self._job_manager: "GateJobManager" = job_manager
-        self._job_router: "GateJobRouter" = job_router
         self._job_leadership_tracker: "JobLeadershipTracker" = job_leadership_tracker
         self._quorum_circuit: "ErrorStats" = quorum_circuit
         self._load_shedder: "LoadShedder" = load_shedder
