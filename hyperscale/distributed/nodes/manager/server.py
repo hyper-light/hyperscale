@@ -1987,7 +1987,7 @@ class ManagerServer(HealthAwareServer):
                         if self._manager_state.has_worker(worker_id):
                             worker_reg = self._manager_state.get_worker(worker_id)
                             if worker_reg:
-                                worker_reg.node.available_cores = (
+                                worker_reg.available_cores = (
                                     worker_snapshot.available_cores
                                 )
 
