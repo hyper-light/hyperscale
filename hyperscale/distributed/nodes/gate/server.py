@@ -3206,6 +3206,10 @@ class GateServer(HealthAwareServer):
         peer_tcp_addr: tuple[str, int],
     ) -> bool:
         """Sync state from peer gate."""
+        if await self._peer_gate_circuit_breaker.is_circuit_open(peer_tcp_addr):
+            return False
+
+        circuit = await self._peer_gate_circuit_breaker.get_circuit(peer_tcp_addr)
         try:
             request = GateStateSyncRequest(
                 requester_id=self._node_id.full,
@@ -3223,11 +3227,14 @@ class GateServer(HealthAwareServer):
                 response = GateStateSyncResponse.load(result)
                 if not response.error and response.snapshot:
                     await self._apply_gate_state_snapshot(response.snapshot)
+                    circuit.record_success()
                     return True
 
+            circuit.record_failure()
             return False
 
         except Exception as sync_error:
+            circuit.record_failure()
             await self._udp_logger.log(
                 ServerWarning(
                     message=f"Failed to sync state from peer: {sync_error}",
