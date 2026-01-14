@@ -2569,6 +2569,10 @@ class GateServer(HealthAwareServer):
         )
 
         for peer_addr in self._modular_state.iter_active_peers():
+            if await self._peer_gate_circuit_breaker.is_circuit_open(peer_addr):
+                continue
+
+            circuit = await self._peer_gate_circuit_breaker.get_circuit(peer_addr)
             try:
                 await self.send_tcp(
                     peer_addr,
@@ -2576,6 +2580,18 @@ class GateServer(HealthAwareServer):
                     broadcast.dump(),
                     timeout=2.0,
                 )
+                circuit.record_success()
+            except Exception as discovery_error:
+                circuit.record_failure()
+                await self._udp_logger.log(
+                    ServerWarning(
+                        message=f"Failed to broadcast manager discovery to peer gate: {discovery_error}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+
             except Exception as discovery_error:
                 await self._udp_logger.log(
                     ServerWarning(
