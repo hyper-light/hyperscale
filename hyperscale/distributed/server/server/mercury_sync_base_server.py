@@ -231,9 +231,8 @@ class MercurySyncBaseServer(Generic[T]):
         self._model_handler_map: dict[bytes, bytes] = {}
         self.tcp_client_response_models: dict[bytes, type[Message]] = {}
         self.tcp_server_request_models: dict[bytes, type[Message]] = {}
-        self._tcp_server_request_transports: dict[str, asyncio.Transport] = {}
-        self._tcp_client_response_transports: dict[str, asyncio.Transport] = {}
-        
+        self._tcp_server_request_transports: dict[tuple[str, int], asyncio.Transport] = {}
+        self._tcp_client_response_transports: dict[tuple[str, int], asyncio.Transport] = {}
         self.udp_client_response_models: dict[bytes, type[Message]] = {}
         self.udp_server_request_models: dict[bytes, type[Message]] = {}
 
@@ -1263,6 +1262,8 @@ class MercurySyncBaseServer(Generic[T]):
             return
 
         try:
+
+            self._tcp_client_response_transports[addr] = transport
             if request_model := self.tcp_server_request_models.get(handler_name):
                 payload = request_model.load(payload)
 
