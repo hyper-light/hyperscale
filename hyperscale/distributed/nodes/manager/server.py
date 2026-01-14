@@ -3739,6 +3739,18 @@ class ManagerServer(HealthAwareServer):
         try:
             request = StateSyncRequest.load(data)
 
+            mtls_error = await self._validate_mtls_claims(
+                addr,
+                "State sync requester",
+                request.requester_id,
+            )
+            if mtls_error:
+                return StateSyncResponse(
+                    responder_id=self._node_id.full,
+                    current_version=self._manager_state.state_version,
+                    responder_ready=False,
+                ).dump()
+
             self._task_runner.run(
                 self._logger.log,
                 ServerInfo(

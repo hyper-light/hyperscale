@@ -315,7 +315,6 @@ class ManagerStateSync:
         snapshot_version: int,
         worker_pool: "WorkerPool | None",
     ) -> None:
-        """Remove a worker during state sync when marked offline."""
         registration = self._registry.get_worker(worker_id)
         if registration:
             self._registry.unregister_worker(worker_id)

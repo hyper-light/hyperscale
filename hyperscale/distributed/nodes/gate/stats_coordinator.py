@@ -174,13 +174,13 @@ class GateStatsCoordinator:
         callback: tuple[str, int],
         push_data: bytes,
         allow_peer_forwarding: bool,
-    ) -> None:
+    ) -> bool:
         last_error: Exception | None = None
 
         for attempt in range(self.CALLBACK_PUSH_MAX_RETRIES):
             try:
                 await self._send_tcp(callback, "job_status_push", push_data)
-                return
+                return True
             except Exception as send_error:
                 last_error = send_error
                 if attempt < self.CALLBACK_PUSH_MAX_RETRIES - 1:
@@ -197,7 +197,7 @@ class GateStatsCoordinator:
                 last_error = forward_error
             else:
                 if forwarded:
-                    return
+                    return False
 
         await self._logger.log(
             ServerError(
@@ -210,6 +210,7 @@ class GateStatsCoordinator:
                 node_id=self._node_id,
             )
         )
+        return False
 
     async def _send_periodic_push_with_retry(
         self,
