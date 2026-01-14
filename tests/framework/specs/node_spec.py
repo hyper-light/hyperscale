@@ -1,7 +1,5 @@
 from dataclasses import dataclass
 
-from hyperscale.distributed.env.env import PrimaryType
-
 
 @dataclass(slots=True)
 class NodeSpec:
@@ -16,4 +14,4 @@ class NodeSpec:
     gate_udp_peers: list[tuple[str, int]] | None = None
     manager_peers: list[tuple[str, int]] | None = None
     manager_udp_peers: list[tuple[str, int]] | None = None
-    env_overrides: dict[str, PrimaryType] | None = None
+    env_overrides: dict[str, object] | None = None
