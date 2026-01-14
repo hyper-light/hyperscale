@@ -133,19 +133,25 @@ This document catalogs all identified issues across the distributed node impleme
 - Optionally support an explicit config override for fixed-size clusters, but default to dynamic membership.
 - Update quorum logging to include active/known counts from the same source used to compute quorum.
 
-### 2.8 Job Progress Ordering Uses Fence Token Instead of Per-Update Sequence
+### 2.8 Job Progress Ordering Uses Fence Token Instead of Per-Update Sequence ✅ FIXED
 
-| File | Lines | Issue |
-|------|-------|-------|
-| `distributed/nodes/gate/state.py` | 324-361 | `check_and_record_progress` uses `fence_token` for ordering and `timestamp` for dedup |
-| `distributed/models/distributed.py` | 1459-1471 | `JobProgress` has no monotonic sequence for per-update ordering |
+| File | Lines | Issue | Status |
+|------|-------|-------|--------|
+| `distributed/nodes/gate/state.py` | 324-361 | `check_and_record_progress` uses `fence_token` for ordering and `timestamp` for dedup | ✅ Fixed |
+| `distributed/models/distributed.py` | 1459-1471 | `JobProgress` has no monotonic sequence for per-update ordering | ✅ Fixed |
 
 **Why this matters:** `fence_token` is for leadership safety, not progress sequencing. Out-of-order progress with the same fence token is accepted, which breaks scenario 7.2 and can regress job status.
 
-**Fix (actionable):**
-- Add a per-job per-datacenter `progress_sequence` field to `JobProgress`, incremented by the manager on each progress update.
-- Change `check_and_record_progress` to reject updates with `progress_sequence` lower than the last seen.
-- Use `timestamp`/`collected_at` only for dedup and stats alignment, not ordering.
+**Fix implemented:**
+- Added `progress_sequence: int = 0` field to `JobProgress` in `models/distributed.py`
+- Added `_job_progress_sequences` tracking dict to `JobManager` with methods:
+  - `get_next_progress_sequence(job_id)` - async increment and return
+  - `get_current_progress_sequence(job_id)` - read without increment
+  - `cleanup_progress_sequence(job_id)` - cleanup on job completion
+- Updated `check_and_record_progress()` in gate state.py to use `progress_sequence` instead of `fence_token`
+- Updated `handle_progress()` in tcp_job.py to pass `progress_sequence` to the check method
+- Updated `to_wire_progress()` in `JobInfo` to accept `progress_sequence` parameter
+- Added cleanup in `complete_job()` to remove progress sequence tracking
 
 ### 2.9 Job Completion Ignores Missing Target Datacenters
 
