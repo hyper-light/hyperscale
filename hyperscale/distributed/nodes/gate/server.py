@@ -1310,6 +1310,7 @@ class GateServer(HealthAwareServer):
                 self._forward_job_final_result_to_peers,
             )
             if response == b"ok" and result is not None:
+                await self._maybe_push_global_job_result(result)
                 await self._forward_job_final_result_to_peer_callbacks(
                     result.job_id,
                     data,
@@ -4203,6 +4204,7 @@ class GateServer(HealthAwareServer):
             ]
             for key in keys_to_remove:
                 self._job_final_statuses.pop(key, None)
+        self._job_global_result_sent.discard(job_id)
         self._job_workflow_ids.pop(job_id, None)
         self._progress_callbacks.pop(job_id, None)
         self._job_leadership_tracker.release_leadership(job_id)
