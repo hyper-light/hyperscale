@@ -3935,7 +3935,11 @@ class GateServer(HealthAwareServer):
                 ]
 
                 for peer_addr in peers_to_cleanup:
-                    self._modular_state.cleanup_dead_peer(peer_addr)
+                    gate_ids_to_remove = self._modular_state.cleanup_dead_peer(
+                        peer_addr
+                    )
+                    for gate_id in gate_ids_to_remove:
+                        await self._versioned_clock.remove_entity(gate_id)
                     await self._peer_gate_circuit_breaker.remove_circuit(peer_addr)
 
                 await self._check_quorum_status()
