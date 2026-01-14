@@ -3223,9 +3223,10 @@ class GateServer(HealthAwareServer):
             if task and not task.done():
                 task.cancel()
 
-    def _cleanup_single_job(self, job_id: str) -> None:
+    async def _cleanup_single_job(self, job_id: str) -> None:
         self._job_manager.delete_job(job_id)
-        self._workflow_dc_results.pop(job_id, None)
+        async with self._workflow_dc_results_lock:
+            self._workflow_dc_results.pop(job_id, None)
         self._job_workflow_ids.pop(job_id, None)
         self._progress_callbacks.pop(job_id, None)
         self._job_leadership_tracker.release_leadership(job_id)
@@ -3254,7 +3255,7 @@ class GateServer(HealthAwareServer):
                 jobs_to_remove = self._get_expired_terminal_jobs(now)
 
                 for job_id in jobs_to_remove:
-                    self._cleanup_single_job(job_id)
+                    await self._cleanup_single_job(job_id)
 
             except asyncio.CancelledError:
                 break
