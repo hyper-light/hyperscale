@@ -1163,6 +1163,20 @@ class GateServer(HealthAwareServer):
         return b"error"
 
     @tcp.receive()
+    async def reporter_result_push(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ):
+        """Handle reporter result push from manager."""
+        if self._manager_handler:
+            return await self._manager_handler.handle_reporter_result_push(
+                addr, data, self.handle_exception
+            )
+        return b"error"
+
+    @tcp.receive()
     async def job_submission(
         self,
         addr: tuple[str, int],
