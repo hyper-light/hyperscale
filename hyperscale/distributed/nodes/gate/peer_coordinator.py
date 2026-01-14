@@ -94,25 +94,27 @@ class GatePeerCoordinator:
             confirm_peer: Callback to confirm peer in SWIM layer
             handle_job_leader_failure: Callback to handle job leader failure
         """
-        self._state = state
-        self._logger = logger
-        self._task_runner = task_runner
-        self._peer_discovery = peer_discovery
-        self._job_hash_ring = job_hash_ring
-        self._job_forwarding_tracker = job_forwarding_tracker
-        self._job_leadership_tracker = job_leadership_tracker
-        self._versioned_clock = versioned_clock
-        self._gate_health_config = gate_health_config
-        self._recovery_semaphore = recovery_semaphore
-        self._recovery_jitter_min = recovery_jitter_min
-        self._recovery_jitter_max = recovery_jitter_max
-        self._get_node_id = get_node_id
-        self._get_host = get_host
-        self._get_tcp_port = get_tcp_port
-        self._get_udp_port = get_udp_port
-        self._confirm_peer = confirm_peer
-        self._handle_job_leader_failure = handle_job_leader_failure
-        self._is_leader = is_leader or (lambda: False)
+        self._state: GateRuntimeState = state
+        self._logger: Logger = logger
+        self._task_runner: "TaskRunner" = task_runner
+        self._peer_discovery: DiscoveryService = peer_discovery
+        self._job_hash_ring: "ConsistentHashRing" = job_hash_ring
+        self._job_forwarding_tracker: "JobForwardingTracker" = job_forwarding_tracker
+        self._job_leadership_tracker: "JobLeadershipTracker" = job_leadership_tracker
+        self._versioned_clock: "VersionedStateClock" = versioned_clock
+        self._gate_health_config: dict = gate_health_config
+        self._recovery_semaphore: asyncio.Semaphore = recovery_semaphore
+        self._recovery_jitter_min: float = recovery_jitter_min
+        self._recovery_jitter_max: float = recovery_jitter_max
+        self._get_node_id: Callable[[], "NodeId"] = get_node_id
+        self._get_host: Callable[[], str] = get_host
+        self._get_tcp_port: Callable[[], int] = get_tcp_port
+        self._get_udp_port: Callable[[], int] = get_udp_port
+        self._confirm_peer: Callable[[tuple[str, int]], None] = confirm_peer
+        self._handle_job_leader_failure: Callable[[tuple[str, int]], "asyncio.Task"] = (
+            handle_job_leader_failure
+        )
+        self._is_leader: Callable[[], bool] = is_leader or (lambda: False)
 
     async def on_peer_confirmed(self, peer: tuple[str, int]) -> None:
         """
