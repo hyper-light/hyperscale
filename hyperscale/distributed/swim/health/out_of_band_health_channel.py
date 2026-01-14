@@ -140,15 +140,24 @@ class OutOfBandHealthChannel:
         return self.base_port + self.config.port_offset
 
     def set_overload_checker(self, checker: Callable[[], bool]) -> None:
-        """
-        Set callback to check if we're overloaded.
-
-        When we receive a probe and are overloaded, we send NACK instead of ACK.
-
-        Args:
-            checker: Callable returning True if this node is overloaded
-        """
         self._is_overloaded = checker
+
+    def set_logger(self, logger: LoggerProtocol, node_id: str) -> None:
+        self._logger = logger
+        self._node_id = node_id
+
+    async def _log_error(self, message: str) -> None:
+        if self._logger:
+            from hyperscale.logging.hyperscale_logging_models import ServerError
+
+            await self._logger.log(
+                ServerError(
+                    message=message,
+                    node_host=self.host,
+                    node_port=self.port,
+                    node_id=self._node_id,
+                )
+            )
 
     async def start(self) -> None:
         """Start the OOB health channel."""
