@@ -48,11 +48,15 @@ class WorkflowProgressHandler:
             if ack.is_leader and self._server._primary_manager_id != ack.manager_id:
                 self._server._primary_manager_id = ack.manager_id
 
+            job_leader_addr = ack.job_leader_addr
+            if isinstance(job_leader_addr, list):
+                job_leader_addr = tuple(job_leader_addr)
+
             # Update job leader routing if provided and changed
-            if workflow_id and ack.job_leader_addr:
+            if workflow_id and job_leader_addr:
                 current_leader = self._server._workflow_job_leader.get(workflow_id)
-                if current_leader != ack.job_leader_addr:
-                    self._server._workflow_job_leader[workflow_id] = ack.job_leader_addr
+                if current_leader != job_leader_addr:
+                    self._server._workflow_job_leader[workflow_id] = job_leader_addr
 
             # AD-23: Extract and apply backpressure signal
             if ack.backpressure_level > 0:

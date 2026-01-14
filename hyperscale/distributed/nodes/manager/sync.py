@@ -92,6 +92,9 @@ class ManagerStateSync:
             lambda _leader_id: None
         )
 
+    async def _noop_async(self, *_: Any) -> None:
+        return None
+
     async def sync_state_from_workers(self) -> None:
         """
         Synchronize state from all known workers.
@@ -181,7 +184,6 @@ class ManagerStateSync:
         return None
 
     def _derive_worker_health_state(self, snapshot: WorkerStateSnapshot) -> str:
-        """Derive overload state label from a worker snapshot."""
         if snapshot.state == WorkerState.HEALTHY.value:
             return "healthy" if snapshot.available_cores > 0 else "busy"
         if snapshot.state == WorkerState.DEGRADED.value:
