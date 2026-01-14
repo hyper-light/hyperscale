@@ -232,6 +232,28 @@ class GateJobManager:
     # Aggregation Helpers
     # =========================================================================
 
+    def _normalize_job_status(self, status: str) -> str:
+        normalized = status.strip().lower()
+        if normalized in ("timeout", "timed_out"):
+            return JobStatus.TIMEOUT.value
+        if normalized in ("cancelled", "canceled"):
+            return JobStatus.CANCELLED.value
+        if normalized in (JobStatus.COMPLETED.value, JobStatus.FAILED.value):
+            return normalized
+        return JobStatus.FAILED.value
+
+    def _should_resolve_final_status(
+        self, missing_dcs: set[str], normalized_statuses: list[str]
+    ) -> bool:
+        if not missing_dcs:
+            return True
+        terminal_overrides = {
+            JobStatus.FAILED.value,
+            JobStatus.CANCELLED.value,
+            JobStatus.TIMEOUT.value,
+        }
+        return any(status in terminal_overrides for status in normalized_statuses)
+
     def aggregate_job_status(self, job_id: str) -> GlobalJobStatus | None:
         """
         Aggregate status across all datacenters for a job.

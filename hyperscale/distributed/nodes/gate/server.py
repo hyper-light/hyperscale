@@ -2126,6 +2126,312 @@ class GateServer(HealthAwareServer):
         await self._send_immediate_update(job_id, "completed", None)
         return True
 
+    async def handle_global_timeout(
+        self,
+        job_id: str,
+        reason: str,
+        target_dcs: list[str],
+        manager_addrs: dict[str, tuple[str, int]],
+    ) -> None:
+        job = await self._mark_job_timeout(job_id, reason)
+        if not job:
+            await self._job_timeout_tracker.stop_tracking(job_id)
+            return
+
+        resolved_target_dcs = self._resolve_timeout_target_dcs(
+            job_id, target_dcs, manager_addrs
+        )
+        await self._cancel_job_for_timeout(
+            job_id,
+            reason,
+            resolved_target_dcs,
+            manager_addrs,
+        )
+        timeout_result = self._build_timeout_global_result(
+            job_id,
+            job,
+            resolved_target_dcs,
+            reason,
+        )
+        await self._push_global_job_result(job_id, timeout_result)
+        await self._job_timeout_tracker.stop_tracking(job_id)
+
+    async def _mark_job_timeout(
+        self,
+        job_id: str,
+        reason: str,
+    ) -> GlobalJobStatus | None:
+        async with self._job_manager.lock_job(job_id):
+            job = self._job_manager.get_job(job_id)
+            if not job:
+                await self._udp_logger.log(
+                    ServerWarning(
+                        message=(
+                            f"Global timeout triggered for unknown job {job_id[:8]}..."
+                        ),
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+                return None
+
+            terminal_statuses = {
+                JobStatus.COMPLETED.value,
+                JobStatus.FAILED.value,
+                JobStatus.CANCELLED.value,
+                JobStatus.TIMEOUT.value,
+            }
+            if job.status in terminal_statuses:
+                await self._udp_logger.log(
+                    ServerInfo(
+                        message=(
+                            "Global timeout ignored for terminal job "
+                            f"{job_id[:8]}... (status={job.status})"
+                        ),
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+                return None
+
+            aggregated = self._job_manager.aggregate_job_status(job_id)
+            if aggregated is not None:
+                job = aggregated
+
+            job.status = JobStatus.TIMEOUT.value
+            job.resolution_details = "global_timeout"
+            if reason:
+                errors = list(getattr(job, "errors", []))
+                if reason not in errors:
+                    errors.append(reason)
+                job.errors = errors
+            if job.timestamp > 0:
+                job.elapsed_seconds = time.monotonic() - job.timestamp
+
+            self._job_manager.set_job(job_id, job)
+
+        await self._modular_state.increment_state_version()
+        await self._send_immediate_update(job_id, "timeout", None)
+        return job
+
+    def _resolve_timeout_target_dcs(
+        self,
+        job_id: str,
+        target_dcs: list[str],
+        manager_addrs: dict[str, tuple[str, int]],
+    ) -> list[str]:
+        resolved = list(target_dcs)
+        if not resolved:
+            resolved = list(self._job_manager.get_target_dcs(job_id))
+        if not resolved:
+            resolved = list(manager_addrs.keys())
+        return resolved
+
+    async def _cancel_job_for_timeout(
+        self,
+        job_id: str,
+        reason: str,
+        target_dcs: list[str],
+        manager_addrs: dict[str, tuple[str, int]],
+    ) -> None:
+        if not target_dcs:
+            return
+
+        cancel_payload = CancelJob(
+            job_id=job_id,
+            reason=reason or "global_timeout",
+            fence_token=self._job_manager.get_fence_token(job_id),
+        ).dump()
+        job_dc_managers = self._job_dc_managers.get(job_id, {})
+        errors: list[str] = []
+
+        for dc_id in target_dcs:
+            manager_addr = manager_addrs.get(dc_id) or job_dc_managers.get(dc_id)
+            if not manager_addr:
+                errors.append(f"No manager found for DC {dc_id}")
+                continue
+
+            try:
+                response, _ = await self._send_tcp(
+                    manager_addr,
+                    "cancel_job",
+                    cancel_payload,
+                    timeout=5.0,
+                )
+            except Exception as error:
+                errors.append(f"DC {dc_id} cancel error: {error}")
+                continue
+
+            if not response:
+                errors.append(f"No response from DC {dc_id}")
+                continue
+
+            try:
+                ack = JobCancelResponse.load(response)
+                if not ack.success:
+                    errors.append(f"DC {dc_id} rejected cancellation: {ack.error}")
+                continue
+            except Exception:
+                pass
+
+            try:
+                ack = CancelAck.load(response)
+                if not ack.cancelled:
+                    errors.append(f"DC {dc_id} rejected cancellation: {ack.error}")
+            except Exception:
+                errors.append(f"DC {dc_id} sent unrecognized cancel response")
+
+        if errors:
+            await self._udp_logger.log(
+                ServerWarning(
+                    message=(
+                        "Global timeout cancellation issues for job "
+                        f"{job_id[:8]}...: {'; '.join(errors)}"
+                    ),
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+
+    def _build_timeout_job_results(
+        self,
+        job_id: str,
+        target_dcs: list[str],
+        reason: str,
+        elapsed_seconds: float,
+    ) -> list[JobFinalResult]:
+        existing_results = self._job_manager.get_all_dc_results(job_id)
+        if not target_dcs:
+            target_dcs = list(existing_results.keys())
+
+        timeout_reason = reason or "Global timeout"
+        fence_token = self._job_manager.get_fence_token(job_id)
+        results: list[JobFinalResult] = []
+
+        for dc_id in target_dcs:
+            if dc_id in existing_results:
+                results.append(existing_results[dc_id])
+                continue
+
+            results.append(
+                JobFinalResult(
+                    job_id=job_id,
+                    datacenter=dc_id,
+                    status="PARTIAL",
+                    workflow_results=[],
+                    total_completed=0,
+                    total_failed=0,
+                    errors=[timeout_reason],
+                    elapsed_seconds=elapsed_seconds,
+                    fence_token=fence_token,
+                )
+            )
+
+        return results
+
+    def _build_timeout_global_result(
+        self,
+        job_id: str,
+        job: GlobalJobStatus,
+        target_dcs: list[str],
+        reason: str,
+    ) -> GlobalJobResult:
+        elapsed_seconds = getattr(job, "elapsed_seconds", 0.0)
+        per_dc_results = self._build_timeout_job_results(
+            job_id,
+            list(target_dcs),
+            reason,
+            elapsed_seconds,
+        )
+        total_completed = sum(result.total_completed for result in per_dc_results)
+        total_failed = sum(result.total_failed for result in per_dc_results)
+        errors: list[str] = []
+        for result in per_dc_results:
+            errors.extend(result.errors)
+        if reason and reason not in errors:
+            errors.append(reason)
+
+        successful_dcs = sum(
+            1
+            for result in per_dc_results
+            if result.status.lower() == JobStatus.COMPLETED.value
+        )
+        failed_dcs = len(per_dc_results) - successful_dcs
+
+        aggregated = AggregatedJobStats(
+            total_requests=total_completed + total_failed,
+            successful_requests=total_completed,
+            failed_requests=total_failed,
+        )
+
+        return GlobalJobResult(
+            job_id=job_id,
+            status=JobStatus.TIMEOUT.value,
+            per_datacenter_results=per_dc_results,
+            aggregated=aggregated,
+            total_completed=total_completed,
+            total_failed=total_failed,
+            successful_datacenters=successful_dcs,
+            failed_datacenters=failed_dcs,
+            errors=errors,
+            elapsed_seconds=elapsed_seconds,
+        )
+
+    async def _push_global_job_result(
+        self,
+        job_id: str,
+        result: GlobalJobResult,
+    ) -> None:
+        callback = self._job_manager.get_callback(job_id)
+        if not callback:
+            await self._udp_logger.log(
+                ServerWarning(
+                    message=(
+                        f"Global timeout result has no callback for job {job_id[:8]}..."
+                    ),
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            return
+
+        payload = result.dump()
+        last_error: Exception | None = None
+        for attempt in range(GateStatsCoordinator.CALLBACK_PUSH_MAX_RETRIES):
+            try:
+                await self._send_tcp(
+                    callback,
+                    "receive_global_job_result",
+                    payload,
+                    timeout=5.0,
+                )
+                return
+            except Exception as error:
+                last_error = error
+                if attempt < GateStatsCoordinator.CALLBACK_PUSH_MAX_RETRIES - 1:
+                    delay = min(
+                        GateStatsCoordinator.CALLBACK_PUSH_BASE_DELAY_SECONDS
+                        * (2**attempt),
+                        GateStatsCoordinator.CALLBACK_PUSH_MAX_DELAY_SECONDS,
+                    )
+                    await asyncio.sleep(delay)
+
+        await self._udp_logger.log(
+            ServerWarning(
+                message=(
+                    "Failed to deliver global timeout result for job "
+                    f"{job_id[:8]}...: {last_error}"
+                ),
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+
     async def _gather_job_status(self, job_id: str) -> GlobalJobStatus:
         async with self._job_manager.lock_job(job_id):
             job = self._job_manager.get_job(job_id)
