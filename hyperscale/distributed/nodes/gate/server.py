@@ -1101,7 +1101,7 @@ class GateServer(HealthAwareServer):
         """Handle job status request from client."""
         if self._job_handler:
             return await self._job_handler.handle_status_request(
-                addr, data, self.handle_exception
+                addr, data, self._gather_job_status
             )
         return b""
 
