@@ -180,15 +180,17 @@ class WorkflowCancellationCompleteHandler:
         config: "ManagerConfig",
         logger: "Logger",
         node_id: str,
-        task_runner,
-        handle_workflow_cancelled,  # Callable to process completion
+        task_runner: "TaskRunner",
+        handle_workflow_cancelled: WorkflowCancelledFunc,
     ) -> None:
-        self._state = state
-        self._config = config
-        self._logger = logger
-        self._node_id = node_id
-        self._task_runner = task_runner
-        self._handle_workflow_cancelled = handle_workflow_cancelled
+        self._state: "ManagerState" = state
+        self._config: "ManagerConfig" = config
+        self._logger: "Logger" = logger
+        self._node_id: str = node_id
+        self._task_runner: "TaskRunner" = task_runner
+        self._handle_workflow_cancelled: WorkflowCancelledFunc = (
+            handle_workflow_cancelled
+        )
 
     async def handle(
         self,
