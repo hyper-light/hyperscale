@@ -28,6 +28,7 @@ from hyperscale.distributed.models import (
     WorkerState as WorkerStateEnum,
     WorkerStateSnapshot,
     WorkflowDispatch,
+    WorkflowFinalResult,
     WorkflowProgress,
     WorkerHeartbeat,
 )
