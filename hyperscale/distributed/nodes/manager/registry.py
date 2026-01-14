@@ -13,7 +13,7 @@ from hyperscale.distributed.models import (
     GateInfo,
     ManagerInfo,
 )
-from hyperscale.distributed.swim.core import ErrorStats, CircuitState
+from hyperscale.distributed.swim.core import ErrorStats
 from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerDebug
 
 if TYPE_CHECKING:
@@ -193,7 +193,7 @@ class ManagerRegistry:
                 continue
 
             if circuit := self._state._worker_circuits.get(worker_id):
-                if circuit.circuit_state != CircuitState.CLOSED:
+                if circuit.is_open():
                     continue
 
             # Skip workers without capacity
