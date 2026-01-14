@@ -23,9 +23,11 @@ import pytest
 import time
 from unittest.mock import MagicMock, AsyncMock
 
+from hyperscale.distributed.jobs import WindowedStatsCollector
 from hyperscale.distributed.nodes.manager.state import ManagerState
 from hyperscale.distributed.nodes.manager.config import ManagerConfig
 from hyperscale.distributed.nodes.manager.registry import ManagerRegistry
+from hyperscale.distributed.reliability import StatsBuffer, StatsBufferConfig
 from hyperscale.distributed.nodes.manager.cancellation import (
     ManagerCancellationCoordinator,
 )
