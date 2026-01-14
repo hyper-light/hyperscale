@@ -282,22 +282,22 @@ class JobLeaseManager:
                     if self._on_lease_expired:
                         for lease in expired:
                             try:
-                                                self._on_lease_expired(lease)
-                                            except Exception as callback_error:
-                                                if self._on_error:
-                                                    try:
-                                                        self._on_error(
-                                                            f"Lease expiry callback failed for job {lease.job_id}",
-                                                            callback_error,
-                                                        )
-                                                    except Exception as handler_error:
-                                                        print(
-                                                            f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] "
-                                                            f"CRITICAL: lease expiry error handler failed: {handler_error}, "
-                                                            f"original_error={callback_error}, "
-                                                            f"job_id={lease.job_id}",
-                                                            file=sys.stderr,
-                                                        )
+                                self._on_lease_expired(lease)
+                            except Exception as callback_error:
+                                if self._on_error:
+                                    try:
+                                        self._on_error(
+                                            f"Lease expiry callback failed for job {lease.job_id}",
+                                            callback_error,
+                                        )
+                                    except Exception as handler_error:
+                                        print(
+                                            f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] "
+                                            f"CRITICAL: lease expiry error handler failed: {handler_error}, "
+                                            f"original_error={callback_error}, "
+                                            f"job_id={lease.job_id}",
+                                            file=sys.stderr,
+                                        )
                     await asyncio.sleep(self._cleanup_interval)
                 except asyncio.CancelledError:
                     break
@@ -305,8 +305,13 @@ class JobLeaseManager:
                     if self._on_error:
                         try:
                             self._on_error("Lease cleanup loop error", loop_error)
-                        except Exception:
-                            pass
+                        except Exception as handler_error:
+                            print(
+                                f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] "
+                                f"CRITICAL: lease cleanup loop error handler failed: {handler_error}, "
+                                f"original_error={loop_error}",
+                                file=sys.stderr,
+                            )
                     await asyncio.sleep(self._cleanup_interval)
 
         self._cleanup_task = asyncio.create_task(cleanup_loop())
