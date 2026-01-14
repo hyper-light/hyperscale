@@ -1972,7 +1972,7 @@ class ManagerServer(HealthAwareServer):
                     requester_version=self._manager_state.state_version,
                 )
 
-                worker_addr = (worker.node.host, worker.node.tcp_port)
+                worker_addr = (worker.node.host, worker.node.port)
                 response = await self.send_tcp(
                     worker_addr,
                     "state_sync_request",

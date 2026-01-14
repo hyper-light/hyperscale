@@ -38,6 +38,7 @@ if TYPE_CHECKING:
     from hyperscale.distributed.jobs.gates import GateJobManager, GateJobTimeoutTracker
     from hyperscale.distributed.routing import GateJobRouter, DispatchTimeTracker
     from hyperscale.distributed.health import CircuitBreakerManager
+    from hyperscale.distributed.swim.core import ErrorStats
     from hyperscale.logging import Logger
     from hyperscale.distributed.taskex import TaskRunner
 
@@ -68,7 +69,7 @@ class GateDispatchCoordinator:
         should_shed_request: Callable,
         has_quorum_available: Callable,
         quorum_size: Callable,
-        quorum_circuit,
+        quorum_circuit: "ErrorStats",
         select_datacenters: Callable,
         assume_leadership: Callable,
         broadcast_leadership: Callable,
