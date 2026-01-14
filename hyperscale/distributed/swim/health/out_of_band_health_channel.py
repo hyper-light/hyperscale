@@ -335,14 +335,10 @@ class OutOfBandHealthChannel:
                     self._handle_response(msg_type, addr)
 
             except asyncio.CancelledError:
+                await self._log_error("Receive loop cancelled")
                 break
             except Exception as receive_error:
-                import sys
-
-                print(
-                    f"[OutOfBandHealthChannel] receive loop error: {receive_error}",
-                    file=sys.stderr,
-                )
+                await self._log_error(f"Receive loop error: {receive_error}")
                 continue
 
     async def _handle_probe(self, data: bytes, addr: tuple[str, int]) -> None:
