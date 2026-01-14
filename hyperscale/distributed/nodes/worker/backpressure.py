@@ -16,6 +16,7 @@ from hyperscale.distributed.reliability import (
     BackpressureLevel,
     HybridOverloadDetector,
 )
+from hyperscale.logging.hyperscale_logging_models import ServerWarning
 
 if TYPE_CHECKING:
     from hyperscale.logging import Logger
