@@ -177,8 +177,32 @@ class JobSuspicionManager:
         self._node_port: int = 0
         self._node_id: str = ""
 
+    def set_logger(
+        self,
+        logger: LoggerProtocol,
+        node_host: str,
+        node_port: int,
+        node_id: str,
+    ) -> None:
+        self._logger = logger
+        self._node_host = node_host
+        self._node_port = node_port
+        self._node_id = node_id
+
+    async def _log_error(self, message: str) -> None:
+        if self._logger:
+            from hyperscale.logging.hyperscale_logging_models import ServerError
+
+            await self._logger.log(
+                ServerError(
+                    message=message,
+                    node_host=self._node_host,
+                    node_port=self._node_port,
+                    node_id=self._node_id,
+                )
+            )
+
     def _get_n_members_for_job(self, job_id: JobId) -> int:
-        """Get member count for a specific job."""
         if self._get_n_members:
             return self._get_n_members(job_id)
         return 1
