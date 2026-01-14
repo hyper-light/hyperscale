@@ -1001,20 +1001,220 @@ class ManagerServer(HealthAwareServer):
         if not self._workflow_dispatcher or not self._job_manager:
             return
 
+        self._task_runner.run(
+            self._handle_worker_dead_for_job_reassignment,
+            job_id,
+            worker_id,
+        )
+
+    async def _handle_worker_dead_for_job_reassignment(
+        self,
+        job_id: str,
+        worker_id: str,
+    ) -> None:
+        if not self._workflow_dispatcher or not self._job_manager:
+            return
+
         job = self._job_manager.get_job_by_id(job_id)
         if not job:
             return
 
-        sub_workflows_to_requeue = [
-            sub.token_str
+        sub_workflows_to_reassign = [
+            (sub.token.workflow_id or "", sub.token_str)
             for sub in job.sub_workflows.values()
             if sub.worker_id == worker_id and sub.result is None
         ]
 
-        for sub_token in sub_workflows_to_requeue:
-            self._task_runner.run(
-                self._workflow_dispatcher.requeue_workflow,
-                sub_token,
+        for workflow_id, sub_token in sub_workflows_to_reassign:
+            await self._apply_workflow_reassignment_state(
+                job_id=job_id,
+                workflow_id=workflow_id,
+                sub_workflow_token=sub_token,
+                failed_worker_id=worker_id,
+                reason="worker_dead",
+            )
+
+    async def _apply_workflow_reassignment_state(
+        self,
+        job_id: str,
+        workflow_id: str,
+        sub_workflow_token: str,
+        failed_worker_id: str,
+        reason: str,
+    ) -> tuple[bool, bool]:
+        if not self._workflow_dispatcher or not self._job_manager:
+            return False, False
+
+        try:
+            reassignment_token = TrackingToken.parse(sub_workflow_token)
+        except ValueError as error:
+            await self._udp_logger.log(
+                ServerWarning(
+                    message=(
+                        "Workflow reassignment parse error: "
+                        f"{sub_workflow_token} ({error})"
+                    ),
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            return False, False
+
+        requeued = False
+        applied = False
+        dispatch_state_updated = False
+
+        async with self._workflow_reassignment_lock:
+            applied = await self._job_manager.apply_workflow_reassignment(
+                job_id=job_id,
+                workflow_id=workflow_id,
+                sub_workflow_token=sub_workflow_token,
+                failed_worker_id=failed_worker_id,
+            )
+
+            if reassignment_token.worker_id == failed_worker_id:
+                requeued = await self._workflow_dispatcher.requeue_workflow(
+                    sub_workflow_token
+                )
+                dispatch_state_updated = requeued
+                if requeued:
+                    await self._udp_logger.log(
+                        ServerInfo(
+                            message=(
+                                f"Requeued workflow {workflow_id[:8]}... from "
+                                f"failed worker {failed_worker_id[:8]}... ({reason})"
+                            ),
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
+                else:
+                    await self._udp_logger.log(
+                        ServerWarning(
+                            message=(
+                                f"Failed to requeue workflow {workflow_id[:8]}... from "
+                                f"failed worker {failed_worker_id[:8]}... - not found in pending"
+                            ),
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
+
+                if not self._worker_pool.get_healthy_worker_ids():
+                    await self._udp_logger.log(
+                        ServerWarning(
+                            message=(
+                                f"No healthy workers available to reassign workflow "
+                                f"{workflow_id[:8]}... for job {job_id[:8]}..."
+                            ),
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
+            elif reassignment_token.worker_id:
+                dispatch_state_updated = (
+                    await self._workflow_dispatcher.mark_workflow_assigned(
+                        job_id=job_id,
+                        workflow_id=workflow_id,
+                    )
+                )
+
+        if applied or dispatch_state_updated:
+            new_worker_id = (
+                reassignment_token.worker_id
+                if reassignment_token.worker_id != failed_worker_id
+                else None
+            )
+            await self._notify_gate_of_workflow_reassignment(
+                job_id=job_id,
+                workflow_id=workflow_id,
+                failed_worker_id=failed_worker_id,
+                reason=reason,
+                new_worker_id=new_worker_id,
+            )
+
+        return applied, requeued
+
+    def _aggregate_job_progress(
+        self,
+        job: JobInfo,
+    ) -> tuple[int, int, float]:
+        total_completed = 0
+        total_failed = 0
+        overall_rate = 0.0
+
+        for workflow_info in job.workflows.values():
+            for sub_workflow_token in workflow_info.sub_workflow_tokens:
+                sub_workflow_info = job.sub_workflows.get(sub_workflow_token)
+                if not sub_workflow_info:
+                    continue
+                if progress := sub_workflow_info.progress:
+                    total_completed += progress.completed_count
+                    total_failed += progress.failed_count
+                    overall_rate += progress.rate_per_second
+
+        return total_completed, total_failed, overall_rate
+
+    async def _notify_gate_of_workflow_reassignment(
+        self,
+        job_id: str,
+        workflow_id: str,
+        failed_worker_id: str,
+        reason: str,
+        new_worker_id: str | None,
+    ) -> None:
+        if not self._is_job_leader(job_id):
+            return
+
+        origin_gate_addr = self._manager_state.get_job_origin_gate(job_id)
+        if not origin_gate_addr:
+            return
+
+        job = self._job_manager.get_job_by_id(job_id)
+        if not job:
+            return
+
+        total_completed, total_failed, overall_rate = self._aggregate_job_progress(job)
+        elapsed_seconds = job.elapsed_seconds()
+
+        message = (
+            f"Workflow {workflow_id[:8]}... reassigned from worker "
+            f"{failed_worker_id[:8]}... ({reason})"
+        )
+        if new_worker_id:
+            message = f"{message} -> {new_worker_id[:8]}..."
+
+        push = JobStatusPush(
+            job_id=job_id,
+            status=job.status,
+            message=message,
+            total_completed=total_completed,
+            total_failed=total_failed,
+            overall_rate=overall_rate,
+            elapsed_seconds=elapsed_seconds,
+            is_final=False,
+            fence_token=self._leases.get_fence_token(job_id),
+        )
+
+        try:
+            await self._send_to_peer(
+                origin_gate_addr,
+                "job_status_push_forward",
+                push.dump(),
+                timeout=2.0,
+            )
+        except Exception as error:
+            await self._udp_logger.log(
+                ServerWarning(
+                    message=f"Failed to send reassignment update to gate: {error}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
             )
 
     # =========================================================================
