@@ -51,14 +51,14 @@ class ManagerRateLimitingCoordinator:
         config: "ManagerConfig",
         logger: "Logger",
         node_id: str,
-        task_runner,
+        task_runner: "TaskRunner",
         overload_detector: HybridOverloadDetector,
     ) -> None:
-        self._state = state
-        self._config = config
-        self._logger = logger
-        self._node_id = node_id
-        self._task_runner = task_runner
+        self._state: "ManagerState" = state
+        self._config: "ManagerConfig" = config
+        self._logger: "Logger" = logger
+        self._node_id: str = node_id
+        self._task_runner: "TaskRunner" = task_runner
 
         # Configure adaptive rate limiting
         adaptive_config = AdaptiveRateLimitConfig(
