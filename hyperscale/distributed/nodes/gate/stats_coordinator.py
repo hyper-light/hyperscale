@@ -153,13 +153,20 @@ class GateStatsCoordinator:
         )
 
         push_data = push.dump()
+        sequence = await self._state.record_client_update(
+            job_id,
+            "job_status_push",
+            push_data,
+        )
 
-        await self._send_status_push_with_retry(
+        delivered = await self._send_status_push_with_retry(
             job_id,
             callback,
             push_data,
             allow_peer_forwarding=True,
         )
+        if delivered:
+            await self._state.set_client_update_position(job_id, callback, sequence)
 
     async def _send_status_push_with_retry(
         self,

@@ -233,7 +233,6 @@ class ManagerStateSync:
         snapshot: WorkerStateSnapshot,
         worker_status: WorkerStatus | None,
     ) -> WorkerRegistration | None:
-        """Resolve or create a worker registration for state sync."""
         registration = self._registry.get_worker(snapshot.node_id)
         if registration:
             registration.total_cores = snapshot.total_cores
@@ -264,7 +263,6 @@ class ManagerStateSync:
         snapshot: WorkerStateSnapshot,
         health_state: str,
     ) -> None:
-        """Apply snapshot data to the worker pool state."""
         queue_depth = len(snapshot.active_workflows)
         heartbeat = WorkerHeartbeat(
             node_id=snapshot.node_id,

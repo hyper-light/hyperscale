@@ -2504,7 +2504,8 @@ class ManagerServer(HealthAwareServer):
                     ServerWarning(
                         message=(
                             "Cannot notify worker of leader transfer; "
-                            f"worker {worker_id[:8]}... not registered for job {job_id[:8]}..."
+                            f"worker {worker_id[:8]}... not registered "
+                            f"for job {job_id[:8]}..."
                         ),
                         node_host=self._host,
                         node_port=self._tcp_port,
