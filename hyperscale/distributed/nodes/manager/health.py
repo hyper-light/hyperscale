@@ -138,9 +138,6 @@ class ManagerHealthMonitor:
         # Global dead workers (affects all jobs)
         self._global_dead_workers: set[str] = set()
 
-        # Lock for health state mutations (lazily created)
-        self._health_state_lock: asyncio.Lock | None = None
-
     async def handle_worker_heartbeat(
         self,
         heartbeat: WorkerHeartbeat,
