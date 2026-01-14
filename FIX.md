@@ -388,22 +388,22 @@ These duplicate class names create confusion and potential import conflicts.
 
 ---
 
-## 6. Stub Methods Requiring Implementation
+## 6. Stub Methods Requiring Implementation ✅ ALL RESOLVED
 
 Based on grep for `pass$` at end of methods (excluding exception handlers).
 
-### 6.1 High Priority Stubs
+### 6.1 High Priority Stubs ✅ ALL FIXED
 
-| File | Line | Method |
-|------|------|--------|
-| `nodes/gate/server.py` | 2354 | `_record_dc_job_stats()` |
-| `nodes/client/leadership.py` | 259 | `orphan_check_loop()` |
+| File | Line | Method | Status |
+|------|------|--------|--------|
+| `nodes/gate/server.py` | 2354 | `_record_dc_job_stats()` | ✅ Fixed in Session 4 |
+| `nodes/client/leadership.py` | 259 | `orphan_check_loop()` | ✅ Fixed in 3.5 (wrong attributes corrected) |
 
-### 6.2 Timeout Strategy Stubs
+### 6.2 Timeout Strategy Stubs ✅ VERIFIED IMPLEMENTED
 
-| File | Lines | Methods |
-|------|-------|---------|
-| `jobs/timeout_strategy.py` | 58, 73, 88, 108, 127, 149, 163, 177 | Multiple timeout strategy methods |
+| File | Lines | Methods | Status |
+|------|-------|---------|--------|
+| `jobs/timeout_strategy.py` | 58, 73, 88, 108, 127, 149, 163, 177 | Multiple timeout strategy methods | ✅ All implemented |
 
 ### 6.3 Acceptable `pass` Statements
 
@@ -415,15 +415,15 @@ Many `pass` statements are in exception handlers where silently ignoring errors 
 
 ---
 
-## 7. Dead Code to Remove
+## 7. Dead Code to Remove ✅ ALL RESOLVED
 
-### 7.1 Confirmed Dead Code
+### 7.1 Dead Code Status
 
-| File | Lines | Description |
-|------|-------|-------------|
-| `nodes/manager/server.py` | 2295-2311 | First `_select_timeout_strategy()` (duplicate) |
-| `nodes/gate/handlers/tcp_state_sync.py` | 153-217 | `handle_state_sync_response()` (never called) |
-| `nodes/gate/server.py` | 892-901 | Job ledger initialization (never used) |
+| File | Lines | Description | Status |
+|------|-------|-------------|--------|
+| `nodes/manager/server.py` | 2295-2311 | First `_select_timeout_strategy()` (duplicate) | ✅ Removed in Session 4 |
+| `nodes/gate/handlers/tcp_state_sync.py` | 153-217 | `handle_state_sync_response()` (never called) | ✅ Method doesn't exist (verified 3.6) |
+| `nodes/gate/server.py` | 892-901 | Job ledger initialization (never used) | ⏸️ Deferred - may be for future use (4.2) |
 
 ### 7.2 Recently Removed
 
