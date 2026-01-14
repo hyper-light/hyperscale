@@ -163,6 +163,7 @@ class HierarchicalFailureDetector:
         self._job_manager = JobSuspicionManager(
             config=job_config,
             on_expired=self._handle_job_expiration,
+            on_error=on_error,
             get_n_members=get_job_n_members,
             get_lhm_multiplier=get_lhm_multiplier,
         )
