@@ -80,6 +80,7 @@ Systematic bug fixes for the Hyperscale distributed performance testing framewor
 - [x] **Task 41**: Add LeaseTransfer sender in gate code (added _send_lease_transfer to leadership_coordinator.py, called during transfer_leadership)
 - [x] **Task 62**: Connection storm mitigation - add explicit connection caps (added is_at_capacity to ServerState, reject in connection_made)
 - [x] **Task 63**: Protocol size violations - send structured error response (added to_error_response to FrameTooLargeError, send before close)
+- [x] **Task 60**: Routing SLO-constraint gating - filter by SLO targets (added SLO exclusion reasons, latency/throughput filtering to CandidateFilter)
 
 ---
 
