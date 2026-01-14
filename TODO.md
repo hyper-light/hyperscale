@@ -1,7 +1,7 @@
 # Hyperscale Distributed Bug Fixes TODO
 
 **Generated**: 2026-01-14  
-**Progress**: 35/64 completed (55%)
+**Progress**: 40/64 completed (63%)
 
 ---
 
@@ -58,10 +58,15 @@ Systematic bug fixes for the Hyperscale distributed performance testing framewor
 - [x] **Task 19**: Add client-side fallback to query gate for leader on missed transfers
 - [x] **Task 22**: Fix dead peer reaping - remove from _gate_peer_unhealthy_since (verified - already handled)
 - [x] **Task 23**: Fix peer cleanup to fully purge UDP-TCP mapping (verified - already handled)
+- [x] **Task 13**: Add JobFinalResult peer-forwarding for gate resilience (verified - already implemented in tcp_state_sync.py)
+- [x] **Task 14**: Add immediate status replay after client reconnect/register_callback (verified - already implemented)
+- [x] **Task 16**: Add job_status_push retry/peer-forward on failure (verified - already implemented in stats_coordinator.py)
+- [x] **Task 17**: Invoke progress callbacks on batch updates (verified - already implemented in stats_coordinator.py)
+- [x] **Task 18**: Add client poll-on-reconnect or replay mechanism (verified - already implemented with last_sequence)
 
 ---
 
-## High Priority Tasks (15 remaining)
+## High Priority Tasks (10 remaining)
 
 ### Task 13: Add JobFinalResult peer-forwarding for gate resilience
 **Status:** Pending  
