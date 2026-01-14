@@ -1186,7 +1186,6 @@ class GateServer(HealthAwareServer):
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
-        transport: asyncio.Transport,
     ):
         """Handle state sync request from peer gate."""
         if self._state_sync_handler:

@@ -4422,7 +4422,7 @@ class ManagerServer(HealthAwareServer):
             return RegisterCallbackResponse(
                 job_id=job_id,
                 success=True,
-                status=job.status.value,
+                status=job.status,
                 total_completed=total_completed,
                 total_failed=total_failed,
                 elapsed_seconds=elapsed,
