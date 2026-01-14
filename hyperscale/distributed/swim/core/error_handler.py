@@ -105,17 +105,18 @@ class ErrorStats:
         self._prune_old_entries(now)
         error_count = len(self._timestamps)
         should_open = self._should_open_circuit(error_count)
+        current_state = self.circuit_state
 
         # Check if we should open the circuit
-        if self._circuit_state == CircuitState.CLOSED:
+        if current_state == CircuitState.CLOSED:
             if should_open:
                 self._circuit_state = CircuitState.OPEN
                 self._circuit_opened_at = now
-        elif self._circuit_state == CircuitState.HALF_OPEN:
+        elif current_state == CircuitState.HALF_OPEN:
             # Error during half-open state means recovery failed - reopen circuit
             self._circuit_state = CircuitState.OPEN
             self._circuit_opened_at = now
-        elif self._circuit_state == CircuitState.OPEN:
+        elif current_state == CircuitState.OPEN:
             self._circuit_opened_at = now
 
     def record_failure(self) -> None:
