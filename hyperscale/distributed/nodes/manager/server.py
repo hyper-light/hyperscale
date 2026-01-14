@@ -576,7 +576,7 @@ class ManagerServer(HealthAwareServer):
             get_health_has_quorum=self._has_quorum_available,
             get_health_throughput=self._get_dispatch_throughput,
             get_health_expected_throughput=self._get_expected_dispatch_throughput,
-            get_health_overload_state=lambda: self._manager_health_state,
+            get_health_overload_state=self._get_manager_health_state_snapshot,
             get_current_gate_leader_id=lambda: self._manager_state.current_gate_leader_id,
             get_current_gate_leader_host=lambda: (
                 self._manager_state.current_gate_leader_addr[0]
@@ -1987,13 +1987,11 @@ class ManagerServer(HealthAwareServer):
                 )
                 new_state_str = new_state.value
 
-                if new_state_str != self._manager_health_state:
-                    self._previous_manager_health_state = self._manager_health_state
-                    self._manager_health_state = new_state_str
-                    self._log_manager_health_transition(
-                        self._previous_manager_health_state,
-                        new_state_str,
-                    )
+                previous_state, current_state, changed = await self._set_manager_health_state(
+                    new_state_str
+                )
+                if changed:
+                    self._log_manager_health_transition(previous_state, current_state)
 
             except asyncio.CancelledError:
                 break

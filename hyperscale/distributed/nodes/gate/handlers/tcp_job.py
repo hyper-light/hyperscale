@@ -619,6 +619,17 @@ class GateJobHandler:
             job = self._job_manager.get_job(progress.job_id)
             if job:
                 if self._is_terminal_status(job.status):
+                    await self._logger.log(
+                        ServerInfo(
+                            message=(
+                                "Discarding progress update for terminal job "
+                                f"{progress.job_id} (status={job.status})"
+                            ),
+                            node_host=self._get_host(),
+                            node_port=self._get_tcp_port(),
+                            node_id=self._get_node_id().short,
+                        )
+                    )
                     await self._release_job_lease(progress.job_id)
                     return JobProgressAck(
                         gate_id=self._get_node_id().full,
