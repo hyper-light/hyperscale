@@ -20,6 +20,7 @@ from hyperscale.distributed.models import (
     WorkerRegistration,
     WorkerState,
     WorkerStateSnapshot,
+    WorkerStatus,
 )
 from hyperscale.distributed.reliability import (
     calculate_jittered_delay,
@@ -450,8 +451,8 @@ class ManagerStateSync:
 
         request = StateSyncRequest(
             requester_id=self._node_id,
-            sync_type="manager_state",
-            state_version=self._state._state_version,
+            requester_role="manager",
+            since_version=self._state.state_version,
         )
 
         for peer_addr in peers:

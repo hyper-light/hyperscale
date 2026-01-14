@@ -411,11 +411,23 @@ class GateStatsCoordinator:
             return
 
         for stats in stats_list:
-            await self._send_periodic_push_with_retry(
+            payload = stats.dump()
+            sequence = await self._state.record_client_update(
+                job_id,
+                "windowed_stats_push",
+                payload,
+            )
+            delivered = await self._send_periodic_push_with_retry(
                 callback,
                 "windowed_stats_push",
-                stats.dump(),
+                payload,
             )
+            if delivered:
+                await self._state.set_client_update_position(
+                    job_id,
+                    callback,
+                    sequence,
+                )
 
 
 __all__ = ["GateStatsCoordinator"]
