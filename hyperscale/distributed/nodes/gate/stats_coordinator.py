@@ -116,14 +116,9 @@ class GateStatsCoordinator:
         event_type: str,
         payload: bytes | None = None,
     ) -> None:
-        """
-        Send an immediate status update to the job's callback address.
+        if not self._has_job(job_id):
+            return
 
-        Args:
-            job_id: Job identifier
-            event_type: Type of event (status_change, progress, etc.)
-            payload: Optional pre-serialized payload
-        """
         if not (callback := self._get_job_callback(job_id)):
             return
 
