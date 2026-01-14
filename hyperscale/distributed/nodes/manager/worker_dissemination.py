@@ -27,7 +27,13 @@ if TYPE_CHECKING:
     from hyperscale.distributed.nodes.manager.state import ManagerState
     from hyperscale.distributed.nodes.manager.config import ManagerConfig
     from hyperscale.distributed.jobs.worker_pool import WorkerPool
+    from hyperscale.distributed.taskex import TaskRunner
     from hyperscale.logging import Logger
+
+SendTcpFunc = Callable[
+    [tuple[str, int], str, bytes, float],
+    Coroutine[Any, Any, bytes | None],
+]
 
 
 class WorkerDisseminator:

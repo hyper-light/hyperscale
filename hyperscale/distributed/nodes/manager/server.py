@@ -1121,6 +1121,10 @@ class ManagerServer(HealthAwareServer):
                 self._registry.mark_gate_healthy(gate_id)
                 break
 
+            elif (gate_info.udp_host, gate_info.udp_port) == udp_addr:
+                self._registry.mark_gate_healthy(gate_id)
+                break
+
     async def _handle_job_leader_failure(self, failed_addr: tuple[str, int]) -> None:
         """Handle job leader manager failure."""
         if not self.is_leader():
