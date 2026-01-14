@@ -75,5 +75,14 @@ class WindowedStatsPushHandler:
 
             return b"ok"
 
-        except Exception:
+        except Exception as error:
+            if self._logger:
+                await self._logger.log(
+                    ServerWarning(
+                        message=f"Windowed stats push handling failed: {error}",
+                        node_host="client",
+                        node_port=0,
+                        node_id="client",
+                    )
+                )
             return b"error"
