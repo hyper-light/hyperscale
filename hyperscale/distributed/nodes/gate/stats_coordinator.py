@@ -135,6 +135,7 @@ class GateStatsCoordinator:
             JobStatus.COMPLETED.value,
             JobStatus.FAILED.value,
             JobStatus.CANCELLED.value,
+            JobStatus.TIMEOUT.value,
         )
         message = f"Job {job_id}: {job.status}"
         if is_final:
