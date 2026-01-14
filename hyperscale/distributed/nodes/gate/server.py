@@ -4464,18 +4464,20 @@ class GateServer(HealthAwareServer):
 
         callback = self._job_manager.get_callback(job_id)
         if callback:
-            try:
-                await self.send_tcp(
-                    callback,
-                    "workflow_result_push",
-                    client_push.dump(),
-                    timeout=5.0,
-                )
-            except Exception as send_error:
+            payload = client_push.dump()
+            delivered = await self._record_and_send_client_update(
+                job_id,
+                callback,
+                "workflow_result_push",
+                payload,
+                timeout=5.0,
+                log_failure=False,
+            )
+            if not delivered:
                 self._task_runner.run(
                     self._udp_logger.log,
                     ServerWarning(
-                        message=f"Failed to send workflow result to client {callback}: {send_error}",
+                        message=f"Failed to send workflow result to client {callback}",
                         node_host=self._host,
                         node_port=self._tcp_port,
                         node_id=self._node_id.short,
