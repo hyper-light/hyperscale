@@ -2133,11 +2133,9 @@ class GateStateSnapshot(Message):
     job_dc_managers: dict[str, dict[str, tuple[str, int]]] = field(
         default_factory=dict
     )  # job_id -> {dc_id -> (host, port)}
-    # Per-job per-DC workflow results used for cross-DC aggregation
     workflow_dc_results: dict[str, dict[str, dict[str, "WorkflowResultPush"]]] = field(
         default_factory=dict
     )
-    # Progress callback addresses for active jobs
     progress_callbacks: dict[str, tuple[str, int]] = field(default_factory=dict)
 
 
