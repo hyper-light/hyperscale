@@ -2091,6 +2091,9 @@ class ManagerStateSnapshot(Message):
     job_leader_addrs: dict[str, tuple[str, int]] = field(
         default_factory=dict
     )  # job_id -> (host, tcp_port)
+    job_fence_tokens: dict[str, int] = field(
+        default_factory=dict
+    )  # job_id -> fencing token for leadership consistency
     job_layer_versions: dict[str, int] = field(
         default_factory=dict
     )  # job_id -> layer version
