@@ -147,7 +147,7 @@ class ClusterFactory:
         gate_specs, manager_specs, worker_specs = _group_node_specs(node_specs)
         if not gate_specs:
             raise ValueError("Node specs must include at least one gate")
-        self._env = Env(**(spec.env_overrides or {}))
+        self._env = Env.model_validate(spec.env_overrides or {})
         cluster = TestCluster(config=spec)
         datacenter_ids = sorted(
             {
