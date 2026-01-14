@@ -708,6 +708,31 @@ class WorkerServer(HealthAwareServer):
         )
         self._lifecycle_manager.add_background_task(self._resource_sample_task)
 
+    async def _run_pending_result_retry_loop(
+        self,
+        get_healthy_managers: callable,
+        send_tcp: callable,
+    ) -> None:
+        while self._running:
+            try:
+                if get_healthy_managers():
+                    await self._progress_reporter.retry_pending_results(
+                        send_tcp=send_tcp,
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id_short=self._node_id.short,
+                        task_runner_run=self._task_runner.run,
+                    )
+                await asyncio.sleep(5.0)
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                await self._udp_logger.log(
+                    f"Pending result retry failed: {exc}",
+                    level="debug",
+                )
+                await asyncio.sleep(5.0)
+
     async def _run_resource_sample_loop(self) -> None:
         while self._running:
             try:

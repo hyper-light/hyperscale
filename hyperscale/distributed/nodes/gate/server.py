@@ -86,6 +86,7 @@ from hyperscale.distributed.models import (
     JobLeadershipAck,
     JobLeaderManagerTransfer,
     JobLeaderManagerTransferAck,
+    ManagerJobLeaderTransfer,
     GateStateSyncRequest,
     GateStateSyncResponse,
     JobStatsCRDT,
@@ -1714,12 +1715,38 @@ class GateServer(HealthAwareServer):
             self._task_runner.run(
                 self._udp_logger.log,
                 ServerInfo(
-                    message=f"Updated job {transfer.job_id[:8]}... DC {transfer.datacenter_id} manager: {old_manager_addr} -> {transfer.new_manager_addr}",
+                    message=(
+                        f"Updated job {transfer.job_id[:8]}... DC {transfer.datacenter_id} manager: "
+                        f"{old_manager_addr} -> {transfer.new_manager_addr}"
+                    ),
                     node_host=self._host,
                     node_port=self._tcp_port,
                     node_id=self._node_id.short,
                 ),
             )
+
+            callback = self._progress_callbacks.get(transfer.job_id)
+            if callback:
+                manager_transfer = ManagerJobLeaderTransfer(
+                    job_id=transfer.job_id,
+                    new_manager_id=transfer.new_manager_id,
+                    new_manager_addr=transfer.new_manager_addr,
+                    fence_token=transfer.fence_token,
+                    datacenter_id=transfer.datacenter_id,
+                    old_manager_id=transfer.old_manager_id,
+                    old_manager_addr=old_manager_addr,
+                )
+                try:
+                    await self._send_tcp(
+                        callback,
+                        "receive_manager_job_leader_transfer",
+                        manager_transfer.dump(),
+                    )
+                except Exception as error:
+                    await self.handle_exception(
+                        error,
+                        "job_leader_manager_transfer_notify_client",
+                    )
 
             return JobLeaderManagerTransferAck(
                 job_id=transfer.job_id,

@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any, Callable, Awaitable
 from hyperscale.distributed.models import (
     JobLeadershipAnnouncement,
     JobStatus,
+    JobStatusPush,
 )
 from hyperscale.logging import Logger
 from hyperscale.logging.hyperscale_logging_models import (
@@ -75,6 +76,7 @@ class GateOrphanJobCoordinator:
         "_get_active_peers",
         "_orphan_check_interval_seconds",
         "_orphan_grace_period_seconds",
+        "_orphan_timeout_seconds",
         "_takeover_jitter_min_seconds",
         "_takeover_jitter_max_seconds",
         "_running",
