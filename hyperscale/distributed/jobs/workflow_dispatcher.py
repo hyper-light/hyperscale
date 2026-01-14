@@ -1212,6 +1212,17 @@ class WorkflowDispatcher:
                 return True
             return False
 
+    async def unassign_workflow(self, job_id: str, workflow_id: str) -> bool:
+        key = f"{job_id}:{workflow_id}"
+        async with self._pending_lock:
+            if pending := self._pending.get(key):
+                pending.dispatched = False
+                pending.dispatch_in_progress = False
+                pending.dispatched_at = 0.0
+                pending.clear_ready()
+                return True
+            return False
+
     async def mark_workflow_assigned(self, job_id: str, workflow_id: str) -> bool:
         key = f"{job_id}:{workflow_id}"
         async with self._pending_lock:
