@@ -2721,6 +2721,51 @@ class GateServer(HealthAwareServer):
 
         return False
 
+    async def _forward_job_status_push_to_peers(
+        self,
+        job_id: str,
+        push_data: bytes,
+    ) -> bool:
+        """
+        Forward job status push to peer gates for delivery reliability.
+
+        Used when direct client delivery fails after retries. Peers may have
+        a better route to the client or can store-and-forward when the client
+        reconnects.
+        """
+        for gate_id, gate_info in list(self._modular_state.iter_known_gates()):
+            if gate_id == self._node_id.full:
+                continue
+
+            gate_addr = (gate_info.tcp_host, gate_info.tcp_port)
+            if await self._peer_gate_circuit_breaker.is_circuit_open(gate_addr):
+                continue
+
+            circuit = await self._peer_gate_circuit_breaker.get_circuit(gate_addr)
+            try:
+                response, _ = await self.send_tcp(
+                    gate_addr,
+                    "job_status_push_forward",
+                    push_data,
+                    timeout=3.0,
+                )
+                if response in (b"ok", b"forwarded"):
+                    circuit.record_success()
+                    return True
+            except Exception as forward_error:
+                circuit.record_failure()
+                await self._udp_logger.log(
+                    ServerDebug(
+                        message=f"Failed to forward job status push for {job_id} to gate {gate_id}: {forward_error}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+                continue
+
+        return False
+
     async def _pop_workflow_results(
         self, job_id: str, workflow_id: str
     ) -> dict[str, WorkflowResultPush]:
