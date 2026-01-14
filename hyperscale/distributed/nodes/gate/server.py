@@ -756,6 +756,13 @@ class GateServer(HealthAwareServer):
             on_partition_detected=self._on_partition_detected,
         )
 
+        self._job_router = GateJobRouter(
+            coordinate_tracker=self._coordinate_tracker,
+            get_datacenter_candidates=lambda: self._health_coordinator.build_datacenter_candidates(
+                list(self._datacenter_managers.keys())
+            ),
+        )
+
         self._orphan_job_coordinator = GateOrphanJobCoordinator(
             state=self._modular_state,
             logger=self._udp_logger,
