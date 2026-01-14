@@ -705,6 +705,9 @@ class GateDispatchCoordinator:
                 self._record_dc_manager_for_job(job_id, target_dc, accepting_manager)
                 continue
 
+            if self._record_dispatch_failure:
+                self._record_dispatch_failure(job_id, target_dc)
+
             fallback_dc, fallback_manager = await self._try_fallback_dispatch(
                 job_id, target_dc, submission, fallback_queue
             )
@@ -714,8 +717,6 @@ class GateDispatchCoordinator:
                 self._record_dc_manager_for_job(job_id, fallback_dc, fallback_manager)
             else:
                 failed.append(target_dc)
-                if self._record_dispatch_failure:
-                    self._record_dispatch_failure(job_id, target_dc)
 
         return (successful, failed)
 
