@@ -5,7 +5,7 @@ from hyperscale.distributed.nodes.gate import GateServer
 from hyperscale.distributed.nodes.manager import ManagerServer
 from hyperscale.distributed.nodes.worker import WorkerServer
 
-from ..specs.cluster_spec import ClusterSpec
+from tests.framework.specs.cluster_spec import ClusterSpec
 
 
 @dataclass(slots=True)

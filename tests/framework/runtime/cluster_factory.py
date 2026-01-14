@@ -6,8 +6,8 @@ from hyperscale.distributed.nodes.gate import GateServer
 from hyperscale.distributed.nodes.manager import ManagerServer
 from hyperscale.distributed.nodes.worker import WorkerServer
 
-from .test_cluster import TestCluster
-from ..specs.cluster_spec import ClusterSpec
+from tests.framework.runtime.test_cluster import TestCluster
+from tests.framework.specs.cluster_spec import ClusterSpec
 
 
 def _build_datacenter_ids(dc_count: int) -> list[str]:
