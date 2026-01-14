@@ -330,6 +330,10 @@ class GateServer(HealthAwareServer):
             str, dict[str, dict[str, WorkflowResultPush]]
         ] = {}
         self._workflow_dc_results_lock = asyncio.Lock()
+        self._workflow_result_timeout_seconds: float = getattr(
+            env, "GATE_WORKFLOW_RESULT_TIMEOUT_SECONDS", 300.0
+        )
+        self._workflow_result_timeout_tokens: dict[str, dict[str, str]] = {}
         self._job_workflow_ids: dict[str, set[str]] = {}
 
         # Per-job leadership tracking
@@ -1901,6 +1905,30 @@ class GateServer(HealthAwareServer):
 
         except Exception as error:
             await self.handle_exception(error, "job_status_push_forward")
+            return b"error"
+
+    @tcp.receive()
+    async def job_final_result_forward(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ):
+        """Handle forwarded job final result from peer gate."""
+        try:
+            result = JobFinalResult.load(data)
+            callback = self._job_manager.get_callback(result.job_id)
+            if not callback:
+                return b"no_callback"
+
+            try:
+                await self._send_tcp(callback, "job_final_result", data)
+                return b"ok"
+            except Exception:
+                return b"forwarded"
+
+        except Exception as error:
+            await self.handle_exception(error, "job_final_result_forward")
             return b"error"
 
     # =========================================================================

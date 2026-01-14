@@ -1987,9 +1987,11 @@ class ManagerServer(HealthAwareServer):
                 )
                 new_state_str = new_state.value
 
-                previous_state, current_state, changed = await self._set_manager_health_state(
-                    new_state_str
-                )
+                (
+                    previous_state,
+                    current_state,
+                    changed,
+                ) = await self._set_manager_health_state(new_state_str)
                 if changed:
                     self._log_manager_health_transition(previous_state, current_state)
 
@@ -2324,7 +2326,7 @@ class ManagerServer(HealthAwareServer):
             overloaded_worker_count=health_state_counts.get("overloaded", 0),
             stressed_worker_count=health_state_counts.get("stressed", 0),
             busy_worker_count=health_state_counts.get("busy", 0),
-            health_overload_state=self._manager_health_state,
+            health_overload_state=self._manager_health_state_snapshot,
         )
 
     def _get_healthy_gate_tcp_addrs(self) -> list[tuple[str, int]]:
