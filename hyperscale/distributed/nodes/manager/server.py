@@ -2949,6 +2949,20 @@ class ManagerServer(HealthAwareServer):
             timeout=timeout or self._config.tcp_timeout_standard_seconds,
         )
 
+    def _export_stats_checkpoint(self) -> list[tuple[float, float]]:
+        """Export pending stats checkpoint for peer recovery (Task 33)."""
+        if hasattr(self, "_stats") and self._stats is not None:
+            return self._stats.export_stats_checkpoint()
+        return []
+
+    async def _import_stats_checkpoint(
+        self, checkpoint: list[tuple[float, float]]
+    ) -> int:
+        """Import stats checkpoint from peer during recovery (Task 33)."""
+        if hasattr(self, "_stats") and self._stats is not None:
+            return await self._stats.import_stats_checkpoint(checkpoint)
+        return 0
+
     async def _send_workflow_dispatch(
         self,
         worker_addr: tuple[str, int],
