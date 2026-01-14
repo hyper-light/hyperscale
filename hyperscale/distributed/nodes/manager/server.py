@@ -4675,6 +4675,21 @@ class ManagerServer(HealthAwareServer):
                     error=f"Manager is {self._manager_state.manager_state_enum.value}, not accepting jobs",
                 ).dump()
 
+            # Leader fencing: only DC leader accepts new jobs to prevent duplicates
+            # during multi-gate submit storms (FIX 2.5)
+            if not self.is_leader():
+                leader_addr = self._leader_election.state.current_leader
+                leader_hint = (
+                    f"{leader_addr[0]}:{leader_addr[1]}" if leader_addr else "unknown"
+                )
+                return JobAck(
+                    job_id=submission.job_id,
+                    accepted=False,
+                    error=f"Not DC leader, retry at leader: {leader_hint}",
+                    protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+                    protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+                ).dump()
+
             if idempotency_key is not None and self._idempotency_ledger is not None:
                 found, entry = await self._idempotency_ledger.check_or_reserve(
                     idempotency_key,
