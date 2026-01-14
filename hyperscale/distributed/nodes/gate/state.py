@@ -315,6 +315,60 @@ class GateRuntimeState:
         async with self._get_backpressure_lock():
             self._update_dc_backpressure_locked(datacenter_id, datacenter_managers)
 
+    # JobProgress sequence tracking methods (Task 31)
+    def _get_job_progress_lock(self) -> asyncio.Lock:
+        if self._job_progress_lock is None:
+            self._job_progress_lock = asyncio.Lock()
+        return self._job_progress_lock
+
+    async def check_and_record_progress(
+        self,
+        job_id: str,
+        datacenter_id: str,
+        fence_token: int,
+        timestamp: float,
+    ) -> tuple[bool, str]:
+        """
+        Check if a JobProgress update should be accepted based on ordering/dedup.
+
+        Returns:
+            (accepted, reason) - True if update should be processed, False if rejected
+        """
+        key = (job_id, datacenter_id)
+        dedup_key = (fence_token, timestamp)
+
+        async with self._get_job_progress_lock():
+            seen_set = self._job_progress_seen.get(key)
+            if seen_set is not None and dedup_key in seen_set:
+                return (False, "duplicate")
+
+            last_sequence = self._job_progress_sequences.get(key, 0)
+            if fence_token < last_sequence:
+                return (False, "out_of_order")
+
+            if seen_set is None:
+                seen_set = set()
+                self._job_progress_seen[key] = seen_set
+
+            seen_set.add(dedup_key)
+            if len(seen_set) > 100:
+                oldest = min(seen_set, key=lambda x: x[1])
+                seen_set.discard(oldest)
+
+            if fence_token > last_sequence:
+                self._job_progress_sequences[key] = fence_token
+
+            return (True, "accepted")
+
+    def cleanup_job_progress_tracking(self, job_id: str) -> None:
+        """Clean up progress tracking state for a completed job."""
+        keys_to_remove = [
+            key for key in self._job_progress_sequences if key[0] == job_id
+        ]
+        for key in keys_to_remove:
+            self._job_progress_sequences.pop(key, None)
+            self._job_progress_seen.pop(key, None)
+
     # Lease methods
     def get_lease_key(self, job_id: str, datacenter_id: str) -> str:
         """Get the lease key for a job-DC pair."""
