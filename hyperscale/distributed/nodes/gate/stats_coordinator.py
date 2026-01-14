@@ -198,6 +198,24 @@ class GateStatsCoordinator:
             }
         )
 
+    async def _send_periodic_push_with_retry(
+        self,
+        callback: tuple[str, int],
+        message_type: str,
+        data: bytes,
+        timeout: float = 2.0,
+    ) -> bool:
+        for attempt in range(self.PERIODIC_PUSH_MAX_RETRIES):
+            try:
+                await self._send_tcp(callback, message_type, data, timeout=timeout)
+                return True
+            except Exception:
+                if attempt < self.PERIODIC_PUSH_MAX_RETRIES - 1:
+                    await asyncio.sleep(
+                        self.PERIODIC_PUSH_BASE_DELAY_SECONDS * (2**attempt)
+                    )
+        return False
+
     async def batch_stats_update(self) -> None:
         """
         Process a batch of Tier 2 (Periodic) updates per AD-15.
@@ -247,15 +265,12 @@ class GateStatsCoordinator:
                 per_dc_stats=per_dc_stats,
             )
 
-            try:
-                await self._send_tcp(
-                    callback,
-                    "job_batch_push",
-                    batch_push.dump(),
-                    timeout=2.0,
-                )
-            except Exception:
-                pass  # Client unreachable - continue with others
+            await self._send_periodic_push_with_retry(
+                callback,
+                "job_batch_push",
+                batch_push.dump(),
+                timeout=2.0,
+            )
 
     async def push_windowed_stats(self) -> None:
         """
@@ -284,10 +299,11 @@ class GateStatsCoordinator:
             return
 
         for stats in stats_list:
-            try:
-                await self._send_tcp(callback, "windowed_stats_push", stats.dump())
-            except Exception:
-                pass
+            await self._send_periodic_push_with_retry(
+                callback,
+                "windowed_stats_push",
+                stats.dump(),
+            )
 
 
 __all__ = ["GateStatsCoordinator"]
