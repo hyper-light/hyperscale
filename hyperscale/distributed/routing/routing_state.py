@@ -162,6 +162,13 @@ class JobRoutingState:
         self.forced_switch_at = time.monotonic()
         self.primary_datacenter = None
 
+    def reset_primary_selection(self) -> None:
+        """Reset the primary selection to force re-routing."""
+        self.primary_datacenter = None
+        self.primary_selected_at = 0.0
+        self.last_score = 0.0
+        self.forced_switch_at = time.monotonic()
+
     def select_primary(
         self,
         datacenter: str,

@@ -303,6 +303,39 @@ class GateStatsCoordinator:
 
     async def _push_windowed_stats(self, job_id: str) -> None:
         if not self._has_job(job_id):
+            await self._logger.log(
+                ServerDebug(
+                    message=f"Discarding windowed stats for unknown job {job_id}",
+                    node_host=self._node_host,
+                    node_port=self._node_port,
+                    node_id=self._node_id,
+                )
+            )
+            await self._windowed_stats.cleanup_job_windows(job_id)
+            return
+
+        job_status = self._get_job_status(job_id)
+        terminal_states = {
+            JobStatus.COMPLETED.value,
+            JobStatus.FAILED.value,
+            JobStatus.CANCELLED.value,
+            JobStatus.TIMEOUT.value,
+        }
+
+        if not job_status or job_status.status in terminal_states:
+            status = job_status.status if job_status else "missing"
+            await self._logger.log(
+                ServerDebug(
+                    message=(
+                        "Discarding windowed stats for job "
+                        f"{job_id} in terminal state {status}"
+                    ),
+                    node_host=self._node_host,
+                    node_port=self._node_port,
+                    node_id=self._node_id,
+                )
+            )
+            await self._windowed_stats.cleanup_job_windows(job_id)
             return
 
         if not (callback := self._state._progress_callbacks.get(job_id)):
