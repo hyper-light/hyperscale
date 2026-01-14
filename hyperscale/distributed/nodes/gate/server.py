@@ -36,7 +36,7 @@ import statistics
 import time
 from collections import defaultdict
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 import cloudpickle
 

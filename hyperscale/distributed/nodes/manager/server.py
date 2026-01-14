@@ -84,6 +84,8 @@ from hyperscale.distributed.models import (
     JobStateSyncAck,
     JobLeaderGateTransfer,
     JobLeaderGateTransferAck,
+    JobLeaderWorkerTransfer,
+    JobLeaderWorkerTransferAck,
     ProvisionRequest,
     ProvisionConfirm,
     ProvisionCommit,
@@ -374,6 +376,7 @@ class ManagerServer(HealthAwareServer):
         self._manager_health_state_snapshot: str = "healthy"
         self._previous_manager_health_state: str = "healthy"
         self._manager_health_state_lock: asyncio.Lock = asyncio.Lock()
+        self._workflow_reassignment_lock: asyncio.Lock = asyncio.Lock()
         self._load_shedder = ManagerLoadShedder(
             config=self._config,
             logger=self._udp_logger,

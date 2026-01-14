@@ -102,6 +102,8 @@ class GateOrphanJobCoordinator:
         get_node_addr: Callable[[], tuple[str, int]],
         send_tcp: Callable[[tuple[str, int], str, bytes, float], Awaitable[bytes]],
         get_active_peers: Callable[[], set[tuple[str, int]]],
+        forward_status_push_to_peers: Callable[[str, bytes], Awaitable[bool]]
+        | None = None,
         orphan_check_interval_seconds: float = 15.0,
         orphan_grace_period_seconds: float = 30.0,
         orphan_timeout_seconds: float = 300.0,
