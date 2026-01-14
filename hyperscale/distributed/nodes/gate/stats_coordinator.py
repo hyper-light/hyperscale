@@ -436,6 +436,15 @@ class GateStatsCoordinator:
             return
 
         if not (callback := self._state._progress_callbacks.get(job_id)):
+            await self._logger.log(
+                ServerDebug(
+                    message=f"No progress callback registered for job {job_id}, cleaning up windows",
+                    node_host=self._node_host,
+                    node_port=self._node_port,
+                    node_id=self._node_id,
+                )
+            )
+            await self._windowed_stats.cleanup_job_windows(job_id)
             return
 
         stats_list = await self._windowed_stats.get_aggregated_stats(job_id)
