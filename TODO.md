@@ -1,7 +1,7 @@
 # Hyperscale Distributed Bug Fixes TODO
 
 **Generated**: 2026-01-14  
-**Progress**: 59/64 completed (92%)
+**Progress**: 64/64 completed (100%)
 
 ---
 
@@ -82,6 +82,8 @@ Systematic bug fixes for the Hyperscale distributed performance testing framewor
 - [x] **Task 63**: Protocol size violations - send structured error response (added to_error_response to FrameTooLargeError, send before close)
 - [x] **Task 60**: Routing SLO-constraint gating - filter by SLO targets (added SLO exclusion reasons, latency/throughput filtering to CandidateFilter)
 - [x] **Task 61**: Latency handling - add percentile/jitter control (added p50/p95/p99 percentiles and jitter_ms to ObservedLatencyState)
+- [x] **Task 29**: Integrate DatacenterCapacityAggregator into routing/dispatch (verified - already wired into health_coordinator.build_datacenter_candidates and fed by server.py heartbeat recording)
+- [x] **Task 30**: Integrate SpilloverEvaluator into routing decisions (verified - already wired into dispatch_coordinator._evaluate_spillover and called during _dispatch_job_with_fallback)
 
 ---
 
