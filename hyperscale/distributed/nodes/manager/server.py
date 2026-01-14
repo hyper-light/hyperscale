@@ -343,6 +343,8 @@ class ManagerServer(HealthAwareServer):
             node_id=self._node_id.short,
             task_runner=self._task_runner,
             send_tcp=self._send_to_peer,
+            export_stats_checkpoint_fn=self._export_stats_checkpoint,
+            import_stats_checkpoint_fn=self._import_stats_checkpoint,
         )
 
         # Leadership coordinator
