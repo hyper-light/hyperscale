@@ -138,6 +138,29 @@ class GateLeadershipCoordinator:
         except Exception:
             pass  # Best effort
 
+    async def _send_leadership_transfer_to_client(
+        self,
+        callback_addr: tuple[str, int],
+        transfer: GateJobLeaderTransfer,
+    ) -> None:
+        try:
+            await self._send_tcp(
+                callback_addr,
+                "receive_gate_job_leader_transfer",
+                transfer.dump(),
+                timeout=5.0,
+            )
+        except Exception as error:
+            await self._logger.log(
+                {
+                    "level": "warning",
+                    "message": (
+                        f"Failed to deliver gate leader transfer for job {transfer.job_id} "
+                        f"to client {callback_addr}: {error}"
+                    ),
+                }
+            )
+
     def handle_leadership_announcement(
         self,
         job_id: str,
