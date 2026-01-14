@@ -1386,4 +1386,118 @@ Race Conditions Under Load
 - WAL backpressure + shutdown - Shutdown completes without blocking
 - Cancellation + timeout loops - No deadlock when both fire
 
+41.20 Federated Health Monitoring (AD-33)
+- Cross-DC probe timeout scaled - High RTT does not trigger false suspect
+- DC leader change mid-probe - New leader accepted, old leader ignored
+- Stale cross-DC incarnation - Rejected, no health downgrade
+- Probe jitter distribution - No synchronized bursts across gates
+- Correlation detector gating - Multiple DC failures treated as network issue
+
+41.21 Pre-Voting and Quorum Safeguards (AD-5, AD-3)
+- Pre-vote prevents split-brain - No dual leaders during partition
+- Quorum size from config - Ignores transient membership count
+- Quorum circuit breaker - Opens after repeated quorum failures
+- Quorum recovery - Half-open allows probe, closes on success
+- Minority partition - Leadership denied without quorum
+
+41.22 Adaptive Healthcheck Extensions (AD-26)
+- Extension granted with progress - Deadline extended per logarithmic rule
+- Extension denied without progress - Worker marked suspect after deadline
+- Extension cap reached - Further requests rejected
+- Extension + global timeout - Timeout accounts for extensions granted
+- Extension during overload - Manager denies under high load
+
+41.23 Enhanced DNS Discovery and Role Validation (AD-28)
+- Cluster/env mismatch - Registration rejected with error
+- Role-based connection matrix - Worker cannot contact gate directly
+- Rendezvous hash stability - Candidate set minimal churn on peer change
+- Power-of-two choice - Load distributed across similar peers
+- Sticky pool eviction - Evict on error rate or latency threshold
+
+41.24 Retry Framework Jitter (AD-21)
+- Full jitter distribution - Retry timings spread across nodes
+- Decorrelated jitter - No periodic retry alignment
+- Jitter + backoff cap - Max delay enforced
+- Retryable exception filter - Non-retryable errors fail fast
+- Backoff under recovery - Avoids thundering herd
+
+41.25 Global Job Ledger Consistency (AD-38)
+- Cancellation beats completion - Conflict resolution honors cancel
+- Higher fence token wins - Later operation dominates
+- HLC ordering - Causal sequence preserved across gates
+- Regional vs global durability - Workflow dispatch not blocked by ledger
+- Ledger repair - Merkle mismatch triggers anti-entropy
+
+41.26 Logger WAL Extensions (AD-39)
+- FSYNC batch overflow - Error surfaced in WAL mode
+- Read-back recovery - WAL entries decoded with CRC validation
+- File lock cleanup - No lock/FD leaks after close
+- Sequence number monotonic - LSN order preserved across batches
+- Data-plane mode - Errors logged, caller not blocked
+
+41.27 Worker Event Log Fidelity (AD-47)
+- Healthcheck events - Probe received logged at TRACE
+- Action failure logging - Error type captured without crash
+- Log buffer saturation - Events dropped without blocking
+- Log retention - Old archives pruned by age/size
+- Shutdown event ordering - WorkerStopping logged before exit
+
+41.28 Context Consistency Under Multi-DC (AD-49)
+- Context update on completion - JobInfo.context updated with LWW semantics
+- Concurrent providers - Conflicting context keys resolved by version
+- Re-dispatch with stored context - No recompute on recovery
+- Context snapshot during state sync - Peer manager applies snapshot
+- Context for unknown workflow - Ignored with warning
+
+41.29 SLO and Resource Correlation (AD-42, AD-41)
+- SLO violation with low RTT - Routing penalizes SLO-offending DC
+- CPU pressure predicts latency - Routing reduces DC score proactively
+- Memory pressure spikes - Health degraded before failure
+- Percentile window rotation - Old samples aged out correctly
+- T-Digest merge ordering - Merge produces stable p95/p99
+
+41.30 Bounded Execution and Load Shedding (AD-32, AD-22)
+- Global in-flight limit reached - LOW/NORMAL shed, HIGH/CRITICAL accepted
+- Per-priority limits enforced - No starvation of CRITICAL
+- Destination queue overflow - Oldest dropped, newest preserved
+- Slow destination isolation - Fast destinations continue unaffected
+- Queue state recovery - Transition back to HEALTHY after drain
+
+---
+42. Extended Chaos and Soak Scenarios
+42.1 Long-Running Soak (24h)
+- Memory growth over time - No unbounded job/worker state
+- Retry budget drift - Budgets do not leak across jobs
+- Idempotency cache churn - TTL eviction remains stable
+- Stats buffer retention - Hot/Warm/Cold tiers bounded
+- Event log rotation - Rotations do not stall workers
+
+42.2 Targeted Chaos Injection
+- Random manager restarts - Gate routing adapts without job loss
+- Random gate restarts - Leadership transfers preserve job state
+- Random worker restarts - Orphans requeued without duplicate results
+- Network delay injection - Vivaldi coordinates adapt gradually
+- Packet loss injection - SWIM suspicion does not spike
+
+42.3 Backpressure + Rate Limiting Interaction
+- Rate limit + backpressure - Both signals applied correctly
+- Retry after headers - Client respects server guidance
+- Throttle escalation - NONE -> THROTTLE -> BATCH -> REJECT
+- Control-plane immunity - SWIM/cancel unaffected by backpressure
+- Recovery ramp - Backpressure relaxes without oscillation
+
+42.4 Multi-Gate Submit Storm
+- 3 gates accept 10K submits - No duplicate job IDs
+- Idempotency across gates - Same key returns same job
+- Spillover under storm - Capacity-aware routing still works
+- Observed latency learning - Score adjusts under load
+- Quorum loss mid-storm - Leaders step down cleanly
+
+42.5 Multi-DC Partial Failure Matrix
+- DC-A unhealthy, DC-B busy, DC-C healthy - Routing chooses DC-C
+- DC leader down - Federated health marks DC unreachable
+- Manager majority unhealthy - DC classified DEGRADED
+- Worker majority unhealthy - DC health changes propagate
+- Recovery sequence - Health transitions stable and monotonic
+
 ---
