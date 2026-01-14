@@ -910,6 +910,26 @@ class ManagerState:
         return list(self._job_submissions.items())
 
     # =========================================================================
+    # Job Reporter Task Accessors (2 direct accesses)
+    # =========================================================================
+
+    def set_job_reporter_task(
+        self, job_id: str, reporter_type: str, task: asyncio.Task
+    ) -> None:
+        self._job_reporter_tasks.setdefault(job_id, {})[reporter_type] = task
+
+    def get_job_reporter_tasks(self, job_id: str) -> dict[str, asyncio.Task] | None:
+        return self._job_reporter_tasks.get(job_id)
+
+    def remove_job_reporter_task(self, job_id: str, reporter_type: str) -> None:
+        job_tasks = self._job_reporter_tasks.get(job_id)
+        if not job_tasks:
+            return
+        job_tasks.pop(reporter_type, None)
+        if not job_tasks:
+            self._job_reporter_tasks.pop(job_id, None)
+
+    # =========================================================================
     # Healthy Gate IDs Accessors (2 direct accesses)
     # =========================================================================
 

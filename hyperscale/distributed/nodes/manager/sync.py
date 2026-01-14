@@ -31,7 +31,6 @@ from hyperscale.logging.hyperscale_logging_models import (
     ServerInfo,
     ServerDebug,
     ServerWarning,
-    ServerError,
 )
 
 if TYPE_CHECKING:
