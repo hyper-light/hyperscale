@@ -1939,6 +1939,41 @@ class RegisterCallbackResponse(Message):
 
 
 @dataclass(slots=True)
+class JobUpdateRecord(Message):
+    """
+    Record of a client update for replay/polling.
+    """
+
+    sequence: int
+    message_type: str
+    payload: bytes
+    timestamp: float
+
+
+@dataclass(slots=True)
+class JobUpdatePollRequest(Message):
+    """
+    Request for job updates since a sequence.
+    """
+
+    job_id: str
+    last_sequence: int = 0
+
+
+@dataclass(slots=True)
+class JobUpdatePollResponse(Message):
+    """
+    Response containing queued job updates for a client.
+    """
+
+    job_id: str
+    updates: list["JobUpdateRecord"] = field(default_factory=list)
+    latest_sequence: int = 0
+    truncated: bool = False
+    oldest_sequence: int = 0
+
+
+@dataclass(slots=True)
 class ReporterResultPush(Message):
     """
     Push notification for reporter submission result.
