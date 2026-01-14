@@ -69,8 +69,7 @@ class ManagerStatsCoordinator:
         self._node_id: str = node_id
         self._task_runner: "TaskRunner" = task_runner
 
-        # AD-19: Progress state tracking
-        self._progress_state = ProgressState.NORMAL
+        self._progress_state: ProgressState = ProgressState.NORMAL
         self._progress_state_since: float = time.monotonic()
 
         # AD-23: Stats buffer tracking for backpressure
