@@ -54,16 +54,16 @@ class ManagerStateSync:
         registry: "ManagerRegistry",
         logger: "Logger",
         node_id: str,
-        task_runner,
-        send_tcp,  # Callable to send TCP message
+        task_runner: "TaskRunner",
+        send_tcp: SendFunc,
     ) -> None:
-        self._state = state
-        self._config = config
-        self._registry = registry
-        self._logger = logger
-        self._node_id = node_id
-        self._task_runner = task_runner
-        self._send_tcp = send_tcp
+        self._state: "ManagerState" = state
+        self._config: "ManagerConfig" = config
+        self._registry: "ManagerRegistry" = registry
+        self._logger: "Logger" = logger
+        self._node_id: str = node_id
+        self._task_runner: "TaskRunner" = task_runner
+        self._send_tcp: SendFunc = send_tcp
 
     async def sync_state_from_workers(self) -> None:
         """
