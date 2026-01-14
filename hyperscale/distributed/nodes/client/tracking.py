@@ -5,7 +5,7 @@ Handles job lifecycle tracking, status updates, completion events, and callbacks
 """
 
 import asyncio
-from typing import Callable
+from typing import Callable, Coroutine, Any
 
 from hyperscale.distributed.models import (
     JobStatus,
@@ -13,9 +13,20 @@ from hyperscale.distributed.models import (
     JobStatusPush,
     WorkflowResultPush,
     ReporterResultPush,
+    GlobalJobStatus,
 )
 from hyperscale.distributed.nodes.client.state import ClientState
 from hyperscale.logging import Logger
+
+PollGateForStatusFunc = Callable[[str], Coroutine[Any, Any, GlobalJobStatus | None]]
+
+TERMINAL_STATUSES = frozenset(
+    {
+        JobStatus.COMPLETED.value,
+        JobStatus.FAILED.value,
+        JobStatus.CANCELLED.value,
+    }
+)
 
 
 class ClientJobTracker:
@@ -26,9 +37,17 @@ class ClientJobTracker:
     for status updates, progress, workflow results, and reporter results.
     """
 
-    def __init__(self, state: ClientState, logger: Logger) -> None:
+    DEFAULT_POLL_INTERVAL_SECONDS: float = 5.0
+
+    def __init__(
+        self,
+        state: ClientState,
+        logger: Logger,
+        poll_gate_for_status: PollGateForStatusFunc | None = None,
+    ) -> None:
         self._state = state
         self._logger = logger
+        self._poll_gate_for_status = poll_gate_for_status
 
     def initialize_job_tracking(
         self,
