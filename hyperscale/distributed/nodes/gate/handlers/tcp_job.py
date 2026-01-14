@@ -266,6 +266,26 @@ class GateJobHandler:
                     submission.job_id,
                     self._get_node_id().full,
                 )
+                if found and entry is None:
+                    await self._logger.log(
+                        ServerInfo(
+                            message=(
+                                "Idempotency wait timeout for job "
+                                f"{submission.job_id} (key={idempotency_key})"
+                            ),
+                            node_host=self._get_host(),
+                            node_port=self._get_tcp_port(),
+                            node_id=self._get_node_id().short,
+                        )
+                    )
+                    return JobAck(
+                        job_id=submission.job_id,
+                        accepted=False,
+                        error="Idempotency request pending, please retry",
+                        protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+                        protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+                        capabilities=negotiated_caps_str,
+                    ).dump()
                 if found and entry is not None:
                     if entry.status in (
                         IdempotencyStatus.COMMITTED,

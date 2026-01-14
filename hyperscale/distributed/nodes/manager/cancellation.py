@@ -17,6 +17,7 @@ from hyperscale.distributed.models import (
     JobCancellationComplete,
     CancelledWorkflowInfo,
 )
+from hyperscale.distributed.models.jobs import TrackingToken
 from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerWarning
 
 if TYPE_CHECKING:
