@@ -81,19 +81,21 @@ class GateStateSyncHandler:
             get_state_snapshot: Callback to get full state snapshot
             apply_state_snapshot: Callback to apply state snapshot
         """
-        self._state = state
-        self._logger = logger
-        self._task_runner = task_runner
-        self._job_manager = job_manager
-        self._job_leadership_tracker = job_leadership_tracker
-        self._versioned_clock = versioned_clock
-        self._get_node_id = get_node_id
-        self._get_host = get_host
-        self._get_tcp_port = get_tcp_port
-        self._is_leader = is_leader
-        self._get_term = get_term
-        self._get_state_snapshot = get_state_snapshot
-        self._apply_state_snapshot = apply_state_snapshot
+        self._state: GateRuntimeState = state
+        self._logger: Logger = logger
+        self._task_runner: "TaskRunner" = task_runner
+        self._job_manager: "GateJobManager" = job_manager
+        self._job_leadership_tracker: "JobLeadershipTracker" = job_leadership_tracker
+        self._versioned_clock: "VersionedStateClock" = versioned_clock
+        self._get_node_id: Callable[[], "NodeId"] = get_node_id
+        self._get_host: Callable[[], str] = get_host
+        self._get_tcp_port: Callable[[], int] = get_tcp_port
+        self._is_leader: Callable[[], bool] = is_leader
+        self._get_term: Callable[[], int] = get_term
+        self._get_state_snapshot: Callable[[], GateStateSnapshot] = get_state_snapshot
+        self._apply_state_snapshot: Callable[[GateStateSnapshot], None] = (
+            apply_state_snapshot
+        )
 
     async def handle_state_sync_request(
         self,
