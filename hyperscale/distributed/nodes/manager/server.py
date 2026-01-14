@@ -1538,7 +1538,6 @@ class ManagerServer(HealthAwareServer):
                 )
 
     async def _windowed_stats_flush_loop(self) -> None:
-        """Flush closed windowed stats and push to gates."""
         flush_interval = self._config.stats_push_interval_ms / 1000.0
 
         while self._running:
