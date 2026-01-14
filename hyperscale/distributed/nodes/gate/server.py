@@ -476,9 +476,6 @@ class GateServer(HealthAwareServer):
             stuck_threshold=getattr(env, "GATE_ALL_DC_STUCK_THRESHOLD", 180.0),
         )
 
-        # Job router (AD-36) - initialized in start()
-        self._job_router: GateJobRouter | None = None
-
         # Idempotency cache (AD-40) - initialized in start() after task_runner is available
         self._idempotency_cache: GateIdempotencyCache[bytes] | None = None
         self._idempotency_config = create_idempotency_config_from_env(env)
