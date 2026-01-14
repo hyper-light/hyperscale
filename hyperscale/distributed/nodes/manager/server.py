@@ -2696,51 +2696,17 @@ class ManagerServer(HealthAwareServer):
                     protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
                 ).dump()
 
-            transport = self._tcp_server_request_transports.get(addr)
-            cert_der = get_peer_certificate_der(transport) if transport else None
-            if cert_der is not None:
-                claims = RoleValidator.extract_claims_from_cert(
-                    cert_der,
-                    default_cluster=self._config.cluster_id,
-                    default_environment=self._config.environment_id,
-                )
-                validation_result = self._role_validator.validate_claims(claims)
-                if not validation_result.allowed:
-                    await self._udp_logger.log(
-                        ServerWarning(
-                            message=(
-                                f"Worker {registration.node.node_id} rejected: certificate claims failed"
-                            ),
-                            node_host=self._host,
-                            node_port=self._tcp_port,
-                            node_id=self._node_id.short,
-                        )
-                    )
-                    return RegistrationResponse(
-                        accepted=False,
-                        manager_id=self._node_id.full,
-                        healthy_managers=[],
-                        error=f"Certificate validation failed: {validation_result.reason}",
-                        protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
-                        protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
-                    ).dump()
-
-            elif self._config.mtls_strict_mode:
-                await self._udp_logger.log(
-                    ServerWarning(
-                        message=(
-                            f"Worker {registration.node.node_id} rejected: no certificate in strict mode"
-                        ),
-                        node_host=self._host,
-                        node_port=self._tcp_port,
-                        node_id=self._node_id.short,
-                    )
-                )
+            mtls_error = await self._validate_mtls_claims(
+                addr,
+                "Worker",
+                registration.node.node_id,
+            )
+            if mtls_error:
                 return RegistrationResponse(
                     accepted=False,
                     manager_id=self._node_id.full,
                     healthy_managers=[],
-                    error="mTLS strict mode requires valid certificate",
+                    error=mtls_error,
                     protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
                     protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
                 ).dump()

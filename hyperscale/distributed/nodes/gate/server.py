@@ -4151,10 +4151,15 @@ class GateServer(HealthAwareServer):
                 return None
 
             target_dcs = set(self._job_manager.get_target_dcs(result.job_id))
-            if target_dcs and not self._job_manager.all_dcs_reported(result.job_id):
-                return None
-
             per_dc_results = self._job_manager.get_all_dc_results(result.job_id)
+            missing_dcs = target_dcs - set(per_dc_results.keys())
+            if target_dcs and missing_dcs:
+                normalized_statuses = [
+                    self._normalize_final_status(dc_result.status)
+                    for dc_result in per_dc_results.values()
+                ]
+                if not self._should_finalize_partial_results(normalized_statuses):
+                    return None
 
         return self._build_global_job_result(result.job_id, per_dc_results, target_dcs)
 

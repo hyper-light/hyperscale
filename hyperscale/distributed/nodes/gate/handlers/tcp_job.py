@@ -474,7 +474,7 @@ class GateJobHandler:
             self._job_leadership_tracker.assume_leadership(
                 job_id=submission.job_id,
                 metadata=len(target_dcs),
-                initial_token=lease_result.lease.fence_token,
+                initial_token=fence_token,
             )
 
             await self._state.increment_state_version()
