@@ -5,6 +5,7 @@ Handles SWIM callbacks, worker health tracking, AD-18 hybrid overload detection,
 AD-26 deadline extensions, and AD-30 hierarchical failure detection with job-level suspicion.
 """
 
+import asyncio
 import time
 from enum import Enum
 from typing import TYPE_CHECKING, Any
@@ -133,6 +134,9 @@ class ManagerHealthMonitor:
         self._job_dead_workers: dict[str, set[str]] = {}  # job_id -> {worker_ids}
         # Global dead workers (affects all jobs)
         self._global_dead_workers: set[str] = set()
+
+        # Lock for health state mutations (lazily created)
+        self._health_state_lock: asyncio.Lock | None = None
 
     def handle_worker_heartbeat(
         self,

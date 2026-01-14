@@ -188,13 +188,14 @@ class ManagerRegistry:
         unhealthy_ids = set(self._state._worker_unhealthy_since.keys())
 
         for worker_id, worker in self._state._workers.items():
-            # Skip unhealthy workers
-            if worker_id in unhealthy_ids:
-                continue
+            circuit = self._state._worker_circuits.get(worker_id)
 
-            if circuit := self._state._worker_circuits.get(worker_id):
-                if circuit.is_open():
+            if worker_id in unhealthy_ids:
+                if not circuit or circuit.circuit_state != CircuitState.HALF_OPEN:
                     continue
+
+            if circuit and circuit.is_open():
+                continue
 
             # Skip workers without capacity
             if worker.node.total_cores < cores_required:

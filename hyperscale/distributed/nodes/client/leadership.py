@@ -33,9 +33,16 @@ class ClientLeadershipTracker:
     4. Client uses new leader for future requests
     """
 
-    def __init__(self, state: ClientState, logger: Logger) -> None:
+    def __init__(
+        self,
+        state: ClientState,
+        logger: Logger,
+        leader_cache_ttl_seconds: float = 30.0,
+    ) -> None:
         self._state = state
         self._logger = logger
+        self._leader_cache_ttl_seconds = leader_cache_ttl_seconds
+        self._query_leader_callback: Callable[[str], Awaitable[tuple[tuple[str, int], int] | None]] | None = None
 
     def validate_gate_fence_token(
         self, job_id: str, new_fence_token: int
