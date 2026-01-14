@@ -127,6 +127,7 @@ class HierarchicalFailureDetector:
         config: HierarchicalConfig | None = None,
         on_global_death: Callable[[NodeAddress, int], None] | None = None,
         on_job_death: Callable[[JobId, NodeAddress, int], None] | None = None,
+        on_error: Callable[[str, Exception], None] | None = None,
         get_n_members: Callable[[], int] | None = None,
         get_job_n_members: Callable[[JobId], int] | None = None,
         get_lhm_multiplier: Callable[[], float] | None = None,
@@ -137,6 +138,7 @@ class HierarchicalFailureDetector:
         self._config = config
         self._on_global_death = on_global_death
         self._on_job_death = on_job_death
+        self._on_error = on_error
         self._get_n_members = get_n_members
         self._get_job_n_members = get_job_n_members
         self._get_lhm_multiplier = get_lhm_multiplier
@@ -701,8 +703,15 @@ class HierarchicalFailureDetector:
         if self._on_global_death:
             try:
                 self._on_global_death(node, state.incarnation)
-            except Exception:
-                pass
+            except Exception as callback_error:
+                if self._on_error:
+                    try:
+                        self._on_error(
+                            f"on_global_death callback failed for {node}",
+                            callback_error,
+                        )
+                    except Exception:
+                        pass
 
     def _handle_job_expiration(
         self,
@@ -730,8 +739,15 @@ class HierarchicalFailureDetector:
         if self._on_job_death:
             try:
                 self._on_job_death(job_id, node, incarnation)
-            except Exception:
-                pass
+            except Exception as callback_error:
+                if self._on_error:
+                    try:
+                        self._on_error(
+                            f"on_job_death callback failed for job {job_id}, node {node}",
+                            callback_error,
+                        )
+                    except Exception:
+                        pass
 
     async def _clear_job_suspicions_for_node(self, node: NodeAddress) -> None:
         """Clear all job suspicions for a globally-dead node."""
@@ -763,8 +779,15 @@ class HierarchicalFailureDetector:
                 await self._reconcile()
             except asyncio.CancelledError:
                 break
-            except Exception:
-                pass  # Don't let reconciliation errors stop the loop
+            except Exception as reconciliation_error:
+                if self._on_error:
+                    try:
+                        self._on_error(
+                            f"Reconciliation loop error (cycle {self._reconciliations})",
+                            reconciliation_error,
+                        )
+                    except Exception:
+                        pass
 
     async def _reconcile(self) -> None:
         """Perform reconciliation between layers."""
