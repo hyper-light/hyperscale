@@ -1,7 +1,7 @@
 # Hyperscale Distributed Bug Fixes TODO
 
 **Generated**: 2026-01-14  
-**Progress**: 54/64 completed (84%)
+**Progress**: 55/64 completed (86%)
 
 ---
 
@@ -77,6 +77,7 @@ Systematic bug fixes for the Hyperscale distributed performance testing framewor
 - [x] **Task 33**: Add recovery path for manager dies with pending stats (added export_checkpoint/import_checkpoint to StatsBuffer, wired into ManagerStateSync and ManagerStateSnapshot)
 - [x] **Task 34**: Add ReporterResultPush forwarding path in gate (verified - already implemented via Task 59)
 - [x] **Task 38**: Add reporter task creation and result dispatch in gate (added _dispatch_to_reporters to server.py, called from _complete_job)
+- [x] **Task 41**: Add LeaseTransfer sender in gate code (added _send_lease_transfer to leadership_coordinator.py, called during transfer_leadership)
 
 ---
 
