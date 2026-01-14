@@ -2241,6 +2241,10 @@ class GateServer(HealthAwareServer):
         if owner and owner.node_id != self._node_id.full:
             owner_addr = await self._job_hash_ring.get_node_addr(owner)
             if owner_addr:
+                if await self._peer_gate_circuit_breaker.is_circuit_open(owner_addr):
+                    return False
+
+                circuit = await self._peer_gate_circuit_breaker.get_circuit(owner_addr)
                 try:
                     await self.send_tcp(
                         owner_addr,
@@ -2248,11 +2252,13 @@ class GateServer(HealthAwareServer):
                         progress.dump(),
                         timeout=3.0,
                     )
+                    circuit.record_success()
                     return True
                 except Exception as forward_error:
+                    circuit.record_failure()
                     await self._udp_logger.log(
                         ServerWarning(
-                            message=f"Failed to forward progress to manager: {forward_error}",
+                            message=f"Failed to forward progress to peer gate: {forward_error}",
                             node_host=self._host,
                             node_port=self._tcp_port,
                             node_id=self._node_id.short,
