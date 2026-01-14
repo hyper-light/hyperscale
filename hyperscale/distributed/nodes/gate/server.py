@@ -1904,68 +1904,13 @@ class GateServer(HealthAwareServer):
         clock_time: int,
     ):
         """Handle job leader gate transfer notification from peer gate."""
-        try:
-            transfer = JobLeaderGateTransfer.load(data)
-
-            if transfer.new_gate_id != self._node_id.full:
-                return JobLeaderGateTransferAck(
-                    job_id=transfer.job_id,
-                    manager_id=self._node_id.full,
-                    accepted=False,
-                ).dump()
-
-            current_fence = self._job_leadership_tracker.get_fencing_token(
-                transfer.job_id
-            )
-            if transfer.fence_token <= current_fence:
-                return JobLeaderGateTransferAck(
-                    job_id=transfer.job_id,
-                    manager_id=self._node_id.full,
-                    accepted=False,
-                ).dump()
-
-            target_dc_count = len(self._job_manager.get_target_dcs(transfer.job_id))
-            accepted = self._job_leadership_tracker.process_leadership_claim(
-                job_id=transfer.job_id,
-                claimer_id=self._node_id.full,
-                claimer_addr=(self._host, self._tcp_port),
-                fencing_token=transfer.fence_token,
-                metadata=target_dc_count,
-            )
-
-            if not accepted:
-                return JobLeaderGateTransferAck(
-                    job_id=transfer.job_id,
-                    manager_id=self._node_id.full,
-                    accepted=False,
-                ).dump()
-
-            self._task_runner.run(
-                self._udp_logger.log,
-                ServerInfo(
-                    message=(
-                        f"Job {transfer.job_id[:8]}... leader gate transferred: "
-                        f"{transfer.old_gate_id} -> {transfer.new_gate_id}"
-                    ),
-                    node_host=self._host,
-                    node_port=self._tcp_port,
-                    node_id=self._node_id.short,
-                ),
-            )
-
-            return JobLeaderGateTransferAck(
-                job_id=transfer.job_id,
-                manager_id=self._node_id.full,
-                accepted=True,
-            ).dump()
-
-        except Exception as error:
-            await self.handle_exception(error, "job_leader_gate_transfer")
-            return JobLeaderGateTransferAck(
-                job_id="unknown",
-                manager_id=self._node_id.full,
-                accepted=False,
-            ).dump()
+        if self._job_handler:
+            return await self._job_handler.handle_job_leader_gate_transfer(addr, data)
+        return JobLeaderGateTransferAck(
+            job_id="unknown",
+            manager_id=self._node_id.full,
+            accepted=False,
+        ).dump()
 
     @tcp.receive()
     async def windowed_stats_push(
