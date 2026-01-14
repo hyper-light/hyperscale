@@ -2748,6 +2748,16 @@ class GateServer(HealthAwareServer):
         if not workflow_results:
             return
 
+        await self._forward_aggregated_workflow_result(
+            job_id, workflow_id, workflow_results
+        )
+
+    async def _forward_aggregated_workflow_result(
+        self,
+        job_id: str,
+        workflow_id: str,
+        workflow_results: dict[str, WorkflowResultPush],
+    ) -> None:
         first_dc_push = next(iter(workflow_results.values()))
         is_test_workflow = first_dc_push.is_test
 
