@@ -759,6 +759,8 @@ class Env(BaseModel):
             "GATE_TCP_TIMEOUT_SHORT": float,
             "GATE_TCP_TIMEOUT_STANDARD": float,
             "GATE_TCP_TIMEOUT_FORWARD": float,
+            "GATE_WORKFLOW_RESULT_TIMEOUT_SECONDS": float,
+            "GATE_ALLOW_PARTIAL_WORKFLOW_RESULTS": bool,
             # Gate orphan grace period settings (Section 7)
             "GATE_ORPHAN_GRACE_PERIOD": float,
             "GATE_ORPHAN_CHECK_INTERVAL": float,

@@ -46,6 +46,7 @@ from hyperscale.logging.hyperscale_logging_models import (
     ServerDebug,
     ServerError,
     ServerInfo,
+    ServerWarning,
 )
 
 from ..state import GateRuntimeState
@@ -78,6 +79,7 @@ class GateJobHandler:
         quorum_circuit: "ErrorStats",
         load_shedder: "LoadShedder",
         job_lease_manager: JobLeaseManager,
+        send_tcp: Callable,
         idempotency_cache: GateIdempotencyCache[bytes] | None,
         get_node_id: Callable[[], "NodeId"],
         get_host: Callable[[], str],
@@ -111,6 +113,7 @@ class GateJobHandler:
             quorum_circuit: Quorum operation circuit breaker
             load_shedder: Load shedding manager
             job_lease_manager: Job lease manager
+            send_tcp: Callback to send TCP messages
             idempotency_cache: Idempotency cache for duplicate detection
             get_node_id: Callback to get this gate's node ID
             get_host: Callback to get this gate's host
