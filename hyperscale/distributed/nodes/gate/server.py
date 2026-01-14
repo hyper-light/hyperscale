@@ -2099,9 +2099,59 @@ class GateServer(HealthAwareServer):
 
     async def _gather_job_status(self, job_id: str) -> GlobalJobStatus:
         async with self._job_manager.lock_job(job_id):
+            job = self._job_manager.get_job(job_id)
+            if not job:
+                raise ValueError(f"Job {job_id} not found")
+            previous_status = job.status
+            target_dcs = self._job_manager.get_target_dcs(job_id)
+
             status = self._job_manager.aggregate_job_status(job_id)
             if status is None:
                 raise ValueError(f"Job {job_id} not found")
+
+            terminal_statuses = {
+                JobStatus.COMPLETED.value,
+                JobStatus.FAILED.value,
+                JobStatus.CANCELLED.value,
+            }
+
+            if (
+                previous_status != status.status
+                and status.status in terminal_statuses
+                and status.resolution_details
+                and target_dcs
+            ):
+                errors_summary = ""
+                if status.errors:
+                    errors_preview = status.errors[:3]
+                    errors_summary = "; ".join(errors_preview)
+                    if len(status.errors) > 3:
+                        errors_summary = (
+                            f"{errors_summary}; +{len(status.errors) - 3} more"
+                        )
+
+                resolution_message = (
+                    f"Resolved job {job_id[:8]}... {status.status} "
+                    f"({status.completed_datacenters} completed, "
+                    f"{status.failed_datacenters} failed, "
+                    f"{len(target_dcs)} total) "
+                    f"[{status.resolution_details}]"
+                )
+
+                if errors_summary:
+                    resolution_message = (
+                        f"{resolution_message} errors: {errors_summary}"
+                    )
+
+                await self._udp_logger.log(
+                    ServerInfo(
+                        message=resolution_message,
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+
             return GlobalJobStatus(
                 job_id=status.job_id,
                 status=status.status,
@@ -2113,6 +2163,8 @@ class GateServer(HealthAwareServer):
                 timestamp=status.timestamp,
                 completed_datacenters=status.completed_datacenters,
                 failed_datacenters=status.failed_datacenters,
+                errors=list(status.errors),
+                resolution_details=status.resolution_details,
             )
 
     def _get_peer_state_lock(self, peer_addr: tuple[str, int]) -> asyncio.Lock:
