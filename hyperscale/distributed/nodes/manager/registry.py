@@ -13,7 +13,7 @@ from hyperscale.distributed.models import (
     GateInfo,
     ManagerInfo,
 )
-from hyperscale.distributed.swim.core import ErrorStats
+from hyperscale.distributed.swim.core import ErrorStats, CircuitState
 from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerDebug
 
 if TYPE_CHECKING:

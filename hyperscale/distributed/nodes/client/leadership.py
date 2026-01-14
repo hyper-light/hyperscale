@@ -7,6 +7,7 @@ Implements AD-16 (Leadership Transfer) semantics.
 
 import asyncio
 import time
+from collections.abc import Awaitable, Callable
 
 from hyperscale.distributed.models import (
     GateLeaderInfo,

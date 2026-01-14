@@ -590,6 +590,15 @@ class JobManager:
                         removed_cores = max(removed_cores, sub_workflow.cores_allocated)
                     self._sub_workflow_to_job.pop(token_str, None)
 
+                if not parent.sub_workflow_tokens and parent.status not in (
+                    WorkflowStatus.COMPLETED,
+                    WorkflowStatus.FAILED,
+                    WorkflowStatus.AGGREGATED,
+                    WorkflowStatus.AGGREGATION_FAILED,
+                    WorkflowStatus.CANCELLED,
+                ):
+                    parent.status = WorkflowStatus.PENDING
+
                 updated = True
 
             if reassignment_worker_id and reassignment_worker_id != failed_worker_id:
@@ -609,6 +618,10 @@ class JobManager:
 
                 if new_token_str not in parent.sub_workflow_tokens:
                     parent.sub_workflow_tokens.append(new_token_str)
+                    updated = True
+
+                if parent.status in (WorkflowStatus.PENDING, WorkflowStatus.ASSIGNED):
+                    parent.status = WorkflowStatus.ASSIGNED
                     updated = True
 
         if updated:

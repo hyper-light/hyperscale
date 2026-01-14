@@ -120,6 +120,73 @@ class GateDispatchCoordinator:
         self._get_node_port: Callable[[], int] = get_node_port
         self._get_node_id_short: Callable[[], str] = get_node_id_short
 
+    def _is_terminal_status(self, status: str) -> bool:
+        return status in (
+            JobStatus.COMPLETED.value,
+            JobStatus.FAILED.value,
+            JobStatus.CANCELLED.value,
+            JobStatus.TIMEOUT.value,
+        )
+
+    def _pop_lease_renewal_token(self, job_id: str) -> str | None:
+        return self._state._job_lease_renewal_tokens.pop(job_id, None)
+
+    async def _cancel_lease_renewal(self, job_id: str) -> None:
+        token = self._pop_lease_renewal_token(job_id)
+        if not token:
+            return
+        try:
+            await self._task_runner.cancel(token)
+        except Exception as error:
+            await self._logger.log(
+                ServerWarning(
+                    message=f"Failed to cancel lease renewal for job {job_id}: {error}",
+                    node_host=self._get_node_host(),
+                    node_port=self._get_node_port(),
+                    node_id=self._get_node_id_short(),
+                )
+            )
+
+    async def _release_job_lease(
+        self,
+        job_id: str,
+        cancel_renewal: bool = True,
+    ) -> None:
+        if cancel_renewal:
+            await self._cancel_lease_renewal(job_id)
+        else:
+            self._pop_lease_renewal_token(job_id)
+        await self._job_lease_manager.release(job_id)
+
+    async def _renew_job_lease(self, job_id: str, lease_duration: float) -> None:
+        renewal_interval = max(1.0, lease_duration * 0.5)
+
+        try:
+            while True:
+                await asyncio.sleep(renewal_interval)
+                job = self._job_manager.get_job(job_id)
+                if job is None or self._is_terminal_status(job.status):
+                    await self._release_job_lease(job_id, cancel_renewal=False)
+                    return
+
+                lease_renewed = await self._job_lease_manager.renew(
+                    job_id, lease_duration
+                )
+                if not lease_renewed:
+                    await self._logger.log(
+                        ServerError(
+                            message=f"Failed to renew lease for job {job_id}: lease lost",
+                            node_host=self._get_node_host(),
+                            node_port=self._get_node_port(),
+                            node_id=self._get_node_id_short(),
+                        )
+                    )
+                    await self._release_job_lease(job_id, cancel_renewal=False)
+                    return
+        except asyncio.CancelledError:
+            self._pop_lease_renewal_token(job_id)
+            return
+
     async def _check_rate_and_load(
         self,
         client_id: str,
@@ -185,7 +252,10 @@ class GateDispatchCoordinator:
         return None
 
     def _setup_job_tracking(
-        self, submission: JobSubmission, primary_dcs: list[str]
+        self,
+        submission: JobSubmission,
+        primary_dcs: list[str],
+        fence_token: int,
     ) -> None:
         """Initialize job tracking state for a new submission."""
         job = GlobalJobStatus(
@@ -193,9 +263,11 @@ class GateDispatchCoordinator:
             status=JobStatus.SUBMITTED.value,
             datacenters=[],
             timestamp=time.monotonic(),
+            fence_token=fence_token,
         )
         self._job_manager.set_job(submission.job_id, job)
         self._job_manager.set_target_dcs(submission.job_id, set(primary_dcs))
+        self._job_manager.set_fence_token(submission.job_id, fence_token)
 
         try:
             workflows = cloudpickle.loads(submission.workflows)
