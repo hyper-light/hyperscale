@@ -296,6 +296,10 @@ class GateServer(HealthAwareServer):
 
         # Load shedding (AD-22)
         self._overload_detector = HybridOverloadDetector()
+        self._resource_monitor = ProcessResourceMonitor()
+        self._last_resource_metrics: ResourceMetrics | None = None
+        self._gate_health_state: str = "healthy"
+        self._previous_gate_health_state: str = "healthy"
         self._load_shedder = LoadShedder(self._overload_detector)
 
         # Backpressure tracking (AD-37) - state managed by _modular_state
