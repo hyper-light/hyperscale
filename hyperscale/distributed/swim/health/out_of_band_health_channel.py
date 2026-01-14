@@ -131,6 +131,9 @@ class OutOfBandHealthChannel:
     _nacks_sent: int = 0
     _timeouts: int = 0
 
+    _logger: LoggerProtocol | None = None
+    _node_id: str = ""
+
     @property
     def port(self) -> int:
         """Get the OOB channel port."""
