@@ -166,8 +166,6 @@ class WorkerExecutor:
                 await send_progress(workflow_id, progress)
             except Exception as error:
                 if self._logger:
-                    from hyperscale.logging.hyperscale_logging_models import ServerDebug
-
                     await self._logger.log(
                         ServerDebug(
                             message=f"Progress flush failed for workflow {workflow_id[:16]}...: {error}",
@@ -232,10 +230,6 @@ class WorkerExecutor:
                 break
             except Exception as error:
                 if self._logger:
-                    from hyperscale.logging.hyperscale_logging_models import (
-                        ServerWarning,
-                    )
-
                     await self._logger.log(
                         ServerWarning(
                             message=f"Progress flush loop error: {error}",
