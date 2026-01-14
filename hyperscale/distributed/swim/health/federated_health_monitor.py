@@ -15,9 +15,10 @@ import asyncio
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Callable, Awaitable
+from typing import Callable, Awaitable, Any
 
 from hyperscale.distributed.models import Message
+from hyperscale.distributed.swim.core.protocols import LoggerProtocol
 
 
 class DCReachability(Enum):
