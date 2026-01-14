@@ -466,6 +466,8 @@ class GateJobHandler:
                 await self._idempotency_cache.reject(idempotency_key, error_ack)
             return error_ack
         except Exception as error:
+            if lease_acquired and submission is not None:
+                await self._release_job_lease(submission.job_id)
             await self._logger.log(
                 ServerError(
                     message=f"Job submission error: {error}",
