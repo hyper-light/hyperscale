@@ -471,4 +471,4 @@ class TestEdgeCases:
             get_job_status=lambda x: MinimalJobStatus(),
         )
 
-        assert coordinator is not None
+        coordinator.classify_update_tier("job-1", "running", "running")

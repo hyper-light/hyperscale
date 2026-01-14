@@ -309,7 +309,7 @@ class GateJobHandler:
                 )
 
             if active_gate_peer_count > 0 and not self._has_quorum_available():
-                self._job_lease_manager.release(submission.job_id)
+                await self._release_job_lease(submission.job_id)
                 active_gates = active_gate_peer_count + 1
                 raise QuorumUnavailableError(
                     active_managers=active_gates,
@@ -325,6 +325,7 @@ class GateJobHandler:
             )
 
             if worst_health == "initializing":
+                await self._release_job_lease(submission.job_id)
                 self._task_runner.run(
                     self._logger.log,
                     ServerInfo(
