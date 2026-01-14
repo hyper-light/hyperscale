@@ -59,6 +59,7 @@ from hyperscale.distributed.models import (
     ManagerHeartbeat,
     JobSubmission,
     JobStatus,
+    JobStatusPush,
     JobProgress,
     JobFinalResult,
     GateStateSnapshot,
