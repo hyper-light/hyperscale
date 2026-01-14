@@ -490,7 +490,7 @@ class ManagerStateSync:
 
                 if response and not isinstance(response, Exception):
                     sync_response = StateSyncResponse.load(response)
-                    if sync_response.manager_state:
+                    if sync_response.responder_ready and sync_response.manager_state:
                         return sync_response.manager_state
 
             except Exception as sync_error:

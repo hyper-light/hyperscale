@@ -1917,6 +1917,7 @@ class RegisterCallback(Message):
 
     job_id: str  # Job to register callback for
     callback_addr: tuple[str, int]  # Client's TCP address for push notifications
+    last_sequence: int = 0
 
 
 @dataclass(slots=True)
