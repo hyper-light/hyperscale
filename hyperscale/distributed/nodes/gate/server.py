@@ -503,9 +503,7 @@ class GateServer(HealthAwareServer):
                 get_health_connected_dc_count=self._count_active_datacenters,
                 get_health_throughput=self._get_forward_throughput,
                 get_health_expected_throughput=self._get_expected_forward_throughput,
-                get_health_overload_state=lambda: self._overload_detector.get_state(
-                    0.0, 0.0
-                ),
+                get_health_overload_state=lambda: self._gate_health_state,
             )
         )
 
@@ -919,12 +917,7 @@ class GateServer(HealthAwareServer):
         await self._job_lease_manager.start_cleanup_task()
 
         # Start background tasks
-        self._task_runner.run(self._lease_cleanup_loop)
-        self._task_runner.run(self._job_cleanup_loop)
-        self._task_runner.run(self._rate_limit_cleanup_loop)
-        self._task_runner.run(self._batch_stats_loop)
-        self._task_runner.run(self._windowed_stats_push_loop)
-        self._task_runner.run(self._dead_peer_reap_loop)
+        self._start_background_loops()
 
         # Discovery maintenance (AD-28)
         self._discovery_maintenance_task = asyncio.create_task(
