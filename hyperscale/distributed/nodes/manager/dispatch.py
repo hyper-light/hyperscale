@@ -138,7 +138,7 @@ class ManagerDispatchCoordinator:
                             ),
                         )
                         # Update throughput counter
-                        self._state._dispatch_throughput_count += 1
+                        await self._state.increment_dispatch_throughput_count()
                         if circuit := self._state._worker_circuits.get(worker_id):
                             circuit.record_success()
                             if not circuit.is_open():
@@ -154,7 +154,7 @@ class ManagerDispatchCoordinator:
                                 node_id=self._node_id,
                             ),
                         )
-                        self._state._dispatch_failure_count += 1
+                        await self._state.increment_dispatch_failure_count()
                     return ack
 
                 self._task_runner.run(
@@ -166,7 +166,7 @@ class ManagerDispatchCoordinator:
                         node_id=self._node_id,
                     ),
                 )
-                self._state._dispatch_failure_count += 1
+                await self._state.increment_dispatch_failure_count()
                 if circuit := self._state._worker_circuits.get(worker_id):
                     circuit.record_error()
                     if circuit.is_open():
@@ -184,7 +184,7 @@ class ManagerDispatchCoordinator:
                         node_id=self._node_id,
                     ),
                 )
-                self._state._dispatch_failure_count += 1
+                await self._state.increment_dispatch_failure_count()
                 if circuit := self._state._worker_circuits.get(worker_id):
                     circuit.record_error()
                     if circuit.is_open():

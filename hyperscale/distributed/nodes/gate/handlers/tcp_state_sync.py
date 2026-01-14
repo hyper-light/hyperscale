@@ -9,7 +9,6 @@ Handles state sync between gates:
 """
 
 import asyncio
-import time
 from typing import TYPE_CHECKING, Callable
 
 from hyperscale.distributed.health import CircuitBreakerManager
@@ -30,7 +29,6 @@ from hyperscale.distributed.reliability import (
 from hyperscale.logging import Logger
 from hyperscale.logging.hyperscale_logging_models import (
     ServerDebug,
-    ServerError,
     ServerInfo,
     ServerWarning,
 )

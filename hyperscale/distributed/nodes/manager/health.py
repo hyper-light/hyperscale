@@ -624,10 +624,13 @@ class ManagerHealthMonitor:
 
         self._job_dead_workers.pop(job_id, None)
 
-    def get_peer_manager_health_counts(self) -> dict[str, int]:
+    def _count_peer_manager_health_states(
+        self,
+        health_states: dict[str, str],
+    ) -> dict[str, int]:
         counts = {"healthy": 0, "busy": 0, "stressed": 0, "overloaded": 0}
 
-        for health_state in self._state._peer_manager_health_states.values():
+        for health_state in health_states.values():
             if health_state in counts:
                 counts[health_state] += 1
             else:
@@ -635,20 +638,23 @@ class ManagerHealthMonitor:
 
         return counts
 
-    def check_peer_manager_health_alerts(self) -> None:
-        counts = self.get_peer_manager_health_counts()
+    async def get_peer_manager_health_counts(self) -> dict[str, int]:
+        health_states = await self._state.get_peer_manager_health_states()
+        return self._count_peer_manager_health_states(health_states)
+
+    async def check_peer_manager_health_alerts(self) -> None:
+        health_states = await self._state.get_peer_manager_health_states()
+        counts = self._count_peer_manager_health_states(health_states)
         total_peers = sum(counts.values())
 
         if total_peers == 0:
             return
 
         dc_leader_id = self._state._dc_leader_manager_id
-        if dc_leader_id and (
-            leader_state := self._state._peer_manager_health_states.get(dc_leader_id)
-        ):
-            if leader_state == "overloaded":
-                self._fire_leader_overload_alert(dc_leader_id)
-                return
+        leader_state = health_states.get(dc_leader_id) if dc_leader_id else None
+        if leader_state == "overloaded":
+            self._fire_leader_overload_alert(dc_leader_id)
+            return
 
         overloaded_count = counts.get("overloaded", 0)
         healthy_count = counts.get("healthy", 0)
