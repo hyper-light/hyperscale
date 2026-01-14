@@ -138,6 +138,7 @@ class JobSuspicionManager:
         self,
         config: JobSuspicionConfig | None = None,
         on_expired: Callable[[JobId, NodeAddress, int], None] | None = None,
+        on_error: Callable[[str, Exception], None] | None = None,
         get_n_members: Callable[[JobId], int] | None = None,
         get_lhm_multiplier: Callable[[], float] | None = None,
     ) -> None:
@@ -146,6 +147,7 @@ class JobSuspicionManager:
 
         self._config = config
         self._on_expired = on_expired
+        self._on_error = on_error
         self._get_n_members = get_n_members
         self._get_lhm_multiplier = get_lhm_multiplier
 
@@ -324,8 +326,15 @@ class JobSuspicionManager:
                 self._on_expired(
                     suspicion.job_id, suspicion.node, suspicion.incarnation
                 )
-            except Exception:
-                pass  # Don't let callback errors propagate
+            except Exception as callback_error:
+                if self._on_error:
+                    try:
+                        self._on_error(
+                            f"on_expired callback failed for job {suspicion.job_id}, node {suspicion.node}",
+                            callback_error,
+                        )
+                    except Exception:
+                        pass
 
     async def confirm_suspicion(
         self,
