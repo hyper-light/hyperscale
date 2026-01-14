@@ -41,15 +41,15 @@ class CancelJobHandler:
         config: "ManagerConfig",
         logger: "Logger",
         node_id: str,
-        task_runner,
-        cancel_job_impl,  # Callable implementing actual cancellation
+        task_runner: "TaskRunner",
+        cancel_job_impl: CancelJobFunc,
     ) -> None:
-        self._state = state
-        self._config = config
-        self._logger = logger
-        self._node_id = node_id
-        self._task_runner = task_runner
-        self._cancel_job_impl = cancel_job_impl
+        self._state: "ManagerState" = state
+        self._config: "ManagerConfig" = config
+        self._logger: "Logger" = logger
+        self._node_id: str = node_id
+        self._task_runner: "TaskRunner" = task_runner
+        self._cancel_job_impl: CancelJobFunc = cancel_job_impl
 
     async def handle(
         self,
