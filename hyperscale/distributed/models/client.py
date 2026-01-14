@@ -13,6 +13,7 @@ from typing import Any
 @dataclass(slots=True)
 class ClientReporterResult:
     """Result of a reporter submission as seen by the client."""
+
     reporter_type: str
     success: bool
     error: str | None = None
@@ -24,6 +25,7 @@ class ClientReporterResult:
 @dataclass(slots=True)
 class ClientWorkflowDCResult:
     """Per-datacenter workflow result for client-side tracking."""
+
     datacenter: str
     status: str
     stats: Any = None  # WorkflowStats for this DC
@@ -34,6 +36,7 @@ class ClientWorkflowDCResult:
 @dataclass(slots=True)
 class ClientWorkflowResult:
     """Result of a completed workflow within a job as seen by the client."""
+
     workflow_id: str
     workflow_name: str
     status: str
@@ -54,6 +57,7 @@ class ClientJobResult:
     For single-DC jobs, only basic fields are populated.
     For multi-DC jobs (via gates), per_datacenter_results and aggregated are populated.
     """
+
     job_id: str
     status: str  # JobStatus value
     total_completed: int = 0
@@ -62,9 +66,14 @@ class ClientJobResult:
     elapsed_seconds: float = 0.0
     error: str | None = None
     # Workflow results (populated as each workflow completes)
-    workflow_results: dict[str, ClientWorkflowResult] = field(default_factory=dict)  # workflow_id -> result
+    workflow_results: dict[str, ClientWorkflowResult] = field(
+        default_factory=dict
+    )  # workflow_id -> result
     # Multi-DC fields (populated when result comes from a gate)
     per_datacenter_results: list = field(default_factory=list)  # list[JobFinalResult]
+    per_datacenter_statuses: dict[str, str] = field(default_factory=dict)
     aggregated: Any = None  # AggregatedJobStats
     # Reporter results (populated as reporters complete)
-    reporter_results: dict[str, ClientReporterResult] = field(default_factory=dict)  # reporter_type -> result
+    reporter_results: dict[str, ClientReporterResult] = field(
+        default_factory=dict
+    )  # reporter_type -> result

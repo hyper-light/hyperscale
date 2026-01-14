@@ -43,7 +43,7 @@ class JobFinalResultHandler:
 
             job = self._state._jobs.get(result.job_id)
             if not job:
-                return b'ok'  # Job not tracked, ignore
+                return b"ok"  # Job not tracked, ignore
 
             # Update job with final result
             job.status = result.status
@@ -58,10 +58,10 @@ class JobFinalResultHandler:
             if event:
                 event.set()
 
-            return b'ok'
+            return b"ok"
 
         except Exception:
-            return b'error'
+            return b"error"
 
 
 class GlobalJobResultHandler:
@@ -98,7 +98,7 @@ class GlobalJobResultHandler:
 
             job = self._state._jobs.get(result.job_id)
             if not job:
-                return b'ok'  # Job not tracked, ignore
+                return b"ok"  # Job not tracked, ignore
 
             # Update job with aggregated result
             job.status = result.status
@@ -110,6 +110,7 @@ class GlobalJobResultHandler:
 
             # Multi-DC specific fields
             job.per_datacenter_results = result.per_datacenter_results
+            job.per_datacenter_statuses = result.per_datacenter_statuses
             job.aggregated = result.aggregated
 
             # Signal completion
@@ -117,7 +118,7 @@ class GlobalJobResultHandler:
             if event:
                 event.set()
 
-            return b'ok'
+            return b"ok"
 
         except Exception:
-            return b'error'
+            return b"error"
