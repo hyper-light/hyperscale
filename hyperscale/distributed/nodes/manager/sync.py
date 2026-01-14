@@ -10,6 +10,7 @@ import asyncio
 import time
 from typing import Any, Callable, Coroutine, TYPE_CHECKING
 
+from hyperscale.distributed.jobs.worker_pool import WorkerPool
 from hyperscale.distributed.models import (
     ManagerStateSnapshot,
     NodeInfo,

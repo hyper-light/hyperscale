@@ -120,6 +120,9 @@ from .distributed import (
     # Client reconnection
     RegisterCallback as RegisterCallback,
     RegisterCallbackResponse as RegisterCallbackResponse,
+    JobUpdateRecord as JobUpdateRecord,
+    JobUpdatePollRequest as JobUpdatePollRequest,
+    JobUpdatePollResponse as JobUpdatePollResponse,
     # Rate limiting
     RateLimitResponse as RateLimitResponse,
     # State sync
