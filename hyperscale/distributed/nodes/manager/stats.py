@@ -205,20 +205,15 @@ class ManagerStatsCoordinator:
         """
         Get current backpressure level (AD-23).
 
-        Based on stats buffer fill level:
-        - NONE: < high watermark
-        - THROTTLE: >= high watermark
-        - BATCH: >= critical watermark
-        - REJECT: >= reject watermark
-
         Returns:
             Current BackpressureLevel
         """
-        if self._stats_buffer_count >= self._stats_buffer_reject_watermark:
+        level = self._stats_buffer.get_backpressure_level()
+        if level == StatsBackpressureLevel.REJECT:
             return BackpressureLevel.REJECT
-        elif self._stats_buffer_count >= self._stats_buffer_critical_watermark:
+        if level == StatsBackpressureLevel.BATCH:
             return BackpressureLevel.BATCH
-        elif self._stats_buffer_count >= self._stats_buffer_high_watermark:
+        if level == StatsBackpressureLevel.THROTTLE:
             return BackpressureLevel.THROTTLE
         return BackpressureLevel.NONE
 
