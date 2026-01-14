@@ -1480,15 +1480,21 @@ class GateServer(HealthAwareServer):
             workflow_results: dict[str, WorkflowResultPush] = {}
             timeout_token: str | None = None
             should_schedule_timeout = False
+            state_updated = False
 
             async with self._workflow_dc_results_lock:
                 if push.job_id not in self._workflow_dc_results:
                     self._workflow_dc_results[push.job_id] = {}
                 if push.workflow_id not in self._workflow_dc_results[push.job_id]:
                     self._workflow_dc_results[push.job_id][push.workflow_id] = {}
-                self._workflow_dc_results[push.job_id][push.workflow_id][
-                    push.datacenter
-                ] = push
+                existing_result = self._workflow_dc_results[push.job_id][
+                    push.workflow_id
+                ].get(push.datacenter)
+                if existing_result != push:
+                    self._workflow_dc_results[push.job_id][push.workflow_id][
+                        push.datacenter
+                    ] = push
+                    state_updated = True
 
                 target_dcs = self._job_manager.get_target_dcs(push.job_id)
                 received_dcs = set(
@@ -1507,6 +1513,9 @@ class GateServer(HealthAwareServer):
                     )
                 elif target_dcs and not has_timeout:
                     should_schedule_timeout = True
+
+            if state_updated:
+                self._increment_version()
 
             if should_schedule_timeout:
                 await self._schedule_workflow_result_timeout(

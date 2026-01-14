@@ -297,8 +297,9 @@ class GateJobManager:
                     f"{dc_id}: reported status {result.status} without error details"
                 )
 
-            if hasattr(result, "rate") and result.rate > 0:
-                rates.append(result.rate)
+            rate_value = getattr(result, "rate", 0.0)
+            if isinstance(rate_value, (int, float)) and rate_value > 0:
+                rates.append(float(rate_value))
 
         should_resolve = bool(expected_dcs) and self._should_resolve_final_status(
             missing_dcs, normalized_statuses

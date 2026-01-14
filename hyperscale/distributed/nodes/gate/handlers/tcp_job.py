@@ -174,7 +174,34 @@ class GateJobHandler:
             JobStatus.TIMEOUT.value,
         )
 
-    async def _release_job_lease(self, job_id: str) -> None:
+    def _pop_lease_renewal_token(self, job_id: str) -> str | None:
+        return self._state._job_lease_renewal_tokens.pop(job_id, None)
+
+    async def _cancel_lease_renewal(self, job_id: str) -> None:
+        token = self._pop_lease_renewal_token(job_id)
+        if not token:
+            return
+        try:
+            await self._task_runner.cancel(token)
+        except Exception as error:
+            await self._logger.log(
+                ServerWarning(
+                    message=f"Failed to cancel lease renewal for job {job_id}: {error}",
+                    node_host=self._get_host(),
+                    node_port=self._get_tcp_port(),
+                    node_id=self._get_node_id().short,
+                )
+            )
+
+    async def _release_job_lease(
+        self,
+        job_id: str,
+        cancel_renewal: bool = True,
+    ) -> None:
+        if cancel_renewal:
+            await self._cancel_lease_renewal(job_id)
+        else:
+            self._pop_lease_renewal_token(job_id)
         await self._job_lease_manager.release(job_id)
 
     async def _renew_job_lease(self, job_id: str, lease_duration: float) -> None:
