@@ -709,6 +709,8 @@ class GateDispatchCoordinator:
                 self._record_dc_manager_for_job(job_id, fallback_dc, fallback_manager)
             else:
                 failed.append(datacenter)
+                if self._record_dispatch_failure:
+                    self._record_dispatch_failure(job_id, datacenter)
 
         return (successful, failed)
 
