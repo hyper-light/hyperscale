@@ -3921,12 +3921,26 @@ class GateServer(HealthAwareServer):
 
                 for peer_addr in peers_to_reap:
                     self._modular_state.mark_peer_dead(peer_addr, now)
+                    self._modular_state.mark_peer_healthy(peer_addr)
                     await self._modular_state.remove_active_peer(peer_addr)
 
                     self._task_runner.run(
                         self._udp_logger.log,
                         ServerInfo(
                             message=f"Reaped dead gate peer {peer_addr[0]}:{peer_addr[1]}",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        ),
+                    )
+
+                    self._task_runner.run(
+                        self._udp_logger.log,
+                        ServerDebug(
+                            message=(
+                                "Removed gate peer from unhealthy tracking during reap: "
+                                f"{peer_addr[0]}:{peer_addr[1]}"
+                            ),
                             node_host=self._host,
                             node_port=self._tcp_port,
                             node_id=self._node_id.short,

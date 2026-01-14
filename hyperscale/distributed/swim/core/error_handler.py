@@ -33,9 +33,10 @@ from .errors import (
 
 class CircuitState(Enum):
     """Circuit breaker states."""
-    CLOSED = auto()      # Normal operation
-    OPEN = auto()        # Failing, rejecting requests
-    HALF_OPEN = auto()   # Testing if recovery succeeded
+
+    CLOSED = auto()  # Normal operation
+    OPEN = auto()  # Failing, rejecting requests
+    HALF_OPEN = auto()  # Testing if recovery succeeded
 
 
 from .protocols import LoggerProtocol
@@ -81,26 +82,40 @@ class ErrorStats:
         """Initialize bounded deque and handle parameter aliases."""
         # Handle error_threshold alias for max_errors
         if self.error_threshold is not None:
-            object.__setattr__(self, 'max_errors', self.error_threshold)
+            object.__setattr__(self, "max_errors", self.error_threshold)
 
         # Create bounded deque if not already bounded
-        if not hasattr(self._timestamps, 'maxlen') or self._timestamps.maxlen != self.max_timestamps:
+        if (
+            not hasattr(self._timestamps, "maxlen")
+            or self._timestamps.maxlen != self.max_timestamps
+        ):
             self._timestamps = deque(self._timestamps, maxlen=self.max_timestamps)
-    
+
+    def _should_open_circuit(self, error_count: int) -> bool:
+        if error_count >= self.max_errors:
+            return True
+        if self.error_rate_threshold <= 0 or self.window_seconds <= 0:
+            return False
+        return (error_count / self.window_seconds) >= self.error_rate_threshold
+
     def record_error(self) -> None:
         """Record an error occurrence."""
         now = time.monotonic()
         self._timestamps.append(now)  # Deque maxlen handles overflow automatically
         self._prune_old_entries(now)
+        error_count = len(self._timestamps)
+        should_open = self._should_open_circuit(error_count)
 
         # Check if we should open the circuit
         if self._circuit_state == CircuitState.CLOSED:
-            if len(self._timestamps) >= self.max_errors:
+            if should_open:
                 self._circuit_state = CircuitState.OPEN
                 self._circuit_opened_at = now
         elif self._circuit_state == CircuitState.HALF_OPEN:
             # Error during half-open state means recovery failed - reopen circuit
             self._circuit_state = CircuitState.OPEN
+            self._circuit_opened_at = now
+        elif self._circuit_state == CircuitState.OPEN:
             self._circuit_opened_at = now
 
     def record_failure(self) -> None:
@@ -110,7 +125,7 @@ class ErrorStats:
     def is_open(self) -> bool:
         """Check if circuit is open (rejecting requests). Method form for compatibility."""
         return self.circuit_state == CircuitState.OPEN
-    
+
     def record_success(self) -> None:
         """
         Record a successful operation.
@@ -132,19 +147,19 @@ class ErrorStats:
         elif self._circuit_state == CircuitState.CLOSED:
             # Prune old entries to keep window current
             self._prune_old_entries(time.monotonic())
-    
+
     def _prune_old_entries(self, now: float) -> None:
         """Remove entries outside the window."""
         cutoff = now - self.window_seconds
         while self._timestamps and self._timestamps[0] < cutoff:
             self._timestamps.popleft()
-    
+
     @property
     def error_count(self) -> int:
         """Number of errors in current window."""
         self._prune_old_entries(time.monotonic())
         return len(self._timestamps)
-    
+
     @property
     def error_rate(self) -> float:
         """Errors per second in the window."""
@@ -152,7 +167,7 @@ class ErrorStats:
         if count == 0:
             return 0.0
         return count / self.window_seconds
-    
+
     @property
     def circuit_state(self) -> CircuitState:
         """Get current circuit state, transitioning to half-open if appropriate."""
@@ -161,12 +176,12 @@ class ErrorStats:
             if elapsed >= self.half_open_after:
                 self._circuit_state = CircuitState.HALF_OPEN
         return self._circuit_state
-    
+
     @property
     def is_circuit_open(self) -> bool:
         """Check if circuit is open (rejecting requests)."""
         return self.circuit_state == CircuitState.OPEN
-    
+
     def reset(self) -> None:
         """Reset error stats and close circuit."""
         self._timestamps.clear()
@@ -178,26 +193,26 @@ class ErrorStats:
 class ErrorHandler:
     """
     Centralized error handling with recovery actions.
-    
+
     Features:
     - Categorized error tracking with circuit breakers per category
     - LHM integration (errors affect local health score)
     - Recovery action registration for automatic healing
     - Structured logging with context
-    
+
     Example:
         handler = ErrorHandler(
             logger=server._udp_logger,
             increment_lhm=server.increase_failure_detector,
             node_id=server.node_id.short,
         )
-        
+
         # Register recovery actions
         handler.register_recovery(
             ErrorCategory.NETWORK,
             self._reset_connections,
         )
-        
+
         # Handle errors
         try:
             await probe_node(target)
@@ -206,35 +221,35 @@ class ErrorHandler:
                 ProbeTimeoutError(target, timeout)
             )
     """
-    
+
     logger: LoggerProtocol | None = None
     """Logger for structured error logging."""
-    
+
     increment_lhm: Callable[[str], Awaitable[None]] | None = None
     """Callback to increment Local Health Multiplier."""
-    
+
     node_id: str = "unknown"
     """Node identifier for log context."""
-    
+
     # Circuit breaker settings per category
     circuit_settings: dict[ErrorCategory, dict[str, Any]] = field(
         default_factory=lambda: {
-            ErrorCategory.NETWORK: {'max_errors': 15, 'window_seconds': 60.0},
-            ErrorCategory.PROTOCOL: {'max_errors': 10, 'window_seconds': 60.0},
-            ErrorCategory.RESOURCE: {'max_errors': 5, 'window_seconds': 30.0},
-            ErrorCategory.ELECTION: {'max_errors': 5, 'window_seconds': 30.0},
-            ErrorCategory.INTERNAL: {'max_errors': 3, 'window_seconds': 60.0},
+            ErrorCategory.NETWORK: {"max_errors": 15, "window_seconds": 60.0},
+            ErrorCategory.PROTOCOL: {"max_errors": 10, "window_seconds": 60.0},
+            ErrorCategory.RESOURCE: {"max_errors": 5, "window_seconds": 30.0},
+            ErrorCategory.ELECTION: {"max_errors": 5, "window_seconds": 30.0},
+            ErrorCategory.INTERNAL: {"max_errors": 3, "window_seconds": 60.0},
         }
     )
-    
+
     # Track errors by category
     _stats: dict[ErrorCategory, ErrorStats] = field(default_factory=dict)
-    
+
     # Recovery actions by category
     _recovery_actions: dict[ErrorCategory, Callable[[], Awaitable[None]]] = field(
         default_factory=dict
     )
-    
+
     # Callbacks for fatal errors
     _fatal_callback: Callable[[SwimError], Awaitable[None]] | None = None
 
@@ -242,13 +257,15 @@ class ErrorHandler:
     _shutting_down: bool = False
 
     # Track last error per category for debugging (includes traceback)
-    _last_errors: dict[ErrorCategory, tuple[SwimError, str]] = field(default_factory=dict)
+    _last_errors: dict[ErrorCategory, tuple[SwimError, str]] = field(
+        default_factory=dict
+    )
 
     def __post_init__(self):
         # Initialize stats for each category
         for category, settings in self.circuit_settings.items():
             self._stats[category] = ErrorStats(**settings)
-    
+
     def register_recovery(
         self,
         category: ErrorCategory,
@@ -256,11 +273,11 @@ class ErrorHandler:
     ) -> None:
         """
         Register a recovery action for a category.
-        
+
         The action is called when the circuit breaker opens for that category.
         """
         self._recovery_actions[category] = action
-    
+
     def set_fatal_callback(
         self,
         callback: Callable[[SwimError], Awaitable[None]],
@@ -290,10 +307,16 @@ class ErrorHandler:
         # Capture traceback for debugging - get the last line of the traceback
         tb_line = ""
         if error.cause:
-            tb_lines = traceback.format_exception(type(error.cause), error.cause, error.cause.__traceback__)
+            tb_lines = traceback.format_exception(
+                type(error.cause), error.cause, error.cause.__traceback__
+            )
             if tb_lines:
                 # Get the last non-empty line (usually the actual error)
-                tb_line = "".join(tb_lines[-3:]).strip() if len(tb_lines) >= 3 else "".join(tb_lines).strip()
+                tb_line = (
+                    "".join(tb_lines[-3:]).strip()
+                    if len(tb_lines) >= 3
+                    else "".join(tb_lines).strip()
+                )
 
         # Store last error with traceback for circuit breaker logging
         self._last_errors[error.category] = (error, tb_line)
@@ -320,7 +343,7 @@ class ErrorHandler:
         # 5. Fatal errors need escalation
         if error.severity == ErrorSeverity.FATAL:
             await self._handle_fatal(error)
-    
+
     async def handle_exception(
         self,
         exception: BaseException,
@@ -385,70 +408,71 @@ class ErrorHandler:
                 )
             )
         else:
-            await self.handle(
-                UnexpectedError(exception, operation)
-            )
-    
+            await self.handle(UnexpectedError(exception, operation))
+
     def record_success(self, category: ErrorCategory) -> None:
         """Record a successful operation (helps circuit breaker recover)."""
         stats = self._get_stats(category)
         stats.record_success()
-    
+
     def is_circuit_open(self, category: ErrorCategory) -> bool:
         """Check if circuit is open for a category."""
         return self._get_stats(category).is_circuit_open
-    
+
     def get_circuit_state(self, category: ErrorCategory) -> CircuitState:
         """Get circuit state for a category."""
         return self._get_stats(category).circuit_state
-    
+
     def get_error_rate(self, category: ErrorCategory) -> float:
         """Get current error rate for a category."""
         return self._get_stats(category).error_rate
-    
+
     def get_stats_summary(self) -> dict[str, dict[str, Any]]:
         """Get summary of all error stats for debugging."""
         return {
             cat.name: {
-                'error_count': stats.error_count,
-                'error_rate': stats.error_rate,
-                'circuit_state': stats.circuit_state.name,
+                "error_count": stats.error_count,
+                "error_rate": stats.error_rate,
+                "circuit_state": stats.circuit_state.name,
             }
             # Snapshot to avoid dict mutation during iteration
             for cat, stats in list(self._stats.items())
         }
-    
+
     def reset_category(self, category: ErrorCategory) -> None:
         """Reset error stats for a category."""
         self._get_stats(category).reset()
-    
+
     def reset_all(self) -> None:
         """Reset all error stats."""
         # Snapshot to avoid dict mutation during iteration
         for stats in list(self._stats.values()):
             stats.reset()
-    
+
     def _get_stats(self, category: ErrorCategory) -> ErrorStats:
         """Get or create stats for a category."""
         if category not in self._stats:
             settings = self.circuit_settings.get(category, {})
             self._stats[category] = ErrorStats(**settings)
         return self._stats[category]
-    
+
     async def _log_internal(self, message: str) -> None:
         """Log an internal error handler issue using ServerDebug."""
         if self.logger:
             try:
                 from hyperscale.logging.hyperscale_logging_models import ServerDebug
-                await self.logger.log(ServerDebug(
-                    message=f"[ErrorHandler] {message}",
-                    node_id=self.node_id,
-                    node_host="",  # Not available at handler level
-                    node_port=0,
-                ))
+
+                await self.logger.log(
+                    ServerDebug(
+                        message=f"[ErrorHandler] {message}",
+                        node_id=self.node_id,
+                        node_host="",  # Not available at handler level
+                        node_port=0,
+                    )
+                )
             except Exception:
                 pass  # Best effort - don't fail on logging errors
-    
+
     async def _log_error(self, error: SwimError) -> None:
         """Log error with structured context, using appropriate level based on severity."""
         if self.logger:
@@ -461,27 +485,30 @@ class ErrorHandler:
                 if error.context:
                     message += f", context={error.context}"
                 message += ")"
-                
+
                 # Select log model based on severity
                 # TRANSIENT = expected/normal, DEGRADED = warning, FATAL = error
                 from hyperscale.logging.hyperscale_logging_models import (
-                    ServerDebug, ServerWarning, ServerError, ServerFatal
+                    ServerDebug,
+                    ServerWarning,
+                    ServerError,
+                    ServerFatal,
                 )
-                
+
                 log_kwargs = {
                     "message": message,
                     "node_id": self.node_id,
                     "node_host": "",  # Not available at handler level
                     "node_port": 0,
                 }
-                
+
                 if error.severity == ErrorSeverity.TRANSIENT:
                     log_model = ServerDebug(**log_kwargs)
                 elif error.severity == ErrorSeverity.DEGRADED:
                     log_model = ServerWarning(**log_kwargs)
                 else:  # FATAL
                     log_model = ServerError(**log_kwargs)
-                
+
                 await self.logger.log(log_model)
             except (ImportError, AttributeError, TypeError):
                 # Fallback to simple logging - if this also fails, silently ignore
@@ -490,8 +517,10 @@ class ErrorHandler:
                     await self.logger.log(str(error))
                 except Exception:
                     pass  # Logging is best-effort
-    
-    async def _log_circuit_open(self, category: ErrorCategory, stats: ErrorStats) -> None:
+
+    async def _log_circuit_open(
+        self, category: ErrorCategory, stats: ErrorStats
+    ) -> None:
         """Log circuit breaker opening with last error details."""
         message = (
             f"[CircuitBreakerOpen] Circuit breaker OPEN for {category.name}: "
@@ -509,6 +538,7 @@ class ErrorHandler:
         if self.logger:
             try:
                 from hyperscale.logging.hyperscale_logging_models import ServerError
+
                 await self.logger.log(
                     ServerError(
                         message=message,
@@ -523,7 +553,7 @@ class ErrorHandler:
                     await self.logger.log(message)
                 except Exception:
                     pass  # Logging is best-effort
-    
+
     async def _update_lhm(self, error: SwimError) -> None:
         """
         Update Local Health Multiplier based on error.
@@ -550,11 +580,11 @@ class ErrorHandler:
 
         if error.severity == ErrorSeverity.FATAL:
             # Fatal errors always affect health significantly
-            event_type = 'event_loop_critical'
+            event_type = "event_loop_critical"
 
         elif error.category == ErrorCategory.RESOURCE:
             # Resource exhaustion is a clear signal of local problems
-            event_type = 'event_loop_lag'
+            event_type = "event_loop_lag"
 
         # Note: We intentionally skip NETWORK, PROTOCOL, ELECTION, and TRANSIENT
         # errors here. They are either:
@@ -566,8 +596,10 @@ class ErrorHandler:
                 await self.increment_lhm(event_type)
             except Exception as e:
                 # Log but don't let LHM updates cause more errors
-                await self._log_internal(f"LHM update failed for {event_type}: {type(e).__name__}: {e}")
-    
+                await self._log_internal(
+                    f"LHM update failed for {event_type}: {type(e).__name__}: {e}"
+                )
+
     async def _trigger_recovery(self, category: ErrorCategory) -> None:
         """Trigger recovery action for a category."""
         if category in self._recovery_actions:
@@ -575,8 +607,10 @@ class ErrorHandler:
                 await self._recovery_actions[category]()
             except Exception as e:
                 # Log recovery failure but don't propagate
-                await self._log_internal(f"Recovery action failed for {category.name}: {type(e).__name__}: {e}")
-    
+                await self._log_internal(
+                    f"Recovery action failed for {category.name}: {type(e).__name__}: {e}"
+                )
+
     async def _handle_fatal(self, error: SwimError) -> None:
         """Handle fatal error - escalate to callback or raise."""
         if self._fatal_callback:
@@ -584,7 +618,9 @@ class ErrorHandler:
                 await self._fatal_callback(error)
             except Exception as e:
                 # Log fatal callback failure - this is serious
-                await self._log_internal(f"FATAL: Fatal callback failed: {type(e).__name__}: {e} (original error: {error})")
+                await self._log_internal(
+                    f"FATAL: Fatal callback failed: {type(e).__name__}: {e} (original error: {error})"
+                )
         else:
             # Re-raise fatal errors if no handler
             raise error
@@ -594,16 +630,17 @@ class ErrorHandler:
 # Context manager for error handling
 # =============================================================================
 
+
 class ErrorContext:
     """
     Async context manager for consistent error handling.
-    
+
     Example:
         async with ErrorContext(handler, "probe_round") as ctx:
             await probe_node(target)
             ctx.record_success(ErrorCategory.NETWORK)
     """
-    
+
     def __init__(
         self,
         handler: ErrorHandler,
@@ -613,8 +650,8 @@ class ErrorContext:
         self.handler = handler
         self.operation = operation
         self.reraise = reraise
-    
-    async def __aenter__(self) -> 'ErrorContext':
+
+    async def __aenter__(self) -> "ErrorContext":
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb) -> bool:
@@ -638,4 +675,3 @@ class ErrorContext:
     def record_success(self, category: ErrorCategory) -> None:
         """Record successful operation for circuit breaker."""
         self.handler.record_success(category)
-

@@ -475,6 +475,159 @@ class JobManager:
 
             return info
 
+    async def apply_workflow_reassignment(
+        self,
+        job_id: str,
+        workflow_id: str,
+        sub_workflow_token: str,
+        failed_worker_id: str,
+    ) -> bool:
+        """
+        Apply a workflow reassignment to local tracking state.
+
+        Removes sub-workflows tied to the failed worker and, when the reassignment
+        token points to a new worker, registers the new assignment while preserving
+        dispatched context.
+        """
+        job = self.get_job_by_id(job_id)
+        if not job:
+            await self._logger.log(
+                JobManagerError(
+                    message=f"[apply_workflow_reassignment] FAILED: job not found for job_id={job_id}",
+                    manager_id=self._manager_id,
+                    datacenter=self._datacenter,
+                    job_id=job_id,
+                    workflow_id=workflow_id,
+                    sub_workflow_token=sub_workflow_token,
+                )
+            )
+            return False
+
+        try:
+            reassignment_token = TrackingToken.parse(sub_workflow_token)
+        except ValueError as error:
+            await self._logger.log(
+                JobManagerError(
+                    message=f"[apply_workflow_reassignment] FAILED: invalid sub_workflow_token {sub_workflow_token}: {error}",
+                    manager_id=self._manager_id,
+                    datacenter=self._datacenter,
+                    job_id=job_id,
+                    workflow_id=workflow_id,
+                    sub_workflow_token=sub_workflow_token,
+                )
+            )
+            return False
+
+        if (
+            reassignment_token.job_id != job_id
+            or reassignment_token.workflow_id != workflow_id
+        ):
+            await self._logger.log(
+                JobManagerError(
+                    message=(
+                        "[apply_workflow_reassignment] FAILED: token mismatch "
+                        f"job_id={job_id}, workflow_id={workflow_id}, token={sub_workflow_token}"
+                    ),
+                    manager_id=self._manager_id,
+                    datacenter=self._datacenter,
+                    job_id=job_id,
+                    workflow_id=workflow_id,
+                    sub_workflow_token=sub_workflow_token,
+                )
+            )
+            return False
+
+        reassignment_worker_id = reassignment_token.worker_id or ""
+        updated = False
+        removed_context: bytes | None = None
+        removed_version = 0
+        removed_cores = 0
+
+        async with job.lock:
+            parent_token_str = reassignment_token.workflow_token or ""
+            parent = job.workflows.get(parent_token_str)
+            if not parent:
+                fallback_token_str = str(
+                    self.create_workflow_token(job_id, workflow_id)
+                )
+                parent = job.workflows.get(fallback_token_str)
+                parent_token_str = fallback_token_str
+
+            if not parent:
+                await self._logger.log(
+                    JobManagerError(
+                        message=f"[apply_workflow_reassignment] FAILED: parent workflow not found for token={parent_token_str}",
+                        manager_id=self._manager_id,
+                        datacenter=self._datacenter,
+                        job_id=job_id,
+                        workflow_id=workflow_id,
+                        sub_workflow_token=sub_workflow_token,
+                    )
+                )
+                return False
+
+            removed_tokens = [
+                token_str
+                for token_str in parent.sub_workflow_tokens
+                if (sub_workflow := job.sub_workflows.get(token_str))
+                and sub_workflow.token.worker_id == failed_worker_id
+            ]
+
+            if removed_tokens:
+                parent.sub_workflow_tokens = [
+                    token_str
+                    for token_str in parent.sub_workflow_tokens
+                    if token_str not in removed_tokens
+                ]
+
+                for token_str in removed_tokens:
+                    if sub_workflow := job.sub_workflows.pop(token_str, None):
+                        if sub_workflow.dispatched_context:
+                            removed_context = sub_workflow.dispatched_context
+                        removed_version = max(
+                            removed_version, sub_workflow.dispatched_version
+                        )
+                        removed_cores = max(removed_cores, sub_workflow.cores_allocated)
+                    self._sub_workflow_to_job.pop(token_str, None)
+
+                updated = True
+
+            if reassignment_worker_id and reassignment_worker_id != failed_worker_id:
+                new_token_str = str(reassignment_token)
+                if new_token_str not in job.sub_workflows:
+                    new_sub_workflow = SubWorkflowInfo(
+                        token=reassignment_token,
+                        parent_token=parent.token,
+                        cores_allocated=removed_cores,
+                    )
+                    if removed_context is not None:
+                        new_sub_workflow.dispatched_context = removed_context
+                        new_sub_workflow.dispatched_version = removed_version
+                    job.sub_workflows[new_token_str] = new_sub_workflow
+                    self._sub_workflow_to_job[new_token_str] = str(job.token)
+                    updated = True
+
+                if new_token_str not in parent.sub_workflow_tokens:
+                    parent.sub_workflow_tokens.append(new_token_str)
+                    updated = True
+
+        if updated:
+            await self._logger.log(
+                JobManagerInfo(
+                    message=(
+                        "Applied workflow reassignment "
+                        f"from worker {failed_worker_id[:8]}... for workflow {workflow_id[:8]}..."
+                    ),
+                    manager_id=self._manager_id,
+                    datacenter=self._datacenter,
+                    job_id=job_id,
+                    workflow_id=workflow_id,
+                    sub_workflow_token=sub_workflow_token,
+                )
+            )
+
+        return updated
+
     # =========================================================================
     # Progress Updates
     # =========================================================================
