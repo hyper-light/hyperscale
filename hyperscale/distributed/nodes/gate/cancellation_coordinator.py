@@ -5,7 +5,7 @@ Coordinates job and workflow cancellation across datacenters.
 """
 
 import asyncio
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Callable, Coroutine
 
 from hyperscale.distributed.models import (
     CancelJob,
@@ -19,6 +19,11 @@ if TYPE_CHECKING:
     from hyperscale.distributed.nodes.gate.state import GateRuntimeState
     from hyperscale.logging import Logger
     from hyperscale.distributed.taskex import TaskRunner
+
+GetJobTargetDcsFunc = Callable[[str], list[str]]
+GetDcManagerAddrFunc = Callable[[str], tuple[str, int] | None]
+SendTcpFunc = Callable[..., Coroutine[Any, Any, bytes | None]]
+IsJobLeaderFunc = Callable[[str], bool]
 
 
 class GateCancellationCoordinator:
@@ -37,18 +42,18 @@ class GateCancellationCoordinator:
         state: "GateRuntimeState",
         logger: "Logger",
         task_runner: "TaskRunner",
-        get_job_target_dcs: callable,
-        get_dc_manager_addr: callable,
-        send_tcp: callable,
-        is_job_leader: callable,
+        get_job_target_dcs: GetJobTargetDcsFunc,
+        get_dc_manager_addr: GetDcManagerAddrFunc,
+        send_tcp: SendTcpFunc,
+        is_job_leader: IsJobLeaderFunc,
     ) -> None:
-        self._state = state
-        self._logger = logger
-        self._task_runner = task_runner
-        self._get_job_target_dcs = get_job_target_dcs
-        self._get_dc_manager_addr = get_dc_manager_addr
-        self._send_tcp = send_tcp
-        self._is_job_leader = is_job_leader
+        self._state: "GateRuntimeState" = state
+        self._logger: "Logger" = logger
+        self._task_runner: "TaskRunner" = task_runner
+        self._get_job_target_dcs: GetJobTargetDcsFunc = get_job_target_dcs
+        self._get_dc_manager_addr: GetDcManagerAddrFunc = get_dc_manager_addr
+        self._send_tcp: SendTcpFunc = send_tcp
+        self._is_job_leader: IsJobLeaderFunc = is_job_leader
 
     async def cancel_job(
         self,
@@ -100,7 +105,9 @@ class GateCancellationCoordinator:
         try:
             await asyncio.wait_for(event.wait(), timeout=30.0)
         except asyncio.TimeoutError:
-            self._state.add_cancellation_error(job_id, "Timeout waiting for DC responses")
+            self._state.add_cancellation_error(
+                job_id, "Timeout waiting for DC responses"
+            )
 
         # Get results
         errors = self._state.get_cancellation_errors(job_id)
