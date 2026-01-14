@@ -1419,6 +1419,7 @@ class GlobalJobStatus(Message):
     errors: list[str] = field(default_factory=list)
     resolution_details: str = ""
     timestamp: float = 0.0  # Monotonic time when job was submitted
+    fence_token: int = 0
 
 
 @dataclass(slots=True)
