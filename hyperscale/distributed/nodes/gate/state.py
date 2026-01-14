@@ -165,12 +165,21 @@ class GateRuntimeState:
 
     def cleanup_peer_tracking(self, peer_addr: tuple[str, int]) -> set[str]:
         """Remove tracking data for a peer address."""
-        udp_addrs_to_remove = [
+        udp_addrs_to_remove = {
             udp_addr
             for udp_addr, tcp_addr in list(self._gate_udp_to_tcp.items())
             if tcp_addr == peer_addr
-        ]
+        }
         gate_ids_to_remove: set[str] = set()
+
+        for udp_addr, heartbeat in list(self._gate_peer_info.items()):
+            if udp_addr in udp_addrs_to_remove:
+                continue
+
+            peer_tcp_host = heartbeat.tcp_host or udp_addr[0]
+            peer_tcp_port = heartbeat.tcp_port or udp_addr[1]
+            if (peer_tcp_host, peer_tcp_port) == peer_addr:
+                udp_addrs_to_remove.add(udp_addr)
 
         for udp_addr in udp_addrs_to_remove:
             heartbeat = self._gate_peer_info.get(udp_addr)
