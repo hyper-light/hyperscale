@@ -42,7 +42,10 @@ from hyperscale.logging.hyperscale_logging_models import (
 if TYPE_CHECKING:
     from hyperscale.distributed.nodes.gate.state import GateRuntimeState
     from hyperscale.distributed.jobs.gates import GateJobManager, GateJobTimeoutTracker
-    from hyperscale.distributed.routing import DispatchTimeTracker
+    from hyperscale.distributed.routing import (
+        DispatchTimeTracker,
+        ObservedLatencyTracker,
+    )
     from hyperscale.distributed.health import CircuitBreakerManager
     from hyperscale.distributed.swim.core import ErrorStats
     from hyperscale.logging import Logger
