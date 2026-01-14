@@ -139,13 +139,14 @@ class ErrorStats:
         Without this, the circuit would immediately re-open on the next error
         because old errors would still be counted in the window.
         """
-        if self._circuit_state == CircuitState.HALF_OPEN:
+        current_state = self.circuit_state
+        if current_state == CircuitState.HALF_OPEN:
             self._circuit_state = CircuitState.CLOSED
             self._circuit_opened_at = None
             # CRITICAL: Clear error history to allow real recovery
             # Without this, circuit immediately re-opens on next error
             self._timestamps.clear()
-        elif self._circuit_state == CircuitState.CLOSED:
+        elif current_state == CircuitState.CLOSED:
             # Prune old entries to keep window current
             self._prune_old_entries(time.monotonic())
 
@@ -177,11 +178,8 @@ class ErrorStats:
             elapsed = now - self._circuit_opened_at
             if elapsed >= self.half_open_after:
                 self._prune_old_entries(now)
-                error_count = len(self._timestamps)
-                if self._should_open_circuit(error_count):
-                    self._circuit_opened_at = now
-                else:
-                    self._circuit_state = CircuitState.HALF_OPEN
+                self._circuit_state = CircuitState.HALF_OPEN
+                self._circuit_opened_at = None
         return self._circuit_state
 
     @property
