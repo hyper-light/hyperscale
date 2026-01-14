@@ -5,7 +5,7 @@ Coordinates job leadership, lease management, and peer gate coordination.
 """
 
 import asyncio
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 from hyperscale.distributed.models import (
     JobLeadershipAnnouncement,
@@ -38,19 +38,19 @@ class GateLeadershipCoordinator:
         logger: "Logger",
         task_runner: "TaskRunner",
         leadership_tracker: "JobLeadershipTracker",
-        get_node_id: callable,
-        get_node_addr: callable,
-        send_tcp: callable,
-        get_active_peers: callable,
+        get_node_id: Callable,
+        get_node_addr: Callable,
+        send_tcp: Callable,
+        get_active_peers: Callable,
     ) -> None:
-        self._state = state
-        self._logger = logger
-        self._task_runner = task_runner
-        self._leadership_tracker = leadership_tracker
-        self._get_node_id = get_node_id
-        self._get_node_addr = get_node_addr
-        self._send_tcp = send_tcp
-        self._get_active_peers = get_active_peers
+        self._state: "GateRuntimeState" = state
+        self._logger: "Logger" = logger
+        self._task_runner: "TaskRunner" = task_runner
+        self._leadership_tracker: "JobLeadershipTracker" = leadership_tracker
+        self._get_node_id: Callable = get_node_id
+        self._get_node_addr: Callable = get_node_addr
+        self._send_tcp: Callable = send_tcp
+        self._get_active_peers: Callable = get_active_peers
 
     def is_job_leader(self, job_id: str) -> bool:
         """
