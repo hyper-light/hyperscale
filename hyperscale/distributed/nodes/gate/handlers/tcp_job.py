@@ -671,13 +671,18 @@ class GateJobHandler:
                         healthy_gates=self._get_healthy_gates(),
                     ).dump()
 
-            current_fence = self._job_manager.get_fence_token(progress.job_id)
-            if progress.fence_token < current_fence:
+            accepted, reason = await self._state.check_and_record_progress(
+                job_id=progress.job_id,
+                datacenter_id=progress.datacenter,
+                fence_token=progress.fence_token,
+                timestamp=progress.timestamp,
+            )
+            if not accepted:
                 self._task_runner.run(
                     self._logger.log,
                     ServerDebug(
-                        message=f"Rejecting stale job progress for {progress.job_id}: "
-                        f"fence_token {progress.fence_token} < {current_fence}",
+                        message=f"Rejecting job progress for {progress.job_id} from {progress.datacenter}: "
+                        f"reason={reason}, fence_token={progress.fence_token}",
                         node_host=self._get_host(),
                         node_port=self._get_tcp_port(),
                         node_id=self._get_node_id().short,
@@ -689,6 +694,7 @@ class GateJobHandler:
                     healthy_gates=self._get_healthy_gates(),
                 ).dump()
 
+            current_fence = self._job_manager.get_fence_token(progress.job_id)
             if progress.fence_token > current_fence:
                 current_fence = progress.fence_token
                 self._job_manager.set_fence_token(progress.job_id, progress.fence_token)
