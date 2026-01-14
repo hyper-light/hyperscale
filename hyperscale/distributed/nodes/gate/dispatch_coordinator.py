@@ -769,6 +769,10 @@ class GateDispatchCoordinator:
                     ),
                 )
                 return (fallback_dc, accepting_manager)
+
+            if self._record_dispatch_failure:
+                self._record_dispatch_failure(job_id, fallback_dc)
+
         return (None, None)
 
     async def _try_dispatch_to_manager(
