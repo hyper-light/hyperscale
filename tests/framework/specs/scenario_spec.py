@@ -2,8 +2,8 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-from .action_spec import ActionSpec
-from .cluster_spec import ClusterSpec
+from tests.framework.specs.action_spec import ActionSpec
+from tests.framework.specs.cluster_spec import ClusterSpec
 
 
 @dataclass(slots=True)

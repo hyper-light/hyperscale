@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 
-from .node_spec import NodeSpec
+from tests.framework.specs.node_spec import NodeSpec
 
 
 @dataclass(slots=True)

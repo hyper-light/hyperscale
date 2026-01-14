@@ -1,7 +1,7 @@
 from dataclasses import dataclass, field
 
-from .action_outcome import ActionOutcome
-from .scenario_result import ScenarioResult
+from tests.framework.results.action_outcome import ActionOutcome
+from tests.framework.results.scenario_result import ScenarioResult
 
 
 @dataclass(slots=True)
