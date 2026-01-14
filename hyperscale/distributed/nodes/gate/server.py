@@ -1370,6 +1370,23 @@ class GateServer(HealthAwareServer):
         try:
             push = WorkflowResultPush.load(data)
 
+            current_fence = self._job_manager.get_fence_token(push.job_id)
+            if push.fence_token < current_fence:
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerDebug(
+                        message=f"Rejecting stale workflow result for {push.job_id}: "
+                        f"fence_token {push.fence_token} < {current_fence}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    ),
+                )
+                return b"ok"
+
+            if push.fence_token > current_fence:
+                self._job_manager.set_fence_token(push.job_id, push.fence_token)
+
             if not self._job_manager.has_job(push.job_id):
                 await self._forward_workflow_result_to_peers(push)
                 return b"ok"
@@ -3369,6 +3386,75 @@ class GateServer(HealthAwareServer):
                 break
             except Exception as error:
                 await self.handle_exception(error, "windowed_stats_push_loop")
+
+    async def _resource_sampling_loop(self) -> None:
+        """
+        Background loop for periodic CPU/memory sampling.
+
+        Samples gate resource usage and feeds HybridOverloadDetector for overload
+        state classification. Runs at 1s cadence for responsive detection.
+        """
+        sample_interval = 1.0
+
+        while self._running:
+            try:
+                await asyncio.sleep(sample_interval)
+
+                metrics = await self._resource_monitor.sample()
+                self._last_resource_metrics = metrics
+
+                new_state = self._overload_detector.get_state(
+                    metrics.cpu_percent,
+                    metrics.memory_percent,
+                )
+                new_state_str = new_state.value
+
+                if new_state_str != self._gate_health_state:
+                    self._previous_gate_health_state = self._gate_health_state
+                    self._gate_health_state = new_state_str
+                    self._log_gate_health_transition(
+                        self._previous_gate_health_state,
+                        new_state_str,
+                    )
+
+            except asyncio.CancelledError:
+                break
+            except Exception as error:
+                await self._udp_logger.log(
+                    ServerWarning(
+                        message=f"Resource sampling error: {error}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+
+    def _log_gate_health_transition(self, previous_state: str, new_state: str) -> None:
+        state_severity = {"healthy": 0, "busy": 1, "stressed": 2, "overloaded": 3}
+        previous_severity = state_severity.get(previous_state, 0)
+        new_severity = state_severity.get(new_state, 0)
+        is_degradation = new_severity > previous_severity
+
+        if is_degradation:
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerWarning(
+                    message=f"Gate health degraded: {previous_state} -> {new_state}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                ),
+            )
+        else:
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerDebug(
+                    message=f"Gate health improved: {previous_state} -> {new_state}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                ),
+            )
 
     def _decay_discovery_failures(self) -> None:
         for dc_discovery in self._dc_manager_discovery.values():
