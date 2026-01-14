@@ -94,6 +94,8 @@ DEFAULT_MESSAGE_PRIORITIES: dict[str, RequestPriority] = {
     "JobStatusPush": RequestPriority.NORMAL,
     "RegisterCallback": RequestPriority.NORMAL,
     "RegisterCallbackResponse": RequestPriority.NORMAL,
+    "JobUpdatePollRequest": RequestPriority.NORMAL,
+    "JobUpdatePollResponse": RequestPriority.NORMAL,
     "StatsUpdate": RequestPriority.NORMAL,
     "StatsQuery": RequestPriority.NORMAL,
     # LOW/TELEMETRY priority - shed first
@@ -163,12 +165,16 @@ class LoadShedder:
         """
         self._detector = overload_detector
         self._config = config or LoadShedderConfig()
-        self._message_priorities = message_priorities or DEFAULT_MESSAGE_PRIORITIES.copy()
+        self._message_priorities = (
+            message_priorities or DEFAULT_MESSAGE_PRIORITIES.copy()
+        )
 
         # Metrics
         self._total_requests = 0
         self._shed_requests = 0
-        self._shed_by_priority: dict[RequestPriority, int] = {p: 0 for p in RequestPriority}
+        self._shed_by_priority: dict[RequestPriority, int] = {
+            p: 0 for p in RequestPriority
+        }
 
     def classify_request(self, message_type: str) -> RequestPriority:
         """
