@@ -2566,31 +2566,21 @@ class GateServer(HealthAwareServer):
             return
 
         payload = result.dump()
-        last_error: Exception | None = None
-        for attempt in range(GateStatsCoordinator.CALLBACK_PUSH_MAX_RETRIES):
-            try:
-                await self._send_tcp(
-                    callback,
-                    "receive_global_job_result",
-                    payload,
-                    timeout=5.0,
-                )
-                return
-            except Exception as error:
-                last_error = error
-                if attempt < GateStatsCoordinator.CALLBACK_PUSH_MAX_RETRIES - 1:
-                    delay = min(
-                        GateStatsCoordinator.CALLBACK_PUSH_BASE_DELAY_SECONDS
-                        * (2**attempt),
-                        GateStatsCoordinator.CALLBACK_PUSH_MAX_DELAY_SECONDS,
-                    )
-                    await asyncio.sleep(delay)
+        delivered = await self._record_and_send_client_update(
+            job_id,
+            callback,
+            "receive_global_job_result",
+            payload,
+            timeout=5.0,
+            log_failure=False,
+        )
+        if delivered:
+            return
 
         await self._udp_logger.log(
             ServerWarning(
                 message=(
-                    "Failed to deliver global timeout result for job "
-                    f"{job_id[:8]}...: {last_error}"
+                    f"Failed to deliver global timeout result for job {job_id[:8]}..."
                 ),
                 node_host=self._host,
                 node_port=self._tcp_port,

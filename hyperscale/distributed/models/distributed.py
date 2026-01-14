@@ -2229,6 +2229,7 @@ class GateStateSnapshot(Message):
     workflow_dc_results: dict[str, dict[str, dict[str, "WorkflowResultPush"]]] = field(
         default_factory=dict
     )
+    job_submissions: dict[str, "JobSubmission"] = field(default_factory=dict)
     progress_callbacks: dict[str, tuple[str, int]] = field(default_factory=dict)
 
 
