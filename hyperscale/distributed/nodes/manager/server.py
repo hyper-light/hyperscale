@@ -2298,10 +2298,11 @@ class ManagerServer(HealthAwareServer):
             if worker_id in job_worker_ids:
                 strategy = self._manager_state.get_job_timeout_strategy(job.job_id)
                 if strategy and hasattr(strategy, "record_extension"):
-                    await strategy.record_extension(
+                    await strategy.record_worker_extension(
                         job_id=job.job_id,
                         worker_id=worker_id,
                         extension_seconds=extension_seconds,
+                        worker_progress=worker_progress,
                     )
 
     def _select_timeout_strategy(self, submission: JobSubmission) -> TimeoutStrategy:
