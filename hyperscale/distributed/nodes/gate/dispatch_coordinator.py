@@ -66,7 +66,6 @@ class GateDispatchCoordinator:
         logger: "Logger",
         task_runner: "TaskRunner",
         job_manager: "GateJobManager",
-        job_router: "GateJobRouter | None",
         job_timeout_tracker: "GateJobTimeoutTracker",
         dispatch_time_tracker: "DispatchTimeTracker",
         circuit_breaker_manager: "CircuitBreakerManager",
