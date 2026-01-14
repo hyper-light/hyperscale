@@ -1414,6 +1414,7 @@ class GlobalJobResult(Message):
     status: str  # COMPLETED | FAILED | PARTIAL
     # Per-datacenter breakdown
     per_datacenter_results: list["JobFinalResult"] = field(default_factory=list)
+    per_datacenter_statuses: dict[str, str] = field(default_factory=dict)
     # Cross-DC aggregated stats
     aggregated: "AggregatedJobStats" = field(default_factory=AggregatedJobStats)
     # Summary

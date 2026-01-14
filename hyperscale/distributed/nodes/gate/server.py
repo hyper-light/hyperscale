@@ -4360,11 +4360,15 @@ class GateServer(HealthAwareServer):
         status = self._resolve_global_result_status(normalized_statuses)
 
         aggregated_stats = self._build_aggregated_job_stats(ordered_results)
+        per_datacenter_statuses = {
+            result.datacenter: result.status for result in ordered_results
+        }
 
         return GlobalJobResult(
             job_id=job_id,
             status=status,
             per_datacenter_results=ordered_results,
+            per_datacenter_statuses=per_datacenter_statuses,
             aggregated=aggregated_stats,
             total_completed=total_completed,
             total_failed=total_failed,
