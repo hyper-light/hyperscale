@@ -31,6 +31,7 @@ Latency and extension-aware signals:
 See tracker.py for within-DC correlation (workers within a manager).
 """
 
+import sys
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -1181,8 +1182,14 @@ class CrossDCCorrelationDetector:
                         self._on_callback_error(
                             "partition_healed", healed_datacenters, callback_error
                         )
-                    except Exception:
-                        pass
+                    except Exception as handler_error:
+                        print(
+                            f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] "
+                            f"CRITICAL: partition_healed callback error handler failed: {handler_error}, "
+                            f"original_error={callback_error}, "
+                            f"datacenters={healed_datacenters}",
+                            file=sys.stderr,
+                        )
 
         return True
 
