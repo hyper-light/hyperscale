@@ -62,9 +62,9 @@ class WorkflowProgressHandler:
             if ack.backpressure_level > 0:
                 self._handle_backpressure(ack)
 
-        except Exception:
-            # Backwards compatibility: ignore parse errors for old b'ok' responses
-            pass
+        except Exception as error:
+            if data != b"ok":
+                pass
 
     def _update_known_managers(self, ack: WorkflowProgressAck) -> None:
         """Update known managers from ack response."""
