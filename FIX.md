@@ -30,14 +30,14 @@ This file lists **current verified issues only**. All items below were confirmed
 **Why this matters:** Scenario 41.23 requires rejecting invalid or mismatched certificates. When `mtls_strict_mode` is enabled but `strict=True` is not passed, parse failures fall back to defaults and can pass validation.
 
 **Fix (actionable):**
-- Pass `strict=self._config.mtls_strict_mode` to `RoleValidator.extract_claims_from_cert()` in all call sites.
+- Pass `strict=self._config.mtls_strict_mode` (or equivalent env flag) to `RoleValidator.extract_claims_from_cert()` in all call sites.
 - If strict mode is enabled, treat parse errors as validation failures.
 
 ### 1.2 Timeout Tracker Accepts Stale Progress Reports
 
 | File | Lines | Issue |
 |------|-------|-------|
-| `distributed/jobs/gates/gate_job_timeout_tracker.py` | 175-205 | `record_progress()` stores `report.fence_token` but never validates it against existing per-DC fence token |
+| `distributed/jobs/gates/gate_job_timeout_tracker.py` | 175-205 | `record_progress()` stores `report.fence_token` but never validates it against existing per‑DC fence token |
 
 **Why this matters:** Scenario 11.1 (timeout detection) can be skewed by stale progress reports from old managers, delaying timeout decisions after leadership transfer.
 
