@@ -450,6 +450,16 @@ class GateJobTimeoutTracker:
                     )
                 )
 
+        try:
+            await self._gate.handle_global_timeout(
+                job_id,
+                reason,
+                list(info.target_datacenters),
+                dict(info.dc_manager_addrs),
+            )
+        except Exception as error:
+            await self._gate.handle_exception(error, "handle_global_timeout")
+
     async def stop_tracking(self, job_id: str) -> None:
         """
         Stop tracking a job (called on cleanup).
