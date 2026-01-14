@@ -313,6 +313,9 @@ class OutOfBandHealthChannel:
         """Receive loop for OOB messages."""
         loop = asyncio.get_event_loop()
 
+        current_addr: tuple[str, int] | None = None
+        current_msg_type: bytes | None = None
+
         while self._running and self._socket:
             try:
                 data, addr = await loop.sock_recvfrom(
@@ -320,10 +323,13 @@ class OutOfBandHealthChannel:
                     self.config.receive_buffer_size,
                 )
 
+                current_addr = addr
+
                 if not data:
                     continue
 
                 msg_type = data[0:1]
+                current_msg_type = msg_type
 
                 if msg_type == OOB_PROBE:
                     # Handle incoming probe
@@ -338,7 +344,20 @@ class OutOfBandHealthChannel:
                 await self._log_error("Receive loop cancelled")
                 break
             except Exception as receive_error:
-                await self._log_error(f"Receive loop error: {receive_error}")
+                msg_type_hex = current_msg_type.hex() if current_msg_type else "unknown"
+                addr_str = (
+                    f"{current_addr[0]}:{current_addr[1]}"
+                    if current_addr
+                    else "unknown"
+                )
+                await self._log_error(
+                    f"Receive loop error: {receive_error}, "
+                    f"socket={self.host}:{self.port}, "
+                    f"remote_addr={addr_str}, "
+                    f"msg_type=0x{msg_type_hex}"
+                )
+                current_addr = None
+                current_msg_type = None
                 continue
 
     async def _handle_probe(self, data: bytes, addr: tuple[str, int]) -> None:
