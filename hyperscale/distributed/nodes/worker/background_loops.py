@@ -258,8 +258,16 @@ class WorkerBackgroundLoops:
 
             except asyncio.CancelledError:
                 break
-            except Exception:
-                pass
+            except Exception as error:
+                if self._logger:
+                    await self._logger.log(
+                        ServerWarning(
+                            message=f"Error in orphan_check_loop: {error}",
+                            node_host=node_host,
+                            node_port=node_port,
+                            node_id=node_id_short,
+                        )
+                    )
 
     async def run_discovery_maintenance_loop(
         self,
