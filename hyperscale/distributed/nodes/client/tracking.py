@@ -127,16 +127,19 @@ class ClientJobTracker:
         self,
         job_id: str,
         timeout: float | None = None,
+        poll_interval: float | None = None,
     ) -> ClientJobResult:
         """
-        Wait for a job to complete.
+        Wait for a job to complete with periodic gate polling for reliability.
 
         Blocks until the job reaches a terminal state (COMPLETED, FAILED, etc.)
-        or timeout is exceeded.
+        or timeout is exceeded. Periodically polls the gate to recover from
+        missed status pushes.
 
         Args:
             job_id: Job identifier from submit_job
             timeout: Maximum time to wait in seconds (None = wait forever)
+            poll_interval: Interval for polling gate (None = use default)
 
         Returns:
             ClientJobResult with final status
@@ -149,13 +152,62 @@ class ClientJobTracker:
             raise KeyError(f"Unknown job: {job_id}")
 
         event = self._state._job_events[job_id]
+        effective_poll_interval = poll_interval or self.DEFAULT_POLL_INTERVAL_SECONDS
 
-        if timeout:
-            await asyncio.wait_for(event.wait(), timeout=timeout)
-        else:
-            await event.wait()
+        async def poll_until_complete():
+            while not event.is_set():
+                await asyncio.sleep(effective_poll_interval)
+                if event.is_set():
+                    break
+                await self._poll_and_update_status(job_id)
+
+        poll_task: asyncio.Task | None = None
+        if self._poll_gate_for_status:
+            poll_task = asyncio.create_task(poll_until_complete())
+
+        try:
+            if timeout:
+                await asyncio.wait_for(event.wait(), timeout=timeout)
+            else:
+                await event.wait()
+        finally:
+            if poll_task and not poll_task.done():
+                poll_task.cancel()
+                try:
+                    await poll_task
+                except asyncio.CancelledError:
+                    pass
 
         return self._state._jobs[job_id]
+
+    async def _poll_and_update_status(self, job_id: str) -> None:
+        if not self._poll_gate_for_status:
+            return
+
+        try:
+            remote_status = await self._poll_gate_for_status(job_id)
+            if not remote_status:
+                return
+
+            job = self._state._jobs.get(job_id)
+            if not job:
+                return
+
+            job.status = remote_status.status
+            job.total_completed = remote_status.total_completed
+            job.total_failed = remote_status.total_failed
+            if hasattr(remote_status, "overall_rate"):
+                job.overall_rate = remote_status.overall_rate
+            if hasattr(remote_status, "elapsed_seconds"):
+                job.elapsed_seconds = remote_status.elapsed_seconds
+
+            if remote_status.status in TERMINAL_STATUSES:
+                event = self._state._job_events.get(job_id)
+                if event:
+                    event.set()
+
+        except Exception:
+            pass
 
     def get_job_status(self, job_id: str) -> ClientJobResult | None:
         """
