@@ -231,16 +231,23 @@ class RoutingStateManager:
 
     def reset_primary_for_datacenters(self, datacenter_ids: set[str]) -> int:
         """Reset routing state for jobs in affected datacenters."""
-        if not datacenter_ids:
-            return 0
+        return len(self.reset_primary_for_datacenters_with_jobs(datacenter_ids))
 
-        reset_count = 0
-        for job_state in self._job_states.values():
+    def reset_primary_for_datacenters_with_jobs(
+        self,
+        datacenter_ids: set[str],
+    ) -> list[str]:
+        """Reset routing state for jobs and return affected job IDs."""
+        if not datacenter_ids:
+            return []
+
+        reset_jobs: list[str] = []
+        for job_id, job_state in self._job_states.items():
             if job_state.primary_datacenter in datacenter_ids:
                 job_state.reset_primary_selection()
-                reset_count += 1
+                reset_jobs.append(job_id)
 
-        return reset_count
+        return reset_jobs
 
     def cleanup_stale_states(self, max_age_seconds: float = 3600.0) -> int:
         """Remove stale job states older than max_age."""
