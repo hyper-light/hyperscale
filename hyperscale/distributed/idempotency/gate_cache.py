@@ -75,15 +75,43 @@ class GateIdempotencyCache(Generic[T]):
         job_id: str,
         source_gate_id: str,
     ) -> tuple[bool, IdempotencyEntry[T] | None]:
-        """Check if a key exists, inserting a PENDING entry if not."""
-        entry = await self._get_entry(key)
-        if entry:
-            if entry.is_terminal() or not self._config.wait_for_pending:
-                return True, entry
+        """
+        Atomically check if key exists, inserting PENDING entry if not.
+
+        Returns (True, entry) if key existed, (False, None) if newly inserted.
+        """
+        should_wait = False
+        evicted_waiters: list[asyncio.Future[T]] = []
+
+        async with self._lock:
+            entry = self._cache.get(key)
+            if entry:
+                self._cache.move_to_end(key)
+                if entry.is_terminal() or not self._config.wait_for_pending:
+                    return True, entry
+                should_wait = True
+            else:
+                new_entry = IdempotencyEntry(
+                    idempotency_key=key,
+                    status=IdempotencyStatus.PENDING,
+                    job_id=job_id,
+                    result=None,
+                    created_at=time.time(),
+                    committed_at=None,
+                    source_gate_id=source_gate_id,
+                )
+                evicted_waiters = self._evict_if_needed()
+                self._cache[key] = new_entry
+
+        if evicted_waiters:
+            self._reject_waiters(
+                evicted_waiters, TimeoutError("Idempotency entry evicted")
+            )
+
+        if should_wait:
             await self._wait_for_pending(key)
             return True, await self._get_entry(key)
 
-        await self._insert_entry(key, job_id, source_gate_id)
         return False, None
 
     async def commit(self, key: IdempotencyKey, result: T) -> None:
