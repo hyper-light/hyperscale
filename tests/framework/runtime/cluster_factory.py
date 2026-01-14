@@ -136,7 +136,6 @@ class ClusterFactory:
                     udp_port=udp_port,
                     env=self._env,
                     dc_id=datacenter_id,
-                    total_cores=spec.cores_per_worker,
                     seed_managers=seed_managers,
                 )
                 cluster.workers[datacenter_id].append(worker)
