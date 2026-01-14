@@ -3774,6 +3774,48 @@ class ManagerServer(HealthAwareServer):
         try:
             request = StateSyncRequest.load(data)
 
+            if request.cluster_id != self._config.cluster_id:
+                reason = (
+                    "State sync cluster_id mismatch: "
+                    f"{request.cluster_id} != {self._config.cluster_id}"
+                )
+                await self._udp_logger.log(
+                    ServerWarning(
+                        message=(
+                            f"State sync requester {request.requester_id} rejected: {reason}"
+                        ),
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+                return StateSyncResponse(
+                    responder_id=self._node_id.full,
+                    current_version=self._manager_state.state_version,
+                    responder_ready=False,
+                ).dump()
+
+            if request.environment_id != self._config.environment_id:
+                reason = (
+                    "State sync environment_id mismatch: "
+                    f"{request.environment_id} != {self._config.environment_id}"
+                )
+                await self._udp_logger.log(
+                    ServerWarning(
+                        message=(
+                            f"State sync requester {request.requester_id} rejected: {reason}"
+                        ),
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+                return StateSyncResponse(
+                    responder_id=self._node_id.full,
+                    current_version=self._manager_state.state_version,
+                    responder_ready=False,
+                ).dump()
+
             mtls_error = await self._validate_mtls_claims(
                 addr,
                 "State sync requester",

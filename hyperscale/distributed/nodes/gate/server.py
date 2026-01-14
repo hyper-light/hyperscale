@@ -2696,6 +2696,7 @@ class GateServer(HealthAwareServer):
             await self._peer_coordinator.handle_peer_failure(udp_addr, tcp_addr)
         else:
             await self._modular_state.remove_active_peer(tcp_addr)
+            self._modular_state.cleanup_peer_udp_tracking(tcp_addr)
             self._modular_state.cleanup_peer_tcp_tracking(tcp_addr)
             await self._peer_gate_circuit_breaker.remove_circuit(tcp_addr)
 

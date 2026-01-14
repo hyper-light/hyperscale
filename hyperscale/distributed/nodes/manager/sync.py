@@ -396,89 +396,93 @@ class ManagerStateSync:
         """
         worker_id = snapshot.node_id
         worker_key = f"worker:{worker_id}"
-        worker_pool = self._registry._worker_pool
-        worker_status = worker_pool.get_worker(worker_id) if worker_pool else None
 
-        if snapshot.state == WorkerState.OFFLINE.value:
-            await self._remove_worker_from_sync(
-                worker_id,
+        async with self._worker_state_lock:
+            worker_pool = self._registry._worker_pool
+            worker_status = worker_pool.get_worker(worker_id) if worker_pool else None
+
+            if snapshot.state == WorkerState.OFFLINE.value:
+                await self._remove_worker_from_sync(
+                    worker_id,
+                    worker_key,
+                    snapshot.version,
+                    worker_pool,
+                )
+                return
+
+            if (
+                worker_status
+                and worker_status.heartbeat
+                and snapshot.version <= worker_status.heartbeat.version
+            ):
+                self._task_runner.run(
+                    self._logger.log,
+                    ServerDebug(
+                        message=(
+                            f"Ignoring stale worker state from {worker_id[:8]}... "
+                            f"(version {snapshot.version})"
+                        ),
+                        node_host=self._config.host,
+                        node_port=self._config.tcp_port,
+                        node_id=self._node_id,
+                    ),
+                )
+                return
+
+            if not await self._state._versioned_clock.should_accept_update(
                 worker_key,
                 snapshot.version,
-                worker_pool,
-            )
-            return
+            ):
+                self._task_runner.run(
+                    self._logger.log,
+                    ServerDebug(
+                        message=(
+                            f"Rejected worker state conflict for {worker_id[:8]}... "
+                            f"(version {snapshot.version})"
+                        ),
+                        node_host=self._config.host,
+                        node_port=self._config.tcp_port,
+                        node_id=self._node_id,
+                    ),
+                )
+                return
 
-        if (
-            worker_status
-            and worker_status.heartbeat
-            and snapshot.version <= worker_status.heartbeat.version
-        ):
+            registration = self._resolve_worker_registration(snapshot, worker_status)
+            if registration is None:
+                return
+
+            health_state = self._derive_worker_health_state(snapshot)
+            self._state._worker_health_states[worker_id] = health_state
+
+            if snapshot.state == WorkerState.HEALTHY.value:
+                self._state.clear_worker_unhealthy_since(worker_id)
+
+            if worker_pool:
+                worker_status = await worker_pool.register_worker(registration)
+                await self._apply_worker_pool_snapshot(
+                    worker_pool,
+                    worker_status,
+                    registration,
+                    snapshot,
+                    health_state,
+                )
+
+            await self._state._versioned_clock.update_entity(
+                worker_key, snapshot.version
+            )
+
             self._task_runner.run(
                 self._logger.log,
                 ServerDebug(
                     message=(
-                        f"Ignoring stale worker state from {worker_id[:8]}... "
-                        f"(version {snapshot.version})"
+                        f"Applied worker state from {worker_id[:8]}... "
+                        f"cores={snapshot.available_cores}/{snapshot.total_cores}"
                     ),
                     node_host=self._config.host,
                     node_port=self._config.tcp_port,
                     node_id=self._node_id,
                 ),
             )
-            return
-
-        if not await self._state._versioned_clock.should_accept_update(
-            worker_key,
-            snapshot.version,
-        ):
-            self._task_runner.run(
-                self._logger.log,
-                ServerDebug(
-                    message=(
-                        f"Rejected worker state conflict for {worker_id[:8]}... "
-                        f"(version {snapshot.version})"
-                    ),
-                    node_host=self._config.host,
-                    node_port=self._config.tcp_port,
-                    node_id=self._node_id,
-                ),
-            )
-            return
-
-        registration = self._resolve_worker_registration(snapshot, worker_status)
-        if registration is None:
-            return
-
-        health_state = self._derive_worker_health_state(snapshot)
-        self._state._worker_health_states[worker_id] = health_state
-
-        if snapshot.state == WorkerState.HEALTHY.value:
-            self._state.clear_worker_unhealthy_since(worker_id)
-
-        if worker_pool:
-            worker_status = await worker_pool.register_worker(registration)
-            await self._apply_worker_pool_snapshot(
-                worker_pool,
-                worker_status,
-                registration,
-                snapshot,
-                health_state,
-            )
-
-        await self._state._versioned_clock.update_entity(worker_key, snapshot.version)
-
-        self._task_runner.run(
-            self._logger.log,
-            ServerDebug(
-                message=(
-                    f"Applied worker state from {worker_id[:8]}... "
-                    f"cores={snapshot.available_cores}/{snapshot.total_cores}"
-                ),
-                node_host=self._config.host,
-                node_port=self._config.tcp_port,
-                node_id=self._node_id,
-            ),
-        )
 
     async def sync_state_from_manager_peers(self) -> None:
         """

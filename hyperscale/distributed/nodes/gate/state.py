@@ -175,6 +175,7 @@ class GateRuntimeState:
         self._gate_peer_unhealthy_since.pop(peer_addr, None)
         self._dead_gate_peers.discard(peer_addr)
         self._dead_gate_timestamps.pop(peer_addr, None)
+        self._dead_job_leaders.discard(peer_addr)
         self._active_gate_peers.discard(peer_addr)
         self.remove_peer_lock(peer_addr)
 
