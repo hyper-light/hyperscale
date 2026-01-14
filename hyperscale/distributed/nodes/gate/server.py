@@ -91,7 +91,6 @@ from hyperscale.distributed.models import (
     restricted_loads,
     JobLeadershipAnnouncement,
     JobLeadershipAck,
-    JobLeaderGateTransfer,
     JobLeaderGateTransferAck,
     JobLeaderManagerTransfer,
     JobLeaderManagerTransferAck,
