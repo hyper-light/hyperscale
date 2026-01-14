@@ -770,6 +770,7 @@ class GateJobHandler:
 
                 if self._is_terminal_status(job.status):
                     await self._release_job_lease(progress.job_id)
+                    self._state.cleanup_job_progress_tracking(progress.job_id)
 
                 self._handle_update_by_tier(
                     progress.job_id,
