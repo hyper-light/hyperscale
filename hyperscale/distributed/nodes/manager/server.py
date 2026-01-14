@@ -18,6 +18,12 @@ from hyperscale.distributed.swim.detection import HierarchicalConfig
 from hyperscale.distributed.swim.health import FederatedHealthMonitor
 from hyperscale.distributed.env import Env
 from hyperscale.distributed.server import tcp
+from hyperscale.distributed.idempotency import (
+    IdempotencyKey,
+    IdempotencyStatus,
+    ManagerIdempotencyLedger,
+    create_idempotency_config_from_env,
+)
 
 from hyperscale.reporting.common.results_types import WorkflowStats
 from hyperscale.distributed.models import (
@@ -239,6 +245,8 @@ class ManagerServer(HealthAwareServer):
         self._workflow_timeout: float = workflow_timeout
 
         self._manager_state: ManagerState = ManagerState()
+        self._idempotency_config = create_idempotency_config_from_env(env)
+        self._idempotency_ledger: ManagerIdempotencyLedger[bytes] | None = None
 
         # Initialize parent HealthAwareServer
         super().__init__(
