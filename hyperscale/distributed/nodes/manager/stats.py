@@ -189,14 +189,6 @@ class ManagerStatsCoordinator:
         """
         return time.monotonic() - self._progress_state_since
 
-    def record_stats_buffer_entry(self) -> None:
-        """Record a new entry in the stats buffer for AD-23 tracking."""
-        self._stats_buffer_count += 1
-
-    def record_stats_buffer_flush(self, count: int) -> None:
-        """Record flushing entries from stats buffer."""
-        self._stats_buffer_count = max(0, self._stats_buffer_count - count)
-
     def should_apply_backpressure(self) -> bool:
         """
         Check if backpressure should be applied (AD-23).
@@ -204,7 +196,10 @@ class ManagerStatsCoordinator:
         Returns:
             True if system is under load and should shed requests
         """
-        return self._stats_buffer_count >= self._stats_buffer_high_watermark
+        return (
+            self._stats_buffer.get_backpressure_level()
+            >= StatsBackpressureLevel.THROTTLE
+        )
 
     def get_backpressure_level(self) -> BackpressureLevel:
         """
