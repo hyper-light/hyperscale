@@ -68,9 +68,9 @@ class ClusterFactory:
             worker_ports[datacenter_id] = []
             for _ in range(spec.workers_per_dc):
                 tcp_port = spec.base_worker_tcp + port_offset
-                udp_port = tcp_port + 1
+                udp_port = tcp_port + spec.worker_udp_offset
                 worker_ports[datacenter_id].append((tcp_port, udp_port))
-                port_offset += 2
+                port_offset += spec.worker_port_stride
         datacenter_managers_tcp: dict[str, list[tuple[str, int]]] = {}
         datacenter_managers_udp: dict[str, list[tuple[str, int]]] = {}
         for datacenter_id in datacenter_ids:
