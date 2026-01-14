@@ -267,6 +267,8 @@ class GateJobManager:
 
         dc_results = self._job_dc_results.get(job_id, {})
         target_dcs = self._job_target_dcs.get(job_id, set())
+        expected_dcs = target_dcs or set(dc_results.keys())
+        missing_dcs = expected_dcs - set(dc_results.keys())
 
         # Aggregate totals
         total_completed = 0
@@ -275,12 +277,14 @@ class GateJobManager:
         failed_dcs = 0
         errors: list[str] = []
         rates: list[float] = []
+        normalized_statuses: list[str] = []
 
         for dc_id, result in dc_results.items():
             total_completed += result.total_completed
             total_failed += result.total_failed
 
-            status_value = result.status.lower()
+            status_value = self._normalize_job_status(result.status)
+            normalized_statuses.append(status_value)
             if status_value == JobStatus.COMPLETED.value:
                 completed_dcs += 1
             else:
@@ -296,6 +300,16 @@ class GateJobManager:
             if hasattr(result, "rate") and result.rate > 0:
                 rates.append(result.rate)
 
+        should_resolve = bool(expected_dcs) and self._should_resolve_final_status(
+            missing_dcs, normalized_statuses
+        )
+
+        if should_resolve and missing_dcs:
+            for dc_id in sorted(missing_dcs):
+                failed_dcs += 1
+                normalized_statuses.append(JobStatus.TIMEOUT.value)
+                errors.append(f"{dc_id}: missing final result")
+
         # Update job with aggregated values
         job.total_completed = total_completed
         job.total_failed = total_failed
@@ -309,23 +323,30 @@ class GateJobManager:
             job.elapsed_seconds = time.monotonic() - job.timestamp
 
         # Determine overall status
-        if len(dc_results) == len(target_dcs) and len(target_dcs) > 0:
+        if should_resolve and normalized_statuses:
             resolution_details = ""
-            if failed_dcs == len(target_dcs):
+            if JobStatus.FAILED.value in normalized_statuses:
                 job.status = JobStatus.FAILED.value
-                resolution_details = "all_failed"
-            elif completed_dcs == len(target_dcs):
+                resolution_details = "failed_dc_reported"
+            elif JobStatus.CANCELLED.value in normalized_statuses:
+                job.status = JobStatus.CANCELLED.value
+                resolution_details = "cancelled_dc_reported"
+            elif JobStatus.TIMEOUT.value in normalized_statuses:
+                job.status = JobStatus.TIMEOUT.value
+                resolution_details = "timeout_dc_reported"
+            elif all(
+                status == JobStatus.COMPLETED.value for status in normalized_statuses
+            ):
                 job.status = JobStatus.COMPLETED.value
                 resolution_details = "all_completed"
-            elif completed_dcs > failed_dcs:
-                job.status = JobStatus.COMPLETED.value
-                resolution_details = "majority_completed"
-            elif failed_dcs > completed_dcs:
-                job.status = JobStatus.FAILED.value
-                resolution_details = "majority_failed"
             else:
                 job.status = JobStatus.FAILED.value
-                resolution_details = "split_default_failed"
+                resolution_details = "mixed_terminal_status"
+
+            if missing_dcs:
+                resolution_details = (
+                    f"{resolution_details};missing_dcs={len(missing_dcs)}"
+                )
 
             if resolution_details:
                 job.resolution_details = resolution_details

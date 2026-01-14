@@ -4388,10 +4388,29 @@ class GateServer(HealthAwareServer):
 
             if isinstance(result, bytes) and len(result) > 0:
                 response = GateStateSyncResponse.load(result)
-                if not response.error and response.snapshot:
+                if response.error:
+                    circuit.record_failure()
+                    return False
+                if response.snapshot:
                     await self._apply_gate_state_snapshot(response.snapshot)
                     circuit.record_success()
                     return True
+                if response.state_version <= self._state_version:
+                    circuit.record_success()
+                    return True
+                await self._udp_logger.log(
+                    ServerWarning(
+                        message=(
+                            "State sync response missing snapshot despite newer version "
+                            f"{response.state_version} > {self._state_version}"
+                        ),
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+                circuit.record_failure()
+                return False
 
             circuit.record_failure()
             return False
