@@ -462,7 +462,7 @@ class GateOrphanJobCoordinator:
                 ),
             )
 
-    def get_orphan_stats(self) -> dict:
+    def get_orphan_stats(self) -> dict[str, Any]:
         """
         Get statistics about orphaned job tracking.
 

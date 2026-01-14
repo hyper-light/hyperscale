@@ -2318,7 +2318,7 @@ class ManagerServer(HealthAwareServer):
         Returns:
             Appropriate TimeoutStrategy instance
         """
-        if submission.gate_addr:
+        if submission.origin_gate_addr:
             return GateCoordinatedTimeout(self)
         else:
             return LocalAuthorityTimeout(self)
