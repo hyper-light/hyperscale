@@ -170,7 +170,20 @@ class TimingWheel:
         self._entries_removed: int = 0
         self._entries_expired: int = 0
         self._entries_moved: int = 0
-        self._cascade_count: int = 0  # Times fine wheel filled from coarse
+        self._cascade_count: int = 0
+
+    async def _log_error(self, message: str) -> None:
+        if self._logger:
+            from hyperscale.logging.hyperscale_logging_models import ServerError
+
+            await self._logger.log(
+                ServerError(
+                    message=message,
+                    node_host=self._node_host,
+                    node_port=self._node_port,
+                    node_id=self._node_id,
+                )
+            )
 
     def _calculate_bucket_index(
         self,
