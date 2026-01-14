@@ -124,6 +124,7 @@ class GateOrphanJobCoordinator:
             get_node_addr: Callback to get this gate's TCP address
             send_tcp: Callback to send TCP messages to peers
             get_active_peers: Callback to get active peer gate addresses
+            forward_status_push_to_peers: Callback to forward status pushes to peer gates
             orphan_check_interval_seconds: How often to scan for orphaned jobs
             orphan_grace_period_seconds: Time to wait before attempting takeover
             orphan_timeout_seconds: Max time before orphaned jobs fail
@@ -140,6 +141,7 @@ class GateOrphanJobCoordinator:
         self._get_node_addr = get_node_addr
         self._send_tcp = send_tcp
         self._get_active_peers = get_active_peers
+        self._forward_status_push_to_peers = forward_status_push_to_peers
         self._orphan_check_interval_seconds = orphan_check_interval_seconds
         self._orphan_grace_period_seconds = orphan_grace_period_seconds
         self._orphan_timeout_seconds = orphan_timeout_seconds

@@ -11,11 +11,15 @@ import time
 from typing import Any, Callable, Coroutine, TYPE_CHECKING
 
 from hyperscale.distributed.models import (
+    ManagerStateSnapshot,
+    NodeInfo,
+    NodeRole,
     StateSyncRequest,
     StateSyncResponse,
     WorkerHeartbeat,
+    WorkerRegistration,
+    WorkerState,
     WorkerStateSnapshot,
-    ManagerStateSnapshot,
 )
 from hyperscale.distributed.reliability import (
     calculate_jittered_delay,

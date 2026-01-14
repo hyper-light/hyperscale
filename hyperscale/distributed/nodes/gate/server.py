@@ -374,6 +374,9 @@ class GateServer(HealthAwareServer):
         # Progress callbacks
         self._progress_callbacks: dict[str, tuple[str, int]] = {}
 
+        self._partition_detected_callbacks: list[Callable[[list[str]], None]] = []
+        self._partition_healed_callbacks: list[Callable[[list[str]], None]] = []
+
         # Windowed stats
         self._windowed_stats = WindowedStatsCollector(
             window_size_ms=env.STATS_WINDOW_SIZE_MS,
