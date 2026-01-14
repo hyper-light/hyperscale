@@ -11,130 +11,73 @@ This document contains **current** findings only. Items previously fixed or move
 
 | Severity | Count | Status |
 |----------|-------|--------|
-| **High Priority** | 5 | 🔴 Needs Fix |
-| **Medium Priority** | 4 | 🟡 Should Fix |
-| **Low Priority** | 0 | 🟢 Can Wait |
+| **High Priority** | 0 | 🟢 All Fixed |
+| **Medium Priority** | 0 | 🟢 All Fixed |
+| **Low Priority** | 0 | 🟢 None |
 
 ---
 
-## 1. High Priority Issues
+## Completed Fixes
 
-### 1.1 Federated Health Probe Loop Swallows Exceptions
+### 1. High Priority (All Fixed)
 
-| File | Lines | Issue |
-|------|-------|-------|
-| `distributed/swim/health/federated_health_monitor.py` | 369-373 | Probe loop catches `Exception` and only sleeps (no logging) |
+#### 1.1 Federated Health Probe Loop - FIXED
+- **File**: `distributed/swim/health/federated_health_monitor.py`
+- **Fix**: Added `on_probe_error` callback for probe loop and individual probe exceptions
+- **Changes**: Exception handlers invoke callback with error message and affected datacenters
 
-**Why this matters:** Cross-DC health drives routing and failover. Silent failures hide probe loop crashes during partitions (SCENARIOS 3.5/24).
+#### 1.2 Worker Progress Flush Errors - FIXED
+- **File**: `distributed/nodes/worker/execution.py`
+- **Fix**: Added logging for progress flush failures and loop errors
+- **Changes**: Uses ServerDebug for per-workflow failures, ServerWarning for loop errors
 
-**Fix (actionable):**
-- Log the exception with datacenter list and probe interval.
-- Use bounded backoff for repeated failures.
+#### 1.3 Worker Progress ACK Parsing - FIXED
+- **File**: `distributed/nodes/worker/progress.py`
+- **Fix**: Added logging for ACK parse failures when not legacy `b"ok"` payload
+- **Changes**: Added `task_runner_run` parameter for sync method logging
 
-### 1.2 Worker Progress Flush Errors Are Silently Dropped
+#### 1.4 Client Push Handlers - FIXED
+- **Files**:
+  - `distributed/nodes/client/handlers/tcp_job_status_push.py`
+  - `distributed/nodes/client/handlers/tcp_windowed_stats.py`
+  - `distributed/nodes/client/handlers/tcp_workflow_result.py`
+- **Fix**: Added logging before returning `b"error"` on exception
+- **Changes**: All handlers now log exception details with ServerWarning
 
-| File | Lines | Issue |
-|------|-------|-------|
-| `distributed/nodes/worker/execution.py` | 163-167 | `send_progress` failures are swallowed in `flush_progress_buffer` |
-| `distributed/nodes/worker/execution.py` | 188-223 | `run_progress_flush_loop` swallows exceptions without logging |
+#### 1.5 Failure Detection Callbacks - FIXED
+- **File**: `distributed/swim/detection/hierarchical_failure_detector.py`
+- **Fix**: Added `on_error` callback for callback failures and reconciliation errors
+- **Changes**: 
+  - `_on_global_death` callback errors now reported
+  - `_on_job_death` callback errors now reported
+  - Reconciliation loop errors now reported with cycle count
 
-**Why this matters:** Progress updates are the primary signal for job liveness and timeouts (SCENARIOS 7.2/11.1). Silent drops break progress ordering and timeout detection.
+### 2. Medium Priority (All Fixed)
 
-**Fix (actionable):**
-- Log send failures with workflow/job identifiers and manager address.
-- On repeated failures, trigger leader refresh or circuit open.
+#### 2.1 Job Suspicion Expiration - FIXED
+- **File**: `distributed/swim/detection/job_suspicion_manager.py`
+- **Fix**: Added `on_error` callback for `on_expired` callback failures
+- **Changes**: Reports job_id and node on callback failure
 
-### 1.3 Worker Progress ACK Parsing Fails Without Visibility
+#### 2.2 Worker TCP Progress Handler - FIXED
+- **File**: `distributed/nodes/worker/handlers/tcp_progress.py`
+- **Fix**: Added logging for non-legacy ACK parse failures
+- **Changes**: Uses task_runner to log ServerDebug via server reference
 
-| File | Lines | Issue |
-|------|-------|-------|
-| `distributed/nodes/worker/progress.py` | 522-555 | `WorkflowProgressAck` parse exceptions swallowed |
+#### 2.3 Lease Expiry Callback - FIXED
+- **File**: `distributed/leases/job_lease.py`
+- **Fix**: Added `on_error` callback for lease expiry and cleanup loop errors
+- **Changes**: Reports job_id on callback failures, loop context on cleanup errors
 
-**Why this matters:** ACKs carry backpressure and leader updates. Silent parsing failures leave workers stuck on stale routing or backpressure state (SCENARIOS 5.1/7.2).
-
-**Fix (actionable):**
-- Log parse failures at debug level with payload size and workflow_id.
-- Keep legacy compatibility but detect `b"ok"` explicitly.
-
-### 1.4 Client Push Handlers Hide Exceptions
-
-| File | Lines | Issue |
-|------|-------|-------|
-| `distributed/nodes/client/handlers/tcp_job_status_push.py` | 82-83, 149-150 | Exceptions return `b"error"` with no logging |
-| `distributed/nodes/client/handlers/tcp_windowed_stats.py` | 78-79 | Exceptions return `b"error"` with no logging |
-| `distributed/nodes/client/handlers/tcp_workflow_result.py` | 118-119 | Exceptions return `b"error"` with no logging |
-
-**Why this matters:** Client callbacks are the only visibility into results/stats. Silent failures break progress/result delivery (SCENARIOS 8–10).
-
-**Fix (actionable):**
-- Log exception details before returning `b"error"`.
-- Include job_id/workflow_id where available.
-
-### 1.5 Failure Detection Callbacks Swallow Exceptions
-
-| File | Lines | Issue |
-|------|-------|-------|
-| `distributed/swim/detection/hierarchical_failure_detector.py` | 701-705, 729-734 | `_on_global_death` and `_on_job_death` callbacks swallow errors |
-| `distributed/swim/detection/hierarchical_failure_detector.py` | 760-767 | Reconciliation loop swallows exceptions without logging |
-
-**Why this matters:** These callbacks drive dead-node and job-death reactions. If they fail silently, failover and timeout logic never runs (SCENARIOS 3.6/11.1).
-
-**Fix (actionable):**
-- Log callback exceptions with node/job identifiers.
-- Log reconciliation failures with cycle and current counters.
-
----
-
-## 2. Medium Priority Issues
-
-### 2.1 Job Suspicion Expiration Callback Swallows Errors
-
-| File | Lines | Issue |
-|------|-------|-------|
-| `distributed/swim/detection/job_suspicion_manager.py` | 321-328 | `_on_expired` callback errors swallowed |
-
-**Why this matters:** Job-level death declarations can fail silently, leaving stuck workflows (SCENARIOS 11.1/13.4).
-
-**Fix (actionable):**
-- Log callback exceptions with job_id/node/incarnation.
-
-### 2.2 Worker TCP Progress Handler Ignores Parse Errors
-
-| File | Lines | Issue |
-|------|-------|-------|
-| `distributed/nodes/worker/handlers/tcp_progress.py` | 65-67 | ACK parse errors ignored (legacy ok only) |
-
-**Why this matters:** Same impact as 1.3; handler should at least log non-legacy parse failures.
-
-**Fix (actionable):**
-- If data is not legacy `b"ok"`, log parse errors at debug level.
-
-### 2.3 Lease Expiry Callback Errors Are Dropped
-
-| File | Lines | Issue |
-|------|-------|-------|
-| `distributed/leases/job_lease.py` | 276-283 | `on_lease_expired` callback exceptions swallowed |
-
-**Why this matters:** Expired leases trigger orphan handling and reassignment. Silent failures leave jobs in limbo (SCENARIOS 13.4/14.2).
-
-**Fix (actionable):**
-- Log exceptions with lease/job identifiers and continue processing remaining leases.
-
-### 2.4 Cross-DC Correlation Callback Errors Are Dropped
-
-| File | Lines | Issue |
-|------|-------|-------|
-| `distributed/datacenters/cross_dc_correlation.py` | 1167-1172, 1189-1195 | Partition healed/detected callbacks swallow exceptions |
-
-**Why this matters:** Correlation events control eviction and routing decisions. Silent failures suppress alerts and response (SCENARIOS 41.20/42.2).
-
-**Fix (actionable):**
-- Log callback failures with affected DC list and timestamps.
-- Keep callback isolation so one failure doesn’t block others.
+#### 2.4 Cross-DC Correlation Callbacks - FIXED
+- **File**: `distributed/datacenters/cross_dc_correlation.py`
+- **Fix**: Added `_on_callback_error` for partition healed/detected callback failures
+- **Changes**: Reports event type, affected datacenter list, and exception
 
 ---
 
 ## Notes
 
 - Previously reported issues around federated ACK timeouts, progress ordering, target DC completion, quorum sizing, and manager leadership loss handling are confirmed resolved in the current codebase.
-- This report focuses on **current** scenario-impacting gaps with exact file references.
+- All exception swallowing issues have been addressed with proper logging or callbacks.
+- Classes without direct logger access now expose error callbacks that callers can wire to their logging infrastructure.
