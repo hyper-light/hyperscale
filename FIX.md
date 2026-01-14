@@ -82,19 +82,17 @@ This document catalogs all identified issues across the distributed node impleme
 
 ---
 
-### 2.4 Federated Health Monitor - Missing Ack Timeout Handling
+### 2.4 Federated Health Monitor - Missing Ack Timeout Handling ✅ FIXED
 
-| File | Lines | Issue |
-|------|-------|-------|
-| `distributed/swim/health/federated_health_monitor.py` | 351-382, 404-432 | Probe failures only recorded when `_send_udp` fails; missing `xack` never transitions DC to `SUSPECTED/UNREACHABLE` |
+| File | Lines | Issue | Status |
+|------|-------|-------|--------|
+| `distributed/swim/health/federated_health_monitor.py` | 351-382, 404-432 | Probe failures only recorded when `_send_udp` fails; missing `xack` never transitions DC to `SUSPECTED/UNREACHABLE` | ✅ Fixed |
 
-**Why this matters:** A DC can remain `REACHABLE` indefinitely after the last ack, so partitions or silent drops won’t be detected.
-
-**Fix (actionable):**
-- Track per-DC outstanding probe deadlines (e.g., `last_probe_sent` + `probe_timeout`).
-- In `_probe_loop` or `_probe_datacenter`, if the last probe deadline expires without an ack, call `_handle_probe_failure()`.
-- Alternatively, compare `time.monotonic() - state.last_ack_received` against `probe_timeout` or a configured “ack grace” and treat it as a failure.
-- Log unexpected exceptions in `_probe_loop` instead of silent sleep (see `distributed/swim/health/federated_health_monitor.py:345`).
+**Fix implemented:**
+- Added `_check_ack_timeouts()` method that checks all DCs for ack timeout
+- Called after each probe in `_probe_loop` 
+- Uses `ack_grace_period = probe_timeout * max_consecutive_failures` to detect silent failures
+- Transitions DC to SUSPECTED/UNREACHABLE when last_ack_received exceeds grace period
 
 ### 2.5 Multi-Gate Submit Storm Can Create Duplicate Jobs in a DC
 
