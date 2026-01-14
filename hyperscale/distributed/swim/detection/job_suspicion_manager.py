@@ -328,12 +328,8 @@ class JobSuspicionManager:
                 await asyncio.sleep(sleep_time)
 
         except asyncio.CancelledError:
-            # Normal cancellation (refutation or cleanup)
-            import sys
-
-            print(
-                f"[JobSuspicionManager] suspicion timer cancelled for {suspicion.job_id}, node {suspicion.node}",
-                file=sys.stderr,
+            await self._log_error(
+                f"Suspicion timer cancelled for job {suspicion.job_id}, node {suspicion.node}"
             )
 
     async def _handle_expiration(self, suspicion: JobSuspicion) -> None:
