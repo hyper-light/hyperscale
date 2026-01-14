@@ -3270,7 +3270,6 @@ class GateServer(HealthAwareServer):
                     callback,
                     latest_sequence,
                 )
-                return
 
             await self._stats_coordinator.send_immediate_update(
                 job_id,

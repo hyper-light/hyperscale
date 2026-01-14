@@ -369,10 +369,16 @@ class WorkflowProgressAck(Message):
             manager_id = values[0] if len(values) > 0 else ""
             is_leader = values[1] if len(values) > 1 else False
             healthy_managers = values[2] if len(values) > 2 else []
-            job_leader_addr = values[3] if len(values) > 3 else None
-            backpressure_level = values[4] if len(values) > 4 else 0
-            backpressure_delay_ms = values[5] if len(values) > 5 else 0
-            backpressure_batch_only = values[6] if len(values) > 6 else False
+            if len(values) > 6:
+                job_leader_addr = values[3] if len(values) > 3 else None
+                backpressure_level = values[4] if len(values) > 4 else 0
+                backpressure_delay_ms = values[5] if len(values) > 5 else 0
+                backpressure_batch_only = values[6] if len(values) > 6 else False
+            else:
+                job_leader_addr = None
+                backpressure_level = values[3] if len(values) > 3 else 0
+                backpressure_delay_ms = values[4] if len(values) > 4 else 0
+                backpressure_batch_only = values[5] if len(values) > 5 else False
         else:
             raise TypeError("Unsupported WorkflowProgressAck state")
 

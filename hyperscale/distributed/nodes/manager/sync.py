@@ -510,6 +510,8 @@ class ManagerStateSync:
         request = StateSyncRequest(
             requester_id=self._node_id,
             requester_role="manager",
+            cluster_id=self._config.cluster_id,
+            environment_id=self._config.environment_id,
             since_version=self._state.state_version,
         )
 

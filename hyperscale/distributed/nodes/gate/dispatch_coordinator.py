@@ -4,12 +4,14 @@ Gate job dispatch coordination module.
 Coordinates job submission and dispatch to datacenter managers.
 """
 
+import asyncio
 import time
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING
 
 import cloudpickle
 
+from hyperscale.distributed.leases import JobLeaseManager
 from hyperscale.distributed.models import (
     JobSubmission,
     JobAck,
