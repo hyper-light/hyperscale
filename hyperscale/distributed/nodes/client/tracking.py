@@ -17,6 +17,7 @@ from hyperscale.distributed.models import (
 )
 from hyperscale.distributed.nodes.client.state import ClientState
 from hyperscale.logging import Logger
+from hyperscale.logging.hyperscale_logging_models import ServerDebug
 
 PollGateForStatusFunc = Callable[[str], Coroutine[Any, Any, GlobalJobStatus | None]]
 
