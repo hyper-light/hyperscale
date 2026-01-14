@@ -397,12 +397,7 @@ class FederatedHealthMonitor:
                     await asyncio.sleep(interval_per_dc)
 
             except asyncio.CancelledError:
-                import sys
-
-                print(
-                    "[FederatedHealthMonitor] probe loop cancelled",
-                    file=sys.stderr,
-                )
+                await self._log_error("Probe loop cancelled")
                 break
             except Exception as error:
                 if self.on_probe_error:
@@ -412,20 +407,11 @@ class FederatedHealthMonitor:
                             list(self._dc_health.keys()),
                         )
                     except Exception as callback_error:
-                        import sys
-
-                        print(
-                            f"[FederatedHealthMonitor] on_probe_error callback failed: {callback_error}, "
-                            f"original error: {error}",
-                            file=sys.stderr,
+                        await self._log_error(
+                            f"on_probe_error callback failed: {callback_error}, original error: {error}"
                         )
                 else:
-                    import sys
-
-                    print(
-                        f"[FederatedHealthMonitor] probe loop error: {error}",
-                        file=sys.stderr,
-                    )
+                    await self._log_error(f"Probe loop error: {error}")
                 await asyncio.sleep(1.0)
 
     async def _probe_datacenter(self, datacenter: str) -> None:
