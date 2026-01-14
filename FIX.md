@@ -188,14 +188,22 @@ This document catalogs all identified issues across the distributed node impleme
 
 **Note:** Original line numbers in FIX.md were stale. The functionality is fully implemented in the current codebase.
 
-### 3.2 Manager Server - Duplicate Heartbeat Processing
+### 3.2 Manager Server - Duplicate Heartbeat Processing ✅ FIXED
 
-| File | Lines | Issue |
-|------|-------|-------|
-| `nodes/manager/server.py` | 1203-1218 | Worker heartbeat via SWIM embedding |
-| `nodes/manager/server.py` | 3424-3425 | Worker heartbeat via TCP handler |
+| File | Lines | Issue | Status |
+|------|-------|-------|--------|
+| `nodes/manager/server.py` | 1455-1464 | Worker heartbeat via SWIM embedding | Already has dedup |
+| `nodes/manager/server.py` | 4320-4349 | Worker heartbeat via TCP handler | ✅ Fixed |
 
-**Risk:** Duplicate processing, race conditions, capacity updates applied twice.
+**Analysis:**
+- `WorkerPool.process_heartbeat()` already has version-based deduplication (lines 445-449)
+- SWIM path calls `_health_monitor.handle_worker_heartbeat()` for health state updates
+- TCP path was missing the health monitoring call
+
+**Fix implemented:**
+- Added `_health_monitor.handle_worker_heartbeat()` call to TCP handler
+- Added worker existence check before calling `process_heartbeat()` (matching SWIM path)
+- Both paths now use identical processing logic
 
 ### 3.3 Gate Server - Duplicate Health Classification Logic
 
