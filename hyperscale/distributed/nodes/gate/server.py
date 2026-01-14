@@ -1084,7 +1084,7 @@ class GateServer(HealthAwareServer):
         """Handle job submission from client."""
         if self._job_handler:
             return await self._job_handler.handle_submission(
-                addr, data, self.handle_exception
+                addr, data, self._modular_state.get_active_peer_count()
             )
         return b"error"
 
