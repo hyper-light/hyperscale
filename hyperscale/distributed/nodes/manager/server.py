@@ -2819,10 +2819,15 @@ class ManagerServer(HealthAwareServer):
             backpressure = self._stats.get_backpressure_signal()
 
             ack = WorkflowProgressAck(
-                workflow_id=progress.workflow_id,
-                received=True,
+                manager_id=self._node_id.full,
+                is_leader=self.is_leader(),
+                healthy_managers=self._get_healthy_managers(),
+                job_leader_addr=self._manager_state.get_job_leader_addr(
+                    progress.job_id
+                ),
                 backpressure_level=backpressure.level.value,
                 backpressure_delay_ms=backpressure.delay_ms,
+                backpressure_batch_only=backpressure.batch_only,
             )
 
             return ack.dump()

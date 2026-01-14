@@ -723,6 +723,8 @@ class GateServer(HealthAwareServer):
             get_host=lambda: self._host,
             get_tcp_port=lambda: self._tcp_port,
             confirm_manager_for_dc=self._confirm_manager_for_dc,
+            on_partition_healed=self._on_partition_healed,
+            on_partition_detected=self._on_partition_detected,
         )
 
         self._orphan_job_coordinator = GateOrphanJobCoordinator(
@@ -3684,8 +3686,14 @@ class GateServer(HealthAwareServer):
 
     async def _cleanup_single_job(self, job_id: str) -> None:
         self._job_manager.delete_job(job_id)
+        workflow_timeout_tokens: dict[str, str] | None = None
         async with self._workflow_dc_results_lock:
             self._workflow_dc_results.pop(job_id, None)
+            workflow_timeout_tokens = self._workflow_result_timeout_tokens.pop(
+                job_id, None
+            )
+        if workflow_timeout_tokens:
+            await self._cancel_workflow_result_timeouts(workflow_timeout_tokens)
         if self._job_final_statuses:
             keys_to_remove = [
                 key for key in self._job_final_statuses.keys() if key[0] == job_id

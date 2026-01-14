@@ -178,6 +178,13 @@ class ManagerHealthState:
 
         return RoutingDecision.ROUTE
 
+    def _apply_liveness_update(self, success: bool) -> None:
+        if success:
+            self.last_liveness_response = time.monotonic()
+            self.consecutive_liveness_failures = 0
+        else:
+            self.consecutive_liveness_failures += 1
+
     def update_liveness(self, success: bool) -> None:
         """
         Update liveness signal from probe/heartbeat result.
@@ -185,11 +192,11 @@ class ManagerHealthState:
         Args:
             success: Whether the probe succeeded
         """
-        if success:
-            self.last_liveness_response = time.monotonic()
-            self.consecutive_liveness_failures = 0
-        else:
-            self.consecutive_liveness_failures += 1
+        self._apply_liveness_update(success)
+
+    async def update_liveness_async(self, success: bool) -> None:
+        async with self._state_lock:
+            self._apply_liveness_update(success)
 
     def update_readiness(
         self,

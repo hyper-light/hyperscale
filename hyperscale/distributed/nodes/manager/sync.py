@@ -162,14 +162,118 @@ class ManagerStateSync:
         Args:
             snapshot: Worker state snapshot
         """
-        # In full implementation, this would:
-        # 1. Update workflow states from worker's active workflows
-        # 2. Reconcile job state with workflow progress
-        # 3. Update completion tracking
+        worker_id = snapshot.node_id
+        worker_key = f"worker:{worker_id}"
+        worker_pool = self._registry._worker_pool
+        worker_status = worker_pool.get_worker(worker_id) if worker_pool else None
+
+        if (
+            worker_status
+            and worker_status.heartbeat
+            and snapshot.version <= worker_status.heartbeat.version
+        ):
+            self._task_runner.run(
+                self._logger.log,
+                ServerDebug(
+                    message=(
+                        f"Ignoring stale worker state from {worker_id[:8]}... "
+                        f"(version {snapshot.version})"
+                    ),
+                    node_host=self._config.host,
+                    node_port=self._config.tcp_port,
+                    node_id=self._node_id,
+                ),
+            )
+            return
+
+        if not await self._state._versioned_clock.should_accept_update(
+            worker_key,
+            snapshot.version,
+        ):
+            self._task_runner.run(
+                self._logger.log,
+                ServerDebug(
+                    message=(
+                        f"Rejected worker state conflict for {worker_id[:8]}... "
+                        f"(version {snapshot.version})"
+                    ),
+                    node_host=self._config.host,
+                    node_port=self._config.tcp_port,
+                    node_id=self._node_id,
+                ),
+            )
+            return
+
+        registration = self._registry.get_worker(worker_id)
+        if not registration:
+            self._task_runner.run(
+                self._logger.log,
+                ServerWarning(
+                    message=(
+                        f"Worker state sync received for unknown worker "
+                        f"{worker_id[:8]}..."
+                    ),
+                    node_host=self._config.host,
+                    node_port=self._config.tcp_port,
+                    node_id=self._node_id,
+                ),
+            )
+            return
+
+        registration.total_cores = snapshot.total_cores
+        registration.available_cores = snapshot.available_cores
+
+        if worker_pool:
+            if worker_status is None:
+                await worker_pool.register_worker(registration)
+                worker_status = worker_pool.get_worker(worker_id)
+
+            if worker_status:
+                heartbeat = WorkerHeartbeat(
+                    node_id=worker_id,
+                    state=snapshot.state,
+                    available_cores=snapshot.available_cores,
+                    queue_depth=0,
+                    cpu_percent=0.0,
+                    memory_percent=0.0,
+                    version=snapshot.version,
+                    active_workflows={
+                        workflow_id: progress.status
+                        for workflow_id, progress in snapshot.active_workflows.items()
+                    },
+                    tcp_host=registration.node.host,
+                    tcp_port=registration.node.port,
+                )
+
+                async with worker_pool._cores_condition:
+                    old_available = worker_status.available_cores
+                    worker_status.heartbeat = heartbeat
+                    worker_status.last_seen = time.monotonic()
+                    worker_status.state = snapshot.state
+                    worker_status.available_cores = snapshot.available_cores
+                    worker_status.total_cores = snapshot.total_cores
+                    worker_status.reserved_cores = 0
+
+                    if worker_status.available_cores > old_available:
+                        worker_pool._cores_condition.notify_all()
+
+                    health_state = worker_pool._worker_health.get(worker_id)
+                    if health_state:
+                        health_state.update_liveness(success=True)
+                        health_state.update_readiness(
+                            accepting=worker_status.available_cores > 0,
+                            capacity=worker_status.available_cores,
+                        )
+
+        await self._state._versioned_clock.update_entity(worker_key, snapshot.version)
+
         self._task_runner.run(
             self._logger.log,
             ServerDebug(
-                message=f"Applied worker state from {snapshot.worker_id[:8]}...",
+                message=(
+                    f"Applied worker state from {worker_id[:8]}... "
+                    f"cores={snapshot.available_cores}/{snapshot.total_cores}"
+                ),
                 node_host=self._config.host,
                 node_port=self._config.tcp_port,
                 node_id=self._node_id,
