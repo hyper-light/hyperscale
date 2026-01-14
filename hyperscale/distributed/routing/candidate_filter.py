@@ -17,6 +17,8 @@ class ExclusionReason(str, Enum):
     ALL_MANAGERS_CIRCUIT_OPEN = "all_managers_circuit_open"
     CIRCUIT_BREAKER_OPEN = "circuit_breaker_open"
     HEARTBEAT_STALE = "heartbeat_stale"
+    SLO_LATENCY_EXCEEDED = "slo_latency_exceeded"
+    SLO_CAPACITY_INSUFFICIENT = "slo_capacity_insufficient"
 
 
 class DemotionReason(str, Enum):
