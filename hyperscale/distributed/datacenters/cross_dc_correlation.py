@@ -1219,8 +1219,14 @@ class CrossDCCorrelationDetector:
                                 affected_datacenters,
                                 callback_error,
                             )
-                        except Exception:
-                            pass
+                        except Exception as handler_error:
+                            print(
+                                f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] "
+                                f"CRITICAL: partition_detected callback error handler failed: {handler_error}, "
+                                f"original_error={callback_error}, "
+                                f"datacenters={affected_datacenters}",
+                                file=sys.stderr,
+                            )
 
     def is_in_partition(self) -> bool:
         """Check if we are currently in a partition state."""
