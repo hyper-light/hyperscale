@@ -2042,6 +2042,12 @@ class GateServer(HealthAwareServer):
             if not callback:
                 return b"no_callback"
 
+            sequence = await self._modular_state.record_client_update(
+                job_id,
+                "job_status_push",
+                data,
+            )
+
             max_retries = GateStatsCoordinator.CALLBACK_PUSH_MAX_RETRIES
             base_delay = GateStatsCoordinator.CALLBACK_PUSH_BASE_DELAY_SECONDS
             max_delay = GateStatsCoordinator.CALLBACK_PUSH_MAX_DELAY_SECONDS
@@ -2050,6 +2056,11 @@ class GateServer(HealthAwareServer):
             for attempt in range(max_retries):
                 try:
                     await self._send_tcp(callback, "job_status_push", data)
+                    await self._modular_state.set_client_update_position(
+                        job_id,
+                        callback,
+                        sequence,
+                    )
                     return b"ok"
                 except Exception as send_error:
                     last_error = send_error
