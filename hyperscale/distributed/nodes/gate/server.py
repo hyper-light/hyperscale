@@ -258,10 +258,7 @@ class GateServer(HealthAwareServer):
                 configured_managers=list(manager_addrs),
             )
 
-        # Per-manager circuit breakers
         self._circuit_breaker_manager = CircuitBreakerManager(env)
-
-        # Per-peer-gate circuit breakers for gate-to-gate forwarding
         self._peer_gate_circuit_breaker = CircuitBreakerManager(env)
 
         # Gate peers
