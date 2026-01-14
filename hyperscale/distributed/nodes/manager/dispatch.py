@@ -152,7 +152,6 @@ class ManagerDispatchCoordinator:
                         self._state._dispatch_failure_count += 1
                     return ack
 
-                # Response was None or Exception - worker unreachable or timeout
                 self._task_runner.run(
                     self._logger.log,
                     ServerWarning(
@@ -165,6 +164,10 @@ class ManagerDispatchCoordinator:
                 self._state._dispatch_failure_count += 1
                 if circuit := self._state._worker_circuits.get(worker_id):
                     circuit.record_error()
+                    if circuit.is_open():
+                        self._state.setdefault_worker_unhealthy_since(
+                            worker_id, time.monotonic()
+                        )
 
             except Exception as e:
                 self._task_runner.run(
@@ -177,9 +180,12 @@ class ManagerDispatchCoordinator:
                     ),
                 )
                 self._state._dispatch_failure_count += 1
-                # Record failure in circuit breaker
                 if circuit := self._state._worker_circuits.get(worker_id):
                     circuit.record_error()
+                    if circuit.is_open():
+                        self._state.setdefault_worker_unhealthy_since(
+                            worker_id, time.monotonic()
+                        )
 
         return None
 
