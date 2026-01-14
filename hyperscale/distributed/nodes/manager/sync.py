@@ -7,11 +7,13 @@ for retry delays to prevent thundering herd.
 """
 
 import asyncio
+import time
 from typing import Any, Callable, Coroutine, TYPE_CHECKING
 
 from hyperscale.distributed.models import (
     StateSyncRequest,
     StateSyncResponse,
+    WorkerHeartbeat,
     WorkerStateSnapshot,
     ManagerStateSnapshot,
 )

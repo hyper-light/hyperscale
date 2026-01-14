@@ -283,6 +283,50 @@ class GatePeerCoordinator:
             ),
         )
 
+    async def cleanup_dead_peer(self, peer_addr: tuple[str, int]) -> None:
+        """
+        Clean up tracking for a reaped peer gate.
+
+        Args:
+            peer_addr: TCP address of the dead peer
+        """
+        udp_addr: tuple[str, int] | None = None
+        peer_heartbeat: GateHeartbeat | None = None
+
+        for candidate_udp_addr, candidate_tcp_addr in list(
+            self._state.iter_udp_to_tcp_mappings()
+        ):
+            if candidate_tcp_addr == peer_addr:
+                udp_addr = candidate_udp_addr
+                peer_heartbeat = self._state.get_gate_peer_heartbeat(udp_addr)
+                break
+
+        peer_host, peer_port = peer_addr
+        fallback_peer_id = f"{peer_host}:{peer_port}"
+        gate_id = peer_heartbeat.node_id if peer_heartbeat else fallback_peer_id
+
+        self._state.mark_peer_healthy(peer_addr)
+
+        self._peer_discovery.remove_peer(fallback_peer_id)
+        if gate_id != fallback_peer_id:
+            self._peer_discovery.remove_peer(gate_id)
+
+        await self._job_hash_ring.remove_node(gate_id)
+        self._job_forwarding_tracker.unregister_peer(gate_id)
+
+        self._task_runner.run(
+            self._logger.log,
+            ServerDebug(
+                message=(
+                    "Cleaned up tracking for reaped gate peer "
+                    f"{peer_addr} (gate_id={gate_id}, udp_addr={udp_addr})"
+                ),
+                node_host=self._get_host(),
+                node_port=self._get_tcp_port(),
+                node_id=self._get_node_id().short,
+            ),
+        )
+
     async def handle_gate_heartbeat(
         self,
         heartbeat: GateHeartbeat,

@@ -95,7 +95,8 @@ class GateJobRouter:
     def __init__(
         self,
         coordinate_tracker: CoordinateTracker | None = None,
-        get_datacenter_candidates: Callable[[], list[DatacenterCandidate]] | None = None,
+        get_datacenter_candidates: Callable[[], list[DatacenterCandidate]]
+        | None = None,
         config: GateJobRouterConfig | None = None,
     ) -> None:
         self._config = config or GateJobRouterConfig()
@@ -115,6 +116,18 @@ class GateJobRouter:
             hold_down_seconds=self._config.hysteresis_config.hold_down_seconds,
             improvement_ratio=self._config.hysteresis_config.improvement_ratio,
             cooldown_seconds=self._config.hysteresis_config.cooldown_seconds,
+        )
+
+    def reset_primary_for_partitioned_datacenters(
+        self,
+        affected_datacenters: list[str],
+    ) -> int:
+        """Reset routing state for jobs in partitioned datacenters."""
+        if not affected_datacenters:
+            return 0
+
+        return self._state_manager.reset_primary_for_datacenters(
+            set(affected_datacenters)
         )
 
     def route_job(
@@ -262,8 +275,8 @@ class GateJobRouter:
                 candidate.rtt_ucb_ms = self._coordinate_tracker.estimate_rtt_ucb_ms(
                     peer_coord
                 )
-                candidate.coordinate_quality = self._coordinate_tracker.coordinate_quality(
-                    peer_coord
+                candidate.coordinate_quality = (
+                    self._coordinate_tracker.coordinate_quality(peer_coord)
                 )
 
     def _check_bootstrap_mode(self) -> bool:

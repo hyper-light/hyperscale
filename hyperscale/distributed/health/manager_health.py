@@ -20,6 +20,7 @@ DC Health Classification:
 - ANY manager progress == "stuck" → DC = DEGRADED
 """
 
+import asyncio
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -85,6 +86,7 @@ class ManagerHealthState:
     manager_id: str
     datacenter_id: str
     config: ManagerHealthConfig = field(default_factory=ManagerHealthConfig)
+    _state_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
     # Signal 1: Liveness
     last_liveness_response: float = field(default_factory=time.monotonic)
@@ -112,7 +114,8 @@ class ManagerHealthState:
         time_since_response = time.monotonic() - self.last_liveness_response
         return (
             time_since_response < self.config.liveness_timeout_seconds
-            and self.consecutive_liveness_failures < self.config.max_consecutive_liveness_failures
+            and self.consecutive_liveness_failures
+            < self.config.max_consecutive_liveness_failures
         )
 
     @property

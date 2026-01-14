@@ -42,6 +42,8 @@ import cloudpickle
 from hyperscale.distributed.server import tcp
 from hyperscale.distributed.leases import JobLeaseManager
 from hyperscale.reporting.results import Results
+from hyperscale.reporting.reporter import Reporter
+from hyperscale.reporting.common import ReporterTypes
 from hyperscale.reporting.common.results_types import WorkflowStats
 from hyperscale.distributed.server.events import VersionedStateClock
 from hyperscale.distributed.swim import HealthAwareServer, GateStateEmbedder
@@ -3342,7 +3344,11 @@ class GateServer(HealthAwareServer):
         job_id: str,
         workflow_id: str,
     ) -> None:
-        workflow_results = await self._pop_workflow_results(job_id, workflow_id)
+        workflow_results, timeout_token = await self._pop_workflow_results(
+            job_id, workflow_id
+        )
+        if timeout_token:
+            await self._cancel_workflow_result_timeout(timeout_token)
         if not workflow_results:
             return
 

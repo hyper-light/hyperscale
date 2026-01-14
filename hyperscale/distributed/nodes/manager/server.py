@@ -122,6 +122,7 @@ from hyperscale.distributed.protocol.version import (
     get_features_for_version,
 )
 from hyperscale.distributed.discovery.security.role_validator import RoleValidator
+from hyperscale.distributed.server.protocol.utils import get_peer_certificate_der
 from hyperscale.distributed.nodes.manager.health import NodeStatus
 from hyperscale.distributed.jobs import (
     JobManager,
@@ -2608,6 +2609,91 @@ class ManagerServer(HealthAwareServer):
         """Handle worker registration."""
         try:
             registration = WorkerRegistration.load(data)
+
+            if registration.cluster_id != self._config.cluster_id:
+                await self._udp_logger.log(
+                    ServerWarning(
+                        message=f"Worker {registration.node.node_id} rejected: cluster_id mismatch",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+                return RegistrationResponse(
+                    accepted=False,
+                    manager_id=self._node_id.full,
+                    healthy_managers=[],
+                    error="Cluster isolation violation: cluster_id mismatch",
+                    protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+                    protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+                ).dump()
+
+            if registration.environment_id != self._config.environment_id:
+                await self._udp_logger.log(
+                    ServerWarning(
+                        message=f"Worker {registration.node.node_id} rejected: environment_id mismatch",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+                return RegistrationResponse(
+                    accepted=False,
+                    manager_id=self._node_id.full,
+                    healthy_managers=[],
+                    error="Environment isolation violation: environment_id mismatch",
+                    protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+                    protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+                ).dump()
+
+            transport = self._tcp_server_request_transports.get(addr)
+            cert_der = get_peer_certificate_der(transport)
+            if cert_der is not None:
+                claims = RoleValidator.extract_claims_from_cert(
+                    cert_der,
+                    default_cluster=self._config.cluster_id,
+                    default_environment=self._config.environment_id,
+                )
+                validation_result = self._role_validator.validate_claims(claims)
+                if not validation_result.allowed:
+                    await self._udp_logger.log(
+                        ServerWarning(
+                            message=(
+                                f"Worker {registration.node.node_id} rejected: certificate claims failed"
+                            ),
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
+                    return RegistrationResponse(
+                        accepted=False,
+                        manager_id=self._node_id.full,
+                        healthy_managers=[],
+                        error=f"Certificate validation failed: {validation_result.reason}",
+                        protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+                        protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+                    ).dump()
+
+            elif self._config.mtls_strict_mode:
+                await self._udp_logger.log(
+                    ServerWarning(
+                        message=(
+                            f"Worker {registration.node.node_id} rejected: no certificate in strict mode"
+                        ),
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+                return RegistrationResponse(
+                    accepted=False,
+                    manager_id=self._node_id.full,
+                    healthy_managers=[],
+                    error="mTLS strict mode requires valid certificate",
+                    protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+                    protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+                ).dump()
 
             # Register worker
             self._registry.register_worker(registration)
