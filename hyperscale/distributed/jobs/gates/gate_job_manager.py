@@ -251,16 +251,25 @@ class GateJobManager:
         total_failed = 0
         completed_dcs = 0
         failed_dcs = 0
+        errors: list[str] = []
         rates: list[float] = []
 
         for dc_id, result in dc_results.items():
             total_completed += result.total_completed
             total_failed += result.total_failed
 
-            if result.status == JobStatus.COMPLETED.value:
+            status_value = result.status.lower()
+            if status_value == JobStatus.COMPLETED.value:
                 completed_dcs += 1
-            elif result.status == JobStatus.FAILED.value:
+            else:
                 failed_dcs += 1
+
+            if result.errors:
+                errors.extend([f"{dc_id}: {error}" for error in result.errors])
+            elif status_value != JobStatus.COMPLETED.value:
+                errors.append(
+                    f"{dc_id}: reported status {result.status} without error details"
+                )
 
             if hasattr(result, "rate") and result.rate > 0:
                 rates.append(result.rate)
