@@ -2102,8 +2102,18 @@ class GateServer(HealthAwareServer):
             if not callback:
                 return b"no_callback"
 
+            sequence = await self._modular_state.record_client_update(
+                result.job_id,
+                "job_final_result",
+                data,
+            )
             try:
                 await self._send_tcp(callback, "job_final_result", data)
+                await self._modular_state.set_client_update_position(
+                    result.job_id,
+                    callback,
+                    sequence,
+                )
                 return b"ok"
             except Exception:
                 return b"forwarded"
