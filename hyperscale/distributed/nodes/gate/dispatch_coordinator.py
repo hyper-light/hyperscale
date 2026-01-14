@@ -102,7 +102,9 @@ class GateDispatchCoordinator:
         self._quorum_circuit: "ErrorStats" = quorum_circuit
         self._select_datacenters: Callable = select_datacenters
         self._assume_leadership: Callable = assume_leadership
-        self._broadcast_leadership: Callable = broadcast_leadership
+        self._broadcast_leadership: Callable[
+            [str, int, tuple[str, int] | None], Awaitable[None]
+        ] = broadcast_leadership
         self._send_tcp: Callable = send_tcp
         self._increment_version: Callable = increment_version
         self._confirm_manager_for_dc: Callable = confirm_manager_for_dc
@@ -270,7 +272,11 @@ class GateDispatchCoordinator:
 
         # Assume and broadcast leadership
         self._assume_leadership(submission.job_id, len(primary_dcs))
-        await self._broadcast_leadership(submission.job_id, len(primary_dcs))
+        await self._broadcast_leadership(
+            submission.job_id,
+            len(primary_dcs),
+            submission.callback_addr,
+        )
         self._quorum_circuit.record_success()
 
         # Dispatch in background
