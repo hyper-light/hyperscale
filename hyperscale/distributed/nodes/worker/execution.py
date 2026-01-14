@@ -163,8 +163,18 @@ class WorkerExecutor:
         for workflow_id, progress in updates.items():
             try:
                 await send_progress(workflow_id, progress)
-            except Exception:
-                pass
+            except Exception as error:
+                if self._logger:
+                    from hyperscale.logging.hyperscale_logging_models import ServerDebug
+
+                    await self._logger.log(
+                        ServerDebug(
+                            message=f"Progress flush failed for workflow {workflow_id[:16]}...: {error}",
+                            node_host="worker",
+                            node_port=0,
+                            node_id="worker",
+                        )
+                    )
 
     async def run_progress_flush_loop(
         self,
@@ -219,8 +229,20 @@ class WorkerExecutor:
 
             except asyncio.CancelledError:
                 break
-            except Exception:
-                pass
+            except Exception as error:
+                if self._logger:
+                    from hyperscale.logging.hyperscale_logging_models import (
+                        ServerWarning,
+                    )
+
+                    await self._logger.log(
+                        ServerWarning(
+                            message=f"Progress flush loop error: {error}",
+                            node_host="worker",
+                            node_port=0,
+                            node_id="worker",
+                        )
+                    )
 
     def stop(self) -> None:
         """Stop background loops."""
