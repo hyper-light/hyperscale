@@ -101,6 +101,7 @@ class GateStatsCoordinator:
             JobStatus.COMPLETED.value,
             JobStatus.FAILED.value,
             JobStatus.CANCELLED.value,
+            JobStatus.TIMEOUT.value,
         ):
             return UpdateTier.IMMEDIATE.value
 

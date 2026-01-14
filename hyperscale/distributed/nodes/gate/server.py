@@ -4009,6 +4009,37 @@ class GateServer(HealthAwareServer):
             p99_latency_ms=p99_latency_ms,
         )
 
+    def _normalize_final_status(self, status: str) -> str:
+        normalized = status.strip().lower()
+        if normalized in ("timeout", "timed_out"):
+            return JobStatus.TIMEOUT.value
+        if normalized in ("cancelled", "canceled"):
+            return JobStatus.CANCELLED.value
+        if normalized in (JobStatus.COMPLETED.value, JobStatus.FAILED.value):
+            return normalized
+        return JobStatus.FAILED.value
+
+    def _should_finalize_partial_results(self, normalized_statuses: list[str]) -> bool:
+        terminal_overrides = {
+            JobStatus.FAILED.value,
+            JobStatus.CANCELLED.value,
+            JobStatus.TIMEOUT.value,
+        }
+        return any(status in terminal_overrides for status in normalized_statuses)
+
+    def _resolve_global_result_status(self, normalized_statuses: list[str]) -> str:
+        if JobStatus.FAILED.value in normalized_statuses:
+            return JobStatus.FAILED.value
+        if JobStatus.CANCELLED.value in normalized_statuses:
+            return JobStatus.CANCELLED.value
+        if JobStatus.TIMEOUT.value in normalized_statuses:
+            return JobStatus.TIMEOUT.value
+        if normalized_statuses and all(
+            status == JobStatus.COMPLETED.value for status in normalized_statuses
+        ):
+            return JobStatus.COMPLETED.value
+        return JobStatus.FAILED.value
+
     def _build_missing_dc_result(
         self, job_id: str, datacenter: str, fence_token: int
     ) -> JobFinalResult:
