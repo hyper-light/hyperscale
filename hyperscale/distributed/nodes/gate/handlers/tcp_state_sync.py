@@ -328,6 +328,38 @@ class GateStateSyncHandler:
                 ),
             )
 
+            leader_id = self._job_leadership_tracker.get_leader(result.job_id)
+            if leader_id and leader_id != self._get_node_id().full:
+                leader_addr = self._job_leadership_tracker.get_leader_addr(
+                    result.job_id
+                )
+                if leader_addr:
+                    forwarded = await self._forward_job_final_result_to_leader(
+                        result.job_id,
+                        leader_addr,
+                        data,
+                    )
+                    if forwarded:
+                        return b"forwarded"
+                    return b"error"
+
+                await self._logger.log(
+                    ServerWarning(
+                        message=(
+                            f"Leader gate {leader_id[:8]}... for job {result.job_id[:8]}... "
+                            "has no known address; attempting peer forward."
+                        ),
+                        node_host=self._get_host(),
+                        node_port=self._get_tcp_port(),
+                        node_id=self._get_node_id().short,
+                    )
+                )
+                if forward_final_result:
+                    forwarded = await forward_final_result(data)
+                    if forwarded:
+                        return b"forwarded"
+                return b"error"
+
             job_exists = self._job_manager.get_job(result.job_id) is not None
             if not job_exists:
                 if forward_final_result:
