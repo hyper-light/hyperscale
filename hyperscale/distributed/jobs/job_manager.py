@@ -241,6 +241,28 @@ class JobManager:
         return fence_token & 0xFFFFFFFF
 
     # =========================================================================
+    # Progress Sequence Management (FIX 2.8)
+    # =========================================================================
+
+    def _get_progress_sequence_lock(self) -> asyncio.Lock:
+        if self._progress_sequence_lock is None:
+            self._progress_sequence_lock = asyncio.Lock()
+        return self._progress_sequence_lock
+
+    async def get_next_progress_sequence(self, job_id: str) -> int:
+        async with self._get_progress_sequence_lock():
+            current = self._job_progress_sequences.get(job_id, 0)
+            next_sequence = current + 1
+            self._job_progress_sequences[job_id] = next_sequence
+            return next_sequence
+
+    def get_current_progress_sequence(self, job_id: str) -> int:
+        return self._job_progress_sequences.get(job_id, 0)
+
+    def cleanup_progress_sequence(self, job_id: str) -> None:
+        self._job_progress_sequences.pop(job_id, None)
+
+    # =========================================================================
     # Job Lifecycle
     # =========================================================================
 
