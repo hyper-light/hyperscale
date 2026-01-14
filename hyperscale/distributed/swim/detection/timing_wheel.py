@@ -418,9 +418,12 @@ class TimingWheel:
                 await self._tick()
             except asyncio.CancelledError:
                 break
-            except Exception:
-                # Log but continue - wheel must keep advancing
-                pass
+            except Exception as advance_error:
+                if self._on_error:
+                    self._on_error(
+                        f"Timing wheel advance loop error: {advance_error}",
+                        advance_error,
+                    )
 
     def start(self) -> None:
         """Start the timing wheel advancement loop."""

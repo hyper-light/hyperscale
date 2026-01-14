@@ -5020,6 +5020,10 @@ class GateServer(HealthAwareServer):
         await self._dispatch_time_tracker.remove_job(job_id)
         self._job_router.cleanup_job_state(job_id)
 
+        self._modular_state.cleanup_job_progress_tracking(job_id)
+        await self._modular_state.cleanup_job_update_state(job_id)
+        self._modular_state.cleanup_cancellation(job_id)
+
     async def _job_cleanup_loop(self) -> None:
         while self._running:
             try:
