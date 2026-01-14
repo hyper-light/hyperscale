@@ -3006,6 +3006,7 @@ class GateServer(HealthAwareServer):
     ) -> None:
         first_dc_push = next(iter(workflow_results.values()))
         is_test_workflow = first_dc_push.is_test
+        fence_token = max(dc_push.fence_token for dc_push in workflow_results.values())
 
         (
             all_workflow_stats,
@@ -3031,6 +3032,7 @@ class GateServer(HealthAwareServer):
             workflow_name=workflow_name,
             datacenter="aggregated",
             status=status,
+            fence_token=fence_token,
             results=results_to_send,
             error=error,
             elapsed_seconds=max_elapsed,
