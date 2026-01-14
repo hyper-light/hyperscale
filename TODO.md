@@ -52,68 +52,16 @@ Systematic bug fixes for the Hyperscale distributed performance testing framewor
 - [x] **Task 57**: Gate idempotency wait_for_pending timeout -> duplicate jobs fix
 - [x] **Task 58**: Manager stats backpressure - wire to windowed stats
 - [x] **Task 64**: Gate process resource sampling loop - add ProcessResourceMonitor
+- [x] **Task 8**: Fix Manager health state race condition
+- [x] **Task 9**: Fix Manager circuit breaker auto-transition bug (verified - already correct in ErrorStats)
+- [x] **Task 10**: Fix Manager dispatch counter race
+- [x] **Task 19**: Add client-side fallback to query gate for leader on missed transfers
+- [x] **Task 22**: Fix dead peer reaping - remove from _gate_peer_unhealthy_since (verified - already handled)
+- [x] **Task 23**: Fix peer cleanup to fully purge UDP-TCP mapping (verified - already handled)
 
 ---
 
-## High Priority Tasks (20 remaining)
-
-### Task 8: Fix Manager health state race condition
-**Status:** Pending  
-**Priority:** HIGH  
-**Files:** `hyperscale/distributed/nodes/manager/server.py`, health coordinator files
-
-**Problem:**  
-Manager health state updates can race between the health monitoring loop and incoming health check responses. Multiple concurrent updates to health state can cause inconsistent state.
-
-**Requirements:**
-1. Find where manager health state is updated (likely in health coordinator or server.py)
-2. Add `asyncio.Lock` protection around health state mutations
-3. Ensure health state transitions are atomic
-4. Follow existing patterns in codebase for lock usage
-
-**Commit message:** `Manager: Add lock protection for health state race condition`
-
----
-
-### Task 9: Fix Manager circuit breaker auto-transition bug
-**Status:** Pending  
-**Priority:** HIGH  
-**Files:** `hyperscale/distributed/nodes/manager/` directory
-
-**Problem:**  
-Circuit breaker may not properly auto-transition from HALF_OPEN to CLOSED on success, or from HALF_OPEN to OPEN on failure. The state machine transitions need verification and fixing.
-
-**Requirements:**
-1. Find circuit breaker implementation in manager
-2. Verify state transitions:
-   - CLOSED → OPEN on failure threshold
-   - OPEN → HALF_OPEN after timeout
-   - HALF_OPEN → CLOSED on success
-   - HALF_OPEN → OPEN on failure
-3. Fix any missing or incorrect transitions
-4. Ensure proper success/failure tracking in each state
-
-**Commit message:** `Manager: Fix circuit breaker state auto-transitions`
-
----
-
-### Task 10: Fix Manager dispatch counter race
-**Status:** Pending  
-**Priority:** HIGH  
-**Files:** `hyperscale/distributed/nodes/manager/` directory
-
-**Problem:**  
-Dispatch counter increments/decrements may race when multiple workflows are being dispatched or completed concurrently. This can lead to incorrect active workflow counts.
-
-**Requirements:**
-1. Find dispatch counter/tracking in manager (likely in dispatch coordinator or job manager)
-2. Add `asyncio.Lock` protection around counter mutations
-3. Ensure increment and decrement operations are atomic
-4. Consider using a dedicated counter class if pattern is repeated
-
-**Commit message:** `Manager: Add lock protection for dispatch counter race`
-
----
+## High Priority Tasks (15 remaining)
 
 ### Task 13: Add JobFinalResult peer-forwarding for gate resilience
 **Status:** Pending  

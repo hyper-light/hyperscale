@@ -1533,11 +1533,21 @@ class ManagerServer(HealthAwareServer):
 
     def _reap_dead_workers(self, now: float) -> None:
         worker_reap_threshold = now - self._config.dead_worker_reap_interval_seconds
-        workers_to_reap = [
-            worker_id
-            for worker_id, unhealthy_since in self._manager_state.iter_worker_unhealthy_since()
-            if unhealthy_since < worker_reap_threshold
-        ]
+        workers_to_reap: list[str] = []
+
+        for (
+            worker_id,
+            unhealthy_since,
+        ) in self._manager_state.iter_worker_unhealthy_since():
+            if unhealthy_since >= worker_reap_threshold:
+                continue
+
+            circuit = self._manager_state._worker_circuits.get(worker_id)
+            if circuit and circuit.circuit_state == CircuitState.HALF_OPEN:
+                continue
+
+            workers_to_reap.append(worker_id)
+
         for worker_id in workers_to_reap:
             self._registry.unregister_worker(worker_id)
 
