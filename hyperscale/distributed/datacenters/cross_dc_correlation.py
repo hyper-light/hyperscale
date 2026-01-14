@@ -1171,8 +1171,14 @@ class CrossDCCorrelationDetector:
         for callback in self._partition_healed_callbacks:
             try:
                 callback(healed_datacenters, now)
-            except Exception:
-                pass
+            except Exception as callback_error:
+                if self._on_callback_error:
+                    try:
+                        self._on_callback_error(
+                            "partition_healed", healed_datacenters, callback_error
+                        )
+                    except Exception:
+                        pass
 
         return True
 
@@ -1194,8 +1200,16 @@ class CrossDCCorrelationDetector:
             for callback in self._partition_detected_callbacks:
                 try:
                     callback(affected_datacenters, now)
-                except Exception:
-                    pass
+                except Exception as callback_error:
+                    if self._on_callback_error:
+                        try:
+                            self._on_callback_error(
+                                "partition_detected",
+                                affected_datacenters,
+                                callback_error,
+                            )
+                        except Exception:
+                            pass
 
     def is_in_partition(self) -> bool:
         """Check if we are currently in a partition state."""
