@@ -408,6 +408,68 @@ class GateRuntimeState:
     def get_state_version(self) -> int:
         return self._state_version
 
+    def set_client_update_history_limit(self, limit: int) -> None:
+        self._client_update_history_limit = max(1, limit)
+
+    async def record_client_update(
+        self,
+        job_id: str,
+        message_type: str,
+        payload: bytes,
+    ) -> int:
+        async with self._get_counter_lock():
+            sequence = self._job_update_sequences.get(job_id, 0) + 1
+            self._job_update_sequences[job_id] = sequence
+            history = self._job_update_history.setdefault(job_id, [])
+            history.append((sequence, message_type, payload, time.monotonic()))
+            if self._client_update_history_limit > 0:
+                excess = len(history) - self._client_update_history_limit
+                if excess > 0:
+                    del history[:excess]
+            return sequence
+
+    async def set_client_update_position(
+        self,
+        job_id: str,
+        callback: tuple[str, int],
+        sequence: int,
+    ) -> None:
+        async with self._get_counter_lock():
+            positions = self._job_client_update_positions.setdefault(job_id, {})
+            positions[callback] = sequence
+
+    async def get_client_update_position(
+        self,
+        job_id: str,
+        callback: tuple[str, int],
+    ) -> int:
+        async with self._get_counter_lock():
+            return self._job_client_update_positions.get(job_id, {}).get(callback, 0)
+
+    async def get_latest_update_sequence(self, job_id: str) -> int:
+        async with self._get_counter_lock():
+            return self._job_update_sequences.get(job_id, 0)
+
+    async def get_client_updates_since(
+        self,
+        job_id: str,
+        last_sequence: int,
+    ) -> tuple[list[tuple[int, str, bytes, float]], int, int]:
+        async with self._get_counter_lock():
+            history = list(self._job_update_history.get(job_id, []))
+        if not history:
+            return [], 0, 0
+        oldest_sequence = history[0][0]
+        latest_sequence = history[-1][0]
+        updates = [entry for entry in history if entry[0] > last_sequence]
+        return updates, oldest_sequence, latest_sequence
+
+    async def cleanup_job_update_state(self, job_id: str) -> None:
+        async with self._get_counter_lock():
+            self._job_update_sequences.pop(job_id, None)
+            self._job_update_history.pop(job_id, None)
+            self._job_client_update_positions.pop(job_id, None)
+
     # Gate state methods
     def set_gate_state(self, state: GateStateEnum) -> None:
         """Set the gate state."""
