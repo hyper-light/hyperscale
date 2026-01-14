@@ -4006,8 +4006,9 @@ class ManagerServer(HealthAwareServer):
                     node_id=self._node_id.short,
                 )
             )
+            job_id = submission.job_id if submission is not None else "unknown"
             error_ack = JobAck(
-                job_id="unknown",
+                job_id=job_id,
                 accepted=False,
                 error=str(error),
             ).dump()
