@@ -1434,6 +1434,8 @@ class GateServer(HealthAwareServer):
             )
 
             workflow_results: dict[str, WorkflowResultPush] = {}
+            timeout_token: str | None = None
+            should_schedule_timeout = False
 
             async with self._workflow_dc_results_lock:
                 if push.job_id not in self._workflow_dc_results:
@@ -1449,12 +1451,26 @@ class GateServer(HealthAwareServer):
                     self._workflow_dc_results[push.job_id][push.workflow_id].keys()
                 )
                 should_aggregate = target_dcs and received_dcs >= target_dcs
+                has_timeout = (
+                    push.job_id in self._workflow_result_timeout_tokens
+                    and push.workflow_id
+                    in self._workflow_result_timeout_tokens[push.job_id]
+                )
 
                 if should_aggregate:
-                    job_results = self._workflow_dc_results.get(push.job_id, {})
-                    workflow_results = job_results.pop(push.workflow_id, {})
-                    if not job_results and push.job_id in self._workflow_dc_results:
-                        del self._workflow_dc_results[push.job_id]
+                    workflow_results, timeout_token = self._pop_workflow_results_locked(
+                        push.job_id, push.workflow_id
+                    )
+                elif target_dcs and not has_timeout:
+                    should_schedule_timeout = True
+
+            if should_schedule_timeout:
+                await self._schedule_workflow_result_timeout(
+                    push.job_id, push.workflow_id
+                )
+
+            if timeout_token:
+                await self._cancel_workflow_result_timeout(timeout_token)
 
             if workflow_results:
                 await self._forward_aggregated_workflow_result(
