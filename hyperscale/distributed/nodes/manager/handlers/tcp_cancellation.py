@@ -5,7 +5,7 @@ Handles cancellation requests and completion notifications (AD-20 compliance).
 """
 
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Callable, Coroutine
 
 from hyperscale.distributed.models import (
     CancelJob,
@@ -19,7 +19,13 @@ from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerWarni
 if TYPE_CHECKING:
     from hyperscale.distributed.nodes.manager.state import ManagerState
     from hyperscale.distributed.nodes.manager.config import ManagerConfig
+    from hyperscale.distributed.taskex import TaskRunner
     from hyperscale.logging import Logger
+
+CancelJobFunc = Callable[
+    [JobCancelRequest, tuple[str, int]], Coroutine[Any, Any, bytes]
+]
+WorkflowCancelledFunc = Callable[..., Coroutine[Any, Any, None]]
 
 
 class CancelJobHandler:
@@ -72,7 +78,7 @@ class CancelJobHandler:
                     node_host=self._config.host,
                     node_port=self._config.tcp_port,
                     node_id=self._node_id,
-                )
+                ),
             )
 
             # Normalize to AD-20 format and delegate
@@ -80,7 +86,9 @@ class CancelJobHandler:
                 job_id=request.job_id,
                 requester_id=self._node_id,
                 timestamp=time.time(),
-                reason=request.reason if hasattr(request, 'reason') else "User requested",
+                reason=request.reason
+                if hasattr(request, "reason")
+                else "User requested",
             )
 
             result = await self._cancel_job_impl(ad20_request, addr)
@@ -144,7 +152,7 @@ class JobCancelRequestHandler:
                     node_host=self._config.host,
                     node_port=self._config.tcp_port,
                     node_id=self._node_id,
-                )
+                ),
             )
 
             result = await self._cancel_job_impl(request, addr)
@@ -209,11 +217,11 @@ class WorkflowCancellationCompleteHandler:
                     node_host=self._config.host,
                     node_port=self._config.tcp_port,
                     node_id=self._node_id,
-                )
+                ),
             )
 
             await self._handle_workflow_cancelled(notification)
-            return b'ok'
+            return b"ok"
 
         except Exception as e:
             self._task_runner.run(
@@ -223,6 +231,6 @@ class WorkflowCancellationCompleteHandler:
                     node_host=self._config.host,
                     node_port=self._config.tcp_port,
                     node_id=self._node_id,
-                )
+                ),
             )
-            return b'error'
+            return b"error"
