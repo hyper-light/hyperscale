@@ -882,17 +882,6 @@ class GateServer(HealthAwareServer):
         self._dc_lease_manager.set_node_id(self._node_id.full)
         self._job_forwarding_tracker.set_local_gate_id(self._node_id.full)
 
-        if self._ledger_data_dir is not None:
-            self._job_ledger = await JobLedger.open(
-                wal_path=self._ledger_data_dir / "wal",
-                checkpoint_dir=self._ledger_data_dir / "checkpoints",
-                archive_dir=self._ledger_data_dir / "archive",
-                region_code=self._node_id.datacenter,
-                gate_id=self._node_id.full,
-                node_id=hash(self._node_id.full) & 0xFFFF,
-                logger=self._udp_logger,
-            )
-
         await self._job_hash_ring.add_node(
             node_id=self._node_id.full,
             tcp_host=self._host,
