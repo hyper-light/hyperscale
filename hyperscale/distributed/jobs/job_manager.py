@@ -120,6 +120,11 @@ class JobManager:
         self._job_fence_tokens: dict[str, int] = {}
         self._fence_token_lock: asyncio.Lock | None = None
 
+        # Progress sequence tracking for per-job progress update ordering (FIX 2.8)
+        # Monotonically increasing per job to ensure gates can reject out-of-order updates
+        self._job_progress_sequences: dict[str, int] = {}
+        self._progress_sequence_lock: asyncio.Lock | None = None
+
         # Global lock for job creation/deletion (not per-job operations)
         self._global_lock = asyncio.Lock()
 
