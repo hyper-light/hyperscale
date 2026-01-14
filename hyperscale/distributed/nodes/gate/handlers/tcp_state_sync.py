@@ -314,7 +314,7 @@ class GateStateSyncHandler:
         self,
         addr: tuple[str, int],
         data: bytes,
-        complete_job: Callable[[str, object], "asyncio.Coroutine[None, None, None]"],
+        complete_job: Callable[[str, object], "asyncio.Coroutine[None, None, bool]"],
         handle_exception: Callable,
         forward_final_result: Callable[[bytes], "asyncio.Coroutine[None, None, bool]"]
         | None = None,
@@ -388,7 +388,9 @@ class GateStateSyncHandler:
                 )
                 return b"ok"
 
-            await complete_job(result.job_id, result)
+            completed = await complete_job(result.job_id, result)
+            if not completed:
+                return b"already_completed"
 
             return b"ok"
 
