@@ -1586,7 +1586,18 @@ class GateServer(HealthAwareServer):
             if existing_callback != request.callback_addr:
                 self._increment_version()
 
-            await self._replay_job_status_to_callback(job_id)
+            last_sequence = request.last_sequence
+            if last_sequence <= 0:
+                last_sequence = await self._modular_state.get_client_update_position(
+                    job_id,
+                    request.callback_addr,
+                )
+
+            await self._replay_job_status_to_callback(
+                job_id,
+                request.callback_addr,
+                last_sequence,
+            )
 
             elapsed = time.monotonic() - job.timestamp if job.timestamp > 0 else 0.0
 
