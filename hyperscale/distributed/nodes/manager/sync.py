@@ -622,13 +622,8 @@ class ManagerStateSync:
                     self._state._job_leaders[job_id] = leader_id
 
                 leader_addr = snapshot.job_leader_addrs.get(job_id)
-                leader_addr_tuple: tuple[str, int] | None = None
-                if leader_addr:
-                    leader_addr_tuple = (
-                        tuple(leader_addr)
-                        if isinstance(leader_addr, list)
-                        else leader_addr
-                    )
+                leader_addr_tuple = self._normalize_job_leader_addr(leader_addr)
+                if leader_addr_tuple is not None:
                     self._state._job_leader_addrs[job_id] = leader_addr_tuple
 
                 incoming_layer_version = snapshot.job_layer_versions.get(job_id)
