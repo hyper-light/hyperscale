@@ -40,9 +40,6 @@ from .state import GateRuntimeState
 
 if TYPE_CHECKING:
     from hyperscale.distributed.swim.core import NodeId
-    from hyperscale.distributed.datacenters.cross_dc_correlation import (
-        CrossDCCorrelationDetector,
-    )
     from hyperscale.distributed.server.events.lamport_clock import VersionedStateClock
     from hyperscale.distributed.datacenters.manager_dispatcher import ManagerDispatcher
     from hyperscale.distributed.taskex import TaskRunner
@@ -66,7 +63,7 @@ class GateHealthCoordinator:
         task_runner: "TaskRunner",
         dc_health_manager: DatacenterHealthManager,
         dc_health_monitor: FederatedHealthMonitor,
-        cross_dc_correlation: "CrossDCCorrelationDetector",
+        cross_dc_correlation: CrossDCCorrelationDetector,
         dc_manager_discovery: dict[str, DiscoveryService],
         versioned_clock: "VersionedStateClock",
         manager_dispatcher: "ManagerDispatcher",
