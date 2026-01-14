@@ -223,6 +223,7 @@ class WorkerWorkflowExecutor:
         node_id_full: str,
         node_host: str,
         node_port: int,
+        send_final_result_callback: callable,
     ):
         """
         Execute a workflow using RemoteGraphManager.
