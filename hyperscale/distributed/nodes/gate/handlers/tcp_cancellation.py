@@ -80,17 +80,23 @@ class GateCancellationHandler:
             send_tcp: Callback to send TCP messages
             get_available_datacenters: Callback to get available DCs
         """
-        self._state = state
-        self._logger = logger
-        self._task_runner = task_runner
-        self._job_manager = job_manager
-        self._datacenter_managers = datacenter_managers
-        self._get_node_id = get_node_id
-        self._get_host = get_host
-        self._get_tcp_port = get_tcp_port
-        self._check_rate_limit = check_rate_limit
-        self._send_tcp = send_tcp
-        self._get_available_datacenters = get_available_datacenters
+        self._state: GateRuntimeState = state
+        self._logger: Logger = logger
+        self._task_runner: "TaskRunner" = task_runner
+        self._job_manager: "GateJobManager" = job_manager
+        self._datacenter_managers: dict[str, list[tuple[str, int]]] = (
+            datacenter_managers
+        )
+        self._get_node_id: Callable[[], "NodeId"] = get_node_id
+        self._get_host: Callable[[], str] = get_host
+        self._get_tcp_port: Callable[[], int] = get_tcp_port
+        self._check_rate_limit: Callable[[str, str], tuple[bool, float]] = (
+            check_rate_limit
+        )
+        self._send_tcp: Callable = send_tcp
+        self._get_available_datacenters: Callable[[], list[str]] = (
+            get_available_datacenters
+        )
 
     def _build_cancel_response(
         self,
