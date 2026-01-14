@@ -12,6 +12,7 @@ import asyncio
 import time
 from typing import TYPE_CHECKING, Callable
 
+from hyperscale.distributed.health import CircuitBreakerManager
 from hyperscale.distributed.models import (
     GateStateSnapshot,
     GateStateSyncRequest,
@@ -20,6 +21,11 @@ from hyperscale.distributed.models import (
     JobLeadershipNotification,
     LeaseTransfer,
     LeaseTransferAck,
+)
+from hyperscale.distributed.reliability import (
+    JitterStrategy,
+    RetryConfig,
+    RetryExecutor,
 )
 from hyperscale.logging import Logger
 from hyperscale.logging.hyperscale_logging_models import (
@@ -55,6 +61,8 @@ class GateStateSyncHandler:
         job_manager: "GateJobManager",
         job_leadership_tracker: "JobLeadershipTracker",
         versioned_clock: "VersionedStateClock",
+        peer_circuit_breaker: CircuitBreakerManager,
+        send_tcp: Callable,
         get_node_id: Callable[[], "NodeId"],
         get_host: Callable[[], str],
         get_tcp_port: Callable[[], int],

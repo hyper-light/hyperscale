@@ -238,6 +238,59 @@ class GateStatsCoordinator:
 
         return False
 
+    def _build_job_batch_push(
+        self,
+        job_id: str,
+        job: GlobalJobStatus,
+    ) -> JobBatchPush:
+        all_step_stats: list = []
+        for datacenter_progress in job.datacenters:
+            if (
+                hasattr(datacenter_progress, "step_stats")
+                and datacenter_progress.step_stats
+            ):
+                all_step_stats.extend(datacenter_progress.step_stats)
+
+        per_dc_stats = [
+            DCStats(
+                datacenter=datacenter_progress.datacenter,
+                status=datacenter_progress.status,
+                completed=datacenter_progress.total_completed,
+                failed=datacenter_progress.total_failed,
+                rate=datacenter_progress.overall_rate,
+            )
+            for datacenter_progress in job.datacenters
+        ]
+
+        return JobBatchPush(
+            job_id=job_id,
+            status=job.status,
+            step_stats=all_step_stats,
+            total_completed=job.total_completed,
+            total_failed=job.total_failed,
+            overall_rate=job.overall_rate,
+            elapsed_seconds=job.elapsed_seconds,
+            per_dc_stats=per_dc_stats,
+        )
+
+    async def send_progress_replay(self, job_id: str) -> None:
+        if not self._has_job(job_id):
+            return
+
+        if not (callback := self._get_job_callback(job_id)):
+            return
+
+        if not (job := self._get_job_status(job_id)):
+            return
+
+        batch_push = self._build_job_batch_push(job_id, job)
+        await self._send_periodic_push_with_retry(
+            callback,
+            "job_batch_push",
+            batch_push.dump(),
+            timeout=2.0,
+        )
+
     async def batch_stats_update(self) -> None:
         running_jobs = self._get_all_running_jobs()
         jobs_with_callbacks: list[tuple[str, GlobalJobStatus, tuple[str, int]]] = []
@@ -252,42 +305,16 @@ class GateStatsCoordinator:
             return
 
         for job_id, job, callback in jobs_with_callbacks:
-            all_step_stats: list = []
-            for datacenter_progress in job.datacenters:
-                if (
-                    hasattr(datacenter_progress, "step_stats")
-                    and datacenter_progress.step_stats
-                ):
-                    all_step_stats.extend(datacenter_progress.step_stats)
-
-            per_dc_stats = [
-                DCStats(
-                    datacenter=datacenter_progress.datacenter,
-                    status=datacenter_progress.status,
-                    completed=datacenter_progress.total_completed,
-                    failed=datacenter_progress.total_failed,
-                    rate=datacenter_progress.overall_rate,
-                )
-                for datacenter_progress in job.datacenters
-            ]
-
-            batch_push = JobBatchPush(
-                job_id=job_id,
-                status=job.status,
-                step_stats=all_step_stats,
-                total_completed=job.total_completed,
-                total_failed=job.total_failed,
-                overall_rate=job.overall_rate,
-                elapsed_seconds=job.elapsed_seconds,
-                per_dc_stats=per_dc_stats,
-            )
-
+            batch_push = self._build_job_batch_push(job_id, job)
             await self._send_periodic_push_with_retry(
                 callback,
                 "job_batch_push",
                 batch_push.dump(),
                 timeout=2.0,
             )
+
+    async def push_windowed_stats_for_job(self, job_id: str) -> None:
+        await self._push_windowed_stats(job_id)
 
     async def push_windowed_stats(self) -> None:
         """
