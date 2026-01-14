@@ -307,6 +307,10 @@ class GateStatsCoordinator:
         if not callbacks:
             return
 
+        unique_callbacks = list(dict.fromkeys(callbacks))
+        if not unique_callbacks:
+            return
+
         batch_push = self._build_job_batch_push(job_id, job)
         payload = batch_push.dump()
         sequence = await self._state.record_client_update(
@@ -315,7 +319,7 @@ class GateStatsCoordinator:
             payload,
         )
 
-        for callback in callbacks:
+        for callback in unique_callbacks:
             delivered = await self._send_periodic_push_with_retry(
                 callback,
                 "job_batch_push",

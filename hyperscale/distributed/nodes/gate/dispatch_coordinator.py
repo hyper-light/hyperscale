@@ -95,6 +95,7 @@ class GateDispatchCoordinator:
         self._job_timeout_tracker: "GateJobTimeoutTracker" = job_timeout_tracker
         self._dispatch_time_tracker: "DispatchTimeTracker" = dispatch_time_tracker
         self._circuit_breaker_manager: "CircuitBreakerManager" = circuit_breaker_manager
+        self._job_lease_manager: JobLeaseManager = job_lease_manager
         self._datacenter_managers: dict[str, list[tuple[str, int]]] = (
             datacenter_managers
         )
