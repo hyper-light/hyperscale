@@ -1416,6 +1416,8 @@ class GlobalJobStatus(Message):
     elapsed_seconds: float = 0.0  # Time since submission
     completed_datacenters: int = 0  # DCs finished
     failed_datacenters: int = 0  # DCs failed
+    errors: list[str] = field(default_factory=list)  # Aggregated error details
+    resolution_details: str = ""  # Gate resolution summary
     timestamp: float = 0.0  # Monotonic time when job was submitted
 
 
