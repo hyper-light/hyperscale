@@ -2516,16 +2516,81 @@ class GateServer(HealthAwareServer):
         leader_udp_addr: tuple[str, int],
         term: int,
     ) -> None:
-        """Handle DC leader change."""
+        """
+        Handle DC leader change.
+
+        Broadcasts the leadership change to all peer gates so they can update
+        their FederatedHealthMonitor with the new leader information.
+        """
         self._task_runner.run(
             self._udp_logger.log,
             ServerInfo(
-                message=f"DC {datacenter} leader changed to {leader_node_id}",
+                message=f"DC {datacenter} leader changed to {leader_node_id} "
+                f"at {leader_tcp_addr[0]}:{leader_tcp_addr[1]} (term {term})",
                 node_host=self._host,
                 node_port=self._tcp_port,
                 node_id=self._node_id.short,
             ),
         )
+
+        # Broadcast DC leader change to peer gates
+        self._task_runner.run(
+            self._broadcast_dc_leader_announcement,
+            datacenter,
+            leader_node_id,
+            leader_tcp_addr,
+            leader_udp_addr,
+            term,
+        )
+
+    async def _broadcast_dc_leader_announcement(
+        self,
+        datacenter: str,
+        leader_node_id: str,
+        leader_tcp_addr: tuple[str, int],
+        leader_udp_addr: tuple[str, int],
+        term: int,
+    ) -> None:
+        """
+        Broadcast a DC leader announcement to all peer gates.
+
+        Ensures all gates in the cluster learn about DC leadership changes,
+        even if they don't directly observe the change via probes.
+        """
+        if not self._modular_state.has_active_peers():
+            return
+
+        announcement = DCLeaderAnnouncement(
+            datacenter=datacenter,
+            leader_node_id=leader_node_id,
+            leader_tcp_addr=leader_tcp_addr,
+            leader_udp_addr=leader_udp_addr,
+            term=term,
+        )
+
+        broadcast_count = 0
+        for peer_addr in self._modular_state.iter_active_peers():
+            try:
+                await self.send_tcp(
+                    peer_addr,
+                    "dc_leader_announcement",
+                    announcement.dump(),
+                    timeout=2.0,
+                )
+                broadcast_count += 1
+            except Exception:
+                # Best effort - peer may be down
+                pass
+
+        if broadcast_count > 0:
+            await self._udp_logger.log(
+                ServerInfo(
+                    message=f"Broadcast DC {datacenter} leader change to {broadcast_count} peer gates",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                ),
+            )
 
     async def _forward_workflow_result_to_peers(self, push: WorkflowResultPush) -> bool:
         candidates = await self._job_hash_ring.get_nodes(push.job_id, count=3)
