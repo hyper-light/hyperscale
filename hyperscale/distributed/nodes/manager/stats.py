@@ -217,23 +217,30 @@ class ManagerStatsCoordinator:
             return BackpressureLevel.THROTTLE
         return BackpressureLevel.NONE
 
-    def record_progress_update(self, job_id: str, workflow_id: str) -> None:
+    async def record_progress_update(
+        self,
+        worker_id: str,
+        progress: "WorkflowProgress",
+    ) -> None:
         """
         Record a progress update for stats aggregation.
 
         Args:
-            job_id: Job ID
-            workflow_id: Workflow ID
+            worker_id: Worker identifier
+            progress: Workflow progress update
         """
-        # In full implementation, this feeds WindowedStatsCollector
-        self._task_runner.run(
-            self._logger.log,
+        self._stats_buffer.record(progress.rate_per_second or 0.0)
+        await self._windowed_stats.record(worker_id, progress)
+        await self._logger.log(
             ServerDebug(
-                message=f"Progress update recorded for workflow {workflow_id[:8]}...",
+                message=(
+                    "Progress update recorded for workflow "
+                    f"{progress.workflow_id[:8]}..."
+                ),
                 node_host=self._config.host,
                 node_port=self._config.tcp_port,
                 node_id=self._node_id,
-            ),
+            )
         )
 
     async def push_batch_stats(self) -> None:
@@ -246,10 +253,13 @@ class ManagerStatsCoordinator:
         # 1. Aggregate windowed stats
         # 2. Push to registered callbacks
         # 3. Clear processed entries
+        stats_buffer_metrics = self._stats_buffer.get_metrics()
         self._task_runner.run(
             self._logger.log,
             ServerDebug(
-                message=f"Batch stats push (buffer={self._stats_buffer_count})",
+                message=(
+                    f"Batch stats push (buffer={stats_buffer_metrics['hot_count']})"
+                ),
                 node_host=self._config.host,
                 node_port=self._config.tcp_port,
                 node_id=self._node_id,
