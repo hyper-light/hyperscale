@@ -32,6 +32,7 @@ Module Structure:
 
 import asyncio
 import random
+import statistics
 import time
 from collections import defaultdict
 from pathlib import Path
