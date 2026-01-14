@@ -198,6 +198,16 @@ class ManagerHealthState:
         async with self._state_lock:
             self._apply_liveness_update(success)
 
+    def _apply_readiness_update(
+        self,
+        has_quorum: bool,
+        accepting: bool,
+        worker_count: int,
+    ) -> None:
+        self.has_quorum = has_quorum
+        self.accepting_jobs = accepting
+        self.active_worker_count = worker_count
+
     def update_readiness(
         self,
         has_quorum: bool,
@@ -212,9 +222,16 @@ class ManagerHealthState:
             accepting: Whether manager is accepting new jobs
             worker_count: Number of active workers available
         """
-        self.has_quorum = has_quorum
-        self.accepting_jobs = accepting
-        self.active_worker_count = worker_count
+        self._apply_readiness_update(has_quorum, accepting, worker_count)
+
+    async def update_readiness_async(
+        self,
+        has_quorum: bool,
+        accepting: bool,
+        worker_count: int,
+    ) -> None:
+        async with self._state_lock:
+            self._apply_readiness_update(has_quorum, accepting, worker_count)
 
     def update_progress(
         self,

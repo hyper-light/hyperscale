@@ -395,6 +395,9 @@ class GateRuntimeState:
 
         Args:
             peer_addr: TCP address of the dead peer
+
+        Returns:
+            Set of gate IDs cleaned up from peer metadata.
         """
         udp_addrs_to_remove: list[tuple[str, int]] = []
         gate_ids_to_remove: set[str] = set()
