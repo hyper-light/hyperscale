@@ -717,7 +717,7 @@ class GateJobHandler:
             accepted, reason = await self._state.check_and_record_progress(
                 job_id=progress.job_id,
                 datacenter_id=progress.datacenter,
-                fence_token=progress.fence_token,
+                progress_sequence=progress.progress_sequence,
                 timestamp=progress.timestamp,
             )
             if not accepted:
@@ -725,7 +725,7 @@ class GateJobHandler:
                     self._logger.log,
                     ServerDebug(
                         message=f"Rejecting job progress for {progress.job_id} from {progress.datacenter}: "
-                        f"reason={reason}, fence_token={progress.fence_token}",
+                        f"reason={reason}, progress_sequence={progress.progress_sequence}",
                         node_host=self._get_host(),
                         node_port=self._get_tcp_port(),
                         node_id=self._get_node_id().short,
@@ -760,7 +760,9 @@ class GateJobHandler:
                 job.timestamp = time.monotonic()
 
                 target_dcs = self._job_manager.get_target_dcs(progress.job_id)
-                target_dc_count = len(target_dcs) if target_dcs else len(job.datacenters)
+                target_dc_count = (
+                    len(target_dcs) if target_dcs else len(job.datacenters)
+                )
                 job.progress_percentage = self._calculate_progress_percentage(
                     job, target_dc_count
                 )
