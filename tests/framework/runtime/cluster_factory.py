@@ -233,8 +233,6 @@ class ClusterFactory:
                 gate_udp_addrs=all_gate_udp,
             )
             cluster.managers[datacenter_id].append(manager)
-        seed_managers: list[tuple[str, int]] = []
-        worker_env: Env | None = None
         for worker_spec in worker_specs:
             datacenter_id = worker_spec.dc_id
             if not datacenter_id:
