@@ -30,6 +30,14 @@ class RoleValidationError(Exception):
         )
 
 
+class CertificateParseError(Exception):
+    """Raised when certificate parsing fails in strict mode."""
+
+    def __init__(self, message: str, parse_error: Exception | None = None):
+        self.parse_error = parse_error
+        super().__init__(message)
+
+
 @dataclass(slots=True, frozen=True)
 class CertificateClaims:
     """Claims extracted from an mTLS certificate."""
