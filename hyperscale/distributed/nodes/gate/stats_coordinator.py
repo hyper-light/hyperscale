@@ -45,14 +45,18 @@ class GateStatsCoordinator:
         get_all_running_jobs: Callable[[], list[tuple[str, GlobalJobStatus]]],
         send_tcp: Callable,
     ) -> None:
-        self._state = state
-        self._logger = logger
-        self._task_runner = task_runner
-        self._windowed_stats = windowed_stats
-        self._get_job_callback = get_job_callback
-        self._get_job_status = get_job_status
-        self._get_all_running_jobs = get_all_running_jobs
-        self._send_tcp = send_tcp
+        self._state: "GateRuntimeState" = state
+        self._logger: "Logger" = logger
+        self._task_runner: "TaskRunner" = task_runner
+        self._windowed_stats: WindowedStatsCollector = windowed_stats
+        self._get_job_callback: Callable[[str], tuple[str, int] | None] = (
+            get_job_callback
+        )
+        self._get_job_status: Callable[[str], GlobalJobStatus | None] = get_job_status
+        self._get_all_running_jobs: Callable[[], list[tuple[str, GlobalJobStatus]]] = (
+            get_all_running_jobs
+        )
+        self._send_tcp: Callable = send_tcp
 
     def classify_update_tier(
         self,
