@@ -3786,6 +3786,10 @@ class ManagerServer(HealthAwareServer):
         clock_time: int,
     ) -> bytes:
         """Handle job submission from gate or client."""
+        submission: JobSubmission | None = None
+        idempotency_key: IdempotencyKey | None = None
+        idempotency_reserved = False
+
         try:
             # Rate limit check (AD-24)
             client_id = f"{addr[0]}:{addr[1]}"
