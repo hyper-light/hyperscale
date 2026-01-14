@@ -71,6 +71,33 @@ class ObservedLatencyState:
         self.sample_count += 1
         self.last_update = current_time
 
+        # Jitter tracking (Task 61)
+        if self._last_latency_ms > 0:
+            instant_jitter = abs(latency_ms - self._last_latency_ms)
+            self.jitter_ms = self.jitter_ms + alpha * (instant_jitter - self.jitter_ms)
+        self._last_latency_ms = latency_ms
+
+        # Percentile tracking (Task 61)
+        if self._recent_samples is not None:
+            self._recent_samples.append(latency_ms)
+            self._update_percentiles()
+
+    def _update_percentiles(self) -> None:
+        """Update percentile calculations from recent samples (Task 61)."""
+        if self._recent_samples is None or len(self._recent_samples) < 2:
+            return
+
+        sorted_samples = sorted(self._recent_samples)
+        n = len(sorted_samples)
+
+        p50_idx = int(n * 0.50)
+        p95_idx = min(int(n * 0.95), n - 1)
+        p99_idx = min(int(n * 0.99), n - 1)
+
+        self.p50_ms = sorted_samples[p50_idx]
+        self.p95_ms = sorted_samples[p95_idx]
+        self.p99_ms = sorted_samples[p99_idx]
+
     def get_confidence(self, min_samples: int) -> float:
         """
         Get confidence in observed latency estimate.
