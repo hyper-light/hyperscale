@@ -321,6 +321,7 @@ class GateServer(HealthAwareServer):
 
         # Job management
         self._job_manager = GateJobManager()
+        self._job_final_statuses: dict[tuple[str, str], float] = {}
 
         # Consistent hash ring
         self._job_hash_ring = ConsistentHashRing(replicas=150)

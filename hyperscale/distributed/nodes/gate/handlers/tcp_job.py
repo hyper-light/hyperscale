@@ -270,7 +270,7 @@ class GateJobHandler:
                     await self._logger.log(
                         ServerInfo(
                             message=(
-                                "Idempotency wait timeout for job "
+                                "Idempotency wait timed out for job "
                                 f"{submission.job_id} (key={idempotency_key})"
                             ),
                             node_host=self._get_host(),
@@ -281,7 +281,7 @@ class GateJobHandler:
                     return JobAck(
                         job_id=submission.job_id,
                         accepted=False,
-                        error="Idempotency request pending, please retry",
+                        error="Idempotency wait timed out, please retry",
                         protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
                         protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
                         capabilities=negotiated_caps_str,
