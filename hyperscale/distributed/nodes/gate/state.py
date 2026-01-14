@@ -325,17 +325,20 @@ class GateRuntimeState:
         self,
         job_id: str,
         datacenter_id: str,
-        fence_token: int,
+        progress_sequence: int,
         timestamp: float,
     ) -> tuple[bool, str]:
         """
         Check if a JobProgress update should be accepted based on ordering/dedup.
 
+        Uses progress_sequence (per-job per-DC monotonic counter) for ordering,
+        NOT fence_token (which is for leadership safety only).
+
         Returns:
             (accepted, reason) - True if update should be processed, False if rejected
         """
         key = (job_id, datacenter_id)
-        dedup_key = (fence_token, timestamp)
+        dedup_key = (progress_sequence, timestamp)
 
         async with self._get_job_progress_lock():
             seen_set = self._job_progress_seen.get(key)
@@ -343,7 +346,7 @@ class GateRuntimeState:
                 return (False, "duplicate")
 
             last_sequence = self._job_progress_sequences.get(key, 0)
-            if fence_token < last_sequence:
+            if progress_sequence < last_sequence:
                 return (False, "out_of_order")
 
             if seen_set is None:
@@ -355,8 +358,8 @@ class GateRuntimeState:
                 oldest = min(seen_set, key=lambda x: x[1])
                 seen_set.discard(oldest)
 
-            if fence_token > last_sequence:
-                self._job_progress_sequences[key] = fence_token
+            if progress_sequence > last_sequence:
+                self._job_progress_sequences[key] = progress_sequence
 
             return (True, "accepted")
 
