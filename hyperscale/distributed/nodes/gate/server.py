@@ -1412,6 +1412,15 @@ class GateServer(HealthAwareServer):
             self._job_manager.set_callback(job_id, request.callback_addr)
             self._progress_callbacks[job_id] = request.callback_addr
 
+            # Immediately push current status to client callback address
+            # This ensures client doesn't wait for next scheduled batch or status change
+            self._task_runner.run(
+                self._send_immediate_update,
+                job_id,
+                f"reconnect:status={job.status}",
+                None,
+            )
+
             elapsed = time.monotonic() - job.timestamp if job.timestamp > 0 else 0.0
 
             self._task_runner.run(
