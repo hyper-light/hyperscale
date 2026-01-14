@@ -11,55 +11,51 @@ This file reflects **verified, current** issues only. Previously reported items 
 
 | Severity | Count | Status |
 |----------|-------|--------|
-| **High Priority** | 0 | 🟢 All Fixed or N/A |
-| **Medium Priority** | 3 | 🟡 Should Fix |
-| **Low Priority** | 0 | 🟢 Can Wait |
+| **High Priority** | 0 | 🟢 All Fixed |
+| **Medium Priority** | 0 | 🟢 All Fixed |
+| **Low Priority** | 0 | 🟢 All Fixed |
 
 ---
 
-## 1. Medium Priority Issues
+## All Issues Fixed
 
-### 1.1 Out-of-Band Health Receive Loop Silently Swallows Exceptions
-
-| File | Lines | Issue |
-|------|-------|-------|
-| `distributed/swim/health/out_of_band_health_channel.py` | 321-324 | `_receive_loop` catches `Exception` and continues without logging |
-
-**Why this matters:** OOB probes are used for high-priority health signals. Silent failures make probe loss or socket errors invisible (SCENARIOS 3.7/6.1).
-
-**Fix (actionable):**
-- Log exceptions (rate-limited) with socket info and message type.
-- Continue loop after logging.
-
-### 1.2 Federated Health Probe Error Callback Failures Are Silent
+### 1.1 Out-of-Band Health Receive Loop Silently Swallows Exceptions - FIXED
 
 | File | Lines | Issue |
 |------|-------|-------|
-| `distributed/swim/health/federated_health_monitor.py` | 372-381, 416-423 | `on_probe_error` exceptions are swallowed |
+| `distributed/swim/health/out_of_band_health_channel.py` | 320-328 | Now logs errors to stderr |
 
-**Why this matters:** Cross-DC probe errors can be suppressed if the callback itself fails, obscuring partitions (SCENARIOS 24.1/24.3).
+**Status:** FIXED - Added `print(..., file=sys.stderr)` logging before continuing loop.
 
-**Fix (actionable):**
-- Add fallback logging when `on_probe_error` raises.
-- Include affected datacenters and probe interval in the log.
-
-### 1.3 Job Suspicion Expiration Error Callback Failures Are Silent
+### 1.2 Federated Health Probe Error Callback Failures Are Silent - FIXED
 
 | File | Lines | Issue |
 |------|-------|-------|
-| `distributed/swim/detection/job_suspicion_manager.py` | 324-337 | `on_error` failure is swallowed |
+| `distributed/swim/health/federated_health_monitor.py` | 380-387, 428-434 | Now has fallback stderr logging |
 
-**Why this matters:** Job-level failure notifications can be lost if the error callback raises, delaying recovery (SCENARIOS 6.1/11.1).
+**Status:** FIXED - Added fallback `print(..., file=sys.stderr)` when `on_probe_error` callback fails.
 
-**Fix (actionable):**
-- Add fallback logging when `on_error` raises.
+### 1.3 Job Suspicion Expiration Error Callback Failures Are Silent - FIXED
+
+| File | Lines | Issue |
+|------|-------|-------|
+| `distributed/swim/detection/job_suspicion_manager.py` | 336-343 | Now has fallback stderr logging |
+
+**Status:** FIXED - Added fallback `print(..., file=sys.stderr)` when `on_error` callback fails.
 
 ---
 
 ## Notes (Verified Fixes)
 
 The following previous findings are confirmed fixed in current code:
-- Job cleanup now removes routing, dispatch timing, progress/update, and cancellation state (`distributed/nodes/gate/server.py:4988`).
-- Job final result forwarding logs failures via `_record_and_send_client_update` (`distributed/nodes/gate/server.py:2119`).
-- Windowed stats push logs missing callbacks and cleans windows (`distributed/nodes/gate/stats_coordinator.py:438`).
-- Timing wheel advance loop logs errors via `_on_error` or stderr (`distributed/swim/detection/timing_wheel.py:423`).
+- Job cleanup now removes routing, dispatch timing, progress/update, and cancellation state (`distributed/nodes/gate/server.py:5019-5025`).
+- Job final result forwarding logs failures via `_record_and_send_client_update` with `log_failure=True` (`distributed/nodes/gate/server.py:2125-2133`).
+- Windowed stats push logs missing callbacks and cleans windows (`distributed/nodes/gate/stats_coordinator.py:438-448`).
+- Timing wheel advance loop logs errors via `_on_error` callback or stderr fallback (`distributed/swim/detection/timing_wheel.py:423-435`).
+- Spillover evaluation uses observed RTT from `ObservedLatencyTracker` instead of hardcoded values (`distributed/nodes/gate/dispatch_coordinator.py`).
+- Dispatch time tracker `remove_job()` called in cleanup (`distributed/nodes/gate/server.py:5020`).
+- Cancellation response parse fallback has debug logging (`distributed/nodes/gate/server.py:2535-2545`).
+- Job routing state cleanup via `GateJobRouter.cleanup_job_state()` (AD-51).
+- Dispatch failure tracking for cooldown penalty in all failure paths (AD-51).
+- Coordinate updates wired via Vivaldi callbacks (AD-51).
+- BlendedLatencyScorer integrated into candidate enrichment (AD-51).
