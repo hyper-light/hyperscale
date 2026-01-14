@@ -191,13 +191,15 @@ class GateStatsCoordinator:
                     return
 
         await self._logger.log(
-            {
-                "level": "error",
-                "message": (
+            ServerError(
+                message=(
                     f"Failed to deliver status push for job {job_id} after "
                     f"{self.CALLBACK_PUSH_MAX_RETRIES} retries: {last_error}"
                 ),
-            }
+                node_host=self._node_host,
+                node_port=self._node_port,
+                node_id=self._node_id,
+            )
         )
 
     async def _send_periodic_push_with_retry(

@@ -996,7 +996,13 @@ class TestManagerStatsCoordinatorHappyPath:
     """Happy path tests for ManagerStatsCoordinator."""
 
     def test_record_dispatch(
-        self, manager_state, manager_config, mock_logger, mock_task_runner
+        self,
+        manager_state,
+        manager_config,
+        mock_logger,
+        mock_task_runner,
+        stats_buffer,
+        windowed_stats,
     ):
         """Can record dispatch for throughput tracking."""
         stats = ManagerStatsCoordinator(
@@ -1005,6 +1011,8 @@ class TestManagerStatsCoordinatorHappyPath:
             logger=mock_logger,
             node_id="manager-1",
             task_runner=mock_task_runner,
+            stats_buffer=stats_buffer,
+            windowed_stats=windowed_stats,
         )
 
         assert manager_state._dispatch_throughput_count == 0
@@ -1021,7 +1029,13 @@ class TestManagerStatsCoordinatorProgressState:
     """Tests for AD-19 progress state tracking."""
 
     def test_get_progress_state_normal(
-        self, manager_state, manager_config, mock_logger, mock_task_runner
+        self,
+        manager_state,
+        manager_config,
+        mock_logger,
+        mock_task_runner,
+        stats_buffer,
+        windowed_stats,
     ):
         """Progress state is NORMAL when no workers."""
         stats = ManagerStatsCoordinator(
@@ -1030,6 +1044,8 @@ class TestManagerStatsCoordinatorProgressState:
             logger=mock_logger,
             node_id="manager-1",
             task_runner=mock_task_runner,
+            stats_buffer=stats_buffer,
+            windowed_stats=windowed_stats,
         )
 
         # With no workers and no dispatches, should be NORMAL
