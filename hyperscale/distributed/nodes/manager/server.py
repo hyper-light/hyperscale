@@ -3840,10 +3840,38 @@ class ManagerServer(HealthAwareServer):
             negotiated_features = client_features & our_features
             negotiated_caps_str = ",".join(sorted(negotiated_features))
 
-            # Unpickle workflows
-            workflows: list[tuple[str, list[str], Workflow]] = restricted_loads(
-                submission.workflows
-            )
+            if submission.idempotency_key and self._idempotency_ledger is not None:
+                try:
+                    idempotency_key = IdempotencyKey.parse(submission.idempotency_key)
+                except ValueError as error:
+                    return JobAck(
+                        job_id=submission.job_id,
+                        accepted=False,
+                        error=str(error),
+                    ).dump()
+
+                existing_entry = self._idempotency_ledger.get_by_key(idempotency_key)
+                if existing_entry is not None:
+                    if existing_entry.result_serialized is not None:
+                        return existing_entry.result_serialized
+                    if existing_entry.status in (
+                        IdempotencyStatus.COMMITTED,
+                        IdempotencyStatus.REJECTED,
+                    ):
+                        return JobAck(
+                            job_id=submission.job_id,
+                            accepted=(
+                                existing_entry.status == IdempotencyStatus.COMMITTED
+                            ),
+                            error="Duplicate request"
+                            if existing_entry.status == IdempotencyStatus.REJECTED
+                            else None,
+                        ).dump()
+                    return JobAck(
+                        job_id=submission.job_id,
+                        accepted=False,
+                        error="Request pending, please retry",
+                    ).dump()
 
             # Only active managers accept jobs
             if self._manager_state.manager_state_enum != ManagerStateEnum.ACTIVE:
@@ -3852,6 +3880,37 @@ class ManagerServer(HealthAwareServer):
                     accepted=False,
                     error=f"Manager is {self._manager_state.manager_state_enum.value}, not accepting jobs",
                 ).dump()
+
+            if idempotency_key is not None and self._idempotency_ledger is not None:
+                found, entry = await self._idempotency_ledger.check_or_reserve(
+                    idempotency_key,
+                    submission.job_id,
+                )
+                if found and entry is not None:
+                    if entry.result_serialized is not None:
+                        return entry.result_serialized
+                    if entry.status in (
+                        IdempotencyStatus.COMMITTED,
+                        IdempotencyStatus.REJECTED,
+                    ):
+                        return JobAck(
+                            job_id=submission.job_id,
+                            accepted=entry.status == IdempotencyStatus.COMMITTED,
+                            error="Duplicate request"
+                            if entry.status == IdempotencyStatus.REJECTED
+                            else None,
+                        ).dump()
+                    return JobAck(
+                        job_id=submission.job_id,
+                        accepted=False,
+                        error="Request pending, please retry",
+                    ).dump()
+                idempotency_reserved = True
+
+            # Unpickle workflows
+            workflows: list[tuple[str, list[str], Workflow]] = restricted_loads(
+                submission.workflows
+            )
 
             # Create job using JobManager
             callback_addr = None
