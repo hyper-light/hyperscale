@@ -1066,7 +1066,6 @@ class GateServer(HealthAwareServer):
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
-        transport: asyncio.Transport,
     ):
         """Handle manager discovery broadcast from peer gate."""
         if self._manager_handler:
@@ -1081,7 +1080,6 @@ class GateServer(HealthAwareServer):
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
-        transport: asyncio.Transport,
     ):
         """Handle job submission from client."""
         if self._job_handler:
@@ -1096,7 +1094,6 @@ class GateServer(HealthAwareServer):
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
-        transport: asyncio.Transport,
     ):
         """Handle job status request from client."""
         if self._job_handler:
@@ -1111,7 +1108,6 @@ class GateServer(HealthAwareServer):
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
-        transport: asyncio.Transport,
     ):
         """Handle job progress update from manager."""
         if self._job_handler:
@@ -1126,7 +1122,6 @@ class GateServer(HealthAwareServer):
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
-        transport: asyncio.Transport,
     ):
         """Handle ping request."""
         if self._ping_handler:
