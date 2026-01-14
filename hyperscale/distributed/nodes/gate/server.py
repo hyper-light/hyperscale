@@ -785,7 +785,6 @@ class GateServer(HealthAwareServer):
             logger=self._udp_logger,
             task_runner=self._task_runner,
             job_manager=self._job_manager,
-            job_router=self._job_router,
             job_leadership_tracker=self._job_leadership_tracker,
             quorum_circuit=self._quorum_circuit,
             load_shedder=self._load_shedder,
