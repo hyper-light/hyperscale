@@ -309,13 +309,22 @@ This document catalogs all identified issues across the distributed node impleme
 - Assignments: `job.status = JobStatus.COMPLETED.value`
 - Pattern is already standardized
 
-### 4.2 Gate Server - Unused Job Ledger
+### 4.2 Gate Server - Unused Job Ledger ⏸️ DEFERRED (requires user decision)
 
-| File | Lines | Issue |
-|------|-------|-------|
-| `nodes/gate/server.py` | 892-901 | Job ledger created but never used |
+| File | Lines | Issue | Status |
+|------|-------|-------|--------|
+| `nodes/gate/server.py` | 897-905 | Job ledger created but never used | ⏸️ Needs user decision |
 
-**Action:** Either implement ledger usage or remove initialization.
+**Analysis:**
+- `_job_ledger` is created if `_ledger_data_dir` is configured (line 896-905)
+- Properly closed in `stop()` (line 1044-1045)
+- No actual read/write operations on the ledger anywhere in the file
+- Might be intended for future durability features
+
+**Options:**
+1. Remove initialization code (breaks future ledger support)
+2. Keep as-is (harmless if `_ledger_data_dir` is None by default)
+3. Implement ledger usage for job state persistence
 
 ### 4.3 Gate Server - Unnecessary Conditional Check
 
