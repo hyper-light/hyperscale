@@ -16,6 +16,7 @@ from hyperscale.distributed.models import (
     WorkflowProgress,
     WorkflowStatus,
 )
+from hyperscale.logging.hyperscale_logging_models import ServerDebug, ServerWarning
 
 if TYPE_CHECKING:
     from hyperscale.logging import Logger
