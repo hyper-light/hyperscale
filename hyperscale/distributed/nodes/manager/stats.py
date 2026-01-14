@@ -300,3 +300,44 @@ class ManagerStatsCoordinator:
             "stats_buffer_count": stats_buffer_metrics["hot_count"],
             "throughput_count": throughput_count,
         }
+
+    def export_stats_checkpoint(self) -> list[tuple[float, float]]:
+        """
+        Export pending stats as a checkpoint for peer recovery (Task 33).
+
+        Called during state sync to include stats in ManagerStateSnapshot.
+
+        Returns:
+            List of (timestamp, value) tuples from the stats buffer
+        """
+        return self._stats_buffer.export_checkpoint()
+
+    async def import_stats_checkpoint(
+        self, checkpoint: list[tuple[float, float]]
+    ) -> int:
+        """
+        Import stats from a checkpoint during recovery (Task 33).
+
+        Called when syncing state from a peer manager.
+
+        Args:
+            checkpoint: List of (timestamp, value) tuples
+
+        Returns:
+            Number of entries imported
+        """
+        if not checkpoint:
+            return 0
+
+        imported = self._stats_buffer.import_checkpoint(checkpoint)
+        if imported > 0:
+            self._task_runner.run(
+                self._logger.log,
+                ServerDebug(
+                    message=f"Imported {imported} stats entries from peer checkpoint",
+                    node_host=self._config.host,
+                    node_port=self._config.tcp_port,
+                    node_id=self._node_id,
+                ),
+            )
+        return imported
