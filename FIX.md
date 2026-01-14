@@ -94,22 +94,18 @@ This document catalogs all identified issues across the distributed node impleme
 - Uses `ack_grace_period = probe_timeout * max_consecutive_failures` to detect silent failures
 - Transitions DC to SUSPECTED/UNREACHABLE when last_ack_received exceeds grace period
 
-### 2.5 Multi-Gate Submit Storm Can Create Duplicate Jobs in a DC
+### 2.5 Multi-Gate Submit Storm Can Create Duplicate Jobs in a DC ✅ FIXED
 
-| File | Lines | Issue |
-|------|-------|-------|
-| `distributed/datacenters/manager_dispatcher.py` | 171-240 | Dispatch falls back to any manager if leader unknown |
-| `distributed/nodes/manager/server.py` | 4560-4740 | `job_submission` accepts jobs on any ACTIVE manager without leader fencing |
-| `distributed/leases/job_lease.py` | 101-150 | Gate leases are local only (no cross-gate fencing) |
+| File | Lines | Issue | Status |
+|------|-------|-------|--------|
+| `distributed/datacenters/manager_dispatcher.py` | 171-240 | Dispatch falls back to any manager if leader unknown | ✅ Fixed via leader fencing |
+| `distributed/nodes/manager/server.py` | 4560-4740 | `job_submission` accepts jobs on any ACTIVE manager without leader fencing | ✅ Fixed |
+| `distributed/leases/job_lease.py` | 101-150 | Gate leases are local only (no cross-gate fencing) | N/A (covered by leader fencing) |
 
-**Why this matters:** Concurrent submissions through multiple gates can hit different managers in the same DC, creating duplicate jobs because non-leader managers accept submissions.
-
-**Fix (actionable):**
-- Require leader fencing for `job_submission` on managers:
-  - Reject if not DC leader, OR
-  - Require a leader term/fence token from the gate and validate against current leader term.
-- In `ManagerDispatcher`, when leader is unknown, perform a leader discovery/confirmation step before dispatching, or hard-fail to force retry.
-- Optionally add a `leader_only` flag to `job_submission` and reject with a retry hint when called on non-leader managers.
+**Fix implemented:**
+- Added leader fencing check in `job_submission` handler on manager
+- Non-leader managers now reject job submissions with error: "Not DC leader, retry at leader: {addr}"
+- Response includes leader hint address for client/gate retry
 
 ### 2.6 Workflow Requeue Ignores Stored Dispatched Context
 
