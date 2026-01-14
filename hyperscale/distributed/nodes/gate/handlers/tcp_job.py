@@ -346,10 +346,6 @@ class GateJobHandler:
 
             self._quorum_circuit.record_success()
 
-            self._task_runner.run(
-                self._dispatch_job_to_datacenters, submission, target_dcs
-            )
-
             ack_response = JobAck(
                 job_id=submission.job_id,
                 accepted=True,
@@ -359,8 +355,14 @@ class GateJobHandler:
                 capabilities=negotiated_caps_str,
             ).dump()
 
+            # Commit idempotency BEFORE dispatch to prevent duplicate jobs
+            # if a retry arrives while dispatch is queued
             if idempotency_key is not None and self._idempotency_cache is not None:
                 await self._idempotency_cache.commit(idempotency_key, ack_response)
+
+            self._task_runner.run(
+                self._dispatch_job_to_datacenters, submission, target_dcs
+            )
 
             return ack_response
 
