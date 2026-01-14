@@ -1,7 +1,5 @@
 from dataclasses import dataclass
 
-from hyperscale.distributed.env.env import PrimaryType
-
 from tests.framework.specs.node_spec import NodeSpec
 
 
@@ -20,7 +18,7 @@ class ClusterSpec:
     stabilization_seconds: int
     worker_registration_seconds: int
     nodes: list[NodeSpec] | None = None
-    env_overrides: dict[str, PrimaryType] | None = None
+    env_overrides: dict[str, object] | None = None
 
     @classmethod
     def from_dict(cls, data: dict) -> "ClusterSpec":
