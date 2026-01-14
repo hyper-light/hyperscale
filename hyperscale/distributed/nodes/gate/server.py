@@ -1355,9 +1355,15 @@ class GateServer(HealthAwareServer):
                 )
                 should_aggregate = target_dcs and received_dcs >= target_dcs
 
-            if should_aggregate:
-                await self._aggregate_and_forward_workflow_result(
-                    push.job_id, push.workflow_id
+                if should_aggregate:
+                    job_results = self._workflow_dc_results.get(push.job_id, {})
+                    workflow_results = job_results.pop(push.workflow_id, {})
+                    if not job_results and push.job_id in self._workflow_dc_results:
+                        del self._workflow_dc_results[push.job_id]
+
+            if should_aggregate and workflow_results:
+                await self._forward_aggregated_workflow_result(
+                    push.job_id, push.workflow_id, workflow_results
                 )
 
             return b"ok"
