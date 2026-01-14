@@ -714,6 +714,11 @@ class GateServer(HealthAwareServer):
             capacity_aggregator=self._capacity_aggregator,
             spillover_evaluator=self._spillover_evaluator,
             observed_latency_tracker=self._observed_latency_tracker,
+            record_dispatch_failure=lambda job_id,
+            datacenter_id: self._job_router.record_dispatch_failure(
+                job_id,
+                datacenter_id,
+            ),
         )
 
         self._peer_coordinator = GatePeerCoordinator(
