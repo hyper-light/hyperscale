@@ -82,31 +82,35 @@ class GateDispatchCoordinator:
         get_node_port: Callable[[], int],
         get_node_id_short: Callable[[], str],
     ) -> None:
-        self._state = state
-        self._logger = logger
-        self._task_runner = task_runner
-        self._job_manager = job_manager
-        self._job_router = job_router
-        self._job_timeout_tracker = job_timeout_tracker
-        self._dispatch_time_tracker = dispatch_time_tracker
-        self._circuit_breaker_manager = circuit_breaker_manager
-        self._datacenter_managers = datacenter_managers
-        self._check_rate_limit = check_rate_limit
-        self._should_shed_request = should_shed_request
-        self._has_quorum_available = has_quorum_available
-        self._quorum_size = quorum_size
-        self._quorum_circuit = quorum_circuit
-        self._select_datacenters = select_datacenters
-        self._assume_leadership = assume_leadership
-        self._broadcast_leadership = broadcast_leadership
-        self._send_tcp = send_tcp
-        self._increment_version = increment_version
-        self._confirm_manager_for_dc = confirm_manager_for_dc
-        self._suspect_manager_for_dc = suspect_manager_for_dc
-        self._record_forward_throughput_event = record_forward_throughput_event
-        self._get_node_host = get_node_host
-        self._get_node_port = get_node_port
-        self._get_node_id_short = get_node_id_short
+        self._state: "GateRuntimeState" = state
+        self._logger: "Logger" = logger
+        self._task_runner: "TaskRunner" = task_runner
+        self._job_manager: "GateJobManager" = job_manager
+        self._job_router: "GateJobRouter | None" = job_router
+        self._job_timeout_tracker: "GateJobTimeoutTracker" = job_timeout_tracker
+        self._dispatch_time_tracker: "DispatchTimeTracker" = dispatch_time_tracker
+        self._circuit_breaker_manager: "CircuitBreakerManager" = circuit_breaker_manager
+        self._datacenter_managers: dict[str, list[tuple[str, int]]] = (
+            datacenter_managers
+        )
+        self._check_rate_limit: Callable = check_rate_limit
+        self._should_shed_request: Callable = should_shed_request
+        self._has_quorum_available: Callable = has_quorum_available
+        self._quorum_size: Callable = quorum_size
+        self._quorum_circuit: "ErrorStats" = quorum_circuit
+        self._select_datacenters: Callable = select_datacenters
+        self._assume_leadership: Callable = assume_leadership
+        self._broadcast_leadership: Callable = broadcast_leadership
+        self._send_tcp: Callable = send_tcp
+        self._increment_version: Callable = increment_version
+        self._confirm_manager_for_dc: Callable = confirm_manager_for_dc
+        self._suspect_manager_for_dc: Callable = suspect_manager_for_dc
+        self._record_forward_throughput_event: Callable = (
+            record_forward_throughput_event
+        )
+        self._get_node_host: Callable[[], str] = get_node_host
+        self._get_node_port: Callable[[], int] = get_node_port
+        self._get_node_id_short: Callable[[], str] = get_node_id_short
 
     async def _check_rate_and_load(
         self,
