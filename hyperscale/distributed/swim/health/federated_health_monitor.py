@@ -187,6 +187,11 @@ class FederatedHealthMonitor:
     _running: bool = False
     _probe_task: asyncio.Task | None = None
 
+    # Logging
+    _logger: LoggerProtocol | None = None
+    _node_host: str = ""
+    _node_port: int = 0
+
     def set_callbacks(
         self,
         send_udp: Callable[[tuple[str, int], bytes], Awaitable[bool]],
