@@ -88,9 +88,6 @@ class GateConfig:
     circuit_breaker_window_seconds: float = 30.0
     circuit_breaker_half_open_after_seconds: float = 10.0
 
-    # Job ledger configuration (AD-38)
-    ledger_data_dir: Path | None = None
-
     dead_peer_reap_interval_seconds: float = 120.0
     dead_peer_check_interval_seconds: float = 10.0
     quorum_stepdown_consecutive_failures: int = 3
@@ -106,7 +103,6 @@ def create_gate_config(
     gate_peers: list[tuple[str, int]] | None = None,
     gate_peers_udp: list[tuple[str, int]] | None = None,
     lease_timeout: float = 30.0,
-    ledger_data_dir: Path | None = None,
 ) -> GateConfig:
     """
     Create gate configuration with defaults.
@@ -121,7 +117,6 @@ def create_gate_config(
         gate_peers: List of peer gate TCP addresses
         gate_peers_udp: List of peer gate UDP addresses
         lease_timeout: Lease timeout in seconds
-        ledger_data_dir: Base directory for job ledger WAL, checkpoints, and archive
 
     Returns:
         GateConfig instance
@@ -136,5 +131,4 @@ def create_gate_config(
         gate_peers=gate_peers or [],
         gate_peers_udp=gate_peers_udp or [],
         lease_timeout_seconds=lease_timeout,
-        ledger_data_dir=ledger_data_dir,
     )
