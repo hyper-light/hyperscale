@@ -1057,7 +1057,13 @@ class TestManagerStatsCoordinatorBackpressure:
     """Tests for AD-23 backpressure."""
 
     def test_backpressure_levels(
-        self, manager_state, manager_config, mock_logger, mock_task_runner
+        self,
+        manager_state,
+        manager_config,
+        mock_logger,
+        mock_task_runner,
+        stats_buffer,
+        windowed_stats,
     ):
         """Backpressure levels based on buffer fill."""
         stats = ManagerStatsCoordinator(
@@ -1066,25 +1072,33 @@ class TestManagerStatsCoordinatorBackpressure:
             logger=mock_logger,
             node_id="manager-1",
             task_runner=mock_task_runner,
+            stats_buffer=stats_buffer,
+            windowed_stats=windowed_stats,
         )
 
         # Initially no backpressure
         assert stats.get_backpressure_level() == BackpressureLevel.NONE
 
-        # Add entries to trigger throttle
-        stats._stats_buffer_count = 1000
+        for _ in range(70):
+            stats_buffer.record(1.0)
         assert stats.get_backpressure_level() == BackpressureLevel.THROTTLE
 
-        # Add more for batch
-        stats._stats_buffer_count = 5000
+        for _ in range(15):
+            stats_buffer.record(1.0)
         assert stats.get_backpressure_level() == BackpressureLevel.BATCH
 
-        # Add more for reject
-        stats._stats_buffer_count = 10000
+        for _ in range(10):
+            stats_buffer.record(1.0)
         assert stats.get_backpressure_level() == BackpressureLevel.REJECT
 
     def test_should_apply_backpressure(
-        self, manager_state, manager_config, mock_logger, mock_task_runner
+        self,
+        manager_state,
+        manager_config,
+        mock_logger,
+        mock_task_runner,
+        stats_buffer,
+        windowed_stats,
     ):
         """should_apply_backpressure checks high watermark."""
         stats = ManagerStatsCoordinator(
@@ -1093,11 +1107,14 @@ class TestManagerStatsCoordinatorBackpressure:
             logger=mock_logger,
             node_id="manager-1",
             task_runner=mock_task_runner,
+            stats_buffer=stats_buffer,
+            windowed_stats=windowed_stats,
         )
 
         assert stats.should_apply_backpressure() is False
 
-        stats._stats_buffer_count = 2000
+        for _ in range(70):
+            stats_buffer.record(1.0)
         assert stats.should_apply_backpressure() is True
 
 

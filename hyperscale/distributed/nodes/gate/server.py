@@ -612,6 +612,9 @@ class GateServer(HealthAwareServer):
         self._stats_coordinator = GateStatsCoordinator(
             state=self._modular_state,
             logger=self._udp_logger,
+            node_host=self._host,
+            node_port=self._tcp_port,
+            node_id=self._node_id.short,
             task_runner=self._task_runner,
             windowed_stats=self._windowed_stats,
             get_job_callback=self._job_manager.get_callback,
