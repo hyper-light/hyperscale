@@ -1334,6 +1334,25 @@ class GateServer(HealthAwareServer):
         """Receive progress report from manager (AD-34 multi-DC coordination)."""
         try:
             report = JobProgressReport.load(data)
+            job = self._job_manager.get_job(report.job_id)
+            if job and job.status in (
+                JobStatus.COMPLETED.value,
+                JobStatus.FAILED.value,
+                JobStatus.CANCELLED.value,
+            ):
+                await self._udp_logger.log(
+                    ServerInfo(
+                        message=(
+                            "Discarding progress report for terminal job "
+                            f"{report.job_id} (status={job.status})"
+                        ),
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+                return b"ok"
+
             await self._job_timeout_tracker.record_progress(report)
             return b"ok"
         except Exception as error:
