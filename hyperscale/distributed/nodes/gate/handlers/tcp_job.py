@@ -158,6 +158,38 @@ class GateJobHandler:
         self._record_dc_job_stats: Callable = record_dc_job_stats
         self._handle_update_by_tier: Callable = handle_update_by_tier
 
+    def _is_terminal_status(self, status: str) -> bool:
+        return status in (
+            JobStatus.COMPLETED.value,
+            JobStatus.FAILED.value,
+            JobStatus.CANCELLED.value,
+        )
+
+    async def _release_job_lease(self, job_id: str) -> None:
+        await self._job_lease_manager.release(job_id)
+
+    async def _renew_job_lease(self, job_id: str, lease_duration: float) -> None:
+        renewal_interval = max(1.0, lease_duration * 0.5)
+
+        while True:
+            await asyncio.sleep(renewal_interval)
+            job = self._job_manager.get_job(job_id)
+            if job is None or self._is_terminal_status(job.status):
+                await self._release_job_lease(job_id)
+                return
+
+            lease_renewed = await self._job_lease_manager.renew(job_id, lease_duration)
+            if not lease_renewed:
+                await self._logger.log(
+                    ServerError(
+                        message=f"Failed to renew lease for job {job_id}: lease lost",
+                        node_host=self._get_host(),
+                        node_port=self._get_tcp_port(),
+                        node_id=self._get_node_id().short,
+                    )
+                )
+                return
+
     async def handle_submission(
         self,
         addr: tuple[str, int],

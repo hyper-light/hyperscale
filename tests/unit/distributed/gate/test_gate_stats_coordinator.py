@@ -466,7 +466,9 @@ class TestEdgeCases:
         class MinimalJobStatus:
             status = "running"
 
-        create_coordinator(
+        coordinator = create_coordinator(
             get_job_callback=lambda x: ("10.0.0.1", 8000),
             get_job_status=lambda x: MinimalJobStatus(),
         )
+
+        assert coordinator is not None
