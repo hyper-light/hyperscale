@@ -2785,6 +2785,16 @@ class GateServer(HealthAwareServer):
                 self._handle_gate_peer_recovery, node_addr, gate_tcp_addr
             )
 
+    def _on_peer_coordinate_update(
+        self,
+        peer_id: str,
+        peer_coordinate: NetworkCoordinate,
+        rtt_ms: float,
+    ) -> None:
+        self._coordinate_tracker.update_peer_coordinate(
+            peer_id, peer_coordinate, rtt_ms
+        )
+
     async def _handle_gate_peer_failure(
         self,
         udp_addr: tuple[str, int],
