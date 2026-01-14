@@ -295,12 +295,20 @@ class GateStatsCoordinator:
         callback: tuple[str, int],
     ) -> None:
         batch_push = self._build_job_batch_push(job_id, job)
-        await self._send_periodic_push_with_retry(
+        payload = batch_push.dump()
+        sequence = await self._state.record_client_update(
+            job_id,
+            "job_batch_push",
+            payload,
+        )
+        delivered = await self._send_periodic_push_with_retry(
             callback,
             "job_batch_push",
-            batch_push.dump(),
+            payload,
             timeout=2.0,
         )
+        if delivered:
+            await self._state.set_client_update_position(job_id, callback, sequence)
 
     async def send_progress_replay(self, job_id: str) -> None:
         if not self._has_job(job_id):
