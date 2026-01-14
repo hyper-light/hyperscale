@@ -227,7 +227,6 @@ class GateServer(HealthAwareServer):
         gate_peers: list[tuple[str, int]] | None = None,
         gate_udp_peers: list[tuple[str, int]] | None = None,
         lease_timeout: float = 30.0,
-        ledger_data_dir: Path | None = None,
     ):
         """
         Initialize the Gate server.
