@@ -1,7 +1,7 @@
-# FIX.md (In-Depth Rescan)
+# FIX.md (Intensive Deep Check)
 
 Last updated: 2026-01-14
-Scope: Full in-depth rescan of `SCENARIOS.md` vs current implementation, including verification of previously reported fixes.
+Scope: Intensive deep scan of `SCENARIOS.md` vs current implementation, with verified code references.
 
 This document contains **current** findings only. Previously fixed items are listed in Notes.
 
@@ -11,9 +11,9 @@ This document contains **current** findings only. Previously fixed items are lis
 
 | Severity | Count | Status |
 |----------|-------|--------|
-| **High Priority** | 1 | 🔴 Needs Fix |
-| **Medium Priority** | 3 | 🟡 Should Fix |
-| **Low Priority** | 1 | 🟢 Can Wait |
+| **High Priority** | 2 | 🔴 Needs Fix |
+| **Medium Priority** | 5 | 🟡 Should Fix |
+| **Low Priority** | 2 | 🟢 Can Wait |
 
 ---
 
@@ -31,6 +31,18 @@ This document contains **current** findings only. Previously fixed items are lis
 - Log the exception before returning `b"forwarded"` with job_id and callback address.
 - Optionally enqueue retry via `_deliver_client_update` rather than returning immediately.
 
+### 1.2 Job Routing State Cleanup Missing
+
+| File | Lines | Issue |
+|------|-------|-------|
+| `distributed/nodes/gate/server.py` | 4908-4939 | `_cleanup_single_job` never calls job router cleanup |
+| `distributed/routing/gate_job_router.py` | 334-336 | `cleanup_job_state()` exists but is unused |
+
+**Why this matters:** Per-job routing state accumulates indefinitely, violating cleanup requirements and SCENARIOS 1.2/1.4.
+
+**Fix (actionable):**
+- Call `self._job_router.cleanup_job_state(job_id)` in `_cleanup_single_job` after job completion.
+
 ---
 
 ## 2. Medium Priority Issues
@@ -44,8 +56,7 @@ This document contains **current** findings only. Previously fixed items are lis
 **Why this matters:** DNS discovery, failure decay, and cache cleanup can silently stop, leading to stale membership and missed recovery (SCENARIOS 2.2/24.1).
 
 **Fix (actionable):**
-- Log exceptions with loop context (dns_names, failure_decay_interval).
-- Continue loop after logging; consider backoff on repeated failures.
+- Log exceptions with loop context (dns_names, failure_decay_interval) and continue with backoff.
 
 ### 2.2 Worker Cancellation Poll Loop Swallows Errors
 
@@ -57,7 +68,6 @@ This document contains **current** findings only. Previously fixed items are lis
 
 **Fix (actionable):**
 - Log exceptions with workflow_id and manager_addr.
-- Preserve current behavior but surface errors for diagnosis.
 
 ### 2.3 Client Job Status Polling Swallows Errors
 
@@ -68,8 +78,29 @@ This document contains **current** findings only. Previously fixed items are lis
 **Why this matters:** Client-side status can stall without visibility, hiding remote failures or protocol mismatches (SCENARIOS 8/9).
 
 **Fix (actionable):**
-- Log poll exceptions with job_id and gate address.
-- Optionally add retry backoff and increment a poll failure counter.
+- Log poll exceptions with job_id and gate address; consider retry backoff.
+
+### 2.4 Windowed Stats Push Returns Early Without Cleanup When Callback Missing
+
+| File | Lines | Issue |
+|------|-------|-------|
+| `distributed/nodes/gate/stats_coordinator.py` | 438-439 | Missing callback returns without cleanup or logging |
+
+**Why this matters:** Windowed stats for jobs without callbacks can accumulate, leading to memory growth and stale stats (SCENARIOS 8.3).
+
+**Fix (actionable):**
+- Log missing callback and call `cleanup_job_windows(job_id)` before returning.
+
+### 2.5 Spillover Evaluation Uses Hardcoded RTT Values
+
+| File | Lines | Issue |
+|------|-------|-------|
+| `distributed/nodes/gate/dispatch_coordinator.py` | 612-619 | `primary_rtt_ms=10.0` and `rtt_ms=50.0` hardcoded |
+
+**Why this matters:** Spillover decisions are made using fixed RTTs instead of measured latency, skewing routing decisions (SCENARIOS 6.2).
+
+**Fix (actionable):**
+- Use observed or predicted RTTs from the coordinate/latency trackers instead of constants.
 
 ---
 
@@ -81,18 +112,30 @@ This document contains **current** findings only. Previously fixed items are lis
 |------|-------|-------|
 | `distributed/nodes/gate/server.py` | 2516-2522 | `JobCancelResponse` parse failure is silently ignored before fallback |
 
-**Why this matters:** When cancellation responses are malformed, we lose the error context while falling back to `CancelAck` parsing.
+**Why this matters:** Malformed cancellation responses lose error context during fallback to `CancelAck`.
 
 **Fix (actionable):**
-- Add debug logging for the parse failure before falling back to `CancelAck`.
+- Add debug logging for the parse failure before fallback.
+
+### 3.2 Dispatch Time Tracker Remove Job Not Used
+
+| File | Lines | Issue |
+|------|-------|-------|
+| `distributed/routing/dispatch_time_tracker.py` | 56-60 | `remove_job()` exists but is unused |
+| `distributed/nodes/gate/server.py` | 4908-4939 | `_cleanup_single_job` doesn’t call `remove_job()` |
+
+**Why this matters:** Per-job dispatch latency entries persist until staleness cleanup, delaying memory reclamation (SCENARIOS 1.2).
+
+**Fix (actionable):**
+- Call `await self._dispatch_time_tracker.remove_job(job_id)` during `_cleanup_single_job`.
 
 ---
 
 ## Notes (Verified Fixes)
 
 The following previously reported issues are confirmed fixed in current code:
-- Federated health probe loop now reports errors via `on_probe_error` and checks ack timeouts.
+- Federated health probe loop reports errors via `on_probe_error` and checks ack timeouts.
 - Worker progress flush and ACK parsing now log failures.
-- Client push handlers now log exceptions before returning `b"error"`.
-- Hierarchical failure detector and job suspicion manager now route errors via `on_error` callbacks.
-- Lease expiry and cross-DC correlation callbacks now surface errors via on-error handlers.
+- Client push handlers log exceptions before returning `b"error"`.
+- Hierarchical failure detector and job suspicion manager route errors via `on_error` callbacks.
+- Lease expiry and cross-DC correlation callbacks surface errors via on-error handlers.

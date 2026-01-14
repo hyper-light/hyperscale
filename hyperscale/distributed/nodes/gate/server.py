@@ -2512,8 +2512,18 @@ class GateServer(HealthAwareServer):
                 if not ack.success:
                     errors.append(f"DC {dc_id} rejected cancellation: {ack.error}")
                 continue
-            except Exception:
-                pass
+            except Exception as parse_error:
+                await self._udp_logger.log(
+                    ServerDebug(
+                        message=(
+                            f"JobCancelResponse parse failed for DC {dc_id}, "
+                            f"falling back to CancelAck: {parse_error}"
+                        ),
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
 
             try:
                 ack = CancelAck.load(response)
