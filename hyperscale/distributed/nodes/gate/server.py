@@ -2541,6 +2541,7 @@ class GateServer(HealthAwareServer):
                 failed_datacenters=status.failed_datacenters,
                 errors=list(status.errors),
                 resolution_details=status.resolution_details,
+                fence_token=status.fence_token,
             )
 
     def _get_peer_state_lock(self, peer_addr: tuple[str, int]) -> asyncio.Lock:

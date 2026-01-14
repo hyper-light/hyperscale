@@ -3650,6 +3650,22 @@ class ManagerServer(HealthAwareServer):
                     protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
                 ).dump()
 
+            mtls_error = await self._validate_mtls_claims(
+                addr,
+                "Gate",
+                registration.node_id,
+            )
+            if mtls_error:
+                return GateRegistrationResponse(
+                    accepted=False,
+                    manager_id=self._node_id.full,
+                    datacenter=self._node_id.datacenter,
+                    healthy_managers=[],
+                    error=mtls_error,
+                    protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+                    protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+                ).dump()
+
             # Protocol version validation (AD-25)
             gate_version = ProtocolVersion(
                 registration.protocol_version_major,

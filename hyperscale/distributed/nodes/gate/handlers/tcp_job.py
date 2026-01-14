@@ -718,22 +718,48 @@ class GateJobHandler:
                     status=progress.status,
                 )
 
+                terminal_statuses = {
+                    JobStatus.COMPLETED.value,
+                    JobStatus.FAILED.value,
+                    JobStatus.CANCELLED.value,
+                    JobStatus.TIMEOUT.value,
+                }
                 completed_dcs = sum(
-                    1
-                    for p in job.datacenters
-                    if p.status in (JobStatus.COMPLETED.value, JobStatus.FAILED.value)
+                    1 for p in job.datacenters if p.status in terminal_statuses
                 )
                 if completed_dcs == len(job.datacenters):
-                    failed_dcs = sum(
+                    completed_count = sum(
+                        1
+                        for p in job.datacenters
+                        if p.status == JobStatus.COMPLETED.value
+                    )
+                    failed_count = sum(
                         1 for p in job.datacenters if p.status == JobStatus.FAILED.value
                     )
-                    job.status = (
-                        JobStatus.FAILED.value
-                        if failed_dcs > 0
-                        else JobStatus.COMPLETED.value
+                    cancelled_count = sum(
+                        1
+                        for p in job.datacenters
+                        if p.status == JobStatus.CANCELLED.value
                     )
-                    job.completed_datacenters = len(job.datacenters) - failed_dcs
-                    job.failed_datacenters = failed_dcs
+                    timeout_count = sum(
+                        1
+                        for p in job.datacenters
+                        if p.status == JobStatus.TIMEOUT.value
+                    )
+
+                    if failed_count > 0:
+                        job.status = JobStatus.FAILED.value
+                    elif cancelled_count > 0:
+                        job.status = JobStatus.CANCELLED.value
+                    elif timeout_count > 0:
+                        job.status = JobStatus.TIMEOUT.value
+                    elif completed_count == len(job.datacenters):
+                        job.status = JobStatus.COMPLETED.value
+                    else:
+                        job.status = JobStatus.FAILED.value
+
+                    job.completed_datacenters = completed_count
+                    job.failed_datacenters = len(job.datacenters) - completed_count
 
                 if self._is_terminal_status(job.status):
                     await self._release_job_lease(progress.job_id)
