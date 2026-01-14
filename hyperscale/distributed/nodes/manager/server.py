@@ -1230,26 +1230,13 @@ class ManagerServer(HealthAwareServer):
             )
 
             for job_id, workflow_id, sub_token in running_sub_workflows:
-                requeued = await self._workflow_dispatcher.requeue_workflow(sub_token)
-
-                if requeued:
-                    await self._udp_logger.log(
-                        ServerInfo(
-                            message=f"Requeued workflow {workflow_id[:8]}... from failed worker {worker_id[:8]}...",
-                            node_host=self._host,
-                            node_port=self._tcp_port,
-                            node_id=self._node_id.short,
-                        )
-                    )
-                else:
-                    await self._udp_logger.log(
-                        ServerWarning(
-                            message=f"Failed to requeue workflow {workflow_id[:8]}... from failed worker {worker_id[:8]}... - not found in pending",
-                            node_host=self._host,
-                            node_port=self._tcp_port,
-                            node_id=self._node_id.short,
-                        )
-                    )
+                await self._apply_workflow_reassignment_state(
+                    job_id=job_id,
+                    workflow_id=workflow_id,
+                    sub_workflow_token=sub_token,
+                    failed_worker_id=worker_id,
+                    reason="worker_dead",
+                )
 
             if running_sub_workflows and self._worker_disseminator:
                 await self._worker_disseminator.broadcast_workflow_reassignments(
