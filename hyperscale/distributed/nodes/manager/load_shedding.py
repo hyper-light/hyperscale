@@ -97,14 +97,14 @@ class ManagerLoadShedder:
         config: "ManagerConfig",
         logger: "Logger",
         node_id: str,
-        task_runner,
+        task_runner: "TaskRunner",
         max_pending: int = 1000,
     ) -> None:
-        self._config = config
-        self._logger = logger
-        self._node_id = node_id
-        self._task_runner = task_runner
-        self._overload = OverloadStateTracker(max_pending)
+        self._config: "ManagerConfig" = config
+        self._logger: "Logger" = logger
+        self._node_id: str = node_id
+        self._task_runner: "TaskRunner" = task_runner
+        self._overload: OverloadStateTracker = OverloadStateTracker(max_pending)
 
         # Map overload state to minimum priority that gets processed
         # Requests with priority >= min_priority are shed
