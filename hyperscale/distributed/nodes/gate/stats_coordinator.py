@@ -283,10 +283,14 @@ class GateStatsCoordinator:
             per_dc_stats=per_dc_stats,
         )
 
-    def _get_progress_callback(self, job_id: str) -> tuple[str, int] | None:
-        return self._state._progress_callbacks.get(job_id) or self._get_job_callback(
-            job_id
-        )
+    def _get_progress_callbacks(self, job_id: str) -> list[tuple[str, int]]:
+        callbacks: list[tuple[str, int]] = []
+        if job_callback := self._get_job_callback(job_id):
+            callbacks.append(job_callback)
+        if state_callback := self._state._progress_callbacks.get(job_id):
+            if state_callback not in callbacks:
+                callbacks.append(state_callback)
+        return callbacks
 
     async def _send_batch_push(
         self,

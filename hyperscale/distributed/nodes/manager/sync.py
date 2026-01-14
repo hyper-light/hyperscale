@@ -315,7 +315,7 @@ class ManagerStateSync:
         worker_id: str,
         worker_key: str,
         snapshot_version: int,
-        worker_pool: "WorkerPool | None",
+        worker_pool: WorkerPool | None,
     ) -> None:
         registration = self._registry.get_worker(worker_id)
         if registration:
