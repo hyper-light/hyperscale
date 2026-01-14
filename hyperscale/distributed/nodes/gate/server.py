@@ -3381,32 +3381,13 @@ class GateServer(HealthAwareServer):
 
     def _on_partition_detected(self, affected_datacenters: list[str]) -> None:
         """Handle partition detection routing updates."""
-        routing_reset_jobs: list[str] = []
+        routing_reset_count = 0
         if self._job_router:
-            routing_reset_jobs = (
-                self._job_router.reset_primary_for_partitioned_datacenters_with_jobs(
+            routing_reset_count = (
+                self._job_router.reset_primary_for_partitioned_datacenters(
                     affected_datacenters
                 )
             )
-
-        for callback in self._partition_detected_callbacks:
-            try:
-                callback(affected_datacenters)
-            except Exception as error:
-                self._task_runner.run(
-                    self._udp_logger.log,
-                    ServerWarning(
-                        message=(f"Partition detected callback failed: {error}"),
-                        node_host=self._host,
-                        node_port=self._tcp_port,
-                        node_id=self._node_id.short,
-                    ),
-                )
-
-        if routing_reset_jobs:
-            self._notify_partition_reroute(routing_reset_jobs)
-
-        routing_reset_count = len(routing_reset_jobs)
         self._task_runner.run(
             self._udp_logger.log,
             ServerWarning(

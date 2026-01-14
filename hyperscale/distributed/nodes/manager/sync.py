@@ -118,8 +118,8 @@ class ManagerStateSync:
 
         request = StateSyncRequest(
             requester_id=self._node_id,
-            sync_type="worker_state",
-            state_version=self._state._state_version,
+            requester_role="manager",
+            since_version=self._state.state_version,
         )
 
         for worker_id, worker in workers.items():
