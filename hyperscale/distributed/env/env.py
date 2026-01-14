@@ -634,6 +634,7 @@ class Env(BaseModel):
     @classmethod
     def types_map(cls) -> Dict[str, Callable[[str], PrimaryType]]:
         return {
+            "MTLS_STRICT_MODE": str,
             "MERCURY_SYNC_CONNECT_SECONDS": str,
             "MERCURY_SYNC_SERVER_URL": str,
             "MERCURY_SYNC_API_VERISON": str,

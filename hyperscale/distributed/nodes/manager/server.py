@@ -208,8 +208,9 @@ class ManagerServer(HealthAwareServer):
             max_workflow_retries: Maximum retry attempts per workflow
             workflow_timeout: Workflow execution timeout in seconds
         """
-        # Build configuration from environment
-        self._config = create_manager_config_from_env(
+        from .config import ManagerConfig
+
+        self._config: ManagerConfig = create_manager_config_from_env(
             host=host,
             tcp_port=tcp_port,
             udp_port=udp_port,
@@ -227,16 +228,17 @@ class ManagerServer(HealthAwareServer):
 
         self._node_wal: NodeWAL | None = None
 
-        self._env = env
-        self._seed_gates = gate_addrs or []
-        self._gate_udp_addrs = gate_udp_addrs or []
-        self._seed_managers = seed_managers or manager_peers or []
-        self._manager_udp_peers = manager_udp_peers or []
-        self._max_workflow_retries = max_workflow_retries
-        self._workflow_timeout = workflow_timeout
+        self._env: Env = env
+        self._seed_gates: list[tuple[str, int]] = gate_addrs or []
+        self._gate_udp_addrs: list[tuple[str, int]] = gate_udp_addrs or []
+        self._seed_managers: list[tuple[str, int]] = (
+            seed_managers or manager_peers or []
+        )
+        self._manager_udp_peers: list[tuple[str, int]] = manager_udp_peers or []
+        self._max_workflow_retries: int = max_workflow_retries
+        self._workflow_timeout: float = workflow_timeout
 
-        # Initialize centralized runtime state
-        self._manager_state = ManagerState()
+        self._manager_state: ManagerState = ManagerState()
 
         # Initialize parent HealthAwareServer
         super().__init__(

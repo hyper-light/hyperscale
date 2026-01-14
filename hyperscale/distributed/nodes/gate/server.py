@@ -578,7 +578,7 @@ class GateServer(HealthAwareServer):
         self._role_validator = RoleValidator(
             cluster_id=env.CLUSTER_ID,
             environment_id=env.ENVIRONMENT_ID,
-            strict_mode=env.get("MTLS_STRICT_MODE", "false").lower() == "true",
+            strict_mode=env.MTLS_STRICT_MODE.lower() == "true",
         )
 
         # Coordinators (initialized in _init_coordinators)
