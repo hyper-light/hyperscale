@@ -75,22 +75,28 @@ class GateHealthCoordinator:
         on_partition_healed: Callable[[list[str]], None] | None = None,
         on_partition_detected: Callable[[list[str]], None] | None = None,
     ) -> None:
-        self._state = state
-        self._logger = logger
-        self._task_runner = task_runner
-        self._dc_health_manager = dc_health_manager
-        self._dc_health_monitor = dc_health_monitor
-        self._cross_dc_correlation = cross_dc_correlation
-        self._dc_manager_discovery = dc_manager_discovery
-        self._versioned_clock = versioned_clock
-        self._manager_dispatcher = manager_dispatcher
-        self._manager_health_config = manager_health_config
-        self._get_node_id = get_node_id
-        self._get_host = get_host
-        self._get_tcp_port = get_tcp_port
-        self._confirm_manager_for_dc = confirm_manager_for_dc
-        self._on_partition_healed = on_partition_healed
-        self._on_partition_detected = on_partition_detected
+        self._state: GateRuntimeState = state
+        self._logger: Logger = logger
+        self._task_runner: "TaskRunner" = task_runner
+        self._dc_health_manager: DatacenterHealthManager = dc_health_manager
+        self._dc_health_monitor: FederatedHealthMonitor = dc_health_monitor
+        self._cross_dc_correlation: "CrossDCCorrelationDetector" = cross_dc_correlation
+        self._dc_manager_discovery: dict[str, DiscoveryService] = dc_manager_discovery
+        self._versioned_clock: "VersionedStateClock" = versioned_clock
+        self._manager_dispatcher: "ManagerDispatcher" = manager_dispatcher
+        self._manager_health_config: dict = manager_health_config
+        self._get_node_id: Callable[[], "NodeId"] = get_node_id
+        self._get_host: Callable[[], str] = get_host
+        self._get_tcp_port: Callable[[], int] = get_tcp_port
+        self._confirm_manager_for_dc: Callable[
+            [str, tuple[str, int]], "asyncio.Task"
+        ] = confirm_manager_for_dc
+        self._on_partition_healed: Callable[[list[str]], None] | None = (
+            on_partition_healed
+        )
+        self._on_partition_detected: Callable[[list[str]], None] | None = (
+            on_partition_detected
+        )
 
         self._cross_dc_correlation.register_partition_healed_callback(
             self._handle_partition_healed
