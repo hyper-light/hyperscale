@@ -259,7 +259,7 @@ class ManagerStateSync:
 
     async def _apply_worker_pool_snapshot(
         self,
-        worker_pool: "WorkerPool",
+        worker_pool: WorkerPool,
         worker_status: WorkerStatus,
         registration: WorkerRegistration,
         snapshot: WorkerStateSnapshot,
