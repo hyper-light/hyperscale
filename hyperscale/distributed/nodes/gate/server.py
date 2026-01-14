@@ -3085,15 +3085,162 @@ class GateServer(HealthAwareServer):
 
         return False
 
+    async def _schedule_workflow_result_timeout(
+        self,
+        job_id: str,
+        workflow_id: str,
+    ) -> None:
+        if self._workflow_result_timeout_seconds <= 0:
+            return
+
+        async with self._workflow_dc_results_lock:
+            job_tokens = self._workflow_result_timeout_tokens.setdefault(job_id, {})
+            if workflow_id in job_tokens:
+                return
+
+            run = self._task_runner.run(
+                self._workflow_result_timeout_wait,
+                job_id,
+                workflow_id,
+                alias=f"workflow-result-timeout-{job_id}-{workflow_id}",
+            )
+            if run is None:
+                return
+            job_tokens[workflow_id] = run.token
+
+    def _pop_workflow_timeout_token_locked(
+        self,
+        job_id: str,
+        workflow_id: str,
+    ) -> str | None:
+        job_tokens = self._workflow_result_timeout_tokens.get(job_id)
+        if not job_tokens:
+            return None
+
+        token = job_tokens.pop(workflow_id, None)
+        if not job_tokens:
+            self._workflow_result_timeout_tokens.pop(job_id, None)
+        return token
+
+    async def _cancel_workflow_result_timeout(self, token: str) -> None:
+        try:
+            await self._task_runner.cancel(token)
+        except Exception as cancel_error:
+            await self._udp_logger.log(
+                ServerWarning(
+                    message=f"Failed to cancel workflow result timeout: {cancel_error}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+
+    async def _cancel_workflow_result_timeouts(
+        self, tokens: dict[str, str] | None
+    ) -> None:
+        if not tokens:
+            return
+
+        for token in tokens.values():
+            await self._cancel_workflow_result_timeout(token)
+
+    async def _workflow_result_timeout_wait(
+        self,
+        job_id: str,
+        workflow_id: str,
+    ) -> None:
+        try:
+            await asyncio.sleep(self._workflow_result_timeout_seconds)
+        except asyncio.CancelledError:
+            return
+
+        await self._handle_workflow_result_timeout(job_id, workflow_id)
+
+    def _build_missing_workflow_result(
+        self,
+        job_id: str,
+        workflow_id: str,
+        workflow_name: str,
+        datacenter: str,
+        fence_token: int,
+        is_test_workflow: bool,
+    ) -> WorkflowResultPush:
+        return WorkflowResultPush(
+            job_id=job_id,
+            workflow_id=workflow_id,
+            workflow_name=workflow_name,
+            datacenter=datacenter,
+            status="FAILED",
+            fence_token=fence_token,
+            results=[],
+            error=f"Timed out waiting for workflow result from DC {datacenter}",
+            elapsed_seconds=0.0,
+            completed_at=time.time(),
+            is_test=is_test_workflow,
+        )
+
+    async def _handle_workflow_result_timeout(
+        self,
+        job_id: str,
+        workflow_id: str,
+    ) -> None:
+        workflow_results, _ = await self._pop_workflow_results(job_id, workflow_id)
+        if not workflow_results:
+            return
+
+        target_dcs = self._job_manager.get_target_dcs(job_id)
+        missing_dcs = set(target_dcs) if target_dcs else set()
+        missing_dcs -= set(workflow_results.keys())
+
+        if missing_dcs:
+            await self._udp_logger.log(
+                ServerWarning(
+                    message=(
+                        f"Workflow results timed out for job {job_id} workflow {workflow_id}; "
+                        f"missing DCs: {sorted(missing_dcs)}"
+                    ),
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+
+            first_push = next(iter(workflow_results.values()))
+            fence_token = max(
+                dc_push.fence_token for dc_push in workflow_results.values()
+            )
+            for datacenter in missing_dcs:
+                workflow_results[datacenter] = self._build_missing_workflow_result(
+                    job_id=job_id,
+                    workflow_id=workflow_id,
+                    workflow_name=first_push.workflow_name,
+                    datacenter=datacenter,
+                    fence_token=fence_token,
+                    is_test_workflow=first_push.is_test,
+                )
+
+        await self._forward_aggregated_workflow_result(
+            job_id, workflow_id, workflow_results
+        )
+
+    def _pop_workflow_results_locked(
+        self,
+        job_id: str,
+        workflow_id: str,
+    ) -> tuple[dict[str, WorkflowResultPush], str | None]:
+        job_results = self._workflow_dc_results.get(job_id, {})
+        workflow_results = job_results.pop(workflow_id, {})
+        if not job_results and job_id in self._workflow_dc_results:
+            del self._workflow_dc_results[job_id]
+
+        timeout_token = self._pop_workflow_timeout_token_locked(job_id, workflow_id)
+        return workflow_results, timeout_token
+
     async def _pop_workflow_results(
         self, job_id: str, workflow_id: str
-    ) -> dict[str, WorkflowResultPush]:
+    ) -> tuple[dict[str, WorkflowResultPush], str | None]:
         async with self._workflow_dc_results_lock:
-            job_results = self._workflow_dc_results.get(job_id, {})
-            workflow_results = job_results.pop(workflow_id, {})
-            if not job_results and job_id in self._workflow_dc_results:
-                del self._workflow_dc_results[job_id]
-        return workflow_results
+            return self._pop_workflow_results_locked(job_id, workflow_id)
 
     def _build_per_dc_result(
         self,
