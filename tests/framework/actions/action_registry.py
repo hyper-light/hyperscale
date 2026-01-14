@@ -1,8 +1,8 @@
 from typing import Awaitable, Callable
 
-from ..runtime.scenario_runtime import ScenarioRuntime
-from ..specs.action_spec import ActionSpec
-from ..results.action_outcome import ActionOutcome
+from tests.framework.runtime.scenario_runtime import ScenarioRuntime
+from tests.framework.specs.action_spec import ActionSpec
+from tests.framework.results.action_outcome import ActionOutcome
 
 ActionHandler = Callable[[ScenarioRuntime, ActionSpec], Awaitable[ActionOutcome]]
 

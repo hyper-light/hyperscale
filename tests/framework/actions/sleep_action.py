@@ -1,9 +1,9 @@
 import asyncio
 import time
 
-from ..results.action_outcome import ActionOutcome
-from ..runtime.scenario_runtime import ScenarioRuntime
-from ..specs.action_spec import ActionSpec
+from tests.framework.results.action_outcome import ActionOutcome
+from tests.framework.runtime.scenario_runtime import ScenarioRuntime
+from tests.framework.specs.action_spec import ActionSpec
 
 
 async def run(runtime: ScenarioRuntime, action: ActionSpec) -> ActionOutcome:

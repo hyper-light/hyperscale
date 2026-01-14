@@ -3,10 +3,10 @@ import time
 
 from hyperscale.graph import Workflow
 
-from .callback_tracker import CallbackTracker
-from .cluster_factory import ClusterFactory
-from .test_cluster import TestCluster
-from ..specs.scenario_spec import ScenarioSpec
+from tests.framework.runtime.callback_tracker import CallbackTracker
+from tests.framework.runtime.cluster_factory import ClusterFactory
+from tests.framework.runtime.test_cluster import TestCluster
+from tests.framework.specs.scenario_spec import ScenarioSpec
 
 
 @dataclass(slots=True)
