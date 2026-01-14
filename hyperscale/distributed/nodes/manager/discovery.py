@@ -57,9 +57,9 @@ class ManagerDiscoveryCoordinator:
                 static_seeds=[],
                 allow_dynamic_registration=True,
             )
-            self._worker_discovery = DiscoveryService(worker_config)
+            self._worker_discovery: DiscoveryService = DiscoveryService(worker_config)
         else:
-            self._worker_discovery = worker_discovery
+            self._worker_discovery: DiscoveryService = worker_discovery
 
         if peer_discovery is None:
             peer_static_seeds = [
@@ -69,7 +69,7 @@ class ManagerDiscoveryCoordinator:
                 node_role="manager",
                 static_seeds=peer_static_seeds,
             )
-            self._peer_discovery = DiscoveryService(peer_config)
+            self._peer_discovery: DiscoveryService = DiscoveryService(peer_config)
             # Pre-register seed managers
             for host, port in config.seed_managers:
                 self._peer_discovery.add_peer(
@@ -80,7 +80,7 @@ class ManagerDiscoveryCoordinator:
                     datacenter_id=config.datacenter_id,
                 )
         else:
-            self._peer_discovery = peer_discovery
+            self._peer_discovery: DiscoveryService = peer_discovery
 
     def add_worker(
         self,

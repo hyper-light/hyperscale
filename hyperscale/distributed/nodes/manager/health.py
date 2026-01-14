@@ -124,7 +124,7 @@ class ManagerHealthMonitor:
         self._latency_max_count: int = 30
 
         # AD-18: Hybrid overload detector for manager self-health
-        self._overload_detector = HybridOverloadDetector()
+        self._overload_detector: HybridOverloadDetector = HybridOverloadDetector()
 
         # AD-30: Job-level suspicion tracking
         # Key: (job_id, worker_id) -> JobSuspicion
