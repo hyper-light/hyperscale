@@ -273,8 +273,17 @@ class WorkerCancellationHandler:
 
             except asyncio.CancelledError:
                 break
-            except Exception:
-                pass
+            except Exception as loop_error:
+                if self._logger:
+                    task_runner_run(
+                        self._logger.log,
+                        ServerDebug(
+                            message=f"Cancellation poll loop error: {loop_error}",
+                            node_host=node_host,
+                            node_port=node_port,
+                            node_id=node_id_short,
+                        ),
+                    )
 
     def stop(self) -> None:
         """Stop the cancellation poll loop."""
