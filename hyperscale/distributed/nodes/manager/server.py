@@ -420,6 +420,17 @@ class ManagerServer(HealthAwareServer):
             max_window_age_ms=self._config.stats_max_window_age_ms,
         )
 
+        # Stats coordinator
+        self._stats = ManagerStatsCoordinator(
+            state=self._manager_state,
+            config=self._config,
+            logger=self._udp_logger,
+            node_id=self._node_id.short,
+            task_runner=self._task_runner,
+            stats_buffer=self._stats_buffer,
+            windowed_stats=self._windowed_stats,
+        )
+
         # Worker health manager (AD-26)
         self._worker_health_manager = WorkerHealthManager(
             WorkerHealthManagerConfig(
@@ -2631,10 +2642,10 @@ class ManagerServer(HealthAwareServer):
             )
 
             stats_worker_id = worker_id or f"{addr[0]}:{addr[1]}"
-            await self._windowed_stats.record(stats_worker_id, progress)
+            await self._stats.record_progress_update(stats_worker_id, progress)
 
             # Get backpressure signal
-            backpressure = self._stats_buffer.get_backpressure_signal()
+            backpressure = self._stats.get_backpressure_signal()
 
             ack = WorkflowProgressAck(
                 workflow_id=progress.workflow_id,
