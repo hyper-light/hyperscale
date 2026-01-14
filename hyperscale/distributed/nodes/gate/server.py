@@ -611,6 +611,7 @@ class GateServer(HealthAwareServer):
             get_job_callback=self._job_manager.get_callback,
             get_job_status=self._job_manager.get_job,
             get_all_running_jobs=self._job_manager.get_running_jobs,
+            has_job=self._job_manager.has_job,
             send_tcp=self._send_tcp,
             forward_status_push_to_peers=self._forward_job_status_push_to_peers,
         )
