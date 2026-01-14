@@ -44,7 +44,7 @@ class ClusterFactory:
 
     async def _create_from_counts(self, spec: ClusterSpec) -> TestCluster:
         env_overrides = spec.env_overrides or {}
-        self._env = Env(**env_overrides)
+        self._env = Env.model_validate(env_overrides)
         cluster = TestCluster(config=spec)
         datacenter_ids = _build_datacenter_ids(spec.dc_count)
         gate_tcp_ports = [
