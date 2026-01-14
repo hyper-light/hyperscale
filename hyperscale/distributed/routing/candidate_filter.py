@@ -166,6 +166,19 @@ class CandidateFilter:
             candidate.rtt_ucb_ms = self._default_rtt_ms
             candidate.coordinate_quality = 0.0
 
+        # SLO-constraint gating (Task 60)
+        if self._slo_max_latency_ms is not None:
+            if candidate.estimated_latency_ms > self._slo_max_latency_ms:
+                candidate.excluded = True
+                candidate.exclusion_reason = ExclusionReason.SLO_LATENCY_EXCEEDED
+                return
+
+        if self._slo_min_throughput_rps is not None:
+            if candidate.estimated_throughput_rps < self._slo_min_throughput_rps:
+                candidate.excluded = True
+                candidate.exclusion_reason = ExclusionReason.SLO_CAPACITY_INSUFFICIENT
+                return
+
     def filter_managers(
         self,
         candidates: list[ManagerCandidate],
