@@ -104,34 +104,34 @@ All MEDIUM priority tasks have been verified as complete.
 After implementing fixes, verify:
 
 ### High Priority
-- [ ] All Manager race conditions fixed with asyncio.Lock
-- [ ] Circuit breaker state transitions are correct
-- [ ] JobFinalResult forwards to leader gate
-- [ ] Client reconnect replays missed status
-- [ ] Dead peer cleanup removes all tracking data
-- [ ] Multi-DC status resolution works correctly
-- [ ] Job leases are acquired and renewed
-- [ ] Manager validates cluster/environment
-- [ ] WorkflowProgressAck structure matches consumers
-- [ ] Workflow reassignment updates dispatch state
-- [ ] Worker state sync applies correctly
-- [ ] Job leader transfers notify workers
-- [ ] Peer sync reconciles fence tokens
-- [ ] Reporter results flow end-to-end
+- [x] All Manager race conditions fixed with asyncio.Lock
+- [x] Circuit breaker state transitions are correct
+- [x] JobFinalResult forwards to leader gate
+- [x] Client reconnect replays missed status
+- [x] Dead peer cleanup removes all tracking data
+- [x] Multi-DC status resolution works correctly
+- [x] Job leases are acquired and renewed
+- [x] Manager validates cluster/environment
+- [x] WorkflowProgressAck structure matches consumers
+- [x] Workflow reassignment updates dispatch state
+- [x] Worker state sync applies correctly
+- [x] Job leader transfers notify workers
+- [x] Peer sync reconciles fence tokens
+- [x] Reporter results flow end-to-end
 
 ### Medium Priority
-- [ ] DatacenterCapacityAggregator influences routing
-- [ ] SpilloverEvaluator triggers when needed
-- [ ] JobProgress is ordered and deduplicated
-- [ ] Progress percentage is calculated correctly
-- [ ] Manager stats survive failure
-- [ ] ReporterResultPush reaches clients
-- [ ] Reporter tasks are created properly
-- [ ] LeaseTransfer happens on gate handoff
-- [ ] SLO constraints gate routing
-- [ ] Latency percentiles are tracked
-- [ ] Connection limits prevent storms
-- [ ] Protocol size errors are helpful
+- [x] DatacenterCapacityAggregator influences routing
+- [x] SpilloverEvaluator triggers when needed
+- [x] JobProgress is ordered and deduplicated
+- [x] Progress percentage is calculated correctly
+- [x] Manager stats survive failure
+- [x] ReporterResultPush reaches clients
+- [x] Reporter tasks are created properly
+- [x] LeaseTransfer happens on gate handoff
+- [x] SLO constraints gate routing
+- [x] Latency percentiles are tracked
+- [x] Connection limits prevent storms
+- [x] Protocol size errors are helpful
 
 ---
 
