@@ -301,8 +301,16 @@ class WorkerBackgroundLoops:
 
             except asyncio.CancelledError:
                 break
-            except Exception:
-                pass
+            except Exception as error:
+                if self._logger:
+                    await self._logger.log(
+                        ServerWarning(
+                            message=f"Error in discovery_maintenance_loop: {error}",
+                            node_host="worker",
+                            node_port=0,
+                            node_id="worker",
+                        )
+                    )
 
     async def run_progress_flush_loop(
         self,
