@@ -3036,7 +3036,21 @@ class GateServer(HealthAwareServer):
         preferred: list[str] | None = None,
         job_id: str | None = None,
     ) -> tuple[list[str], list[str], str]:
-        return self._legacy_select_datacenters(count, preferred)
+        if job_id is None:
+            return self._legacy_select_datacenters(count, preferred)
+
+        preferred_set = set(preferred) if preferred else None
+        decision = self._job_router.route_job(job_id, preferred_set)
+
+        if not decision.primary_datacenters:
+            return self._legacy_select_datacenters(count, preferred)
+
+        primary = decision.primary_datacenters[:count]
+        fallback = decision.fallback_datacenters
+
+        health_bucket = decision.primary_bucket or "healthy"
+
+        return (primary, fallback, health_bucket.lower())
 
     def _categorize_datacenters_by_health(
         self,
