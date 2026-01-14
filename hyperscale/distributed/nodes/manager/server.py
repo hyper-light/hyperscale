@@ -1385,11 +1385,16 @@ class ManagerServer(HealthAwareServer):
         ]
 
         for job_id in jobs_to_takeover:
-            self._leases.claim_job_leadership(
+            old_leader_id = self._manager_state.get_job_leader(job_id)
+            claimed = self._leases.claim_job_leadership(
                 job_id,
                 (self._host, self._tcp_port),
                 force_takeover=True,
             )
+            if not claimed:
+                continue
+
+            await self._notify_workers_job_leader_transfer(job_id, old_leader_id)
             await self._udp_logger.log(
                 ServerInfo(
                     message=f"Took over leadership for job {job_id[:8]}...",
