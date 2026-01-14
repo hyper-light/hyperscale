@@ -516,6 +516,17 @@ class GateJobHandler:
 
             job = self._job_manager.get_job(progress.job_id)
             if job:
+                if job.status in (
+                    JobStatus.COMPLETED.value,
+                    JobStatus.FAILED.value,
+                    JobStatus.CANCELLED.value,
+                ):
+                    return JobProgressAck(
+                        gate_id=self._get_node_id().full,
+                        is_leader=self._is_leader(),
+                        healthy_gates=self._get_healthy_gates(),
+                    ).dump()
+
                 old_status = job.status
 
                 for idx, dc_prog in enumerate(job.datacenters):
