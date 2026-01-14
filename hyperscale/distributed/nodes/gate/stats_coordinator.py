@@ -287,12 +287,9 @@ class GateStatsCoordinator:
             await self._push_windowed_stats(job_id)
 
     async def _push_windowed_stats(self, job_id: str) -> None:
-        """
-        Push aggregated windowed stats to client callback.
+        if not self._has_job(job_id):
+            return
 
-        Args:
-            job_id: Job identifier
-        """
         if not (callback := self._state._progress_callbacks.get(job_id)):
             return
 
