@@ -393,6 +393,7 @@ class GateHealthCoordinator:
         healed_datacenters: list[str],
         timestamp: float,
     ) -> None:
+        self._partitioned_datacenters.clear()
         self._task_runner.run(
             self._logger.log,
             ServerInfo(
@@ -406,14 +407,23 @@ class GateHealthCoordinator:
         if self._on_partition_healed:
             try:
                 self._on_partition_healed(healed_datacenters)
-            except Exception:
-                pass
+            except Exception as error:
+                self._task_runner.run(
+                    self._logger.log,
+                    ServerWarning(
+                        message=f"Partition healed callback failed: {error}",
+                        node_host=self._get_host(),
+                        node_port=self._get_tcp_port(),
+                        node_id=self._get_node_id().full,
+                    ),
+                )
 
     def _handle_partition_detected(
         self,
         affected_datacenters: list[str],
         timestamp: float,
     ) -> None:
+        self._partitioned_datacenters = set(affected_datacenters)
         self._task_runner.run(
             self._logger.log,
             ServerInfo(
@@ -427,8 +437,16 @@ class GateHealthCoordinator:
         if self._on_partition_detected:
             try:
                 self._on_partition_detected(affected_datacenters)
-            except Exception:
-                pass
+            except Exception as error:
+                self._task_runner.run(
+                    self._logger.log,
+                    ServerWarning(
+                        message=f"Partition detected callback failed: {error}",
+                        node_host=self._get_host(),
+                        node_port=self._get_tcp_port(),
+                        node_id=self._get_node_id().full,
+                    ),
+                )
 
     def build_datacenter_candidates(
         self,
