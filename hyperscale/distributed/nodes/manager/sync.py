@@ -734,6 +734,9 @@ class ManagerStateSync:
                 ),
             )
 
+        if snapshot.pending_stats_checkpoint:
+            await self._import_stats_checkpoint(snapshot.pending_stats_checkpoint)
+
         self._task_runner.run(
             self._logger.log,
             ServerDebug(
