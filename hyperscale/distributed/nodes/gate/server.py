@@ -3017,29 +3017,6 @@ class GateServer(HealthAwareServer):
         preferred: list[str] | None = None,
         job_id: str | None = None,
     ) -> tuple[list[str], list[str], str]:
-        """Select datacenters with fallback (AD-36)."""
-        if self._job_router:
-            decision = self._job_router.route_job(
-                job_id=job_id or f"temp-{time.monotonic()}",
-                preferred_datacenters=set(preferred) if preferred else None,
-            )
-            primary_dcs = (
-                decision.primary_datacenters[:count]
-                if decision.primary_datacenters
-                else []
-            )
-            fallback_dcs = (
-                decision.fallback_datacenters + decision.primary_datacenters[count:]
-            )
-
-            if not decision.primary_bucket:
-                dc_health = self._get_all_datacenter_health()
-                if len(dc_health) == 0 and len(self._datacenter_managers) > 0:
-                    return ([], [], "initializing")
-                return ([], [], "unhealthy")
-
-            return (primary_dcs, fallback_dcs, decision.primary_bucket.lower())
-
         return self._legacy_select_datacenters(count, preferred)
 
     def _categorize_datacenters_by_health(
