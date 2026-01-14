@@ -969,6 +969,7 @@ class GateServer(HealthAwareServer):
     ) -> None:
         """Stop the gate server."""
         self._running = False
+        await self._stop_background_loops()
 
         if (
             self._discovery_maintenance_task
@@ -996,6 +997,40 @@ class GateServer(HealthAwareServer):
             drain_timeout=drain_timeout,
             broadcast_leave=broadcast_leave,
         )
+
+    def _start_background_loops(self) -> None:
+        self._task_runner.run(self._lease_cleanup_loop)
+        self._task_runner.run(self._job_cleanup_loop)
+        self._task_runner.run(self._rate_limit_cleanup_loop)
+        self._task_runner.run(self._batch_stats_loop)
+        self._task_runner.run(self._windowed_stats_push_loop)
+        self._task_runner.run(self._dead_peer_reap_loop)
+
+        run = self._task_runner.run(self._resource_sampling_loop)
+        if run:
+            self._resource_sampling_token = f"{run.task_name}:{run.run_id}"
+
+    async def _stop_background_loops(self) -> None:
+        cleanup_error: Exception | None = None
+
+        if self._resource_sampling_token:
+            try:
+                await self._task_runner.cancel(self._resource_sampling_token)
+            except Exception as error:
+                cleanup_error = error
+                await self._udp_logger.log(
+                    ServerWarning(
+                        message=f"Failed to cancel resource sampling loop: {error}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+            finally:
+                self._resource_sampling_token = None
+
+        if cleanup_error:
+            raise cleanup_error
 
     # =========================================================================
     # UDP Cross-Cluster Overrides

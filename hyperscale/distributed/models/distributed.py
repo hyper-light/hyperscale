@@ -1295,6 +1295,7 @@ class WorkflowResultPush(Message):
     workflow_name: str  # Workflow class name
     datacenter: str  # Source datacenter (or "aggregated" for cross-DC)
     status: str  # COMPLETED | FAILED
+    fence_token: int = 0  # Fencing token for at-most-once semantics
     results: list[WorkflowStats] = field(default_factory=list)
     error: str | None = None  # Error message if failed
     elapsed_seconds: float = 0.0
