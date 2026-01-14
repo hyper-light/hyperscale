@@ -1822,6 +1822,28 @@ class GateServer(HealthAwareServer):
 
         await self._send_immediate_update(job_id, "completed", None)
 
+    async def _gather_job_status(self, job_id: str) -> GlobalJobStatus:
+        """
+        Gather aggregated job status for client status request.
+
+        Uses GateJobManager.aggregate_job_status to compute current status
+        across all datacenters with proper locking.
+
+        Args:
+            job_id: The job ID to get status for
+
+        Returns:
+            GlobalJobStatus with aggregated metrics
+
+        Raises:
+            ValueError: If job does not exist
+        """
+        async with self._job_manager.lock_job(job_id):
+            status = self._job_manager.aggregate_job_status(job_id)
+            if status is None:
+                raise ValueError(f"Job {job_id} not found")
+            return status
+
     def _get_peer_state_lock(self, peer_addr: tuple[str, int]) -> asyncio.Lock:
         """Get or create lock for a peer."""
         return self._modular_state.get_or_create_peer_lock_sync(peer_addr)
