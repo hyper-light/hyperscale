@@ -20,6 +20,7 @@ from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerWarni
 if TYPE_CHECKING:
     from hyperscale.distributed.nodes.manager.state import ManagerState
     from hyperscale.distributed.nodes.manager.config import ManagerConfig
+    from hyperscale.distributed.taskex import TaskRunner
     from hyperscale.logging import Logger
 
 
@@ -112,7 +113,7 @@ class ManagerVersionSkewHandler:
                     node_host=self._config.host,
                     node_port=self._config.tcp_port,
                     node_id=self._node_id,
-                )
+                ),
             )
             raise ValueError(
                 f"Incompatible protocol versions: "
@@ -128,7 +129,7 @@ class ManagerVersionSkewHandler:
                 node_host=self._config.host,
                 node_port=self._config.tcp_port,
                 node_id=self._node_id,
-            )
+            ),
         )
 
         return result
@@ -165,7 +166,7 @@ class ManagerVersionSkewHandler:
                     node_host=self._config.host,
                     node_port=self._config.tcp_port,
                     node_id=self._node_id,
-                )
+                ),
             )
             raise ValueError(
                 f"Incompatible protocol versions: "
@@ -183,7 +184,7 @@ class ManagerVersionSkewHandler:
                 node_host=self._config.host,
                 node_port=self._config.tcp_port,
                 node_id=self._node_id,
-            )
+            ),
         )
 
         return result
@@ -220,7 +221,7 @@ class ManagerVersionSkewHandler:
                     node_host=self._config.host,
                     node_port=self._config.tcp_port,
                     node_id=self._node_id,
-                )
+                ),
             )
             raise ValueError(
                 f"Incompatible protocol versions: "
@@ -236,7 +237,7 @@ class ManagerVersionSkewHandler:
                 node_host=self._config.host,
                 node_port=self._config.tcp_port,
                 node_id=self._node_id,
-            )
+            ),
         )
 
         return result
