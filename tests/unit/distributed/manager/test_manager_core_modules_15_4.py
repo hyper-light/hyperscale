@@ -1122,7 +1122,13 @@ class TestManagerStatsCoordinatorMetrics:
     """Tests for stats metrics."""
 
     def test_get_stats_metrics(
-        self, manager_state, manager_config, mock_logger, mock_task_runner
+        self,
+        manager_state,
+        manager_config,
+        mock_logger,
+        mock_task_runner,
+        stats_buffer,
+        windowed_stats,
     ):
         """Can get stats metrics."""
         stats = ManagerStatsCoordinator(
@@ -1131,11 +1137,15 @@ class TestManagerStatsCoordinatorMetrics:
             logger=mock_logger,
             node_id="manager-1",
             task_runner=mock_task_runner,
+            stats_buffer=stats_buffer,
+            windowed_stats=windowed_stats,
         )
 
         stats.record_dispatch()
         stats.record_dispatch()
-        stats._stats_buffer_count = 500
+
+        for _ in range(12):
+            stats_buffer.record(1.0)
 
         metrics = stats.get_stats_metrics()
 
@@ -1143,7 +1153,7 @@ class TestManagerStatsCoordinatorMetrics:
         assert "expected_throughput" in metrics
         assert "progress_state" in metrics
         assert "backpressure_level" in metrics
-        assert metrics["stats_buffer_count"] == 500
+        assert metrics["stats_buffer_count"] == 12
         assert metrics["throughput_count"] == 2
 
 
