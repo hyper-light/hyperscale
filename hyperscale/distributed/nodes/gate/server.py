@@ -3083,6 +3083,16 @@ class GateServer(HealthAwareServer):
 
         health_bucket = decision.primary_bucket or "healthy"
 
+        self._task_runner.run(
+            self._udp_logger.log,
+            ServerInfo(
+                message=f"Routed job {job_id[:8]}... to DCs {primary} (bucket={health_bucket}, reason={decision.reason}, fallbacks={fallback})",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short if self._node_id else "unknown",
+            ),
+        )
+
         return (primary, fallback, health_bucket.lower())
 
     def _categorize_datacenters_by_health(
