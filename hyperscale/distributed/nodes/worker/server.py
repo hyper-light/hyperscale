@@ -1184,6 +1184,17 @@ class WorkerServer(HealthAwareServer):
         allocation_result: AllocationResult,
     ) -> bytes:
         """Handle the execution phase of a workflow dispatch."""
+
+        async def send_final_result_callback(final_result: WorkflowFinalResult) -> None:
+            await self._progress_reporter.send_final_result(
+                final_result=final_result,
+                send_tcp=self.send_tcp,
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id_short=self._node_id.short,
+                task_runner_run=self._task_runner.run,
+            )
+
         result = await self._workflow_executor.handle_dispatch_execution(
             dispatch=dispatch,
             dispatching_addr=addr,
@@ -1193,9 +1204,9 @@ class WorkerServer(HealthAwareServer):
             node_id_full=self._node_id.full,
             node_host=self._host,
             node_port=self._tcp_port,
+            send_final_result_callback=send_final_result_callback,
         )
 
-        # Section 8.3: Check for pending transfers that arrived before this dispatch
         await self._check_pending_transfer_for_job(
             dispatch.job_id, dispatch.workflow_id
         )
