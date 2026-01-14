@@ -8,6 +8,7 @@ import asyncio
 from typing import TYPE_CHECKING, Callable
 
 from hyperscale.distributed.models import (
+    GateJobLeaderTransfer,
     JobLeadershipAnnouncement,
     JobLeadershipAck,
     JobLeaderGateTransfer,

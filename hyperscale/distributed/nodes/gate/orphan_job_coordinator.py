@@ -99,6 +99,7 @@ class GateOrphanJobCoordinator:
         get_active_peers: Callable[[], set[tuple[str, int]]],
         orphan_check_interval_seconds: float = 15.0,
         orphan_grace_period_seconds: float = 30.0,
+        orphan_timeout_seconds: float = 300.0,
         takeover_jitter_min_seconds: float = 0.5,
         takeover_jitter_max_seconds: float = 2.0,
     ) -> None:
@@ -118,6 +119,7 @@ class GateOrphanJobCoordinator:
             get_active_peers: Callback to get active peer gate addresses
             orphan_check_interval_seconds: How often to scan for orphaned jobs
             orphan_grace_period_seconds: Time to wait before attempting takeover
+            orphan_timeout_seconds: Max time before orphaned jobs fail
             takeover_jitter_min_seconds: Minimum random jitter before takeover
             takeover_jitter_max_seconds: Maximum random jitter before takeover
         """
