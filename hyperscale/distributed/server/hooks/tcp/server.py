@@ -12,14 +12,12 @@ def receive():
             addr: tuple[str, int],
             data: T,
             clock_time: int,
-            transport: asyncio.Transport,
         ):
             return await func(
                 server,
                 addr,
                 data,
                 clock_time,
-                transport,
             )
 
         wrapper.is_hook = True
