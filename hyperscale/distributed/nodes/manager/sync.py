@@ -284,16 +284,20 @@ class ManagerStateSync:
     ) -> WorkerRegistration | None:
         registration = self._registry.get_worker(snapshot.node_id)
         if registration:
-            registration.total_cores = snapshot.total_cores
-            registration.available_cores = snapshot.available_cores
-            registration.node.version = snapshot.version
+            self._update_registration_from_snapshot(
+                registration,
+                snapshot,
+                should_update_mapping=True,
+            )
             return registration
 
         if worker_status and worker_status.registration:
             registration = worker_status.registration
-            registration.total_cores = snapshot.total_cores
-            registration.available_cores = snapshot.available_cores
-            registration.node.version = snapshot.version
+            self._update_registration_from_snapshot(
+                registration,
+                snapshot,
+                should_update_mapping=False,
+            )
             self._registry.register_worker(registration)
             return registration
 

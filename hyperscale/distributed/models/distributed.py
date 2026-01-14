@@ -2244,6 +2244,8 @@ class StateSyncRequest(Message):
 
     requester_id: str  # Requesting node
     requester_role: str  # NodeRole value
+    cluster_id: str = "hyperscale"  # Cluster identifier for isolation
+    environment_id: str = "default"  # Environment identifier for isolation
     since_version: int = 0  # Only send updates after this version
 
 

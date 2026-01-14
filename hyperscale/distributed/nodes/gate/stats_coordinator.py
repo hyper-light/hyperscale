@@ -361,21 +361,20 @@ class GateStatsCoordinator:
             return
 
         for job_id, job, callbacks in jobs_with_callbacks:
-            for callback in callbacks:
-                try:
-                    await self._send_batch_push(job_id, job, callback)
-                except Exception as error:
-                    await self._logger.log(
-                        ServerError(
-                            message=(
-                                "Failed to send batch stats update for job "
-                                f"{job_id}: {error}"
-                            ),
-                            node_host=self._node_host,
-                            node_port=self._node_port,
-                            node_id=self._node_id,
-                        )
+            try:
+                await self._send_batch_push_to_callbacks(job_id, job, callbacks)
+            except Exception as error:
+                await self._logger.log(
+                    ServerError(
+                        message=(
+                            "Failed to send batch stats update for job "
+                            f"{job_id}: {error}"
+                        ),
+                        node_host=self._node_host,
+                        node_port=self._node_port,
+                        node_id=self._node_id,
                     )
+                )
 
     async def push_windowed_stats_for_job(self, job_id: str) -> None:
         await self._push_windowed_stats(job_id)
