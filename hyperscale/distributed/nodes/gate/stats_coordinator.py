@@ -209,15 +209,33 @@ class GateStatsCoordinator:
         data: bytes,
         timeout: float = 2.0,
     ) -> bool:
-        for attempt in range(self.PERIODIC_PUSH_MAX_RETRIES):
+        last_error: Exception | None = None
+
+        for attempt in range(self.CALLBACK_PUSH_MAX_RETRIES):
             try:
                 await self._send_tcp(callback, message_type, data, timeout=timeout)
                 return True
-            except Exception:
-                if attempt < self.PERIODIC_PUSH_MAX_RETRIES - 1:
-                    await asyncio.sleep(
-                        self.PERIODIC_PUSH_BASE_DELAY_SECONDS * (2**attempt)
+            except Exception as send_error:
+                last_error = send_error
+                if attempt < self.CALLBACK_PUSH_MAX_RETRIES - 1:
+                    delay = min(
+                        self.CALLBACK_PUSH_BASE_DELAY_SECONDS * (2**attempt),
+                        self.CALLBACK_PUSH_MAX_DELAY_SECONDS,
                     )
+                    await asyncio.sleep(delay)
+
+        await self._logger.log(
+            ServerError(
+                message=(
+                    f"Failed to deliver {message_type} to client {callback} after "
+                    f"{self.CALLBACK_PUSH_MAX_RETRIES} retries: {last_error}"
+                ),
+                node_host=self._node_host,
+                node_port=self._node_port,
+                node_id=self._node_id,
+            )
+        )
+
         return False
 
     async def batch_stats_update(self) -> None:
