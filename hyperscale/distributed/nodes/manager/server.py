@@ -988,8 +988,7 @@ class ManagerServer(HealthAwareServer):
         self._task_runner.run(self._resume_timeout_tracking_for_all_jobs)
 
     def _on_manager_lose_leadership(self) -> None:
-        """Handle losing SWIM cluster leadership."""
-        pass
+        self._task_runner.run(self._handle_leadership_loss)
 
     def _on_worker_globally_dead(self, worker_id: str) -> None:
         """Handle worker global death (AD-30)."""
