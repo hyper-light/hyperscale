@@ -1136,7 +1136,6 @@ class GateServer(HealthAwareServer):
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
-        transport: asyncio.Transport,
     ):
         """Handle job cancellation request."""
         if self._cancellation_handler:
@@ -1151,7 +1150,6 @@ class GateServer(HealthAwareServer):
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
-        transport: asyncio.Transport,
     ):
         """Handle job cancellation complete notification."""
         if self._cancellation_handler:
@@ -1166,7 +1164,6 @@ class GateServer(HealthAwareServer):
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
-        transport: asyncio.Transport,
     ):
         """Handle single workflow cancellation request."""
         if self._cancellation_handler:
@@ -1195,7 +1192,6 @@ class GateServer(HealthAwareServer):
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
-        transport: asyncio.Transport,
     ):
         """Handle lease transfer during gate scaling."""
         if self._state_sync_handler:
@@ -1210,7 +1206,6 @@ class GateServer(HealthAwareServer):
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
-        transport: asyncio.Transport,
     ):
         """Handle job final result from manager."""
         try:
@@ -1248,7 +1243,6 @@ class GateServer(HealthAwareServer):
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
-        transport: asyncio.Transport,
     ):
         """Handle job leadership notification from peer gate."""
         if self._state_sync_handler:
@@ -1263,7 +1257,6 @@ class GateServer(HealthAwareServer):
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
-        transport: asyncio.Transport,
     ):
         """Receive progress report from manager (AD-34 multi-DC coordination)."""
         try:
@@ -1280,7 +1273,6 @@ class GateServer(HealthAwareServer):
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
-        transport: asyncio.Transport,
     ):
         """Receive DC-local timeout report from manager (AD-34 multi-DC coordination)."""
         try:
@@ -1297,7 +1289,6 @@ class GateServer(HealthAwareServer):
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
-        transport: asyncio.Transport,
     ):
         """Receive manager leader transfer notification (AD-34 multi-DC coordination)."""
         try:
