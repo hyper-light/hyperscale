@@ -386,7 +386,7 @@ class GateRuntimeState:
         self._dead_gate_timestamps[peer_addr] = timestamp
         self._gate_peer_unhealthy_since.pop(peer_addr, None)
 
-    def cleanup_dead_peer(self, peer_addr: tuple[str, int]) -> None:
+    def cleanup_dead_peer(self, peer_addr: tuple[str, int]) -> set[str]:
         """
         Fully clean up a dead peer from all tracking structures.
 
@@ -396,18 +396,17 @@ class GateRuntimeState:
         Args:
             peer_addr: TCP address of the dead peer
         """
-        # Find UDP address by reverse lookup to clean UDP-keyed structures
-        udp_addr_to_remove: tuple[str, int] | None = None
-        gate_id_to_remove: str | None = None
+        udp_addrs_to_remove: list[tuple[str, int]] = []
+        gate_ids_to_remove: set[str] = set()
 
         for udp_addr, tcp_addr in list(self._gate_udp_to_tcp.items()):
             if tcp_addr == peer_addr:
-                udp_addr_to_remove = udp_addr
-                # Get the gate_id from the heartbeat before we remove it
+                udp_addrs_to_remove.append(udp_addr)
                 heartbeat = self._gate_peer_info.get(udp_addr)
                 if heartbeat:
-                    gate_id_to_remove = heartbeat.gate_id
-                break
+                    gate_id = getattr(heartbeat, "gate_id", None) or heartbeat.node_id
+                    if gate_id:
+                        gate_ids_to_remove.add(gate_id)
 
         # Clean up TCP-address-keyed structures
         self._dead_gate_peers.discard(peer_addr)
@@ -416,15 +415,17 @@ class GateRuntimeState:
         self._active_gate_peers.discard(peer_addr)
         self.remove_peer_lock(peer_addr)
 
-        # Clean up UDP-address-keyed structures if we found the UDP address
-        if udp_addr_to_remove is not None:
-            self._gate_udp_to_tcp.pop(udp_addr_to_remove, None)
-            self._gate_peer_info.pop(udp_addr_to_remove, None)
+        # Clean up UDP-address-keyed structures
+        for udp_addr in udp_addrs_to_remove:
+            self._gate_udp_to_tcp.pop(udp_addr, None)
+            self._gate_peer_info.pop(udp_addr, None)
 
         # Clean up gate_id-keyed structures
-        if gate_id_to_remove is not None:
-            self._gate_peer_health.pop(gate_id_to_remove, None)
-            self._known_gates.pop(gate_id_to_remove, None)
+        for gate_id in gate_ids_to_remove:
+            self._gate_peer_health.pop(gate_id, None)
+            self._known_gates.pop(gate_id, None)
+
+        return gate_ids_to_remove
 
     def is_peer_dead(self, peer_addr: tuple[str, int]) -> bool:
         return peer_addr in self._dead_gate_peers
