@@ -218,14 +218,21 @@ This document catalogs all identified issues across the distributed node impleme
 - `_log_health_transitions()` is only called once at line 5237 in `dead_peer_reap_loop`
 - The original issue (duplicate logging) no longer exists - code was likely refactored previously
 
-### 3.4 Gate Server - Duplicate Datacenter Selection Logic
+### 3.4 Gate Server - Duplicate Datacenter Selection Logic ✅ VERIFIED INTENTIONAL DESIGN
 
-| File | Lines | Issue |
-|------|-------|-------|
-| `nodes/gate/server.py` | 2135-2164 | `_select_datacenters_with_fallback()` |
-| `nodes/gate/server.py` | 2166-2207 | `_legacy_select_datacenters()` |
+| File | Lines | Issue | Status |
+|------|-------|-------|--------|
+| `nodes/gate/server.py` | 3045-3074 | `_select_datacenters_with_fallback()` | ✅ Modern implementation |
+| `nodes/gate/server.py` | 3108-3136 | `_legacy_select_datacenters()` | ✅ Explicit fallback |
 
-**Risk:** Similar logic duplicated, maintenance burden.
+**Verification:**
+- This is an **intentional migration pattern**, not duplicate code
+- `_select_datacenters_with_fallback()` uses `_job_router` if available (modern path)
+- Falls back to `_legacy_select_datacenters()` only when no `_job_router`
+- `_legacy_select_datacenters()` can also delegate to `_health_coordinator` if available
+- Only runs inline legacy logic when no coordinator exists
+- This layered fallback enables gradual migration without breaking existing deployments
+- **No action needed** - keep both methods for backward compatibility
 
 ### 3.5 Client - Stub Orphan Check Loop
 
