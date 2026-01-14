@@ -58,6 +58,8 @@ from hyperscale.distributed.models import (
     GateState,
     GateHeartbeat,
     GateRegistrationRequest,
+    AggregatedJobStats,
+    GlobalJobResult,
     GlobalJobStatus,
     ManagerDiscoveryBroadcast,
     ManagerHeartbeat,
@@ -329,6 +331,7 @@ class GateServer(HealthAwareServer):
         # Job management
         self._job_manager = GateJobManager()
         self._job_final_statuses: dict[tuple[str, str], float] = {}
+        self._job_global_result_sent: set[str] = set()
 
         # Consistent hash ring
         self._job_hash_ring = ConsistentHashRing(replicas=150)

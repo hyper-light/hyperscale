@@ -716,3 +716,149 @@ class GateJobHandler:
         finally:
             latency_ms = (time.monotonic() - start_time) * 1000
             self._record_request_latency(latency_ms)
+
+    async def handle_job_leader_gate_transfer(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+    ) -> bytes:
+        try:
+            transfer = JobLeaderGateTransfer.load(data)
+            node_id = self._get_node_id()
+
+            if transfer.new_gate_id != node_id.full:
+                return JobLeaderGateTransferAck(
+                    job_id=transfer.job_id,
+                    manager_id=node_id.full,
+                    accepted=False,
+                ).dump()
+
+            current_fence = self._job_leadership_tracker.get_fencing_token(
+                transfer.job_id
+            )
+            if transfer.fence_token <= current_fence:
+                self._task_runner.run(
+                    self._logger.log,
+                    ServerDebug(
+                        message=(
+                            f"Rejecting stale gate transfer for job {transfer.job_id[:8]}... "
+                            f"(fence {transfer.fence_token} <= {current_fence})"
+                        ),
+                        node_host=self._get_host(),
+                        node_port=self._get_tcp_port(),
+                        node_id=node_id.short,
+                    ),
+                )
+                return JobLeaderGateTransferAck(
+                    job_id=transfer.job_id,
+                    manager_id=node_id.full,
+                    accepted=False,
+                ).dump()
+
+            fence_updated = await self._job_manager.update_fence_token_if_higher(
+                transfer.job_id,
+                transfer.fence_token,
+            )
+            if not fence_updated:
+                job_fence = self._job_manager.get_fence_token(transfer.job_id)
+                self._task_runner.run(
+                    self._logger.log,
+                    ServerDebug(
+                        message=(
+                            f"Rejecting gate transfer for job {transfer.job_id[:8]}... "
+                            f"(fence {transfer.fence_token} <= {job_fence})"
+                        ),
+                        node_host=self._get_host(),
+                        node_port=self._get_tcp_port(),
+                        node_id=node_id.short,
+                    ),
+                )
+                return JobLeaderGateTransferAck(
+                    job_id=transfer.job_id,
+                    manager_id=node_id.full,
+                    accepted=False,
+                ).dump()
+
+            target_dc_count = len(self._job_manager.get_target_dcs(transfer.job_id))
+            accepted = self._job_leadership_tracker.process_leadership_claim(
+                job_id=transfer.job_id,
+                claimer_id=node_id.full,
+                claimer_addr=(self._get_host(), self._get_tcp_port()),
+                fencing_token=transfer.fence_token,
+                metadata=target_dc_count,
+            )
+            if not accepted:
+                return JobLeaderGateTransferAck(
+                    job_id=transfer.job_id,
+                    manager_id=node_id.full,
+                    accepted=False,
+                ).dump()
+
+            await self._state.increment_state_version()
+
+            self._task_runner.run(
+                self._logger.log,
+                ServerInfo(
+                    message=(
+                        f"Job {transfer.job_id[:8]}... leader gate transferred: "
+                        f"{transfer.old_gate_id} -> {transfer.new_gate_id}"
+                    ),
+                    node_host=self._get_host(),
+                    node_port=self._get_tcp_port(),
+                    node_id=node_id.short,
+                ),
+            )
+
+            callback_addr = self._state._progress_callbacks.get(transfer.job_id)
+            if callback_addr is None:
+                callback_addr = self._job_manager.get_callback(transfer.job_id)
+
+            if callback_addr:
+                notification = GateJobLeaderTransfer(
+                    job_id=transfer.job_id,
+                    new_gate_id=node_id.full,
+                    new_gate_addr=(self._get_host(), self._get_tcp_port()),
+                    fence_token=transfer.fence_token,
+                    old_gate_id=transfer.old_gate_id,
+                    old_gate_addr=transfer.old_gate_addr,
+                )
+                try:
+                    await self._send_tcp(
+                        callback_addr,
+                        "receive_gate_job_leader_transfer",
+                        notification.dump(),
+                        timeout=5.0,
+                    )
+                except Exception as error:
+                    await self._logger.log(
+                        ServerWarning(
+                            message=(
+                                "Failed to notify client about gate leader transfer for job "
+                                f"{transfer.job_id[:8]}...: {error}"
+                            ),
+                            node_host=self._get_host(),
+                            node_port=self._get_tcp_port(),
+                            node_id=node_id.short,
+                        )
+                    )
+
+            return JobLeaderGateTransferAck(
+                job_id=transfer.job_id,
+                manager_id=node_id.full,
+                accepted=True,
+            ).dump()
+
+        except Exception as error:
+            await self._logger.log(
+                ServerError(
+                    message=f"Job leader gate transfer error: {error}",
+                    node_host=self._get_host(),
+                    node_port=self._get_tcp_port(),
+                    node_id=self._get_node_id().short,
+                )
+            )
+            return JobLeaderGateTransferAck(
+                job_id="unknown",
+                manager_id=self._get_node_id().full,
+                accepted=False,
+            ).dump()
