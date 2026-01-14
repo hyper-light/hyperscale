@@ -70,6 +70,11 @@ class ManagerStateSync:
         should_yield_fn: Callable[[tuple[str, int], int], bool] | None = None,
         step_down_fn: Callable[[], Coroutine[Any, Any, None]] | None = None,
         set_dc_leader_fn: Callable[[str | None], None] | None = None,
+        export_stats_checkpoint_fn: Callable[[], list[tuple[float, float]]] | None = None,
+        import_stats_checkpoint_fn: Callable[
+            [list[tuple[float, float]]], Coroutine[Any, Any, int]
+        ]
+        | None = None,
     ) -> None:
         self._state: "ManagerState" = state
         self._config: "ManagerConfig" = config
@@ -92,7 +97,18 @@ class ManagerStateSync:
         self._set_dc_leader: Callable[[str | None], None] = set_dc_leader_fn or (
             lambda _leader_id: None
         )
+        self._export_stats_checkpoint: Callable[[], list[tuple[float, float]]] = (
+            export_stats_checkpoint_fn or (lambda: [])
+        )
+        self._import_stats_checkpoint: Callable[
+            [list[tuple[float, float]]], Coroutine[Any, Any, int]
+        ] = import_stats_checkpoint_fn or self._noop_import_checkpoint
         self._worker_state_lock: asyncio.Lock = asyncio.Lock()
+
+    async def _noop_import_checkpoint(
+        self, _checkpoint: list[tuple[float, float]]
+    ) -> int:
+        return 0
 
     async def _noop_async(self, *_: Any) -> None:
         return None
