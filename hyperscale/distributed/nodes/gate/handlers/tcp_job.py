@@ -782,10 +782,37 @@ class GateJobHandler:
                     JobStatus.CANCELLED.value,
                     JobStatus.TIMEOUT.value,
                 }
-                completed_dcs = sum(
+
+                reported_dc_ids = {p.datacenter for p in job.datacenters}
+                terminal_dcs = sum(
                     1 for p in job.datacenters if p.status in terminal_statuses
                 )
-                if completed_dcs == len(job.datacenters):
+
+                all_target_dcs_reported = (
+                    target_dcs and target_dcs <= reported_dc_ids
+                )
+                all_reported_dcs_terminal = terminal_dcs == len(job.datacenters)
+
+                job_can_complete = (
+                    all_target_dcs_reported and all_reported_dcs_terminal
+                ) if target_dcs else all_reported_dcs_terminal
+
+                if not all_target_dcs_reported and all_reported_dcs_terminal and target_dcs:
+                    missing_dcs = target_dcs - reported_dc_ids
+                    self._task_runner.run(
+                        self._logger.log,
+                        ServerWarning(
+                            message=(
+                                f"Job {progress.job_id[:8]}... has {len(missing_dcs)} "
+                                f"missing target DCs: {missing_dcs}. Waiting for timeout."
+                            ),
+                            node_host=self._get_host(),
+                            node_port=self._get_tcp_port(),
+                            node_id=self._get_node_id().short,
+                        ),
+                    )
+
+                if job_can_complete:
                     completed_count = sum(
                         1
                         for p in job.datacenters
@@ -811,13 +838,13 @@ class GateJobHandler:
                         job.status = JobStatus.CANCELLED.value
                     elif timeout_count > 0:
                         job.status = JobStatus.TIMEOUT.value
-                    elif completed_count == len(job.datacenters):
+                    elif completed_count == target_dc_count:
                         job.status = JobStatus.COMPLETED.value
                     else:
                         job.status = JobStatus.FAILED.value
 
                     job.completed_datacenters = completed_count
-                    job.failed_datacenters = len(job.datacenters) - completed_count
+                    job.failed_datacenters = target_dc_count - completed_count
 
                 if self._is_terminal_status(job.status):
                     await self._release_job_lease(progress.job_id)
