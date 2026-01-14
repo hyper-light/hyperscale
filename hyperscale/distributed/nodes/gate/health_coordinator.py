@@ -34,7 +34,7 @@ from hyperscale.distributed.reliability import (
 )
 from hyperscale.distributed.discovery import DiscoveryService
 from hyperscale.logging import Logger
-from hyperscale.logging.hyperscale_logging_models import ServerInfo
+from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerWarning
 
 from .state import GateRuntimeState
 
