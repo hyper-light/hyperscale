@@ -139,6 +139,10 @@ class ManagerDispatchCoordinator:
                         )
                         # Update throughput counter
                         self._state._dispatch_throughput_count += 1
+                        if circuit := self._state._worker_circuits.get(worker_id):
+                            circuit.record_success()
+                            if not circuit.is_open():
+                                self._state.clear_worker_unhealthy_since(worker_id)
                     else:
                         # Worker rejected dispatch - record failure
                         self._task_runner.run(

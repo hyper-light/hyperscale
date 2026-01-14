@@ -161,8 +161,8 @@ class GateHealthCoordinator:
             )
             self._state._manager_health[manager_key] = health_state
 
-        health_state.update_liveness(success=True)
-        health_state.update_readiness(
+        await health_state.update_liveness_async(success=True)
+        await health_state.update_readiness_async(
             has_quorum=heartbeat.has_quorum,
             accepting=heartbeat.accepting_jobs,
             worker_count=heartbeat.healthy_worker_count,

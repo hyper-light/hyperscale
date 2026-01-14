@@ -2822,6 +2822,44 @@ class GateServer(HealthAwareServer):
             ),
         )
 
+    def _on_partition_detected(self, affected_datacenters: list[str]) -> None:
+        """Handle partition detection routing updates."""
+        routing_reset_count = 0
+        if self._job_router:
+            routing_reset_count = (
+                self._job_router.reset_primary_for_partitioned_datacenters(
+                    affected_datacenters
+                )
+            )
+
+        self._task_runner.run(
+            self._udp_logger.log,
+            ServerWarning(
+                message=(
+                    "Partition detected, routing reset for "
+                    f"{routing_reset_count} jobs across datacenters: {affected_datacenters}"
+                ),
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            ),
+        )
+
+    def _on_partition_healed(self, healed_datacenters: list[str]) -> None:
+        """Handle partition healed notifications."""
+        self._task_runner.run(
+            self._udp_logger.log,
+            ServerInfo(
+                message=(
+                    "Partition healed, routing restored for datacenters: "
+                    f"{healed_datacenters}"
+                ),
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            ),
+        )
+
     def _on_dc_latency(self, datacenter: str, latency_ms: float) -> None:
         """Handle DC latency update."""
         self._cross_dc_correlation.record_latency(
