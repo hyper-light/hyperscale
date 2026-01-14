@@ -153,18 +153,22 @@ This document catalogs all identified issues across the distributed node impleme
 - Updated `to_wire_progress()` in `JobInfo` to accept `progress_sequence` parameter
 - Added cleanup in `complete_job()` to remove progress sequence tracking
 
-### 2.9 Job Completion Ignores Missing Target Datacenters
+### 2.9 Job Completion Ignores Missing Target Datacenters ✅ FIXED
 
-| File | Lines | Issue |
-|------|-------|-------|
-| `distributed/nodes/gate/handlers/tcp_job.py` | 783-813 | Job completion computed using `len(job.datacenters)` instead of `target_dcs` |
+| File | Lines | Issue | Status |
+|------|-------|-------|--------|
+| `distributed/nodes/gate/handlers/tcp_job.py` | 783-813 | Job completion computed using `len(job.datacenters)` instead of `target_dcs` | ✅ Fixed |
 
 **Why this matters:** If a target DC never reports progress, the job can be marked complete as soon as all reporting DCs are terminal, violating multi-DC completion rules.
 
-**Fix (actionable):**
-- Use `target_dcs` for completion checks when available; only mark complete when all target DCs have terminal status.
-- If `target_dcs` missing, keep current behavior but log a warning and rely on timeout tracker for missing DCs.
-- Consider a “missing DC timeout” that forces partial completion after a configured grace period.
+**Fix implemented:**
+- Completion check now verifies all target DCs have reported: `target_dcs <= reported_dc_ids`
+- Only marks job complete when both conditions are met:
+  1. All target DCs have reported progress
+  2. All reported DCs are in terminal status
+- If target DCs are missing but all reported DCs are terminal, logs a warning and waits for timeout tracker
+- Uses `target_dc_count` instead of `len(job.datacenters)` for final status calculations
+- Fallback behavior (no target_dcs) unchanged for backward compatibility
 
 ---
 
