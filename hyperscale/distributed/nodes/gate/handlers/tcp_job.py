@@ -212,6 +212,8 @@ class GateJobHandler:
         """
         submission: JobSubmission | None = None
         idempotency_key: IdempotencyKey | None = None
+        lease_acquired = False
+        lease_duration: float | None = None
 
         try:
             client_id = f"{addr[0]}:{addr[1]}"
@@ -278,8 +280,27 @@ class GateJobHandler:
                             else None,
                         ).dump()
 
+            lease_result = await self._job_lease_manager.acquire(submission.job_id)
+            if not lease_result.success:
+                error_message = (
+                    f"Job lease held by {lease_result.current_owner} "
+                    f"(expires in {lease_result.expires_in:.1f}s)"
+                )
+                return JobAck(
+                    job_id=submission.job_id,
+                    accepted=False,
+                    error=error_message,
+                ).dump()
+
+            lease_acquired = True
+            lease_duration = (
+                lease_result.lease.lease_duration
+                if lease_result.lease is not None
+                else None
+            )
+
             if self._quorum_circuit.circuit_state == CircuitState.OPEN:
-                self._job_lease_manager.release(submission.job_id)
+                await self._release_job_lease(submission.job_id)
                 retry_after = self._quorum_circuit.half_open_after
                 raise QuorumCircuitOpenError(
                     recent_failures=self._quorum_circuit.error_count,
