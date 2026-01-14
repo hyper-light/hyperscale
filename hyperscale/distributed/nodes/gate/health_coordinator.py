@@ -24,6 +24,7 @@ from hyperscale.distributed.datacenters import (
     DatacenterHealthManager,
     CrossDCCorrelationDetector,
 )
+from hyperscale.distributed.capacity import DatacenterCapacityAggregator
 from hyperscale.distributed.swim.health import (
     FederatedHealthMonitor,
     DCReachability,
@@ -72,6 +73,7 @@ class GateHealthCoordinator:
         get_host: Callable[[], str],
         get_tcp_port: Callable[[], int],
         confirm_manager_for_dc: Callable[[str, tuple[str, int]], "asyncio.Task"],
+        capacity_aggregator: DatacenterCapacityAggregator | None = None,
         on_partition_healed: Callable[[list[str]], None] | None = None,
         on_partition_detected: Callable[[list[str]], None] | None = None,
     ) -> None:
