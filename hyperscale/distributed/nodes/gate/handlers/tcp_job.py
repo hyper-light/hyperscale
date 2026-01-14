@@ -20,6 +20,7 @@ from hyperscale.distributed.models import (
     JobStatus,
     JobSubmission,
 )
+from hyperscale.distributed.leases import JobLeaseManager
 from hyperscale.distributed.protocol.version import (
     CURRENT_PROTOCOL_VERSION,
     ProtocolVersion,
@@ -643,6 +644,9 @@ class GateJobHandler:
                     )
                     job.completed_datacenters = len(job.datacenters) - failed_dcs
                     job.failed_datacenters = failed_dcs
+
+                if self._is_terminal_status(job.status):
+                    await self._release_job_lease(progress.job_id)
 
                 self._handle_update_by_tier(
                     progress.job_id,

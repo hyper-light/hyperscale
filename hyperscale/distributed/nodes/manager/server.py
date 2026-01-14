@@ -752,6 +752,7 @@ class ManagerServer(HealthAwareServer):
             self._discovery_maintenance_task,
             self._job_responsiveness_task,
             self._stats_push_task,
+            self._windowed_stats_flush_task,
             self._gate_heartbeat_task,
             self._rate_limit_cleanup_task,
             self._job_cleanup_task,
@@ -775,6 +776,9 @@ class ManagerServer(HealthAwareServer):
         )
         self._stats_push_task = self._create_background_task(
             self._stats_push_loop(), "stats_push"
+        )
+        self._windowed_stats_flush_task = self._create_background_task(
+            self._windowed_stats_flush_loop(), "windowed_stats_flush"
         )
         self._gate_heartbeat_task = self._create_background_task(
             self._gate_heartbeat_loop(), "gate_heartbeat"
