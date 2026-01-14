@@ -596,11 +596,8 @@ class GateJobHandler:
 
             job = self._job_manager.get_job(progress.job_id)
             if job:
-                if job.status in (
-                    JobStatus.COMPLETED.value,
-                    JobStatus.FAILED.value,
-                    JobStatus.CANCELLED.value,
-                ):
+                if self._is_terminal_status(job.status):
+                    await self._release_job_lease(progress.job_id)
                     return JobProgressAck(
                         gate_id=self._get_node_id().full,
                         is_leader=self._is_leader(),

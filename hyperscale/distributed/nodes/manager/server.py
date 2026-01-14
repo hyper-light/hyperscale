@@ -496,6 +496,7 @@ class ManagerServer(HealthAwareServer):
         self._discovery_maintenance_task: asyncio.Task | None = None
         self._job_responsiveness_task: asyncio.Task | None = None
         self._stats_push_task: asyncio.Task | None = None
+        self._windowed_stats_flush_task: asyncio.Task | None = None
         self._gate_heartbeat_task: asyncio.Task | None = None
         self._rate_limit_cleanup_task: asyncio.Task | None = None
         self._job_cleanup_task: asyncio.Task | None = None
