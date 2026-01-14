@@ -8,7 +8,7 @@ Uses the centralized AD-37 message classification from the reliability module
 to ensure consistent priority handling across all node types.
 """
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from hyperscale.distributed.reliability import (
     RequestPriority,

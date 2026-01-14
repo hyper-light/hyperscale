@@ -7,7 +7,7 @@ integrating with the manager's HybridOverloadDetector.
 
 import asyncio
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from hyperscale.distributed.reliability.rate_limiting import (
     ServerRateLimiter,

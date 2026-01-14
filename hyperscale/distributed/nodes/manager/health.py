@@ -7,7 +7,7 @@ AD-26 deadline extensions, and AD-30 hierarchical failure detection with job-lev
 
 import time
 from enum import Enum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from hyperscale.distributed.models import WorkerHeartbeat
 from hyperscale.distributed.reliability import HybridOverloadDetector

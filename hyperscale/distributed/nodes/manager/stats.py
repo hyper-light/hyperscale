@@ -7,7 +7,7 @@ throughput tracking per AD-19 and AD-23 specifications.
 
 import time
 from enum import Enum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from hyperscale.logging.hyperscale_logging_models import ServerDebug, ServerWarning
 

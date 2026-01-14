@@ -7,7 +7,7 @@ job leadership, cancellation tracking, and metrics.
 
 import asyncio
 from collections import defaultdict, deque
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from hyperscale.distributed.models import (
     GateInfo,

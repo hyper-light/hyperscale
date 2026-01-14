@@ -5,7 +5,7 @@ Provides protocol versioning and capability negotiation for rolling upgrades
 and backwards-compatible communication with workers, gates, and peer managers.
 """
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from hyperscale.distributed.protocol.version import (
     ProtocolVersion,
