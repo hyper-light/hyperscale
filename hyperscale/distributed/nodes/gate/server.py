@@ -3222,11 +3222,55 @@ class GateServer(HealthAwareServer):
 
         return UpdateTier.PERIODIC.value
 
-    async def _replay_job_status_to_callback(self, job_id: str) -> None:
+    async def _replay_job_status_to_callback(
+        self,
+        job_id: str,
+        callback: tuple[str, int],
+        last_sequence: int,
+    ) -> None:
         if not self._stats_coordinator:
             return
 
         try:
+            (
+                updates,
+                oldest_sequence,
+                latest_sequence,
+            ) = await self._modular_state.get_client_updates_since(
+                job_id,
+                last_sequence,
+            )
+            if updates:
+                if last_sequence > 0 and oldest_sequence > 0:
+                    if last_sequence < (oldest_sequence - 1):
+                        await self._udp_logger.log(
+                            ServerWarning(
+                                message=(
+                                    "Update history truncated for job "
+                                    f"{job_id[:8]}...; replaying from {oldest_sequence}"
+                                ),
+                                node_host=self._host,
+                                node_port=self._tcp_port,
+                                node_id=self._node_id.short,
+                            )
+                        )
+                for sequence, message_type, payload, _ in updates:
+                    delivered = await self._deliver_client_update(
+                        job_id,
+                        callback,
+                        sequence,
+                        message_type,
+                        payload,
+                    )
+                    if not delivered:
+                        return
+                await self._modular_state.set_client_update_position(
+                    job_id,
+                    callback,
+                    latest_sequence,
+                )
+                return
+
             await self._stats_coordinator.send_immediate_update(
                 job_id,
                 "reconnect",

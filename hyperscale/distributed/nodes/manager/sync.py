@@ -108,7 +108,7 @@ class ManagerStateSync:
                 return None
             return (str(leader_addr[0]), int(leader_addr[1]))
 
-        return leader_addr
+        return cast(tuple[str, int], leader_addr)
 
     async def sync_state_from_workers(self) -> None:
         """
