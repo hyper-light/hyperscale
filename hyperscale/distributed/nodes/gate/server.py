@@ -3598,7 +3598,6 @@ class GateServer(HealthAwareServer):
     def _collect_job_workflow_stats(
         self, per_dc_results: list[JobFinalResult]
     ) -> list[WorkflowStats]:
-        """Collect workflow stats from per-DC job results."""
         workflow_stats: list[WorkflowStats] = []
         for dc_result in per_dc_results:
             for workflow_result in dc_result.workflow_results:
@@ -3608,7 +3607,6 @@ class GateServer(HealthAwareServer):
     def _collect_timing_stats(
         self, workflow_stats: list[WorkflowStats]
     ) -> list[dict[str, float | int]]:
-        """Collect timing statistics from workflow stats."""
         timing_stats: list[dict[str, float | int]] = []
         for workflow_stat in workflow_stats:
             results = workflow_stat.get("results")
