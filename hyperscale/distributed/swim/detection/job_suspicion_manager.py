@@ -171,6 +171,12 @@ class JobSuspicionManager:
         self._refuted_count: int = 0
         self._confirmed_count: int = 0
 
+        # Logging
+        self._logger: LoggerProtocol | None = None
+        self._node_host: str = ""
+        self._node_port: int = 0
+        self._node_id: str = ""
+
     def _get_n_members_for_job(self, job_id: JobId) -> int:
         """Get member count for a specific job."""
         if self._get_n_members:
