@@ -223,6 +223,37 @@ This document catalogs all identified issues across the distributed node impleme
 
 **Action:** Either remove as dead code OR add missing server endpoint.
 
+### 3.7 Manager Leadership Loss Handler Is Stubbed
+
+| File | Lines | Issue |
+|------|-------|-------|
+| `distributed/nodes/manager/server.py` | 990-992 | `_on_manager_lose_leadership()` is `pass` |
+
+**Why this matters:** When a manager loses leadership, leader-only sync and reconciliation tasks keep running. This can cause conflicting state updates and violate scenario 15.3 (quorum recovery) and 33.2 (manager split).
+
+**Fix (actionable):**
+- Stop leader-only background tasks started in `_on_manager_become_leader()` (state sync, orphan scan, timeout resume).
+- Clear leader-only flags or demote manager state to follower.
+- Emit a leadership change log entry so the transition is observable.
+
+### 3.8 Background Loops Swallow Exceptions Without Logging
+
+| File | Lines | Issue |
+|------|-------|-------|
+| `distributed/nodes/worker/background_loops.py` | 170-173, 250-253, 285-288, 354-357 | `except Exception: pass` hides failures in reap/orphan/discovery/progress loops |
+| `distributed/nodes/worker/backpressure.py` | 97-100 | Overload polling loop suppresses errors silently |
+| `distributed/nodes/worker/progress.py` | 554-555 | Progress ACK parsing errors swallowed without visibility |
+| `distributed/nodes/worker/handlers/tcp_progress.py` | 65-67 | ACK parse errors ignored (beyond legacy `b"ok"` compatibility) |
+| `distributed/nodes/gate/leadership_coordinator.py` | 137-145 | Leadership announcement errors are best-effort but unlogged |
+| `distributed/nodes/gate/server.py` | 3827-3833 | DC leader announcement errors swallowed after circuit failure |
+
+**Why this matters:** Silent failures mask broken retry paths and make soak/chaos scenarios unobservable, violating the “never swallow errors” rule and scenarios 39–42.
+
+**Fix (actionable):**
+- Replace `except Exception: pass` with logging via `Logger.log()` (awaited), including context (loop name, peer/manager IDs).
+- For legacy compatibility, explicitly detect old `b"ok"` ACKs and log parse errors at debug level only.
+- Avoid spamming logs by throttling or sampling repeated failures.
+
 ---
 
 ## 4. Low Priority Issues
@@ -393,7 +424,7 @@ All 35+ issues from Categories A-F have been fixed:
 |----------|-------|--------|
 | **Critical (runtime errors)** | 5 | 🔴 Needs Fix |
 | **High Priority** | 9 | 🔴 Needs Fix |
-| **Medium Priority** | 6 | 🟡 Should Fix |
+| **Medium Priority** | 8 | 🟡 Should Fix |
 | **Low Priority** | 4 | 🟢 Can Wait |
 | **Duplicate Classes** | 15+ | 🟡 Should Consolidate |
 | **Stub Methods** | 10+ | 🟡 Needs Implementation |
