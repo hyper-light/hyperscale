@@ -107,19 +107,18 @@ This document catalogs all identified issues across the distributed node impleme
 - Non-leader managers now reject job submissions with error: "Not DC leader, retry at leader: {addr}"
 - Response includes leader hint address for client/gate retry
 
-### 2.6 Workflow Requeue Ignores Stored Dispatched Context
+### 2.6 Workflow Requeue Ignores Stored Dispatched Context ✅ FIXED
 
-| File | Lines | Issue |
-|------|-------|-------|
-| `distributed/jobs/workflow_dispatcher.py` | 607-664, 1194-1212 | Requeue resets dispatch state but always recomputes context via `get_context_for_workflow` |
-| `distributed/jobs/job_manager.py` | 1136-1149 | Dispatched context is stored but never reused on requeue |
+| File | Lines | Issue | Status |
+|------|-------|-------|--------|
+| `distributed/jobs/workflow_dispatcher.py` | 607-664, 1194-1212 | Requeue resets dispatch state but always recomputes context via `get_context_for_workflow` | ✅ Fixed |
+| `distributed/jobs/job_manager.py` | 1136-1149 | Dispatched context is stored but never reused on requeue | ✅ Fixed |
 
-**Why this matters:** Re-dispatched workflows can observe a newer context version than the original dispatch, causing inconsistent behavior during retries or reassignment.
-
-**Fix (actionable):**
-- Add a `get_sub_workflow_dispatched_context()` accessor in `JobManager` to return `dispatched_context` + `dispatched_version`.
-- In `WorkflowDispatcher`, when requeuing a workflow, prefer the stored `dispatched_context` if it exists (especially after worker failure) and include the original `context_version`.
-- Only recompute context when no dispatched context exists or when an explicit re-dispatch with updated context is required.
+**Fix implemented:**
+- Added `get_stored_dispatched_context(job_id, workflow_id)` method to `JobManager`
+- Returns `(context_bytes, layer_version)` tuple if stored context exists
+- Modified `_dispatch_workflow` in `WorkflowDispatcher` to prefer stored context
+- Only recomputes fresh context when no stored context is available
 
 ---
 
