@@ -30,9 +30,9 @@ from typing import Callable
 
 
 # Message format: single byte type + payload
-OOB_PROBE = b'\x01'  # Health probe request
-OOB_ACK = b'\x02'    # Health probe acknowledgment
-OOB_NACK = b'\x03'   # Health probe negative acknowledgment (overloaded)
+OOB_PROBE = b"\x01"  # Health probe request
+OOB_ACK = b"\x02"  # Health probe acknowledgment
+OOB_NACK = b"\x03"  # Health probe negative acknowledgment (overloaded)
 
 # Maximum OOB message size (minimal for fast processing)
 MAX_OOB_MESSAGE_SIZE = 64
@@ -101,6 +101,7 @@ class OutOfBandHealthChannel:
 
         await channel.stop()
     """
+
     host: str
     base_port: int
     config: OOBHealthChannelConfig = field(default_factory=OOBHealthChannelConfig)
@@ -159,7 +160,9 @@ class OutOfBandHealthChannel:
         except OSError as e:
             self._socket.close()
             self._socket = None
-            raise RuntimeError(f"Failed to bind OOB channel on {self.host}:{self.port}: {e}")
+            raise RuntimeError(
+                f"Failed to bind OOB channel on {self.host}:{self.port}: {e}"
+            )
 
         self._running = True
         self._receive_task = asyncio.create_task(self._receive_loop())
@@ -319,8 +322,13 @@ class OutOfBandHealthChannel:
 
             except asyncio.CancelledError:
                 break
-            except Exception:
-                # Don't crash the receive loop on errors
+            except Exception as receive_error:
+                import sys
+
+                print(
+                    f"[OutOfBandHealthChannel] receive loop error: {receive_error}",
+                    file=sys.stderr,
+                )
                 continue
 
     async def _handle_probe(self, data: bytes, addr: tuple[str, int]) -> None:
@@ -329,7 +337,11 @@ class OutOfBandHealthChannel:
             return
 
         # Determine response type
-        if self.config.send_nack_when_overloaded and self._is_overloaded and self._is_overloaded():
+        if (
+            self.config.send_nack_when_overloaded
+            and self._is_overloaded
+            and self._is_overloaded()
+        ):
             response = OOB_NACK
             self._nacks_sent += 1
         else:
@@ -340,8 +352,8 @@ class OutOfBandHealthChannel:
         try:
             if len(data) > 1:
                 reply_addr_str = data[1:].decode()
-                if ':' in reply_addr_str:
-                    host, port = reply_addr_str.split(':', 1)
+                if ":" in reply_addr_str:
+                    host, port = reply_addr_str.split(":", 1)
                     reply_addr = (host, int(port))
                 else:
                     reply_addr = addr
