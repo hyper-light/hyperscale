@@ -697,7 +697,7 @@ class WorkerServer(HealthAwareServer):
             except asyncio.CancelledError:
                 break
             except Exception as exc:
-                await self._logger.log(
+                await self._udp_logger.log(
                     f"Resource sampling failed: {exc}",
                     level="debug",
                 )
