@@ -1828,7 +1828,18 @@ class GateServer(HealthAwareServer):
             status = self._job_manager.aggregate_job_status(job_id)
             if status is None:
                 raise ValueError(f"Job {job_id} not found")
-            return status
+            return GlobalJobStatus(
+                job_id=status.job_id,
+                status=status.status,
+                total_completed=status.total_completed,
+                total_failed=status.total_failed,
+                elapsed_seconds=status.elapsed_seconds,
+                overall_rate=status.overall_rate,
+                datacenters=list(status.datacenters),
+                timestamp=status.timestamp,
+                completed_datacenters=status.completed_datacenters,
+                failed_datacenters=status.failed_datacenters,
+            )
 
     def _get_peer_state_lock(self, peer_addr: tuple[str, int]) -> asyncio.Lock:
         """Get or create lock for a peer."""
