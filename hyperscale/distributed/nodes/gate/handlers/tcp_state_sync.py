@@ -238,21 +238,9 @@ class GateStateSyncHandler:
         data: bytes,
         complete_job: Callable[[str, object], "asyncio.Coroutine[None, None, None]"],
         handle_exception: Callable,
+        forward_final_result: Callable[[bytes], "asyncio.Coroutine[None, None, bool]"]
+        | None = None,
     ) -> bytes:
-        """
-        Handle job final result from manager.
-
-        Marks job as complete and pushes result to client callback if registered.
-
-        Args:
-            addr: Manager address
-            data: Serialized JobFinalResult
-            complete_job: Callback to complete the job
-            handle_exception: Callback for exception handling
-
-        Returns:
-            b'ok' on success, b'error' on failure
-        """
         try:
             result = JobFinalResult.load(data)
 
@@ -266,6 +254,14 @@ class GateStateSyncHandler:
                     node_id=self._get_node_id().short,
                 ),
             )
+
+            job_exists = self._job_manager.get_job(result.job_id) is not None
+            if not job_exists:
+                if forward_final_result:
+                    forwarded = await forward_final_result(data)
+                    if forwarded:
+                        return b"forwarded"
+                return b"unknown_job"
 
             current_fence = self._job_manager.get_fence_token(result.job_id)
             if result.fence_token < current_fence:
