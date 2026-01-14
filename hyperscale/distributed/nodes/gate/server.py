@@ -110,6 +110,7 @@ from hyperscale.distributed.models import (
     JobFinalStatus,
     WorkflowProgress,
 )
+from hyperscale.distributed.models.coordinates import NetworkCoordinate
 from hyperscale.distributed.swim.core import (
     ErrorStats,
 )
