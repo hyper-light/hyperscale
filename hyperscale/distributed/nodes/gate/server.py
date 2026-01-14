@@ -705,6 +705,7 @@ class GateServer(HealthAwareServer):
             get_node_id_short=lambda: self._node_id.short,
             capacity_aggregator=self._capacity_aggregator,
             spillover_evaluator=self._spillover_evaluator,
+            observed_latency_tracker=self._observed_latency_tracker,
         )
 
         self._peer_coordinator = GatePeerCoordinator(
