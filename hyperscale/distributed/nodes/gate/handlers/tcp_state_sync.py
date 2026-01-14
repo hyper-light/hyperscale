@@ -140,12 +140,23 @@ class GateStateSyncHandler:
             )
 
             snapshot = self._get_state_snapshot()
+            state_version = snapshot.version
+
+            if request.known_version >= state_version:
+                response = GateStateSyncResponse(
+                    responder_id=self._get_node_id().full,
+                    is_leader=self._is_leader(),
+                    term=self._get_term(),
+                    state_version=state_version,
+                    snapshot=None,
+                )
+                return response.dump()
 
             response = GateStateSyncResponse(
                 responder_id=self._get_node_id().full,
                 is_leader=self._is_leader(),
                 term=self._get_term(),
-                state_version=self._state.get_state_version(),
+                state_version=state_version,
                 snapshot=snapshot,
             )
 

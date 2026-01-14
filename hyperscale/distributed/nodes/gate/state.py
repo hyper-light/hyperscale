@@ -83,6 +83,7 @@ class GateRuntimeState:
         self._job_dc_managers: dict[str, dict[str, tuple[str, int]]] = {}
         self._job_submissions: dict[str, JobSubmission] = {}
         self._job_reporter_tasks: dict[str, dict[str, asyncio.Task]] = {}
+        self._job_lease_renewal_tokens: dict[str, str] = {}
 
         # Cancellation state
         self._cancellation_completion_events: dict[str, asyncio.Event] = {}
