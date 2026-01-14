@@ -287,7 +287,9 @@ class GateStateSyncHandler:
                 )
 
         try:
-            await retry_executor.run(send_result)
+            await retry_executor.execute(
+                send_result, operation_name="forward_job_final_result"
+            )
             circuit.record_success()
             return True
         except Exception as error:

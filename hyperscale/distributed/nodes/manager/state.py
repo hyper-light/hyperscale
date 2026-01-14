@@ -48,6 +48,7 @@ class ManagerState:
 
         # Lock for creating per-resource locks and semaphores
         self._resource_creation_lock: asyncio.Lock | None = None
+        self._peer_manager_health_lock: asyncio.Lock | None = None
 
         # Gate tracking
         self._known_gates: dict[str, GateInfo] = {}
@@ -168,6 +169,7 @@ class ManagerState:
         self._eager_dispatch_lock = asyncio.Lock()
         self._counter_lock = asyncio.Lock()
         self._resource_creation_lock = asyncio.Lock()
+        self._peer_manager_health_lock = asyncio.Lock()
 
     def _get_counter_lock(self) -> asyncio.Lock:
         if self._counter_lock is None:
