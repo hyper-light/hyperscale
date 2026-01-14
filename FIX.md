@@ -76,8 +76,29 @@ This document contains **current** findings only. Items previously fixed or move
 
 ---
 
+## Callback Wiring (Post-Fix Integration)
+
+The following error callbacks have been wired to logging infrastructure in the calling code:
+
+### Gate Server (`distributed/nodes/gate/server.py`)
+- `FederatedHealthMonitor.on_probe_error` → `_on_federated_probe_error()` logs via task_runner
+- `CrossDCCorrelationDetector._on_callback_error` → `_on_cross_dc_callback_error()` logs via task_runner
+
+### Manager Server (`distributed/nodes/manager/server.py`)
+- `FederatedHealthMonitor.on_probe_error` → `_on_federated_probe_error()` logs via task_runner
+
+### HealthAwareServer (`distributed/swim/health_aware_server.py`)
+- `HierarchicalFailureDetector.on_error` → `_on_hierarchical_detector_error()` logs via task_runner
+- Both constructor and `configure_hierarchical_detector()` method now wire the callback
+
+### HierarchicalFailureDetector (`distributed/swim/detection/hierarchical_failure_detector.py`)
+- `JobSuspicionManager.on_error` now receives the parent's `on_error` callback for propagation
+
+---
+
 ## Notes
 
 - Previously reported issues around federated ACK timeouts, progress ordering, target DC completion, quorum sizing, and manager leadership loss handling are confirmed resolved in the current codebase.
 - All exception swallowing issues have been addressed with proper logging or callbacks.
 - Classes without direct logger access now expose error callbacks that callers can wire to their logging infrastructure.
+- Error callbacks are wired in the composition roots (Gate, Manager, HealthAwareServer) to ensure all errors are logged.
