@@ -428,9 +428,21 @@ class GateJobHandler:
                 self._dispatch_job_to_datacenters, submission, target_dcs
             )
 
+            if lease_duration is None:
+                lease_duration = lease_result.lease.lease_duration
+
+            self._task_runner.run(
+                self._renew_job_lease,
+                submission.job_id,
+                lease_duration,
+                alias=f"job-lease-renewal-{submission.job_id}",
+            )
+
             return ack_response
 
         except QuorumCircuitOpenError as error:
+            if lease_acquired and submission is not None:
+                await self._release_job_lease(submission.job_id)
             job_id = submission.job_id if submission is not None else "unknown"
             error_ack = JobAck(
                 job_id=job_id,
@@ -441,6 +453,8 @@ class GateJobHandler:
                 await self._idempotency_cache.reject(idempotency_key, error_ack)
             return error_ack
         except QuorumError as error:
+            if lease_acquired and submission is not None:
+                await self._release_job_lease(submission.job_id)
             self._quorum_circuit.record_error()
             job_id = submission.job_id if submission is not None else "unknown"
             error_ack = JobAck(
