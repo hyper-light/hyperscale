@@ -135,6 +135,9 @@ class GateDispatchCoordinator:
         self._observed_latency_tracker: "ObservedLatencyTracker | None" = (
             observed_latency_tracker
         )
+        self._record_dispatch_failure: Callable[[str, str], None] | None = (
+            record_dispatch_failure
+        )
 
     def _get_observed_rtt_ms(
         self,
