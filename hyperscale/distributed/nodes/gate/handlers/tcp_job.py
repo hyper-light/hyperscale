@@ -689,10 +689,12 @@ class GateJobHandler:
                 ).dump()
 
             if progress.fence_token > current_fence:
+                current_fence = progress.fence_token
                 self._job_manager.set_fence_token(progress.job_id, progress.fence_token)
 
             job = self._job_manager.get_job(progress.job_id)
             if job:
+                job.fence_token = current_fence
                 old_status = job.status
 
                 for idx, dc_prog in enumerate(job.datacenters):
