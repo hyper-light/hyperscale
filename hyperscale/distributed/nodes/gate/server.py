@@ -108,6 +108,8 @@ from hyperscale.distributed.health import (
     CircuitBreakerManager,
     LatencyTracker,
 )
+from hyperscale.distributed.monitoring import ProcessResourceMonitor
+from hyperscale.distributed.resources import ResourceMetrics
 from hyperscale.distributed.reliability import (
     HybridOverloadDetector,
     LoadShedder,
