@@ -81,6 +81,8 @@ class GateStateSyncHandler:
             job_manager: Job management service
             job_leadership_tracker: Per-job leadership tracker
             versioned_clock: Version tracking for stale update rejection
+            peer_circuit_breaker: Circuit breaker manager for peer gate calls
+            send_tcp: Callback to send TCP messages
             get_node_id: Callback to get this gate's node ID
             get_host: Callback to get this gate's host
             get_tcp_port: Callback to get this gate's TCP port
@@ -95,6 +97,8 @@ class GateStateSyncHandler:
         self._job_manager: "GateJobManager" = job_manager
         self._job_leadership_tracker: "JobLeadershipTracker" = job_leadership_tracker
         self._versioned_clock: "VersionedStateClock" = versioned_clock
+        self._peer_circuit_breaker: CircuitBreakerManager = peer_circuit_breaker
+        self._send_tcp: Callable = send_tcp
         self._get_node_id: Callable[[], "NodeId"] = get_node_id
         self._get_host: Callable[[], str] = get_host
         self._get_tcp_port: Callable[[], int] = get_tcp_port
