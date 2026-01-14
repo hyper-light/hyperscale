@@ -128,6 +128,7 @@ from hyperscale.distributed.jobs import (
     WorkerPool,
     WorkflowDispatcher,
     WindowedStatsCollector,
+    WindowedStatsPush,
 )
 from hyperscale.distributed.ledger.wal import NodeWAL
 from hyperscale.logging.lsn import HybridLamportClock
