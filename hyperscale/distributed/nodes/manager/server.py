@@ -2647,7 +2647,7 @@ class ManagerServer(HealthAwareServer):
                 ).dump()
 
             transport = self._tcp_server_request_transports.get(addr)
-            cert_der = get_peer_certificate_der(transport)
+            cert_der = get_peer_certificate_der(transport) if transport else None
             if cert_der is not None:
                 claims = RoleValidator.extract_claims_from_cert(
                     cert_der,

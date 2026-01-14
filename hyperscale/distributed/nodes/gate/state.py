@@ -403,10 +403,8 @@ class GateRuntimeState:
             if tcp_addr == peer_addr:
                 udp_addrs_to_remove.append(udp_addr)
                 heartbeat = self._gate_peer_info.get(udp_addr)
-                if heartbeat:
-                    gate_id = getattr(heartbeat, "gate_id", None) or heartbeat.node_id
-                    if gate_id:
-                        gate_ids_to_remove.add(gate_id)
+                if heartbeat and heartbeat.node_id:
+                    gate_ids_to_remove.add(heartbeat.node_id)
 
         # Clean up TCP-address-keyed structures
         self._dead_gate_peers.discard(peer_addr)
