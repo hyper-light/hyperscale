@@ -7,6 +7,7 @@ Handles submission to local file-based reporters (JSON/CSV/XML).
 from hyperscale.distributed.nodes.client.state import ClientState
 from hyperscale.distributed.nodes.client.config import ClientConfig
 from hyperscale.logging import Logger
+from hyperscale.logging.hyperscale_logging_models import ServerWarning
 from hyperscale.reporting.reporter import Reporter
 from hyperscale.reporting.json import JSONConfig
 
@@ -74,8 +75,11 @@ class ClientReportingManager:
             workflow_stats: Workflow statistics dictionary
 
         Note:
-            Failures are silently caught (best-effort submission)
+            Failures are logged but not raised (best-effort submission)
         """
+        reporter_type = getattr(config, "reporter_type", None)
+        reporter_type_name = reporter_type.name if reporter_type else "unknown"
+
         try:
             reporter = Reporter(config)
             await reporter.connect()
@@ -86,8 +90,18 @@ class ClientReportingManager:
             finally:
                 await reporter.close()
 
-        except Exception:
-            pass  # Best effort - don't break on reporter failures
+        except Exception as reporter_error:
+            workflow_name = workflow_stats.get("workflow_name", "unknown")
+            await self._logger.log(
+                ServerWarning(
+                    message=f"Reporter submission failed: {reporter_error}, "
+                    f"reporter_type={reporter_type_name}, "
+                    f"workflow={workflow_name}",
+                    node_host="client",
+                    node_port=0,
+                    node_id="client",
+                )
+            )
 
     def _get_local_reporter_configs(self, job_id: str) -> list:
         """
@@ -106,8 +120,9 @@ class ClientReportingManager:
 
         # Filter to only file-based reporters
         local_configs = [
-            config for config in configs
-            if hasattr(config, 'reporter_type')
+            config
+            for config in configs
+            if hasattr(config, "reporter_type")
             and config.reporter_type.name in self._config.local_reporter_types
         ]
 
