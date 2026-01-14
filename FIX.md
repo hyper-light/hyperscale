@@ -52,6 +52,17 @@ This document contains **current** findings only. Previously fixed items are lis
 - **File**: `distributed/nodes/gate/server.py`
 - **Fix**: Added `await self._dispatch_time_tracker.remove_job(job_id)` to `_cleanup_single_job`
 
+### 2.3 Dispatch Failure Tracking Incomplete - FIXED
+- **File**: `distributed/nodes/gate/dispatch_coordinator.py`
+- **Issue**: `record_dispatch_failure` was only called in one failure path, missing several scenarios
+- **Changes**:
+  - **UNHEALTHY path** (lines 529-531): Added loop to record failures for all target DCs when all DCs are unhealthy at dispatch start
+  - **Primary dispatch failure** (lines 708-709): Added immediate recording when `target_dc` fails (before trying fallbacks)
+  - **Fallback dispatch failures** (lines 774-775): Added recording for each fallback DC that fails in `_try_fallback_dispatch`
+  - **Fixed target_dc tracking** (line 719): Changed `failed.append(datacenter)` to `failed.append(target_dc)` to correctly track spillover DC failures
+
+**Why this matters**: Cooldown tracking requires ALL dispatch failures to be recorded so the router can apply penalties and avoid failing DCs for subsequent routing decisions.
+
 ---
 
 ## 3. Previously Verified Fixes
