@@ -341,17 +341,21 @@ class JobInfo:
             return 0.0
         return time.monotonic() - self.started_at
 
-    def to_wire_progress(self) -> JobProgress:
+    def to_wire_progress(self, progress_sequence: int = 0) -> JobProgress:
         """
         Convert internal JobInfo to wire protocol JobProgress.
 
         Used for state sync between managers and progress reporting to gates.
+
+        Args:
+            progress_sequence: Per-job monotonic counter for ordering. Gates use this
+                             to reject out-of-order updates. Caller should get this
+                             from JobManager.get_next_progress_sequence() when sending
+                             actual progress updates (not for state sync).
         """
-        # Convert internal workflow state to wire protocol WorkflowProgress
         workflow_progresses = []
         current_time = time.time()
         for wf_token_str, wf_info in self.workflows.items():
-            # Aggregate completed_count and failed_count from sub-workflows
             aggregated_completed_count = 0
             aggregated_failed_count = 0
             for sub_wf_token_str in wf_info.sub_workflow_tokens:
@@ -386,7 +390,8 @@ class JobInfo:
             overall_rate=0.0,
             elapsed_seconds=self.elapsed_seconds(),
             timestamp=self.timestamp,
-            collected_at=current_time,  # Unix timestamp for cross-DC alignment
+            collected_at=current_time,
+            progress_sequence=progress_sequence,
         )
 
 
