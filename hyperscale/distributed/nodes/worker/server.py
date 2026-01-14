@@ -237,6 +237,15 @@ class WorkerServer(HealthAwareServer):
         # Event logger for crash forensics (AD-47)
         self._event_logger: Logger | None = None
 
+        # UI updates controller for RemoteGraphManager
+        from hyperscale.ui.interface_updates_controller import (
+            InterfaceUpdatesController,
+        )
+
+        self._updates_controller: InterfaceUpdatesController = (
+            InterfaceUpdatesController()
+        )
+
         # Create state embedder for SWIM
         state_embedder = WorkerStateEmbedder(
             get_node_id=lambda: self._node_id.full,
