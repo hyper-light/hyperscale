@@ -1,7 +1,7 @@
 # Hyperscale Distributed Bug Fixes TODO
 
 **Generated**: 2026-01-14  
-**Progress**: 49/64 completed (77%)
+**Progress**: 51/64 completed (80%)
 
 ---
 
@@ -72,6 +72,8 @@ Systematic bug fixes for the Hyperscale distributed performance testing framewor
 - [x] **Task 50**: Manager job leader transfer notification to workers (verified - already implemented in _notify_workers_job_leader_transfer)
 - [x] **Task 54**: Peer state sync reconciles fence tokens (verified - already implemented in update_fence_token_if_higher)
 - [x] **Task 59**: Reporter results end-to-end path (implemented reporter_result_push handler in gate)
+- [x] **Task 31**: Add ordering/dedup for JobProgress beyond fence token (added check_and_record_progress to state.py, integrated in tcp_job.py)
+- [x] **Task 34**: Add ReporterResultPush forwarding path in gate (verified - already implemented via Task 59)
 
 ---
 
