@@ -764,15 +764,39 @@ class ManagerState:
     def dispatch_throughput_count(self) -> int:
         return self._dispatch_throughput_count
 
-    def increment_dispatch_throughput_count(self) -> None:
-        self._dispatch_throughput_count += 1
+    async def increment_dispatch_throughput_count(self) -> int:
+        async with self._get_counter_lock():
+            self._dispatch_throughput_count += 1
+            return self._dispatch_throughput_count
 
-    def reset_dispatch_throughput(
+    async def increment_dispatch_failure_count(self) -> int:
+        async with self._get_counter_lock():
+            self._dispatch_failure_count += 1
+            return self._dispatch_failure_count
+
+    async def update_dispatch_throughput(
+        self,
+        interval_seconds: float,
+        now: float | None = None,
+    ) -> float:
+        current_time = now if now is not None else asyncio.get_running_loop().time()
+        async with self._get_counter_lock():
+            elapsed = current_time - self._dispatch_throughput_interval_start
+            if elapsed >= interval_seconds and elapsed > 0:
+                throughput = self._dispatch_throughput_count / elapsed
+                self._dispatch_throughput_count = 0
+                self._dispatch_throughput_interval_start = current_time
+                self._dispatch_throughput_last_value = throughput
+                return throughput
+            return self._dispatch_throughput_last_value
+
+    async def reset_dispatch_throughput(
         self, interval_start: float, last_value: float
     ) -> None:
-        self._dispatch_throughput_count = 0
-        self._dispatch_throughput_interval_start = interval_start
-        self._dispatch_throughput_last_value = last_value
+        async with self._get_counter_lock():
+            self._dispatch_throughput_count = 0
+            self._dispatch_throughput_interval_start = interval_start
+            self._dispatch_throughput_last_value = last_value
 
     @property
     def dispatch_throughput_interval_start(self) -> float:
@@ -853,11 +877,24 @@ class ManagerState:
     # Peer Manager Health States Accessors (2 direct accesses)
     # =========================================================================
 
-    def get_peer_manager_health_state(self, peer_id: str) -> str | None:
-        return self._peer_manager_health_states.get(peer_id)
+    async def get_peer_manager_health_state(self, peer_id: str) -> str | None:
+        lock = await self.get_peer_manager_health_lock()
+        async with lock:
+            return self._peer_manager_health_states.get(peer_id)
 
-    def set_peer_manager_health_state(self, peer_id: str, state: str) -> None:
-        self._peer_manager_health_states[peer_id] = state
+    async def update_peer_manager_health_state(
+        self, peer_id: str, state: str
+    ) -> str | None:
+        lock = await self.get_peer_manager_health_lock()
+        async with lock:
+            previous_state = self._peer_manager_health_states.get(peer_id)
+            self._peer_manager_health_states[peer_id] = state
+            return previous_state
+
+    async def get_peer_manager_health_states(self) -> dict[str, str]:
+        lock = await self.get_peer_manager_health_lock()
+        async with lock:
+            return dict(self._peer_manager_health_states)
 
     # =========================================================================
     # Job Submissions Accessors (2 direct accesses)
