@@ -97,8 +97,16 @@ class WorkerBackpressureManager:
 
             except asyncio.CancelledError:
                 break
-            except Exception:
-                pass
+            except Exception as error:
+                if self._logger:
+                    await self._logger.log(
+                        ServerWarning(
+                            message=f"Error in overload_poll_loop: {error}",
+                            node_host="worker",
+                            node_port=0,
+                            node_id="worker",
+                        )
+                    )
 
     def stop(self) -> None:
         """Stop the polling loop."""
