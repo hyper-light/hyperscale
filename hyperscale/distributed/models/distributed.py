@@ -216,11 +216,17 @@ class ManagerPeerRegistration(Message):
     Protocol Version (AD-25):
     - protocol_version_major/minor: For version compatibility checks
     - capabilities: Comma-separated list of supported features
+
+    Cluster Isolation (AD-28 Issue 2):
+    - cluster_id: Cluster identifier for isolation validation
+    - environment_id: Environment identifier for isolation validation
     """
 
     node: ManagerInfo  # Registering manager's info
     term: int  # Current leadership term
     is_leader: bool  # Whether registering manager is leader
+    cluster_id: str = "hyperscale"  # Cluster identifier for isolation
+    environment_id: str = "default"  # Environment identifier for isolation
     # Protocol version fields (AD-25) - defaults for backwards compatibility
     protocol_version_major: int = 1
     protocol_version_minor: int = 0

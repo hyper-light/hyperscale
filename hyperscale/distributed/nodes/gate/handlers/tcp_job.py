@@ -207,24 +207,31 @@ class GateJobHandler:
     async def _renew_job_lease(self, job_id: str, lease_duration: float) -> None:
         renewal_interval = max(1.0, lease_duration * 0.5)
 
-        while True:
-            await asyncio.sleep(renewal_interval)
-            job = self._job_manager.get_job(job_id)
-            if job is None or self._is_terminal_status(job.status):
-                await self._release_job_lease(job_id)
-                return
+        try:
+            while True:
+                await asyncio.sleep(renewal_interval)
+                job = self._job_manager.get_job(job_id)
+                if job is None or self._is_terminal_status(job.status):
+                    await self._release_job_lease(job_id, cancel_renewal=False)
+                    return
 
-            lease_renewed = await self._job_lease_manager.renew(job_id, lease_duration)
-            if not lease_renewed:
-                await self._logger.log(
-                    ServerError(
-                        message=f"Failed to renew lease for job {job_id}: lease lost",
-                        node_host=self._get_host(),
-                        node_port=self._get_tcp_port(),
-                        node_id=self._get_node_id().short,
-                    )
+                lease_renewed = await self._job_lease_manager.renew(
+                    job_id, lease_duration
                 )
-                return
+                if not lease_renewed:
+                    await self._logger.log(
+                        ServerError(
+                            message=f"Failed to renew lease for job {job_id}: lease lost",
+                            node_host=self._get_host(),
+                            node_port=self._get_tcp_port(),
+                            node_id=self._get_node_id().short,
+                        )
+                    )
+                    await self._release_job_lease(job_id, cancel_renewal=False)
+                    return
+        except asyncio.CancelledError:
+            self._pop_lease_renewal_token(job_id)
+            return
 
     async def handle_submission(
         self,

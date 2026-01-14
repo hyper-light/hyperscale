@@ -3061,6 +3061,7 @@ class GateServer(HealthAwareServer):
             JobStatus.COMPLETED.value,
             JobStatus.FAILED.value,
             JobStatus.CANCELLED.value,
+            JobStatus.TIMEOUT.value,
         }
 
         if new_status in terminal_states:
