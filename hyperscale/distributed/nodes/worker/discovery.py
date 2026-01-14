@@ -8,6 +8,8 @@ for adaptive peer selection and DNS-based discovery.
 import asyncio
 from typing import TYPE_CHECKING
 
+from hyperscale.logging.hyperscale_logging_models import ServerWarning
+
 if TYPE_CHECKING:
     from hyperscale.distributed.discovery import DiscoveryService
     from hyperscale.logging import Logger
@@ -66,8 +68,23 @@ class WorkerDiscoveryManager:
 
             except asyncio.CancelledError:
                 break
-            except Exception:
-                pass
+            except Exception as maintenance_error:
+                dns_names = (
+                    self._discovery_service.config.dns_names
+                    if self._discovery_service.config
+                    else []
+                )
+                await self._logger.log(
+                    ServerWarning(
+                        message=(
+                            f"Discovery maintenance loop error: {maintenance_error} "
+                            f"(dns_names={dns_names}, decay_interval={self._failure_decay_interval}s)"
+                        ),
+                        node_host="worker",
+                        node_port=0,
+                        node_id="discovery",
+                    )
+                )
 
     def stop(self) -> None:
         """Stop the maintenance loop."""
