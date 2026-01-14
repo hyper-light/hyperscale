@@ -1,7 +1,7 @@
 # Hyperscale Distributed Bug Fixes TODO
 
 **Generated**: 2026-01-14  
-**Progress**: 52/64 completed (81%)
+**Progress**: 53/64 completed (83%)
 
 ---
 
@@ -74,6 +74,7 @@ Systematic bug fixes for the Hyperscale distributed performance testing framewor
 - [x] **Task 59**: Reporter results end-to-end path (implemented reporter_result_push handler in gate)
 - [x] **Task 31**: Add ordering/dedup for JobProgress beyond fence token (added check_and_record_progress to state.py, integrated in tcp_job.py)
 - [x] **Task 32**: Add explicit progress percentage calculation in gate (added _calculate_progress_percentage to tcp_job.py, added progress_percentage field to GlobalJobStatus)
+- [x] **Task 33**: Add recovery path for manager dies with pending stats (added export_checkpoint/import_checkpoint to StatsBuffer, wired into ManagerStateSync and ManagerStateSnapshot)
 - [x] **Task 34**: Add ReporterResultPush forwarding path in gate (verified - already implemented via Task 59)
 
 ---
