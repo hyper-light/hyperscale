@@ -82,8 +82,13 @@ class MercurySyncTCPProtocol(asyncio.Protocol, Generic[T]):
         while True:
             try:
                 message = self._receive_buffer.maybe_extract_framed()
-            except FrameTooLargeError:
-                # Frame too large - close connection (potential attack)
+            except FrameTooLargeError as frame_error:
+                # Frame too large - send structured error response before closing (Task 63)
+                try:
+                    error_response = frame_error.to_error_response()
+                    self.transport.write(error_response)
+                except Exception:
+                    pass  # Best effort - don't fail on error response
                 self._receive_buffer.clear()
                 self.transport.close()
                 return

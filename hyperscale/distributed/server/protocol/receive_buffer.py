@@ -136,7 +136,9 @@ class ReceiveBuffer:
         # Security check: reject frames that are too large
         if message_length > self._max_frame_length:
             raise FrameTooLargeError(
-                f"Frame length exceeds maximum: {message_length} > {self._max_frame_length} bytes"
+                f"Frame length exceeds maximum: {message_length} > {self._max_frame_length} bytes",
+                actual_size=message_length,
+                max_size=self._max_frame_length,
             )
 
         # Check if we have the complete message
