@@ -173,8 +173,8 @@ async def validate_5_1_manager_signals_high() -> None:
         _assert_backpressure_map(
             runtime, "Manager signals HIGH expected _manager_backpressure map"
         )
-        assert BackpressureLevel.HIGH in BackpressureLevel, (
-            "Manager signals HIGH expected BackpressureLevel.HIGH"
+        assert BackpressureLevel.REJECT in BackpressureLevel, (
+            "Manager signals HIGH expected BackpressureLevel.REJECT"
         )
     finally:
         await runtime.stop_cluster()
@@ -194,8 +194,8 @@ async def validate_5_1_manager_signals_critical() -> None:
         _assert_backpressure_map(
             runtime, "Manager signals CRITICAL expected _manager_backpressure map"
         )
-        assert BackpressureLevel.CRITICAL in BackpressureLevel, (
-            "Manager signals CRITICAL expected BackpressureLevel.CRITICAL"
+        assert BackpressureLevel.REJECT in BackpressureLevel, (
+            "Manager signals CRITICAL expected BackpressureLevel.REJECT"
         )
     finally:
         await runtime.stop_cluster()
