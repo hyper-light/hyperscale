@@ -90,15 +90,20 @@ class DynamicWorkflowFactory:
         dependencies = step_spec.get("depends_on", [])
         if isinstance(dependencies, str):
             dependencies = [dependencies]
-        parameters = self._build_parameters(step_spec.get("params", []))
+        parameters, annotations = self._build_parameters(step_spec.get("params", []))
+        factory = self
 
         async def dynamic_step(self, **kwargs):
-            resolved_args = self._resolve_value_list(step_spec.get("args", []), kwargs)
-            resolved_kwargs = self._resolve_value_map(
+            resolved_args = factory._resolve_value_list(
+                step_spec.get("args", []), kwargs
+            )
+            resolved_kwargs = factory._resolve_value_map(
                 step_spec.get("kwargs", {}), kwargs
             )
             if return_value is not None:
-                return self._resolve_value(return_value, kwargs)
+                return factory._resolve_value(return_value, kwargs)
+            if client_name is None or method_name is None:
+                raise ValueError(f"Step '{step_name}' requires client and method")
             client = getattr(self.client, client_name)
             method = getattr(client, method_name)
             return await method(*resolved_args, **resolved_kwargs)
@@ -109,6 +114,7 @@ class DynamicWorkflowFactory:
             step_name,
             return_type,
             parameters,
+            annotations,
         )
         return step(*dependencies)(dynamic_step)
 
@@ -121,14 +127,15 @@ class DynamicWorkflowFactory:
             workflows = [workflows]
         mode = state_spec.get("mode", "provide")
         value = state_spec.get("value")
-        parameters = self._build_parameters(state_spec.get("params", []))
+        parameters, annotations = self._build_parameters(state_spec.get("params", []))
         state_type = self._resolve_type(state_spec.get("state_type", "object"))
         return_type = Provide[state_type] if mode == "provide" else Use[state_type]
         source = state_spec.get("source")
+        factory = self
 
         async def dynamic_state(self, **kwargs):
             if value is not None:
-                return self._resolve_value(value, kwargs)
+                return factory._resolve_value(value, kwargs)
             if source:
                 return kwargs.get(source)
             if parameters:
@@ -141,18 +148,23 @@ class DynamicWorkflowFactory:
             state_name,
             return_type,
             parameters,
+            annotations,
         )
         return state(*workflows)(dynamic_state)
 
     def _build_parameters(
         self, param_specs: list[dict[str, Any]]
-    ) -> list[inspect.Parameter]:
+    ) -> tuple[list[inspect.Parameter], dict[str, type]]:
         parameters: list[inspect.Parameter] = []
+        annotations: dict[str, type] = {}
         for spec in param_specs:
             name = spec.get("name")
             if not name:
                 raise ValueError("parameter spec requires name")
             default = spec.get("default", inspect._empty)
+            parameter_type = spec.get("type")
+            if parameter_type is not None:
+                annotations[name] = self._resolve_type(parameter_type)
             parameters.append(
                 inspect.Parameter(
                     name,
@@ -160,7 +172,7 @@ class DynamicWorkflowFactory:
                     default=default,
                 )
             )
-        return parameters
+        return parameters, annotations
 
     def _apply_function_metadata(
         self,
@@ -169,10 +181,11 @@ class DynamicWorkflowFactory:
         func_name: str,
         return_type: type,
         parameters: list[inspect.Parameter],
+        annotations: dict[str, type],
     ) -> None:
         func.__name__ = func_name
         func.__qualname__ = f"{subclass_name}.{func_name}"
-        func.__annotations__ = {"return": return_type}
+        func.__annotations__ = {"return": return_type, **annotations}
         signature_parameters = [
             inspect.Parameter("self", inspect.Parameter.POSITIONAL_OR_KEYWORD),
             *parameters,
