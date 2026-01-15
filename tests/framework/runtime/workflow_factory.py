@@ -104,8 +104,10 @@ class DynamicWorkflowFactory:
                 return factory._resolve_value(return_value, kwargs)
             if client_name is None or method_name is None:
                 raise ValueError(f"Step '{step_name}' requires client and method")
-            client = getattr(self.client, client_name)
-            method = getattr(client, method_name)
+            client_name_value = str(client_name)
+            method_name_value = str(method_name)
+            client = getattr(self.client, client_name_value)
+            method = getattr(client, method_name_value)
             return await method(*resolved_args, **resolved_kwargs)
 
         self._apply_function_metadata(
