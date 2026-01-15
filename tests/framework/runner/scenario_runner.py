@@ -7,6 +7,10 @@ from hyperscale.logging.config.logging_config import LogOutput
 from hyperscale.logging.models import LogLevelName
 
 from tests.framework.actions.default_registry import build_default_registry
+from tests.framework.results.scenario_outcome import ScenarioOutcome
+from tests.framework.results.scenario_result import ScenarioResult
+from tests.framework.runtime.scenario_runtime import ScenarioRuntime
+from tests.framework.specs.scenario_spec import ScenarioSpec
 
 
 def _normalize_log_level(value: str | None) -> LogLevelName | None:
@@ -23,12 +27,6 @@ def _normalize_log_output(value: str | None) -> LogOutput | None:
     if value in {"stdout", "stderr"}:
         return cast(LogOutput, value)
     raise ValueError(f"Unsupported log_output '{value}'")
-
-
-from tests.framework.results.scenario_outcome import ScenarioOutcome
-from tests.framework.results.scenario_result import ScenarioResult
-from tests.framework.runtime.scenario_runtime import ScenarioRuntime
-from tests.framework.specs.scenario_spec import ScenarioSpec
 
 
 class ScenarioRunner:
