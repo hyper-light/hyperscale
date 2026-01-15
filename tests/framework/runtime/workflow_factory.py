@@ -163,20 +163,6 @@ class DynamicWorkflowFactory:
         )
         return state(*workflows)(state_callable)
 
-        self._apply_function_metadata(
-            dynamic_state,
-            subclass_name,
-            state_name,
-            return_type,
-            parameters,
-            annotations,
-        )
-        state_callable = cast(
-            Callable[..., Awaitable[Use[object] | Provide[object]]],
-            dynamic_state,
-        )
-        return state(*workflows)(state_callable)
-
     def _build_parameters(
         self, param_specs: list[dict[str, Any]]
     ) -> tuple[list[inspect.Parameter], dict[str, type]]:
