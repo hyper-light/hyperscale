@@ -1,6 +1,5 @@
 import asyncio
 import re
-from typing import Optional
 
 from hyperscale.distributed.nodes.gate import GateServer
 
