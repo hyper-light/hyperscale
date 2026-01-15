@@ -501,12 +501,61 @@ class TestStateSyncHandler:
     @pytest.fixture
     def mock_server(self):
         server = MockServerForHandlers()
-        server._state_sync = MagicMock()
-        server._state_sync.generate_snapshot.return_value = {
-            "version": 1,
-            "active_workflows": [],
-        }
+        server._state_version = 3
+        server._get_state_snapshot = MagicMock(
+            return_value=WorkerStateSnapshot(
+                node_id=server._node_id.full,
+                state=WorkerState.HEALTHY,
+                total_cores=8,
+                available_cores=6,
+                version=3,
+                host="127.0.0.1",
+                tcp_port=9001,
+                udp_port=9002,
+                active_workflows={},
+            )
+        )
         return server
+
+    @pytest.mark.asyncio
+    async def test_state_sync_returns_snapshot(self, mock_server):
+        from hyperscale.distributed.models import StateSyncRequest, StateSyncResponse
+        from hyperscale.distributed.nodes.worker.handlers.tcp_state_sync import (
+            StateSyncHandler,
+        )
+
+        handler = StateSyncHandler(mock_server)
+        request = StateSyncRequest(
+            requester_id="manager-1",
+            requester_role="manager",
+        )
+
+        result = await handler.handle(
+            addr=("127.0.0.1", 8000),
+            data=request.dump(),
+            clock_time=1,
+        )
+
+        response = StateSyncResponse.load(result)
+        assert response.responder_id == mock_server._node_id.full
+        assert response.current_version == mock_server._state_version
+        assert response.worker_state == mock_server._get_state_snapshot.return_value
+
+    @pytest.mark.asyncio
+    async def test_state_sync_invalid_data_returns_empty(self, mock_server):
+        from hyperscale.distributed.nodes.worker.handlers.tcp_state_sync import (
+            StateSyncHandler,
+        )
+
+        handler = StateSyncHandler(mock_server)
+
+        result = await handler.handle(
+            addr=("127.0.0.1", 8000),
+            data=b"invalid",
+            clock_time=1,
+        )
+
+        assert result == b""
 
 
 class TestWorkflowStatusQueryHandler:
