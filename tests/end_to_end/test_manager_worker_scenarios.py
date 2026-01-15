@@ -14,6 +14,118 @@ SECTION_START = "Manager <-> Worker Scenarios (Comprehensive)"
 
 WORKFLOW_REGISTRY = {"BaseScenarioWorkflow": BaseScenarioWorkflow}
 
+FIELD_TARGETS = {
+    "_workers": "manager_state",
+    "_worker_addr_to_id": "manager_state",
+    "_worker_circuits": "manager_state",
+    "_worker_unhealthy_since": "manager_state",
+    "_worker_deadlines": "manager_state",
+    "_worker_job_last_progress": "manager_state",
+    "_worker_health_states": "manager_state",
+    "_dispatch_semaphores": "manager_state",
+    "_job_leaders": "manager_state",
+    "_job_leader_addrs": "manager_state",
+    "_job_fencing_tokens": "manager_state",
+    "_job_contexts": "manager_state",
+    "_job_callbacks": "manager_state",
+    "_client_callbacks": "manager_state",
+    "_job_origin_gates": "manager_state",
+    "_progress_callbacks": "manager_state",
+    "_cancellation_pending_workflows": "manager_state",
+    "_cancellation_errors": "manager_state",
+    "_cancellation_completion_events": "manager_state",
+    "_cancelled_workflows": "manager_state",
+    "_workflow_lifecycle_states": "manager_state",
+    "_workflow_completion_events": "manager_state",
+    "_job_submissions": "manager_state",
+    "_job_reporter_tasks": "manager_state",
+    "_workflow_retries": "manager_state",
+    "_job_timeout_strategies": "manager_state",
+    "_job_aggregated_results": "manager_state",
+    "_cores_available_event": "manager_state",
+    "_core_allocation_lock": "manager_state",
+    "_eager_dispatch_lock": "manager_state",
+    "_dispatch_throughput_count": "manager_state",
+    "_dispatch_throughput_interval_start": "manager_state",
+    "_dispatch_throughput_last_value": "manager_state",
+    "_dispatch_failure_count": "manager_state",
+    "_workflow_latency_digest": "manager_state",
+    "_gate_latency_samples": "manager_state",
+    "_peer_manager_latency_samples": "manager_state",
+    "_worker_latency_samples": "manager_state",
+    "_pending_provisions": "manager_state",
+    "_provision_confirmations": "manager_state",
+    "_versioned_clock": "manager_state",
+    "_state_version": "manager_state",
+    "_fence_token": "manager_state",
+    "_manager_state": "manager_state",
+    "_known_gates": "manager_state",
+    "_healthy_gate_ids": "manager_state",
+    "_known_manager_peers": "manager_state",
+    "_active_manager_peer_ids": "manager_state",
+    "_manager_peer_info": "manager_state",
+    "_workflow_tokens": "worker_state",
+    "_workflow_cancel_events": "worker_state",
+    "_workflow_id_to_name": "worker_state",
+    "_workflow_job_leader": "worker_state",
+    "_workflow_fence_tokens": "worker_state",
+    "_workflow_cores_completed": "worker_state",
+    "_workflow_start_times": "worker_state",
+    "_workflow_timeout_seconds": "worker_state",
+    "_pending_workflows": "worker_state",
+    "_orphaned_workflows": "worker_state",
+    "_pending_transfers": "worker_state",
+    "_job_fence_tokens": "worker_state",
+    "_progress_buffer": "worker_state",
+    "_extension_requested": "worker_state",
+    "_extension_reason": "worker_state",
+    "_extension_current_progress": "worker_state",
+    "_extension_completed_items": "worker_state",
+    "_extension_total_items": "worker_state",
+    "_extension_estimated_completion": "worker_state",
+    "_extension_active_workflow_count": "worker_state",
+    "_registry": "manager",
+    "_worker_pool": "manager",
+    "_health_monitor": "manager",
+    "_cancellation": "manager",
+    "_dispatch": "manager",
+    "_workflow_dispatcher": "manager",
+    "_overload_detector": "manager",
+    "_load_shedder": "manager",
+    "_rate_limiter": "manager",
+    "_core_allocator": "worker",
+}
+
+JOB_KEY_FIELDS = {
+    "_job_leaders",
+    "_job_leader_addrs",
+    "_job_fencing_tokens",
+    "_job_contexts",
+    "_job_callbacks",
+    "_job_origin_gates",
+    "_progress_callbacks",
+    "_cancellation_pending_workflows",
+    "_cancellation_errors",
+    "_cancellation_completion_events",
+    "_job_submissions",
+    "_job_reporter_tasks",
+    "_workflow_retries",
+    "_job_timeout_strategies",
+    "_job_aggregated_results",
+}
+
+CLASS_FIELD_MAP = {
+    "ManagerRegistry": ("manager", "_registry"),
+    "WorkerPool": ("manager", "_worker_pool"),
+    "CoreAllocator": ("worker", "_core_allocator"),
+    "ManagerDispatchCoordinator": ("manager", "_dispatch"),
+    "ManagerHealthMonitor": ("manager", "_health_monitor"),
+    "ManagerCancellationCoordinator": ("manager", "_cancellation"),
+    "ManagerLoadShedder": ("manager", "_load_shedder"),
+    "ServerRateLimiter": ("manager", "_rate_limiter"),
+    "WorkflowDispatcher": ("manager", "_workflow_dispatcher"),
+}
+
 
 def _slugify(value: str) -> str:
     slug = re.sub(r"[^a-zA-Z0-9]+", "_", value.strip()).strip("_").lower()
@@ -91,104 +203,98 @@ def _get_worker(runtime: ScenarioRuntime):
     return cluster.get_all_workers()[0]
 
 
-def _assert_hasattr(obj: object, name: str) -> None:
-    assert hasattr(obj, name), f"Expected {obj} to have attribute '{name}'"
+def _get_target(runtime: ScenarioRuntime, target_name: str):
+    manager = _get_manager(runtime, "DC-A")
+    worker = _get_worker(runtime)
+    if target_name == "manager":
+        return manager
+    if target_name == "manager_state":
+        return manager._manager_state
+    if target_name == "worker":
+        return worker
+    if target_name == "worker_state":
+        return worker._worker_state
+    raise AssertionError(f"Unknown target {target_name}")
+
+
+def _extract_field_refs(bullet: str) -> list[str]:
+    return list(dict.fromkeys(re.findall(r"_[a-zA-Z0-9_]+", bullet)))
+
+
+def _extract_method_refs(bullet: str) -> list[tuple[str, str]]:
+    return [
+        (match.group(1), match.group(2))
+        for match in re.finditer(r"(_[a-zA-Z0-9_]+)\.([a-zA-Z0-9_]+)\(", bullet)
+    ]
+
+
+def _extract_class_method_refs(bullet: str) -> list[tuple[str, str]]:
+    return [
+        (match.group(1), match.group(2))
+        for match in re.finditer(r"([A-Za-z][A-Za-z0-9_]+)\.([a-zA-Z0-9_]+)\(", bullet)
+    ]
+
+
+def _assert_field(runtime: ScenarioRuntime, field_name: str, bullet: str) -> None:
+    if field_name not in FIELD_TARGETS:
+        raise AssertionError(f"Unmapped field '{field_name}' in bullet '{bullet}'")
+    target = _get_target(runtime, FIELD_TARGETS[field_name])
+    assert hasattr(target, field_name), f"Expected {target} to have {field_name}"
+    value = getattr(target, field_name)
+    if field_name in JOB_KEY_FIELDS:
+        job_id = runtime.job_ids.get("job-1") or runtime.last_job_id
+        if job_id:
+            assert job_id in value, f"Expected {field_name} to include job {job_id}"
+
+
+def _assert_method(runtime: ScenarioRuntime, field_name: str, method_name: str) -> None:
+    target = _get_target(runtime, FIELD_TARGETS[field_name])
+    field = getattr(target, field_name)
+    assert hasattr(field, method_name), f"Expected {field_name}.{method_name} to exist"
+    assert callable(getattr(field, method_name))
+
+
+def _assert_class_method(
+    runtime: ScenarioRuntime, class_name: str, method_name: str
+) -> None:
+    if class_name in CLASS_FIELD_MAP:
+        target_name, field_name = CLASS_FIELD_MAP[class_name]
+        target = _get_target(runtime, target_name)
+        field = getattr(target, field_name)
+        assert hasattr(field, method_name), f"Expected {class_name}.{method_name}"
+        assert callable(getattr(field, method_name))
+
+
+def _assert_fallbacks(bullet_lower: str, runtime: ScenarioRuntime) -> bool:
+    if "progress" in bullet_lower:
+        assert runtime.callbacks.progress_updates is not None
+        return True
+    if "status" in bullet_lower:
+        assert runtime.callbacks.status_updates is not None
+        return True
+    if "result" in bullet_lower:
+        assert runtime.callbacks.workflow_results is not None
+        return True
+    return False
 
 
 def _assert_manager_worker_bullet(bullet: str, runtime: ScenarioRuntime) -> None:
-    manager = _get_manager(runtime, "DC-A")
-    worker = _get_worker(runtime)
-    manager_state = manager._manager_state
-    worker_state = worker._worker_state
-    job_id = runtime.job_ids.get("job-1") or runtime.last_job_id
-    bullet_lower = bullet.lower()
-    matched = False
+    field_refs = _extract_field_refs(bullet)
+    method_refs = _extract_method_refs(bullet)
+    class_method_refs = _extract_class_method_refs(bullet)
 
-    if "register" in bullet_lower or "registration" in bullet_lower:
-        matched = True
-        _assert_hasattr(manager_state, "_workers")
-        _assert_hasattr(manager_state, "_worker_addr_to_id")
-        _assert_hasattr(manager_state, "_worker_circuits")
-        _assert_hasattr(manager_state, "_worker_health_states")
+    for field_name in field_refs:
+        _assert_field(runtime, field_name, bullet)
+    for field_name, method_name in method_refs:
+        if field_name in FIELD_TARGETS:
+            _assert_method(runtime, field_name, method_name)
+    for class_name, method_name in class_method_refs:
+        _assert_class_method(runtime, class_name, method_name)
 
-    if "unregister" in bullet_lower or "disconnect" in bullet_lower:
-        matched = True
-        _assert_hasattr(manager_state, "_worker_deadlines")
-        _assert_hasattr(manager_state, "_worker_unhealthy_since")
-
-    if "worker pool" in bullet_lower or "health state" in bullet_lower:
-        matched = True
-        _assert_hasattr(manager, "_worker_pool")
-
-    if "core" in bullet_lower or "allocation" in bullet_lower:
-        matched = True
-        _assert_hasattr(worker, "_core_allocator")
-        _assert_hasattr(worker_state, "_workflow_cores_completed")
-
-    if "dispatch" in bullet_lower:
-        matched = True
-        _assert_hasattr(manager, "_dispatch_coordinator")
-        _assert_hasattr(manager_state, "_dispatch_semaphores")
-
-    if "priority" in bullet_lower or "scheduling" in bullet_lower:
-        matched = True
-        _assert_hasattr(manager_state, "_job_submissions")
-
-    if "health" in bullet_lower:
-        matched = True
-        _assert_hasattr(manager, "_health_monitor")
-        _assert_hasattr(manager_state, "_worker_unhealthy_since")
-
-    if "circuit" in bullet_lower:
-        matched = True
-        _assert_hasattr(manager_state, "_worker_circuits")
-
-    if "workflow" in bullet_lower and "state" in bullet_lower:
-        matched = True
-        _assert_hasattr(worker_state, "_workflow_completion_events")
-
-    if "progress" in bullet_lower:
-        matched = True
-        _assert_hasattr(manager_state, "_worker_job_last_progress")
-        _assert_hasattr(worker_state, "_progress_buffer")
-
-    if "cancellation" in bullet_lower or "cancel" in bullet_lower:
-        matched = True
-        _assert_hasattr(manager_state, "_cancellation_pending_workflows")
-        _assert_hasattr(manager_state, "_cancellation_completion_events")
-        _assert_hasattr(worker_state, "_workflow_cancel_events")
-
-    if "reporter" in bullet_lower:
-        matched = True
-        _assert_hasattr(manager_state, "_job_reporter_tasks")
-
-    if "leadership" in bullet_lower or "leader" in bullet_lower:
-        matched = True
-        _assert_hasattr(manager_state, "_job_leaders")
-        _assert_hasattr(manager_state, "_job_fencing_tokens")
-
-    if "timeout" in bullet_lower:
-        matched = True
-        _assert_hasattr(manager_state, "_job_timeout_strategies")
-
-    if "orphan" in bullet_lower:
-        matched = True
-        _assert_hasattr(worker_state, "_orphaned_workflows")
-
-    if "metrics" in bullet_lower or "stats" in bullet_lower:
-        matched = True
-        _assert_hasattr(manager_state, "_workflow_stats_buffer")
-
-    if "latency" in bullet_lower:
-        matched = True
-        _assert_hasattr(manager_state, "_workflow_latency_tracker")
-
-    if job_id and "job" in bullet_lower:
-        matched = True
-        assert job_id in runtime.job_ids.values(), "Expected job id recorded"
-
-    if not matched:
-        raise AssertionError(f"No verification criteria mapped for bullet: {bullet}")
+    if not field_refs and not method_refs and not class_method_refs:
+        matched = _assert_fallbacks(bullet.lower(), runtime)
+        if not matched:
+            raise AssertionError(f"No explicit assertions for bullet: {bullet}")
 
 
 def _get_runtime(outcome):
