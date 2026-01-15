@@ -33,6 +33,9 @@ class ScenarioSpec:
         normalized_timeouts = {key: float(value) for key, value in timeouts.items()}
         default_action_timeout_seconds = normalized_timeouts.get("default")
         scenario_timeout_seconds = normalized_timeouts.get("scenario")
+        logging = data.get("logging")
+        if logging is not None and not isinstance(logging, dict):
+            raise ValueError("logging must be a dict")
         return cls(
             name=name,
             description=description,
@@ -41,6 +44,7 @@ class ScenarioSpec:
             timeouts=normalized_timeouts,
             default_action_timeout_seconds=default_action_timeout_seconds,
             scenario_timeout_seconds=scenario_timeout_seconds,
+            logging=logging,
         )
 
     @classmethod
