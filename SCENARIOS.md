@@ -858,6 +858,17 @@ Manager <-> Worker Scenarios (Comprehensive)
 - Snapshot with in-flight dispatches - State snapshot applied safely
 - Restore pending cancellations - Worker restores cancel events
 - Stale state version rejection - Reject stale state on reconnect
+20.12 Additional Manager/Worker Scenarios II
+- Worker affinity vs rebalancing - Sticky assignment vs fairness under churn
+- Dispatch gating on slow heartbeats - Avoid routing to slow-but-healthy workers
+- Cancellation storms with partial completion - Cancel vs finalize race
+- Manager failover mid-dispatch - Avoid double-dispatch
+- Per-tenant quotas under mixed load - No cross-tenant starvation
+- Clock drift on progress timestamps - Ordering and dedupe stability
+- Compression negotiation for progress/results - Fallback when unsupported
+- Cold-start throttling - Ramp first workflow after restart
+- Heartbeat loss burst then recovery - No false mass-eviction
+- Worker capability downgrade mid-run - Feature negotiation fallback
 ---
 
 Manager <-> Worker Scenarios (Comprehensive)
