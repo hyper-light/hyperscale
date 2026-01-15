@@ -86,10 +86,10 @@ def _require_runtime(outcome: ScenarioOutcome) -> ScenarioRuntime:
     return runtime
 
 
-async def validate_21_1_burst_stats_traffic() -> None:
+async def validate_22_1_high_volume_result_handling() -> None:
     spec = _build_spec(
-        "manager_worker_21_1_burst_stats_traffic",
-        "21.1 Burst Stats Traffic - 1000 VUs generating stats",
+        "manager_worker_22_1_high_volume_result_handling",
+        "22.1 High-Volume Result Handling - 10K workflows complete simultaneously",
     )
     runner = ScenarioRunner(WORKFLOW_REGISTRY)
     outcome = await runner.run(spec, cleanup=False)
@@ -99,17 +99,17 @@ async def validate_21_1_burst_stats_traffic() -> None:
             raise AssertionError(outcome.error or "Scenario failed")
         manager = _get_manager(runtime, "DC-A")
         state = manager._manager_state
-        assert isinstance(state._worker_job_last_progress, dict), (
-            "Burst stats traffic expected worker job progress"
+        assert isinstance(state._job_aggregated_results, dict), (
+            "High-volume results expected aggregated results"
         )
     finally:
         await runtime.stop_cluster()
 
 
-async def validate_21_1_stats_batching_under_load() -> None:
+async def validate_22_1_result_serialization_bottleneck() -> None:
     spec = _build_spec(
-        "manager_worker_21_1_stats_batching_under_load",
-        "21.1 Burst Stats Traffic - Stats batching under load",
+        "manager_worker_22_1_result_serialization_bottleneck",
+        "22.1 High-Volume Result Handling - Result serialization bottleneck",
     )
     runner = ScenarioRunner(WORKFLOW_REGISTRY)
     outcome = await runner.run(spec, cleanup=False)
@@ -119,77 +119,17 @@ async def validate_21_1_stats_batching_under_load() -> None:
             raise AssertionError(outcome.error or "Scenario failed")
         worker = _get_worker(runtime)
         state = worker._worker_state
-        assert isinstance(state._progress_buffer, dict), (
-            "Stats batching expected progress buffer"
+        assert isinstance(state._pending_workflows, dict), (
+            "Result serialization expected pending workflows"
         )
     finally:
         await runtime.stop_cluster()
 
 
-async def validate_21_1_stats_queue_overflow() -> None:
+async def validate_22_1_result_queue_depth() -> None:
     spec = _build_spec(
-        "manager_worker_21_1_stats_queue_overflow",
-        "21.1 Burst Stats Traffic - Stats queue overflow",
-    )
-    runner = ScenarioRunner(WORKFLOW_REGISTRY)
-    outcome = await runner.run(spec, cleanup=False)
-    runtime = _require_runtime(outcome)
-    try:
-        if outcome.result != ScenarioResult.PASSED:
-            raise AssertionError(outcome.error or "Scenario failed")
-        worker = _get_worker(runtime)
-        state = worker._worker_state
-        assert isinstance(state._progress_buffer, dict), (
-            "Stats queue overflow expected progress buffer"
-        )
-    finally:
-        await runtime.stop_cluster()
-
-
-async def validate_21_1_stats_memory_pressure() -> None:
-    spec = _build_spec(
-        "manager_worker_21_1_stats_memory_pressure",
-        "21.1 Burst Stats Traffic - Stats memory pressure",
-    )
-    runner = ScenarioRunner(WORKFLOW_REGISTRY)
-    outcome = await runner.run(spec, cleanup=False)
-    runtime = _require_runtime(outcome)
-    try:
-        if outcome.result != ScenarioResult.PASSED:
-            raise AssertionError(outcome.error or "Scenario failed")
-        worker = _get_worker(runtime)
-        state = worker._worker_state
-        assert isinstance(state._progress_buffer, dict), (
-            "Stats memory pressure expected progress buffer"
-        )
-    finally:
-        await runtime.stop_cluster()
-
-
-async def validate_21_1_stats_flush_backpressure() -> None:
-    spec = _build_spec(
-        "manager_worker_21_1_stats_flush_backpressure",
-        "21.1 Burst Stats Traffic - Stats flush backpressure",
-    )
-    runner = ScenarioRunner(WORKFLOW_REGISTRY)
-    outcome = await runner.run(spec, cleanup=False)
-    runtime = _require_runtime(outcome)
-    try:
-        if outcome.result != ScenarioResult.PASSED:
-            raise AssertionError(outcome.error or "Scenario failed")
-        worker = _get_worker(runtime)
-        state = worker._worker_state
-        assert isinstance(state._manager_backpressure, dict), (
-            "Stats flush backpressure expected manager backpressure"
-        )
-    finally:
-        await runtime.stop_cluster()
-
-
-async def validate_21_2_out_of_order_stats_batches() -> None:
-    spec = _build_spec(
-        "manager_worker_21_2_out_of_order_stats_batches",
-        "21.2 Stats Ordering - Out-of-order stats batches",
+        "manager_worker_22_1_result_queue_depth",
+        "22.1 High-Volume Result Handling - Result queue depth",
     )
     runner = ScenarioRunner(WORKFLOW_REGISTRY)
     outcome = await runner.run(spec, cleanup=False)
@@ -199,17 +139,17 @@ async def validate_21_2_out_of_order_stats_batches() -> None:
             raise AssertionError(outcome.error or "Scenario failed")
         manager = _get_manager(runtime, "DC-A")
         state = manager._manager_state
-        assert isinstance(state._worker_job_last_progress, dict), (
-            "Out-of-order stats expected worker job progress"
+        assert isinstance(state._job_aggregated_results, dict), (
+            "Result queue depth expected aggregated results"
         )
     finally:
         await runtime.stop_cluster()
 
 
-async def validate_21_2_duplicate_stats_batch() -> None:
+async def validate_22_1_result_memory_accumulation() -> None:
     spec = _build_spec(
-        "manager_worker_21_2_duplicate_stats_batch",
-        "21.2 Stats Ordering - Duplicate stats batch",
+        "manager_worker_22_1_result_memory_accumulation",
+        "22.1 High-Volume Result Handling - Result memory accumulation",
     )
     runner = ScenarioRunner(WORKFLOW_REGISTRY)
     outcome = await runner.run(spec, cleanup=False)
@@ -219,17 +159,17 @@ async def validate_21_2_duplicate_stats_batch() -> None:
             raise AssertionError(outcome.error or "Scenario failed")
         manager = _get_manager(runtime, "DC-A")
         state = manager._manager_state
-        assert isinstance(state._worker_job_last_progress, dict), (
-            "Duplicate stats batch expected worker job progress"
+        assert isinstance(state._job_aggregated_results, dict), (
+            "Result memory accumulation expected aggregated results"
         )
     finally:
         await runtime.stop_cluster()
 
 
-async def validate_21_2_stats_from_dead_worker() -> None:
+async def validate_22_2_results_before_dispatch_ack() -> None:
     spec = _build_spec(
-        "manager_worker_21_2_stats_from_dead_worker",
-        "21.2 Stats Ordering - Stats from dead worker",
+        "manager_worker_22_2_results_before_dispatch_ack",
+        "22.2 Result Ordering - Results arrive before dispatch ACK",
     )
     runner = ScenarioRunner(WORKFLOW_REGISTRY)
     outcome = await runner.run(spec, cleanup=False)
@@ -239,17 +179,17 @@ async def validate_21_2_stats_from_dead_worker() -> None:
             raise AssertionError(outcome.error or "Scenario failed")
         manager = _get_manager(runtime, "DC-A")
         state = manager._manager_state
-        assert isinstance(state._worker_unhealthy_since, dict), (
-            "Stats from dead worker expected worker unhealthy tracking"
+        assert isinstance(state._workflow_lifecycle_states, dict), (
+            "Results before ACK expected workflow lifecycle states"
         )
     finally:
         await runtime.stop_cluster()
 
 
-async def validate_21_2_stats_version_conflict() -> None:
+async def validate_22_2_results_not_in_tracking() -> None:
     spec = _build_spec(
-        "manager_worker_21_2_stats_version_conflict",
-        "21.2 Stats Ordering - Stats version conflict",
+        "manager_worker_22_2_results_not_in_tracking",
+        "22.2 Result Ordering - Results from workflow not in tracking",
     )
     runner = ScenarioRunner(WORKFLOW_REGISTRY)
     outcome = await runner.run(spec, cleanup=False)
@@ -259,17 +199,17 @@ async def validate_21_2_stats_version_conflict() -> None:
             raise AssertionError(outcome.error or "Scenario failed")
         manager = _get_manager(runtime, "DC-A")
         state = manager._manager_state
-        assert isinstance(state._worker_job_last_progress, dict), (
-            "Stats version conflict expected worker job progress"
+        assert isinstance(state._job_aggregated_results, dict), (
+            "Results not in tracking expected aggregated results"
         )
     finally:
         await runtime.stop_cluster()
 
 
-async def validate_21_3_parallel_stats_merging() -> None:
+async def validate_22_2_duplicate_results() -> None:
     spec = _build_spec(
-        "manager_worker_21_3_parallel_stats_merging",
-        "21.3 Stats Aggregation - Parallel stats merging",
+        "manager_worker_22_2_duplicate_results",
+        "22.2 Result Ordering - Duplicate results",
     )
     runner = ScenarioRunner(WORKFLOW_REGISTRY)
     outcome = await runner.run(spec, cleanup=False)
@@ -279,17 +219,17 @@ async def validate_21_3_parallel_stats_merging() -> None:
             raise AssertionError(outcome.error or "Scenario failed")
         manager = _get_manager(runtime, "DC-A")
         state = manager._manager_state
-        assert isinstance(state._worker_job_last_progress, dict), (
-            "Parallel stats merging expected worker job progress"
+        assert isinstance(state._job_aggregated_results, dict), (
+            "Duplicate results expected aggregated results"
         )
     finally:
         await runtime.stop_cluster()
 
 
-async def validate_21_3_partial_aggregation_windows() -> None:
+async def validate_22_2_partial_result_set() -> None:
     spec = _build_spec(
-        "manager_worker_21_3_partial_aggregation_windows",
-        "21.3 Stats Aggregation - Partial aggregation windows",
+        "manager_worker_22_2_partial_result_set",
+        "22.2 Result Ordering - Partial result set",
     )
     runner = ScenarioRunner(WORKFLOW_REGISTRY)
     outcome = await runner.run(spec, cleanup=False)
@@ -299,17 +239,17 @@ async def validate_21_3_partial_aggregation_windows() -> None:
             raise AssertionError(outcome.error or "Scenario failed")
         manager = _get_manager(runtime, "DC-A")
         state = manager._manager_state
-        assert isinstance(state._worker_job_last_progress, dict), (
-            "Partial aggregation expected worker job progress"
+        assert isinstance(state._job_aggregated_results, dict), (
+            "Partial result set expected aggregated results"
         )
     finally:
         await runtime.stop_cluster()
 
 
-async def validate_21_3_stats_window_boundary() -> None:
+async def validate_22_3_dc_latency_asymmetry() -> None:
     spec = _build_spec(
-        "manager_worker_21_3_stats_window_boundary",
-        "21.3 Stats Aggregation - Stats window boundary",
+        "manager_worker_22_3_dc_latency_asymmetry",
+        "22.3 Cross-DC Result Aggregation - DC latency asymmetry",
     )
     runner = ScenarioRunner(WORKFLOW_REGISTRY)
     outcome = await runner.run(spec, cleanup=False)
@@ -319,17 +259,17 @@ async def validate_21_3_stats_window_boundary() -> None:
             raise AssertionError(outcome.error or "Scenario failed")
         manager = _get_manager(runtime, "DC-A")
         state = manager._manager_state
-        assert isinstance(state._worker_job_last_progress, dict), (
-            "Stats window boundary expected worker job progress"
+        assert isinstance(state._job_aggregated_results, dict), (
+            "DC latency asymmetry expected aggregated results"
         )
     finally:
         await runtime.stop_cluster()
 
 
-async def validate_21_3_stats_compression() -> None:
+async def validate_22_3_dc_result_conflict() -> None:
     spec = _build_spec(
-        "manager_worker_21_3_stats_compression",
-        "21.3 Stats Aggregation - Stats compression",
+        "manager_worker_22_3_dc_result_conflict",
+        "22.3 Cross-DC Result Aggregation - DC result conflict",
     )
     runner = ScenarioRunner(WORKFLOW_REGISTRY)
     outcome = await runner.run(spec, cleanup=False)
@@ -339,36 +279,17 @@ async def validate_21_3_stats_compression() -> None:
             raise AssertionError(outcome.error or "Scenario failed")
         manager = _get_manager(runtime, "DC-A")
         state = manager._manager_state
-        assert isinstance(state._worker_job_last_progress, dict), (
-            "Stats compression expected worker job progress"
+        assert isinstance(state._job_aggregated_results, dict), (
+            "DC result conflict expected aggregated results"
         )
     finally:
         await runtime.stop_cluster()
 
 
-async def validate_21_4_manager_overloaded() -> None:
+async def validate_22_3_dc_result_timeout() -> None:
     spec = _build_spec(
-        "manager_worker_21_4_manager_overloaded",
-        "21.4 Stats Pipeline Backpressure - Manager overloaded",
-    )
-    runner = ScenarioRunner(WORKFLOW_REGISTRY)
-    outcome = await runner.run(spec, cleanup=False)
-    runtime = _require_runtime(outcome)
-    try:
-        if outcome.result != ScenarioResult.PASSED:
-            raise AssertionError(outcome.error or "Scenario failed")
-        manager = _get_manager(runtime, "DC-A")
-        assert manager._health_monitor is not None, (
-            "Manager overloaded expected health monitor"
-        )
-    finally:
-        await runtime.stop_cluster()
-
-
-async def validate_21_4_gate_overloaded() -> None:
-    spec = _build_spec(
-        "manager_worker_21_4_gate_overloaded",
-        "21.4 Stats Pipeline Backpressure - Gate overloaded",
+        "manager_worker_22_3_dc_result_timeout",
+        "22.3 Cross-DC Result Aggregation - DC result timeout",
     )
     runner = ScenarioRunner(WORKFLOW_REGISTRY)
     outcome = await runner.run(spec, cleanup=False)
@@ -378,17 +299,17 @@ async def validate_21_4_gate_overloaded() -> None:
             raise AssertionError(outcome.error or "Scenario failed")
         manager = _get_manager(runtime, "DC-A")
         state = manager._manager_state
-        assert state._job_origin_gates is not None, (
-            "Gate overloaded expected job origin gates"
+        assert isinstance(state._job_aggregated_results, dict), (
+            "DC result timeout expected aggregated results"
         )
     finally:
         await runtime.stop_cluster()
 
 
-async def validate_21_4_client_callback_slow() -> None:
+async def validate_22_3_result_aggregation_race() -> None:
     spec = _build_spec(
-        "manager_worker_21_4_client_callback_slow",
-        "21.4 Stats Pipeline Backpressure - Client callback slow",
+        "manager_worker_22_3_result_aggregation_race",
+        "22.3 Cross-DC Result Aggregation - Result aggregation race",
     )
     runner = ScenarioRunner(WORKFLOW_REGISTRY)
     outcome = await runner.run(spec, cleanup=False)
@@ -398,51 +319,26 @@ async def validate_21_4_client_callback_slow() -> None:
             raise AssertionError(outcome.error or "Scenario failed")
         manager = _get_manager(runtime, "DC-A")
         state = manager._manager_state
-        assert state._job_origin_gates is not None, (
-            "Client callback slow expected job origin gates"
-        )
-    finally:
-        await runtime.stop_cluster()
-
-
-async def validate_21_4_end_to_end_latency_spike() -> None:
-    spec = _build_spec(
-        "manager_worker_21_4_end_to_end_latency_spike",
-        "21.4 Stats Pipeline Backpressure - End-to-end latency spike",
-    )
-    runner = ScenarioRunner(WORKFLOW_REGISTRY)
-    outcome = await runner.run(spec, cleanup=False)
-    runtime = _require_runtime(outcome)
-    try:
-        if outcome.result != ScenarioResult.PASSED:
-            raise AssertionError(outcome.error or "Scenario failed")
-        manager = _get_manager(runtime, "DC-A")
-        state = manager._manager_state
-        assert state._overload_detector is not None, (
-            "Latency spike expected overload detector"
+        assert isinstance(state._job_aggregated_results, dict), (
+            "Result aggregation race expected aggregated results"
         )
     finally:
         await runtime.stop_cluster()
 
 
 async def run() -> None:
-    await validate_21_1_burst_stats_traffic()
-    await validate_21_1_stats_batching_under_load()
-    await validate_21_1_stats_queue_overflow()
-    await validate_21_1_stats_memory_pressure()
-    await validate_21_1_stats_flush_backpressure()
-    await validate_21_2_out_of_order_stats_batches()
-    await validate_21_2_duplicate_stats_batch()
-    await validate_21_2_stats_from_dead_worker()
-    await validate_21_2_stats_version_conflict()
-    await validate_21_3_parallel_stats_merging()
-    await validate_21_3_partial_aggregation_windows()
-    await validate_21_3_stats_window_boundary()
-    await validate_21_3_stats_compression()
-    await validate_21_4_manager_overloaded()
-    await validate_21_4_gate_overloaded()
-    await validate_21_4_client_callback_slow()
-    await validate_21_4_end_to_end_latency_spike()
+    await validate_22_1_high_volume_result_handling()
+    await validate_22_1_result_serialization_bottleneck()
+    await validate_22_1_result_queue_depth()
+    await validate_22_1_result_memory_accumulation()
+    await validate_22_2_results_before_dispatch_ack()
+    await validate_22_2_results_not_in_tracking()
+    await validate_22_2_duplicate_results()
+    await validate_22_2_partial_result_set()
+    await validate_22_3_dc_latency_asymmetry()
+    await validate_22_3_dc_result_conflict()
+    await validate_22_3_dc_result_timeout()
+    await validate_22_3_result_aggregation_race()
 
 
 if __name__ == "__main__":
