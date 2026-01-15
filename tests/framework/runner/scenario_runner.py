@@ -1,7 +1,10 @@
 import asyncio
 import time
+from typing import cast
 
 from hyperscale.logging.config import LoggingConfig
+from hyperscale.logging.config.logging_config import LogOutput
+from hyperscale.logging.models import LogLevelName
 
 from tests.framework.actions.default_registry import build_default_registry
 from tests.framework.results.scenario_outcome import ScenarioOutcome
