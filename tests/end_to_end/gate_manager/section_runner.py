@@ -68,6 +68,8 @@ FIELD_TARGETS = {
     "_rate_limiter": "gate",
     "_overload_detector": "gate",
     "_state_sync_handler": "gate",
+    "_job_stats_crdt": "gate",
+    "_windowed_stats": "gate",
     "_manager_peer_unhealthy_since": "manager_state",
 }
 
