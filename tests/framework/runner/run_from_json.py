@@ -7,7 +7,7 @@ from tests.framework.runner.scenario_runner import ScenarioRunner
 from tests.framework.specs.scenario_spec import ScenarioSpec
 
 
-def run_from_json(path: str, workflow_registry: dict) -> ScenarioOutcome:
+async def run_from_json(path: str, workflow_registry: dict) -> ScenarioOutcome:
     spec = ScenarioSpec.from_json(Path(path))
     runner = ScenarioRunner(workflow_registry)
     outcome = asyncio.run(runner.run(spec))
