@@ -1565,3 +1565,15 @@ Race Conditions Under Load
 52.2 Restore pending cancellations - Worker restores cancel events
 52.3 Stale state version rejection - Reject stale state on reconnect
 ---
+53. Additional Manager/Worker Scenarios IV
+53.1 Worker lease renewal jitter - Renewal jitter does not cause false expiry
+53.2 Dispatch retry collapse - Burst of retries collapses to single enqueue
+53.3 Progress snapshot batching - Snapshot batching avoids duplication
+53.4 Result forwarding timeout - Retry with backoff to gate
+53.5 Manager load shed on dispatch - Load shed avoids overload spiral
+53.6 Worker queue overflow - Oldest workflow dropped safely
+53.7 Health probe priority inversion - Probes not starved by dispatch
+53.8 Worker clock skew - Manager tolerates skew in timestamps
+53.9 Retry budget global cap - Per-job retries respect global cap
+53.10 Cancel propagation lag - Cancel reaches all workers within SLA
+---
