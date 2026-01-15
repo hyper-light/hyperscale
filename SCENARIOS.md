@@ -1625,3 +1625,15 @@ Race Conditions Under Load
 57.9 Manager admission control - Admission control enforces limits
 57.10 Progress ack lag - Ack lag does not block pipeline
 ---
+58. Additional Manager/Worker Scenarios IX
+58.1 Worker lease renewal backlog - Renewal backlog drains without expiry
+58.2 Dispatch ack flood - Ack flood does not stall dispatch loop
+58.3 Progress ordering watermark - Watermark enforces monotonic progress
+58.4 Result batching retry - Retry uses exponential backoff
+58.5 Manager retry queue overflow - Overflow drops oldest safely
+58.6 Worker heartbeat coalescing - Coalescing reduces overhead
+58.7 Cancel dispatch priority - Cancel dispatch not starved
+58.8 Worker registry snapshot - Snapshot includes all live workers
+58.9 Dispatch admission sampling - Sampling keeps overhead low
+58.10 Progress lag alerting - Lag alert triggers once per threshold
+---
