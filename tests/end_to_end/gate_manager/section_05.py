@@ -124,9 +124,15 @@ async def validate_5_1_manager_signals_low() -> None:
     try:
         if outcome.result != ScenarioResult.PASSED:
             raise AssertionError(outcome.error or "Scenario failed")
-        _assert_backpressure_map(
-            runtime, "Manager signals LOW expected _manager_backpressure map"
+        gate = _get_gate(runtime)
+        state = gate._modular_state
+        assert isinstance(state._manager_backpressure, dict), (
+            "Manager signals LOW expected _manager_backpressure map"
         )
+        assert all(
+            isinstance(level, BackpressureLevel)
+            for level in state._manager_backpressure.values()
+        ), "Manager signals LOW expected BackpressureLevel values"
         assert BackpressureLevel.THROTTLE in BackpressureLevel, (
             "Manager signals LOW expected BackpressureLevel.THROTTLE"
         )
@@ -145,9 +151,15 @@ async def validate_5_1_manager_signals_medium() -> None:
     try:
         if outcome.result != ScenarioResult.PASSED:
             raise AssertionError(outcome.error or "Scenario failed")
-        _assert_backpressure_map(
-            runtime, "Manager signals MEDIUM expected _manager_backpressure map"
+        gate = _get_gate(runtime)
+        state = gate._modular_state
+        assert isinstance(state._manager_backpressure, dict), (
+            "Manager signals MEDIUM expected _manager_backpressure map"
         )
+        assert all(
+            isinstance(level, BackpressureLevel)
+            for level in state._manager_backpressure.values()
+        ), "Manager signals MEDIUM expected BackpressureLevel values"
         assert BackpressureLevel.BATCH in BackpressureLevel, (
             "Manager signals MEDIUM expected BackpressureLevel.BATCH"
         )
@@ -166,9 +178,15 @@ async def validate_5_1_manager_signals_high() -> None:
     try:
         if outcome.result != ScenarioResult.PASSED:
             raise AssertionError(outcome.error or "Scenario failed")
-        _assert_backpressure_map(
-            runtime, "Manager signals HIGH expected _manager_backpressure map"
+        gate = _get_gate(runtime)
+        state = gate._modular_state
+        assert isinstance(state._manager_backpressure, dict), (
+            "Manager signals HIGH expected _manager_backpressure map"
         )
+        assert all(
+            isinstance(level, BackpressureLevel)
+            for level in state._manager_backpressure.values()
+        ), "Manager signals HIGH expected BackpressureLevel values"
         assert BackpressureLevel.REJECT in BackpressureLevel, (
             "Manager signals HIGH expected BackpressureLevel.REJECT"
         )
