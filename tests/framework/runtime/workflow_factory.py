@@ -152,7 +152,11 @@ class DynamicWorkflowFactory:
             parameters,
             annotations,
         )
-        return state(*workflows)(dynamic_state)
+        state_callable = cast(
+            Callable[..., Awaitable[Use[object] | Provide[object]]],
+            dynamic_state,
+        )
+        return state(*workflows)(state_callable)
 
     def _build_parameters(
         self, param_specs: list[dict[str, Any]]
