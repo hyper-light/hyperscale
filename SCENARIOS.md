@@ -821,7 +821,20 @@ Manager <-> Worker Scenarios (Comprehensive)
 - Retry dispatch - Retry to same or different worker
 - Mark worker unhealthy - After repeated failures
 - Escalate to gate - Report failure for job-level handling
+20.4 Additional Manager/Worker Scenarios
+- Stats batching drift - Worker stats batching windows vs flush interval drift
+- Priority fairness under contention - Manager fairness with mixed priorities and core contention
+- Retry budget exhaustion - Worker retry budget exhaustion escalates to manager/gate
+- Progress idempotency - Duplicate progress frames and stale progress replay
+- Late dispatch ACK reconciliation - Timeout fires then late ACK arrives
+- Worker state sync after restart - Pending workflows and cancel events restored
+- Circuit breaker oscillation - Manager circuit breaker flaps under intermittent worker failures
+- Result integrity on restart - Partial workflow completion across worker restarts
 ---
+
+Manager <-> Worker Scenarios (Comprehensive)
+---
+
 
 High-Throughput Load Test Scenarios
 ---
