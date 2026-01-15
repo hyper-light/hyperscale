@@ -711,7 +711,7 @@ class TestHandlersConcurrency:
 
         mock_server = MockServerForHandlers()
         mock_server._known_managers["mgr-1"] = MagicMock()
-        handler = JobLeaderTransferHandler(mock_server)
+        handler = JobLeaderTransferHandler(cast(WorkerServer, mock_server))
 
         access_order = []
 
