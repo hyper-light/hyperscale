@@ -34,16 +34,30 @@ async def run(runtime: ScenarioRuntime, action: ActionSpec) -> ActionOutcome:
     client = cluster.client
     if client is None:
         raise RuntimeError("Cluster client not initialized")
+    assert client is not None
+
+    def on_status_update(push) -> None:
+        runtime.callbacks.on_status_update(push)
+
+    def on_progress_update(push) -> None:
+        runtime.callbacks.on_progress_update(push)
+
+    def on_workflow_result(push) -> None:
+        runtime.callbacks.on_workflow_result(push)
+
+    def on_reporter_result(push) -> None:
+        runtime.callbacks.on_reporter_result(push)
+
     job_id = await client.submit_job(
         workflows=workflows,
         vus=vus,
         timeout_seconds=timeout_seconds,
         datacenter_count=datacenter_count,
         datacenters=datacenters,
-        on_status_update=runtime.callbacks.on_status_update,
-        on_progress_update=runtime.callbacks.on_progress_update,
-        on_workflow_result=runtime.callbacks.on_workflow_result,
-        on_reporter_result=runtime.callbacks.on_reporter_result,
+        on_status_update=on_status_update,
+        on_progress_update=on_progress_update,
+        on_workflow_result=on_workflow_result,
+        on_reporter_result=on_reporter_result,
     )
     alias = action.params.get("job_alias")
     if alias:
