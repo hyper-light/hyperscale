@@ -1589,3 +1589,15 @@ Race Conditions Under Load
 54.9 Dispatch jitter smoothing - Jitter smoothing avoids thundering herd
 54.10 Cancel replay safety - Replayed cancel does not re-open workflow
 ---
+55. Additional Manager/Worker Scenarios VI
+55.1 Worker reconnect flood - Reconnect flood does not overload manager
+55.2 Manager dispatch retry jitter - Jitter spreads retries across window
+55.3 Progress watermark lag - Watermark lag does not regress stats
+55.4 Result ack idempotency - Duplicate ack does not double-close
+55.5 Worker shutdown with backlog - Backlog rescheduled on shutdown
+55.6 Manager failover cancel safety - Cancels survive manager failover
+55.7 Worker health decay - Gradual decay before unhealthy
+55.8 Retry escalation tiers - Tiered retries avoid hot loops
+55.9 Dispatch queue spillover - Spillover routes to secondary manager
+55.10 Progress drop detection - Drop detection triggers warning
+---
