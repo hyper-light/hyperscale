@@ -1697,3 +1697,15 @@ Race Conditions Under Load
 63.9 Dispatch queue aging - Aging boosts long-waiting jobs
 63.10 Progress snapshot merge - Merge keeps latest progress
 ---
+64. Additional Manager/Worker Scenarios XV
+64.1 Worker lease jitter cap - Cap prevents excessive jitter
+64.2 Dispatch retry token reuse - Reuse does not confuse retries
+64.3 Progress snapshot lag - Snapshot lag bounded
+64.4 Result ack loss detection - Loss detection triggers resend
+64.5 Manager load shed reporting - Reporting emits warning once
+64.6 Worker health probe drop - Drop triggers suspect state
+64.7 Cancel ack delay - Delay does not block new cancels
+64.8 Worker metadata refresh - Refresh keeps metadata fresh
+64.9 Dispatch admission burst - Burst handled without starvation
+64.10 Progress ack reorder - Reorder handled without regression
+---
