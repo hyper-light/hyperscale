@@ -27,6 +27,8 @@ class ScenarioRunner:
                 action_timeout = action.timeout_seconds
                 if action_timeout is None:
                     action_timeout = spec.timeouts.get(action.action_type)
+                if action_timeout is None:
+                    action_timeout = spec.default_action_timeout_seconds
                 action_started = time.monotonic()
                 try:
                     if action_timeout:
@@ -39,9 +41,16 @@ class ScenarioRunner:
                     elapsed = time.monotonic() - action_started
                     raise AssertionError(
                         f"Action '{action.action_type}' timed out after {elapsed:.2f}s "
-                        f"(index {index})"
+                        f"(index {index}, params={action.params})"
                     ) from error
                 outcome.actions.append(result)
+                if spec.scenario_timeout_seconds is not None:
+                    elapsed = time.monotonic() - start
+                    if elapsed > spec.scenario_timeout_seconds:
+                        raise AssertionError(
+                            "Scenario timeout exceeded after "
+                            f"{elapsed:.2f}s (limit {spec.scenario_timeout_seconds:.2f}s)"
+                        )
             outcome.duration_seconds = time.monotonic() - start
         except AssertionError as error:
             outcome.result = ScenarioResult.FAILED
