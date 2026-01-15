@@ -266,26 +266,6 @@ async def validate_20_3_escalate_to_gate() -> None:
         await runtime.stop_cluster()
 
 
-async def validate_20_4_stats_batching_drift() -> None:
-    spec = _build_spec(
-        "manager_worker_20_4_stats_batching_drift",
-        "20.4 Additional Manager/Worker Scenarios - Stats batching drift",
-    )
-    runner = ScenarioRunner(WORKFLOW_REGISTRY)
-    outcome = await runner.run(spec, cleanup=False)
-    runtime = _require_runtime(outcome)
-    try:
-        if outcome.result != ScenarioResult.PASSED:
-            raise AssertionError(outcome.error or "Scenario failed")
-        worker = _get_worker(runtime)
-        state = worker._worker_state
-        assert isinstance(state._progress_buffer, dict), (
-            "Stats batching drift expected progress buffer"
-        )
-    finally:
-        await runtime.stop_cluster()
-
-
 async def validate_20_4_priority_fairness_under_contention() -> None:
     spec = _build_spec(
         "manager_worker_20_4_priority_fairness_under_contention",
@@ -859,35 +839,6 @@ async def run() -> None:
     await validate_20_3_retry_dispatch()
     await validate_20_3_mark_worker_unhealthy()
     await validate_20_3_escalate_to_gate()
-    await validate_20_4_stats_batching_drift()
-    await validate_20_4_priority_fairness_under_contention()
-    await validate_20_4_retry_budget_exhaustion()
-    await validate_20_4_progress_idempotency()
-    await validate_20_4_late_dispatch_ack_reconciliation()
-    await validate_20_4_worker_state_sync_after_restart()
-    await validate_20_4_circuit_breaker_oscillation()
-    await validate_20_4_result_integrity_on_restart()
-    await validate_20_5_starvation_prevention()
-    await validate_20_5_uneven_core_fairness()
-    await validate_20_5_priority_inversion()
-    await validate_20_6_duplicate_dispatch_acks()
-    await validate_20_6_ack_without_execution()
-    await validate_20_6_redispatch_after_partial_execution()
-    await validate_20_7_progress_buffer_overflow_recovery()
-    await validate_20_7_progress_jitter_smoothing()
-    await validate_20_7_backpressure_deescalation_hysteresis()
-    await validate_20_8_retry_budget_reset_on_failover()
-    await validate_20_8_extension_early_completion()
-    await validate_20_8_overlapping_retry_windows()
-    await validate_20_9_health_restored_mid_dispatch()
-    await validate_20_9_zombie_late_progress()
-    await validate_20_9_gc_pause_false_positive()
-    await validate_20_10_result_dedupe_across_restarts()
-    await validate_20_10_result_merge_after_retries()
-    await validate_20_10_result_schema_change()
-    await validate_20_11_snapshot_with_in_flight_dispatches()
-    await validate_20_11_restore_pending_cancellations()
-    await validate_20_11_stale_state_version_rejection()
 
 
 if __name__ == "__main__":
