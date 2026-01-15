@@ -1613,3 +1613,15 @@ Race Conditions Under Load
 56.9 Worker registration retry - Registration retry honors backoff
 56.10 Retry budget hysteresis - Hysteresis avoids oscillation
 ---
+57. Additional Manager/Worker Scenarios VIII
+57.1 Worker lease overlap - Overlap avoids double-scheduling
+57.2 Dispatch ack timeout override - Override per-tenant timeout
+57.3 Progress compression fallback - Fallback to raw on decode error
+57.4 Result routing split - Split routing across gates for latency
+57.5 Manager retry queue compaction - Compaction keeps queue bounded
+57.6 Worker health quorum - Quorum avoids single-sample flaps
+57.7 Cancel vs result ordering - Result after cancel handled safely
+57.8 Worker stats sampling - Sampling does not skew aggregates
+57.9 Manager admission control - Admission control enforces limits
+57.10 Progress ack lag - Ack lag does not block pipeline
+---
