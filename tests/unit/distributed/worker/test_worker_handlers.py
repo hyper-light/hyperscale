@@ -764,7 +764,7 @@ class TestHandlersEdgeCases:
         )
 
         mock_server = MockServerForHandlers()
-        handler = WorkflowDispatchHandler(mock_server)
+        handler = WorkflowDispatchHandler(cast(WorkerServer, mock_server))
 
         result = await handler.handle(
             addr=("192.168.1.1", 8000),
@@ -784,7 +784,7 @@ class TestHandlersEdgeCases:
 
         mock_server = MockServerForHandlers()
         mock_server._known_managers["mgr-1"] = MagicMock()
-        handler = JobLeaderTransferHandler(mock_server)
+        handler = JobLeaderTransferHandler(cast(WorkerServer, mock_server))
 
         # Add many workflows
         workflow_ids = [f"wf-{i}" for i in range(100)]
