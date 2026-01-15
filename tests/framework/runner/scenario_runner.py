@@ -91,5 +91,6 @@ class ScenarioRunner:
             outcome.error = str(error)
             outcome.duration_seconds = time.monotonic() - start
         finally:
-            await runtime.stop_cluster()
+            if cleanup:
+                await runtime.stop_cluster()
         return outcome
