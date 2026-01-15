@@ -10,11 +10,10 @@ async def run(runtime: ScenarioRuntime, action: ActionSpec) -> ActionOutcome:
     start = time.monotonic()
     cluster = runtime.require_cluster()
     workflow_instances = action.params.get("workflow_instances")
-    workflows: list[tuple[list[str], object]]
     if workflow_instances:
-        workflows = DynamicWorkflowFactory(runtime.workflow_registry).build_workflows(
-            workflow_instances
-        )
+        workflows: list[tuple[list[str], object]] = DynamicWorkflowFactory(
+            runtime.workflow_registry
+        ).build_workflows(workflow_instances)
     else:
         workflow_names = action.params.get("workflows") or []
         if isinstance(workflow_names, str):
@@ -31,7 +30,10 @@ async def run(runtime: ScenarioRuntime, action: ActionSpec) -> ActionOutcome:
     timeout_seconds = float(action.params.get("timeout_seconds", 300.0))
     datacenter_count = int(action.params.get("datacenter_count", 1))
     datacenters = action.params.get("datacenters")
-    job_id = await cluster.client.submit_job(
+    client = cluster.client
+    if client is None:
+        raise RuntimeError("Cluster client not initialized")
+    job_id = await client.submit_job(
         workflows=workflows,
         vus=vus,
         timeout_seconds=timeout_seconds,
