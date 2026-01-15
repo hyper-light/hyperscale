@@ -1661,3 +1661,15 @@ Race Conditions Under Load
 60.9 Dispatch queue watermark - Watermark blocks overload
 60.10 Progress lag spike suppression - Suppress transient spikes
 ---
+61. Additional Manager/Worker Scenarios XII
+61.1 Worker lease orphan cleanup - Orphan cleanup clears stale leases
+61.2 Dispatch retry window cap - Cap prevents infinite retries
+61.3 Progress backlog eviction - Eviction avoids memory growth
+61.4 Result ack batching - Batch acks reduce chatter
+61.5 Manager load shed recovery - Recovery restores dispatch smoothly
+61.6 Worker health grace - Grace period avoids false suspect
+61.7 Cancel broadcast batching - Batch cancels efficiently
+61.8 Worker metadata decay - Decay prunes inactive workers
+61.9 Dispatch queue visibility - Visibility metrics stay accurate
+61.10 Progress merge conflict - Conflict resolution keeps monotonicity
+---
