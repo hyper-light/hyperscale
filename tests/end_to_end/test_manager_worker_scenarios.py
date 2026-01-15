@@ -287,15 +287,22 @@ def _assert_class_method(
         )
 
 
-def _assert_fallbacks(bullet_lower: str, runtime: ScenarioRuntime) -> bool:
+def _assert_fallbacks(bullet: str, runtime: ScenarioRuntime) -> bool:
+    bullet_lower = bullet.lower()
     if "progress" in bullet_lower:
-        assert runtime.callbacks.progress_updates is not None
+        assert runtime.callbacks.progress_updates is not None, (
+            f"Bullet '{bullet}' expected progress_updates"
+        )
         return True
     if "status" in bullet_lower:
-        assert runtime.callbacks.status_updates is not None
+        assert runtime.callbacks.status_updates is not None, (
+            f"Bullet '{bullet}' expected status_updates"
+        )
         return True
     if "result" in bullet_lower:
-        assert runtime.callbacks.workflow_results is not None
+        assert runtime.callbacks.workflow_results is not None, (
+            f"Bullet '{bullet}' expected workflow_results"
+        )
         return True
     return False
 
