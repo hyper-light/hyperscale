@@ -131,8 +131,8 @@ async def validate_5_1_manager_signals_low() -> None:
         _assert_backpressure_map(
             runtime, "Manager signals LOW expected _manager_backpressure map"
         )
-        assert BackpressureLevel.LOW in BackpressureLevel, (
-            "Manager signals LOW expected BackpressureLevel.LOW"
+        assert BackpressureLevel.THROTTLE in BackpressureLevel, (
+            "Manager signals LOW expected BackpressureLevel.THROTTLE"
         )
     finally:
         await runtime.stop_cluster()
