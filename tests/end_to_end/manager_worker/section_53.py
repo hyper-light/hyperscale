@@ -273,8 +273,8 @@ async def validate_53_10_cancel_propagation_lag() -> None:
     try:
         if outcome.result != ScenarioResult.PASSED:
             raise AssertionError(outcome.error or "Scenario failed")
-        manager = _get_manager(runtime, "DC-A")
-        state = manager._manager_state
+        worker = _get_worker(runtime)
+        state = worker._worker_state
         assert isinstance(state._workflow_cancel_events, dict), (
             "Cancel propagation expected workflow cancel events"
         )
