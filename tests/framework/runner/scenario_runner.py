@@ -22,14 +22,25 @@ class ScenarioRunner:
             duration_seconds=0.0,
         )
         try:
-            for action in spec.actions:
+            for index, action in enumerate(spec.actions, start=1):
                 handler = self._registry.get(action.action_type)
-                if action.timeout_seconds:
-                    result = await asyncio.wait_for(
-                        handler(runtime, action), timeout=action.timeout_seconds
-                    )
-                else:
-                    result = await handler(runtime, action)
+                action_timeout = action.timeout_seconds
+                if action_timeout is None:
+                    action_timeout = spec.timeouts.get(action.action_type)
+                action_started = time.monotonic()
+                try:
+                    if action_timeout:
+                        result = await asyncio.wait_for(
+                            handler(runtime, action), timeout=action_timeout
+                        )
+                    else:
+                        result = await handler(runtime, action)
+                except asyncio.TimeoutError as error:
+                    elapsed = time.monotonic() - action_started
+                    raise AssertionError(
+                        f"Action '{action.action_type}' timed out after {elapsed:.2f}s "
+                        f"(index {index})"
+                    ) from error
                 outcome.actions.append(result)
             outcome.duration_seconds = time.monotonic() - start
         except AssertionError as error:
