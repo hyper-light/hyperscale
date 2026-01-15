@@ -1,8 +1,8 @@
 import sys
 import asyncio
 import zstandard
-from hyperscale.distributed_rewrite.server.events import LamportClock
-from hyperscale.distributed_rewrite.models import BitVector
+from hyperscale.distributed.server.events import LamportClock
+from hyperscale.distributed.models import BitVector
 
 
 async def test():

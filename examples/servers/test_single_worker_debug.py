@@ -11,8 +11,8 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from hyperscale.logging.config import LoggingConfig
-from hyperscale.distributed_rewrite.env.env import Env
-from hyperscale.distributed_rewrite.nodes.worker import WorkerServer
+from hyperscale.distributed.env.env import Env
+from hyperscale.distributed.nodes.worker import WorkerServer
 
 
 async def test_worker_startup_phases():

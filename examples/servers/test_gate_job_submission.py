@@ -21,12 +21,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 
 from hyperscale.graph import Workflow, step
 from hyperscale.testing import URL, HTTPResponse
-from hyperscale.distributed_rewrite.nodes.gate import GateServer
-from hyperscale.distributed_rewrite.nodes.manager import ManagerServer
-from hyperscale.distributed_rewrite.nodes.worker import WorkerServer
-from hyperscale.distributed_rewrite.nodes.client import HyperscaleClient
-from hyperscale.distributed_rewrite.env.env import Env
-from hyperscale.distributed_rewrite.models import GateState, ManagerState, JobStatus
+from hyperscale.distributed.nodes.gate import GateServer
+from hyperscale.distributed.nodes.manager import ManagerServer
+from hyperscale.distributed.nodes.worker import WorkerServer
+from hyperscale.distributed.nodes.client import HyperscaleClient
+from hyperscale.distributed.env.env import Env
+from hyperscale.distributed.models import GateState, ManagerState, JobStatus
 
 
 # ==========================================================================

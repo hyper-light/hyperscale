@@ -1,6 +1,6 @@
 from typing import List
 
-from pydantic import BaseModel, conlist, StrictStr, StrictInt
+from pydantic import BaseModel, ConfigDict, conlist, StrictStr, StrictInt
 
 from hyperscale.reporting.common.types import ReporterTypes
 
@@ -11,6 +11,8 @@ class _CloudwatchTarget(BaseModel):
 
 
 class CloudwatchConfig(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     aws_access_key_id: StrictStr
     aws_secret_access_key: StrictStr
     region_name: StrictStr
@@ -23,6 +25,3 @@ class CloudwatchConfig(BaseModel):
     cloudwatch_source: StrictStr = "hyperscale"
     submit_timeout: StrictInt = 60
     reporter_type: ReporterTypes = ReporterTypes.Cloudwatch
-
-    class Config:
-        arbitrary_types_allowed = True

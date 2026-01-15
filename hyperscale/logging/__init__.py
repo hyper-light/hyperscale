@@ -1,5 +1,14 @@
+from .config import DurabilityMode as DurabilityMode
 from .config import LoggingConfig as LoggingConfig
+from .exceptions import LSNGenerationError as LSNGenerationError
+from .exceptions import WALBackpressureError as WALBackpressureError
+from .exceptions import WALBatchOverflowError as WALBatchOverflowError
+from .exceptions import WALClosingError as WALClosingError
+from .exceptions import WALConsumerTooSlowError as WALConsumerTooSlowError
+from .exceptions import WALError as WALError
+from .exceptions import WALWriteError as WALWriteError
 from .models import Entry as Entry
+from .models import Log as Log
 from .models import LogLevel as LogLevel
 from .models import LogLevelName as LogLevelName
 from .streams import Logger as Logger

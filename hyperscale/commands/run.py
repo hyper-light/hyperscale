@@ -82,9 +82,10 @@ async def run(
     @param name The name of the test
     @param quiet If specified, all GUI output will be disabled
     """
-    workflows = [workflow() for workflow in path.data.values()]
 
-    for workflow in workflows:
+    workflows = [(workflow._dependencies, workflow()) for workflow in path.data.values()]
+
+    for _, workflow in workflows:
         cloudpickle.register_pickle_by_value(sys.modules[workflow.__module__])
 
     logging_config = LoggingConfig()
@@ -119,5 +120,6 @@ async def run(
     ) as e:
         await runner.abort(
             error=e,
-            terminal_mode=terminal_mode,
+            terminal_mode=config.data.terminal_mode,
         )
+

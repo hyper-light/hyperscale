@@ -20,11 +20,11 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from hyperscale.graph import Workflow, step
-from hyperscale.distributed_rewrite.nodes.manager import ManagerServer
-from hyperscale.distributed_rewrite.nodes.worker import WorkerServer
-from hyperscale.distributed_rewrite.nodes.client import HyperscaleClient
-from hyperscale.distributed_rewrite.env.env import Env
-from hyperscale.distributed_rewrite.models import ManagerState, JobStatus
+from hyperscale.distributed.nodes.manager import ManagerServer
+from hyperscale.distributed.nodes.worker import WorkerServer
+from hyperscale.distributed.nodes.client import HyperscaleClient
+from hyperscale.distributed.env.env import Env
+from hyperscale.distributed.models import ManagerState, JobStatus
 
 
 # ==========================================================================

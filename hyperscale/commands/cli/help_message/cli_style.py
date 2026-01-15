@@ -1,4 +1,4 @@
-from pydantic import BaseModel, StrictInt
+from pydantic import BaseModel, ConfigDict, StrictInt
 from hyperscale.ui.config.mode import TerminalDisplayMode, TerminalMode
 from hyperscale.ui.styling.attributes import Attributizer
 from hyperscale.ui.styling.colors import Colorizer, HighlightColorizer
@@ -6,6 +6,8 @@ from typing import List, Callable, Awaitable, Any
 
 
 class CLIStyle(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     header: Callable[..., Awaitable[List[str]]] | None = None
     description_color: Colorizer | None = None
     description_highlight: HighlightColorizer | None = None
@@ -33,9 +35,6 @@ class CLIStyle(BaseModel):
     text_attributes: List[Attributizer] | None = None
     indentation: StrictInt = 0
     terminal_mode: TerminalDisplayMode = "compatability"
-
-    class Config:
-        allow_arbitrary_types = True
 
     def to_mode(self):
         return TerminalMode.to_mode(self.terminal_mode)

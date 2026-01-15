@@ -10,6 +10,7 @@ except Exception:
     
 from pydantic import (
     BaseModel,
+    ConfigDict,
     StrictFloat,
     StrictInt,
     StrictStr,
@@ -17,12 +18,11 @@ from pydantic import (
 
 
 class LocatorCommand(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     selector: StrictStr
     has_text: Optional[StrictStr | Pattern[str]] = None
     has_not_text: Optional[StrictStr | Pattern[str]] = None
     has: Optional[Locator] = None
     has_not: Optional[Locator] = None
     timeout: StrictInt | StrictFloat
-
-    class Config:
-        arbitrary_types_allowed = True

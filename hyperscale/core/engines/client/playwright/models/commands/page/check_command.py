@@ -11,6 +11,7 @@ except Exception:
 
 from pydantic import (
     BaseModel,
+    ConfigDict,
     StrictBool,
     StrictFloat,
     StrictInt,
@@ -19,6 +20,8 @@ from pydantic import (
 
 
 class CheckCommand(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     selector: StrictStr
     postion: Optional[Position] = None
     timeout: StrictInt | StrictFloat
@@ -26,6 +29,3 @@ class CheckCommand(BaseModel):
     no_wait_after: Optional[StrictBool] = None
     strict: Optional[StrictBool] = None
     trial: Optional[StrictBool] = None
-
-    class Config:
-        arbitrary_types_allowed = True

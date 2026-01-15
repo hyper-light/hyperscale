@@ -3,7 +3,7 @@ import random
 import uuid
 import time
 from pydantic import BaseModel, StrictStr, Field
-from hyperscale.distributed_rewrite.server.events import (
+from hyperscale.distributed.server.events import (
     LamportRunner,
 )
 

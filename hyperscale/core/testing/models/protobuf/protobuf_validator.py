@@ -7,11 +7,10 @@ except Exception:
     class Message:
         pass
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 
 class ProtobufValidator(BaseModel):
-    value: Message
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
-    class Config:
-        arbitrary_types_allowed = True
+    value: Message

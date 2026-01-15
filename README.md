@@ -218,6 +218,21 @@ uv pip install -e .
 ```
 ___________
 
+## <b>JSON Scenario Framework</b>
+
+Hyperscale includes a JSON-driven scenario framework for cluster-level testing in
+`tests/framework`. It is used by end-to-end scenarios under `tests/end_to_end`.
+
+Key capabilities:
+- Define clusters and actions in JSON (start/stop, submit jobs, stop/restart nodes)
+- Assert runtime state via `assert_condition` targets
+- Submit workflow instances with explicit dependencies via `workflow_instances`
+- Dynamically generate step/state hooks per workflow instance
+- Port safety defaults: manager and worker ports are gapped by 500, worker UDP
+  ports use a 50 offset and 100 stride by default (configurable)
+
+See `tests/framework/README.txt` for the full schema and examples.
+
 ## <b>Clients and Reporters</b>
 
 Below find a tables of Hyperscale's supported client and reporting options, as well as co-requisite dependencies (if any):

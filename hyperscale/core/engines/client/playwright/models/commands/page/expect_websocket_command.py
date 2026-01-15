@@ -7,12 +7,11 @@ except Exception:
     class WebSocket:
         pass
     
-from pydantic import BaseModel, StrictBool, StrictFloat, StrictInt
+from pydantic import BaseModel, ConfigDict, StrictBool, StrictFloat, StrictInt
 
 
 class ExpectWebsocketCommand(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     predicate: Optional[Callable[[WebSocket], StrictBool]] = None
     timeout: StrictInt | StrictFloat
-
-    class Config:
-        arbitrary_types_allowed = True

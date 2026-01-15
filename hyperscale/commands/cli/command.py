@@ -119,7 +119,7 @@ class Command(Generic[T]):
         self.error_exit_code = error_exit_code
 
         self._consumed_keywords: list[str] = []
-        self._loop = asyncio.get_event_loop()
+        self._loop: asyncio.AbstractEventLoop | None = None
 
     @property
     def source(self):

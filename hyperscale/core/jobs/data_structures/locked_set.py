@@ -16,6 +16,9 @@ class LockedSet(Generic[T]):
         self._reads: int = itertools.count()
         self._writes: int = itertools.count()
 
+    def items(self):
+        return list(self._set)
+
     def __iter__(self):
         for item in self._set:
             yield item

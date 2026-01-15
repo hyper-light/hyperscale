@@ -4,17 +4,17 @@ try:
 except Exception:
     class Locator:
         pass
-    
+
 from pydantic import (
     BaseModel,
+    ConfigDict,
     StrictFloat,
     StrictInt,
 )
 
 
 class AndMatchingCommand(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     locator: Locator
     timeout: StrictInt | StrictFloat
-
-    class Config:
-        arbitrary_types_allowed = True
