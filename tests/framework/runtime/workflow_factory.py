@@ -159,8 +159,8 @@ class DynamicWorkflowFactory:
             parameters,
             annotations,
         )
-        state_callable = cast(
-            Callable[..., Awaitable[Use[object] | Provide[object]]],
+        state_callable = typing.cast(
+            typing.Callable[..., typing.Awaitable[Use[object] | Provide[object]]],
             dynamic_state,
         )
         return state(*workflows)(state_callable)
