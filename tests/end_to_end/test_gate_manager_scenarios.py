@@ -273,16 +273,24 @@ def _assert_class_method(
 
 def _assert_fallbacks(bullet_lower: str, runtime: ScenarioRuntime) -> bool:
     if "reporter" in bullet_lower:
-        assert runtime.callbacks.reporter_results is not None
+        assert runtime.callbacks.reporter_results is not None, (
+            f"Bullet '{bullet_lower}' expected reporter_results"
+        )
         return True
     if "workflow result" in bullet_lower or "result" in bullet_lower:
-        assert runtime.callbacks.workflow_results is not None
+        assert runtime.callbacks.workflow_results is not None, (
+            f"Bullet '{bullet_lower}' expected workflow_results"
+        )
         return True
     if "progress" in bullet_lower:
-        assert runtime.callbacks.progress_updates is not None
+        assert runtime.callbacks.progress_updates is not None, (
+            f"Bullet '{bullet_lower}' expected progress_updates"
+        )
         return True
     if "status" in bullet_lower:
-        assert runtime.callbacks.status_updates is not None
+        assert runtime.callbacks.status_updates is not None, (
+            f"Bullet '{bullet_lower}' expected status_updates"
+        )
         return True
     return False
 
