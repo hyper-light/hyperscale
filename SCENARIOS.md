@@ -1541,3 +1541,15 @@ Race Conditions Under Load
 - Recovery sequence - Health transitions stable and monotonic
 
 ---
+43. Additional Manager/Worker Scenarios II
+43.1 Worker affinity vs rebalancing - Sticky assignment vs fairness under churn
+43.2 Dispatch gating on slow heartbeats - Avoid routing to slow-but-healthy workers
+43.3 Cancellation storms with partial completion - Cancel vs finalize race
+43.4 Manager failover mid-dispatch - Avoid double-dispatch
+43.5 Per-tenant quotas under mixed load - No cross-tenant starvation
+43.6 Clock drift on progress timestamps - Ordering and dedupe stability
+43.7 Compression negotiation for progress/results - Fallback when unsupported
+43.8 Cold-start throttling - Ramp first workflow after restart
+43.9 Heartbeat loss burst then recovery - No false mass-eviction
+43.10 Worker capability downgrade mid-run - Feature negotiation fallback
+---
