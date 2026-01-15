@@ -34,7 +34,7 @@ class ScenarioRunner:
         self._workflow_registry = workflow_registry
         self._registry = build_default_registry()
 
-    async def run(self, spec: ScenarioSpec) -> ScenarioOutcome:
+    async def run(self, spec: ScenarioSpec, cleanup: bool = True) -> ScenarioOutcome:
         if spec.logging:
             log_level = _normalize_log_level(spec.logging.get("log_level"))
             log_output = _normalize_log_output(spec.logging.get("log_output"))
