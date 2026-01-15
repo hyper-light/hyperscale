@@ -245,18 +245,29 @@ def _assert_method(
 
 
 def _assert_class_method(
-    runtime: ScenarioRuntime, class_name: str, method_name: str
+    runtime: ScenarioRuntime,
+    class_name: str,
+    method_name: str,
+    bullet: str,
 ) -> None:
     if class_name in CLASS_FIELD_MAP:
         target_name, field_name = CLASS_FIELD_MAP[class_name]
         target = _get_target(runtime, target_name)
         field = getattr(target, field_name)
-        assert hasattr(field, method_name), f"Expected {class_name}.{method_name}"
-        assert callable(getattr(field, method_name))
+        assert hasattr(field, method_name), (
+            f"Bullet '{bullet}' expected {class_name}.{method_name}"
+        )
+        assert callable(getattr(field, method_name)), (
+            f"Bullet '{bullet}' expected {class_name}.{method_name} to be callable"
+        )
         return
     if class_name == "JobFinalResult":
-        assert hasattr(JobFinalResult, method_name)
-        assert callable(getattr(JobFinalResult, method_name))
+        assert hasattr(JobFinalResult, method_name), (
+            f"Bullet '{bullet}' expected JobFinalResult.{method_name}"
+        )
+        assert callable(getattr(JobFinalResult, method_name)), (
+            f"Bullet '{bullet}' expected JobFinalResult.{method_name} to be callable"
+        )
         return
 
 
