@@ -81,6 +81,15 @@ class MockServerForHandlers:
         self._worker_state.update_workflow_fence_token = AsyncMock(return_value=True)
         self._worker_state.get_workflow_fence_token = AsyncMock(return_value=0)
 
+        self._registry = MagicMock()
+        self._backpressure_manager = MagicMock()
+        self._backpressure_manager.get_backpressure_delay_ms = MagicMock(return_value=0)
+        self._task_runner = MagicMock()
+        self._task_runner.run = MagicMock()
+        self._state_version = 0
+        self._get_state_snapshot = MagicMock()
+        self._cancel_workflow = AsyncMock()
+
     def _get_worker_state(self):
         return WorkerState.HEALTHY
 
@@ -251,6 +260,7 @@ class TestWorkflowDispatchHandler:
 
         ack = WorkflowDispatchAck.load(result)
         assert ack.accepted is False
+        assert ack.error is not None
         assert "cores" in ack.error.lower()
 
 
