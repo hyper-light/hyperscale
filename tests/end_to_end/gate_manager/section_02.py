@@ -73,12 +73,13 @@ def _build_spec(name: str, description: str) -> ScenarioSpec:
     )
 
 
-def _get_gate(runtime):
+def _get_gate(runtime: ScenarioRuntime) -> GateServer:
     cluster = runtime.require_cluster()
-    return cluster.get_gate_leader() or cluster.gates[0]
+    gate = cluster.get_gate_leader() or cluster.gates[0]
+    return gate
 
 
-def _require_runtime(outcome):
+def _require_runtime(outcome: ScenarioOutcome) -> ScenarioRuntime:
     runtime = outcome.runtime
     if runtime is None:
         raise AssertionError("Scenario runtime not available")
