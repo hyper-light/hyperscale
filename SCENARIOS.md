@@ -1527,3 +1527,41 @@ Race Conditions Under Load
 44.9 Manager queue fairness - Mixed retry/cancel fairness enforced
 44.10 Worker health debounce - Avoid flapping health states
 ---
+45. Additional Manager/Worker Scenarios
+45.1 Stats batching drift - Worker stats batching windows vs flush interval drift
+45.2 Priority fairness under contention - Manager fairness with mixed priorities and core contention
+45.3 Retry budget exhaustion - Worker retry budget exhaustion escalates to manager/gate
+45.4 Progress idempotency - Duplicate progress frames and stale progress replay
+45.5 Late dispatch ACK reconciliation - Timeout fires then late ACK arrives
+45.6 Worker state sync after restart - Pending workflows and cancel events restored
+45.7 Circuit breaker oscillation - Manager circuit breaker flaps under intermittent worker failures
+45.8 Result integrity on restart - Partial workflow completion across worker restarts
+46. Scheduling and Fairness
+46.1 Starvation prevention - Mixed workflow sizes avoid starvation
+46.2 Uneven core fairness - Fairness across workers with uneven cores
+46.3 Priority inversion - Low-priority holds scarce cores
+47. Dispatch and Acks
+47.1 Duplicate dispatch ACKs - Idempotent handling of ACKs
+47.2 ACK without execution - Worker crashes after ACK, before run
+47.3 Re-dispatch after partial execution - Resume with partial metadata
+48. Progress and Backpressure
+48.1 Progress buffer overflow recovery - Recover after overflow
+48.2 Progress jitter smoothing - Smooth bursty update timing
+48.3 Backpressure de-escalation hysteresis - Avoid flapping
+49. Retry and Timeout Semantics
+49.1 Retry budget reset on failover - Manager failover resets budget safely
+49.2 Extension early completion - Extension granted but worker finishes early
+49.3 Overlapping retry windows - Multiple retry windows per workflow
+50. Worker Health and Recovery
+50.1 Health restored mid-dispatch - Avoid double scheduling
+50.2 Zombie late progress - Late progress ignored safely
+50.3 GC pause false positive - Health monitor tolerates GC pause
+51. Result Integrity and Validation
+51.1 Result dedupe across restarts - Avoid duplicate final results
+51.2 Result merge after retries - Merge partial outputs safely
+51.3 Result schema change - Validation handles schema changes
+52. State Sync and Consistency
+52.1 Snapshot with in-flight dispatches - State snapshot applied safely
+52.2 Restore pending cancellations - Worker restores cancel events
+52.3 Stale state version rejection - Reject stale state on reconnect
+---
