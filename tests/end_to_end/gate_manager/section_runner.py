@@ -238,15 +238,17 @@ def _get_manager(runtime: ScenarioRuntime, dc_id: str):
 def _get_target(runtime: ScenarioRuntime, target_name: str):
     gate = _get_gate(runtime)
     manager = _get_manager(runtime, "DC-A")
-    if target_name == "gate":
-        return gate
-    if target_name == "gate_state":
-        return gate._modular_state
-    if target_name == "manager":
-        return manager
-    if target_name == "manager_state":
-        return manager._manager_state
-    raise AssertionError(f"Unknown target {target_name}")
+    match target_name:
+        case "gate":
+            return gate
+        case "gate_state":
+            return gate._modular_state
+        case "manager":
+            return manager
+        case "manager_state":
+            return manager._manager_state
+        case _:
+            raise AssertionError(f"Unknown target {target_name}")
 
 
 def _extract_field_refs(bullet: str) -> list[str]:
