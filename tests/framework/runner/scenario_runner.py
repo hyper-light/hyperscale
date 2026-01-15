@@ -38,8 +38,8 @@ class ScenarioRunner:
 
     async def run(self, spec: ScenarioSpec) -> ScenarioOutcome:
         if spec.logging:
-            log_level = cast(LogLevelName | None, spec.logging.get("log_level"))
-            log_output = cast(LogOutput | None, spec.logging.get("log_output"))
+            log_level = _normalize_log_level(spec.logging.get("log_level"))
+            log_output = _normalize_log_output(spec.logging.get("log_output"))
             LoggingConfig().update(
                 log_directory=spec.logging.get("log_directory"),
                 log_level=log_level,
