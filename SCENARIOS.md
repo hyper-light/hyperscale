@@ -1649,3 +1649,15 @@ Race Conditions Under Load
 59.9 Retry budget priority - High priority retries retain budget
 59.10 Progress resume sync - Resume sync after worker restart
 ---
+60. Additional Manager/Worker Scenarios XI
+60.1 Worker lease fast renew - Fast renew does not starve dispatch
+60.2 Dispatch retry fairness - Fairness across retries and new work
+60.3 Progress window trimming - Trimming keeps window bounded
+60.4 Result ack timeout backoff - Backoff avoids hammering
+60.5 Manager load shed hysteresis - Hysteresis prevents oscillation
+60.6 Worker health probe batching - Batching reduces overhead
+60.7 Cancel path priority - Cancel path preempts non-critical work
+60.8 Worker metadata snapshot drift - Drift handled without regressions
+60.9 Dispatch queue watermark - Watermark blocks overload
+60.10 Progress lag spike suppression - Suppress transient spikes
+---
