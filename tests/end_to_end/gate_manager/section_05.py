@@ -205,9 +205,15 @@ async def validate_5_1_manager_signals_critical() -> None:
     try:
         if outcome.result != ScenarioResult.PASSED:
             raise AssertionError(outcome.error or "Scenario failed")
-        _assert_backpressure_map(
-            runtime, "Manager signals CRITICAL expected _manager_backpressure map"
+        gate = _get_gate(runtime)
+        state = gate._modular_state
+        assert isinstance(state._manager_backpressure, dict), (
+            "Manager signals CRITICAL expected _manager_backpressure map"
         )
+        assert all(
+            isinstance(level, BackpressureLevel)
+            for level in state._manager_backpressure.values()
+        ), "Manager signals CRITICAL expected BackpressureLevel values"
         assert BackpressureLevel.REJECT in BackpressureLevel, (
             "Manager signals CRITICAL expected BackpressureLevel.REJECT"
         )
@@ -283,9 +289,15 @@ async def validate_5_3_manager_backpressure_decreases() -> None:
     try:
         if outcome.result != ScenarioResult.PASSED:
             raise AssertionError(outcome.error or "Scenario failed")
-        _assert_backpressure_map(
-            runtime, "Backpressure recovery expected _manager_backpressure"
+        gate = _get_gate(runtime)
+        state = gate._modular_state
+        assert isinstance(state._manager_backpressure, dict), (
+            "Backpressure recovery expected _manager_backpressure"
         )
+        assert all(
+            isinstance(level, BackpressureLevel)
+            for level in state._manager_backpressure.values()
+        ), "Backpressure recovery expected BackpressureLevel values"
     finally:
         await runtime.stop_cluster()
 
