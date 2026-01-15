@@ -1553,3 +1553,15 @@ Race Conditions Under Load
 43.9 Heartbeat loss burst then recovery - No false mass-eviction
 43.10 Worker capability downgrade mid-run - Feature negotiation fallback
 ---
+44. Additional Manager/Worker Scenarios III
+44.1 Worker lease expiry - Lease expires during long action
+44.2 Dispatch list staleness - Manager dispatches using stale worker list
+44.3 Retry token mismatch - Worker reports mismatched retry token
+44.4 Progress flush on shutdown - Worker flushes progress before exit
+44.5 Result ack retry loop - Manager retries ack for flaky worker
+44.6 Cancel vs retry race - Cancellation races with retry dispatch
+44.7 Worker metadata eviction - Evict stale worker metadata safely
+44.8 Backpressure recovery ramp - Backpressure relaxes without spikes
+44.9 Manager queue fairness - Mixed retry/cancel fairness enforced
+44.10 Worker health debounce - Avoid flapping health states
+---
