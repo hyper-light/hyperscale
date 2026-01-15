@@ -1673,3 +1673,15 @@ Race Conditions Under Load
 61.9 Dispatch queue visibility - Visibility metrics stay accurate
 61.10 Progress merge conflict - Conflict resolution keeps monotonicity
 ---
+62. Additional Manager/Worker Scenarios XIII
+62.1 Worker lease renewal override - Override renew interval during load
+62.2 Dispatch retry enqueue fairness - Retry enqueue does not starve new
+62.3 Progress snapshot eviction - Eviction keeps snapshot size bounded
+62.4 Result ack timeout escalation - Escalation triggers alert
+62.5 Manager load shed floor - Floor avoids total blackout
+62.6 Worker health probe jitter - Jitter avoids synchronized probes
+62.7 Cancel queue compaction - Compaction keeps cancel queue bounded
+62.8 Worker metadata flush - Flush writes metadata on shutdown
+62.9 Dispatch queue admission floor - Floor allows critical jobs
+62.10 Progress lag recovery - Recovery clears lag state
+---
