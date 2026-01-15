@@ -447,7 +447,6 @@ class TestWorkflowProgressHandler:
         return server
 
     def test_process_ack_updates_routing_and_backpressure(self, mock_server):
-        """Test progress ack updates routing and backpressure."""
         from hyperscale.distributed.models import ManagerInfo, WorkflowProgressAck
         from hyperscale.distributed.nodes.worker.handlers.tcp_progress import (
             WorkflowProgressHandler,
@@ -484,7 +483,6 @@ class TestWorkflowProgressHandler:
         mock_server._backpressure_manager.set_backpressure_delay_ms.assert_called_once()
 
     def test_process_ack_invalid_data_logs_debug(self, mock_server):
-        """Invalid ack payload triggers debug logging via task runner."""
         from hyperscale.distributed.nodes.worker.handlers.tcp_progress import (
             WorkflowProgressHandler,
         )
