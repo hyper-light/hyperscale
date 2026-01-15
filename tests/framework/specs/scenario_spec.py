@@ -30,12 +30,16 @@ class ScenarioSpec:
         actions = [ActionSpec.from_dict(action) for action in actions_data]
         timeouts = data.get("timeouts", {})
         normalized_timeouts = {key: float(value) for key, value in timeouts.items()}
+        default_action_timeout_seconds = normalized_timeouts.get("default")
+        scenario_timeout_seconds = normalized_timeouts.get("scenario")
         return cls(
             name=name,
             description=description,
             cluster=cluster,
             actions=actions,
             timeouts=normalized_timeouts,
+            default_action_timeout_seconds=default_action_timeout_seconds,
+            scenario_timeout_seconds=scenario_timeout_seconds,
         )
 
     @classmethod
