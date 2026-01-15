@@ -13,6 +13,8 @@ class ScenarioSpec:
     cluster: ClusterSpec
     actions: list[ActionSpec]
     timeouts: dict[str, float]
+    default_action_timeout_seconds: float | None
+    scenario_timeout_seconds: float | None
 
     @classmethod
     def from_dict(cls, data: dict) -> "ScenarioSpec":
