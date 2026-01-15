@@ -1577,3 +1577,15 @@ Race Conditions Under Load
 53.9 Retry budget global cap - Per-job retries respect global cap
 53.10 Cancel propagation lag - Cancel reaches all workers within SLA
 ---
+54. Additional Manager/Worker Scenarios V
+54.1 Worker backlog drain rate - Drain rate stays within expected bounds
+54.2 Manager dispatch burst coalescing - Coalesce bursts without starvation
+54.3 Progress dedupe window - Dedupe window prevents double counting
+54.4 Result batch sizing - Batch sizing respects size limits
+54.5 Worker eviction grace period - Grace period allows in-flight completion
+54.6 Manager retry queue isolation - Retry queue does not block new dispatch
+54.7 Health state snapshot lag - Snapshot lag does not regress state
+54.8 Worker registration storm - Registration storm does not drop workers
+54.9 Dispatch jitter smoothing - Jitter smoothing avoids thundering herd
+54.10 Cancel replay safety - Replayed cancel does not re-open workflow
+---
