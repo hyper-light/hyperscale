@@ -1685,3 +1685,15 @@ Race Conditions Under Load
 62.9 Dispatch queue admission floor - Floor allows critical jobs
 62.10 Progress lag recovery - Recovery clears lag state
 ---
+63. Additional Manager/Worker Scenarios XIV
+63.1 Worker lease double-renew - Double renew does not extend beyond max
+63.2 Dispatch retry debounce - Debounce avoids rapid retries
+63.3 Progress drop backfill - Backfill recovers dropped progress
+63.4 Result ack quorum - Quorum required before close
+63.5 Manager overload grace - Grace period before shedding
+63.6 Worker probe coalescing - Coalescing reduces ping storms
+63.7 Cancel batch fairness - Fairness across cancel batches
+63.8 Worker metadata ttl - TTL removes stale entries
+63.9 Dispatch queue aging - Aging boosts long-waiting jobs
+63.10 Progress snapshot merge - Merge keeps latest progress
+---
