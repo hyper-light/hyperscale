@@ -266,6 +266,172 @@ async def validate_20_3_escalate_to_gate() -> None:
         await runtime.stop_cluster()
 
 
+async def validate_20_4_stats_batching_drift() -> None:
+    spec = _build_spec(
+        "manager_worker_20_4_stats_batching_drift",
+        "20.4 Additional Manager/Worker Scenarios - Stats batching drift",
+    )
+    runner = ScenarioRunner(WORKFLOW_REGISTRY)
+    outcome = await runner.run(spec, cleanup=False)
+    runtime = _require_runtime(outcome)
+    try:
+        if outcome.result != ScenarioResult.PASSED:
+            raise AssertionError(outcome.error or "Scenario failed")
+        worker = _get_worker(runtime)
+        state = worker._worker_state
+        assert isinstance(state._progress_buffer, dict), (
+            "Stats batching drift expected progress buffer"
+        )
+    finally:
+        await runtime.stop_cluster()
+
+
+async def validate_20_4_priority_fairness_under_contention() -> None:
+    spec = _build_spec(
+        "manager_worker_20_4_priority_fairness_under_contention",
+        "20.4 Additional Manager/Worker Scenarios - Priority fairness under contention",
+    )
+    runner = ScenarioRunner(WORKFLOW_REGISTRY)
+    outcome = await runner.run(spec, cleanup=False)
+    runtime = _require_runtime(outcome)
+    try:
+        if outcome.result != ScenarioResult.PASSED:
+            raise AssertionError(outcome.error or "Scenario failed")
+        manager = _get_manager(runtime, "DC-A")
+        state = manager._manager_state
+        assert state._dispatch_throughput_count is not None, (
+            "Priority fairness expected dispatch throughput count"
+        )
+    finally:
+        await runtime.stop_cluster()
+
+
+async def validate_20_4_retry_budget_exhaustion() -> None:
+    spec = _build_spec(
+        "manager_worker_20_4_retry_budget_exhaustion",
+        "20.4 Additional Manager/Worker Scenarios - Retry budget exhaustion",
+    )
+    runner = ScenarioRunner(WORKFLOW_REGISTRY)
+    outcome = await runner.run(spec, cleanup=False)
+    runtime = _require_runtime(outcome)
+    try:
+        if outcome.result != ScenarioResult.PASSED:
+            raise AssertionError(outcome.error or "Scenario failed")
+        manager = _get_manager(runtime, "DC-A")
+        state = manager._manager_state
+        assert isinstance(state._workflow_retries, dict), (
+            "Retry budget exhaustion expected workflow retries"
+        )
+        assert isinstance(state._job_origin_gates, dict), (
+            "Retry budget exhaustion expected job origin gates"
+        )
+    finally:
+        await runtime.stop_cluster()
+
+
+async def validate_20_4_progress_idempotency() -> None:
+    spec = _build_spec(
+        "manager_worker_20_4_progress_idempotency",
+        "20.4 Additional Manager/Worker Scenarios - Progress idempotency",
+    )
+    runner = ScenarioRunner(WORKFLOW_REGISTRY)
+    outcome = await runner.run(spec, cleanup=False)
+    runtime = _require_runtime(outcome)
+    try:
+        if outcome.result != ScenarioResult.PASSED:
+            raise AssertionError(outcome.error or "Scenario failed")
+        manager = _get_manager(runtime, "DC-A")
+        state = manager._manager_state
+        assert isinstance(state._worker_job_last_progress, dict), (
+            "Progress idempotency expected worker job progress"
+        )
+    finally:
+        await runtime.stop_cluster()
+
+
+async def validate_20_4_late_dispatch_ack_reconciliation() -> None:
+    spec = _build_spec(
+        "manager_worker_20_4_late_dispatch_ack_reconciliation",
+        "20.4 Additional Manager/Worker Scenarios - Late dispatch ACK reconciliation",
+    )
+    runner = ScenarioRunner(WORKFLOW_REGISTRY)
+    outcome = await runner.run(spec, cleanup=False)
+    runtime = _require_runtime(outcome)
+    try:
+        if outcome.result != ScenarioResult.PASSED:
+            raise AssertionError(outcome.error or "Scenario failed")
+        manager = _get_manager(runtime, "DC-A")
+        state = manager._manager_state
+        assert state._dispatch_failure_count is not None, (
+            "Late dispatch ACK expected dispatch failure count"
+        )
+    finally:
+        await runtime.stop_cluster()
+
+
+async def validate_20_4_worker_state_sync_after_restart() -> None:
+    spec = _build_spec(
+        "manager_worker_20_4_worker_state_sync_after_restart",
+        "20.4 Additional Manager/Worker Scenarios - Worker state sync after restart",
+    )
+    runner = ScenarioRunner(WORKFLOW_REGISTRY)
+    outcome = await runner.run(spec, cleanup=False)
+    runtime = _require_runtime(outcome)
+    try:
+        if outcome.result != ScenarioResult.PASSED:
+            raise AssertionError(outcome.error or "Scenario failed")
+        worker = _get_worker(runtime)
+        state = worker._worker_state
+        assert isinstance(state._pending_workflows, dict), (
+            "Worker state sync expected pending workflows"
+        )
+        assert isinstance(state._workflow_cancel_events, dict), (
+            "Worker state sync expected workflow cancel events"
+        )
+    finally:
+        await runtime.stop_cluster()
+
+
+async def validate_20_4_circuit_breaker_oscillation() -> None:
+    spec = _build_spec(
+        "manager_worker_20_4_circuit_breaker_oscillation",
+        "20.4 Additional Manager/Worker Scenarios - Circuit breaker oscillation",
+    )
+    runner = ScenarioRunner(WORKFLOW_REGISTRY)
+    outcome = await runner.run(spec, cleanup=False)
+    runtime = _require_runtime(outcome)
+    try:
+        if outcome.result != ScenarioResult.PASSED:
+            raise AssertionError(outcome.error or "Scenario failed")
+        manager = _get_manager(runtime, "DC-A")
+        state = manager._manager_state
+        assert isinstance(state._worker_circuits, dict), (
+            "Circuit breaker oscillation expected worker circuits"
+        )
+    finally:
+        await runtime.stop_cluster()
+
+
+async def validate_20_4_result_integrity_on_restart() -> None:
+    spec = _build_spec(
+        "manager_worker_20_4_result_integrity_on_restart",
+        "20.4 Additional Manager/Worker Scenarios - Result integrity on restart",
+    )
+    runner = ScenarioRunner(WORKFLOW_REGISTRY)
+    outcome = await runner.run(spec, cleanup=False)
+    runtime = _require_runtime(outcome)
+    try:
+        if outcome.result != ScenarioResult.PASSED:
+            raise AssertionError(outcome.error or "Scenario failed")
+        manager = _get_manager(runtime, "DC-A")
+        state = manager._manager_state
+        assert isinstance(state._job_aggregated_results, dict), (
+            "Result integrity expected aggregated results"
+        )
+    finally:
+        await runtime.stop_cluster()
+
+
 async def run() -> None:
     await validate_20_1_timeout()
     await validate_20_1_rejection()
@@ -276,6 +442,14 @@ async def run() -> None:
     await validate_20_3_retry_dispatch()
     await validate_20_3_mark_worker_unhealthy()
     await validate_20_3_escalate_to_gate()
+    await validate_20_4_stats_batching_drift()
+    await validate_20_4_priority_fairness_under_contention()
+    await validate_20_4_retry_budget_exhaustion()
+    await validate_20_4_progress_idempotency()
+    await validate_20_4_late_dispatch_ack_reconciliation()
+    await validate_20_4_worker_state_sync_after_restart()
+    await validate_20_4_circuit_breaker_oscillation()
+    await validate_20_4_result_integrity_on_restart()
 
 
 if __name__ == "__main__":
