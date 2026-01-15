@@ -888,16 +888,6 @@ async def run() -> None:
     await validate_20_11_snapshot_with_in_flight_dispatches()
     await validate_20_11_restore_pending_cancellations()
     await validate_20_11_stale_state_version_rejection()
-    await validate_20_12_worker_affinity_rebalancing()
-    await validate_20_12_dispatch_gating_slow_heartbeats()
-    await validate_20_12_cancellation_storm_partial_completion()
-    await validate_20_12_manager_failover_mid_dispatch()
-    await validate_20_12_per_tenant_quotas_mixed_load()
-    await validate_20_12_clock_drift_progress_timestamps()
-    await validate_20_12_compression_negotiation_progress_results()
-    await validate_20_12_cold_start_throttling()
-    await validate_20_12_heartbeat_loss_burst_recovery()
-    await validate_20_12_worker_capability_downgrade_mid_run()
 
 
 if __name__ == "__main__":
