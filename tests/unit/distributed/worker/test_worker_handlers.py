@@ -29,6 +29,7 @@ from hyperscale.distributed.models import (
     WorkflowProgress,
     WorkflowStatus,
     WorkerState,
+    WorkerStateSnapshot,
     PendingTransfer,
 )
 
