@@ -14,9 +14,12 @@ Covers:
 
 import asyncio
 import time
+from typing import cast
 from unittest.mock import MagicMock, AsyncMock, patch
 
 import pytest
+
+from hyperscale.distributed.nodes.worker.server import WorkerServer
 
 from hyperscale.distributed.models import (
     WorkflowDispatch,
