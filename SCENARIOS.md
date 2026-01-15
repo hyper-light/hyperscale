@@ -1637,3 +1637,15 @@ Race Conditions Under Load
 58.9 Dispatch admission sampling - Sampling keeps overhead low
 58.10 Progress lag alerting - Lag alert triggers once per threshold
 ---
+59. Additional Manager/Worker Scenarios X
+59.1 Worker lease cancellation - Lease cancellation cleans up pending jobs
+59.2 Dispatch backoff tuning - Backoff adapts to load
+59.3 Progress durability checkpoint - Checkpoints survive restart
+59.4 Result dedupe window - Dedupe window prevents double emit
+59.5 Manager throttle escalation - Throttle escalates under sustained load
+59.6 Worker health dampening - Dampening avoids rapid flips
+59.7 Cancel queue isolation - Cancel queue does not block dispatch
+59.8 Worker metadata compaction - Compaction keeps metadata bounded
+59.9 Retry budget priority - High priority retries retain budget
+59.10 Progress resume sync - Resume sync after worker restart
+---
