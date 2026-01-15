@@ -1601,3 +1601,15 @@ Race Conditions Under Load
 55.9 Dispatch queue spillover - Spillover routes to secondary manager
 55.10 Progress drop detection - Drop detection triggers warning
 ---
+56. Additional Manager/Worker Scenarios VII
+56.1 Dispatch fairness across tenants - Tenant fairness preserved under load
+56.2 Worker shutdown handshake - Graceful shutdown handshake completes
+56.3 Manager backpressure on retries - Retry backlog respects backpressure
+56.4 Progress burst coalescing - Progress bursts coalesce safely
+56.5 Result retry cap - Retry cap avoids infinite loops
+56.6 Worker health probe timeouts - Timeout escalates to suspect
+56.7 Cancel dedupe window - Duplicate cancels ignored
+56.8 Manager metrics lag - Metrics lag does not trip alerts
+56.9 Worker registration retry - Registration retry honors backoff
+56.10 Retry budget hysteresis - Hysteresis avoids oscillation
+---
