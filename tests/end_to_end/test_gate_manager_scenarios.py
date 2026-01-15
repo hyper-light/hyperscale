@@ -296,9 +296,9 @@ def _assert_gate_manager_bullet(bullet: str, runtime: ScenarioRuntime) -> None:
         _assert_field(runtime, field_name, bullet)
     for field_name, method_name in method_refs:
         if field_name in FIELD_TARGETS:
-            _assert_method(runtime, field_name, method_name)
+            _assert_method(runtime, field_name, method_name, bullet)
     for class_name, method_name in class_method_refs:
-        _assert_class_method(runtime, class_name, method_name)
+        _assert_class_method(runtime, class_name, method_name, bullet)
 
     if not field_refs and not method_refs and not class_method_refs:
         matched = _assert_fallbacks(bullet.lower(), runtime)
