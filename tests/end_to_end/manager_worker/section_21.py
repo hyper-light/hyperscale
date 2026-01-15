@@ -417,9 +417,8 @@ async def validate_21_4_end_to_end_latency_spike() -> None:
         if outcome.result != ScenarioResult.PASSED:
             raise AssertionError(outcome.error or "Scenario failed")
         manager = _get_manager(runtime, "DC-A")
-        state = manager._manager_state
-        assert state._overload_detector is not None, (
-            "Latency spike expected overload detector"
+        assert manager._health_monitor is not None, (
+            "Latency spike expected health monitor"
         )
     finally:
         await runtime.stop_cluster()
