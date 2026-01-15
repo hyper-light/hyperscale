@@ -245,17 +245,19 @@ def _get_worker(runtime: ScenarioRuntime):
 def _get_target(runtime: ScenarioRuntime, target_name: str):
     manager = _get_manager(runtime, "DC-A")
     worker = _get_worker(runtime)
-    if target_name == "manager":
-        return manager
-    if target_name == "manager_state":
-        return manager._manager_state
-    if target_name == "worker":
-        return worker
-    if target_name == "worker_state":
-        return worker._worker_state
-    if target_name == "core_allocator":
-        return worker._core_allocator
-    raise AssertionError(f"Unknown target {target_name}")
+    match target_name:
+        case "manager":
+            return manager
+        case "manager_state":
+            return manager._manager_state
+        case "worker":
+            return worker
+        case "worker_state":
+            return worker._worker_state
+        case "core_allocator":
+            return worker._core_allocator
+        case _:
+            raise AssertionError(f"Unknown target {target_name}")
 
 
 def _extract_field_refs(bullet: str) -> list[str]:
