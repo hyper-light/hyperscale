@@ -43,6 +43,8 @@ class ScenarioRunner:
                 log_level=log_level,
                 log_output=log_output,
             )
+        description = spec.description or spec.name
+        print(f"[SCENARIO] {description}")
         runtime = ScenarioRuntime(spec=spec, workflow_registry=self._workflow_registry)
         start = time.monotonic()
         outcome = ScenarioOutcome(
