@@ -310,7 +310,7 @@ def _assert_gate_manager_bullet(bullet: str, runtime: ScenarioRuntime) -> None:
         _assert_class_method(runtime, class_name, method_name, bullet)
 
     if not field_refs and not method_refs and not class_method_refs:
-        matched = _assert_fallbacks(bullet.lower(), runtime)
+        matched = _assert_fallbacks(bullet, runtime)
         if not matched:
             raise AssertionError(f"No explicit assertions for bullet: {bullet}")
 
