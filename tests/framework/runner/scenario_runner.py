@@ -28,6 +28,7 @@ class ScenarioRunner:
             name=spec.name,
             result=ScenarioResult.PASSED,
             duration_seconds=0.0,
+            runtime=runtime,
         )
         try:
             for index, action in enumerate(spec.actions, start=1):
