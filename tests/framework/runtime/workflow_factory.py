@@ -135,7 +135,7 @@ class DynamicWorkflowFactory:
         source = state_spec.get("source")
         factory = self
 
-        async def dynamic_state(self, **kwargs):
+        async def dynamic_state(self, **kwargs) -> Use[object] | Provide[object]:
             if value is not None:
                 return factory._resolve_value(value, kwargs)
             if source:
@@ -152,11 +152,7 @@ class DynamicWorkflowFactory:
             parameters,
             annotations,
         )
-        state_callable = cast(
-            Callable[..., Awaitable[Use[object] | Provide[object]]],
-            dynamic_state,
-        )
-        return state(*workflows)(state_callable)
+        return state(*workflows)(dynamic_state)
 
     def _build_parameters(
         self, param_specs: list[dict[str, Any]]
