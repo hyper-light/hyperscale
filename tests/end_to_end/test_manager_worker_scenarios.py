@@ -237,14 +237,20 @@ def _extract_class_method_refs(bullet: str) -> list[tuple[str, str]]:
 
 def _assert_field(runtime: ScenarioRuntime, field_name: str, bullet: str) -> None:
     if field_name not in FIELD_TARGETS:
-        raise AssertionError(f"Unmapped field '{field_name}' in bullet '{bullet}'")
+        raise AssertionError(
+            f"Bullet '{bullet}' references unmapped field '{field_name}'"
+        )
     target = _get_target(runtime, FIELD_TARGETS[field_name])
-    assert hasattr(target, field_name), f"Expected {target} to have {field_name}"
+    assert hasattr(target, field_name), (
+        f"Bullet '{bullet}' expected {target} to have '{field_name}'"
+    )
     value = getattr(target, field_name)
     if field_name in JOB_KEY_FIELDS:
         job_id = runtime.job_ids.get("job-1") or runtime.last_job_id
         if job_id:
-            assert job_id in value, f"Expected {field_name} to include job {job_id}"
+            assert job_id in value, (
+                f"Bullet '{bullet}' expected {field_name} to include job {job_id}"
+            )
 
 
 def _assert_method(runtime: ScenarioRuntime, field_name: str, method_name: str) -> None:
