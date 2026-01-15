@@ -138,18 +138,18 @@ class DynamicWorkflowFactory:
 
         async def dynamic_state(self, **kwargs) -> Use[object] | Provide[object]:
             if value is not None:
-                return cast(
+                return typing.cast(
                     Use[object] | Provide[object],
                     factory._resolve_value(value, kwargs),
                 )
             if source:
-                return cast(Use[object] | Provide[object], kwargs.get(source))
+                return typing.cast(Use[object] | Provide[object], kwargs.get(source))
             if parameters:
-                return cast(
+                return typing.cast(
                     Use[object] | Provide[object],
                     kwargs.get(parameters[0].name),
                 )
-            return cast(Use[object] | Provide[object], None)
+            return typing.cast(Use[object] | Provide[object], None)
 
         self._apply_function_metadata(
             dynamic_state,
