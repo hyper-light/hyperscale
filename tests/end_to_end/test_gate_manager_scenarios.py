@@ -228,11 +228,20 @@ def _assert_field(runtime: ScenarioRuntime, field_name: str, bullet: str) -> Non
             )
 
 
-def _assert_method(runtime: ScenarioRuntime, field_name: str, method_name: str) -> None:
+def _assert_method(
+    runtime: ScenarioRuntime,
+    field_name: str,
+    method_name: str,
+    bullet: str,
+) -> None:
     target = _get_target(runtime, FIELD_TARGETS[field_name])
     field = getattr(target, field_name)
-    assert hasattr(field, method_name), f"Expected {field_name}.{method_name} to exist"
-    assert callable(getattr(field, method_name))
+    assert hasattr(field, method_name), (
+        f"Bullet '{bullet}' expected {field_name}.{method_name} to exist"
+    )
+    assert callable(getattr(field, method_name)), (
+        f"Bullet '{bullet}' expected {field_name}.{method_name} to be callable"
+    )
 
 
 def _assert_class_method(
