@@ -86,16 +86,6 @@ def _require_runtime(outcome: ScenarioOutcome) -> ScenarioRuntime:
     return runtime
 
 
-def _assert_backpressure_map(runtime: ScenarioRuntime, message: str) -> None:
-    gate = _get_gate(runtime)
-    state = gate._modular_state
-    assert isinstance(state._manager_backpressure, dict), message
-    assert all(
-        isinstance(level, BackpressureLevel)
-        for level in state._manager_backpressure.values()
-    ), "Backpressure map expected BackpressureLevel values"
-
-
 async def validate_5_1_manager_signals_none() -> None:
     spec = _build_spec(
         "gate_manager_5_1_manager_signals_none",
@@ -107,9 +97,15 @@ async def validate_5_1_manager_signals_none() -> None:
     try:
         if outcome.result != ScenarioResult.PASSED:
             raise AssertionError(outcome.error or "Scenario failed")
-        _assert_backpressure_map(
-            runtime, "Manager signals NONE expected _manager_backpressure map"
+        gate = _get_gate(runtime)
+        state = gate._modular_state
+        assert isinstance(state._manager_backpressure, dict), (
+            "Manager signals NONE expected _manager_backpressure map"
         )
+        assert all(
+            isinstance(level, BackpressureLevel)
+            for level in state._manager_backpressure.values()
+        ), "Manager signals NONE expected BackpressureLevel values"
         assert BackpressureLevel.NONE in BackpressureLevel, (
             "Manager signals NONE expected BackpressureLevel.NONE"
         )
