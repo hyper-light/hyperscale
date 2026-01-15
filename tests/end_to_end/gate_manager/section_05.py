@@ -152,8 +152,8 @@ async def validate_5_1_manager_signals_medium() -> None:
         _assert_backpressure_map(
             runtime, "Manager signals MEDIUM expected _manager_backpressure map"
         )
-        assert BackpressureLevel.MEDIUM in BackpressureLevel, (
-            "Manager signals MEDIUM expected BackpressureLevel.MEDIUM"
+        assert BackpressureLevel.BATCH in BackpressureLevel, (
+            "Manager signals MEDIUM expected BackpressureLevel.BATCH"
         )
     finally:
         await runtime.stop_cluster()
