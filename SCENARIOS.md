@@ -830,6 +830,34 @@ Manager <-> Worker Scenarios (Comprehensive)
 - Worker state sync after restart - Pending workflows and cancel events restored
 - Circuit breaker oscillation - Manager circuit breaker flaps under intermittent worker failures
 - Result integrity on restart - Partial workflow completion across worker restarts
+20.5 Scheduling and Fairness
+- Starvation prevention - Mixed workflow sizes avoid starvation
+- Uneven core fairness - Fairness across workers with uneven cores
+- Priority inversion - Low-priority holds scarce cores
+20.6 Dispatch and Acks
+- Duplicate dispatch ACKs - Idempotent handling of ACKs
+- ACK without execution - Worker crashes after ACK, before run
+- Re-dispatch after partial execution - Resume with partial metadata
+20.7 Progress and Backpressure
+- Progress buffer overflow recovery - Recover after overflow
+- Progress jitter smoothing - Smooth bursty update timing
+- Backpressure de-escalation hysteresis - Avoid flapping
+20.8 Retry and Timeout Semantics
+- Retry budget reset on failover - Manager failover resets budget safely
+- Extension early completion - Extension granted but worker finishes early
+- Overlapping retry windows - Multiple retry windows per workflow
+20.9 Worker Health and Recovery
+- Health restored mid-dispatch - Avoid double scheduling
+- Zombie late progress - Late progress ignored safely
+- GC pause false positive - Health monitor tolerates GC pause
+20.10 Result Integrity and Validation
+- Result dedupe across restarts - Avoid duplicate final results
+- Result merge after retries - Merge partial outputs safely
+- Result schema change - Validation handles schema changes
+20.11 State Sync and Consistency
+- Snapshot with in-flight dispatches - State snapshot applied safely
+- Restore pending cancellations - Worker restores cancel events
+- Stale state version rejection - Reject stale state on reconnect
 ---
 
 Manager <-> Worker Scenarios (Comprehensive)
