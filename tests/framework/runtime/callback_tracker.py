@@ -1,6 +1,3 @@
-import asyncio
-
-
 class CallbackTracker:
     def __init__(self) -> None:
         self.status_updates: list = []
