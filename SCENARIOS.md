@@ -1709,3 +1709,15 @@ Race Conditions Under Load
 64.9 Dispatch admission burst - Burst handled without starvation
 64.10 Progress ack reorder - Reorder handled without regression
 ---
+65. Additional Manager/Worker Scenarios XVI
+65.1 Worker lease rebalance - Rebalance does not double-assign
+65.2 Dispatch retry spillover - Spillover uses least-loaded worker
+65.3 Progress snapshot dedupe - Dedupe avoids double-counting
+65.4 Result ack escalation - Escalation triggers circuit breaker
+65.5 Manager load shed sampling - Sampling keeps shed decisions stable
+65.6 Worker health probe retry - Retry does not spam network
+65.7 Cancel ack timeout - Timeout triggers resend
+65.8 Worker metadata reconciliation - Reconciliation resolves conflicts
+65.9 Dispatch fairness across priorities - Priorities respected under load
+65.10 Progress resume ordering - Resume ordering stays monotonic
+---
