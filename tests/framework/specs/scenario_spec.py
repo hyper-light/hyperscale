@@ -15,6 +15,7 @@ class ScenarioSpec:
     timeouts: dict[str, float]
     default_action_timeout_seconds: float | None
     scenario_timeout_seconds: float | None
+    logging: dict[str, str] | None
 
     @classmethod
     def from_dict(cls, data: dict) -> "ScenarioSpec":
