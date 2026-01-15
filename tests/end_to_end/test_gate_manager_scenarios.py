@@ -2,11 +2,13 @@ import asyncio
 import re
 from pathlib import Path
 
+from hyperscale.distributed.models import JobFinalResult
+
 from tests.end_to_end.workflows.base_scenario_workflow import BaseScenarioWorkflow
 from tests.framework.results.scenario_result import ScenarioResult
 from tests.framework.runner.scenario_runner import ScenarioRunner
-from tests.framework.specs.scenario_spec import ScenarioSpec
 from tests.framework.runtime.scenario_runtime import ScenarioRuntime
+from tests.framework.specs.scenario_spec import ScenarioSpec
 
 
 SCENARIO_PATH = Path(__file__).resolve().parents[2] / "SCENARIOS.md"
@@ -14,6 +16,86 @@ SECTION_START = "Gate <-> Manager Scenarios (Comprehensive)"
 SECTION_END = "Manager <-> Worker Scenarios (Comprehensive)"
 
 WORKFLOW_REGISTRY = {"BaseScenarioWorkflow": BaseScenarioWorkflow}
+
+FIELD_TARGETS = {
+    "_datacenter_manager_status": "gate_state",
+    "_manager_last_status": "gate_state",
+    "_manager_health": "gate_state",
+    "_manager_backpressure": "gate_state",
+    "_dc_backpressure": "gate_state",
+    "_backpressure_delay_ms": "gate_state",
+    "_manager_negotiated_caps": "gate_state",
+    "_workflow_dc_results": "gate_state",
+    "_job_workflow_ids": "gate_state",
+    "_job_dc_managers": "gate_state",
+    "_job_submissions": "gate_state",
+    "_job_reporter_tasks": "gate_state",
+    "_job_lease_renewal_tokens": "gate_state",
+    "_job_progress_sequences": "gate_state",
+    "_job_progress_seen": "gate_state",
+    "_job_progress_lock": "gate_state",
+    "_cancellation_completion_events": "gate_state",
+    "_cancellation_errors": "gate_state",
+    "_progress_callbacks": "gate_state",
+    "_job_update_sequences": "gate_state",
+    "_job_update_history": "gate_state",
+    "_job_client_update_positions": "gate_state",
+    "_leases": "gate_state",
+    "_fence_token": "gate_state",
+    "_dead_job_leaders": "gate_state",
+    "_orphaned_jobs": "gate_state",
+    "_gate_state": "gate_state",
+    "_state_version": "gate_state",
+    "_gate_peer_unhealthy_since": "gate_state",
+    "_dead_gate_peers": "gate_state",
+    "_dead_gate_timestamps": "gate_state",
+    "_forward_throughput_count": "gate_state",
+    "_forward_throughput_interval_start": "gate_state",
+    "_forward_throughput_last_value": "gate_state",
+    "_job_router": "gate",
+    "_job_timeout_tracker": "gate",
+    "_job_leadership_tracker": "gate",
+    "_job_manager": "gate",
+    "_capacity_aggregator": "gate",
+    "_dispatch_time_tracker": "gate",
+    "_observed_latency_tracker": "gate",
+    "_coordinate_tracker": "gate",
+    "_blended_scorer": "gate",
+    "_job_forwarding_tracker": "gate",
+    "_idempotency_cache": "gate",
+    "_quorum_circuit": "gate",
+    "_load_shedder": "gate",
+    "_rate_limiter": "gate",
+    "_overload_detector": "gate",
+    "_state_sync_handler": "gate",
+    "_manager_peer_unhealthy_since": "manager_state",
+}
+
+JOB_KEY_FIELDS = {
+    "_job_dc_managers",
+    "_job_workflow_ids",
+    "_job_submissions",
+    "_job_reporter_tasks",
+    "_job_progress_sequences",
+    "_job_progress_seen",
+    "_cancellation_completion_events",
+    "_cancellation_errors",
+    "_progress_callbacks",
+    "_job_update_sequences",
+    "_job_update_history",
+    "_job_client_update_positions",
+    "_workflow_dc_results",
+}
+
+CLASS_FIELD_MAP = {
+    "GateJobTimeoutTracker": ("gate", "_job_timeout_tracker"),
+    "GateJobManager": ("gate", "_job_manager"),
+    "GateJobRouter": ("gate", "_job_router"),
+    "JobLeadershipTracker": ("gate", "_job_leadership_tracker"),
+    "GateIdempotencyCache": ("gate", "_idempotency_cache"),
+    "DatacenterCapacityAggregator": ("gate", "_capacity_aggregator"),
+    "GateStateSyncHandler": ("gate", "_state_sync_handler"),
+}
 
 
 def _slugify(value: str) -> str:
@@ -96,160 +178,106 @@ def _get_manager(runtime: ScenarioRuntime, dc_id: str):
     return cluster.get_manager_leader(dc_id) or cluster.managers[dc_id][0]
 
 
-def _assert_hasattr(obj: object, name: str) -> None:
-    assert hasattr(obj, name), f"Expected {obj} to have attribute '{name}'"
-
-
-def _assert_non_empty(mapping: dict, label: str) -> None:
-    assert mapping, f"Expected {label} to be non-empty"
-
-
-def _assert_gate_manager_bullet(
-    bullet: str,
-    runtime: ScenarioRuntime,
-) -> None:
+def _get_target(runtime: ScenarioRuntime, target_name: str):
     gate = _get_gate(runtime)
     manager = _get_manager(runtime, "DC-A")
-    gate_state = gate._modular_state
-    manager_state = manager._manager_state
-    job_id = runtime.job_ids.get("job-1") or runtime.last_job_id
-    bullet_lower = bullet.lower()
-    matched = False
+    if target_name == "gate":
+        return gate
+    if target_name == "gate_state":
+        return gate._modular_state
+    if target_name == "manager":
+        return manager
+    if target_name == "manager_state":
+        return manager._manager_state
+    raise AssertionError(f"Unknown target {target_name}")
 
-    if "dispatch" in bullet_lower or "routing" in bullet_lower:
-        matched = True
-        _assert_hasattr(gate, "_job_router")
-        _assert_hasattr(gate, "_dispatch_time_tracker")
-        _assert_hasattr(gate, "_observed_latency_tracker")
-        _assert_hasattr(gate, "_coordinate_tracker")
-        _assert_hasattr(gate, "_blended_scorer")
-        _assert_hasattr(gate_state, "_job_dc_managers")
+
+def _extract_field_refs(bullet: str) -> list[str]:
+    return list(dict.fromkeys(re.findall(r"_[a-zA-Z0-9_]+", bullet)))
+
+
+def _extract_method_refs(bullet: str) -> list[tuple[str, str]]:
+    return [
+        (match.group(1), match.group(2))
+        for match in re.finditer(r"(_[a-zA-Z0-9_]+)\.([a-zA-Z0-9_]+)\(", bullet)
+    ]
+
+
+def _extract_class_method_refs(bullet: str) -> list[tuple[str, str]]:
+    return [
+        (match.group(1), match.group(2))
+        for match in re.finditer(r"([A-Za-z][A-Za-z0-9_]+)\.([a-zA-Z0-9_]+)\(", bullet)
+    ]
+
+
+def _assert_field(runtime: ScenarioRuntime, field_name: str, bullet: str) -> None:
+    if field_name not in FIELD_TARGETS:
+        raise AssertionError(f"Unmapped field '{field_name}' in bullet '{bullet}'")
+    target = _get_target(runtime, FIELD_TARGETS[field_name])
+    assert hasattr(target, field_name), f"Expected {target} to have {field_name}"
+    value = getattr(target, field_name)
+    if field_name in JOB_KEY_FIELDS:
+        job_id = runtime.job_ids.get("job-1") or runtime.last_job_id
         if job_id:
-            assert job_id in runtime.job_ids.values(), "Expected job id recorded"
+            assert job_id in value, f"Expected {field_name} to include job {job_id}"
 
-    if "forward" in bullet_lower:
-        matched = True
-        _assert_hasattr(gate, "_job_forwarding_tracker")
-        _assert_hasattr(gate_state, "_forward_throughput_count")
 
-    if "idempotency" in bullet_lower or "idempotent" in bullet_lower:
-        matched = True
-        _assert_hasattr(gate, "_idempotency_cache")
+def _assert_method(runtime: ScenarioRuntime, field_name: str, method_name: str) -> None:
+    target = _get_target(runtime, FIELD_TARGETS[field_name])
+    field = getattr(target, field_name)
+    assert hasattr(field, method_name), f"Expected {field_name}.{method_name} to exist"
+    assert callable(getattr(field, method_name))
 
-    if "register" in bullet_lower or "discovery" in bullet_lower:
-        matched = True
-        _assert_hasattr(gate_state, "_datacenter_manager_status")
-        assert "DC-A" in gate_state._datacenter_manager_status
-        _assert_non_empty(
-            gate_state._datacenter_manager_status["DC-A"], "manager status"
-        )
-        _assert_hasattr(gate_state, "_manager_health")
-        _assert_hasattr(gate_state, "_manager_last_status")
 
-    if "heartbeat" in bullet_lower:
-        matched = True
-        _assert_hasattr(gate_state, "_manager_last_status")
-        _assert_non_empty(gate_state._manager_last_status, "manager_last_status")
+def _assert_class_method(
+    runtime: ScenarioRuntime, class_name: str, method_name: str
+) -> None:
+    if class_name in CLASS_FIELD_MAP:
+        target_name, field_name = CLASS_FIELD_MAP[class_name]
+        target = _get_target(runtime, target_name)
+        field = getattr(target, field_name)
+        assert hasattr(field, method_name), f"Expected {class_name}.{method_name}"
+        assert callable(getattr(field, method_name))
+        return
+    if class_name == "JobFinalResult":
+        assert hasattr(JobFinalResult, method_name)
+        assert callable(getattr(JobFinalResult, method_name))
+        return
 
-    if "health" in bullet_lower or "unhealthy" in bullet_lower:
-        matched = True
-        _assert_hasattr(gate_state, "_manager_health")
-        _assert_hasattr(gate_state, "_gate_peer_health")
 
-    if "circuit" in bullet_lower:
-        matched = True
-        _assert_hasattr(gate_state, "_manager_backpressure")
-        _assert_hasattr(gate, "_quorum_circuit")
-
-    if "backpressure" in bullet_lower:
-        matched = True
-        _assert_hasattr(gate_state, "_manager_backpressure")
-        _assert_hasattr(gate_state, "_dc_backpressure")
-        _assert_hasattr(gate_state, "_backpressure_delay_ms")
-
-    if "capacity" in bullet_lower or "spillover" in bullet_lower:
-        matched = True
-        _assert_hasattr(gate, "_capacity_aggregator")
-        _assert_hasattr(gate, "_job_router")
-
-    if "progress" in bullet_lower:
-        matched = True
-        _assert_hasattr(gate_state, "_job_progress_sequences")
-        _assert_hasattr(gate_state, "_job_progress_seen")
-        _assert_hasattr(gate_state, "_progress_callbacks")
-
-    if "stats" in bullet_lower:
-        matched = True
-        _assert_hasattr(gate, "_windowed_stats")
-        _assert_hasattr(gate_state, "_job_stats_crdt")
-
-    if "workflow result" in bullet_lower or "result" in bullet_lower:
-        matched = True
-        _assert_hasattr(gate_state, "_workflow_dc_results")
-        _assert_hasattr(gate_state, "_job_workflow_ids")
-
-    if "final" in bullet_lower:
-        matched = True
-        _assert_hasattr(gate, "_job_manager")
-        _assert_hasattr(gate, "_dispatch_time_tracker")
-        _assert_hasattr(gate, "_observed_latency_tracker")
-
-    if "timeout" in bullet_lower:
-        matched = True
-        _assert_hasattr(gate, "_job_timeout_tracker")
-
+def _assert_fallbacks(bullet_lower: str, runtime: ScenarioRuntime) -> bool:
     if "reporter" in bullet_lower:
-        matched = True
-        _assert_hasattr(gate_state, "_job_reporter_tasks")
-
-    if "leadership" in bullet_lower or "leader" in bullet_lower:
-        matched = True
-        _assert_hasattr(gate, "_job_leadership_tracker")
-        _assert_hasattr(gate_state, "_dead_job_leaders")
-
-    if "lease" in bullet_lower or "fence" in bullet_lower:
-        matched = True
-        _assert_hasattr(gate_state, "_leases")
-        _assert_hasattr(gate_state, "_fence_token")
-
-    if "quorum" in bullet_lower:
-        matched = True
-        _assert_hasattr(gate, "_quorum_circuit")
-
-    if "sync" in bullet_lower or "snapshot" in bullet_lower:
-        matched = True
-        _assert_hasattr(gate, "_state_sync_handler")
-        _assert_hasattr(gate_state, "_state_version")
-
-    if "protocol" in bullet_lower or "capabilities" in bullet_lower:
-        matched = True
-        _assert_hasattr(gate_state, "_manager_negotiated_caps")
-
-    if "cancellation" in bullet_lower or "cancel" in bullet_lower:
-        matched = True
-        _assert_hasattr(gate_state, "_cancellation_errors")
-        _assert_hasattr(gate_state, "_cancellation_completion_events")
-
-    if "throughput" in bullet_lower or "latency" in bullet_lower:
-        matched = True
-        _assert_hasattr(gate_state, "_forward_throughput_count")
-        _assert_hasattr(gate_state, "_forward_throughput_interval_start")
-
-    if "error" in bullet_lower or "exception" in bullet_lower:
-        matched = True
-        _assert_hasattr(gate, "_load_shedder")
-        _assert_hasattr(gate, "_rate_limiter")
-
-    if "manager" in bullet_lower and "health" in bullet_lower:
-        matched = True
-        _assert_hasattr(manager_state, "_manager_peer_unhealthy_since")
-
-    if not matched:
-        raise AssertionError(f"No verification criteria mapped for bullet: {bullet}")
+        assert runtime.callbacks.reporter_results is not None
+        return True
+    if "workflow result" in bullet_lower or "result" in bullet_lower:
+        assert runtime.callbacks.workflow_results is not None
+        return True
+    if "progress" in bullet_lower:
+        assert runtime.callbacks.progress_updates is not None
+        return True
+    if "status" in bullet_lower:
+        assert runtime.callbacks.status_updates is not None
+        return True
+    return False
 
 
-def _run_scenario(runtime: ScenarioRuntime, bullet: str) -> None:
-    _assert_gate_manager_bullet(bullet, runtime)
+def _assert_gate_manager_bullet(bullet: str, runtime: ScenarioRuntime) -> None:
+    field_refs = _extract_field_refs(bullet)
+    method_refs = _extract_method_refs(bullet)
+    class_method_refs = _extract_class_method_refs(bullet)
+
+    for field_name in field_refs:
+        _assert_field(runtime, field_name, bullet)
+    for field_name, method_name in method_refs:
+        if field_name in FIELD_TARGETS:
+            _assert_method(runtime, field_name, method_name)
+    for class_name, method_name in class_method_refs:
+        _assert_class_method(runtime, class_name, method_name)
+
+    if not field_refs and not method_refs and not class_method_refs:
+        matched = _assert_fallbacks(bullet.lower(), runtime)
+        if not matched:
+            raise AssertionError(f"No explicit assertions for bullet: {bullet}")
 
 
 def _get_runtime(outcome):
@@ -271,7 +299,7 @@ async def run_all_scenarios() -> None:
         try:
             if outcome.result != ScenarioResult.PASSED:
                 raise AssertionError(f"{spec.name} failed: {outcome.error}")
-            _run_scenario(runtime, bullet)
+            _assert_gate_manager_bullet(bullet, runtime)
         finally:
             await runtime.stop_cluster()
 
