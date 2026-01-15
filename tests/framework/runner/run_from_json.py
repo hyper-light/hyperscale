@@ -14,12 +14,3 @@ def run_from_json(path: str, workflow_registry: dict) -> ScenarioOutcome:
     if outcome.result != ScenarioResult.PASSED:
         raise AssertionError(outcome.error or "Scenario failed")
     return outcome
-
-
-async def run_from_json_async(path: str, workflow_registry: dict) -> ScenarioOutcome:
-    spec = ScenarioSpec.from_json(Path(path))
-    runner = ScenarioRunner(workflow_registry)
-    outcome = await runner.run(spec)
-    if outcome.result != ScenarioResult.PASSED:
-        raise AssertionError(outcome.error or "Scenario failed")
-    return outcome
