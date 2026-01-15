@@ -253,6 +253,8 @@ def _get_target(runtime: ScenarioRuntime, target_name: str):
         return worker
     if target_name == "worker_state":
         return worker._worker_state
+    if target_name == "core_allocator":
+        return worker._core_allocator
     raise AssertionError(f"Unknown target {target_name}")
 
 
