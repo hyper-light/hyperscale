@@ -1,6 +1,8 @@
 import asyncio
 import time
 
+from hyperscale.logging.config import LoggingConfig
+
 from tests.framework.actions.default_registry import build_default_registry
 from tests.framework.results.scenario_outcome import ScenarioOutcome
 from tests.framework.results.scenario_result import ScenarioResult
