@@ -10,10 +10,11 @@ async def run(runtime: ScenarioRuntime, action: ActionSpec) -> ActionOutcome:
     start = time.monotonic()
     cluster = runtime.require_cluster()
     workflow_instances = action.params.get("workflow_instances")
+    workflows: list[tuple[list[str], object]] = []
     if workflow_instances:
-        workflows: list[tuple[list[str], object]] = DynamicWorkflowFactory(
-            runtime.workflow_registry
-        ).build_workflows(workflow_instances)
+        workflows = DynamicWorkflowFactory(runtime.workflow_registry).build_workflows(
+            workflow_instances
+        )
     else:
         workflow_names = action.params.get("workflows") or []
         if isinstance(workflow_names, str):
@@ -22,10 +23,10 @@ async def run(runtime: ScenarioRuntime, action: ActionSpec) -> ActionOutcome:
             workflow_name = action.params.get("workflow")
             if workflow_name:
                 workflow_names = [workflow_name]
-        workflows = []
         for name in workflow_names:
             workflow_class = runtime.resolve_workflow(name)
             workflows.append(([], workflow_class()))
+
     vus = int(action.params.get("vus", 1))
     timeout_seconds = float(action.params.get("timeout_seconds", 300.0))
     datacenter_count = int(action.params.get("datacenter_count", 1))
