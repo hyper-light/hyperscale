@@ -184,6 +184,7 @@ class TestWorkflowDispatchHandler:
 
         ack = WorkflowDispatchAck.load(result)
         assert ack.accepted is False
+        assert ack.error is not None
         assert "Stale fence token" in ack.error
 
     @pytest.mark.asyncio
@@ -215,6 +216,7 @@ class TestWorkflowDispatchHandler:
 
         ack = WorkflowDispatchAck.load(result)
         assert ack.accepted is False
+        assert ack.error is not None
         assert "Queue depth limit" in ack.error
 
     @pytest.mark.asyncio
