@@ -95,6 +95,10 @@ FIELD_TARGETS = {
     "_load_shedder": "manager",
     "_rate_limiter": "manager",
     "_core_allocator": "worker",
+    "_core_assignments": "core_allocator",
+    "_workflow_cores": "core_allocator",
+    "_available_cores": "core_allocator",
+    "_cores_available": "core_allocator",
 }
 
 KEYWORD_REQUIREMENTS = {
