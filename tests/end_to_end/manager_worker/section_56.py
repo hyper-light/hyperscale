@@ -156,7 +156,8 @@ async def validate_56_4_progress_burst_coalescing() -> None:
     runtime = _require_runtime(outcome)
     try:
         if outcome.result != ScenarioResult.PASSED:
-            raise AssertionError(outcome.error or "Scenario failed")n        manager = _get_manager(runtime, "DC-A")
+            raise AssertionError(outcome.error or "Scenario failed")
+        manager = _get_manager(runtime, "DC-A")
         state = manager._manager_state
         assert isinstance(state._worker_job_last_progress, dict), (
             "Progress coalescing expected worker job progress"
