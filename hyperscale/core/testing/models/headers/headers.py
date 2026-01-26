@@ -52,11 +52,10 @@ class Headers(Generic[T], OptimizedArg):
                     **self.data,
                 }
 
-                optimized: str = ""
-                for key, value in header_items.items():
-                    optimized += f"{key}: {value}{NEW_LINE}"
-
-                self.optimized = optimized
+                header_parts = [
+                    f"{key}: {value}" for key, value in header_items.items()
+                ]
+                self.optimized = NEW_LINE.join(header_parts) + NEW_LINE
 
             case RequestType.GRAPHQL_HTTP2 | RequestType.HTTP2 | RequestType.HTTP3:
                 encoded_headers = [

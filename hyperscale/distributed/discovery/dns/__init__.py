@@ -1,1 +1,11 @@
-from .registrar import Registrar
+"""DNS resolution components for the discovery system."""
+
+from hyperscale.distributed.discovery.dns.negative_cache import (
+    NegativeCache as NegativeCache,
+    NegativeEntry as NegativeEntry,
+)
+from hyperscale.distributed.discovery.dns.resolver import (
+    AsyncDNSResolver as AsyncDNSResolver,
+    DNSResult as DNSResult,
+    DNSError as DNSError,
+)

@@ -11,6 +11,7 @@ except Exception:
 
 from pydantic import (
     BaseModel,
+    ConfigDict,
     StrictBool,
     StrictFloat,
     StrictInt,
@@ -19,6 +20,8 @@ from pydantic import (
 
 
 class ClickCommand(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     selector: StrictStr
     modifiers: Optional[
         Sequence[Literal["Alt", "Control", "ControlOrMeta", "Meta", "Shift"]]
@@ -32,6 +35,3 @@ class ClickCommand(BaseModel):
     no_wait_after: Optional[StrictBool] = None
     strict: Optional[StrictBool] = None
     trial: Optional[StrictBool] = None
-
-    class Config:
-        arbitrary_types_allowed = True

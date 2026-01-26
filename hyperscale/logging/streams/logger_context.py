@@ -1,7 +1,9 @@
 import asyncio
 import os
+from typing import Any, Literal, TypeVar
 
-from typing import TypeVar, Any
+from hyperscale.logging.config.durability_mode import DurabilityMode
+
 from .logger_stream import LoggerStream
 from .retention_policy import (
     RetentionPolicy,
@@ -9,7 +11,7 @@ from .retention_policy import (
 )
 
 
-T = TypeVar('T')
+T = TypeVar("T")
 
 
 class LoggerContext:
@@ -22,9 +24,17 @@ class LoggerContext:
         retention_policy: RetentionPolicyConfig | None = None,
         nested: bool = False,
         models: dict[
-            type[T],
-            dict[str, Any],
-        ] | None = None,
+            str,
+            tuple[
+                type[T],
+                dict[str, Any],
+            ],
+        ]
+        | None = None,
+        durability: DurabilityMode = DurabilityMode.FLUSH,
+        log_format: Literal["json", "binary"] = "json",
+        enable_lsn: bool = False,
+        instance_id: int = 0,
     ) -> None:
         self.name = name
         self.template = template
@@ -38,6 +48,10 @@ class LoggerContext:
             directory=directory,
             retention_policy=retention_policy,
             models=models,
+            durability=durability,
+            log_format=log_format,
+            enable_lsn=enable_lsn,
+            instance_id=instance_id,
         )
         self.nested = nested
 
@@ -60,9 +74,9 @@ class LoggerContext:
             )
 
         if self.retention_policy and self.filename is None:
-
             filename = "logs.json"
-            directory = os.path.join(self.stream._cwd, "logs")
+            cwd = self.stream._cwd if self.stream._cwd else os.getcwd()
+            directory = os.path.join(cwd, "logs")
             logfile_path = os.path.join(directory, filename)
 
             policy = RetentionPolicy(self.retention_policy)
@@ -74,4 +88,6 @@ class LoggerContext:
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         if self.nested is False:
-            await self.stream.close(shutdown_subscribed=self.stream.has_active_subscriptions)
+            await self.stream.close(
+                shutdown_subscribed=self.stream.has_active_subscriptions
+            )

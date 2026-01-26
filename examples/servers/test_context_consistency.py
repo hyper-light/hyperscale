@@ -27,11 +27,11 @@ from hyperscale.core.state.state import state
 from hyperscale.core.state.provide import Provide
 from hyperscale.core.state.use import Use
 from hyperscale.testing import URL, HTTPResponse
-from hyperscale.distributed_rewrite.nodes.manager import ManagerServer
-from hyperscale.distributed_rewrite.nodes.worker import WorkerServer
-from hyperscale.distributed_rewrite.nodes.client import HyperscaleClient
-from hyperscale.distributed_rewrite.env.env import Env
-from hyperscale.distributed_rewrite.models import ManagerState, JobStatus
+from hyperscale.distributed.nodes.manager import ManagerServer
+from hyperscale.distributed.nodes.worker import WorkerServer
+from hyperscale.distributed.nodes.client import HyperscaleClient
+from hyperscale.distributed.env.env import Env
+from hyperscale.distributed.models import ManagerState, JobStatus
 from hyperscale.logging.config.logging_config import LoggingConfig
 
 # Initialize logging directory (required for server pool)

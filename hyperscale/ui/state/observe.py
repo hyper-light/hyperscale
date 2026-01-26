@@ -1,9 +1,9 @@
 import asyncio
 from collections import defaultdict
-from typing import TypeVar, Any
+from typing import Callable, TypeVar, Any
 from .state_types import ActionData, Action
 from .subscription_set import (
-    SubscriptionSet, 
+    SubscriptionSet,
 )
 
 
@@ -17,6 +17,7 @@ def observe(
     trigger: Action[K, T],
     subscriptions: SubscriptionSet,
     default_channel: str | None = None,
+    on_update: Callable[[], None] | None = None,
 ) -> Action[K, T]:
     if default_channel is None:
         default_channel = trigger.__name__
@@ -32,7 +33,7 @@ def observe(
 
         if len(kwargs) > 0:
             subscriptions.last_kwargs.data[trigger.__name__] = kwargs
-        
+
         result = await trigger(*args, **kwargs)
 
         channel = default_channel
@@ -50,6 +51,10 @@ def observe(
             await asyncio.gather(
                 *[update(data) for update in updates], return_exceptions=True
             )
+
+            # Signal that an update occurred so the render loop can wake up
+            if on_update is not None:
+                on_update()
 
         return result
 

@@ -74,7 +74,8 @@ class TCPProtocol(FlowControlMixin, Protocol):
             }
             if self._source_traceback:
                 context["source_traceback"] = self._source_traceback
-            self._loop.call_exception_handler(context)
+            if self._loop is not None:
+                self._loop.call_exception_handler(context)
             transport.abort()
             return
         self._transport = transport

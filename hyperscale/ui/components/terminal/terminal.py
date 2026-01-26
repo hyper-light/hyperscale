@@ -97,6 +97,7 @@ async def handle_resize(engine: Terminal):
 class Terminal:
     _actions: List[tuple[Action[Any, ActionData], str | None]] = []
     _updates = SubscriptionSet()
+    _render_event: asyncio.Event | None = None
 
     def __init__(
         self,
@@ -136,6 +137,10 @@ class Terminal:
         # custom handlers set by ``sigmap`` at the cleanup phase.
         self._dfl_sigmap: dict[signal.Signals, SignalHandlers] = {}
 
+        # Pre-encoded ANSI sequences for efficiency
+        self._frame_prefix = b"\033[3J\033[H"
+        self._frame_suffix = b"\n"
+
         components: dict[str, tuple[list[str], Action[ActionData, ActionData]]] = {}
 
         for action, default_channel in self._actions:
@@ -165,6 +170,12 @@ class Terminal:
                 self._updates.add_topic(subscription, [update])
 
     @classmethod
+    def trigger_render(cls):
+        """Signal the render loop to wake up and re-render immediately."""
+        if cls._render_event is not None and not cls._render_event.is_set():
+            cls._render_event.set()
+
+    @classmethod
     def wrap_action(
         cls,
         func: Action[K, T],
@@ -175,6 +186,7 @@ class Terminal:
             func,
             cls._updates,
             default_channel=default_channel,
+            on_update=cls.trigger_render,
         )
 
     async def set_component_active(self, component_name: str):
@@ -349,24 +361,55 @@ class Terminal:
     async def _execute_render_loop(self):
         await self._clear_terminal(force=True)
 
+        # Initialize the class-level render event
+        Terminal._render_event = asyncio.Event()
+
+        # Initial render
+        try:
+            await self._stdout_lock.acquire()
+
+            frame = await self.canvas.render()
+
+            self._writer.write(self._frame_prefix)
+            self._writer.write(frame.encode())
+            self._writer.write(self._frame_suffix)
+            await self._writer.drain()
+
+        except Exception:
+            pass
+
+        finally:
+            if self._stdout_lock.locked():
+                self._stdout_lock.release()
+
+        # Wait for action triggers to re-render
         while not self._stop_run.is_set():
+            await Terminal._render_event.wait()
+            Terminal._render_event.clear()
+
+            if self._stop_run.is_set():
+                break
+
+            # Coalesce rapid triggers - wait briefly to batch multiple events
+            await asyncio.sleep(0)
+            Terminal._render_event.clear()
+
             try:
                 await self._stdout_lock.acquire()
 
                 frame = await self.canvas.render()
 
-                frame = f"\033[3J\033[H{frame}\n".encode()
-                self._writer.write(frame)
+                self._writer.write(self._frame_prefix)
+                self._writer.write(frame.encode())
+                self._writer.write(self._frame_suffix)
                 await self._writer.drain()
-
-                if self._stdout_lock.locked():
-                    self._stdout_lock.release()
 
             except Exception:
                 pass
 
-                # Wait
-            await asyncio.sleep(self._interval)
+            finally:
+                if self._stdout_lock.locked():
+                    self._stdout_lock.release()
 
     async def _show_cursor(self):
         if await self._loop.run_in_executor(None, self._stdout.isatty):
@@ -411,6 +454,9 @@ class Terminal:
         if not self._stop_run.is_set():
             self._stop_run.set()
 
+        # Wake up the render loop so it can exit
+        Terminal.trigger_render()
+
         try:
             await self._spin_thread
 
@@ -421,8 +467,6 @@ class Terminal:
             await self._run_engine
         except Exception:
             pass
-
-        await self._clear_terminal(force=True)
 
     async def resume(self):
         try:
@@ -450,6 +494,9 @@ class Terminal:
 
         self._stop_run.set()
 
+        # Wake up the render loop so it can exit
+        Terminal.trigger_render()
+
         try:
             await self._spin_thread
 
@@ -463,8 +510,9 @@ class Terminal:
 
         frame = await self.canvas.render()
 
-        frame = f"\033[3J\033[H{frame}\n".encode()
-        self._writer.write(frame)
+        self._writer.write(self._frame_prefix)
+        self._writer.write(frame.encode())
+        self._writer.write(self._frame_suffix)
         await self._writer.drain()
 
         try:
@@ -488,6 +536,9 @@ class Terminal:
 
         self._stop_run.set()
 
+        # Wake up the render loop so it can exit
+        Terminal.trigger_render()
+
         try:
             self._spin_thread.cancel()
             await asyncio.sleep(0)
@@ -506,8 +557,9 @@ class Terminal:
 
         frame = await self.canvas.render()
 
-        frame = f"\033[3J\033[H{frame}\n".encode()
-        self._writer.write(frame)
+        self._writer.write(self._frame_prefix)
+        self._writer.write(frame.encode())
+        self._writer.write(self._frame_suffix)
         await self._writer.drain()
 
         try:
@@ -533,3 +585,26 @@ class Terminal:
         self._loop.add_signal_handler(
             signal.SIGWINCH, lambda: asyncio.create_task(handle_resize(self))
         )
+
+        # Store the original SIGINT handler so we can restore and re-raise
+        self._dfl_sigmap[signal.SIGINT] = signal.getsignal(signal.SIGINT)
+
+        self._loop.add_signal_handler(
+            signal.SIGINT, lambda: asyncio.create_task(self._handle_keyboard_interrupt())
+        )
+
+    async def _handle_keyboard_interrupt(self):
+        """Handle keyboard interrupt by aborting the terminal and re-sending SIGINT."""
+        try:
+            await self.abort()
+        except Exception:
+            pass
+
+        # Restore the default SIGINT handler
+        if signal.SIGINT in self._dfl_sigmap:
+            original_handler = self._dfl_sigmap[signal.SIGINT]
+            if original_handler is not None:
+                signal.signal(signal.SIGINT, original_handler)
+
+        # Re-send SIGINT to ourselves so the signal propagates correctly
+        os.kill(os.getpid(), signal.SIGINT)

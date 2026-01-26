@@ -19,7 +19,7 @@ class ImportType(Generic[T]):
         data_type: ImportType[T],
     ):
         super().__init__()
-        self.data: dict[str, T] | None = None
+        self.data: dict[str, type[T]] | None = None
 
         conversion_types: list[T] = reduce_pattern_type(data_type)
 

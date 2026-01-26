@@ -17,6 +17,7 @@ import asyncio
 import sys
 import time
 from dataclasses import dataclass
+import inspect
 
 # Add project root to path
 sys.path.insert(0, '/home/ada/Projects/hyperscale')
@@ -79,7 +80,7 @@ def test(name: str):
     def decorator(func):
         async def wrapper():
             try:
-                await func() if asyncio.iscoroutinefunction(func) else func()
+                await func() if inspect.iscoroutinefunction(func) else func()
                 results.record_pass(name)
             except AssertionError as e:
                 results.record_fail(name, str(e))

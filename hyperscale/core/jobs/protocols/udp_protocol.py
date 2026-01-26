@@ -6,6 +6,7 @@ import pickle
 import signal
 import socket
 import ssl
+import time
 import uuid
 from collections import defaultdict, deque
 from typing import (
@@ -26,13 +27,13 @@ from typing import (
 import cloudpickle
 import zstandard
 
+from .constants import MAX_DECOMPRESSED_SIZE
 from hyperscale.core.engines.client.time_parser import TimeParser
 from hyperscale.core.engines.client.udp.protocols.dtls import do_patch
 from hyperscale.core.jobs.data_structures import LockedSet
 from hyperscale.core.jobs.hooks.hook_type import HookType
-from hyperscale.core.jobs.models import Env, Message
+from hyperscale.core.jobs.models import Env, JobContext, Message
 from hyperscale.core.jobs.tasks import TaskRunner
-from hyperscale.core.snowflake import Snowflake
 from hyperscale.core.snowflake.snowflake_generator import SnowflakeGenerator
 from hyperscale.logging import Logger
 from hyperscale.logging.hyperscale_logging_models import (
@@ -49,7 +50,6 @@ from .message_limits import (
     validate_decompressed_size,
     MessageSizeError,
 )
-from .rate_limiter import RateLimiter, RateLimitExceeded
 from .replay_guard import ReplayGuard, ReplayError
 from .restricted_unpickler import restricted_loads, SecurityError
 from .udp_socket_protocol import UDPSocketProtocol
@@ -116,6 +116,7 @@ class UDPProtocol(Generic[T, K]):
         self._connect_timeout = TimeParser(env.MERCURY_SYNC_CONNECT_TIMEOUT).time
         self._retry_interval = TimeParser(env.MERCURY_SYNC_RETRY_INTERVAL).time
         self._shutdown_poll_rate = TimeParser(env.MERCURY_SYNC_SHUTDOWN_POLL_RATE).time
+        self._max_connect_time = TimeParser(env.MERCURY_SYNC_MAX_CONNECT_TIME).time
         self._retries = env.MERCURY_SYNC_SEND_RETRIES
 
         self._max_concurrency = env.MERCURY_SYNC_MAX_CONCURRENCY
@@ -132,13 +133,6 @@ class UDPProtocol(Generic[T, K]):
             max_age_seconds=300,  # 5 minutes
             max_future_seconds=60,  # 1 minute clock skew tolerance
             max_window_size=100000,
-        )
-        
-        # Rate limiting (per-source)
-        self._rate_limiter = RateLimiter(
-            requests_per_second=1000,
-            burst_size=100,
-            max_sources=10000,
         )
 
     @property
@@ -208,10 +202,24 @@ class UDPProtocol(Generic[T, K]):
                 key_path=key_path,
             )
 
-        run_start = True
         instance_id: int | None = None
+        start_time = time.monotonic()
+        attempt = 0
 
-        while run_start:
+        # Connect retry with exponential backoff
+        # Start with short timeout/interval, increase as processes may be slow to start
+        base_timeout = 2.0  # Initial per-attempt timeout
+        base_interval = 0.5  # Initial retry interval
+        max_timeout = 10.0  # Cap per-attempt timeout
+        max_interval = 5.0  # Cap retry interval
+
+        while True:
+            elapsed = time.monotonic() - start_time
+            if elapsed >= self._max_connect_time:
+                raise TimeoutError(
+                    f"Failed to connect to {address} after {self._max_connect_time}s ({attempt} attempts)"
+                )
+
             if self._transport is None:
                 await self.start_server(
                     cert_path=cert_path,
@@ -219,6 +227,10 @@ class UDPProtocol(Generic[T, K]):
                     worker_socket=worker_socket,
                     worker_server=worker_server,
                 )
+
+            # Calculate timeouts with exponential backoff, capped at max values
+            attempt_timeout = min(base_timeout * (1.5 ** min(attempt, 5)), max_timeout)
+            retry_interval = min(base_interval * (1.5 ** min(attempt, 5)), max_interval)
 
             try:
                 result: Tuple[int, Message[None]] = await asyncio.wait_for(
@@ -228,24 +240,26 @@ class UDPProtocol(Generic[T, K]):
                         target_address=address,
                         request_type="connect",
                     ),
-                    timeout=self._connect_timeout,
+                    timeout=attempt_timeout,
                 )
 
-                shard_id, _ = result
+                shard_id, response = result
 
-                snowflake = Snowflake.parse(shard_id)
-
-                instance_id = snowflake.instance
+                # Use full 64-bit node_id from message instead of 10-bit snowflake instance
+                instance_id = response.node_id
 
                 self._node_host_map[instance_id] = address
                 self._nodes.put_no_wait(instance_id)
 
-                run_start = False
+                # Successfully connected
+                break
 
             except (Exception, asyncio.CancelledError, socket.error, OSError):
-                pass
-
-            await asyncio.sleep(self._retry_interval)
+                attempt += 1
+                # Don't sleep if we've exceeded the max time
+                remaining = self._max_connect_time - (time.monotonic() - start_time)
+                if remaining > 0:
+                    await asyncio.sleep(min(retry_interval, remaining))
 
         default_config = {
             "node_id": self._node_id_base,
@@ -341,10 +355,8 @@ class UDPProtocol(Generic[T, K]):
             self.id_generator = SnowflakeGenerator(self._node_id_base)
 
         if self.node_id is None:
-            snowflake_id = self.id_generator.generate()
-            snowflake = Snowflake.parse(snowflake_id)
-
-            self.node_id = snowflake.instance
+            # Use full 64-bit UUID to avoid collisions (10-bit snowflake instance is too small)
+            self.node_id = self._node_id_base
 
         if self._semaphore is None:
             self._semaphore = asyncio.Semaphore(self._max_concurrency)
@@ -392,6 +404,19 @@ class UDPProtocol(Generic[T, K]):
                     self.udp_socket.setsockopt(
                         socket.SOL_SOCKET, socket.SO_REUSEADDR, 1
                     )
+
+                    # Increase socket buffer sizes to reduce EAGAIN errors under load
+                    # Default is typically 212992 bytes, we increase to 4MB
+                    try:
+                        self.udp_socket.setsockopt(
+                            socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024
+                        )
+                        self.udp_socket.setsockopt(
+                            socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024
+                        )
+                    except (OSError, socket.error):
+                        # Some systems may not allow large buffers, ignore
+                        pass
 
                     await self._loop.run_in_executor(
                         None, self.udp_socket.bind, (self.host, self.port)
@@ -530,6 +555,24 @@ class UDPProtocol(Generic[T, K]):
                     if len(self._pending_responses) > 0:
                         self._pending_responses.pop()
 
+    async def _sendto_with_retry(
+        self,
+        data: bytes,
+        address: Tuple[str, int],
+    ) -> None:
+        """Send data with retry on EAGAIN/EWOULDBLOCK (socket buffer full)."""
+        for send_attempt in range(self._retries + 1):
+            try:
+                self._transport.sendto(data, address)
+                return
+            except BlockingIOError:
+                # Socket buffer full, use exponential backoff: 10ms, 20ms, 40ms, 80ms...
+                if send_attempt < self._retries:
+                    await asyncio.sleep(0.01 * (2 ** send_attempt))
+                else:
+                    # All retries exhausted, let it propagate
+                    raise
+
     async def send(
         self,
         target: str,
@@ -551,27 +594,44 @@ class UDPProtocol(Generic[T, K]):
         if request_type is None:
             request_type = "request"
 
-        item = cloudpickle.dumps(
-            (
-                request_type,
-                self.id_generator.generate(),
-                Message(
-                    self.node_id,
-                    target,
-                    data=data,
-                    service_host=self.host,
-                    service_port=self.port,
-                ),
-            ),
-            pickle.HIGHEST_PROTOCOL,
+        # Build message once - we'll regenerate shard_id on each retry
+        message = Message(
+            self.node_id,
+            target,
+            data=data,
+            service_host=self.host,
+            service_port=self.port,
         )
 
-        encrypted_message = self._encryptor.encrypt(item)
-        compressed = self._compressor.compress(encrypted_message)
+        for attempt in range(self._retries + 1):
+            # Generate new shard_id for each attempt to avoid replay detection
+            item = cloudpickle.dumps(
+                (
+                    request_type,
+                    self.id_generator.generate(),
+                    message,
+                ),
+                pickle.HIGHEST_PROTOCOL,
+            )
 
-        self._transport.sendto(compressed, address)
+            encrypted_message = self._encryptor.encrypt(item)
+            compressed = self._compressor.compress(encrypted_message)
 
-        for _ in range(self._retries):
+            try:
+                await self._sendto_with_retry(compressed, address)
+            except BlockingIOError:
+                # Socket buffer full after all retries - return error response
+                return (
+                    self.id_generator.generate(),
+                    Message(
+                        self.node_id,
+                        target,
+                        service_host=self.host,
+                        service_port=self.port,
+                        error="Send failed: socket buffer full.",
+                    ),
+                )
+
             try:
                 waiter = self._loop.create_future()
                 self._waiters[target].put_nowait(waiter)
@@ -591,7 +651,13 @@ class UDPProtocol(Generic[T, K]):
 
                 return (shard_id, response.data)
 
+            except asyncio.TimeoutError:
+                # Worker may not be ready yet - retry with exponential backoff
+                if attempt < self._retries:
+                    await asyncio.sleep(self._retry_interval * (2 ** attempt))
             except Exception:
+                import traceback
+                print(traceback.format_exc())
                 await asyncio.sleep(self._retry_interval)
 
         return (
@@ -625,28 +691,34 @@ class UDPProtocol(Generic[T, K]):
         encrypted_message = self._encryptor.encrypt(data)
         compressed = self._compressor.compress(encrypted_message)
 
-        try:
-            self._transport.sendto(compressed, address)
+        for attempt in range(self._retries + 1):
+            try:
+                await self._sendto_with_retry(compressed, address)
+            except BlockingIOError:
+                # Socket buffer full after all retries
+                return (self.id_generator.generate(), b"Send failed: socket buffer full.")
 
-            for _ in range(self._retries):
-                try:
-                    waiter = self._loop.create_future()
-                    self._waiters[target].put_nowait(waiter)
+            try:
+                waiter = self._loop.create_future()
+                self._waiters[target].put_nowait(waiter)
 
-                    result: Tuple[int, bytes] = await asyncio.wait_for(
-                        waiter,
-                        timeout=self._request_timeout,
-                    )
+                result: Tuple[int, bytes] = await asyncio.wait_for(
+                    waiter,
+                    timeout=self._request_timeout,
+                )
 
-                    (shard_id, response) = result
+                (shard_id, response) = result
 
-                    return (shard_id, response)
+                return (shard_id, response)
 
-                except Exception:
-                    await asyncio.sleep(self._retry_interval)
+            except asyncio.TimeoutError:
+                # Worker may not be ready yet - retry with exponential backoff
+                if attempt < self._retries:
+                    await asyncio.sleep(self._retry_interval * (2 ** attempt))
+            except (Exception, socket.error):
+                await asyncio.sleep(self._retry_interval)
 
-        except (Exception, socket.error):
-            return (self.id_generator.generate(), b"Request timed out.")
+        return (self.id_generator.generate(), b"Request timed out.")
 
     async def stream(
         self,
@@ -669,50 +741,77 @@ class UDPProtocol(Generic[T, K]):
         if request_type is None:
             request_type = "request"
 
-        item = cloudpickle.dumps(
-            (
-                request_type,
-                self.id_generator.generate(),
-                Message(
-                    self.node_id,
-                    target,
-                    data=data,
-                    service_host=self.host,
-                    service_port=self.port,
-                ),
-            ),
-            pickle.HIGHEST_PROTOCOL,
+        # Build message once - we'll regenerate shard_id on each retry
+        message = Message(
+            self.node_id,
+            target,
+            data=data,
+            service_host=self.host,
+            service_port=self.port,
         )
 
-        encrypted_message = self._encryptor.encrypt(item)
-        compressed = self._compressor.compress(encrypted_message)
-
-        try:
-            self._transport.sendto(compressed, address)
-
-            waiter = self._loop.create_future()
-            self._waiters[target].put_nowait(waiter)
-
-            await asyncio.wait_for(waiter, timeout=self._request_timeout)
-
-            for item in self.queue[target]:
-                (shard_id, response) = item
-
-                yield (shard_id, response)
-
-            self.queue.clear()
-
-        except (Exception, socket.error):
-            yield (
-                self.id_generator.generate(),
-                Message(
-                    self.node_id,
-                    target,
-                    service_host=self.host,
-                    service_port=self.port,
-                    error="Request timed out.",
+        for attempt in range(self._retries + 1):
+            # Generate new shard_id for each attempt to avoid replay detection
+            item = cloudpickle.dumps(
+                (
+                    request_type,
+                    self.id_generator.generate(),
+                    message,
                 ),
+                pickle.HIGHEST_PROTOCOL,
             )
+
+            encrypted_message = self._encryptor.encrypt(item)
+            compressed = self._compressor.compress(encrypted_message)
+
+            try:
+                await self._sendto_with_retry(compressed, address)
+            except BlockingIOError:
+                # Socket buffer full after all retries
+                yield (
+                    self.id_generator.generate(),
+                    Message(
+                        self.node_id,
+                        target,
+                        service_host=self.host,
+                        service_port=self.port,
+                        error="Send failed: socket buffer full.",
+                    ),
+                )
+                return
+
+            try:
+                waiter = self._loop.create_future()
+                self._waiters[target].put_nowait(waiter)
+
+                await asyncio.wait_for(waiter, timeout=self._request_timeout)
+
+                for queued_item in self.queue[target]:
+                    (shard_id, response) = queued_item
+
+                    yield (shard_id, response)
+
+                self.queue.clear()
+                return  # Success, exit the retry loop
+
+            except asyncio.TimeoutError:
+                # Worker may not be ready yet - retry with exponential backoff
+                if attempt < self._retries:
+                    await asyncio.sleep(self._retry_interval * (2 ** attempt))
+            except (Exception, socket.error):
+                await asyncio.sleep(self._retry_interval)
+
+        # All retries exhausted
+        yield (
+            self.id_generator.generate(),
+            Message(
+                self.node_id,
+                target,
+                service_host=self.host,
+                service_port=self.port,
+                error="Request timed out.",
+            ),
+        )
 
     async def broadcast(
         self,
@@ -731,10 +830,6 @@ class UDPProtocol(Generic[T, K]):
         )
 
     def read(self, data: bytes, addr: Tuple[str, int]) -> None:
-        # Rate limiting - silently drop if rate exceeded
-        if not self._rate_limiter.check(addr, raise_on_limit=False):
-            return
-        
         # Validate compressed message size before decompression
         try:
             validate_compressed_size(data, raise_on_error=True)
@@ -746,12 +841,15 @@ class UDPProtocol(Generic[T, K]):
         compressed_size = len(data)
 
         try:
-            decompressed = self._decompressor.decompress(data)
+            decompressed = self._decompressor.decompress(
+                data, 
+                max_output_size=MAX_DECOMPRESSED_SIZE,
+            )
 
         except Exception:
             # Sanitized error - don't leak internal details
             self._pending_responses.append(
-                asyncio.create_task(
+                asyncio.ensure_future(
                     self._return_error(
                         Message(
                             node_id=self.node_id,
@@ -781,7 +879,7 @@ class UDPProtocol(Generic[T, K]):
         except (EncryptionError, Exception):
             # Sanitized error - don't leak encryption details
             self._pending_responses.append(
-                asyncio.create_task(
+                asyncio.ensure_future(
                     self._return_error(
                         Message(
                             node_id=self.node_id,
@@ -807,7 +905,7 @@ class UDPProtocol(Generic[T, K]):
             print(traceback.format_exc())
             # Sanitized error - don't leak details about what was blocked
             self._pending_responses.append(
-                asyncio.create_task(
+                asyncio.ensure_future(
                     self._return_error(
                         Message(
                             node_id=self.node_id,
@@ -836,7 +934,7 @@ class UDPProtocol(Generic[T, K]):
         except Exception:
             # Sanitized error - don't leak message structure details
             self._pending_responses.append(
-                asyncio.create_task(
+                asyncio.ensure_future(
                     self._return_error(
                         Message(
                             node_id=self.node_id,
@@ -852,7 +950,7 @@ class UDPProtocol(Generic[T, K]):
             return
 
         # Replay attack protection - validate message freshness and uniqueness
-        # Skip for "response" (replies to our requests) and "connect" (idempotent, 
+        # Skip for "response" (replies to our requests) and "connect" (idempotent,
         # often retried during startup when processes may be slow to spin up)
         if message_type not in ("response", "connect"):
             try:
@@ -864,7 +962,7 @@ class UDPProtocol(Generic[T, K]):
 
         if message_type == "connect":
             self._pending_responses.append(
-                asyncio.create_task(
+                asyncio.ensure_future(
                     self._read_connect(
                         shard_id,
                         message,
@@ -874,14 +972,19 @@ class UDPProtocol(Generic[T, K]):
             )
 
         elif message_type == "request":
+            # Inject sender's node_id into JobContext if present
+            data = message.data
+            if isinstance(data, JobContext):
+                data.node_id = message.node_id
+
             self._pending_responses.append(
-                asyncio.create_task(
+                asyncio.ensure_future(
                     self._read(
                         shard_id,
                         message,
                         self._events.get(message.name)(
                             shard_id,
-                            message.data,
+                            data,
                         ),
                         addr,
                     )
@@ -889,12 +992,17 @@ class UDPProtocol(Generic[T, K]):
             )
 
         elif message_type == "stream":
+            # Inject sender's node_id into JobContext if present
+            stream_data = message.data
+            if isinstance(stream_data, JobContext):
+                stream_data.node_id = message.node_id
+
             self._pending_responses.append(
-                asyncio.create_task(
+                asyncio.ensure_future(
                     self._read_iterator(
                         message.name,
                         message,
-                        self._events.get(message.name)(shard_id, message.data),
+                        self._events.get(message.name)(shard_id, stream_data),
                         addr,
                     )
                 )
@@ -902,7 +1010,7 @@ class UDPProtocol(Generic[T, K]):
 
         else:
             self._pending_responses.append(
-                asyncio.create_task(
+                asyncio.ensure_future(
                     self._receive_response(
                         shard_id,
                         message,
@@ -957,7 +1065,11 @@ class UDPProtocol(Generic[T, K]):
         encrypted_message = self._encryptor.encrypt(item)
         compressed = self._compressor.compress(encrypted_message)
 
-        self._transport.sendto(compressed, addr)
+        try:
+            await self._sendto_with_retry(compressed, addr)
+        except BlockingIOError:
+            # Error responses are best-effort, don't propagate failure
+            pass
 
     async def _reset_connection(self):
         try:
@@ -995,7 +1107,11 @@ class UDPProtocol(Generic[T, K]):
         encrypted_message = self._encryptor.encrypt(item)
         compressed = self._compressor.compress(encrypted_message)
 
-        self._transport.sendto(compressed, addr)
+        try:
+            await self._sendto_with_retry(compressed, addr)
+        except BlockingIOError:
+            # Connect responses are critical but best-effort, log and continue
+            pass
 
     async def _read(
         self,
@@ -1026,7 +1142,7 @@ class UDPProtocol(Generic[T, K]):
             encrypted_message = self._encryptor.encrypt(item)
             compressed = self._compressor.compress(encrypted_message)
 
-            self._transport.sendto(compressed, addr)
+            await self._sendto_with_retry(compressed, addr)
 
         except (Exception, socket.error):
             pass
@@ -1060,17 +1176,17 @@ class UDPProtocol(Generic[T, K]):
 
                 encrypted_message = self._encryptor.encrypt(item)
                 compressed = self._compressor.compress(encrypted_message)
-                self._transport.sendto(compressed, addr)
+                await self._sendto_with_retry(compressed, addr)
 
             except Exception:
                 pass
 
     async def _add_node_from_shard_id(self, shard_id: int, message: Message[T | None]):
-        snowflake = Snowflake.parse(shard_id)
-        instance = snowflake.instance
-        if (await self._nodes.exists(instance)) is False:
-            self._nodes.put_no_wait(instance)
-            self._node_host_map[instance] = (
+        # Use full 64-bit node_id from message instead of 10-bit snowflake instance
+        node_id = message.node_id
+        if (await self._nodes.exists(node_id)) is False:
+            self._nodes.put_no_wait(node_id)
+            self._node_host_map[node_id] = (
                 message.service_host,
                 message.service_port,
             )
@@ -1186,17 +1302,8 @@ class UDPProtocol(Generic[T, K]):
         pending_tasks = list(self._pending_responses)
         for task in pending_tasks:
             if not task.done():
-                task.cancel()
+                task.set_result(None)
 
-        # Wait for cancelled tasks to complete (with timeout to avoid hanging)
-        if pending_tasks:
-            try:
-                await asyncio.wait_for(
-                    asyncio.gather(*pending_tasks, return_exceptions=True),
-                    timeout=2.0,
-                )
-            except asyncio.TimeoutError:
-                pass
 
         # Signal run_forever() to exit
         if self._run_future:

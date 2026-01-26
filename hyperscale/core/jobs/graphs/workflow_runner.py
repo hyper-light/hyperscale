@@ -17,6 +17,7 @@ from hyperscale.core.graph.workflow import Workflow
 from hyperscale.core.hooks import Hook, HookType
 from hyperscale.core.jobs.models.env import Env
 from hyperscale.core.jobs.models.workflow_status import WorkflowStatus
+from hyperscale.core.utils.cancel_and_release_task import cancel_and_release_task
 from hyperscale.core.monitoring import CPUMonitor, MemoryMonitor
 from hyperscale.core.state import Context, ContextHook, StateAction
 from hyperscale.core.state.workflow_context import WorkflowContext
@@ -49,36 +50,6 @@ async def guard_optimize_call(optimize_call: Coroutine[Any, Any, None]):
         await optimize_call
 
     except Exception:
-        pass
-
-
-async def cancel_pending(pend: asyncio.Task):
-    try:
-        if pend.done():
-            pend.exception()
-
-            return pend
-
-        pend.cancel()
-        await asyncio.sleep(0)
-        if not pend.cancelled():
-            await pend
-
-        return pend
-
-    except asyncio.CancelledError as cancelled_error:
-        return cancelled_error
-
-    except asyncio.TimeoutError as timeout_error:
-        return timeout_error
-
-    except asyncio.InvalidStateError as invalid_state:
-        return invalid_state
-
-    except Exception:
-        pass
-
-    except socket.error:
         pass
 
 
@@ -146,6 +117,11 @@ class WorkflowRunner:
         self._cpu_monitor = CPUMonitor(env)
         self._memory_monitor = MemoryMonitor(env)
         self._logger = Logger()
+        self._is_cancelled: asyncio.Event = asyncio.Event()
+        self._is_stopped: asyncio.Event = asyncio.Event()
+
+        # Cancellation flag - checked by generators to stop spawning new VUs
+        self._running: bool = False
 
     def setup(self):
         if self._workflows_sem is None:
@@ -155,6 +131,37 @@ class WorkflowRunner:
             self._run_check_lock = asyncio.Lock()
 
         self._clear()
+
+    async def await_cancellation(self) -> None:
+        """
+        Wait for the current workflow to finish (by cancellation or completion).
+
+        This event is set when either _execute_test_workflow or
+        _execute_non_test_workflow completes, regardless of whether
+        the workflow was cancelled or finished normally.
+        """
+        await self._is_cancelled.wait()
+
+    def request_cancellation(self) -> None:
+        """
+        Request graceful cancellation of the current workflow.
+
+        This sets a flag that causes the VU generators (_generate, _generate_constant)
+        to stop yielding new VUs. Already-spawned tasks complete normally, and the
+        standard cleanup path runs without throwing exceptions.
+
+        Thread-safe: GIL ensures atomic bool write.
+        """
+        self._running = False
+
+    async def await_stop(self) -> None:
+        return await self._is_stopped.wait()
+        
+
+    @property
+    def is_cancelled(self) -> bool:
+        """Check if cancellation has been requested."""
+        return self._running is False
 
     @property
     def pending(self):
@@ -259,6 +266,10 @@ class WorkflowRunner:
         Exception | None,
         WorkflowStatus,
     ]:
+        # Reset cancellation state for new workflow run
+        self._running = True
+        self._is_cancelled.clear()
+
         default_config = {
             "node_id": self._node_id,
             "workflow": workflow.name,
@@ -314,6 +325,8 @@ class WorkflowRunner:
                     name="error",
                 )
 
+                self._run_check_lock.release()
+
                 return (
                     run_id,
                     None,
@@ -327,6 +340,8 @@ class WorkflowRunner:
                     message=f"Run {run_id} of Workflow {workflow.name} failed to start due to workflow already being in running stats with duplicate job policy of REJECT",
                     name="error",
                 )
+
+                self._run_check_lock.release()
 
                 return (
                     run_id,
@@ -701,8 +716,13 @@ class WorkflowRunner:
 
             threads = config.get("threads")
 
+            # Floor-based approach - commented out for testing
+            # self._max_active[run_id][workflow.name] = vus * 10
+
+            # Original CPU-aware formula: scales with CPU count to account for
+            # less powerful individual cores on high-CPU systems
             self._max_active[run_id][workflow.name] = math.ceil(
-                (vus * (psutil.cpu_count(logical=False) ** 2)) / threads
+                (vus * (psutil.cpu_count() ** 2)) / threads
             )
 
             for client in workflow.client:
@@ -715,7 +735,7 @@ class WorkflowRunner:
                     reset_connections=config.get("reset_connections"),
                 )
 
-            self._workflow_hooks[run_id][workflow] = list(hooks.keys())
+            self._workflow_hooks[run_id][workflow.name] = list(hooks.keys())
 
             step_graph = networkx.DiGraph()
             sources = []
@@ -861,23 +881,19 @@ class WorkflowRunner:
 
         elapsed = time.monotonic() - start
 
-        await asyncio.gather(*completed, return_exceptions=True)
-        await asyncio.gather(
-            *[
-                asyncio.create_task(
-                    cancel_pending(pend),
-                )
-                for pend in self._pending[run_id][workflow.name]
-            ],
-            return_exceptions=True,
-        )
+        if not self._is_stopped.set():
+            self._is_stopped.set()
 
-        if len(pending) > 0:
-            await asyncio.gather(*[
-                asyncio.create_task(
-                    cancel_pending(pend),
-                ) for pend in pending
-            ], return_exceptions=True)
+        await asyncio.gather(*completed, return_exceptions=True)
+
+        # Cancel and release all pending tasks
+        for pend in self._pending[run_id][workflow.name]:
+            cancel_and_release_task(pend)
+        self._pending[run_id][workflow.name].clear()
+
+        # Cancel tasks from asyncio.wait that didn't complete
+        for pend in pending:
+            cancel_and_release_task(pend)
 
         if len(self._failed[run_id][workflow_name]) > 0:
             await asyncio.gather(
@@ -905,6 +921,9 @@ class WorkflowRunner:
             workflow_results_set,
             elapsed,
         )
+
+        if not self._is_cancelled.is_set():
+            self._is_cancelled.set()
 
         return processed_results
 
@@ -934,12 +953,16 @@ class WorkflowRunner:
 
         await asyncio.gather(*execution_results)
 
-        await asyncio.gather(
-            *[
-                asyncio.create_task(cancel_pending(pend))
-                for pend in self._pending[run_id][workflow_name]
-            ]
-        )
+        if not self._is_stopped.set():
+            self._is_stopped.set()
+
+        # Cancel and release all pending tasks
+        for pend in self._pending[run_id][workflow_name]:
+            cancel_and_release_task(pend)
+        self._pending[run_id][workflow_name].clear()
+
+        if not self._is_cancelled.is_set():
+            self._is_cancelled.set()
 
         return {result.get_name(): guard_result(result) for result in execution_results}
 
@@ -1042,7 +1065,7 @@ class WorkflowRunner:
         elapsed = 0
 
         start = time.monotonic()
-        while elapsed < duration:
+        while elapsed < duration and self._running:
             try:
                 remaining = duration - elapsed
 
@@ -1066,16 +1089,6 @@ class WorkflowRunner:
                         )
                     except asyncio.TimeoutError:
                         pass
-
-                elif self._cpu_monitor.check_lock(
-                    self._cpu_monitor.get_moving_median,
-                    run_id,
-                    workflow_name,
-                ):
-                    await self._cpu_monitor.lock(
-                        run_id,
-                        workflow_name,
-                    )
 
             except Exception:
                 pass
@@ -1101,7 +1114,7 @@ class WorkflowRunner:
         generated = 0
 
         start = time.monotonic()
-        while elapsed < duration:
+        while elapsed < duration and self._running:
             try:
                 remaining = duration - elapsed
 
@@ -1131,16 +1144,6 @@ class WorkflowRunner:
                         )
                     except asyncio.TimeoutError:
                         pass
-
-                elif self._cpu_monitor.check_lock(
-                    self._cpu_monitor.get_moving_median,
-                    run_id,
-                    workflow_name,
-                ):
-                    await self._cpu_monitor.lock(
-                        run_id,
-                        workflow_name,
-                    )
 
             except Exception:
                 pass
@@ -1214,29 +1217,12 @@ class WorkflowRunner:
                 )
             )
 
-            await asyncio.gather(
-                *[
-                    asyncio.create_task(
-                        cancel_pending(pend),
-                    )
-                    for run_id in self._pending
-                    for workflow_name in self._pending[run_id]
-                    for pend in self._pending[run_id][workflow_name]
-                ],
-                return_exceptions=True,
-            )
-
-            await asyncio.gather(
-                *[
-                    asyncio.create_task(
-                        cancel_pending(pend),
-                    )
-                    for run_id in self._pending
-                    for workflow_name in self._pending[run_id]
-                    for pend in self._pending[run_id][workflow_name]
-                ],
-                return_exceptions=True,
-            )
+            # Cancel and release all pending tasks across all runs/workflows
+            for run_id in self._pending:
+                for workflow_name in self._pending[run_id]:
+                    for pend in self._pending[run_id][workflow_name]:
+                        cancel_and_release_task(pend)
+                    self._pending[run_id][workflow_name].clear()
 
             for job in self._running_workflows.values():
                 for workflow in job.values():
@@ -1255,51 +1241,19 @@ class WorkflowRunner:
     def abort(self):
         self._logger.abort()
 
+        # Cancel and release all pending tasks
         for run_id in self._pending:
             for workflow_name in self._pending[run_id]:
                 for pend in self._pending[run_id][workflow_name]:
-                    try:
-                        pend.exception()
+                    cancel_and_release_task(pend)
+                self._pending[run_id][workflow_name].clear()
 
-                    except (
-                        asyncio.CancelledError,
-                        asyncio.InvalidStateError,
-                        Exception,
-                    ):
-                        pass
-
-                    try:
-                        pend.cancel()
-
-                    except (
-                        asyncio.CancelledError,
-                        asyncio.InvalidStateError,
-                        Exception,
-                    ):
-                        pass
-
+        # Cancel and release all failed tasks
         for run_id in self._failed:
             for workflow_name in self._failed[run_id]:
                 for pend in self._failed[run_id][workflow_name]:
-                    try:
-                        pend.exception()
-
-                    except (
-                        asyncio.CancelledError,
-                        asyncio.InvalidStateError,
-                        Exception,
-                    ):
-                        pass
-
-                    try:
-                        pend.cancel()
-
-                    except (
-                        asyncio.CancelledError,
-                        asyncio.InvalidStateError,
-                        Exception,
-                    ):
-                        pass
+                    cancel_and_release_task(pend)
+                self._failed[run_id][workflow_name].clear()
 
         for job in self._running_workflows.values():
             for workflow in job.values():

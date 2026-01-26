@@ -31,6 +31,7 @@ class Env(BaseModel):
     MERCURY_SYNC_SHUTDOWN_POLL_RATE: StrictStr = "0.1s"
     MERCURY_SYNC_DUPLICATE_JOB_POLICY: Literal["reject", "replace"] = "replace"
     MERCURY_SYNC_TLS_VERIFY_HOSTNAME: StrictStr = "false"  # Set to "true" in production
+    MERCURY_SYNC_MAX_CONNECT_TIME: StrictStr = "120s"  # Maximum time to wait for client connection
 
     @classmethod
     def types_map(self) -> Dict[str, Callable[[str], PrimaryType]]:
@@ -53,4 +54,5 @@ class Env(BaseModel):
             "MERCURY_SYNC_CONTEXT_POLL_RATE": str,
             "MERCURY_SYNC_SHUTDOWN_POLL_RATE": str,
             "MERCURY_SYNC_DUPLICATE_JOB_POLICY": str,
+            "MERCURY_SYNC_MAX_CONNECT_TIME": str,
         }

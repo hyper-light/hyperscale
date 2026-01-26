@@ -3,9 +3,9 @@ import msgspec
 from collections import defaultdict
 from typing import Literal
 from pydantic import BaseModel, StrictStr
-from hyperscale.distributed_rewrite.env import Env
-from hyperscale.distributed_rewrite.server import tcp, udp, task
-from hyperscale.distributed_rewrite.server.server.mercury_sync_base_server import MercurySyncBaseServer
+from hyperscale.distributed.env import Env
+from hyperscale.distributed.server import tcp, udp, task
+from hyperscale.distributed.server.server.mercury_sync_base_server import MercurySyncBaseServer
 
 Message = Literal[b'ack', b'nack', b'join', b'leave', b'probe']
 Status = Literal[b'JOIN', b'OK', b'SUSPECT', b'DEAD']

@@ -8,14 +8,14 @@ except Exception:
 
 from pydantic import (
     BaseModel,
+    ConfigDict,
     StrictFloat,
     StrictInt,
 )
 
 
 class OrMatchingCommand(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     locator: Locator
     timeout: StrictInt | StrictFloat
-
-    class Config:
-        arbitrary_types_allowed = True

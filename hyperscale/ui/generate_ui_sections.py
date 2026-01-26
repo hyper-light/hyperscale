@@ -283,7 +283,7 @@ def generate_ui_sections(
                     PlotConfig(
                         plot_name="Completions Per. Second",
                         x_axis_name="Time (sec)",
-                        y_axis_name="Value",
+                        y_axis_name="Executions",
                         line_color="aquamarine_2",
                         point_char="dot",
                         terminal_mode=hyperscale_terminal_mode,

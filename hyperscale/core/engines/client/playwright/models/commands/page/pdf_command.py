@@ -11,6 +11,7 @@ except Exception:
 
 from pydantic import (
     BaseModel,
+    ConfigDict,
     StrictBool,
     StrictFloat,
     StrictInt,
@@ -19,6 +20,8 @@ from pydantic import (
 
 
 class PdfCommand(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     scale: Optional[StrictFloat] = None
     display_header_footer: Optional[StrictBool] = None
     header_template: Optional[StrictStr] = None
@@ -35,6 +38,3 @@ class PdfCommand(BaseModel):
     outline: Optional[StrictBool] = None
     tagged: Optional[StrictBool] = None
     timeout: Optional[StrictInt | StrictFloat] = None
-
-    class Config:
-        arbitrary_types_allowed = True

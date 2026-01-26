@@ -1,26 +1,23 @@
 import os
-from .dotenv import dotenv_values
-from typing import Dict, Union, Type, TypeVar
+from pydantic import BaseModel
+from typing import Dict, TypeVar, Union
+
+from dotenv import dotenv_values
+
 from .env import Env
-from .monitor_env import MonitorEnv
-from .replication_env import ReplicationEnv
-from .registrar_env import RegistrarEnv
 
-T = TypeVar("T")
-
+T = TypeVar("T", bound=BaseModel)
 
 PrimaryType = Union[str, int, bool, float, bytes]
 
 
-def load_env(env: Type[T], env_file: str = None) -> T:
-    env_type: Union[Env, MonitorEnv, ReplicationEnv, RegistrarEnv] = env
-    envars = env_type.types_map()
+def load_env(default: type[Env], env_file: str = None, override: T | None = None) -> T:
+    envars = default.types_map()
 
     if env_file is None:
         env_file = ".env"
 
     values: Dict[str, PrimaryType] = {}
-
     for envar_name, envar_type in envars.items():
         envar_value = os.getenv(envar_name)
         if envar_value:
@@ -36,4 +33,13 @@ def load_env(env: Type[T], env_file: str = None) -> T:
 
         values.update(env_file_values)
 
-    return env(**{name: value for name, value in values.items() if value is not None})
+    if override:
+        values.update(**override.model_dump(exclude_none=True))
+
+        return type(override)(
+            **{name: value for name, value in values.items() if value is not None}
+        )
+
+    return default(
+        **{name: value for name, value in values.items() if value is not None}
+    )
