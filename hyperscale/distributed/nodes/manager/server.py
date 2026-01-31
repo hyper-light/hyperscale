@@ -406,6 +406,8 @@ class ManagerServer(HealthAwareServer):
             logger=self._udp_logger,
             task_runner=self._task_runner,
             send_tcp=self._send_to_peer,
+            on_job_raft_leader=self._on_job_raft_leader,
+            on_job_raft_lose_leader=self._on_job_raft_lose_leader,
         )
 
         self._worker_pool = WorkerPool(
@@ -1052,6 +1054,70 @@ class ManagerServer(HealthAwareServer):
                         )
                     )
 
+    # =========================================================================
+    # Per-Job Raft Leader Callbacks
+    # =========================================================================
+
+    def _on_job_raft_leader(self, job_id: str) -> None:
+        """Called when this node becomes the per-job Raft leader.
+
+        Schedules an async check for whether the current job leader
+        is dead and needs to be taken over.
+        """
+        self._task_runner.run(self._check_raft_leader_takeover, job_id)
+
+    def _on_job_raft_lose_leader(self, job_id: str) -> None:
+        """Called when this node loses per-job Raft leadership."""
+        self._task_runner.run(
+            self._udp_logger.log,
+            ServerInfo(
+                message=f"Lost Raft leadership for job {job_id[:8]}...",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            ),
+        )
+
+    async def _check_raft_leader_takeover(self, job_id: str) -> None:
+        """Check if job leadership takeover is needed after becoming Raft leader.
+
+        When this node becomes the per-job Raft leader, it checks if
+        the current job leader is dead. If so, it proposes a leadership
+        takeover through Raft consensus and notifies workers.
+        """
+        leader_addr = self._manager_state.get_job_leader_addr(job_id)
+        if leader_addr is None:
+            return
+
+        dead_managers = self._manager_state.get_dead_managers()
+        if leader_addr not in dead_managers:
+            return
+
+        old_leader_id = self._manager_state.get_job_leader(job_id)
+
+        accepted = await self._raft.raft_job_manager.takeover_job_leadership(job_id)
+        if not accepted:
+            return
+
+        self._leases.claim_job_leadership(
+            job_id,
+            (self._host, self._tcp_port),
+            force_takeover=True,
+        )
+
+        await self._notify_workers_job_leader_transfer(job_id, old_leader_id)
+        await self._udp_logger.log(
+            ServerInfo(
+                message=(
+                    f"Raft leader takeover: assumed job leadership for {job_id[:8]}... "
+                    f"(previous leader {old_leader_id or 'unknown'} is dead)"
+                ),
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+
     def _on_worker_globally_dead(self, worker_id: str) -> None:
         """Handle worker global death (AD-30)."""
         self._health_monitor.on_global_death(worker_id)
@@ -1459,7 +1525,14 @@ class ManagerServer(HealthAwareServer):
                 break
 
     async def _handle_job_leader_failure(self, failed_addr: tuple[str, int]) -> None:
-        """Handle job leader manager failure."""
+        """Handle job leader manager failure.
+
+        The SWIM leader coordinates takeover by proposing leadership
+        changes through Raft consensus. If this node is also the
+        per-job Raft leader, the proposal succeeds immediately.
+        Otherwise, the per-job Raft leader handles it via the
+        on_become_leader callback.
+        """
         if not self.is_leader():
             return
 
@@ -1471,18 +1544,34 @@ class ManagerServer(HealthAwareServer):
 
         for job_id in jobs_to_takeover:
             old_leader_id = self._manager_state.get_job_leader(job_id)
-            claimed = self._leases.claim_job_leadership(
+
+            await self._raft.consensus.create_job_raft(job_id)
+
+            accepted = await self._raft.raft_job_manager.takeover_job_leadership(job_id)
+            if not accepted:
+                await self._udp_logger.log(
+                    ServerWarning(
+                        message=(
+                            f"Raft takeover proposal rejected for job {job_id[:8]}... "
+                            "(not Raft leader for this job; per-job Raft leader will handle)"
+                        ),
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+                continue
+
+            self._leases.claim_job_leadership(
                 job_id,
                 (self._host, self._tcp_port),
                 force_takeover=True,
             )
-            if not claimed:
-                continue
 
             await self._notify_workers_job_leader_transfer(job_id, old_leader_id)
             await self._udp_logger.log(
                 ServerInfo(
-                    message=f"Took over leadership for job {job_id[:8]}...",
+                    message=f"Took over leadership for job {job_id[:8]}... via Raft consensus",
                     node_host=self._host,
                     node_port=self._tcp_port,
                     node_id=self._node_id.short,
@@ -2457,7 +2546,12 @@ class ManagerServer(HealthAwareServer):
                 )
 
     async def _scan_for_orphaned_jobs(self) -> None:
-        """Scan for orphaned jobs from dead managers."""
+        """Scan for orphaned jobs from dead managers.
+
+        Called when this node becomes the SWIM cluster leader.
+        Proposes leadership takeover through Raft consensus for
+        any jobs whose leader is in the dead managers set.
+        """
         dead_managers_snapshot = self._manager_state.get_dead_managers()
         job_leader_addrs_snapshot = self._manager_state.iter_job_leader_addrs()
 
@@ -2470,15 +2564,22 @@ class ManagerServer(HealthAwareServer):
 
             for job_id in jobs_to_takeover:
                 old_leader_id = self._manager_state.get_job_leader(job_id)
-                claimed = self._leases.claim_job_leadership(
+
+                await self._raft.consensus.create_job_raft(job_id)
+
+                accepted = await self._raft.raft_job_manager.takeover_job_leadership(job_id)
+                if not accepted:
+                    continue
+
+                self._leases.claim_job_leadership(
                     job_id,
                     (self._host, self._tcp_port),
                     force_takeover=True,
                 )
-                if claimed:
-                    await self._notify_workers_job_leader_transfer(
-                        job_id, old_leader_id
-                    )
+
+                await self._notify_workers_job_leader_transfer(
+                    job_id, old_leader_id
+                )
 
     async def _resume_timeout_tracking_for_all_jobs(self) -> None:
         """Resume timeout tracking for all jobs as new leader."""

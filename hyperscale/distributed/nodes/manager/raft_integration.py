@@ -53,6 +53,8 @@ class ManagerRaftIntegration:
         logger: "Logger",
         task_runner: "TaskRunner",
         send_tcp: Callable[..., Awaitable[bytes | Exception | None]],
+        on_job_raft_leader: Callable[[str], None] | None = None,
+        on_job_raft_lose_leader: Callable[[str], None] | None = None,
     ) -> None:
         self._node_id = node_id
         self._logger = logger
@@ -65,6 +67,8 @@ class ManagerRaftIntegration:
             logger=logger,
             task_runner=task_runner,
             send_message=self._send_raft_message,
+            on_become_leader=on_job_raft_leader,
+            on_lose_leadership=on_job_raft_lose_leader,
         )
 
         self._raft_job_manager = RaftJobManager(
