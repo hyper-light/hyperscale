@@ -186,6 +186,7 @@ from .leadership_coordinator import GateLeadershipCoordinator
 from .peer_coordinator import GatePeerCoordinator
 from .health_coordinator import GateHealthCoordinator
 from .orphan_job_coordinator import GateOrphanJobCoordinator
+from .raft_integration import GateRaftIntegration
 from .config import GateConfig, create_gate_config
 from .state import GateRuntimeState
 from .handlers import (
@@ -480,6 +481,9 @@ class GateServer(HealthAwareServer):
         # Idempotency cache (AD-40) - initialized in start() after task_runner is available
         self._idempotency_cache: GateIdempotencyCache[bytes] | None = None
         self._idempotency_config = create_idempotency_config_from_env(env)
+
+        # Raft integration (initialized in _init_coordinators, declared here for SWIM callback safety)
+        self._raft: GateRaftIntegration | None = None
 
         # State version
         self._state_version = 0
@@ -785,6 +789,17 @@ class GateServer(HealthAwareServer):
             orphan_grace_period_seconds=self._orphan_grace_period,
         )
 
+        # Raft consensus integration
+        self._raft = GateRaftIntegration(
+            node_id=self._node_id.short,
+            job_manager=self._job_manager,
+            leadership_tracker=self._job_leadership_tracker,
+            gate_state=self._modular_state,
+            logger=self._udp_logger,
+            task_runner=self._task_runner,
+            send_tcp=self._send_tcp,
+        )
+
     def _init_handlers(self) -> None:
         """Initialize handler instances with dependencies."""
         self._ping_handler = GatePingHandler(
@@ -987,6 +1002,15 @@ class GateServer(HealthAwareServer):
         self._init_coordinators()
         self._init_handlers()
 
+        # Start Raft consensus tick loop and seed membership from known gate peers
+        self._raft.start()
+        raft_members: set[str] = set()
+        raft_addrs: dict[str, tuple[str, int]] = {}
+        for gate_id, gate_info in self._modular_state.iter_known_gates():
+            raft_members.add(gate_id)
+            raft_addrs[gate_id] = (gate_info.tcp_host, gate_info.tcp_port)
+        self._raft.set_initial_membership(raft_members, raft_addrs)
+
         if self._orphan_job_coordinator:
             self._job_lease_manager._on_lease_expired = (
                 self._orphan_job_coordinator.on_lease_expired
@@ -1033,6 +1057,10 @@ class GateServer(HealthAwareServer):
 
         if self._idempotency_cache is not None:
             await self._idempotency_cache.close()
+
+        # Stop Raft consensus
+        if self._raft is not None:
+            await self._raft.stop()
 
         await super().stop(
             drain_timeout=drain_timeout,
@@ -2776,6 +2804,11 @@ class GateServer(HealthAwareServer):
         """Handle node death via SWIM."""
         gate_tcp_addr = self._modular_state.get_tcp_addr_for_udp(node_addr)
         if gate_tcp_addr:
+            if self._raft is not None:
+                for gate_id, gate_info in self._modular_state.iter_known_gates():
+                    if (gate_info.udp_host, gate_info.udp_port) == node_addr:
+                        self._raft.on_node_leave(gate_id)
+                        break
             self._task_runner.run(
                 self._handle_gate_peer_failure, node_addr, gate_tcp_addr
             )
@@ -2784,6 +2817,11 @@ class GateServer(HealthAwareServer):
         """Handle node join via SWIM."""
         gate_tcp_addr = self._modular_state.get_tcp_addr_for_udp(node_addr)
         if gate_tcp_addr:
+            if self._raft is not None:
+                for gate_id, gate_info in self._modular_state.iter_known_gates():
+                    if (gate_info.udp_host, gate_info.udp_port) == node_addr:
+                        self._raft.on_node_join(gate_id, gate_tcp_addr)
+                        break
             self._task_runner.run(
                 self._handle_gate_peer_recovery, node_addr, gate_tcp_addr
             )
@@ -5353,6 +5391,61 @@ class GateServer(HealthAwareServer):
     def health_coordinator(self) -> GateHealthCoordinator | None:
         """Get the health coordinator."""
         return self._health_coordinator
+
+
+    # =========================================================================
+    # Raft TCP Handlers
+    # =========================================================================
+
+    @tcp.receive()
+    async def gate_raft_request_vote(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ) -> bytes:
+        """Handle incoming Raft RequestVote RPC from a gate peer."""
+        if self._raft is None:
+            return b""
+        response = await self._raft.handle_request_vote(data)
+        return response if response is not None else b""
+
+    @tcp.receive()
+    async def gate_raft_request_vote_response(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ) -> bytes:
+        """Handle incoming Raft RequestVoteResponse from a gate peer."""
+        if self._raft is not None:
+            await self._raft.handle_request_vote_response(data)
+        return b""
+
+    @tcp.receive()
+    async def gate_raft_append_entries(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ) -> bytes:
+        """Handle incoming Raft AppendEntries RPC from a gate peer."""
+        if self._raft is None:
+            return b""
+        response = await self._raft.handle_append_entries(data)
+        return response if response is not None else b""
+
+    @tcp.receive()
+    async def gate_raft_append_entries_response(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ) -> bytes:
+        """Handle incoming Raft AppendEntriesResponse from a gate peer."""
+        if self._raft is not None:
+            await self._raft.handle_append_entries_response(data)
+        return b""
 
 
 __all__ = [

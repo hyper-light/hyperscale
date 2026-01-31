@@ -34,6 +34,7 @@ from .cancellation_coordinator import GateCancellationCoordinator
 from .peer_coordinator import GatePeerCoordinator
 from .health_coordinator import GateHealthCoordinator
 from .orphan_job_coordinator import GateOrphanJobCoordinator
+from .raft_integration import GateRaftIntegration
 
 # Handlers
 from .handlers import (
@@ -58,6 +59,7 @@ __all__ = [
     "GatePeerCoordinator",
     "GateHealthCoordinator",
     "GateOrphanJobCoordinator",
+    "GateRaftIntegration",
     # Handlers
     "GatePingHandler",
     "GateJobHandler",

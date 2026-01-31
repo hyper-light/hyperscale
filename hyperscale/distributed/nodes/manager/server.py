@@ -134,6 +134,7 @@ from hyperscale.distributed.jobs import (
     WindowedStatsCollector,
     WindowedStatsPush,
 )
+from hyperscale.distributed.jobs.job_leadership_tracker import JobLeadershipTracker
 from hyperscale.distributed.ledger.wal import NodeWAL
 from hyperscale.logging.lsn import HybridLamportClock
 from hyperscale.distributed.jobs.timeout_strategy import (
@@ -160,6 +161,7 @@ from .leases import ManagerLeaseCoordinator
 from .health import ManagerHealthMonitor, HealthcheckExtensionManager
 from .sync import ManagerStateSync
 from .leadership import ManagerLeadershipCoordinator
+from .raft_integration import ManagerRaftIntegration
 from .stats import ManagerStatsCoordinator
 from .discovery import ManagerDiscoveryCoordinator
 from .load_shedding import ManagerLoadShedder
@@ -390,6 +392,20 @@ class ManagerServer(HealthAwareServer):
         self._job_manager = JobManager(
             datacenter=self._node_id.datacenter,
             manager_id=self._node_id.short,
+        )
+
+        # Raft consensus integration
+        self._raft_leadership_tracker: JobLeadershipTracker[int] = JobLeadershipTracker(
+            node_id=self._node_id.short,
+            node_addr=(self._host, self._tcp_port),
+        )
+        self._raft = ManagerRaftIntegration(
+            node_id=self._node_id.short,
+            job_manager=self._job_manager,
+            leadership_tracker=self._raft_leadership_tracker,
+            logger=self._udp_logger,
+            task_runner=self._task_runner,
+            send_tcp=self._send_to_peer,
         )
 
         self._worker_pool = WorkerPool(
@@ -724,6 +740,15 @@ class ManagerServer(HealthAwareServer):
         # Start background tasks
         self._start_background_tasks()
 
+        # Start Raft consensus tick loop and seed membership from known peers
+        self._raft.start()
+        raft_members: set[str] = set()
+        raft_addrs: dict[str, tuple[str, int]] = {}
+        for peer_id, peer_info in self._manager_state.iter_known_manager_peers():
+            raft_members.add(peer_id)
+            raft_addrs[peer_id] = (peer_info.tcp_host, peer_info.tcp_port)
+        self._raft.set_initial_membership(raft_members, raft_addrs)
+
         manager_count = self._manager_state.get_known_manager_peer_count() + 1
         await self._udp_logger.log(
             ServerInfo(
@@ -754,6 +779,9 @@ class ManagerServer(HealthAwareServer):
 
         if self._node_wal is not None:
             await self._node_wal.close()
+
+        # Stop Raft consensus
+        await self._raft.stop()
 
         # Graceful shutdown
         await super().stop(
@@ -944,6 +972,10 @@ class ManagerServer(HealthAwareServer):
 
         manager_tcp_addr = self._manager_state.get_manager_tcp_from_udp(node_addr)
         if manager_tcp_addr:
+            for peer_id, peer_info in self._manager_state.iter_known_manager_peers():
+                if (peer_info.udp_host, peer_info.udp_port) == node_addr:
+                    self._raft.on_node_leave(peer_id)
+                    break
             self._task_runner.run(
                 self._handle_manager_peer_failure, node_addr, manager_tcp_addr
             )
@@ -969,6 +1001,10 @@ class ManagerServer(HealthAwareServer):
         if manager_tcp_addr:
             dead_managers = self._manager_state.get_dead_managers()
             dead_managers.discard(manager_tcp_addr)
+            for peer_id, peer_info in self._manager_state.iter_known_manager_peers():
+                if (peer_info.udp_host, peer_info.udp_port) == node_addr:
+                    self._raft.on_node_join(peer_id, manager_tcp_addr)
+                    break
             self._task_runner.run(
                 self._handle_manager_peer_recovery, node_addr, manager_tcp_addr
             )
@@ -5800,6 +5836,55 @@ class ManagerServer(HealthAwareServer):
                 node_id=self._node_id.short,
             )
         )
+
+
+    # =========================================================================
+    # Raft TCP Handlers
+    # =========================================================================
+
+    @tcp.receive()
+    async def raft_request_vote(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ) -> bytes:
+        """Handle incoming Raft RequestVote RPC from a manager peer."""
+        response = await self._raft.handle_request_vote(data)
+        return response if response is not None else b""
+
+    @tcp.receive()
+    async def raft_request_vote_response(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ) -> bytes:
+        """Handle incoming Raft RequestVoteResponse from a manager peer."""
+        await self._raft.handle_request_vote_response(data)
+        return b""
+
+    @tcp.receive()
+    async def raft_append_entries(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ) -> bytes:
+        """Handle incoming Raft AppendEntries RPC from a manager peer."""
+        response = await self._raft.handle_append_entries(data)
+        return response if response is not None else b""
+
+    @tcp.receive()
+    async def raft_append_entries_response(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ) -> bytes:
+        """Handle incoming Raft AppendEntriesResponse from a manager peer."""
+        await self._raft.handle_append_entries_response(data)
+        return b""
 
 
 __all__ = ["ManagerServer"]

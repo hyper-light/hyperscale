@@ -25,6 +25,7 @@ from .health import (
     HealthcheckExtensionManager,
 )
 from .leadership import ManagerLeadershipCoordinator
+from .raft_integration import ManagerRaftIntegration
 from .stats import ManagerStatsCoordinator, ProgressState, BackpressureLevel
 from .discovery import ManagerDiscoveryCoordinator
 from .load_shedding import ManagerLoadShedder, RequestPriority, OverloadStateTracker
@@ -50,6 +51,7 @@ __all__ = [
     "ManagerStateSync",
     "ManagerHealthMonitor",
     "ManagerLeadershipCoordinator",
+    "ManagerRaftIntegration",
     "ManagerStatsCoordinator",
     "ManagerDiscoveryCoordinator",
     # AD-19 Progress State (Three-Signal Health)
