@@ -21,6 +21,7 @@ from hyperscale.distributed.models.jobs import TrackingToken
 from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerWarning
 
 if TYPE_CHECKING:
+    from hyperscale.distributed.jobs.job_manager import JobManager
     from hyperscale.distributed.nodes.manager.state import ManagerState
     from hyperscale.distributed.nodes.manager.config import ManagerConfig
     from hyperscale.distributed.taskex import TaskRunner
@@ -50,6 +51,7 @@ class ManagerCancellationCoordinator:
         task_runner: "TaskRunner",
         send_to_worker: SendFunc,
         send_to_client: SendFunc,
+        job_manager: "JobManager | None" = None,
     ) -> None:
         self._state: "ManagerState" = state
         self._config: "ManagerConfig" = config
@@ -58,6 +60,7 @@ class ManagerCancellationCoordinator:
         self._task_runner: "TaskRunner" = task_runner
         self._send_to_worker: SendFunc = send_to_worker
         self._send_to_client: SendFunc = send_to_client
+        self._job_manager: "JobManager | None" = job_manager
 
     async def cancel_job(
         self,
@@ -361,18 +364,19 @@ class ManagerCancellationCoordinator:
 
     def _get_job_workflow_ids(self, job_id: str) -> list[str]:
         """
-        Get workflow IDs for a job.
-
-        In the full implementation, this would query JobManager.
+        Get sub-workflow IDs for a job from the JobManager.
 
         Args:
             job_id: Job ID
 
         Returns:
-            List of workflow IDs
+            List of sub-workflow token strings
         """
-        # Placeholder - in full implementation this queries JobManager
-        return []
+        if not self._job_manager:
+            return []
+        if not (job := self._job_manager.get_job_by_id(job_id)):
+            return []
+        return list(job.sub_workflows.keys())
 
     def is_workflow_cancelled(self, workflow_id: str) -> bool:
         """

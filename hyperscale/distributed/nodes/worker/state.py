@@ -55,6 +55,8 @@ class WorkerState:
         self._active_workflows: dict[str, WorkflowProgress] = {}
         self._workflow_tokens: dict[str, str] = {}
         self._workflow_cancel_events: dict[str, asyncio.Event] = {}
+        self._cancellation_completion_events: dict[str, asyncio.Event] = {}
+        self._cancellation_errors: dict[str, list[str]] = {}
         self._workflow_id_to_name: dict[str, str] = {}
         self._workflow_job_leader: dict[str, tuple[str, int]] = {}
         self._workflow_fence_tokens: dict[str, int] = {}
@@ -228,6 +230,8 @@ class WorkerState:
         self._workflow_job_leader.pop(workflow_id, None)
         self._workflow_cores_completed.pop(workflow_id, None)
         self._workflow_cancel_events.pop(workflow_id, None)
+        self._cancellation_completion_events.pop(workflow_id, None)
+        self._cancellation_errors.pop(workflow_id, None)
         self._workflow_tokens.pop(workflow_id, None)
         self._workflow_id_to_name.pop(workflow_id, None)
         self._orphaned_workflows.pop(workflow_id, None)

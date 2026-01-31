@@ -334,6 +334,7 @@ class ManagerServer(HealthAwareServer):
             task_runner=self._task_runner,
             send_to_worker=self._send_to_worker,
             send_to_client=self._send_to_client,
+            job_manager=self._job_manager,
         )
 
         # State sync coordinator

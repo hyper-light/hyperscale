@@ -288,3 +288,43 @@ class WorkerCancellationHandler:
     def stop(self) -> None:
         """Stop the cancellation poll loop."""
         self._running = False
+
+    def cleanup_stale_events(self, active_workflow_ids: set[str]) -> int:
+        """
+        Remove cancel events for workflows that are no longer active.
+
+        Defensive cleanup to prevent memory leaks if events outlive
+        their workflows due to race conditions or missed cleanup.
+
+        Args:
+            active_workflow_ids: Currently active workflow IDs
+
+        Returns:
+            Number of stale events removed
+        """
+        stale_ids = [
+            workflow_id
+            for workflow_id in self._state._workflow_cancel_events
+            if workflow_id not in active_workflow_ids
+        ]
+
+        for workflow_id in stale_ids:
+            self._state._workflow_cancel_events.pop(workflow_id, None)
+            self._state._cancellation_completion_events.pop(workflow_id, None)
+            self._state._cancellation_errors.pop(workflow_id, None)
+
+        return len(stale_ids)
+
+    def get_cancellation_stats(self) -> dict[str, int]:
+        """
+        Get observability stats for cancellation tracking.
+
+        Returns:
+            Dictionary with cancel event counts and active workflow counts
+        """
+        return {
+            "cancel_events": len(self._state._workflow_cancel_events),
+            "completion_events": len(self._state._cancellation_completion_events),
+            "active_workflows": len(self._state._active_workflows),
+            "pending_errors": len(self._state._cancellation_errors),
+        }
