@@ -485,6 +485,9 @@ class GateServer(HealthAwareServer):
         # Raft integration (initialized in _init_coordinators, declared here for SWIM callback safety)
         self._raft: GateRaftIntegration | None = None
 
+        # Dead gate tracking for Raft-based leadership takeover
+        self._dead_gate_addrs: set[tuple[str, int]] = set()
+
         # State version
         self._state_version = 0
 
@@ -798,6 +801,8 @@ class GateServer(HealthAwareServer):
             logger=self._udp_logger,
             task_runner=self._task_runner,
             send_tcp=self._send_tcp,
+            on_job_raft_leader=self._on_job_raft_leader,
+            on_job_raft_lose_leader=self._on_job_raft_lose_leader,
         )
 
     def _init_handlers(self) -> None:
@@ -2804,6 +2809,7 @@ class GateServer(HealthAwareServer):
         """Handle node death via SWIM."""
         gate_tcp_addr = self._modular_state.get_tcp_addr_for_udp(node_addr)
         if gate_tcp_addr:
+            self._dead_gate_addrs.add(gate_tcp_addr)
             if self._raft is not None:
                 for gate_id, gate_info in self._modular_state.iter_known_gates():
                     if (gate_info.udp_host, gate_info.udp_port) == node_addr:
@@ -2817,6 +2823,7 @@ class GateServer(HealthAwareServer):
         """Handle node join via SWIM."""
         gate_tcp_addr = self._modular_state.get_tcp_addr_for_udp(node_addr)
         if gate_tcp_addr:
+            self._dead_gate_addrs.discard(gate_tcp_addr)
             if self._raft is not None:
                 for gate_id, gate_info in self._modular_state.iter_known_gates():
                     if (gate_info.udp_host, gate_info.udp_port) == node_addr:
@@ -2895,7 +2902,7 @@ class GateServer(HealthAwareServer):
                 )
 
     def _on_gate_become_leader(self) -> None:
-        """Called when this gate becomes the cluster leader."""
+        """Called when this gate becomes the SWIM cluster leader."""
         self._task_runner.run(
             self._udp_logger.log,
             ServerInfo(
@@ -2905,6 +2912,7 @@ class GateServer(HealthAwareServer):
                 node_id=self._node_id.short,
             ),
         )
+        self._task_runner.run(self._scan_for_orphaned_gate_jobs)
 
     def _on_gate_lose_leadership(self) -> None:
         """Called when this gate loses cluster leadership."""
@@ -2917,6 +2925,98 @@ class GateServer(HealthAwareServer):
                 node_id=self._node_id.short,
             ),
         )
+
+    # =========================================================================
+    # Per-Job Raft Leader Callbacks
+    # =========================================================================
+
+    def _on_job_raft_leader(self, job_id: str) -> None:
+        """Called when this gate becomes the per-job Raft leader.
+
+        Schedules an async check for whether the current gate job
+        leader is dead and needs to be taken over.
+        """
+        self._task_runner.run(self._check_gate_raft_leader_takeover, job_id)
+
+    def _on_job_raft_lose_leader(self, job_id: str) -> None:
+        """Called when this gate loses per-job Raft leadership."""
+        self._task_runner.run(
+            self._udp_logger.log,
+            ServerInfo(
+                message=f"Lost Raft leadership for gate job {job_id[:8]}...",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            ),
+        )
+
+    async def _check_gate_raft_leader_takeover(self, job_id: str) -> None:
+        """Check if gate job leadership takeover is needed after becoming Raft leader.
+
+        When this gate becomes the per-job Raft leader, it checks if
+        the current gate job leader is dead. If so, it proposes a
+        leadership takeover through Raft consensus.
+        """
+        if self._raft is None:
+            return
+
+        leader_addr = self._job_leadership_tracker.get_leader_addr(job_id)
+        if leader_addr is None:
+            return
+
+        if leader_addr not in self._dead_gate_addrs:
+            return
+
+        old_leader_id = self._job_leadership_tracker.get_leader(job_id)
+
+        accepted = await self._raft.raft_job_manager.takeover_gate_leadership(job_id)
+        if not accepted:
+            return
+
+        await self._udp_logger.log(
+            ServerInfo(
+                message=(
+                    f"Raft leader takeover: assumed gate job leadership for {job_id[:8]}... "
+                    f"(previous gate leader {old_leader_id or 'unknown'} is dead)"
+                ),
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+
+    async def _scan_for_orphaned_gate_jobs(self) -> None:
+        """Scan for orphaned gate jobs from dead gate peers.
+
+        Called when this gate becomes the SWIM cluster leader.
+        Proposes leadership takeover through Raft consensus for any
+        gate jobs whose leader is in the dead gate addresses set.
+        """
+        if self._raft is None:
+            return
+
+        all_leaderships = self._job_leadership_tracker.get_all_leaderships()
+        for job_id, leader_id, leader_addr, _fencing_token in all_leaderships:
+            if leader_addr not in self._dead_gate_addrs:
+                continue
+
+            await self._raft.consensus.create_job_raft(job_id)
+
+            accepted = await self._raft.raft_job_manager.takeover_gate_leadership(job_id)
+            if not accepted:
+                continue
+
+            await self._udp_logger.log(
+                ServerInfo(
+                    message=(
+                        f"Orphan scan: took over gate job leadership for {job_id[:8]}... "
+                        f"(previous leader {leader_id} is dead)"
+                    ),
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
 
     def _on_manager_globally_dead(
         self,

@@ -507,3 +507,95 @@ class TestManagerRaftLeaderCallbacks:
         """No callbacks passed means RaftConsensus has None for callbacks."""
         assert manager_integration.consensus._on_become_leader is None
         assert manager_integration.consensus._on_lose_leadership is None
+
+
+class TestGateRaftLeaderCallbacks:
+    """Tests for gate per-job Raft leader callbacks wiring."""
+
+    def test_leader_callback_passed_to_consensus(
+        self,
+        mock_gate_job_manager,
+        leadership_tracker,
+        mock_gate_state,
+        mock_logger,
+        mock_task_runner,
+        mock_send_tcp,
+    ) -> None:
+        """on_job_raft_leader callback is forwarded to GateRaftConsensus."""
+        callback = MagicMock()
+        integration = GateRaftIntegration(
+            node_id="gate-1",
+            job_manager=mock_gate_job_manager,
+            leadership_tracker=leadership_tracker,
+            gate_state=mock_gate_state,
+            logger=mock_logger,
+            task_runner=mock_task_runner,
+            send_tcp=mock_send_tcp,
+            on_job_raft_leader=callback,
+        )
+        assert integration.consensus._on_become_leader is callback
+
+    def test_lose_leader_callback_passed_to_consensus(
+        self,
+        mock_gate_job_manager,
+        leadership_tracker,
+        mock_gate_state,
+        mock_logger,
+        mock_task_runner,
+        mock_send_tcp,
+    ) -> None:
+        """on_job_raft_lose_leader callback is forwarded to GateRaftConsensus."""
+        callback = MagicMock()
+        integration = GateRaftIntegration(
+            node_id="gate-1",
+            job_manager=mock_gate_job_manager,
+            leadership_tracker=leadership_tracker,
+            gate_state=mock_gate_state,
+            logger=mock_logger,
+            task_runner=mock_task_runner,
+            send_tcp=mock_send_tcp,
+            on_job_raft_lose_leader=callback,
+        )
+        assert integration.consensus._on_lose_leadership is callback
+
+    @pytest.mark.asyncio
+    async def test_leader_callback_invoked_on_job_raft_creation(
+        self,
+        mock_gate_job_manager,
+        leadership_tracker,
+        mock_gate_state,
+        mock_logger,
+        mock_task_runner,
+        mock_send_tcp,
+    ) -> None:
+        """Per-job gate RaftNode receives wrapped callback that passes job_id."""
+        invoked_jobs: list[str] = []
+
+        def on_leader(job_id: str) -> None:
+            invoked_jobs.append(job_id)
+
+        integration = GateRaftIntegration(
+            node_id="gate-1",
+            job_manager=mock_gate_job_manager,
+            leadership_tracker=leadership_tracker,
+            gate_state=mock_gate_state,
+            logger=mock_logger,
+            task_runner=mock_task_runner,
+            send_tcp=mock_send_tcp,
+            on_job_raft_leader=on_leader,
+        )
+
+        await integration.consensus.create_job_raft("gate-job-1")
+        node = integration.consensus.get_node("gate-job-1")
+        assert node is not None
+
+        # Simulate the callback being triggered
+        node._on_become_leader()
+        assert invoked_jobs == ["gate-job-1"]
+
+    def test_no_callback_when_not_provided(
+        self, gate_integration: GateRaftIntegration
+    ) -> None:
+        """No callbacks passed means GateRaftConsensus has None for callbacks."""
+        assert gate_integration.consensus._on_become_leader is None
+        assert gate_integration.consensus._on_lose_leadership is None
