@@ -19,6 +19,7 @@ from .raft_node import HEARTBEAT_INTERVAL, RaftNode
 from .state_machine import RaftStateMachine
 
 if TYPE_CHECKING:
+    from hyperscale.distributed.jobs.job_leadership_tracker import JobLeadershipTracker
     from hyperscale.distributed.jobs.job_manager import JobManager
     from hyperscale.distributed.taskex import TaskRunner
     from hyperscale.logging import Logger
@@ -52,6 +53,7 @@ class RaftConsensus:
         self,
         node_id: str,
         job_manager: "JobManager",
+        leadership_tracker: "JobLeadershipTracker",
         logger: "Logger",
         task_runner: "TaskRunner",
         send_message: Callable[..., Awaitable[None]],
@@ -61,7 +63,7 @@ class RaftConsensus:
     ) -> None:
         self._node_id = node_id
         self._job_manager = job_manager
-        self._state_machine = RaftStateMachine(job_manager, logger, node_id)
+        self._state_machine = RaftStateMachine(job_manager, leadership_tracker, logger, node_id)
         self._logger = logger
         self._task_runner = task_runner
         self._send_message = send_message

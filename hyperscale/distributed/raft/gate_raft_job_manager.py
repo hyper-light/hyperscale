@@ -12,7 +12,14 @@ from .models import GateRaftCommandType
 from .models.gate_commands import GateRaftCommand
 
 if TYPE_CHECKING:
-    from hyperscale.distributed.models import GlobalJobStatus, JobFinalResult
+    from typing import Any
+
+    from hyperscale.distributed.models import (
+        GlobalJobStatus,
+        JobFinalResult,
+        JobSubmission,
+        WorkflowResultPush,
+    )
     from hyperscale.logging import Logger
 
     from .gate_raft_consensus import GateRaftConsensus
@@ -190,4 +197,175 @@ class GateRaftJobManager:
             command_type=GateRaftCommandType.CLEANUP_OLD_JOBS,
             job_id=job_id,
             max_age_seconds=max_age_seconds,
+        ))
+
+    # =========================================================================
+    # Gate Leadership
+    # =========================================================================
+
+    async def assume_gate_leadership(
+        self,
+        job_id: str,
+        metadata: "Any" = None,
+        initial_token: int = 1,
+    ) -> bool:
+        """Propose ASSUME_GATE_LEADERSHIP through Raft."""
+        return await self._propose(job_id, GateRaftCommand(
+            command_type=GateRaftCommandType.ASSUME_GATE_LEADERSHIP,
+            job_id=job_id,
+            metadata=metadata,
+            initial_token=initial_token,
+        ))
+
+    async def takeover_gate_leadership(
+        self,
+        job_id: str,
+        metadata: "Any" = None,
+    ) -> bool:
+        """Propose TAKEOVER_GATE_LEADERSHIP through Raft."""
+        return await self._propose(job_id, GateRaftCommand(
+            command_type=GateRaftCommandType.TAKEOVER_GATE_LEADERSHIP,
+            job_id=job_id,
+            metadata=metadata,
+        ))
+
+    async def release_gate_leadership(self, job_id: str) -> bool:
+        """Propose RELEASE_GATE_LEADERSHIP through Raft."""
+        return await self._propose(job_id, GateRaftCommand(
+            command_type=GateRaftCommandType.RELEASE_GATE_LEADERSHIP,
+            job_id=job_id,
+        ))
+
+    async def process_leadership_claim(
+        self,
+        job_id: str,
+        claimer_id: str,
+        claimer_addr: tuple[str, int],
+        fencing_token: int,
+        metadata: "Any" = None,
+    ) -> bool:
+        """Propose PROCESS_LEADERSHIP_CLAIM through Raft."""
+        return await self._propose(job_id, GateRaftCommand(
+            command_type=GateRaftCommandType.PROCESS_LEADERSHIP_CLAIM,
+            job_id=job_id,
+            claimer_id=claimer_id,
+            claimer_addr=claimer_addr,
+            fencing_token=fencing_token,
+            metadata=metadata,
+        ))
+
+    # =========================================================================
+    # DC Manager Tracking
+    # =========================================================================
+
+    async def update_dc_manager(
+        self,
+        job_id: str,
+        dc_id: str,
+        manager_id: str,
+        manager_addr: tuple[str, int],
+        fencing_token: int,
+    ) -> bool:
+        """Propose UPDATE_DC_MANAGER through Raft."""
+        return await self._propose(job_id, GateRaftCommand(
+            command_type=GateRaftCommandType.UPDATE_DC_MANAGER,
+            job_id=job_id,
+            dc_id=dc_id,
+            manager_id=manager_id,
+            manager_addr=manager_addr,
+            fencing_token=fencing_token,
+        ))
+
+    async def release_dc_managers(self, job_id: str) -> bool:
+        """Propose RELEASE_DC_MANAGERS through Raft."""
+        return await self._propose(job_id, GateRaftCommand(
+            command_type=GateRaftCommandType.RELEASE_DC_MANAGERS,
+            job_id=job_id,
+        ))
+
+    # =========================================================================
+    # Lease Management
+    # =========================================================================
+
+    async def create_lease(
+        self,
+        job_id: str,
+        datacenter: str,
+        lease_holder: str,
+        fence_token: int,
+        expires_at: float,
+        lease_version: int = 0,
+    ) -> bool:
+        """Propose CREATE_LEASE through Raft."""
+        return await self._propose(job_id, GateRaftCommand(
+            command_type=GateRaftCommandType.CREATE_LEASE,
+            job_id=job_id,
+            datacenter=datacenter,
+            lease_holder=lease_holder,
+            fence_token=fence_token,
+            expires_at=expires_at,
+            lease_version=lease_version,
+        ))
+
+    async def release_lease(self, job_id: str) -> bool:
+        """Propose RELEASE_LEASE through Raft."""
+        return await self._propose(job_id, GateRaftCommand(
+            command_type=GateRaftCommandType.RELEASE_LEASE,
+            job_id=job_id,
+        ))
+
+    # =========================================================================
+    # Job Submission State
+    # =========================================================================
+
+    async def set_job_submission(
+        self,
+        job_id: str,
+        submission: "JobSubmission",
+    ) -> bool:
+        """Propose SET_JOB_SUBMISSION through Raft."""
+        return await self._propose(job_id, GateRaftCommand(
+            command_type=GateRaftCommandType.SET_JOB_SUBMISSION,
+            job_id=job_id,
+            submission=submission,
+        ))
+
+    # =========================================================================
+    # Workflow DC Results
+    # =========================================================================
+
+    async def set_workflow_dc_result(
+        self,
+        job_id: str,
+        dc_id: str,
+        workflow_id: str,
+        workflow_result: "WorkflowResultPush",
+    ) -> bool:
+        """Propose SET_WORKFLOW_DC_RESULT through Raft."""
+        return await self._propose(job_id, GateRaftCommand(
+            command_type=GateRaftCommandType.SET_WORKFLOW_DC_RESULT,
+            job_id=job_id,
+            dc_id=dc_id,
+            workflow_id=workflow_id,
+            workflow_result=workflow_result,
+        ))
+
+    # =========================================================================
+    # Membership
+    # =========================================================================
+
+    async def gate_membership_event(
+        self,
+        job_id: str,
+        event_type: str,
+        node_id: str,
+        node_addr: tuple[str, int] | None = None,
+    ) -> bool:
+        """Propose GATE_MEMBERSHIP_EVENT through Raft."""
+        return await self._propose(job_id, GateRaftCommand(
+            command_type=GateRaftCommandType.GATE_MEMBERSHIP_EVENT,
+            job_id=job_id,
+            event_type=event_type,
+            node_id=node_id,
+            node_addr=node_addr,
         ))

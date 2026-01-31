@@ -274,3 +274,115 @@ class RaftJobManager:
             job_token=job_token,
             context_updates=updates,
         ))
+
+    # =========================================================================
+    # Job Leadership
+    # =========================================================================
+
+    async def assume_job_leadership(
+        self,
+        job_id: str,
+        metadata: Any = None,
+        initial_token: int = 1,
+    ) -> bool:
+        """Propose ASSUME_JOB_LEADERSHIP through Raft."""
+        return await self._propose(job_id, RaftCommand(
+            command_type=RaftCommandType.ASSUME_JOB_LEADERSHIP,
+            job_id=job_id,
+            metadata=metadata,
+            initial_token=initial_token,
+        ))
+
+    async def takeover_job_leadership(
+        self,
+        job_id: str,
+        metadata: Any = None,
+    ) -> bool:
+        """Propose TAKEOVER_JOB_LEADERSHIP through Raft."""
+        return await self._propose(job_id, RaftCommand(
+            command_type=RaftCommandType.TAKEOVER_JOB_LEADERSHIP,
+            job_id=job_id,
+            metadata=metadata,
+        ))
+
+    async def release_job_leadership(self, job_id: str) -> bool:
+        """Propose RELEASE_JOB_LEADERSHIP through Raft."""
+        return await self._propose(job_id, RaftCommand(
+            command_type=RaftCommandType.RELEASE_JOB_LEADERSHIP,
+            job_id=job_id,
+        ))
+
+    # =========================================================================
+    # Cancellation
+    # =========================================================================
+
+    async def initiate_cancellation(
+        self,
+        job_id: str,
+        pending_workflows: set[str] | None = None,
+    ) -> bool:
+        """Propose INITIATE_CANCELLATION through Raft."""
+        return await self._propose(job_id, RaftCommand(
+            command_type=RaftCommandType.INITIATE_CANCELLATION,
+            job_id=job_id,
+            pending_workflows=pending_workflows,
+        ))
+
+    async def complete_cancellation(self, job_id: str) -> bool:
+        """Propose COMPLETE_CANCELLATION through Raft."""
+        return await self._propose(job_id, RaftCommand(
+            command_type=RaftCommandType.COMPLETE_CANCELLATION,
+            job_id=job_id,
+        ))
+
+    # =========================================================================
+    # Provisioning
+    # =========================================================================
+
+    async def provision_confirmed(
+        self,
+        job_id: str,
+        confirming_node_id: str,
+    ) -> bool:
+        """Propose PROVISION_CONFIRMED through Raft."""
+        return await self._propose(job_id, RaftCommand(
+            command_type=RaftCommandType.PROVISION_CONFIRMED,
+            job_id=job_id,
+            confirming_node_id=confirming_node_id,
+        ))
+
+    # =========================================================================
+    # Stats
+    # =========================================================================
+
+    async def flush_stats_window(
+        self,
+        job_id: str,
+        stats_data: bytes,
+    ) -> bool:
+        """Propose FLUSH_STATS_WINDOW through Raft."""
+        return await self._propose(job_id, RaftCommand(
+            command_type=RaftCommandType.FLUSH_STATS_WINDOW,
+            job_id=job_id,
+            stats_data=stats_data,
+        ))
+
+    # =========================================================================
+    # Membership
+    # =========================================================================
+
+    async def node_membership_event(
+        self,
+        job_id: str,
+        event_type: str,
+        node_id: str,
+        node_addr: tuple[str, int] | None = None,
+    ) -> bool:
+        """Propose NODE_MEMBERSHIP_EVENT through Raft."""
+        return await self._propose(job_id, RaftCommand(
+            command_type=RaftCommandType.NODE_MEMBERSHIP_EVENT,
+            job_id=job_id,
+            event_type=event_type,
+            node_id=node_id,
+            node_addr=node_addr,
+        ))

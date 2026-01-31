@@ -12,7 +12,7 @@ class RaftCommandType(str, Enum):
     """
     Command types for manager Raft log entries.
 
-    Maps to JobManager's 13 state-mutating methods plus
+    Maps to JobManager's 21 state-mutating methods plus
     Raft control operations.
     """
 
@@ -38,6 +38,24 @@ class RaftCommandType(str, Enum):
     # State management (2 methods)
     UPDATE_JOB_STATUS = "update_job_status"
     UPDATE_CONTEXT = "update_context"
+
+    # Job leadership (3 methods)
+    ASSUME_JOB_LEADERSHIP = "assume_job_leadership"
+    TAKEOVER_JOB_LEADERSHIP = "takeover_job_leadership"
+    RELEASE_JOB_LEADERSHIP = "release_job_leadership"
+
+    # Cancellation (2 methods)
+    INITIATE_CANCELLATION = "initiate_cancellation"
+    COMPLETE_CANCELLATION = "complete_cancellation"
+
+    # Provisioning (1 method)
+    PROVISION_CONFIRMED = "provision_confirmed"
+
+    # Stats (1 method)
+    FLUSH_STATS_WINDOW = "flush_stats_window"
+
+    # Membership (1 method)
+    NODE_MEMBERSHIP_EVENT = "node_membership_event"
 
     # Raft control
     NO_OP = "no_op"

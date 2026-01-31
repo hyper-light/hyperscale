@@ -60,3 +60,22 @@ class RaftCommand:
     job_token: str | None = None
     status: str | None = None
     context_updates: dict[str, Any] | None = None
+
+    # Job leadership (assume, takeover, release)
+    metadata: Any | None = None
+    initial_token: int = 1
+    fencing_token: int = 0
+
+    # Cancellation (initiate, complete)
+    pending_workflows: set[str] | None = None
+
+    # Provisioning (provision_confirmed)
+    confirming_node_id: str | None = None
+
+    # Stats (flush_stats_window)
+    stats_data: bytes | None = None
+
+    # Membership events
+    event_type: str | None = None
+    node_id: str | None = None
+    node_addr: tuple[str, int] | None = None

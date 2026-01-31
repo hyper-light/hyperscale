@@ -20,6 +20,8 @@ from .raft_node import HEARTBEAT_INTERVAL, RaftNode
 
 if TYPE_CHECKING:
     from hyperscale.distributed.jobs.gates.gate_job_manager import GateJobManager
+    from hyperscale.distributed.jobs.job_leadership_tracker import JobLeadershipTracker
+    from hyperscale.distributed.nodes.gate.state import GateRuntimeState
     from hyperscale.distributed.taskex import TaskRunner
     from hyperscale.logging import Logger
 
@@ -52,6 +54,8 @@ class GateRaftConsensus:
         self,
         node_id: str,
         job_manager: "GateJobManager",
+        leadership_tracker: "JobLeadershipTracker",
+        gate_state: "GateRuntimeState",
         logger: "Logger",
         task_runner: "TaskRunner",
         send_message: Callable[..., Awaitable[None]],
@@ -61,7 +65,9 @@ class GateRaftConsensus:
     ) -> None:
         self._node_id = node_id
         self._job_manager = job_manager
-        self._state_machine = GateStateMachine(job_manager, logger, node_id)
+        self._state_machine = GateStateMachine(
+            job_manager, leadership_tracker, gate_state, logger, node_id,
+        )
         self._logger = logger
         self._task_runner = task_runner
         self._send_message = send_message

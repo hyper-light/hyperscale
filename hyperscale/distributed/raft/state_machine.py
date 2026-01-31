@@ -15,6 +15,7 @@ from .models import RaftCommandType, RaftLogEntry
 from .models.commands import RaftCommand
 
 if TYPE_CHECKING:
+    from hyperscale.distributed.jobs.job_leadership_tracker import JobLeadershipTracker
     from hyperscale.distributed.jobs.job_manager import JobManager
     from hyperscale.logging import Logger
 
@@ -30,6 +31,7 @@ class RaftStateMachine:
 
     __slots__ = (
         "_job_manager",
+        "_leadership_tracker",
         "_logger",
         "_node_id",
         "_handlers",
@@ -38,10 +40,12 @@ class RaftStateMachine:
     def __init__(
         self,
         job_manager: "JobManager",
+        leadership_tracker: "JobLeadershipTracker",
         logger: "Logger",
         node_id: str,
     ) -> None:
         self._job_manager = job_manager
+        self._leadership_tracker = leadership_tracker
         self._logger = logger
         self._node_id = node_id
         self._handlers: dict[str, object] = {
@@ -58,6 +62,14 @@ class RaftStateMachine:
             RaftCommandType.UPDATE_WORKFLOW_STATUS: self._apply_update_workflow_status,
             RaftCommandType.UPDATE_JOB_STATUS: self._apply_update_job_status,
             RaftCommandType.UPDATE_CONTEXT: self._apply_update_context,
+            RaftCommandType.ASSUME_JOB_LEADERSHIP: self._apply_assume_leadership,
+            RaftCommandType.TAKEOVER_JOB_LEADERSHIP: self._apply_takeover_leadership,
+            RaftCommandType.RELEASE_JOB_LEADERSHIP: self._apply_release_leadership,
+            RaftCommandType.INITIATE_CANCELLATION: self._apply_initiate_cancellation,
+            RaftCommandType.COMPLETE_CANCELLATION: self._apply_complete_cancellation,
+            RaftCommandType.PROVISION_CONFIRMED: self._apply_provision_confirmed,
+            RaftCommandType.FLUSH_STATS_WINDOW: self._apply_flush_stats_window,
+            RaftCommandType.NODE_MEMBERSHIP_EVENT: self._apply_node_membership_event,
             RaftCommandType.NO_OP: self._apply_no_op,
         }
 
@@ -211,6 +223,65 @@ class RaftStateMachine:
             job_token=command.job_token,
             updates=command.context_updates,
         )
+
+    # =========================================================================
+    # Job Leadership Handlers
+    # =========================================================================
+
+    async def _apply_assume_leadership(self, command: RaftCommand) -> None:
+        """Apply ASSUME_JOB_LEADERSHIP: this node assumes leadership."""
+        self._leadership_tracker.assume_leadership(
+            job_id=command.job_id,
+            metadata=command.metadata,
+            initial_token=command.initial_token,
+        )
+
+    async def _apply_takeover_leadership(self, command: RaftCommand) -> None:
+        """Apply TAKEOVER_JOB_LEADERSHIP: this node takes over leadership."""
+        self._leadership_tracker.takeover_leadership(
+            job_id=command.job_id,
+            metadata=command.metadata,
+        )
+
+    async def _apply_release_leadership(self, command: RaftCommand) -> None:
+        """Apply RELEASE_JOB_LEADERSHIP: release leadership of a job."""
+        self._leadership_tracker.release_leadership(job_id=command.job_id)
+
+    # =========================================================================
+    # Cancellation Handlers
+    # =========================================================================
+
+    async def _apply_initiate_cancellation(self, command: RaftCommand) -> None:
+        """Apply INITIATE_CANCELLATION: begin cancellation of a job."""
+        pass
+
+    async def _apply_complete_cancellation(self, command: RaftCommand) -> None:
+        """Apply COMPLETE_CANCELLATION: finalize cancellation of a job."""
+        pass
+
+    # =========================================================================
+    # Provisioning Handlers
+    # =========================================================================
+
+    async def _apply_provision_confirmed(self, command: RaftCommand) -> None:
+        """Apply PROVISION_CONFIRMED: record a provision confirmation."""
+        pass
+
+    # =========================================================================
+    # Stats Handlers
+    # =========================================================================
+
+    async def _apply_flush_stats_window(self, command: RaftCommand) -> None:
+        """Apply FLUSH_STATS_WINDOW: apply aggregated stats window data."""
+        pass
+
+    # =========================================================================
+    # Membership Handlers
+    # =========================================================================
+
+    async def _apply_node_membership_event(self, command: RaftCommand) -> None:
+        """Apply NODE_MEMBERSHIP_EVENT: record a cluster membership change."""
+        pass
 
     # =========================================================================
     # Raft Control

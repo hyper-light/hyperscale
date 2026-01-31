@@ -16,6 +16,8 @@ from .models.gate_commands import GateRaftCommand
 
 if TYPE_CHECKING:
     from hyperscale.distributed.jobs.gates.gate_job_manager import GateJobManager
+    from hyperscale.distributed.jobs.job_leadership_tracker import JobLeadershipTracker
+    from hyperscale.distributed.nodes.gate.state import GateRuntimeState
     from hyperscale.logging import Logger
 
 
@@ -30,6 +32,8 @@ class GateStateMachine:
 
     __slots__ = (
         "_job_manager",
+        "_leadership_tracker",
+        "_gate_state",
         "_logger",
         "_node_id",
         "_handlers",
@@ -38,10 +42,14 @@ class GateStateMachine:
     def __init__(
         self,
         job_manager: "GateJobManager",
+        leadership_tracker: "JobLeadershipTracker",
+        gate_state: "GateRuntimeState",
         logger: "Logger",
         node_id: str,
     ) -> None:
         self._job_manager = job_manager
+        self._leadership_tracker = leadership_tracker
+        self._gate_state = gate_state
         self._logger = logger
         self._node_id = node_id
         self._handlers: dict[str, object] = {
@@ -54,6 +62,17 @@ class GateStateMachine:
             GateRaftCommandType.REMOVE_CALLBACK: self._apply_remove_callback,
             GateRaftCommandType.SET_FENCE_TOKEN: self._apply_set_fence_token,
             GateRaftCommandType.CLEANUP_OLD_JOBS: self._apply_cleanup_old_jobs,
+            GateRaftCommandType.ASSUME_GATE_LEADERSHIP: self._apply_assume_leadership,
+            GateRaftCommandType.TAKEOVER_GATE_LEADERSHIP: self._apply_takeover_leadership,
+            GateRaftCommandType.RELEASE_GATE_LEADERSHIP: self._apply_release_leadership,
+            GateRaftCommandType.PROCESS_LEADERSHIP_CLAIM: self._apply_process_leadership_claim,
+            GateRaftCommandType.UPDATE_DC_MANAGER: self._apply_update_dc_manager,
+            GateRaftCommandType.RELEASE_DC_MANAGERS: self._apply_release_dc_managers,
+            GateRaftCommandType.CREATE_LEASE: self._apply_create_lease,
+            GateRaftCommandType.RELEASE_LEASE: self._apply_release_lease,
+            GateRaftCommandType.SET_JOB_SUBMISSION: self._apply_set_job_submission,
+            GateRaftCommandType.SET_WORKFLOW_DC_RESULT: self._apply_set_workflow_dc_result,
+            GateRaftCommandType.GATE_MEMBERSHIP_EVENT: self._apply_gate_membership_event,
             GateRaftCommandType.NO_OP: self._apply_no_op,
         }
 
@@ -172,6 +191,109 @@ class GateStateMachine:
         self._job_manager.cleanup_old_jobs(
             max_age_seconds=command.max_age_seconds,
         )
+
+    # =========================================================================
+    # Gate Leadership Handlers
+    # =========================================================================
+
+    async def _apply_assume_leadership(self, command: GateRaftCommand) -> None:
+        """Apply ASSUME_GATE_LEADERSHIP: this gate assumes job leadership."""
+        self._leadership_tracker.assume_leadership(
+            job_id=command.job_id,
+            metadata=command.metadata,
+            initial_token=command.initial_token,
+        )
+
+    async def _apply_takeover_leadership(self, command: GateRaftCommand) -> None:
+        """Apply TAKEOVER_GATE_LEADERSHIP: this gate takes over leadership."""
+        self._leadership_tracker.takeover_leadership(
+            job_id=command.job_id,
+            metadata=command.metadata,
+        )
+
+    async def _apply_release_leadership(self, command: GateRaftCommand) -> None:
+        """Apply RELEASE_GATE_LEADERSHIP: release leadership of a job."""
+        self._leadership_tracker.release_leadership(job_id=command.job_id)
+
+    async def _apply_process_leadership_claim(self, command: GateRaftCommand) -> None:
+        """Apply PROCESS_LEADERSHIP_CLAIM: process peer's leadership claim."""
+        self._leadership_tracker.process_leadership_claim(
+            job_id=command.job_id,
+            claimer_id=command.claimer_id,
+            claimer_addr=command.claimer_addr,
+            fencing_token=command.fencing_token,
+            metadata=command.metadata,
+        )
+
+    # =========================================================================
+    # DC Manager Tracking Handlers
+    # =========================================================================
+
+    async def _apply_update_dc_manager(self, command: GateRaftCommand) -> None:
+        """Apply UPDATE_DC_MANAGER: update DC manager for a job."""
+        self._leadership_tracker._update_dc_manager(
+            job_id=command.job_id,
+            dc_id=command.dc_id,
+            manager_id=command.manager_id,
+            manager_addr=command.manager_addr,
+            fencing_token=command.fencing_token,
+        )
+
+    async def _apply_release_dc_managers(self, command: GateRaftCommand) -> None:
+        """Apply RELEASE_DC_MANAGERS: release all DC manager tracking for a job."""
+        self._leadership_tracker._dc_managers.pop(command.job_id, None)
+
+    # =========================================================================
+    # Lease Management Handlers
+    # =========================================================================
+
+    async def _apply_create_lease(self, command: GateRaftCommand) -> None:
+        """Apply CREATE_LEASE: create a datacenter lease."""
+        from hyperscale.distributed.models import DatacenterLease
+
+        lease = DatacenterLease()
+        lease.job_id = command.job_id
+        lease.datacenter = command.datacenter
+        lease.lease_holder = command.lease_holder
+        lease.fence_token = command.fence_token
+        lease.expires_at = command.expires_at
+        lease.version = command.lease_version
+        self._gate_state._leases[command.job_id] = lease
+
+    async def _apply_release_lease(self, command: GateRaftCommand) -> None:
+        """Apply RELEASE_LEASE: release a datacenter lease."""
+        self._gate_state._leases.pop(command.job_id, None)
+
+    # =========================================================================
+    # Job Submission State Handler
+    # =========================================================================
+
+    async def _apply_set_job_submission(self, command: GateRaftCommand) -> None:
+        """Apply SET_JOB_SUBMISSION: store the job submission."""
+        self._gate_state._job_submissions[command.job_id] = command.submission
+
+    # =========================================================================
+    # Workflow DC Result Handler
+    # =========================================================================
+
+    async def _apply_set_workflow_dc_result(self, command: GateRaftCommand) -> None:
+        """Apply SET_WORKFLOW_DC_RESULT: store a workflow result from a DC."""
+        job_id = command.job_id
+        dc_id = command.dc_id
+        workflow_id = command.workflow_id
+        if job_id not in self._gate_state._workflow_dc_results:
+            self._gate_state._workflow_dc_results[job_id] = {}
+        if dc_id not in self._gate_state._workflow_dc_results[job_id]:
+            self._gate_state._workflow_dc_results[job_id][dc_id] = {}
+        self._gate_state._workflow_dc_results[job_id][dc_id][workflow_id] = command.workflow_result
+
+    # =========================================================================
+    # Membership Handler
+    # =========================================================================
+
+    async def _apply_gate_membership_event(self, command: GateRaftCommand) -> None:
+        """Apply GATE_MEMBERSHIP_EVENT: record a cluster membership change."""
+        pass
 
     # =========================================================================
     # Raft Control

@@ -12,7 +12,7 @@ class GateRaftCommandType(str, Enum):
     """
     Command types for gate Raft log entries.
 
-    Maps to GateJobManager's 9 state-mutating methods plus
+    Maps to GateJobManager's 20 state-mutating methods plus
     Raft control operations.
     """
 
@@ -36,6 +36,29 @@ class GateRaftCommandType(str, Enum):
 
     # Cleanup (1 method)
     CLEANUP_OLD_JOBS = "cleanup_old_jobs"
+
+    # Gate leadership (4 methods)
+    ASSUME_GATE_LEADERSHIP = "assume_gate_leadership"
+    TAKEOVER_GATE_LEADERSHIP = "takeover_gate_leadership"
+    RELEASE_GATE_LEADERSHIP = "release_gate_leadership"
+    PROCESS_LEADERSHIP_CLAIM = "process_leadership_claim"
+
+    # DC manager tracking (2 methods)
+    UPDATE_DC_MANAGER = "update_dc_manager"
+    RELEASE_DC_MANAGERS = "release_dc_managers"
+
+    # Lease management (2 methods)
+    CREATE_LEASE = "create_lease"
+    RELEASE_LEASE = "release_lease"
+
+    # Job submission state (1 method)
+    SET_JOB_SUBMISSION = "set_job_submission"
+
+    # Workflow DC results (1 method)
+    SET_WORKFLOW_DC_RESULT = "set_workflow_dc_result"
+
+    # Membership events (1 method)
+    GATE_MEMBERSHIP_EVENT = "gate_membership_event"
 
     # Raft control
     NO_OP = "no_op"
