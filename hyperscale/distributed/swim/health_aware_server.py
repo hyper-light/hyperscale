@@ -1016,10 +1016,6 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         if self._error_handler:
             self._error_handler.record_success(ErrorCategory.NETWORK)
 
-    def _setup_task_runner_integration(self) -> None:
-        """Integrate TaskRunner with SWIM components."""
-        pass
-
     async def initialize_incarnation_store(self) -> int:
         """
         Initialize the incarnation store and return the starting incarnation.
@@ -2255,9 +2251,6 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         # Ensure error handler is set up first
         if self._error_handler is None:
             self._setup_error_handler()
-
-        # Integrate task runner with SWIM components
-        self._setup_task_runner_integration()
 
         # Start hierarchical failure detector (AD-30)
         await self._hierarchical_detector.start()
@@ -3821,20 +3814,3 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             await self.handle_exception(error, "receive")
             return b"nack"
 
-    # ==========================================================================
-    # Legacy receive() match statement - preserved for reference during testing
-    # This entire block will be removed after confirming handlers work correctly
-    # ==========================================================================
-    async def _legacy_receive_removed(self) -> None:
-        """Placeholder to mark where old receive() logic was removed."""
-        # The old receive() method contained a ~600 line match statement.
-        # It has been replaced by the message_handling module with separate
-        # handler classes for each message type:
-        #   - membership/: ack, nack, join, leave
-        #   - probing/: probe, ping-req, ping-req-ack
-        #   - suspicion/: alive, suspect
-        #   - leadership/: leader-claim, leader-vote, leader-elected, etc.
-        #   - cross_cluster/: xprobe, xack, xnack
-        #
-        # See hyperscale/distributed_rewrite/swim/message_handling/
-        pass

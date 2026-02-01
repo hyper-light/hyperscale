@@ -6,6 +6,7 @@ throughput tracking per AD-19 and AD-23 specifications.
 """
 
 import time
+from collections.abc import Awaitable, Callable
 from enum import Enum
 from typing import TYPE_CHECKING, Any
 
@@ -23,6 +24,8 @@ if TYPE_CHECKING:
     from hyperscale.distributed.nodes.manager.config import ManagerConfig
     from hyperscale.distributed.taskex import TaskRunner
     from hyperscale.logging import Logger
+
+SendFunc = Callable[..., Awaitable[bytes | Exception | None]]
 
 
 class ProgressState(Enum):
@@ -71,12 +74,14 @@ class ManagerStatsCoordinator:
         task_runner: "TaskRunner",
         stats_buffer: StatsBuffer,
         windowed_stats: "WindowedStatsCollector",
+        send_to_callback: SendFunc | None = None,
     ) -> None:
         self._state: "ManagerState" = state
         self._config: "ManagerConfig" = config
         self._logger: "Logger" = logger
         self._node_id: str = node_id
         self._task_runner: "TaskRunner" = task_runner
+        self._send_to_callback: SendFunc | None = send_to_callback
 
         self._progress_state: ProgressState = ProgressState.NORMAL
         self._progress_state_since: float = time.monotonic()
@@ -267,24 +272,58 @@ class ManagerStatsCoordinator:
         """
         Push batched stats to gates/clients.
 
-        Called periodically by the stats push loop.
+        Called periodically by the stats push loop. Aggregates closed
+        windowed stats windows for each job and pushes them to registered
+        progress callbacks. Entries are cleared from the windowed collector
+        after successful aggregation.
         """
-        # In full implementation, this would:
-        # 1. Aggregate windowed stats
-        # 2. Push to registered callbacks
-        # 3. Clear processed entries
-        stats_buffer_metrics = self._stats_buffer.get_metrics()
-        self._task_runner.run(
-            self._logger.log,
-            ServerDebug(
-                message=(
-                    f"Batch stats push (buffer={stats_buffer_metrics['hot_count']})"
-                ),
+        job_ids = self._windowed_stats.get_active_job_ids()
+        if not job_ids:
+            return
+
+        pushed_count = 0
+        for job_id in job_ids:
+            pushed_count += await self._push_job_stats(job_id)
+
+        if pushed_count > 0:
+            await self._logger.log(ServerDebug(
+                message=f"Pushed {pushed_count} stats windows across {len(job_ids)} jobs",
                 node_host=self._config.host,
                 node_port=self._config.tcp_port,
                 node_id=self._node_id,
-            ),
-        )
+            ))
+
+    async def _push_job_stats(self, job_id: str) -> int:
+        """
+        Push aggregated stats for a single job to its callback.
+
+        Returns:
+            Number of stats windows pushed
+        """
+        aggregated = await self._windowed_stats.get_aggregated_stats(job_id)
+        if not aggregated:
+            return 0
+
+        callback_addr = self._state.get_progress_callback(job_id)
+        if not callback_addr or not self._send_to_callback:
+            return len(aggregated)
+
+        for stats_push in aggregated:
+            try:
+                await self._send_to_callback(
+                    callback_addr,
+                    "windowed_stats_push",
+                    stats_push.dump(),
+                )
+            except Exception as send_error:
+                await self._logger.log(ServerWarning(
+                    message=f"Failed to push stats for job {job_id[:8]}...: {send_error}",
+                    node_host=self._config.host,
+                    node_port=self._config.tcp_port,
+                    node_id=self._node_id,
+                ))
+
+        return len(aggregated)
 
     def get_stats_metrics(self) -> dict[str, Any]:
         """Get stats-related metrics."""

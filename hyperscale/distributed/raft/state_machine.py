@@ -6,17 +6,19 @@ deserializing commands and dispatching to the correct method.
 Each command type maps to exactly one handler.
 """
 
+import time
 from typing import TYPE_CHECKING
 
 import cloudpickle
 
-from .logging_models import RaftError, RaftWarning
+from .logging_models import RaftDebug, RaftError, RaftInfo, RaftWarning
 from .models import RaftCommandType, RaftLogEntry
 from .models.commands import RaftCommand
 
 if TYPE_CHECKING:
     from hyperscale.distributed.jobs.job_leadership_tracker import JobLeadershipTracker
     from hyperscale.distributed.jobs.job_manager import JobManager
+    from hyperscale.distributed.nodes.manager.state import ManagerState
     from hyperscale.logging import Logger
 
 
@@ -32,6 +34,7 @@ class RaftStateMachine:
     __slots__ = (
         "_job_manager",
         "_leadership_tracker",
+        "_manager_state",
         "_logger",
         "_node_id",
         "_handlers",
@@ -43,9 +46,11 @@ class RaftStateMachine:
         leadership_tracker: "JobLeadershipTracker",
         logger: "Logger",
         node_id: str,
+        manager_state: "ManagerState | None" = None,
     ) -> None:
         self._job_manager = job_manager
         self._leadership_tracker = leadership_tracker
+        self._manager_state = manager_state
         self._logger = logger
         self._node_id = node_id
         self._handlers: dict[str, object] = {
@@ -253,11 +258,34 @@ class RaftStateMachine:
 
     async def _apply_initiate_cancellation(self, command: RaftCommand) -> None:
         """Apply INITIATE_CANCELLATION: begin cancellation of a job."""
-        pass
+        if not (job := self._job_manager.get_job_by_id(command.job_id)):
+            return
+
+        async with job.lock:
+            job.status = "cancelling"
+            job.timestamp = time.monotonic()
+
+        if self._manager_state and command.pending_workflows:
+            self._manager_state.set_cancellation_initiated_at(
+                command.job_id, time.monotonic()
+            )
+            for workflow_id in command.pending_workflows:
+                self._manager_state.add_cancellation_pending_workflow(
+                    command.job_id, workflow_id
+                )
 
     async def _apply_complete_cancellation(self, command: RaftCommand) -> None:
         """Apply COMPLETE_CANCELLATION: finalize cancellation of a job."""
-        pass
+        if not (job := self._job_manager.get_job_by_id(command.job_id)):
+            return
+
+        async with job.lock:
+            job.status = "cancelled"
+            job.completed_at = time.monotonic()
+            job.timestamp = time.monotonic()
+
+        if self._manager_state:
+            self._manager_state.clear_cancellation_state(command.job_id)
 
     # =========================================================================
     # Provisioning Handlers
@@ -265,7 +293,15 @@ class RaftStateMachine:
 
     async def _apply_provision_confirmed(self, command: RaftCommand) -> None:
         """Apply PROVISION_CONFIRMED: record a provision confirmation."""
-        pass
+        if not self._manager_state or not command.confirming_node_id:
+            return
+        if not command.job_id:
+            return
+
+        confirmations = self._manager_state._provision_confirmations
+        if command.job_id not in confirmations:
+            confirmations[command.job_id] = set()
+        confirmations[command.job_id].add(command.confirming_node_id)
 
     # =========================================================================
     # Stats Handlers
@@ -273,7 +309,26 @@ class RaftStateMachine:
 
     async def _apply_flush_stats_window(self, command: RaftCommand) -> None:
         """Apply FLUSH_STATS_WINDOW: apply aggregated stats window data."""
-        pass
+        if not command.stats_data:
+            return
+
+        try:
+            stats_entries: list[tuple[float, float]] = cloudpickle.loads(
+                command.stats_data
+            )
+        except Exception:
+            await self._logger.log(RaftWarning(
+                message="Failed to deserialize stats window data",
+                node_id=self._node_id,
+                job_id=command.job_id,
+            ))
+            return
+
+        await self._logger.log(RaftDebug(
+            message=f"Applied stats window with {len(stats_entries)} entries for job {command.job_id}",
+            node_id=self._node_id,
+            job_id=command.job_id,
+        ))
 
     # =========================================================================
     # Membership Handlers
@@ -281,7 +336,14 @@ class RaftStateMachine:
 
     async def _apply_node_membership_event(self, command: RaftCommand) -> None:
         """Apply NODE_MEMBERSHIP_EVENT: record a cluster membership change."""
-        pass
+        if not command.event_type or not command.node_id:
+            return
+
+        await self._logger.log(RaftInfo(
+            message=f"Membership event: {command.event_type} node={command.node_id} addr={command.node_addr}",
+            node_id=self._node_id,
+            job_id=command.job_id,
+        ))
 
     # =========================================================================
     # Raft Control

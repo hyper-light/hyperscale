@@ -83,14 +83,17 @@ class WorkerStateSync:
 
     def apply_snapshot(self, snapshot: dict[str, Any]) -> bool:
         """
-        Apply a state snapshot (for future use in state recovery).
+        Apply a state snapshot from a peer.
+
+        Workers are state producers, not consumers of manager state.
+        Snapshot application is handled by the manager-side state sync
+        protocol. This hook exists for interface conformance and returns
+        True unconditionally.
 
         Args:
-            snapshot: State snapshot dictionary
+            snapshot: State snapshot dictionary (unused)
 
         Returns:
-            True if applied successfully
+            Always True
         """
-        # Workers typically don't apply snapshots from managers
-        # This is a placeholder for potential future use
         return True

@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 
 import cloudpickle
 
-from .logging_models import RaftError, RaftWarning
+from .logging_models import RaftError, RaftInfo, RaftWarning
 from .models import GateRaftCommandType, RaftLogEntry
 from .models.gate_commands import GateRaftCommand
 
@@ -293,7 +293,14 @@ class GateStateMachine:
 
     async def _apply_gate_membership_event(self, command: GateRaftCommand) -> None:
         """Apply GATE_MEMBERSHIP_EVENT: record a cluster membership change."""
-        pass
+        if not command.event_type or not command.node_id:
+            return
+
+        await self._logger.log(RaftInfo(
+            message=f"Gate membership event: {command.event_type} node={command.node_id} addr={command.node_addr}",
+            node_id=self._node_id,
+            job_id=command.job_id,
+        ))
 
     # =========================================================================
     # Raft Control

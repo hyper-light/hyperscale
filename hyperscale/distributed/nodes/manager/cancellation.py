@@ -91,8 +91,7 @@ class ManagerCancellationCoordinator:
         self._state._cancellation_initiated_at[job_id] = time.monotonic()
         self._state._cancellation_completion_events[job_id] = asyncio.Event()
 
-        # Get workflows to cancel
-        # Note: In the full implementation, this would get workflows from JobManager
+        # Get workflows to cancel from JobManager
         workflow_ids = self._get_job_workflow_ids(job_id)
 
         if not workflow_ids:

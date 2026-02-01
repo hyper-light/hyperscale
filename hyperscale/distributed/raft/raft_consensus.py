@@ -21,6 +21,7 @@ from .state_machine import RaftStateMachine
 if TYPE_CHECKING:
     from hyperscale.distributed.jobs.job_leadership_tracker import JobLeadershipTracker
     from hyperscale.distributed.jobs.job_manager import JobManager
+    from hyperscale.distributed.nodes.manager.state import ManagerState
     from hyperscale.distributed.taskex import TaskRunner
     from hyperscale.logging import Logger
 
@@ -60,10 +61,14 @@ class RaftConsensus:
         max_instances: int = 10_000,
         on_become_leader: Callable[[str], None] | None = None,
         on_lose_leadership: Callable[[str], None] | None = None,
+        manager_state: "ManagerState | None" = None,
     ) -> None:
         self._node_id = node_id
         self._job_manager = job_manager
-        self._state_machine = RaftStateMachine(job_manager, leadership_tracker, logger, node_id)
+        self._state_machine = RaftStateMachine(
+            job_manager, leadership_tracker, logger, node_id,
+            manager_state=manager_state,
+        )
         self._logger = logger
         self._task_runner = task_runner
         self._send_message = send_message

@@ -409,6 +409,7 @@ class ManagerServer(HealthAwareServer):
             send_tcp=self._send_to_peer,
             on_job_raft_leader=self._on_job_raft_leader,
             on_job_raft_lose_leader=self._on_job_raft_lose_leader,
+            manager_state=self._manager_state,
         )
 
         self._worker_pool = WorkerPool(
@@ -458,6 +459,7 @@ class ManagerServer(HealthAwareServer):
             task_runner=self._task_runner,
             stats_buffer=self._stats_buffer,
             windowed_stats=self._windowed_stats,
+            send_to_callback=self._send_to_client,
         )
 
         # Worker health manager (AD-26)
