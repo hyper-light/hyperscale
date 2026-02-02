@@ -34,7 +34,7 @@ orjson==3.11.1
     # via -r requirements.in
 psutil==7.0.0
     # via -r requirements.in
-pyasn1==0.6.1
+pyasn1==0.6.2
     # via
     #   pyasn1-modules
     #   service-identity
@@ -60,6 +60,7 @@ typing-extensions==4.14.1
     # via
     #   pydantic
     #   pydantic-core
+    #   pyopenssl
     #   typing-inspection
 typing-inspection==0.4.1
     # via pydantic
