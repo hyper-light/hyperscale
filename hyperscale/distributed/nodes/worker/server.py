@@ -444,7 +444,6 @@ class WorkerServer(HealthAwareServer):
 
         # Start parent server. The base server exposes `start_server`, not
         # `start`; the manager calls it directly on self for the same reason.
-        await super().start_server()
 
         if self._config.event_log_dir is not None:
             self._event_logger = Logger()
@@ -475,6 +474,8 @@ class WorkerServer(HealthAwareServer):
             )
 
             self._workflow_executor.set_event_logger(self._event_logger)
+        
+        await self.start_server()
 
         # Update node capabilities
         self._node_capabilities = self._lifecycle_manager.get_node_capabilities(

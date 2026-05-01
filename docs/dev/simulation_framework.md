@@ -579,16 +579,62 @@ tests/simulation/
 
 Strict order, each phase independently shippable.
 
-### Phase 1 — Foundation (REAL mode only)
+### Phase 1 — Foundation (REAL mode only) — *partially landed*
+
+**Shipped:**
 
 - `Supervisor` with full process tracking (§6.1–6.7).
 - `PortAllocator` with try-bind + range reservation.
 - `ClusterHarness` + `ClusterSpec`/`DCSpec` building real servers.
-- One smoke scenario per level standing up + tearing down a cluster.
+- Framework-structure smoke scenarios at L1/L2/L3 (passing).
 
-**Exit criteria:** L1/L2/L3 smoke scenarios run end-to-end; **all
-processes reaped on graceful exit, on `pytest -x` interruption, and when
-the scenario itself raises.**
+**Surfaced production bugs while constructing a single-manager cluster
+(nine fixed inline as of 2026-05-01):**
+
+1. `manager/config.py:242–244` — `env.get(...)` on a Pydantic `BaseModel`
+   with no `.get`. Replaced with attribute access.
+2. `manager/server.py:329` — `ManagerCancellationCoordinator` referenced
+   `self._job_manager` 60 lines before its assignment. JobManager moved
+   earlier in init.
+3. `manager/discovery.py:64` — single-manager DC fails `DiscoveryConfig`
+   validation (no seeds, no DNS, no dynamic registration). Added
+   dynamic-registration fallback when seed list is empty.
+4. `worker/server.py:1372` — read-only `@property env` overrode the
+   parent's `self.env = env` assignment in `MercurySyncBaseServer.__init__`.
+   Removed the redundant property.
+5. `manager/server.py:707` — `WorkflowLifecycleStateMachine()` called with
+   no args; class requires `(logger, node_host, node_port, node_id)`.
+   Now passes the four arguments.
+6. `manager/server.py:756` — `RaftIntegration` constructed during
+   `__init__` with `task_runner=None` (parent populates `_task_runner` in
+   `start_server`, called later). Re-binds the live task runner before
+   `_raft.start()`.
+7. `taskex/run.py:96, 110` — `setattr(bound_instance, method_name, method)`
+   raises `AttributeError` on `__slots__` classes that don't list the
+   method name. The setattr is an optimization; wrapped both call sites
+   in try/except.
+8. `worker/server.py:446` — `await super().start()` but parent only
+   exposes `start_server`. Replaced with `super().start_server()`.
+9. `tests/simulation/conftest.py` — pytest captures stdout, but
+   `LoggerStream._setup_stdout_writer` calls `loop.connect_write_pipe(...)`
+   which requires a TTY/pipe/socket. Disabled the global Logger via
+   `LoggingConfig().disable()` for the simulation suite (Phase 2 will
+   wire file-backed logging for diagnostic dumps).
+
+**Outstanding (10th bug, not yet investigated):** `WorkerServer.start()`
+hangs after `setup_server_pool()` even with logging disabled and a real
+manager listening. The `ProcessPoolExecutor` spawns subprocess workers
+(observed via leaked semaphores), but the next step in the start chain
+(likely `connect_to_workers` or `_register_with_manager`) does not
+return. Until this is resolved, `test_l1_cluster_lifecycle` is marked
+`@pytest.mark.skip` because the multiprocessing-leak prevents pytest's
+own teardown from completing. The framework-structure tests do not hit
+this path and run cleanly.
+
+**Exit criteria for Phase 1 closure:** the worker-startup hang is
+diagnosed, full-lifecycle smoke tests at L1/L2/L3 stand up and tear
+down cleanly, and the supervisor reaps every artifact on graceful exit,
+`pytest -x` interruption, and scenario-raises.
 
 ### Phase 2 — Conditions, diagnostics, invariant skeleton
 
