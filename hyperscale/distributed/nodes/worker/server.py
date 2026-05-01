@@ -522,7 +522,7 @@ class WorkerServer(HealthAwareServer):
             manager_udp_addr = (manager_info.udp_host, manager_info.udp_port)
             await self.join_cluster(manager_udp_addr)
 
-        # Start SWIM probe cycle
+        # Start SWIM probe cycle.
         self.start_probe_cycle()
 
         # Start background loops

@@ -258,7 +258,14 @@ class Supervisor:
             )
 
     async def _final_descendant_sweep(self) -> None:
-        """The safety net: kill anything still hanging off our PID."""
+        """The safety net: kill anything still hanging off our PID.
+
+        Layered: SIGTERM → wait → SIGKILL → wait again, with a final
+        zombie-tolerant pass. A zombie process (state == "zombie") has
+        already exited; the kernel keeps the PID slot until the parent
+        calls `wait()`. Zombies count as reaped for our purposes — the
+        multiprocessing resource tracker will clean them up at exit.
+        """
         try:
             current = {
                 proc.pid for proc in psutil.Process().children(recursive=True)
@@ -297,10 +304,14 @@ class Supervisor:
                     f"{type(kill_error).__name__}: {kill_error}"
                 )
 
-        if alive:
+        # Give SIGKILL more time, then accept zombies as reaped.
+        _gone2, still_alive = psutil.wait_procs(alive, timeout=5.0)
+        truly_alive = [p for p in still_alive if not _is_zombie(p)]
+
+        if truly_alive:
             self.cleanup_errors.append(
-                f"sweep left {len(alive)} undeath-able processes: "
-                f"{[p.pid for p in alive]}"
+                f"sweep left {len(truly_alive)} undeath-able processes: "
+                f"{[p.pid for p in truly_alive]}"
             )
 
     async def _verify_ports_released(self) -> None:
@@ -406,3 +417,16 @@ class Supervisor:
     @staticmethod
     def _now() -> float:
         return time.monotonic()
+
+
+def _is_zombie(proc: psutil.Process) -> bool:
+    """Return True if the process is in zombie state.
+
+    A zombie has exited; the kernel keeps the PID slot until the parent
+    waits on it. For cleanup purposes a zombie counts as dead — the
+    multiprocessing resource tracker reaps these at process exit.
+    """
+    try:
+        return proc.status() == psutil.STATUS_ZOMBIE
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return True

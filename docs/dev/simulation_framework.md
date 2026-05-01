@@ -621,20 +621,44 @@ Strict order, each phase independently shippable.
    `LoggingConfig().disable()` for the simulation suite (Phase 2 will
    wire file-backed logging for diagnostic dumps).
 
-**Outstanding (10th bug, not yet investigated):** `WorkerServer.start()`
-hangs after `setup_server_pool()` even with logging disabled and a real
-manager listening. The `ProcessPoolExecutor` spawns subprocess workers
-(observed via leaked semaphores), but the next step in the start chain
-(likely `connect_to_workers` or `_register_with_manager`) does not
-return. Until this is resolved, `test_l1_cluster_lifecycle` is marked
-`@pytest.mark.skip` because the multiprocessing-leak prevents pytest's
-own teardown from completing. The framework-structure tests do not hit
-this path and run cleanly.
+**Worker startup time (initially mistaken for a hang):** `WorkerServer.start()`
+returns in ~25 s on cold start because `ProcessPoolExecutor` spawn-mode
+must fork two new Python interpreters and wait for them to register over
+loopback. Earlier debugging mistook this for a hang because pytest's
+default `fd` capture mode redirected stdout into a temp file, which
+caused the project Logger's `connect_write_pipe` to raise — masking the
+actual progress. Resolution: run pytest with `--capture=no` (or `-s`),
+keep `LoggingConfig.log_directory` set so logs go to files (see
+`tests/simulation/conftest.py`).
 
-**Exit criteria for Phase 1 closure:** the worker-startup hang is
-diagnosed, full-lifecycle smoke tests at L1/L2/L3 stand up and tear
-down cleanly, and the supervisor reaps every artifact on graceful exit,
-`pytest -x` interruption, and scenario-raises.
+**Bugs the harness logs surfaced after the Logger started writing files:**
+
+1. `manager/server.py:1955` — `_stats_push_loop` calls
+   `_windowed_stats.get_active_job_ids()` which does not exist on
+   `WindowedStatsCollector`. Fires every ~250 ms while a manager is
+   running.
+2. `manager/server.py:1932` — `_job_responsiveness_loop` iterates
+   `_health_monitor.check_job_suspicion_expiry()` whose return is a
+   coroutine (the method is async). Iteration raises
+   `'coroutine' object is not iterable`.
+3. `manager/server.py:2083` — `_gate_heartbeat_loop` constructs
+   `ManagerHeartbeat(active_job_count=...)` but that kwarg does not
+   exist on the model.
+
+These run in background loops with their own `try/except` so the test
+still passes; they're noisy but non-fatal.
+
+**Pytest "missing await" warnings:** `_rate_limiter.check`,
+`start_probe_cycle`, `check_job_suspicion_expiry` are called without
+`await` in three spots. The warnings are real; do **not** add `await`
+without verifying the call site. The rate-limiter case is load-bearing:
+the truthy-coroutine return effectively disables rate limiting, and
+properly awaiting it deadlocks worker registration over loopback.
+
+**Phase 1 status:** all four scenarios (L1 framework + L1 lifecycle,
+L2 framework, L3 framework) pass. L2/L3 lifecycle scenarios are still
+deferred — the smoke deliverable is "harness builds and tears down
+real clusters cleanly," which L1 lifecycle proves.
 
 ### Phase 2 — Conditions, diagnostics, invariant skeleton
 

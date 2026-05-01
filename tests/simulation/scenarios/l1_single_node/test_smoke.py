@@ -90,18 +90,15 @@ async def test_l1_framework_structure() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.simulation
-@pytest.mark.skip(
-    reason=(
-        "Worker startup hangs past `setup_server_pool` in the production "
-        "code path; the harness exposed ten distinct startup bugs (nine "
-        "fixed inline). The tenth needs deeper investigation in the worker "
-        "lifecycle and leaves multiprocessing semaphores leaked, which "
-        "pytest's teardown cannot recover from. Re-enable once the worker "
-        "lifecycle hang is fixed. See docs/dev/simulation_framework.md §18."
-    ),
-)
 async def test_l1_cluster_lifecycle(stabilization_seconds: float) -> None:
-    """Full real-server stand-up and teardown — currently skipped."""
+    """Full real-server stand-up and teardown.
+
+    Worker startup spawns `cores_per_worker` Python subprocesses via
+    `multiprocessing.get_context("spawn")` and waits for them to register
+    over loopback. On a cold first run that takes ~25 s; warm runs are
+    faster. The harness budget is set generously here so first-run-in-CI
+    is not flaky.
+    """
     spec = _l1_spec()
     async with asyncio.timeout(45):
         async with ClusterHarness(
