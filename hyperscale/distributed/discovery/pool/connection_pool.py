@@ -81,6 +81,21 @@ class ConnectionPool(Generic[T]):
     - Age-based eviction
     - Health-based eviction (consecutive failures)
 
+    Locking discipline:
+        This class has a single lock (self._lock). The invariant is:
+        NEVER call connect_fn or close_fn while holding the lock —
+        those are network I/O operations and may take arbitrarily long
+        (or block on user code). The pattern is:
+            1. Inside the lock: select/mutate pool data structures.
+            2. Capture any connection that needs to be created or closed.
+            3. Release the lock.
+            4. Perform the I/O.
+            5. Re-acquire the lock if you need to install/remove the
+               result of the I/O.
+        Helpers ending in `_locked` (e.g. _select_oldest_idle_locked,
+        _remove_from_pool_locked) MUST be called with the lock held
+        and MUST NOT perform I/O.
+
     Usage:
         pool = ConnectionPool(
             config=ConnectionPoolConfig(),
@@ -157,6 +172,7 @@ class ConnectionPool(Generic[T]):
 
         timeout = timeout or self.config.connection_timeout_seconds
 
+        evicted_to_close: PooledConnection[T] | None = None
         async with self._get_lock():
             # Try to get existing idle connection
             peer_connections = self._connections.get(peer_id, [])
@@ -174,15 +190,23 @@ class ConnectionPool(Generic[T]):
 
             # Check limits before creating new connection
             if self._total_connections >= self.config.max_total_connections:
-                # Try to evict an idle connection
-                evicted = await self._evict_one_idle()
-                if not evicted:
+                # Select and remove an idle connection inside the lock; close it
+                # outside the lock so we don't hold the pool lock during I/O.
+                evicted_to_close = self._select_oldest_idle_locked()
+                if evicted_to_close is None:
                     raise RuntimeError(
                         f"Connection pool exhausted ({self._total_connections} connections)"
                     )
+                self._remove_from_pool_locked(evicted_to_close)
 
             if len(peer_connections) >= self.config.max_connections_per_peer:
                 raise RuntimeError(f"Max connections per peer reached for {peer_id}")
+
+        if evicted_to_close is not None and self.close_fn is not None:
+            try:
+                await self.close_fn(evicted_to_close.connection)
+            except Exception:
+                pass
 
         # Create new connection (outside lock)
         try:
@@ -391,12 +415,10 @@ class ConnectionPool(Generic[T]):
 
         return (idle_evicted, aged_evicted, failed_evicted)
 
-    async def _evict_one_idle(self) -> bool:
-        """
-        Evict the oldest idle connection.
+    def _select_oldest_idle_locked(self) -> "PooledConnection[T] | None":
+        """Find the oldest idle connection across all peers.
 
-        Returns:
-            True if a connection was evicted
+        Caller must hold self._get_lock(). Pure read; does not mutate state.
         """
         oldest: PooledConnection[T] | None = None
         oldest_time = float("inf")
@@ -404,28 +426,27 @@ class ConnectionPool(Generic[T]):
         for connections in self._connections.values():
             for pooled in connections:
                 conn_id = id(pooled.connection)
-                if conn_id not in self._in_use:
-                    if pooled.last_used < oldest_time:
-                        oldest_time = pooled.last_used
-                        oldest = pooled
+                if conn_id in self._in_use:
+                    continue
+                if pooled.last_used < oldest_time:
+                    oldest_time = pooled.last_used
+                    oldest = pooled
 
-        if oldest is not None:
-            peer_conns = self._connections.get(oldest.peer_id)
-            if peer_conns:
-                peer_conns.remove(oldest)
-                self._total_connections -= 1
-                if not peer_conns:
-                    del self._connections[oldest.peer_id]
+        return oldest
 
-            if self.close_fn is not None:
-                try:
-                    await self.close_fn(oldest.connection)
-                except Exception:
-                    pass
+    def _remove_from_pool_locked(self, pooled: "PooledConnection[T]") -> None:
+        """Remove a connection from the pool data structures.
 
-            return True
-
-        return False
+        Caller must hold self._get_lock(). Does not invoke close_fn —
+        the caller must close the connection after releasing the lock.
+        """
+        peer_conns = self._connections.get(pooled.peer_id)
+        if peer_conns and pooled in peer_conns:
+            peer_conns.remove(pooled)
+            self._total_connections -= 1
+            if not peer_conns:
+                del self._connections[pooled.peer_id]
+        self._in_use.discard(id(pooled.connection))
 
     async def close_all(self) -> int:
         """

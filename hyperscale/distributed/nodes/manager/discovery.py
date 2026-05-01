@@ -65,9 +65,14 @@ class ManagerDiscoveryCoordinator:
             peer_static_seeds = [
                 f"{host}:{port}" for host, port in config.seed_managers
             ]
+            # A solo manager (no seeds, no peers) is a valid topology for
+            # L1 smoke tests and degenerate single-node deployments.
+            # DiscoveryConfig refuses an empty seed list otherwise, so
+            # fall back to dynamic registration in that case.
             peer_config = env.get_discovery_config(
                 node_role="manager",
                 static_seeds=peer_static_seeds,
+                allow_dynamic_registration=not peer_static_seeds,
             )
             self._peer_discovery: DiscoveryService = DiscoveryService(peer_config)
             # Pre-register seed managers

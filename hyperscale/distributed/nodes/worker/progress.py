@@ -5,6 +5,7 @@ Handles sending workflow progress updates and final results to managers.
 Implements job leader routing and backpressure-aware delivery.
 """
 
+import asyncio
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -29,6 +30,41 @@ from hyperscale.logging.hyperscale_logging_models import (
     ServerInfo,
     ServerWarning,
 )
+
+
+_TRANSIENT_SEND_ERRORS: tuple[type[BaseException], ...] = (
+    asyncio.TimeoutError,
+    ConnectionError,
+    OSError,
+    TimeoutError,
+)
+"""Errors expected during normal operation (network blips, manager restarts).
+Recorded against the circuit breaker so it can trip on a struggling peer."""
+
+_LOCAL_BUG_ERRORS: tuple[type[BaseException], ...] = (
+    TypeError,
+    AttributeError,
+    KeyError,
+    IndexError,
+)
+"""Errors that almost always indicate a bug in our own code, not a peer
+problem. Logged at ERROR level but NOT recorded against the circuit breaker —
+tripping the circuit on a local bug just hides the bug behind retries."""
+
+
+def _classify_send_error(error: BaseException) -> tuple[bool, str]:
+    """Classify a peer-send exception for circuit-breaker accounting.
+
+    Returns:
+        (record_against_circuit, category_label) where category_label is one
+        of "transient", "local_bug", or "unknown". Unknown is treated as
+        transient for circuit purposes but logged distinctly.
+    """
+    if isinstance(error, _TRANSIENT_SEND_ERRORS):
+        return (True, "transient")
+    if isinstance(error, _LOCAL_BUG_ERRORS):
+        return (False, "local_bug")
+    return (True, "unknown")
 
 if TYPE_CHECKING:
     from hyperscale.logging import Logger
@@ -134,11 +170,17 @@ class WorkerProgressReporter:
             await executor.execute(attempt_send, "progress_update")
             circuit.record_success()
         except Exception as send_error:
-            circuit.record_error()
+            record_circuit, category = _classify_send_error(send_error)
+            if record_circuit:
+                circuit.record_error()
             if self._logger:
+                log_model = ServerError if category == "local_bug" else ServerWarning
                 await self._logger.log(
-                    ServerWarning(
-                        message=f"Failed to send progress update: {send_error}",
+                    log_model(
+                        message=(
+                            f"Failed to send progress update [{category}]: "
+                            f"{type(send_error).__name__}: {send_error}"
+                        ),
                         node_host=node_host,
                         node_port=node_port,
                         node_id=node_id_short,
@@ -247,11 +289,17 @@ class WorkerProgressReporter:
             return False
 
         except Exception as error:
-            circuit.record_error()
+            record_circuit, category = _classify_send_error(error)
+            if record_circuit:
+                circuit.record_error()
             if self._logger:
+                log_model = ServerError if category == "local_bug" else ServerDebug
                 await self._logger.log(
-                    ServerDebug(
-                        message=f"Progress send to {manager_addr} failed: {error}",
+                    log_model(
+                        message=(
+                            f"Progress send to {manager_addr} failed [{category}]: "
+                            f"{type(error).__name__}: {error}"
+                        ),
                         node_host="worker",
                         node_port=0,
                         node_id="worker",
@@ -300,11 +348,19 @@ class WorkerProgressReporter:
                         circuit.record_error()
 
                 except Exception as error:
-                    circuit.record_error()
+                    record_circuit, category = _classify_send_error(error)
+                    if record_circuit:
+                        circuit.record_error()
                     if self._logger:
+                        log_model = (
+                            ServerError if category == "local_bug" else ServerDebug
+                        )
                         await self._logger.log(
-                            ServerDebug(
-                                message=f"Broadcast progress to manager failed: {error}",
+                            log_model(
+                                message=(
+                                    f"Broadcast progress to manager failed [{category}]: "
+                                    f"{type(error).__name__}: {error}"
+                                ),
                                 node_host="worker",
                                 node_port=0,
                                 node_id="worker",
@@ -406,11 +462,16 @@ class WorkerProgressReporter:
                 return
 
             except Exception as err:
-                circuit.record_error()
+                record_circuit, category = _classify_send_error(err)
+                if record_circuit:
+                    circuit.record_error()
                 if self._logger:
                     await self._logger.log(
                         ServerError(
-                            message=f"Failed to send final result for {final_result.workflow_id} to {manager_id}: {err}",
+                            message=(
+                                f"Failed to send final result for {final_result.workflow_id} "
+                                f"to {manager_id} [{category}]: {type(err).__name__}: {err}"
+                            ),
                             node_host=node_host,
                             node_port=node_port,
                             node_id=node_id_short,
@@ -695,11 +756,17 @@ class WorkerProgressReporter:
                     self._registry.get_or_create_circuit(manager_id).record_success()
                     return True
             except Exception as error:
-                self._registry.get_or_create_circuit(manager_id).record_error()
+                record_circuit, category = _classify_send_error(error)
+                if record_circuit:
+                    self._registry.get_or_create_circuit(manager_id).record_error()
                 if self._logger:
+                    log_model = ServerError if category == "local_bug" else ServerDebug
                     await self._logger.log(
-                        ServerDebug(
-                            message=f"Final result send to {manager_addr} failed: {error}",
+                        log_model(
+                            message=(
+                                f"Final result send to {manager_addr} failed [{category}]: "
+                                f"{type(error).__name__}: {error}"
+                            ),
                             node_host="worker",
                             node_port=0,
                             node_id="worker",

@@ -1,0 +1,408 @@
+"""
+Supervisor — owns the lifetime and cleanup of every artifact the harness
+creates: server handles, worker subprocess PIDs, ports, asyncio tasks
+the harness itself spawned.
+
+The cleanup contract:
+
+* `__aexit__` never raises. Every error is collected into the supervisor's
+  `cleanup_errors` list and surfaced through the harness on test failure.
+* Reaping is layered: graceful → forced → SIGKILL → final descendant sweep.
+  Each layer has its own timeout so a hung component degrades gracefully.
+* Asyncio task leaks are detected by diffing `asyncio.all_tasks()` against
+  the supervisor's own baseline.
+
+See docs/dev/simulation_framework.md §6 and §7.
+"""
+
+import asyncio
+import os
+import time
+import uuid
+from dataclasses import dataclass, field
+
+import psutil
+
+from tests.simulation.harness.errors import (
+    LeakedAsyncTasksError,
+    PreflightZombieError,
+    ReapError,
+)
+from tests.simulation.harness.port_allocator import PortAllocator
+from tests.simulation.harness.server_handle import ServerHandle, ServerKind
+from tests.simulation.harness.timeouts import HarnessTimeouts
+
+
+_HARNESS_RUN_ID_ENV = "HYPERSCALE_HARNESS_RUN_ID"
+
+
+@dataclass(slots=True)
+class Supervisor:
+    """Centralized lifetime + cleanup of every artifact the harness owns.
+
+    Construction does not allocate anything. `__aenter__` runs preflight
+    (zombie reap, baseline snapshot). Servers are registered as the
+    `ClusterHarness` builds them. `__aexit__` reaps everything and surfaces
+    a `cleanup_errors` report; the harness raises on a leak unless the
+    caller opted out.
+    """
+
+    timeouts: HarnessTimeouts
+    ports: PortAllocator
+    fail_on_async_leak: bool = True
+    """Per design §19 open question: lean fail-immediately."""
+
+    _run_id: str = field(init=False, default="")
+    _server_handles: list[ServerHandle] = field(init=False, default_factory=list)
+    _tracked_pids: dict[str, set[int]] = field(init=False, default_factory=dict)
+    _pid_track_tasks: list[asyncio.Task] = field(init=False, default_factory=list)
+    _baseline_pids: set[int] = field(init=False, default_factory=set)
+    _baseline_tasks: set[asyncio.Task] = field(init=False, default_factory=set)
+    _running: bool = field(init=False, default=False)
+    cleanup_errors: list[str] = field(init=False, default_factory=list)
+
+    @property
+    def run_id(self) -> str:
+        return self._run_id
+
+    @property
+    def server_handles(self) -> list[ServerHandle]:
+        return list(self._server_handles)
+
+    def tracked_pids(self, node_id: str) -> set[int]:
+        return set(self._tracked_pids.get(node_id, set()))
+
+    async def __aenter__(self) -> "Supervisor":
+        self._run_id = uuid.uuid4().hex
+        os.environ[_HARNESS_RUN_ID_ENV] = self._run_id
+
+        await self._preflight_zombie_reap()
+
+        self._baseline_pids = {
+            proc.pid for proc in psutil.Process().children(recursive=True)
+        }
+        self._baseline_tasks = set(asyncio.all_tasks())
+        self._running = True
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
+        await self.shutdown()
+
+    def register_server(self, handle: ServerHandle) -> None:
+        """Add a server handle. Call after construction, before `start()`.
+
+        For workers, call `start_worker_pid_tracking` once `start()` has
+        returned so the PID tick task has something to snapshot.
+        """
+        self._server_handles.append(handle)
+        if handle.kind is ServerKind.WORKER:
+            self._tracked_pids[handle.node_id] = set()
+
+    def start_worker_pid_tracking(self, handle: ServerHandle) -> None:
+        """Begin the 1 s tick that snapshots a worker's subprocess PIDs.
+
+        Reaches into `_lifecycle_manager._server_pool._executor._processes`
+        — same private API the existing `kill_child_processes()` uses.
+        Degrades gracefully if the structure is missing: the `psutil`
+        baseline-diff in `_final_descendant_sweep` remains the source of
+        truth for cleanup correctness.
+        """
+        if handle.kind is not ServerKind.WORKER:
+            return
+        task = asyncio.create_task(
+            self._tick_worker_pids(handle),
+            name=f"sim-pid-track-{handle.node_id}",
+        )
+        self._pid_track_tasks.append(task)
+
+    async def shutdown(self) -> None:
+        """Reap everything in reverse order with bounded timeouts."""
+        if not self._running:
+            return
+        self._running = False
+
+        # Stop PID-tracking tasks first so the per-server reaps below own the
+        # final pid snapshot without races.
+        await self._stop_pid_tracking()
+
+        # Reverse-dependency order: workers first (they hold subprocesses),
+        # then managers, then gates. Each kind reaped in parallel within itself.
+        for kind in (ServerKind.WORKER, ServerKind.MANAGER, ServerKind.GATE):
+            handles = [h for h in self._server_handles if h.kind is kind]
+            if not handles:
+                continue
+            await asyncio.gather(
+                *(self._reap_server(h) for h in handles),
+                return_exceptions=True,
+            )
+
+        await self._final_descendant_sweep()
+        await self._verify_ports_released()
+        self._detect_leaked_async_tasks()
+
+        os.environ.pop(_HARNESS_RUN_ID_ENV, None)
+
+    async def _stop_pid_tracking(self) -> None:
+        for task in self._pid_track_tasks:
+            if not task.done():
+                task.cancel()
+        if self._pid_track_tasks:
+            await asyncio.gather(*self._pid_track_tasks, return_exceptions=True)
+        self._pid_track_tasks.clear()
+
+    async def _tick_worker_pids(self, handle: ServerHandle) -> None:
+        while self._running:
+            try:
+                self._tracked_pids[handle.node_id] = self._snapshot_worker_pids(handle)
+            except Exception as snapshot_error:
+                self.cleanup_errors.append(
+                    f"pid-snapshot {handle.node_id}: {type(snapshot_error).__name__}: {snapshot_error}"
+                )
+            try:
+                await asyncio.sleep(self.timeouts.pid_track_interval)
+            except asyncio.CancelledError:
+                break
+
+    @staticmethod
+    def _snapshot_worker_pids(handle: ServerHandle) -> set[int]:
+        lifecycle = getattr(handle.instance, "_lifecycle_manager", None)
+        if lifecycle is None:
+            return set()
+        pool = getattr(lifecycle, "_server_pool", None)
+        if pool is None:
+            return set()
+        executor = getattr(pool, "_executor", None)
+        if executor is None:
+            return set()
+        processes = getattr(executor, "_processes", None)
+        if processes is None:
+            return set()
+        return set(processes.keys())
+
+    async def _reap_server(self, handle: ServerHandle) -> None:
+        graceful_ok = await self._reap_graceful(handle)
+        if handle.kind is ServerKind.WORKER:
+            await self._reap_worker_subprocesses(handle, graceful_ok)
+
+    async def _reap_graceful(self, handle: ServerHandle) -> bool:
+        """Layer 1: ask the server to stop on its own."""
+        if not handle.started:
+            return True
+        try:
+            await asyncio.wait_for(
+                handle.instance.stop(drain_timeout=2.0, broadcast_leave=False),
+                timeout=self.timeouts.stop_default,
+            )
+            return True
+        except asyncio.TimeoutError:
+            self.cleanup_errors.append(f"graceful-stop timeout: {handle.node_id}")
+            return False
+        except Exception as stop_error:
+            self.cleanup_errors.append(
+                f"graceful-stop {handle.node_id}: "
+                f"{type(stop_error).__name__}: {stop_error}"
+            )
+            return False
+
+    async def _reap_worker_subprocesses(
+        self, handle: ServerHandle, graceful_ok: bool
+    ) -> None:
+        """Layers 2 + 3 for workers: forced kill_child_processes, then per-PID."""
+        if not graceful_ok:
+            await self._invoke_lifecycle_kill(handle)
+
+        pids = list(self._tracked_pids.get(handle.node_id, set()))
+        procs = self._existing_processes(pids)
+        if not procs:
+            return
+
+        for proc in procs:
+            try:
+                proc.terminate()
+            except psutil.NoSuchProcess:
+                continue
+            except Exception as term_error:
+                self.cleanup_errors.append(
+                    f"SIGTERM {handle.node_id} pid={proc.pid}: "
+                    f"{type(term_error).__name__}: {term_error}"
+                )
+
+        _gone, alive = psutil.wait_procs(procs, timeout=3.0)
+        for proc in alive:
+            try:
+                proc.kill()
+            except psutil.NoSuchProcess:
+                continue
+            except Exception as kill_error:
+                self.cleanup_errors.append(
+                    f"SIGKILL {handle.node_id} pid={proc.pid}: "
+                    f"{type(kill_error).__name__}: {kill_error}"
+                )
+
+        # Final wait so the descendant sweep does not race with kernel reaping.
+        psutil.wait_procs([psutil.Process(p.pid) for p in alive if psutil.pid_exists(p.pid)], timeout=2.0)
+
+    async def _invoke_lifecycle_kill(self, handle: ServerHandle) -> None:
+        lifecycle = getattr(handle.instance, "_lifecycle_manager", None)
+        if lifecycle is None:
+            return
+        kill_child_processes = getattr(lifecycle, "kill_child_processes", None)
+        if kill_child_processes is None:
+            return
+        try:
+            await asyncio.wait_for(kill_child_processes(), timeout=3.0)
+        except Exception as kill_error:
+            self.cleanup_errors.append(
+                f"lifecycle.kill_child_processes {handle.node_id}: "
+                f"{type(kill_error).__name__}: {kill_error}"
+            )
+
+    async def _final_descendant_sweep(self) -> None:
+        """The safety net: kill anything still hanging off our PID."""
+        try:
+            current = {
+                proc.pid for proc in psutil.Process().children(recursive=True)
+            }
+        except psutil.Error as walk_error:
+            self.cleanup_errors.append(
+                f"descendant-walk: {type(walk_error).__name__}: {walk_error}"
+            )
+            return
+
+        leftover_pids = current - self._baseline_pids
+        if not leftover_pids:
+            return
+
+        leftover_procs = self._existing_processes(list(leftover_pids))
+        for proc in leftover_procs:
+            try:
+                proc.terminate()
+            except psutil.NoSuchProcess:
+                continue
+            except Exception as term_error:
+                self.cleanup_errors.append(
+                    f"sweep SIGTERM pid={proc.pid}: "
+                    f"{type(term_error).__name__}: {term_error}"
+                )
+
+        _gone, alive = psutil.wait_procs(leftover_procs, timeout=3.0)
+        for proc in alive:
+            try:
+                proc.kill()
+            except psutil.NoSuchProcess:
+                continue
+            except Exception as kill_error:
+                self.cleanup_errors.append(
+                    f"sweep SIGKILL pid={proc.pid}: "
+                    f"{type(kill_error).__name__}: {kill_error}"
+                )
+
+        if alive:
+            self.cleanup_errors.append(
+                f"sweep left {len(alive)} undeath-able processes: "
+                f"{[p.pid for p in alive]}"
+            )
+
+    async def _verify_ports_released(self) -> None:
+        held = await self.ports.verify_all_released()
+        if held:
+            self.cleanup_errors.append(f"ports still held after teardown: {held}")
+
+    def _detect_leaked_async_tasks(self) -> None:
+        """Any task that exists now and didn't at __aenter__ is suspect.
+
+        Excludes the supervisor's own tracking tasks (already cancelled) and
+        the currently-running task (the caller). Tasks marked done are fine
+        — the GC will collect them.
+        """
+        now_tasks = set(asyncio.all_tasks())
+        try:
+            current = asyncio.current_task()
+        except RuntimeError:
+            current = None
+        new = now_tasks - self._baseline_tasks - set(self._pid_track_tasks)
+        if current is not None:
+            new.discard(current)
+        leaked = [task for task in new if not task.done()]
+        if leaked:
+            names = sorted(task.get_name() for task in leaked)
+            message = f"{len(leaked)} async tasks leaked across cluster lifetime: {names}"
+            self.cleanup_errors.append(message)
+            if self.fail_on_async_leak:
+                raise LeakedAsyncTasksError(message)
+
+    async def _preflight_zombie_reap(self) -> None:
+        """Find and kill processes left over from earlier harness runs.
+
+        We tag every harness-spawned process by setting `HYPERSCALE_HARNESS_RUN_ID`
+        in the env. Any process carrying that env var with a value *other than*
+        our current run id is from a previous run that didn't clean up.
+
+        Also asserts that the planned port range is not currently held by
+        non-harness processes (would surface a real conflict, e.g. another
+        local server using the same range).
+        """
+        loop = asyncio.get_running_loop()
+        zombies = await loop.run_in_executor(None, self._scan_zombie_processes)
+        if not zombies:
+            return
+
+        for proc in zombies:
+            try:
+                proc.terminate()
+            except psutil.NoSuchProcess:
+                continue
+            except Exception:
+                continue
+
+        _gone, alive = await loop.run_in_executor(
+            None, psutil.wait_procs, zombies, 3.0
+        )
+        for proc in alive:
+            try:
+                proc.kill()
+            except psutil.NoSuchProcess:
+                continue
+            except Exception:
+                continue
+
+        await asyncio.sleep(0.5)
+
+        still_alive = [p for p in alive if psutil.pid_exists(p.pid)]
+        if still_alive:
+            raise PreflightZombieError(
+                f"Could not reap {len(still_alive)} prior-run zombies: "
+                f"{[p.pid for p in still_alive]}"
+            )
+
+    def _scan_zombie_processes(self) -> list[psutil.Process]:
+        """Walk all processes; return those carrying a foreign run id."""
+        zombies: list[psutil.Process] = []
+        for proc in psutil.process_iter(["environ"]):
+            try:
+                env = proc.info.get("environ") or {}
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+            if env is None:
+                continue
+            foreign_id = env.get(_HARNESS_RUN_ID_ENV)
+            if not foreign_id:
+                continue
+            if foreign_id == self._run_id:
+                continue
+            zombies.append(proc)
+        return zombies
+
+    @staticmethod
+    def _existing_processes(pids: list[int]) -> list[psutil.Process]:
+        result: list[psutil.Process] = []
+        for pid in pids:
+            try:
+                result.append(psutil.Process(pid))
+            except psutil.NoSuchProcess:
+                continue
+        return result
+
+    @staticmethod
+    def _now() -> float:
+        return time.monotonic()

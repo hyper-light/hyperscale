@@ -39,6 +39,25 @@ class ManagerState:
     Centralizes all mutable dictionaries and tracking structures.
     Provides clean separation between configuration (immutable) and
     runtime state (mutable).
+
+    Lock ordering (acquire in this order to avoid deadlock):
+        1. _resource_creation_lock — outermost; held only briefly while
+           creating per-resource locks/semaphores. Never held across an
+           await of any other lock here.
+        2. _peer_manager_health_lock — guards _peer_manager_health_states.
+           Acquired only after _resource_creation_lock has been released.
+        3. _provision_lock — guards _pending_provisions / _provision_confirmations.
+           Independent of the health lock; never nest the two.
+        4. _core_allocation_lock / _eager_dispatch_lock — innermost; guard
+           short core-bookkeeping critical sections only.
+        5. _counter_lock — innermost; pure atomic-increment guard. Never
+           held across awaits on any other lock above.
+
+    Per-resource locks (_peer_state_locks[addr], _gate_state_locks[id],
+    _workflow_cancellation_locks[id], _dispatch_semaphores[id]) are leaf
+    locks: they are acquired AFTER the relevant lookup-time critical
+    section in _resource_creation_lock has been released, and never
+    held while acquiring any of the locks above.
     """
 
     def __init__(self) -> None:
@@ -310,11 +329,32 @@ class ManagerState:
         """Remove lock when gate disconnects to prevent memory leak."""
         self._gate_state_locks.pop(gate_id, None)
         self._gate_state_epoch.pop(gate_id, None)
+        self._gate_negotiated_caps.pop(gate_id, None)
 
     def remove_peer_lock(self, peer_addr: tuple[str, int]) -> None:
-        """Remove lock when manager peer disconnects to prevent memory leak."""
+        """Remove lock when manager peer disconnects to prevent memory leak.
+
+        peer_addr is the TCP address. Also removes TCP-keyed metadata and
+        any UDP→TCP mappings that point at this TCP address.
+        """
         self._peer_state_locks.pop(peer_addr, None)
         self._peer_state_epoch.pop(peer_addr, None)
+        self._manager_peer_info.pop(peer_addr, None)
+        self._recovery_verification_pending.pop(peer_addr, None)
+        stale_udp_addrs = [
+            udp_addr
+            for udp_addr, tcp_addr in self._manager_udp_to_tcp.items()
+            if tcp_addr == peer_addr
+        ]
+        for udp_addr in stale_udp_addrs:
+            self._manager_udp_to_tcp.pop(udp_addr, None)
+
+    def remove_peer_latency_samples(self, peer_id: str) -> None:
+        """Remove latency sample deque for a peer to prevent memory leak.
+
+        Called when the peer is declared dead/deregistered.
+        """
+        self._peer_manager_latency_samples.pop(peer_id, None)
 
     def remove_worker_state(self, worker_id: str) -> None:
         """Remove all state associated with a dead worker to prevent memory leaks."""

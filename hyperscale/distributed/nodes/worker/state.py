@@ -29,6 +29,24 @@ class WorkerState:
     Centralizes all mutable dictionaries and tracking structures.
     Provides clean separation between configuration (immutable) and
     runtime state (mutable).
+
+    Lock ordering (acquire in this order to avoid deadlock):
+        1. _resource_creation_lock — outermost; held only briefly while
+           creating per-resource locks (e.g. _manager_state_locks,
+           _job_leader_transfer_locks). Never held across an await on any
+           other lock here.
+        2. _version_lock — guards _state_version. Independent of other
+           locks below; never nested with _counter_lock.
+        3. _progress_buffer_lock — guards _progress_buffer. Independent
+           leaf lock.
+        4. _counter_lock — innermost; pure atomic-increment guard for
+           transfer metrics, fence tokens, throughput counters. Never
+           held across awaits on any other lock above.
+
+    Per-resource locks (_manager_state_locks[id], _job_leader_transfer_locks[id])
+    are leaf locks: acquired after the lookup-time critical section in
+    _resource_creation_lock has been released, and never held while
+    acquiring any of the locks above.
     """
 
     def __init__(self, core_allocator: "CoreAllocator") -> None:

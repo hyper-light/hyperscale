@@ -442,8 +442,9 @@ class WorkerServer(HealthAwareServer):
         # Setup logging config
         self._lifecycle_manager.setup_logging_config()
 
-        # Start parent server
-        await super().start()
+        # Start parent server. The base server exposes `start_server`, not
+        # `start`; the manager calls it directly on self for the same reason.
+        await super().start_server()
 
         if self._config.event_log_dir is not None:
             self._event_logger = Logger()
@@ -1364,15 +1365,6 @@ class WorkerServer(HealthAwareServer):
                     f"Failed to report progress for workflow {workflow_id}: {exc}",
                     level="debug",
                 )
-
-    # =========================================================================
-    # Environment Property (for tcp_dispatch.py)
-    # =========================================================================
-
-    @property
-    def env(self) -> Env:
-        """Get the environment configuration."""
-        return self._env
 
     # =========================================================================
     # State Version Property (for tcp_state_sync.py)

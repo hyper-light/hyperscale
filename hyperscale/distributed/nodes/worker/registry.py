@@ -130,6 +130,24 @@ class WorkerRegistry:
         """Get current epoch for a manager."""
         return self._manager_state_epoch.get(manager_id, 0)
 
+    def remove_manager_state(
+        self, manager_id: str, manager_addr: tuple[str, int] | None
+    ) -> None:
+        """Remove all per-manager tracking when a manager is reaped.
+
+        Drops the per-manager lock, epoch counter, circuit breaker, address
+        circuit breaker, and health/registry entries. Without this cleanup the
+        per-manager state dicts would grow unbounded under manager churn.
+        """
+        self._known_managers.pop(manager_id, None)
+        self._healthy_manager_ids.discard(manager_id)
+        self._manager_unhealthy_since.pop(manager_id, None)
+        self._manager_circuits.pop(manager_id, None)
+        self._manager_state_locks.pop(manager_id, None)
+        self._manager_state_epoch.pop(manager_id, None)
+        if manager_addr is not None:
+            self._manager_addr_circuits.pop(manager_addr, None)
+
     def get_or_create_circuit(
         self,
         manager_id: str,

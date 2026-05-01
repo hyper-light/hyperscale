@@ -325,6 +325,14 @@ class ManagerServer(HealthAwareServer):
             send_to_peer=self._send_to_peer,
         )
 
+        # JobManager must exist before any coordinator that takes it as a
+        # dependency (e.g. cancellation below). Constructed here so the rest
+        # of the init sequence can reference it.
+        self._job_manager = JobManager(
+            datacenter=self._node_id.datacenter,
+            manager_id=self._node_id.short,
+        )
+
         # Cancellation coordinator for AD-20
         self._cancellation = ManagerCancellationCoordinator(
             state=self._manager_state,
@@ -387,12 +395,6 @@ class ManagerServer(HealthAwareServer):
             logger=self._udp_logger,
             node_id=self._node_id.short,
             task_runner=self._task_runner,
-        )
-
-        # JobManager for race-safe job/workflow state
-        self._job_manager = JobManager(
-            datacenter=self._node_id.datacenter,
-            manager_id=self._node_id.short,
         )
 
         # Raft consensus integration
@@ -702,7 +704,12 @@ class ManagerServer(HealthAwareServer):
         )
 
         # Initialize workflow lifecycle state machine (AD-33)
-        self._workflow_lifecycle_states = WorkflowLifecycleStateMachine()
+        self._workflow_lifecycle_states = WorkflowLifecycleStateMachine(
+            logger=self._udp_logger,
+            node_host=self._host,
+            node_port=self._tcp_port,
+            node_id=self._node_id.short,
+        )
 
         self._workflow_dispatcher = WorkflowDispatcher(
             job_manager=self._job_manager,
@@ -745,7 +752,11 @@ class ManagerServer(HealthAwareServer):
         # Start background tasks
         self._start_background_tasks()
 
-        # Start Raft consensus tick loop and seed membership from known peers
+        # Start Raft consensus tick loop and seed membership from known peers.
+        # Re-bind the live task runner: _raft was constructed in __init__ when
+        # the parent's TaskRunner was still None; start_server has populated it
+        # by now.
+        self._raft._consensus._task_runner = self._task_runner
         self._raft.start()
         raft_members: set[str] = set()
         raft_addrs: dict[str, tuple[str, int]] = {}

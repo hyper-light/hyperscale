@@ -247,9 +247,19 @@ class ManagerRegistry:
         Args:
             gate_id: Gate node ID to unregister
         """
-        self._state._known_gates.pop(gate_id, None)
+        gate_info = self._state._known_gates.pop(gate_id, None)
         self._state._healthy_gate_ids.discard(gate_id)
         self._state._gate_unhealthy_since.pop(gate_id, None)
+        self._state.remove_gate_lock(gate_id)
+
+        if gate_info is not None:
+            stale_udp_addrs = [
+                udp_addr
+                for udp_addr, tcp_addr in self._state._gate_udp_to_tcp.items()
+                if tcp_addr == (gate_info.tcp_host, gate_info.tcp_port)
+            ]
+            for udp_addr in stale_udp_addrs:
+                self._state._gate_udp_to_tcp.pop(udp_addr, None)
 
     def get_gate(self, gate_id: str) -> GateInfo | None:
         """Get gate info by ID."""
@@ -305,8 +315,12 @@ class ManagerRegistry:
         if peer_info:
             tcp_addr = (peer_info.tcp_host, peer_info.tcp_port)
             self._state._active_manager_peers.discard(tcp_addr)
+            self._state.remove_peer_lock(tcp_addr)
         self._state._active_manager_peer_ids.discard(peer_id)
         self._state._manager_peer_unhealthy_since.pop(peer_id, None)
+        self._state._peer_manager_health_states.pop(peer_id, None)
+        self._state._registered_with_managers.discard(peer_id)
+        self._state.remove_peer_latency_samples(peer_id)
 
     def get_manager_peer(self, peer_id: str) -> ManagerInfo | None:
         """Get manager peer info by ID."""

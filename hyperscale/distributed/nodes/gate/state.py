@@ -35,6 +35,24 @@ class GateRuntimeState:
     Centralizes all mutable dictionaries and tracking structures.
     Provides clean separation between configuration (immutable) and
     runtime state (mutable).
+
+    Lock ordering (acquire in this order to avoid deadlock):
+        1. _lock_creation_lock — outermost; held only briefly while creating
+           per-resource locks (e.g. _peer_state_locks entries). Never held
+           across an await on any other lock here.
+        2. _manager_state_lock — guards _datacenter_manager_status and
+           _manager_last_status. Acquired only after _lock_creation_lock has
+           been released.
+        3. _backpressure_lock — guards _manager_backpressure / _dc_backpressure.
+           Independent of the manager state lock; never nest the two.
+        4. _job_progress_lock — guards _job_progress_sequences and
+           _job_progress_seen. Independent of the locks above.
+        5. _counter_lock — innermost; pure atomic-increment guard.
+           Never held across awaits on any other lock above.
+
+    Per-resource locks (_peer_state_locks[addr]) are leaf locks: acquired
+    after the lookup-time critical section in _lock_creation_lock has been
+    released, and never held while acquiring any of the locks above.
     """
 
     def __init__(self) -> None:

@@ -143,18 +143,8 @@ class WorkerBackgroundLoops:
                     if manager_info:
                         manager_addr = (manager_info.tcp_host, manager_info.tcp_port)
 
-                    # Remove from all tracking structures
-                    self._registry._known_managers.pop(manager_id, None)
-                    self._registry._healthy_manager_ids.discard(manager_id)
-                    self._registry._manager_unhealthy_since.pop(manager_id, None)
-                    self._registry._manager_circuits.pop(manager_id, None)
-
-                    # Remove from discovery service
+                    self._registry.remove_manager_state(manager_id, manager_addr)
                     self._discovery_service.remove_peer(manager_id)
-
-                    # Clean up address-based circuit breaker
-                    if manager_addr:
-                        self._registry._manager_addr_circuits.pop(manager_addr, None)
 
                     if self._logger:
                         task_runner_run(

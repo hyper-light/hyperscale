@@ -88,12 +88,18 @@ class Run:
             call,
             functools.partial,
         ) and hasattr(
-            call, 
+            call,
             "__self__",
         ):
             bound_instance = call.__self__
             self.call = self.call.__get__(bound_instance, self.call.__class__)
-            setattr(bound_instance, self.call.__name__, self.call)
+            # Caching the bound method on the instance is an optimization; it
+            # is impossible (and unnecessary) on classes using __slots__ that
+            # do not list this attribute. Skip the cache when that's the case.
+            try:
+                setattr(bound_instance, self.call.__name__, self.call)
+            except AttributeError:
+                pass
 
         elif not isinstance(
             self.call,
@@ -102,12 +108,15 @@ class Run:
             call,
             functools.partial,
         ) and hasattr(
-            call.func, 
+            call.func,
             "__self__",
         ):
             bound_instance = call.func.__self__
             self.call = self.call.__get__(bound_instance, self.call.__class__)
-            setattr(bound_instance, call.func.__name__, self.call)
+            try:
+                setattr(bound_instance, call.func.__name__, self.call)
+            except AttributeError:
+                pass
 
         self._task: Optional[asyncio.Task] = None
         self._process: Process | None = None

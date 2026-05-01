@@ -699,6 +699,10 @@ class HierarchicalFailureDetector:
         task = asyncio.create_task(self._clear_job_suspicions_for_node(node))
         self._pending_clear_tasks.add(task)
         task.add_done_callback(self._pending_clear_tasks.discard)
+        # If the task already completed before the callback was registered,
+        # the discard wouldn't fire — drop it manually so the set doesn't leak.
+        if task.done():
+            self._pending_clear_tasks.discard(task)
 
         # Call callback
         if self._on_global_death:
