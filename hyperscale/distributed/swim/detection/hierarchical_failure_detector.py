@@ -29,6 +29,9 @@ from hyperscale.distributed.health.extension_tracker import (
 )
 
 if TYPE_CHECKING:
+    from hyperscale.distributed.swim.health.peer_health_awareness import (
+        PeerHealthAwareness,
+    )
     from hyperscale.distributed.taskex import TaskRunner
 
 
@@ -136,6 +139,9 @@ class HierarchicalFailureDetector:
         get_job_n_members: Callable[[JobId], int] | None = None,
         get_lhm_multiplier: Callable[[], float] | None = None,
         task_runner: "TaskRunner | None" = None,
+        peer_health_awareness: "PeerHealthAwareness | None" = None,
+        get_peer_load_multiplier: Callable[[NodeAddress], float] | None = None,
+        get_vivaldi_quality_multiplier: Callable[[NodeAddress], float] | None = None,
     ) -> None:
         if config is None:
             config = HierarchicalConfig()
@@ -153,6 +159,27 @@ class HierarchicalFailureDetector:
         # keep working — production code paths through HealthAwareServer
         # always supply one.
         self._task_runner: "TaskRunner | None" = task_runner
+        # Phase C: peer-health-aware suspicion. The suspicion timer is
+        # composed multiplicatively per AD-35:186:
+        #   T_suspect = base_lifeguard
+        #               * self_lhm
+        #               * peer_load
+        #               * vivaldi_quality
+        # ``peer_health_awareness`` is the primary source of peer-load
+        # multipliers (it's wired to the AD-19 health-piggyback gossip
+        # buffer). ``get_peer_load_multiplier`` is an explicit callable
+        # alternative for callers that don't have a PHA instance handy
+        # (tests, embedded uses). ``get_vivaldi_quality_multiplier`` is
+        # the AD-35 confidence_adjustment.
+        self._peer_health_awareness: "PeerHealthAwareness | None" = (
+            peer_health_awareness
+        )
+        self._get_peer_load_multiplier_explicit: (
+            Callable[[NodeAddress], float] | None
+        ) = get_peer_load_multiplier
+        self._get_vivaldi_quality_multiplier: (
+            Callable[[NodeAddress], float] | None
+        ) = get_vivaldi_quality_multiplier
 
         # Initialize global layer (timing wheel)
         timing_wheel_config = TimingWheelConfig(
@@ -223,6 +250,60 @@ class HierarchicalFailureDetector:
         if self._get_n_members:
             return self._get_n_members()
         return 1
+
+    # =========================================================================
+    # Phase C — composite suspicion multiplier resolution
+    # =========================================================================
+
+    def _compute_peer_load_multiplier(self, node: NodeAddress) -> float:
+        """Resolve the peer-load multiplier for ``node``.
+
+        Per AD-19/AD-50, peer load is reported via SWIM health gossip
+        and surfaces in ``PeerHealthAwareness``. The multiplier scales
+        with reported overload state:
+            UNKNOWN/HEALTHY → 1.0   (no scaling)
+            BUSY            → 1.25
+            STRESSED        → 1.75
+            OVERLOADED      → 2.5
+
+        Returning 1.0 for unknown peers is deliberate: a peer that's
+        gossip-stale (e.g. mid-failure) should not get a longer
+        suspicion timer just because we lost track of its state —
+        otherwise the very condition we're trying to detect (peer
+        going dark) would extend the time we wait to detect it.
+        """
+        if self._peer_health_awareness is not None:
+            host, port = node
+            node_id = f"{host}:{port}"
+            try:
+                return self._peer_health_awareness.get_load_multiplier(node_id)
+            except Exception:
+                # PeerHealthAwareness errors must never block suspicion
+                # decisions; degrade silently to neutral.
+                return 1.0
+        if self._get_peer_load_multiplier_explicit is not None:
+            try:
+                return self._get_peer_load_multiplier_explicit(node)
+            except Exception:
+                return 1.0
+        return 1.0
+
+    def _compute_vivaldi_quality_multiplier(self, node: NodeAddress) -> float:
+        """Resolve the Vivaldi confidence adjustment for ``node``.
+
+        Per AD-35:183, the confidence adjustment for adaptive timeouts
+        is ``1.0 + vivaldi_error / 10.0``. Higher coordinate error =
+        more conservative timeout (we don't trust our distance
+        estimate, so we extend the budget). Returns 1.0 when no
+        Vivaldi callable is wired or the lookup fails — neutral
+        by default.
+        """
+        if self._get_vivaldi_quality_multiplier is None:
+            return 1.0
+        try:
+            return self._get_vivaldi_quality_multiplier(node)
+        except Exception:
+            return 1.0
 
     async def start(self) -> None:
         """Start the failure detector."""
@@ -310,14 +391,37 @@ class HierarchicalFailureDetector:
                     # Higher incarnation - remove old and create new
                     await self._global_wheel.remove(node)
 
-            # Create new suspicion state
-            lhm = self._get_lhm_multiplier() if self._get_lhm_multiplier else 1.0
+            # Phase C — multiplicative composition of independent
+            # adjustment factors per AD-35:186:
+            #
+            #     T_suspect_bracket =
+            #         (global_min_timeout, global_max_timeout)
+            #         × self_lhm
+            #         × peer_load
+            #         × vivaldi_quality
+            #
+            # The Lifeguard confirmation/cluster term is applied via
+            # ``SuspicionState.calculate_timeout`` (log(c+1)/log(n+1))
+            # using the composed (min, max) bracket. Each factor is
+            # independent and bounded:
+            #   self_lhm: [1, 3] (architecture.md:7221, Phase B)
+            #   peer_load: [1, 2.5] (PeerHealthAwarenessConfig)
+            #   vivaldi_quality: ~[1, 1.5] (AD-35:183 confidence_adjustment)
+            #
+            # See AD-30 addendum "Suspicion-timer composition".
+            self_lhm = (
+                self._get_lhm_multiplier() if self._get_lhm_multiplier else 1.0
+            )
+            peer_load = self._compute_peer_load_multiplier(node)
+            vivaldi_quality = self._compute_vivaldi_quality_multiplier(node)
+            composite_multiplier = self_lhm * peer_load * vivaldi_quality
+
             state = SuspicionState(
                 node=node,
                 incarnation=incarnation,
                 start_time=time.monotonic(),
-                min_timeout=self._config.global_min_timeout * lhm,
-                max_timeout=self._config.global_max_timeout * lhm,
+                min_timeout=self._config.global_min_timeout * composite_multiplier,
+                max_timeout=self._config.global_max_timeout * composite_multiplier,
                 n_members=self._get_current_n_members(),
             )
             state.add_confirmation(from_node)

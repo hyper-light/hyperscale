@@ -225,16 +225,25 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         # - Global layer: Machine-level liveness (via timing wheel)
         # - Job layer: Per-job responsiveness (via adaptive polling)
         # Uses polling instead of cancel/reschedule to avoid timer starvation
+        #
         # ``task_runner`` is threaded in so async callbacks (notably
         # ``_on_suspicion_expired``) are dispatched correctly per CLAUDE.md
         # — without it, async-def callbacks are silently dropped at GC
         # time and the SUSPECT->DEAD transition never executes.
+        #
+        # ``peer_health_awareness`` and the Vivaldi-quality callable feed
+        # the Phase C multiplicative composition of suspicion timers per
+        # AD-30 addendum "Suspicion-timer composition" and AD-35:186.
         self._hierarchical_detector = HierarchicalFailureDetector(
             on_global_death=self._on_suspicion_expired,
             on_error=self._on_hierarchical_detector_error,
             get_n_members=self._get_member_count,
             get_lhm_multiplier=self._get_lhm_multiplier,
             task_runner=self._task_runner,
+            peer_health_awareness=self._peer_health_awareness,
+            get_vivaldi_quality_multiplier=(
+                self._compute_vivaldi_quality_multiplier_for_node
+            ),
         )
 
         # Initialize leader election with configurable parameters from Env
@@ -887,6 +896,10 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             get_job_n_members=get_job_n_members,
             get_lhm_multiplier=self._get_lhm_multiplier,
             task_runner=self._task_runner,
+            peer_health_awareness=self._peer_health_awareness,
+            get_vivaldi_quality_multiplier=(
+                self._compute_vivaldi_quality_multiplier_for_node
+            ),
         )
         return self._hierarchical_detector
 
@@ -2007,6 +2020,70 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         """Get the current number of known members."""
         return len(self._incarnation_tracker.node_states) or 1
 
+    def _compute_vivaldi_quality_multiplier_for_node(
+        self, node: tuple[str, int]
+    ) -> float:
+        """Vivaldi confidence-adjustment multiplier for ``node`` (AD-35:183).
+
+        Per AD-35:183:
+            ``confidence_adjustment = 1.0 + (vivaldi_error / 10.0)``
+
+        Higher coordinate error = wider posterior uncertainty about
+        the network distance to ``node`` = more conservative timeout.
+        Returns 1.0 when:
+
+        * the target's Vivaldi coordinate isn't tracked yet (cold
+          start / first-ever contact), or
+        * the local coordinate engine has not converged enough to
+          produce meaningful error estimates.
+
+        Both fall-throughs are intentionally neutral so that a node
+        without Vivaldi data doesn't get a *shorter* suspicion timer
+        than one with data — that would invert the safety property
+        (less knowledge = more aggressive failure declaration).
+        """
+        host, port = node
+        peer_id = f"{host}:{port}"
+        try:
+            peer_coord = self._coordinate_tracker.get_peer_coordinate(peer_id)
+        except Exception:
+            return 1.0
+        if peer_coord is None:
+            return 1.0
+        error = float(getattr(peer_coord, "error", 0.0) or 0.0)
+        # AD-35:183: 1 + error/10. Clamp to [1.0, 1.5] envelope per
+        # AD-35:194-198 worked example (max error penalty seen there
+        # is ~1.15× from confidence_adjustment alone).
+        adjustment = 1.0 + error / 10.0
+        return max(1.0, min(adjustment, 1.5))
+
+    def _is_target_already_suspect_or_dead(
+        self, target: tuple[str, int]
+    ) -> bool:
+        """Return True if ``target`` is already SUSPECT or DEAD.
+
+        Phase C signal-hygiene gate: probe failures to a peer that
+        we've already concluded is in trouble are evidence of peer-side
+        deadness, not local slowness, and must not feed back into our
+        self-LHM. Catches the positive-feedback loop on small clusters
+        (single dead peer pumps LHM to saturation; suspicion timer
+        scales accordingly; detection gets slower under failure load).
+
+        Reads from the incarnation-tracker's authoritative state per
+        AD-46 ("All node state stored in IncarnationTracker.node_states").
+        Returns False conservatively when the tracker has no entry for
+        the target — that's a fresh-or-unknown peer, and probe failures
+        in that case *are* evidence of self-slowness (we may simply not
+        have established communication).
+        """
+        try:
+            node_state = self._incarnation_tracker.get_node_state(target)
+        except Exception:
+            return False
+        if node_state is None:
+            return False
+        return node_state.status in (b"SUSPECT", b"DEAD")
+
     def _get_election_member_count(self) -> int:
         """Members that participate in *this node's* leader election.
 
@@ -2474,7 +2551,20 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                 )  # Help circuit breaker recover
                 return
 
-            await self.increase_failure_detector("probe_timeout")
+            # Phase C signal hygiene — only pump self-LHM when the
+            # probe failure is evidence of *our* slowness. If the
+            # target is already SUSPECT or DEAD, further probe-timeouts
+            # to it are evidence of *peer* deadness and must not feed
+            # back into our self-health signal. Without this gate, a
+            # single dead peer creates a positive feedback loop:
+            # probe-timeout -> self-LHM++ -> longer suspicion timer ->
+            # more probe-timeouts before DEAD declared -> self-LHM++
+            # again. The result is detection getting *slower* as the
+            # cluster gets *unhealthier* — opposite of SWIM's intent.
+            #
+            # See AD-30 addendum "Self-LHM growth gating".
+            if not self._is_target_already_suspect_or_dead(target):
+                await self.increase_failure_detector("probe_timeout")
             indirect_sent = await self.initiate_indirect_probe(target, incarnation)
 
             # Exit early if shutting down

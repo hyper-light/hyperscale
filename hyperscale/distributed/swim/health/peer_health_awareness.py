@@ -240,12 +240,50 @@ class PeerHealthAwareness:
             return peer_info.load_level
         return PeerLoadLevel.UNKNOWN
 
+    def get_load_multiplier(self, node_id: str) -> float:
+        """
+        Return the timeout multiplier driven by a peer's reported load.
+
+        This is the building block that ``get_probe_timeout`` (probe
+        path) and the suspicion-timer composition in
+        ``HierarchicalFailureDetector.suspect_global`` (Phase C) both
+        consume. Returning a multiplier instead of a fully-applied
+        timeout lets callers compose it multiplicatively with other
+        adjustment factors (self-LHM, Vivaldi quality) per AD-35:186
+        without coupling to any single base-timeout value.
+
+        Returns 1.0 when:
+        * timeout adaptation is disabled
+        * the peer is unknown to PeerHealthAwareness (no gossip yet, or
+          info has gone stale and was evicted)
+        * the peer is reported HEALTHY or UNKNOWN
+
+        Otherwise returns the load-level multiplier configured in
+        ``PeerHealthAwarenessConfig`` (BUSY 1.25×, STRESSED 1.75×,
+        OVERLOADED 2.5× by default).
+        """
+        if not self.config.enable_timeout_adaptation:
+            return 1.0
+
+        peer_info = self.get_peer_info(node_id)
+        if not peer_info:
+            return 1.0
+
+        if peer_info.load_level == PeerLoadLevel.OVERLOADED:
+            return self.config.timeout_multiplier_overloaded
+        if peer_info.load_level == PeerLoadLevel.STRESSED:
+            return self.config.timeout_multiplier_stressed
+        if peer_info.load_level == PeerLoadLevel.BUSY:
+            return self.config.timeout_multiplier_busy
+
+        return 1.0
+
     def get_probe_timeout(self, node_id: str, base_timeout: float) -> float:
         """
         Get adapted probe timeout for a peer based on their load.
 
-        When peers are overloaded, we give them more time to respond
-        to avoid false failure detection.
+        Thin wrapper over :meth:`get_load_multiplier` so existing
+        probe-path callers preserve their current API.
 
         Args:
             node_id: Peer node ID
@@ -254,22 +292,7 @@ class PeerHealthAwareness:
         Returns:
             Adapted timeout (>= base_timeout)
         """
-        if not self.config.enable_timeout_adaptation:
-            return base_timeout
-
-        peer_info = self.get_peer_info(node_id)
-        if not peer_info:
-            return base_timeout
-
-        # Apply multiplier based on load level
-        if peer_info.load_level == PeerLoadLevel.OVERLOADED:
-            return base_timeout * self.config.timeout_multiplier_overloaded
-        elif peer_info.load_level == PeerLoadLevel.STRESSED:
-            return base_timeout * self.config.timeout_multiplier_stressed
-        elif peer_info.load_level == PeerLoadLevel.BUSY:
-            return base_timeout * self.config.timeout_multiplier_busy
-
-        return base_timeout
+        return base_timeout * self.get_load_multiplier(node_id)
 
     def should_use_as_proxy(self, node_id: str) -> bool:
         """
