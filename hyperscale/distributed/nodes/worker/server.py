@@ -522,8 +522,11 @@ class WorkerServer(HealthAwareServer):
             manager_udp_addr = (manager_info.udp_host, manager_info.udp_port)
             await self.join_cluster(manager_udp_addr)
 
-        # Start SWIM probe cycle.
-        self.start_probe_cycle()
+        # Start SWIM probe cycle. `start_probe_cycle` is an async loop;
+        # submit it to the TaskRunner the same way the manager does
+        # (manager/server.py). Calling it sync just creates a coroutine
+        # that never runs — workers in that mode never emit SWIM probes.
+        self._task_runner.run(self.start_probe_cycle)
 
         # Start background loops
         await self._start_background_loops()

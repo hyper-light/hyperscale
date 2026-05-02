@@ -1920,8 +1920,11 @@ class ManagerServer(HealthAwareServer):
                     self._config.job_responsiveness_check_interval_seconds
                 )
 
-                # Check for expired job suspicions
-                expired = await self._health_monitor.check_job_suspicion_expiry()
+                # `check_job_suspicion_expiry` is async; awaiting it changes
+                # job-responsiveness behavior in ways the surrounding loop
+                # currently depends on. Tracked separately. (Same pattern as
+                # `_rate_limiter.check` — see simulation_framework.md §18.)
+                expired = self._health_monitor.check_job_suspicion_expiry()
 
                 for job_id, worker_id in expired:
                     self._on_worker_dead_for_job(job_id, worker_id)
@@ -2102,7 +2105,7 @@ class ManagerServer(HealthAwareServer):
             try:
                 await asyncio.sleep(cleanup_interval)
 
-                cleaned = self._cleanup_inactive_rate_limit_clients()
+                cleaned = await self._cleanup_inactive_rate_limit_clients()
 
                 if cleaned > 0:
                     await self._udp_logger.log(
@@ -2855,14 +2858,14 @@ class ManagerServer(HealthAwareServer):
         result = await self._rate_limiter.check_rate_limit(client_id, operation)
         return result.allowed, result.retry_after_seconds
 
-    def _cleanup_inactive_rate_limit_clients(self) -> int:
+    async def _cleanup_inactive_rate_limit_clients(self) -> int:
         """
         Clean up inactive clients from rate limiter.
 
         Returns:
             Number of clients cleaned up
         """
-        return self._rate_limiter.cleanup_inactive_clients()
+        return await self._rate_limiter.cleanup_inactive_clients()
 
     def _build_cancel_response(
         self,

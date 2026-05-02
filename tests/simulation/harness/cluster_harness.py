@@ -42,8 +42,10 @@ from tests.simulation.harness.invariants import (
 )
 from tests.simulation.harness.port_allocator import PortAllocator
 from tests.simulation.harness.server_handle import ServerHandle, ServerKind
+from tests.simulation.harness.submission import WorkloadSpec
 from tests.simulation.harness.supervisor import Supervisor
 from tests.simulation.harness.worker_ports import WorkerPorts
+from tests.simulation.harness.workload import WorkloadDriver
 
 
 _DEFAULT_ARTIFACTS_ROOT = pathlib.Path(__file__).resolve().parents[1] / "_artifacts"
@@ -151,6 +153,21 @@ class ClusterHarness:
     async def dump_diagnostics(self, reason: str = "manual") -> None:
         """Write a complete diagnostic snapshot. Safe to call any time after __aenter__."""
         await self._diagnostics.dump(reason=reason)
+
+    def workload(self, spec: WorkloadSpec) -> WorkloadDriver:
+        """Construct a `WorkloadDriver` bound to this cluster.
+
+        The driver allocates a fresh client port from the supervisor's
+        port allocator and is intended to be used as ``async with``.
+        Each call returns a new driver — workloads do not share state
+        across the same cluster lifetime.
+        """
+        client_port = self._ports.reserve_pair()[0]
+        return WorkloadDriver(
+            harness=self,
+            spec=spec,
+            client_port=client_port,
+        )
 
     async def _on_invariant_violation(self, reason: str) -> None:
         await self._diagnostics.dump(reason=f"invariant: {reason}")

@@ -130,6 +130,12 @@ class HyperscaleClient(MercurySyncBaseServer):
             env=env,
         )
 
+        # Logger used by every client submodule. The base class also creates
+        # `_tcp_logger` / `_udp_logger` during `start_server`, but the
+        # submodules below take a single Logger reference at construction.
+        from hyperscale.logging import Logger
+        self._logger = Logger()
+
         # Initialize config and state
         self._config = ClientConfig(
             host=host,
@@ -158,7 +164,6 @@ class HyperscaleClient(MercurySyncBaseServer):
         )
         self._leadership = ClientLeadershipTracker(
             state=self._state,
-            config=self._config,
             logger=self._logger,
         )
         self._tracker = ClientJobTracker(
@@ -200,26 +205,29 @@ class HyperscaleClient(MercurySyncBaseServer):
         self._register_handlers()
 
     def _register_handlers(self) -> None:
-        """Register all TCP handlers with module dependencies."""
+        """Register all TCP handlers with module dependencies.
+
+        Handler constructors take only ``(state, logger)`` plus a small
+        number of optional dependencies; the matching kwargs below are
+        the ones each handler actually accepts. (The dropped ``tracker``
+        and ``node_id`` kwargs are not present on the handler signatures
+        — passing them raised TypeError and broke client construction.)
+        """
         self._job_status_push_handler = JobStatusPushHandler(
             state=self._state,
             logger=self._logger,
-            tracker=self._tracker,
         )
         self._job_batch_push_handler = JobBatchPushHandler(
             state=self._state,
             logger=self._logger,
-            tracker=self._tracker,
         )
         self._job_final_result_handler = JobFinalResultHandler(
             state=self._state,
             logger=self._logger,
-            tracker=self._tracker,
         )
         self._global_job_result_handler = GlobalJobResultHandler(
             state=self._state,
             logger=self._logger,
-            tracker=self._tracker,
         )
         self._reporter_result_push_handler = ReporterResultPushHandler(
             state=self._state,
@@ -228,7 +236,7 @@ class HyperscaleClient(MercurySyncBaseServer):
         self._workflow_result_push_handler = WorkflowResultPushHandler(
             state=self._state,
             logger=self._logger,
-            reporting=self._reporting,
+            reporting_manager=self._reporting,
         )
         self._windowed_stats_push_handler = WindowedStatsPushHandler(
             state=self._state,
@@ -243,13 +251,11 @@ class HyperscaleClient(MercurySyncBaseServer):
             state=self._state,
             logger=self._logger,
             leadership_manager=self._leadership,
-            node_id=self._node_id,
         )
         self._manager_leader_transfer_handler = ManagerLeaderTransferHandler(
             state=self._state,
             logger=self._logger,
             leadership_manager=self._leadership,
-            node_id=self._node_id,
         )
 
     async def start(self) -> None:

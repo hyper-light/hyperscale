@@ -252,7 +252,7 @@ class ManagerRateLimitingCoordinator:
             while True:
                 try:
                     await asyncio.sleep(interval)
-                    self.cleanup_inactive_clients()
+                    await self.cleanup_inactive_clients()
                 except asyncio.CancelledError:
                     break
                 except Exception as cleanup_error:

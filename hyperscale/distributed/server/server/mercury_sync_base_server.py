@@ -1312,11 +1312,7 @@ class MercurySyncBaseServer(Generic[T]):
         handler_name = b""
 
         try:
-            # `_rate_limiter.check` is async — calling it without await
-            # returns a truthy coroutine and bypasses the limit. Properly
-            # awaiting it currently rejects loopback worker registrations;
-            # tracking the fix separately. See simulation_framework.md §18.
-            if peername is not None and not self._rate_limiter.check(peername):
+            if peername is not None and not await self._rate_limiter.check(peername):
                 self._tcp_drop_counter.increment_rate_limited()
                 return
 

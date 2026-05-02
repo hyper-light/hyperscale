@@ -5183,7 +5183,7 @@ class GateServer(HealthAwareServer):
         while self._running:
             try:
                 await asyncio.sleep(self._rate_limit_cleanup_interval)
-                self._rate_limiter.cleanup_inactive_clients()
+                await self._rate_limiter.cleanup_inactive_clients()
             except asyncio.CancelledError:
                 break
             except Exception as error:

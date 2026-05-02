@@ -30,6 +30,13 @@ from tests.simulation.harness.errors import (
     ReapError,
 )
 from tests.simulation.harness.execution_mode import ExecutionMode
+from tests.simulation.harness.expectations import (
+    ExpectAllWorkflowsComplete,
+    ExpectCompletionWithin,
+    Expectation,
+    ExpectationResult,
+    WorkloadObservations,
+)
 from tests.simulation.harness.invariants import (
     InvariantChecker,
     InvariantResult,
@@ -42,9 +49,16 @@ from tests.simulation.harness.invariants import (
 )
 from tests.simulation.harness.port_allocator import PortAllocator
 from tests.simulation.harness.server_handle import ServerHandle, ServerKind
+from tests.simulation.harness.submission import (
+    Submission,
+    SubmissionPattern,
+    WorkflowFactory,
+    WorkloadSpec,
+)
 from tests.simulation.harness.supervisor import Supervisor
 from tests.simulation.harness.timeouts import HarnessTimeouts
 from tests.simulation.harness.worker_ports import WorkerPorts
+from tests.simulation.harness.workload import WorkloadDriver, WorkloadFailure
 
 
 __all__ = [
@@ -55,6 +69,10 @@ __all__ = [
     "DiagnosticDumper",
     "EnvOverrides",
     "ExecutionMode",
+    "ExpectAllWorkflowsComplete",
+    "ExpectCompletionWithin",
+    "Expectation",
+    "ExpectationResult",
     "HarnessError",
     "HarnessTimeouts",
     "InvariantChecker",
@@ -70,9 +88,16 @@ __all__ = [
     "ServerHandle",
     "ServerKind",
     "Severity",
+    "Submission",
+    "SubmissionPattern",
     "Supervisor",
     "WaitContext",
     "WorkerPorts",
+    "WorkflowFactory",
+    "WorkloadDriver",
+    "WorkloadFailure",
+    "WorkloadObservations",
+    "WorkloadSpec",
     "all_of",
     "any_of",
     "at_most_one_job_leader_per_job",
