@@ -389,12 +389,16 @@ class TaskRunner:
 
         self._run_cleanup = False
 
-        try:
+        # Cancel and AWAIT the cleanup task. The previous version only yielded
+        # control once via `asyncio.sleep(0)` after cancel, which is not
+        # enough — the cancelled task may still be alive when shutdown
+        # returns and surfaces as a leaked asyncio task.
+        if self._cleanup_task is not None and not self._cleanup_task.done():
             self._cleanup_task.cancel()
-            await asyncio.sleep(0)
-
-        except Exception:
-            pass
+            try:
+                await self._cleanup_task
+            except (asyncio.CancelledError, Exception):
+                pass
 
         if self._executor:
             try:

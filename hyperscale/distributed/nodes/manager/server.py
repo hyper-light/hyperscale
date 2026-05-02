@@ -924,7 +924,7 @@ class ManagerServer(HealthAwareServer):
         )
 
         try:
-            response = await self.send_tcp(
+            response, _clock = await self.send_tcp(
                 manager_addr,
                 "manager_peer_register",
                 registration.dump(),

@@ -65,6 +65,8 @@ from hyperscale.core.utils.cancel_and_release_task import cancel_and_release_tas
 from hyperscale.logging import Logger
 from hyperscale.logging.config import LoggingConfig
 from hyperscale.logging.hyperscale_logging_models import ServerWarning, SilentDropStats
+from hyperscale.core.jobs.tasks.cancel import cancel
+
 
 do_patch()
 
@@ -1701,11 +1703,26 @@ class MercurySyncBaseServer(Generic[T]):
             self._tcp_server = None
             self._tcp_connected = False
 
-        cancel_and_release_task(self._drop_stats_task)
-        cancel_and_release_task(self._tcp_server_sleep_task)
-        cancel_and_release_task(self._tcp_server_cleanup_task)
-        cancel_and_release_task(self._udp_server_sleep_task)
-        cancel_and_release_task(self._udp_server_cleanup_task)
+        # Cancel-and-await every server-owned background task in parallel.
+        # `cancel_and_release_task` only schedules a done-callback; without
+        # an actual await the tasks are still pending when callers (e.g. the
+        # simulation supervisor's leak detector) inspect `asyncio.all_tasks()`.
+        all_pending = (
+            [
+                self._drop_stats_task,
+                self._tcp_server_sleep_task,
+                self._tcp_server_cleanup_task,
+                self._udp_server_sleep_task,
+                self._udp_server_cleanup_task,
+            ]
+            + list(self._pending_tcp_server_responses)
+            + list(self._pending_udp_server_responses)
+        )
+        await asyncio.gather(
+            *(cancel(task) for task in all_pending if task is not None)
+        )
+        self._pending_tcp_server_responses.clear()
+        self._pending_udp_server_responses.clear()
 
     def abort(self) -> None:
         self._running = False

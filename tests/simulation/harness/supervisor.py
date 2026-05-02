@@ -185,12 +185,19 @@ class Supervisor:
             await self._reap_worker_subprocesses(handle, graceful_ok)
 
     async def _reap_graceful(self, handle: ServerHandle) -> bool:
-        """Layer 1: ask the server to stop on its own."""
+        """Layer 1: ask the server to stop on its own.
+
+        ``drain_timeout=0`` because the harness is tearing the cluster
+        down — we do not need to wait for in-flight messages to drain,
+        only for the server to release resources and cancel its
+        background tasks. With non-zero drain, larger topologies (L2/L3)
+        exceed the wait-for budget and leave background tasks alive.
+        """
         if not handle.started:
             return True
         try:
             await asyncio.wait_for(
-                handle.instance.stop(drain_timeout=2.0, broadcast_leave=False),
+                handle.instance.stop(drain_timeout=0.0, broadcast_leave=False),
                 timeout=self.timeouts.stop_default,
             )
             return True
@@ -325,6 +332,11 @@ class Supervisor:
         Excludes the supervisor's own tracking tasks (already cancelled) and
         the currently-running task (the caller). Tasks marked done are fine
         — the GC will collect them.
+
+        Each leaked task is described by its coroutine's qualified name and
+        the file:line where the coroutine is defined, so generic "Task-N"
+        names point at concrete production sites without further detective
+        work.
         """
         now_tasks = set(asyncio.all_tasks())
         try:
@@ -336,8 +348,11 @@ class Supervisor:
             new.discard(current)
         leaked = [task for task in new if not task.done()]
         if leaked:
-            names = sorted(task.get_name() for task in leaked)
-            message = f"{len(leaked)} async tasks leaked across cluster lifetime: {names}"
+            descriptions = sorted(_describe_leaked_task(task) for task in leaked)
+            message = (
+                f"{len(leaked)} async tasks leaked across cluster lifetime:\n  - "
+                + "\n  - ".join(descriptions)
+            )
             self.cleanup_errors.append(message)
             if self.fail_on_async_leak:
                 raise LeakedAsyncTasksError(message)
@@ -417,6 +432,52 @@ class Supervisor:
     @staticmethod
     def _now() -> float:
         return time.monotonic()
+
+
+def _describe_leaked_task(task: asyncio.Task) -> str:
+    """Render a leaked task as ``name | qualname | file:line | awaiting``.
+
+    The default ``task.get_name()`` returns "Task-N" for unnamed tasks,
+    which is useless for finding the leak source. This helper extracts:
+
+    * task name (``task.get_name()``)
+    * coroutine qualified name (``coro.cr_code.co_qualname``)
+    * source location (``co_filename:co_firstlineno``, repo-relative)
+    * current await frame, if the task is waiting on something
+      (last frame of ``task.get_stack()``)
+    """
+    name = task.get_name()
+    coro = task.get_coro()
+    qualname = "?"
+    location = "?"
+    if coro is not None:
+        code = getattr(coro, "cr_code", None) or getattr(coro, "gi_code", None)
+        if code is not None:
+            qualname = getattr(code, "co_qualname", code.co_name)
+            filename = code.co_filename
+            line = code.co_firstlineno
+            try:
+                from pathlib import Path as _Path
+
+                filename = str(
+                    _Path(filename).resolve().relative_to(_Path.cwd())
+                )
+            except (ValueError, OSError):
+                pass
+            location = f"{filename}:{line}"
+
+    awaiting = ""
+    try:
+        stack = task.get_stack(limit=1)
+        if stack:
+            frame = stack[0]
+            await_code = frame.f_code
+            await_qual = getattr(await_code, "co_qualname", await_code.co_name)
+            awaiting = f" @ {await_qual}:{frame.f_lineno}"
+    except Exception:
+        pass
+
+    return f"{name} | {qualname} | {location}{awaiting}"
 
 
 def _is_zombie(proc: psutil.Process) -> bool:

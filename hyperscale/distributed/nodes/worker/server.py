@@ -543,13 +543,19 @@ class WorkerServer(HealthAwareServer):
     async def stop(
         self, drain_timeout: float = 5, broadcast_leave: bool = True
     ) -> None:
-        """Stop the worker server gracefully."""
+        """Stop the worker server gracefully.
+
+        Background loops are cancelled FIRST so that even if a later step
+        raises (or the parent supervisor's `wait_for` cancels mid-stop),
+        the worker's named bg tasks are already done. Otherwise they
+        survive past shutdown and surface as leaked asyncio tasks.
+        """
         self._running = False
 
-        await self._log_worker_stopping()
         await self._stop_background_loops()
         await self._cancel_cores_notification_task()
         self._stop_modules()
+        await self._log_worker_stopping()
         await self._cancel_all_active_workflows()
         await self._shutdown_lifecycle_components()
         await super().stop(drain_timeout, broadcast_leave)
