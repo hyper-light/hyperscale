@@ -297,7 +297,7 @@ class ManagerServer(HealthAwareServer):
         )
 
         # Health monitor for worker health tracking
-        self._health_monitor = ManagerHealthMonitor(
+        self._worker_health_monitor = ManagerHealthMonitor(
             state=self._manager_state,
             config=self._config,
             registry=self._registry,
@@ -1160,7 +1160,7 @@ class ManagerServer(HealthAwareServer):
 
     def _on_worker_globally_dead(self, worker_id: str) -> None:
         """Handle worker global death (AD-30)."""
-        self._health_monitor.on_global_death(worker_id)
+        self._worker_health_monitor.on_global_death(worker_id)
         if self._worker_disseminator:
             self._task_runner.run(
                 self._worker_disseminator.broadcast_worker_dead, worker_id, "dead"
@@ -1413,7 +1413,7 @@ class ManagerServer(HealthAwareServer):
     # =========================================================================
 
     async def _handle_worker_failure(self, worker_id: str) -> None:
-        await self._health_monitor.handle_worker_failure(worker_id)
+        await self._worker_health_monitor.handle_worker_failure(worker_id)
 
         if self._workflow_dispatcher and self._job_manager:
             running_sub_workflows = (
@@ -1663,7 +1663,7 @@ class ManagerServer(HealthAwareServer):
         heartbeat: WorkerHeartbeat,
         source_addr: tuple[str, int],
     ) -> None:
-        await self._health_monitor.handle_worker_heartbeat(heartbeat, source_addr)
+        await self._worker_health_monitor.handle_worker_heartbeat(heartbeat, source_addr)
 
         worker_id = heartbeat.node_id
         if self._manager_state.has_worker(worker_id):
@@ -1703,7 +1703,7 @@ class ManagerServer(HealthAwareServer):
             self._log_peer_manager_health_transition(
                 peer_id, previous_peer_state, peer_health_state
             )
-            await self._health_monitor.check_peer_manager_health_alerts()
+            await self._worker_health_monitor.check_peer_manager_health_alerts()
 
         self.confirm_peer(source_addr)
 
@@ -1946,7 +1946,7 @@ class ManagerServer(HealthAwareServer):
                     self._config.job_responsiveness_check_interval_seconds
                 )
 
-                expired = await self._health_monitor.check_job_suspicion_expiry()
+                expired = await self._worker_health_monitor.check_job_suspicion_expiry()
 
                 for job_id, worker_id in expired:
                     self._on_worker_dead_for_job(job_id, worker_id)
@@ -2909,7 +2909,7 @@ class ManagerServer(HealthAwareServer):
         ).dump()
 
     def _build_manager_heartbeat(self) -> ManagerHeartbeat:
-        health_state_counts = self._health_monitor.get_worker_health_state_counts()
+        health_state_counts = self._worker_health_monitor.get_worker_health_state_counts()
         return ManagerHeartbeat(
             node_id=self._node_id.full,
             datacenter=self._node_id.datacenter,
@@ -3563,7 +3563,7 @@ class ManagerServer(HealthAwareServer):
             # Record job progress for AD-30 responsiveness tracking
             worker_id = self._manager_state.get_worker_id_from_addr(addr)
             if worker_id:
-                self._health_monitor.record_job_progress(progress.job_id, worker_id)
+                self._worker_health_monitor.record_job_progress(progress.job_id, worker_id)
 
             # Update job manager
             self._job_manager.update_workflow_progress(
@@ -4420,7 +4420,7 @@ class ManagerServer(HealthAwareServer):
             worker_statuses = [
                 WorkerStatus(
                     worker_id=worker_id,
-                    state=self._health_monitor.get_worker_health_status(worker_id),
+                    state=self._worker_health_monitor.get_worker_health_status(worker_id),
                     available_cores=worker.available_cores,
                     total_cores=worker.total_cores,
                 )
@@ -4433,7 +4433,7 @@ class ManagerServer(HealthAwareServer):
                 state=self._manager_state.manager_state_enum.value,
                 state_version=self._manager_state.state_version,
                 worker_count=self._manager_state.get_worker_count(),
-                healthy_worker_count=self._health_monitor.get_healthy_worker_count(),
+                healthy_worker_count=self._worker_health_monitor.get_healthy_worker_count(),
                 active_job_count=self._job_manager.job_count,
                 workers=worker_statuses,
             )
@@ -4655,7 +4655,7 @@ class ManagerServer(HealthAwareServer):
         try:
             heartbeat = WorkerHeartbeat.load(data)
 
-            await self._health_monitor.handle_worker_heartbeat(heartbeat, addr)
+            await self._worker_health_monitor.handle_worker_heartbeat(heartbeat, addr)
 
             worker_id = heartbeat.node_id
             if self._manager_state.has_worker(worker_id):
@@ -6073,8 +6073,8 @@ class ManagerServer(HealthAwareServer):
 
     async def _cleanup_job_state(self, job_id: str) -> None:
         self._leases.clear_job_leases(job_id)
-        self._health_monitor.cleanup_job_progress(job_id)
-        self._health_monitor.clear_job_suspicions(job_id)
+        self._worker_health_monitor.cleanup_job_progress(job_id)
+        self._worker_health_monitor.clear_job_suspicions(job_id)
         self._manager_state.clear_job_state(job_id)
         job_token = self._job_manager.create_job_token(job_id)
         await self._job_manager.remove_job(job_token)
