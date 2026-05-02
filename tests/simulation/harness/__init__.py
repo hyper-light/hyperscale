@@ -8,16 +8,38 @@ Phases 5–6 once the Clock/Random/Transport refactor lands.
 
 from tests.simulation.harness.cluster_harness import ClusterHarness
 from tests.simulation.harness.cluster_spec import ClusterSpec
+from tests.simulation.harness.conditions import (
+    ConditionTimeoutError,
+    WaitContext,
+    all_of,
+    any_of,
+    gate_cluster_formed,
+    manager_has_n_peers,
+    manager_has_n_workers,
+    wait_until,
+    worker_subprocesses_alive,
+)
 from tests.simulation.harness.dc_spec import DCSpec
+from tests.simulation.harness.diagnostics import DiagnosticDumper
 from tests.simulation.harness.env_overrides import EnvOverrides
 from tests.simulation.harness.errors import (
     HarnessError,
-    PortConflictError,
-    ReapError,
     LeakedAsyncTasksError,
+    PortConflictError,
     PreflightZombieError,
+    ReapError,
 )
 from tests.simulation.harness.execution_mode import ExecutionMode
+from tests.simulation.harness.invariants import (
+    InvariantChecker,
+    InvariantResult,
+    InvariantViolation,
+    LivenessInvariant,
+    SafetyInvariant,
+    Severity,
+    at_most_one_job_leader_per_job,
+    cluster_membership_progress,
+)
 from tests.simulation.harness.port_allocator import PortAllocator
 from tests.simulation.harness.server_handle import ServerHandle, ServerKind
 from tests.simulation.harness.supervisor import Supervisor
@@ -28,18 +50,36 @@ from tests.simulation.harness.worker_ports import WorkerPorts
 __all__ = [
     "ClusterHarness",
     "ClusterSpec",
+    "ConditionTimeoutError",
     "DCSpec",
+    "DiagnosticDumper",
     "EnvOverrides",
     "ExecutionMode",
     "HarnessError",
     "HarnessTimeouts",
+    "InvariantChecker",
+    "InvariantResult",
+    "InvariantViolation",
     "LeakedAsyncTasksError",
+    "LivenessInvariant",
     "PortAllocator",
     "PortConflictError",
     "PreflightZombieError",
     "ReapError",
+    "SafetyInvariant",
     "ServerHandle",
     "ServerKind",
+    "Severity",
     "Supervisor",
+    "WaitContext",
     "WorkerPorts",
+    "all_of",
+    "any_of",
+    "at_most_one_job_leader_per_job",
+    "cluster_membership_progress",
+    "gate_cluster_formed",
+    "manager_has_n_peers",
+    "manager_has_n_workers",
+    "wait_until",
+    "worker_subprocesses_alive",
 ]

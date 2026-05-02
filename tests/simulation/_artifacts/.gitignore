@@ -1,1 +1,3 @@
-_artifacts/
+# Per-run diagnostic dumps + log directories. Ephemeral; do not commit.
+*
+!.gitignore

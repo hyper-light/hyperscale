@@ -13,6 +13,7 @@ until the production-side Clock/Random/Transport refactor lands.
 """
 
 import asyncio
+import pathlib
 from dataclasses import dataclass, field
 
 from hyperscale.distributed.env.env import Env
@@ -21,13 +22,31 @@ from hyperscale.distributed.nodes.manager import ManagerServer
 from hyperscale.distributed.nodes.worker import WorkerServer
 
 from tests.simulation.harness.cluster_spec import ClusterSpec
+from tests.simulation.harness.conditions import (
+    all_of,
+    manager_has_n_peers,
+    manager_has_n_workers,
+    wait_until,
+    worker_subprocesses_alive,
+)
 from tests.simulation.harness.dc_spec import DCSpec
+from tests.simulation.harness.diagnostics import DiagnosticDumper
 from tests.simulation.harness.env_overrides import EnvOverrides
 from tests.simulation.harness.execution_mode import ExecutionMode
+from tests.simulation.harness.invariants import (
+    InvariantChecker,
+    LivenessInvariant,
+    SafetyInvariant,
+    at_most_one_job_leader_per_job,
+    cluster_membership_progress,
+)
 from tests.simulation.harness.port_allocator import PortAllocator
 from tests.simulation.harness.server_handle import ServerHandle, ServerKind
 from tests.simulation.harness.supervisor import Supervisor
 from tests.simulation.harness.worker_ports import WorkerPorts
+
+
+_DEFAULT_ARTIFACTS_ROOT = pathlib.Path(__file__).resolve().parents[1] / "_artifacts"
 
 
 @dataclass(slots=True)
@@ -47,10 +66,20 @@ class ClusterHarness:
     mode: ExecutionMode = ExecutionMode.REAL
     fail_on_async_leak: bool = True
     stabilization_seconds: float | None = None
-    """Wall-clock pause after starting all servers; uses spec.timeouts default if None."""
+    """Hard ceiling on cluster stabilization. ``None`` uses
+    ``spec.timeouts.stabilization_default``. The harness uses condition
+    predicates (membership / worker registration / subprocess spawn) to
+    return as soon as steady state is reached, capped by this budget."""
+    scenario_name: str = "anonymous"
+    """Used for diagnostic dump path: _artifacts/<scenario>/<timestamp>/."""
+    artifacts_root: pathlib.Path = field(default_factory=lambda: _DEFAULT_ARTIFACTS_ROOT)
+    extra_safety_invariants: list[SafetyInvariant] = field(default_factory=list)
+    extra_liveness_invariants: list[LivenessInvariant] = field(default_factory=list)
 
     _supervisor: Supervisor = field(init=False)
     _ports: PortAllocator = field(init=False)
+    _diagnostics: DiagnosticDumper = field(init=False)
+    _invariants: InvariantChecker = field(init=False)
     _handles_by_id: dict[str, ServerHandle] = field(init=False, default_factory=dict)
     _gates: list[ServerHandle] = field(init=False, default_factory=list)
     _managers_by_dc: dict[str, list[ServerHandle]] = field(init=False, default_factory=dict)
@@ -70,13 +99,36 @@ class ClusterHarness:
             ports=self._ports,
             fail_on_async_leak=self.fail_on_async_leak,
         )
+        self._diagnostics = DiagnosticDumper(
+            artifacts_root=self.artifacts_root,
+            scenario=self.scenario_name,
+            harness=self,
+        )
+        self._invariants = InvariantChecker(
+            harness=self,
+            poll_interval=self.spec.timeouts.invariant_poll_interval,
+            on_violation=self._on_invariant_violation,
+        )
+        self._invariants.add_safety(at_most_one_job_leader_per_job())
+        self._invariants.add_liveness(
+            cluster_membership_progress(
+                staleness_budget=self.spec.timeouts.stabilization_default,
+            )
+        )
+        for safety in self.extra_safety_invariants:
+            self._invariants.add_safety(safety)
+        for liveness in self.extra_liveness_invariants:
+            self._invariants.add_liveness(liveness)
+
         await self._supervisor.__aenter__()
 
         try:
             self._build_servers()
             await self._start_servers()
+            await self._invariants.start()
             await self._stabilize()
         except BaseException:
+            await self._invariants.stop()
             await self._supervisor.shutdown()
             raise
 
@@ -84,15 +136,24 @@ class ClusterHarness:
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
+        await self._invariants.stop()
+        invariant_violation = self._invariants.violation
         try:
             await self._supervisor.shutdown()
         finally:
             errors = self._supervisor.cleanup_errors
+            if invariant_violation is not None and exc_type is None:
+                raise invariant_violation
             if errors and exc_type is None:
-                # Surface cleanup errors when the scenario itself succeeded;
-                # otherwise the original exception is already informative.
                 joined = "\n  - ".join(errors)
                 raise RuntimeError(f"harness cleanup reported errors:\n  - {joined}")
+
+    async def dump_diagnostics(self, reason: str = "manual") -> None:
+        """Write a complete diagnostic snapshot. Safe to call any time after __aenter__."""
+        await self._diagnostics.dump(reason=reason)
+
+    async def _on_invariant_violation(self, reason: str) -> None:
+        await self._diagnostics.dump(reason=f"invariant: {reason}")
 
     @property
     def supervisor(self) -> Supervisor:
@@ -308,13 +369,42 @@ class ClusterHarness:
                     self._supervisor.start_worker_pid_tracking(handle)
 
     async def _stabilize(self) -> None:
+        """Wait until the cluster is in steady state, capped at the budget.
+
+        For each DC: every manager has discovered its peers and has every
+        worker registered, and every worker's subprocess pool has spawned
+        at least one tracked PID. Returns as soon as all hold; raises
+        ``ConditionTimeoutError`` (with a diagnostic dump already written)
+        on budget exhaustion.
+        """
         budget = self.stabilization_seconds
         if budget is None:
             budget = self.spec.timeouts.stabilization_default
-        # Phase 1: real wall-clock sleep. Phase 2 replaces this with
-        # condition predicates (`wait_until(has_quorum and has_workers)`).
-        if budget > 0:
-            await asyncio.sleep(budget)
+        if budget <= 0:
+            return
+
+        predicates: list = []
+        for dc_id, dc_spec in self.spec.datacenters.items():
+            managers = self._managers_by_dc.get(dc_id, [])
+            workers = self._workers_by_dc.get(dc_id, [])
+            for manager in managers:
+                predicates.append(manager_has_n_peers(manager, dc_spec.managers - 1))
+                predicates.append(manager_has_n_workers(manager, dc_spec.workers))
+            for worker in workers:
+                predicates.append(worker_subprocesses_alive(self, worker))
+
+        if not predicates:
+            return
+
+        await wait_until(
+            all_of(*predicates),
+            timeout=budget,
+            poll=0.5,
+            description=f"cluster stabilizes ({len(predicates)} predicates)",
+            on_fail=lambda: self._diagnostics.dump(
+                reason="stabilization timeout"
+            ),
+        )
 
     def _allocate_pair(self) -> tuple[int, int]:
         return self._ports.reserve_pair()

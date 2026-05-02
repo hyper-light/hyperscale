@@ -1921,7 +1921,7 @@ class ManagerServer(HealthAwareServer):
                 )
 
                 # Check for expired job suspicions
-                expired = self._health_monitor.check_job_suspicion_expiry()
+                expired = await self._health_monitor.check_job_suspicion_expiry()
 
                 for job_id, worker_id in expired:
                     self._on_worker_dead_for_job(job_id, worker_id)
@@ -2894,7 +2894,7 @@ class ManagerServer(HealthAwareServer):
             healthy_worker_count=len(self._registry.get_healthy_worker_ids()),
             available_cores=self._get_available_cores_for_healthy_workers(),
             total_cores=self._get_total_cores(),
-            active_job_count=self._job_manager.job_count,
+            active_jobs=self._job_manager.job_count,
             tcp_host=self._host,
             tcp_port=self._tcp_port,
             udp_host=self._host,

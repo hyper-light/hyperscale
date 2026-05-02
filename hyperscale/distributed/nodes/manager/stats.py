@@ -277,7 +277,7 @@ class ManagerStatsCoordinator:
         progress callbacks. Entries are cleared from the windowed collector
         after successful aggregation.
         """
-        job_ids = self._windowed_stats.get_active_job_ids()
+        job_ids = self._windowed_stats.get_jobs_with_pending_stats()
         if not job_ids:
             return
 

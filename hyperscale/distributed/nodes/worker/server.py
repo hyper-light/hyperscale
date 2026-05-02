@@ -999,7 +999,7 @@ class WorkerServer(HealthAwareServer):
         try:
             response, _ = await self.send_tcp(
                 manager_addr,
-                "worker_registration",
+                "worker_register",
                 data,
                 timeout=timeout,
             )

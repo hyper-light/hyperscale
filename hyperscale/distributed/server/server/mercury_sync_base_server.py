@@ -1385,11 +1385,17 @@ class MercurySyncBaseServer(Generic[T]):
             if handler is None:
                 return
 
+            # The @tcp.receive() wrapper signature is (server, addr, data,
+            # clock_time) — passing `transport` as a 4th positional arg
+            # raises TypeError, which the generic `except Exception` below
+            # silently catches and turns into an opaque error response.
+            # No handler currently reads transport; if certificate
+            # extraction (AD-28) is needed in future, extend the wrapper
+            # to thread transport through explicitly.
             response = await handler(
                 addr,
                 payload,
                 clock_time,
-                transport,  # AD-28: Pass transport for certificate extraction
             )
 
             if isinstance(response, Message):
