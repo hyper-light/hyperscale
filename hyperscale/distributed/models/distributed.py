@@ -862,6 +862,16 @@ class JobSubmission(Message):
     workflows: bytes  # Cloudpickled list[tuple[str, list[str], Workflow]]
     vus: int  # Virtual users (cores to use per workflow)
     timeout_seconds: float  # Maximum execution time
+    # Phase H2: distinguishes "client passed timeout_seconds explicitly"
+    # from "client took the framework default." When False, the manager
+    # falls back to:
+    #   1. The workflow class's timeout if it was overridden from the
+    #      base ``Workflow.timeout = "30s"`` default.
+    #   2. Otherwise ``workflow.duration × HYPERSCALE_DEFAULT_WORKER_
+    #      TIMEOUT_MULTIPLIER`` (default 1.5).
+    # When True, ``timeout_seconds`` is honored verbatim regardless of
+    # workflow-class settings. See AD-34 addendum (Phase H).
+    timeout_seconds_explicit: bool = False
     datacenter_count: int = 1  # Number of DCs to run in (gates only)
     datacenters: list[str] = field(default_factory=list)
     # Optional callback address for push notifications

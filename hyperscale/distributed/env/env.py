@@ -419,6 +419,13 @@ class Env(BaseModel):
     EXTENSION_EXHAUSTION_GRACE_PERIOD: StrictFloat = (
         10.0  # Seconds of grace after exhaustion before kill
     )
+    # Phase H2 — default per-workflow timeout multiplier when neither
+    # JobSubmission.timeout_seconds (set explicitly by the client) nor
+    # Workflow.timeout (overridden in the workflow class) is provided.
+    # The deadline is then ``workflow.duration × multiplier``. Default
+    # 1.5 per the AD-26/AD-34 design conversation: workflows of declared
+    # duration D get a buffered deadline of 1.5×D before SUSPECT.
+    HYPERSCALE_DEFAULT_WORKER_TIMEOUT_MULTIPLIER: StrictFloat = 1.5
 
     # ==========================================================================
     # Orphaned Workflow Scanner Settings
@@ -811,6 +818,7 @@ class Env(BaseModel):
             "EXTENSION_MIN_GRANT": float,
             "EXTENSION_MAX_EXTENSIONS": int,
             "EXTENSION_EVICTION_THRESHOLD": int,
+            "HYPERSCALE_DEFAULT_WORKER_TIMEOUT_MULTIPLIER": float,
             "EXTENSION_EXHAUSTION_WARNING_THRESHOLD": int,
             "EXTENSION_EXHAUSTION_GRACE_PERIOD": float,
             # Orphaned workflow scanner settings

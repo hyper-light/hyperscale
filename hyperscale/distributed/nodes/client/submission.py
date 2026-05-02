@@ -69,7 +69,7 @@ class ClientJobSubmitter:
         self,
         workflows: list[tuple[list[str], object]],
         vus: int = 1,
-        timeout_seconds: float = 300.0,
+        timeout_seconds: float | None = None,
         datacenter_count: int = 1,
         datacenters: list[str] | None = None,
         on_status_update: Callable[[JobStatusPush], None] | None = None,
@@ -116,12 +116,25 @@ class ClientJobSubmitter:
         if reporting_configs:
             reporting_configs_bytes = cloudpickle.dumps(reporting_configs)
 
+        # Phase H2 — explicit-vs-default detection. ``None`` means
+        # "let the manager apply the AD-26/AD-34 override hierarchy
+        # (workflow-class timeout > duration × multiplier)." Any
+        # positive number is treated as an explicit per-job override
+        # the manager honors verbatim.
+        is_explicit_timeout = (
+            timeout_seconds is not None and timeout_seconds > 0.0
+        )
+        effective_timeout_for_wire = (
+            timeout_seconds if is_explicit_timeout else 0.0
+        )
+
         # Build submission message
         submission = self._build_job_submission(
             job_id=job_id,
             workflows_bytes=workflows_bytes,
             vus=vus,
-            timeout_seconds=timeout_seconds,
+            timeout_seconds=effective_timeout_for_wire,
+            timeout_seconds_explicit=is_explicit_timeout,
             datacenter_count=datacenter_count,
             datacenters=datacenters or [],
             reporting_configs_bytes=reporting_configs_bytes,
@@ -214,6 +227,7 @@ class ClientJobSubmitter:
         datacenter_count: int,
         datacenters: list[str],
         reporting_configs_bytes: bytes,
+        timeout_seconds_explicit: bool = False,
     ) -> JobSubmission:
         """
         Build JobSubmission message with protocol version.
@@ -222,10 +236,14 @@ class ClientJobSubmitter:
             job_id: Job identifier
             workflows_bytes: Serialized workflows
             vus: Virtual users
-            timeout_seconds: Timeout
+            timeout_seconds: Timeout (0.0 when not explicit; manager
+                applies override hierarchy)
             datacenter_count: DC count
             datacenters: Specific DCs
             reporting_configs_bytes: Serialized reporter configs
+            timeout_seconds_explicit: True when the client passed an
+                explicit per-job timeout. Phase H2 — distinguishes
+                "use this exact value" from "use framework default."
 
         Returns:
             JobSubmission message
@@ -235,6 +253,7 @@ class ClientJobSubmitter:
             workflows=workflows_bytes,
             vus=vus,
             timeout_seconds=timeout_seconds,
+            timeout_seconds_explicit=timeout_seconds_explicit,
             datacenter_count=datacenter_count,
             datacenters=datacenters,
             callback_addr=self._targets.get_callback_addr(),

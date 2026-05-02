@@ -280,7 +280,7 @@ class HyperscaleClient(MercurySyncBaseServer):
         self,
         workflows: list[tuple[list[str], object]],
         vus: int = 1,
-        timeout_seconds: float = 300.0,
+        timeout_seconds: float | None = None,
         datacenter_count: int = 1,
         datacenters: list[str] | None = None,
         on_status_update: Callable[[JobStatusPush], None] | None = None,
@@ -289,7 +289,16 @@ class HyperscaleClient(MercurySyncBaseServer):
         reporting_configs: list | None = None,
         on_reporter_result: Callable[[ReporterResultPush], None] | None = None,
     ) -> str:
-        """Submit a job for execution (delegates to ClientJobSubmitter)."""
+        """Submit a job for execution (delegates to ClientJobSubmitter).
+
+        Phase H2: ``timeout_seconds=None`` (the default) lets the
+        manager apply the AD-26/AD-34 override hierarchy:
+        ``Workflow.timeout`` (when overridden in the workflow class)
+        wins over the framework default of
+        ``workflow.duration × HYPERSCALE_DEFAULT_WORKER_TIMEOUT_MULTIPLIER``
+        (1.5 by default). Pass a positive number to force an explicit
+        per-job override that the manager honors verbatim.
+        """
         return await self._submitter.submit_job(
             workflows=workflows,
             vus=vus,

@@ -23,6 +23,9 @@ import networkx
 
 from hyperscale.core.graph.workflow import Workflow
 from hyperscale.core.jobs.workers.stage_priority import StagePriority
+from hyperscale.distributed.health.deadline_resolver import (
+    resolve_worker_deadline_seconds,
+)
 from hyperscale.distributed.models import (
     JobSubmission,
     PendingWorkflow,
@@ -115,11 +118,18 @@ class WorkflowDispatcher:
         self._get_leader_term = get_leader_term
         self._logger = Logger()
 
+        # Phase H2: hold onto env for the deadline resolver. Falls back
+        # to a fresh ``Env()`` so the constructor invariant "self._env
+        # is never None" holds — simplifies all downstream call sites
+        # that need the multiplier.
+        self._env: Env = env if env is not None else Env()
+
         if retry_budget_manager is not None:
             self._retry_budget_manager = retry_budget_manager
         else:
-            config = create_reliability_config_from_env(env or Env())
-            self._retry_budget_manager = RetryBudgetManager(config=config)
+            self._retry_budget_manager = RetryBudgetManager(
+                config=create_reliability_config_from_env(self._env)
+            )
 
         # Pending workflows waiting for dependencies/cores
         # Key: f"{job_id}:{workflow_id}"
@@ -579,12 +589,20 @@ class WorkflowDispatcher:
             pending.dispatch_attempts += 1
             pending.last_dispatch_attempt = time.monotonic()
 
-            # Allocate cores from worker pool
+            # Allocate cores from worker pool. The allocation budget is
+            # capped at 30s regardless of per-job timeout — this is a
+            # backpressure cap, not the workflow execution deadline.
+            # Phase H2: when ``timeout_seconds_explicit`` is False the
+            # wire value is 0 (sentinel); fall back to the 30s cap so
+            # we never end up with a zero-budget allocation that
+            # immediately fails.
+            if submission.timeout_seconds > 0.0:
+                allocator_budget = min(submission.timeout_seconds, 30.0)
+            else:
+                allocator_budget = 30.0
             allocations = await self._worker_pool.allocate_cores(
                 cores_needed,
-                timeout=min(
-                    submission.timeout_seconds, 30.0
-                ),  # Don't wait too long for allocation
+                timeout=allocator_budget,
             )
 
             if not allocations:
@@ -645,6 +663,19 @@ class WorkflowDispatcher:
                     pending.job_id, leader_term
                 )
 
+                # Phase H2: derive the worker-observed deadline via
+                # the canonical override hierarchy (explicit submission
+                # > class-level timeout override > default = duration ×
+                # multiplier). All dispatch paths share this resolver
+                # so deadlines stay consistent across gate, manager,
+                # and timeout-strategy layers.
+                resolved_timeout_seconds = resolve_worker_deadline_seconds(
+                    workflow=pending.workflow,
+                    submission_timeout_seconds=submission.timeout_seconds,
+                    submission_timeout_explicit=submission.timeout_seconds_explicit,
+                    default_multiplier=self._env.HYPERSCALE_DEFAULT_WORKER_TIMEOUT_MULTIPLIER,
+                )
+
                 dispatch = WorkflowDispatch(
                     job_id=pending.job_id,
                     workflow_id=str(sub_token),
@@ -652,7 +683,7 @@ class WorkflowDispatcher:
                     context=context_bytes,
                     vus=worker_vus,
                     cores=worker_cores,
-                    timeout_seconds=submission.timeout_seconds,
+                    timeout_seconds=resolved_timeout_seconds,
                     fence_token=fence_token,
                     context_version=layer_version,
                 )
