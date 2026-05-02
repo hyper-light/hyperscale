@@ -51,6 +51,11 @@ from hyperscale.logging.hyperscale_logging_models import (
 )
 
 from .config import WorkerConfig
+from .extension_trigger import (
+    ExtensionTrigger,
+    ExtensionTriggerConfig,
+)
+from .models import WorkflowRuntimeState
 from .state import WorkerState
 from .registry import WorkerRegistry
 from .execution import WorkerExecutor
@@ -231,6 +236,25 @@ class WorkerServer(HealthAwareServer):
         self._discovery_maintenance_task: asyncio.Task | None = None
         self._overload_poll_task: asyncio.Task | None = None
         self._pending_result_retry_task: asyncio.Task | None = None
+        # Phase H4 — autonomous extension trigger background task
+        self._extension_trigger_task: asyncio.Task | None = None
+        self._extension_trigger: ExtensionTrigger = ExtensionTrigger(
+            active_runtimes_provider=self._iter_active_workflow_runtimes,
+            deadline_provider=self._worker_state.get_workflow_timeout,
+            is_extension_pending=lambda: self._worker_state._extension_requested,
+            request_extension=self.request_extension,
+            config=ExtensionTriggerConfig.from_env_values(
+                poll_interval_str=env.HYPERSCALE_EXTENSION_TRIGGER_INTERVAL,
+                lookahead_fraction=env.HYPERSCALE_EXTENSION_LOOKAHEAD_FRACTION,
+            ),
+        )
+        # Drop trigger bookkeeping for any workflow that finishes via
+        # any path (success / failure / cancel / orphan-eviction).
+        # WorkerState.remove_active_workflow fires every termination,
+        # so registering here covers all of them uniformly.
+        self._worker_state.register_workflow_termination_callback(
+            self._extension_trigger.forget_workflow
+        )
 
         # Debounced cores notification (AD-38 fix: single in-flight task, coalesced updates)
         self._pending_cores_notification: int | None = None
@@ -729,6 +753,21 @@ class WorkerServer(HealthAwareServer):
         )
         self._lifecycle_manager.add_background_task(self._resource_sample_task)
 
+        # Phase H4 — autonomous extension trigger. Scans active
+        # workflows on a heartbeat-aligned cadence and invokes
+        # ``request_extension`` for any workflow approaching its
+        # deadline that has shown forward progress since the last
+        # request. The actual heartbeat piggyback is set on the
+        # WorkerState; the next outbound heartbeat ships it.
+        self._extension_trigger_task = self._create_background_task(
+            self._extension_trigger.run_loop(
+                is_running=lambda: self._running,
+                sleep=asyncio.sleep,
+            ),
+            "extension_trigger",
+        )
+        self._lifecycle_manager.add_background_task(self._extension_trigger_task)
+
     async def _run_pending_result_retry_loop(
         self,
         get_healthy_managers: callable,
@@ -799,6 +838,46 @@ class WorkerServer(HealthAwareServer):
             version=self._state_sync.state_version,
             active_workflows=dict(self._active_workflows),
         )
+
+    def _iter_active_workflow_runtimes(self) -> list[WorkflowRuntimeState]:
+        """Adapt the worker's ``_active_workflows`` dict to the H4
+        ``WorkflowRuntimeState`` shape that ``ExtensionTrigger`` expects.
+
+        Phase H4 needs the multi-dimensional progress counters (cores
+        completed, step transitions, action completion) plus the
+        workflow's start time. ``WorkflowProgress`` (the wire-level
+        message stored in ``_active_workflows``) carries cores and
+        action counts directly; the start time comes from
+        ``WorkerState._workflow_start_times`` (set when the workflow
+        was dispatched). Step transitions default to 0 — the AD-33
+        state-machine wiring lands separately and the trigger's
+        ``any_advanced`` check works as long as cores or actions
+        advance.
+        """
+        runtimes: list[WorkflowRuntimeState] = []
+        for workflow_id, progress in list(self._active_workflows.items()):
+            start_time = self._worker_state._workflow_start_times.get(
+                workflow_id
+            )
+            if not start_time:
+                continue
+            runtimes.append(
+                WorkflowRuntimeState(
+                    workflow_id=workflow_id,
+                    job_id=progress.job_id,
+                    status=progress.status,
+                    allocated_cores=progress.worker_workflow_assigned_cores or 0,
+                    fence_token=self._worker_state._workflow_fence_tokens.get(
+                        workflow_id, -1
+                    ),
+                    start_time=start_time,
+                    cores_completed=progress.cores_completed,
+                    vus=progress.vus,
+                    step_transitions=0,
+                    actions_completed=progress.completed_count,
+                )
+            )
+        return runtimes
 
     def _get_heartbeat(self) -> WorkerHeartbeat:
         """
@@ -1312,6 +1391,10 @@ class WorkerServer(HealthAwareServer):
     def _cleanup_workflow_state(self, workflow_id: str) -> None:
         """Cleanup workflow state on failure."""
         self._worker_state.remove_active_workflow(workflow_id)
+        # Phase H4 — drop the trigger's per-workflow tracker so the
+        # bookkeeping dict doesn't grow unbounded across the worker's
+        # lifetime.
+        self._extension_trigger.forget_workflow(workflow_id)
 
     # =========================================================================
     # Cancellation

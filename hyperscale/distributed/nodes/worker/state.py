@@ -7,7 +7,7 @@ core allocation, backpressure, and metrics.
 
 import asyncio
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 from hyperscale.distributed.models import (
     ManagerInfo,
@@ -82,6 +82,12 @@ class WorkerState:
         self._pending_workflows: list[WorkflowDispatch] = []
         self._workflow_start_times: dict[str, float] = {}
         self._workflow_timeout_seconds: dict[str, float] = {}
+        # Phase H4 — callbacks invoked on every workflow termination
+        # path (success / failure / cancel / orphan-eviction). The
+        # autonomous extension trigger registers here so its
+        # per-workflow bookkeeping is dropped uniformly regardless of
+        # which subsystem terminated the workflow.
+        self._workflow_termination_callbacks: list[Callable[[str], None]] = []
 
         # Progress buffering
         self._progress_buffer: dict[str, WorkflowProgress] = {}
@@ -263,7 +269,31 @@ class WorkerState:
         self._orphaned_workflows.pop(workflow_id, None)
         self._workflow_start_times.pop(workflow_id, None)
         self._workflow_timeout_seconds.pop(workflow_id, None)
+        # Phase H4 — fire registered termination callbacks (e.g. the
+        # autonomous extension trigger's forget_workflow). Catches the
+        # workflow_executor termination path as well as the worker
+        # server's _cleanup_workflow_state path; everyone goes through
+        # remove_active_workflow eventually.
+        for callback in list(self._workflow_termination_callbacks):
+            try:
+                callback(workflow_id)
+            except Exception:
+                # Don't let one callback's failure cascade into others
+                # — per-callback failures are already a downstream
+                # bug; surface them separately.
+                pass
         return progress
+
+    def register_workflow_termination_callback(
+        self, callback: "Callable[[str], None]"
+    ) -> None:
+        """Register a callable invoked with ``workflow_id`` whenever a
+        workflow finishes (any path through ``remove_active_workflow``).
+
+        Phase H4: ``ExtensionTrigger`` registers via this to clean up
+        its per-workflow bookkeeping dict.
+        """
+        self._workflow_termination_callbacks.append(callback)
 
     def get_workflow_job_leader(self, workflow_id: str) -> tuple[str, int] | None:
         """Get job leader address for a workflow."""
@@ -298,6 +328,14 @@ class WorkerState:
         now = time.monotonic()
         self._workflow_start_times[workflow_id] = now
         self._workflow_timeout_seconds[workflow_id] = timeout_seconds
+
+    def get_workflow_timeout(self, workflow_id: str) -> float | None:
+        """Return the per-workflow timeout in seconds, or None if not set.
+
+        Phase H4 — used by ``ExtensionTrigger`` to decide when a
+        workflow is approaching its deadline.
+        """
+        return self._workflow_timeout_seconds.get(workflow_id)
 
     def get_stuck_workflows(self) -> list[tuple[str, float]]:
         """

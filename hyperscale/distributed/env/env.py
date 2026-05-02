@@ -434,6 +434,23 @@ class Env(BaseModel):
     # α-budget allocator splits this across DC → manager → worker →
     # workflow via Benjamini-Hochberg FDR.
     HYPERSCALE_EXTENSION_FPR_BUDGET: StrictFloat = 0.01
+    # Phase H4 — worker autonomous extension trigger. The trigger
+    # background loop checks active workflows at this cadence; for
+    # each workflow whose elapsed time exceeds deadline ×
+    # ``HYPERSCALE_EXTENSION_LOOKAHEAD_FRACTION`` AND has shown
+    # forward progress since the last extension request, it
+    # invokes ``WorkerServer.request_extension`` with a complete
+    # ``WorkflowProgressSnapshot``. Defaults aligned with the
+    # heartbeat cadence so requests piggyback on the next outbound
+    # heartbeat without lag.
+    HYPERSCALE_EXTENSION_TRIGGER_INTERVAL: StrictStr = "5s"
+    # Fraction of the workflow's deadline at which the autonomous
+    # trigger starts requesting extensions. 0.75 = "request when
+    # 75% of the budget is gone." Picked so a typical 60s workflow
+    # asks for its first extension at the 45s mark — comfortably
+    # before the deadline fires but late enough that short
+    # workflows complete normally without ever requesting.
+    HYPERSCALE_EXTENSION_LOOKAHEAD_FRACTION: StrictFloat = 0.75
 
     # ==========================================================================
     # Orphaned Workflow Scanner Settings
@@ -828,6 +845,8 @@ class Env(BaseModel):
             "EXTENSION_EVICTION_THRESHOLD": int,
             "HYPERSCALE_DEFAULT_WORKER_TIMEOUT_MULTIPLIER": float,
             "HYPERSCALE_EXTENSION_FPR_BUDGET": float,
+            "HYPERSCALE_EXTENSION_TRIGGER_INTERVAL": str,
+            "HYPERSCALE_EXTENSION_LOOKAHEAD_FRACTION": float,
             "EXTENSION_EXHAUSTION_WARNING_THRESHOLD": int,
             "EXTENSION_EXHAUSTION_GRACE_PERIOD": float,
             # Orphaned workflow scanner settings
