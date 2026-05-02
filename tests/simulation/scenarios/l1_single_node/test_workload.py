@@ -101,26 +101,6 @@ def _l1_spec() -> ClusterSpec:
 
 @pytest.mark.asyncio
 @pytest.mark.simulation
-@pytest.mark.skip(
-    reason=(
-        "Submit + dispatch path is now end-to-end correct (closing several "
-        "production bugs in this run): leader election started in "
-        "manager.start, _send_workflow_dispatch contract fixed "
-        "(worker_id:str, returns bool), JobManager and WorkflowDispatcher "
-        "share manager_id=node_id.full so TrackingTokens round-trip, "
-        "WorkerHeartbeat carries total_cores so the manager-side health "
-        "monitor stops dropping every heartbeat, and load-shedder/"
-        "send_tcp tuple unpacking are corrected. Test workflows moved to "
-        "hyperscale.distributed.testing.workflows so the production "
-        "RestrictedUnpickler accepts them without a security-relaxing hook "
-        "(packaging excludes *.testing.* from wheels). However the worker "
-        "→ manager workflow_final_result push still does not deliver "
-        "WorkflowResultPush to the client within budget; deeper "
-        "investigation needed in the worker executor and the manager's "
-        "result-forwarding-to-client path. Re-enable once the round-trip "
-        "completes end-to-end at L1."
-    ),
-)
 async def test_l1_workload_submission_pipeline() -> None:
     spec = _l1_spec()
     workload = WorkloadSpec(

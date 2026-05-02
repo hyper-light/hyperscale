@@ -252,6 +252,7 @@ class WorkerServer(HealthAwareServer):
             get_node_id=lambda: self._node_id.full,
             get_worker_state=lambda: self._get_worker_state().value,
             get_available_cores=lambda: self._core_allocator.available_cores,
+            get_total_cores=lambda: self._core_allocator.total_cores,
             get_queue_depth=lambda: len(self._pending_workflows),
             get_cpu_percent=self._get_cpu_percent,
             get_memory_percent=self._get_memory_percent,

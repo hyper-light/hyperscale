@@ -141,6 +141,7 @@ class WorkerStateEmbedder:
     get_node_id: Callable[[], str]
     get_worker_state: Callable[[], str]
     get_available_cores: Callable[[], int]
+    get_total_cores: Callable[[], int]
     get_queue_depth: Callable[[], int]
     get_cpu_percent: Callable[[], float]
     get_memory_percent: Callable[[], float]
@@ -178,6 +179,7 @@ class WorkerStateEmbedder:
             node_id=self.get_node_id(),
             state=self.get_worker_state(),
             available_cores=self.get_available_cores(),
+            total_cores=self.get_total_cores(),
             queue_depth=self.get_queue_depth(),
             cpu_percent=self.get_cpu_percent(),
             memory_percent=self.get_memory_percent(),

@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING
 from hyperscale.distributed.env.env import Env
 from hyperscale.distributed.nodes.client import HyperscaleClient
 
+from tests.simulation.harness.conditions import dc_has_leader, wait_until
 from tests.simulation.harness.errors import HarnessError
 from tests.simulation.harness.expectations import (
     Expectation,
@@ -76,6 +77,25 @@ class WorkloadDriver:
             raise HarnessError(
                 "workload requires at least one routing target "
                 "(gates for L3, managers for L1/L2); cluster has none"
+            )
+        # Submit_job requires a known DC leader. The harness's general
+        # _stabilize wait does NOT gate on leader election because for
+        # multi-manager DCs leadership emerges only after SWIM has fully
+        # converged peer membership — coupling the two would force every
+        # lifecycle test to also wait for election, even those that never
+        # touch the submit path. Instead, gate it here per DC, where
+        # submission actually depends on a leader being known.
+        for dc_id, managers in self.harness._managers_by_dc.items():
+            if not managers:
+                continue
+            await wait_until(
+                dc_has_leader(managers),
+                timeout=30.0,
+                poll=0.5,
+                description=f"DC {dc_id} elects a leader",
+                on_fail=lambda dc=dc_id: self.harness.dump_diagnostics(
+                    reason=f"workload waited for DC {dc} leader; never arrived"
+                ),
             )
         self._client = HyperscaleClient(
             host=self.harness.spec.host,

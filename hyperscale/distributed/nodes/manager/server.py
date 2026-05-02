@@ -57,6 +57,7 @@ from hyperscale.distributed.models import (
     WorkflowProgressAck,
     WorkflowFinalResult,
     WorkflowResult,
+    WorkflowResultPush,
     WorkflowStatus,
     StateSyncRequest,
     StateSyncResponse,
@@ -3632,6 +3633,61 @@ class ManagerServer(HealthAwareServer):
         elif result.error:
             await self._job_manager.mark_workflow_failed(
                 parent_workflow_token, result.error
+            )
+
+        # Push aggregated WorkflowResultPush to the client when no gate is
+        # involved. The model docstring spells out the contract:
+        #   "Sent from Manager to Client (aggregated) or Manager to Gate (raw)"
+        # Without this push, L1/L2 jobs (no gate) silently complete on the
+        # manager and the client's on_workflow_result callback never fires.
+        # Gates handle the cross-DC aggregation case via their own
+        # workflow_result_push handler.
+        await self._push_workflow_result_to_client(result, sub_token)
+
+    async def _push_workflow_result_to_client(
+        self,
+        result: WorkflowFinalResult,
+        sub_token: TrackingToken,
+    ) -> None:
+        callback_addr = self._manager_state.get_job_callback(result.job_id)
+        if not callback_addr:
+            return
+        if isinstance(callback_addr, list):
+            callback_addr = tuple(callback_addr)
+        # ``result.results`` already carries the worker's per-core
+        # WorkflowStats list. For single-DC L1/L2 the aggregation is
+        # the identity; multi-DC aggregation is a gate concern.
+        push = WorkflowResultPush(
+            job_id=result.job_id,
+            workflow_id=sub_token.workflow_id or result.workflow_id,
+            workflow_name=result.workflow_name,
+            datacenter=self._node_id.datacenter,
+            status=result.status,
+            fence_token=self._leases.get_fence_token(result.job_id),
+            results=list(result.results) if result.results else [],
+            error=result.error,
+            elapsed_seconds=0.0,
+            completed_at=time.time(),
+        )
+        try:
+            await self._send_to_client(
+                callback_addr,
+                "workflow_result_push",
+                push.dump(),
+                timeout=5.0,
+            )
+        except Exception as send_error:
+            await self._udp_logger.log(
+                ServerWarning(
+                    message=(
+                        f"Failed to push workflow_result for "
+                        f"{result.job_id}/{result.workflow_name} to client "
+                        f"{callback_addr}: {send_error}"
+                    ),
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
             )
 
     def _is_job_complete(self, job_id: str) -> bool:
