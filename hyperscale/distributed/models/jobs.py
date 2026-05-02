@@ -26,6 +26,7 @@ Examples:
 import asyncio
 import time
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from hyperscale.core.graph.workflow import Workflow
 from hyperscale.core.jobs.workers.stage_priority import StagePriority
@@ -38,6 +39,11 @@ from hyperscale.distributed.models.distributed import (
     WorkflowFinalResult,
     WorkflowStatus,
 )
+
+if TYPE_CHECKING:
+    from hyperscale.distributed.health.workflow_progress_snapshot import (
+        WorkflowProgressSnapshot,
+    )
 
 
 def _create_event() -> asyncio.Event:
@@ -275,6 +281,18 @@ class TimeoutTrackingState:
     max_worker_extension: float = 0.0  # Largest extension granted to any worker
     last_extension_at: float = 0.0  # When last extension was granted
     active_workers_with_extensions: set[str] = field(default_factory=set)
+    # Phase H7 — per-workflow last-known progress snapshot. Replicated
+    # via the AD-48 channel for real-time visibility *and* persisted
+    # here so a leader takeover (AD-34 state-sync path) inherits the
+    # most-recent snapshot without depending on gossip having reached
+    # the new leader yet. Keys are workflow_ids; values are the
+    # H3 ``WorkflowProgressSnapshot`` instances. The dict is bounded
+    # implicitly by the active workflow population — entries are
+    # dropped via ``ExtensionLedger.forget_workflow`` when the
+    # workflow terminates.
+    last_progress_snapshots: dict[str, "WorkflowProgressSnapshot"] = field(
+        default_factory=dict
+    )
 
     # State flags (idempotency)
     locally_timed_out: bool = False  # Manager reported/detected timeout

@@ -20,6 +20,11 @@ from hyperscale.distributed.health.extension_decision import (
     ExtensionDecisionEvaluator,
     ExtensionDenialCode,
 )
+from hyperscale.distributed.health.extension_ledger import (
+    ExtensionDecisionEvent,
+    ExtensionLedger,
+    ExtensionLedgerConfig,
+)
 from hyperscale.distributed.health.extension_tracker import (
     ExtensionTracker,
     ExtensionTrackerConfig,
@@ -132,6 +137,12 @@ class WorkerHealthManager:
             else None
         )
 
+        # Phase H7 — local authoritative ledger of every extension
+        # decision made on this manager. Always present (even on
+        # the legacy single-witness path) so observability /
+        # cross-DC correlation tooling can query consistently.
+        self._ledger: ExtensionLedger = ExtensionLedger(ExtensionLedgerConfig())
+
     def _get_tracker(self, worker_id: str) -> ExtensionTracker:
         """Get or create an ExtensionTracker for a worker."""
         if worker_id not in self._trackers:
@@ -219,7 +230,14 @@ class WorkerHealthManager:
         active_in_dc: int,
         active_on_manager: int,
         active_on_worker: int,
-    ) -> tuple[HealthcheckExtensionResponse, ExtensionDecision]:
+        job_id: str = "",
+        fence_token: int = 0,
+        leader_term: int = 0,
+    ) -> tuple[
+        HealthcheckExtensionResponse,
+        ExtensionDecision,
+        ExtensionDecisionEvent,
+    ]:
         """Phase H5 multi-witness path.
 
         Runs the full ``ExtensionDecisionEvaluator`` over all five
@@ -274,7 +292,15 @@ class WorkerHealthManager:
                 evidence=evidence,
                 is_exhaustion_warning=response.is_exhaustion_warning,
             )
-            return response, decision
+            event = self._record_decision_event(
+                job_id=job_id,
+                worker_id=request.worker_id,
+                decision=decision,
+                snapshot=snapshot,
+                fence_token=fence_token,
+                leader_term=leader_term,
+            )
+            return response, decision, event
 
         tracker = self._get_tracker(request.worker_id)
         decision = self._decision_evaluator.decide(
@@ -326,7 +352,85 @@ class WorkerHealthManager:
                 in_grace_period=tracker.is_in_grace_period,
                 denial_reason_code=decision.denial_reason_code.value,
             )
-        return response, decision
+
+        event = self._record_decision_event(
+            job_id=job_id,
+            worker_id=request.worker_id,
+            decision=decision,
+            snapshot=snapshot,
+            fence_token=fence_token,
+            leader_term=leader_term,
+        )
+        return response, decision, event
+
+    def _record_decision_event(
+        self,
+        *,
+        job_id: str,
+        worker_id: str,
+        decision: ExtensionDecision,
+        snapshot: WorkflowProgressSnapshot,
+        fence_token: int,
+        leader_term: int,
+    ) -> ExtensionDecisionEvent:
+        """Build the ledger event, persist it, and return it for
+        downstream H7b dissemination.
+
+        Cumulative-extended bookkeeping pulls the previous total from
+        the ledger (defaults to 0 on first decision) so a denial
+        carries the running sum forward unchanged and a grant
+        increases it by ``decision.extension_seconds``. This way the
+        event self-describes the post-decision state without the
+        ledger needing a second-pass mutation.
+        """
+        prior_entry = self._ledger.get_workflow_entry(snapshot.workflow_id)
+        prior_cumulative = (
+            prior_entry.cumulative_extended if prior_entry is not None else 0.0
+        )
+        post_cumulative = (
+            prior_cumulative + decision.extension_seconds
+            if decision.granted
+            else prior_cumulative
+        )
+        event = ExtensionDecisionEvent.from_decision(
+            job_id=job_id,
+            workflow_id=snapshot.workflow_id,
+            worker_id=worker_id,
+            decision=decision,
+            cumulative_extended=post_cumulative,
+            progress_snapshot=snapshot,
+            fence_token=fence_token,
+            timestamp=time.monotonic(),
+            leader_term=leader_term,
+        )
+        self._ledger.record(event)
+        return event
+
+    @property
+    def ledger(self) -> ExtensionLedger:
+        """Read-only access to the H7 extension decision ledger."""
+        return self._ledger
+
+    def ingest_remote_decision_event(
+        self, event: ExtensionDecisionEvent
+    ) -> None:
+        """Apply an ``ExtensionDecisionEvent`` received from a peer
+        manager via AD-48 dissemination.
+
+        The ledger is the source of truth, and ``record`` itself is
+        idempotent + stale-term-rejecting, so this is just a thin
+        forwarder that exists so callers don't reach into ``_ledger``
+        directly.
+        """
+        self._ledger.record(event)
+
+    def forget_workflow(self, workflow_id: str) -> None:
+        """Drop H7 ledger state for a terminated workflow."""
+        self._ledger.forget_workflow(workflow_id)
+
+    def forget_job(self, job_id: str) -> None:
+        """Cascade-drop H7 ledger state for a terminated job."""
+        self._ledger.forget_job(job_id)
 
     @property
     def throughput_witness(self) -> ThroughputWitness | None:
@@ -365,6 +469,11 @@ class WorkerHealthManager:
         """
         self._trackers.pop(worker_id, None)
         self._extension_failures.pop(worker_id, None)
+        # Phase H7 — cascade-evict the ledger so a reaped worker's
+        # workflow entries don't leak. This is also the path that
+        # closes the H8 outcome-feedback loop: every workflow owned
+        # by the worker is implicitly resolved as "worker_lost".
+        self._ledger.forget_worker(worker_id)
 
     def should_evict_worker(self, worker_id: str) -> tuple[bool, str | None]:
         """
