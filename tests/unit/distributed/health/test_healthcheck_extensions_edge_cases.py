@@ -37,8 +37,8 @@ from hyperscale.distributed.models import (
 class TestLogarithmicDecay:
     """Tests for extension grant logarithmic decay."""
 
-    def test_first_extension_is_half_base(self):
-        """First extension grants base_deadline / 2."""
+    def test_first_extension_grants_full_base(self):
+        """First extension grants the full base_deadline (AD-26 line 32: count=0 -> base/2^0 = base)."""
         tracker = ExtensionTracker(
             worker_id="worker-1",
             base_deadline=30.0,
@@ -52,11 +52,11 @@ class TestLogarithmicDecay:
         )
 
         assert granted
-        assert extension_seconds == 15.0  # 30 / 2
+        assert extension_seconds == 30.0  # 30 / 2^0 = 30
         assert denial_reason is None
 
-    def test_second_extension_is_quarter_base(self):
-        """Second extension grants base_deadline / 4."""
+    def test_second_extension_is_half_base(self):
+        """Second extension grants base_deadline / 2 (AD-26 line 32: count=1 -> base/2)."""
         tracker = ExtensionTracker(
             worker_id="worker-1",
             base_deadline=30.0,
@@ -74,10 +74,10 @@ class TestLogarithmicDecay:
         )
 
         assert granted
-        assert extension_seconds == 7.5  # 30 / 4
+        assert extension_seconds == 15.0  # 30 / 2
 
     def test_full_decay_sequence(self):
-        """Test complete decay sequence until min_grant."""
+        """Test complete decay sequence until min_grant per AD-26 line 32."""
         tracker = ExtensionTracker(
             worker_id="worker-1",
             base_deadline=32.0,  # Powers of 2 for clean math
@@ -86,12 +86,13 @@ class TestLogarithmicDecay:
         )
 
         expected_grants = [
-            16.0,  # 32 / 2^1
-            8.0,  # 32 / 2^2
-            4.0,  # 32 / 2^3
-            2.0,  # 32 / 2^4
-            1.0,  # 32 / 2^5 = 1.0 (at min_grant)
-            1.0,  # Would be 0.5, but min_grant is 1.0
+            32.0,  # count=0: 32/1 = 32 (full base)
+            16.0,  # count=1: 32/2 = 16
+            8.0,   # count=2: 32/4 = 8
+            4.0,   # count=3: 32/8 = 4
+            2.0,   # count=4: 32/16 = 2
+            1.0,   # count=5: 32/32 = 1 (at min_grant)
+            1.0,   # count=6: would be 0.5, floored to min_grant
         ]
 
         for index, expected in enumerate(expected_grants):
@@ -111,20 +112,20 @@ class TestLogarithmicDecay:
             max_extensions=10,
         )
 
-        # First: 4/2 = 2.0
+        # 1st (count=0): 4/1 = 4.0
         _, grant_1, _, _ = tracker.request_extension(reason="1", current_progress=1.0)
-        assert grant_1 == 2.0
+        assert grant_1 == 4.0
 
-        # Second: 4/4 = 1.0, but min_grant is 2.0
+        # 2nd (count=1): 4/2 = 2.0 (at min_grant)
         _, grant_2, _, _ = tracker.request_extension(reason="2", current_progress=2.0)
-        assert grant_2 == 2.0  # Floored to min_grant
+        assert grant_2 == 2.0
 
-        # Third: 4/8 = 0.5, but min_grant is 2.0
+        # 3rd (count=2): 4/4 = 1.0, but min_grant is 2.0
         _, grant_3, _, _ = tracker.request_extension(reason="3", current_progress=3.0)
         assert grant_3 == 2.0  # Floored to min_grant
 
     def test_very_small_base_deadline(self):
-        """Very small base_deadline immediately hits min_grant."""
+        """Very small base_deadline starts at full base, then floors at min_grant."""
         tracker = ExtensionTracker(
             worker_id="worker-1",
             base_deadline=0.5,
@@ -132,7 +133,7 @@ class TestLogarithmicDecay:
             max_extensions=5,
         )
 
-        # 0.5 / 2 = 0.25, but min_grant is 1.0
+        # 1st (count=0): 0.5 / 1 = 0.5, but min_grant is 1.0
         granted, extension_seconds, _, _ = tracker.request_extension(
             reason="small deadline",
             current_progress=1.0,
@@ -142,7 +143,7 @@ class TestLogarithmicDecay:
         assert extension_seconds == 1.0  # min_grant
 
     def test_large_base_deadline(self):
-        """Large base_deadline decays correctly."""
+        """Large base_deadline grants the full base on first request."""
         tracker = ExtensionTracker(
             worker_id="worker-1",
             base_deadline=3600.0,  # 1 hour
@@ -150,7 +151,8 @@ class TestLogarithmicDecay:
             max_extensions=10,
         )
 
-        expected = 1800.0  # 3600 / 2
+        # 1st (count=0): 3600 / 1 = 3600
+        expected = 3600.0
         granted, extension_seconds, _, _ = tracker.request_extension(
             reason="very long workflow",
             current_progress=1.0,
@@ -490,7 +492,7 @@ class TestStateReset:
         )
 
         assert granted
-        assert extension_seconds == 15.0  # First extension = base / 2
+        assert extension_seconds == 30.0  # First extension grants full base (AD-26 line 32)
         assert not tracker.is_exhausted
 
     def test_reset_clears_total_extended(self):

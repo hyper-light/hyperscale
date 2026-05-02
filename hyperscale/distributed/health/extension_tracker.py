@@ -21,11 +21,15 @@ class ExtensionTracker:
     """
     Tracks deadline extension requests for a single worker.
 
-    Implements logarithmic decay for extension grants:
-    - First extension: base_deadline / 2 = 15s (with base=30s)
-    - Second extension: base_deadline / 4 = 7.5s
-    - Third extension: base_deadline / 8 = 3.75s
-    - ...continues until min_grant is reached
+    Implements logarithmic decay for extension grants per AD-26
+    line 32 (``grant = base / 2^extension_count`` where
+    ``extension_count`` is the count *before* this grant):
+    - 1st extension (count=0): base_deadline / 1 = 30s (with base=30s)
+    - 2nd extension (count=1): base_deadline / 2 = 15s
+    - 3rd extension (count=2): base_deadline / 4 = 7.5s
+    - 4th extension (count=3): base_deadline / 8 = 3.75s
+    - 5th extension (count=4): floored to min_grant (1.875s -> 1.0s)
+    - cumulative ≈ 57.25s for base=30s, min=1s
 
     Extensions require progress since the last extension to be granted.
     This prevents stuck workers from getting unlimited extensions.
@@ -87,8 +91,19 @@ class ExtensionTracker:
         relative progress (current_progress) when available. This avoids
         float precision issues with values close to 1.0.
 
-        The extension amount uses logarithmic decay:
-        grant = max(min_grant, base_deadline / 2^(extension_count + 1))
+        The extension amount uses logarithmic decay (AD-26 line 32, with
+        the extension count starting at 0 *before* this grant is applied):
+
+            grant = max(min_grant, base_deadline / 2 ** extension_count)
+
+        For ``base_deadline = 30s``:
+            1st extension (count=0): 30 / 2^0 = 30s
+            2nd extension (count=1): 30 / 2^1 = 15s
+            3rd extension (count=2): 30 / 2^2 = 7.5s
+            4th extension (count=3): 30 / 2^3 = 3.75s
+            5th extension (count=4): 30 / 2^4 = 1.875s -> floored to min_grant=1.0s
+
+        Cumulative ≈ 57.25s (geometric series, AD-26 line 220-228).
 
         Args:
             reason: Reason for requesting extension (for logging).
@@ -137,9 +152,13 @@ class ExtensionTracker:
                     False,
                 )
 
-        # Calculate extension grant with logarithmic decay
-        # grant = base / 2^(n+1) where n = extension_count
-        divisor = 2 ** (self.extension_count + 1)
+        # Calculate extension grant with logarithmic decay per AD-26
+        # line 32: grant = max(min_grant, base / 2^extension_count)
+        # where extension_count is the *pre-grant* count (n = 0 for the
+        # first extension yields a full base_deadline grant). Earlier
+        # versions used 2^(n+1) which silently halved every grant
+        # against the AD spec; cumulative was ~29s instead of ~58s.
+        divisor = 2 ** self.extension_count
         grant = max(self.min_grant, self.base_deadline / divisor)
 
         # Update state

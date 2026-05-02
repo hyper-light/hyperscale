@@ -43,8 +43,8 @@ class TestExtensionTracker:
         assert tracker.total_extended == 0.0
         assert not tracker.is_exhausted
 
-    def test_first_extension_grants_half_base(self):
-        """First extension should grant base/2 seconds."""
+    def test_first_extension_grants_full_base(self):
+        """First extension should grant the full base_deadline (AD-26 line 32: count=0 -> base/2^0 = base)."""
         tracker = ExtensionTracker(
             worker_id="worker-1",
             base_deadline=30.0,
@@ -56,40 +56,50 @@ class TestExtensionTracker:
         )
 
         assert granted is True
-        assert seconds == 15.0  # 30 / 2^1 = 15
+        assert seconds == 30.0  # 30 / 2^0 = 30
         assert reason is None
         assert tracker.extension_count == 1
 
     def test_logarithmic_decay(self):
-        """Extensions should follow logarithmic decay: base / 2^n."""
+        """Extensions follow AD-26 line 32 logarithmic decay: grant = base / 2^extension_count.
+
+        ``extension_count`` is the count *before* this grant — so the
+        1st grant uses count=0 and gives the full base.
+        """
         tracker = ExtensionTracker(
             worker_id="worker-1",
             base_deadline=32.0,  # Powers of 2 for easy math
             min_grant=1.0,
+            max_extensions=6,
         )
 
-        # First extension: 32/2 = 16
+        # 1st extension (count=0): 32/1 = 32
         granted, seconds, _, _ = tracker.request_extension("busy", 1.0)
+        assert granted is True
+        assert seconds == 32.0
+
+        # 2nd extension (count=1): 32/2 = 16
+        granted, seconds, _, _ = tracker.request_extension("busy", 2.0)
         assert granted is True
         assert seconds == 16.0
 
-        # Second extension: 32/4 = 8
-        granted, seconds, _, _ = tracker.request_extension("busy", 2.0)
+        # 3rd extension (count=2): 32/4 = 8
+        granted, seconds, _, _ = tracker.request_extension("busy", 3.0)
         assert granted is True
         assert seconds == 8.0
 
-        # Third extension: 32/8 = 4
-        granted, seconds, _, _ = tracker.request_extension("busy", 3.0)
+        # 4th extension (count=3): 32/8 = 4
+        granted, seconds, _, _ = tracker.request_extension("busy", 4.0)
         assert granted is True
         assert seconds == 4.0
 
-        # Fourth extension: 32/16 = 2
-        granted, seconds, _, _ = tracker.request_extension("busy", 4.0)
+        # 5th extension (count=4): 32/16 = 2
+        granted, seconds, _, _ = tracker.request_extension("busy", 5.0)
         assert granted is True
         assert seconds == 2.0
 
-        # Fifth extension: 32/32 = 1 (min_grant)
-        granted, seconds, _, _ = tracker.request_extension("busy", 5.0)
+        # 6th extension (count=5): 32/32 = 1 (at min_grant)
+        granted, seconds, _, _ = tracker.request_extension("busy", 6.0)
         assert granted is True
         assert seconds == 1.0
 
@@ -310,14 +320,15 @@ class TestWorkerHealthManager:
 
         deadline = time.monotonic() + 30.0
 
-        # Both should get full first extension (15s with default base=30)
+        # Both should get full first extension (30s with default base=30
+        # per AD-26 line 32: count=0 -> base/2^0 = base)
         response1 = manager.handle_extension_request(request1, deadline)
         response2 = manager.handle_extension_request(request2, deadline)
 
         assert response1.granted is True
         assert response2.granted is True
-        assert response1.extension_seconds == 15.0
-        assert response2.extension_seconds == 15.0
+        assert response1.extension_seconds == 30.0
+        assert response2.extension_seconds == 30.0
 
     def test_manager_resets_on_healthy(self):
         """Manager should reset tracker when worker becomes healthy."""

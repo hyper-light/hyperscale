@@ -1197,10 +1197,13 @@ class HealthcheckExtensionRequest(Message):
     - System is under heavy load but making progress
     - Approaching timeout but not stuck
 
-    Extensions use logarithmic decay:
-    - First extension: base/2 (e.g., 15s with base=30s)
-    - Second extension: base/4 (e.g., 7.5s)
-    - Continues until min_grant is reached
+    Extensions use logarithmic decay (AD-26 line 32):
+        grant = max(min_grant, base_deadline / 2 ** extension_count)
+    where ``extension_count`` is the count *before* this grant.
+    - First extension (count=0):  base   (e.g., 30s with base=30s)
+    - Second extension (count=1): base/2 (e.g., 15s)
+    - Third extension (count=2):  base/4 (e.g., 7.5s)
+    - ...continues until min_grant is reached.
 
     Sent from: Worker -> Manager
 

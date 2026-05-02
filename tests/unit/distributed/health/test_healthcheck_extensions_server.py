@@ -207,8 +207,8 @@ class SimulatedManager:
 class TestExtensionTrackerBasics:
     """Test basic ExtensionTracker functionality."""
 
-    def test_first_extension_is_base_divided_by_2(self) -> None:
-        """Test that first extension is base_deadline / 2."""
+    def test_first_extension_grants_full_base(self) -> None:
+        """First extension grants full base_deadline per AD-26 line 32 (count=0 -> base/2^0)."""
         tracker = ExtensionTracker(
             worker_id="worker-1",
             base_deadline=30.0,
@@ -222,11 +222,11 @@ class TestExtensionTrackerBasics:
         )
 
         assert granted is True
-        assert seconds == 15.0  # 30 / 2
+        assert seconds == 30.0  # 30 / 2^0 = 30
         assert reason is None
 
     def test_logarithmic_decay(self) -> None:
-        """Test that extensions follow logarithmic decay."""
+        """Extensions follow AD-26 line 32: grant = base / 2^extension_count."""
         tracker = ExtensionTracker(
             worker_id="worker-1",
             base_deadline=32.0,  # Nice power of 2 for easy math
@@ -235,12 +235,13 @@ class TestExtensionTrackerBasics:
         )
 
         expected_grants = [
-            16.0,  # 32 / 2^1
-            8.0,   # 32 / 2^2
-            4.0,   # 32 / 2^3
-            2.0,   # 32 / 2^4
-            1.0,   # 32 / 2^5 = 1.0 (min_grant)
-            1.0,   # Would be 0.5 but clamped to min_grant
+            32.0,  # count=0: 32/1 = 32 (full base)
+            16.0,  # count=1: 32/2 = 16
+            8.0,   # count=2: 32/4 = 8
+            4.0,   # count=3: 32/8 = 4
+            2.0,   # count=4: 32/16 = 2
+            1.0,   # count=5: 32/32 = 1 (at min_grant)
+            1.0,   # count=6: would be 0.5, floored to min_grant
         ]
 
         progress = 0.1
@@ -472,7 +473,7 @@ class TestServerExtensionFlow:
         worker.record_response(response)
 
         assert response.granted is True
-        assert response.extension_seconds == 15.0  # default base=30, so 30/2
+        assert response.extension_seconds == 30.0  # default base=30, count=0 -> base/2^0 = 30
         assert worker.deadline == response.new_deadline
 
     @pytest.mark.asyncio
@@ -542,8 +543,8 @@ class TestServerExtensionFlow:
         response = await manager.handle_extension_request(worker, request)
 
         assert response.granted is True
-        # Should be back to first extension (15s)
-        assert response.extension_seconds == 15.0
+        # Should be back to first extension (full base = 30s per AD-26 line 32)
+        assert response.extension_seconds == 30.0
 
 
 class TestConcurrentExtensionRequests:
