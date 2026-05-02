@@ -19,7 +19,7 @@ from hyperscale.distributed.models import (
     ManagerHeartbeat,
 )
 from hyperscale.distributed.routing import DatacenterCandidate
-from hyperscale.distributed.health import ManagerHealthState
+from hyperscale.distributed.health import ManagerHealthConfig, ManagerHealthState
 from hyperscale.distributed.datacenters import (
     DatacenterHealthManager,
     CrossDCCorrelationDetector,
@@ -68,7 +68,7 @@ class GateHealthCoordinator:
         dc_manager_discovery: dict[str, DiscoveryService],
         versioned_clock: "VersionedStateClock",
         manager_dispatcher: "ManagerDispatcher",
-        manager_health_config: dict,
+        manager_health_config: "ManagerHealthConfig",
         get_node_id: Callable[[], "NodeId"],
         get_host: Callable[[], str],
         get_tcp_port: Callable[[], int],
@@ -86,7 +86,7 @@ class GateHealthCoordinator:
         self._dc_manager_discovery: dict[str, DiscoveryService] = dc_manager_discovery
         self._versioned_clock: "VersionedStateClock" = versioned_clock
         self._manager_dispatcher: "ManagerDispatcher" = manager_dispatcher
-        self._manager_health_config: dict = manager_health_config
+        self._manager_health_config: "ManagerHealthConfig" = manager_health_config
         self._get_node_id: Callable[[], "NodeId"] = get_node_id
         self._get_host: Callable[[], str] = get_host
         self._get_tcp_port: Callable[[], int] = get_tcp_port

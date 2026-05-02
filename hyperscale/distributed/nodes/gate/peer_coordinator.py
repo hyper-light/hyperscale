@@ -17,7 +17,7 @@ from hyperscale.distributed.models import (
     GateHeartbeat,
     GateInfo,
 )
-from hyperscale.distributed.health import GateHealthState
+from hyperscale.distributed.health import GateHealthConfig, GateHealthState
 from hyperscale.distributed.discovery import DiscoveryService
 from hyperscale.logging import Logger
 from hyperscale.logging.hyperscale_logging_models import (
@@ -59,7 +59,7 @@ class GatePeerCoordinator:
         job_forwarding_tracker: "JobForwardingTracker",
         job_leadership_tracker: "JobLeadershipTracker",
         versioned_clock: "VersionedStateClock",
-        gate_health_config: dict,
+        gate_health_config: "GateHealthConfig",
         recovery_semaphore: asyncio.Semaphore,
         recovery_jitter_min: float,
         recovery_jitter_max: float,
@@ -104,7 +104,7 @@ class GatePeerCoordinator:
         self._job_forwarding_tracker: "JobForwardingTracker" = job_forwarding_tracker
         self._job_leadership_tracker: "JobLeadershipTracker" = job_leadership_tracker
         self._versioned_clock: "VersionedStateClock" = versioned_clock
-        self._gate_health_config: dict = gate_health_config
+        self._gate_health_config: "GateHealthConfig" = gate_health_config
         self._recovery_semaphore: asyncio.Semaphore = recovery_semaphore
         self._recovery_jitter_min: float = recovery_jitter_min
         self._recovery_jitter_max: float = recovery_jitter_max
