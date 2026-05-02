@@ -475,7 +475,7 @@ class WorkerServer(HealthAwareServer):
 
             self._workflow_executor.set_event_logger(self._event_logger)
         
-        await self.start_server()
+        await self.start_server(init_context=self.env.get_swim_init_context())
 
         # Update node capabilities
         self._node_capabilities = self._lifecycle_manager.get_node_capabilities(

@@ -8,6 +8,7 @@ All business logic is delegated to specialized coordinators.
 import asyncio
 import random
 import time
+import traceback
 import cloudpickle
 from pathlib import Path
 
@@ -1887,7 +1888,7 @@ class ManagerServer(HealthAwareServer):
 
                 for worker_id, worker in self._manager_state.iter_workers():
                     try:
-                        worker_addr = (worker.node.host, worker.node.tcp_port)
+                        worker_addr = (worker.node.host, worker.node.port)
                         await self._scan_worker_for_orphans(worker_id, worker_addr)
 
                     except Exception as worker_error:
@@ -1920,11 +1921,7 @@ class ManagerServer(HealthAwareServer):
                     self._config.job_responsiveness_check_interval_seconds
                 )
 
-                # `check_job_suspicion_expiry` is async; awaiting it changes
-                # job-responsiveness behavior in ways the surrounding loop
-                # currently depends on. Tracked separately. (Same pattern as
-                # `_rate_limiter.check` — see simulation_framework.md §18.)
-                expired = self._health_monitor.check_job_suspicion_expiry()
+                expired = await self._health_monitor.check_job_suspicion_expiry()
 
                 for job_id, worker_id in expired:
                     self._on_worker_dead_for_job(job_id, worker_id)
@@ -2892,12 +2889,18 @@ class ManagerServer(HealthAwareServer):
             node_id=self._node_id.full,
             datacenter=self._node_id.datacenter,
             is_leader=self.is_leader(),
+            term=self._leader_election.state.current_term,
+            version=self._manager_state.state_version,
+            active_jobs=self._job_manager.job_count,
+            active_workflows=sum(
+                len(getattr(job, "workflows", {}) or {})
+                for job in self._job_manager.iter_jobs()
+            ),
             state=self._manager_state.manager_state_enum.value,
             worker_count=self._manager_state.get_worker_count(),
             healthy_worker_count=len(self._registry.get_healthy_worker_ids()),
             available_cores=self._get_available_cores_for_healthy_workers(),
             total_cores=self._get_total_cores(),
-            active_jobs=self._job_manager.job_count,
             tcp_host=self._host,
             tcp_port=self._tcp_port,
             udp_host=self._host,
@@ -3323,12 +3326,7 @@ class ManagerServer(HealthAwareServer):
             self._registry.register_worker(registration)
 
             # Add to worker pool
-            self._worker_pool.register_worker(
-                worker_id=registration.node.node_id,
-                total_cores=registration.total_cores,
-                available_cores=registration.available_cores,
-                tcp_addr=(registration.node.host, registration.node.port),
-            )
+            await self._worker_pool.register_worker(registration)
 
             # Add to SWIM
             worker_udp_addr = (registration.node.host, registration.node.udp_port)
@@ -3367,9 +3365,38 @@ class ManagerServer(HealthAwareServer):
             return response.dump()
 
         except Exception as error:
+            # Log the failure with traceback so we can diagnose what's
+            # actually breaking. Silently returning an error response
+            # makes registration failures invisible — the worker just
+            # sees `accepted=False` with an opaque `error` string.
+            await self._udp_logger.log(
+                ServerError(
+                    message=(
+                        f"worker_register failed: "
+                        f"{type(error).__name__}: {error}\n"
+                        + "".join(traceback.format_exception(error))
+                    ),
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            healthy_managers = self._manager_state.get_active_known_manager_peers()
+            healthy_managers.append(
+                ManagerInfo(
+                    node_id=self._node_id.full,
+                    tcp_host=self._host,
+                    tcp_port=self._tcp_port,
+                    udp_host=self._host,
+                    udp_port=self._udp_port,
+                    datacenter=self._node_id.datacenter,
+                    is_leader=self.is_leader(),
+                )
+            )
             return RegistrationResponse(
                 accepted=False,
                 manager_id=self._node_id.full,
+                healthy_managers=healthy_managers,
                 error=str(error),
             ).dump()
 

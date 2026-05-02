@@ -3453,7 +3453,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                 # Rate limited - return current incarnation without incrementing
                 return self._incarnation_tracker.get_self_incarnation()
 
-        new_incarnation = self.increment_incarnation()
+        new_incarnation = await self.increment_incarnation()
 
         self_addr = self._get_self_udp_addr()
 
@@ -3786,22 +3786,15 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                 # Duplicate - still send ack but don't process
                 return b"ack>" + self._udp_addr_slug
 
-            # Extract health gossip piggyback first (format: #|hentry1;entry2;...)
-            health_piggyback_idx = data.find(self._HEALTH_SEPARATOR)
-            if health_piggyback_idx > 0:
-                health_piggyback_data = data[health_piggyback_idx:]
-                data = data[:health_piggyback_idx]
-                self._health_gossip_buffer.decode_and_process_piggyback(
-                    health_piggyback_data
-                )
-
-            # Extract membership piggyback (format: #|mtype:incarnation:host:port...)
-            piggyback_idx = data.find(self._MEMBERSHIP_SEPARATOR)
-            if piggyback_idx > 0:
-                main_data = data[:piggyback_idx]
-                piggyback_data = data[piggyback_idx:]
-                await self.process_piggyback_data(piggyback_data)
-                data = main_data
+            # Strip ALL piggyback (vivaldi/worker_state/health/membership)
+            # and any embedded #|s state, mirroring the layout produced by
+            # _add_piggyback_safe on send. The previous code only stripped
+            # #|h and #|m, leaving #|v (vivaldi) and #|w (worker state)
+            # glued onto the target_addr portion of `probe>host:port`.
+            # The parser then decoded `host:port#|v{...}` as the address,
+            # int() failed on the port, target became None, and every
+            # probe was rejected as `Missing target address`.
+            data = await self._extract_embedded_state(data, addr)
 
             # Delegate to the message dispatcher for handler-based processing
             return await self._message_dispatcher.dispatch(addr, data, clock_time)

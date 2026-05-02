@@ -56,7 +56,7 @@ class ManagerRegistry:
         worker_id = registration.node.node_id
         self._state._workers[worker_id] = registration
 
-        tcp_addr = (registration.node.host, registration.node.tcp_port)
+        tcp_addr = (registration.node.host, registration.node.port)
         udp_addr = (registration.node.host, registration.node.udp_port)
         self._state._worker_addr_to_id[tcp_addr] = worker_id
         self._state._worker_addr_to_id[udp_addr] = worker_id
@@ -72,7 +72,7 @@ class ManagerRegistry:
         self._task_runner.run(
             self._logger.log,
             ServerInfo(
-                message=f"Worker {worker_id[:8]}... registered with {registration.node.total_cores} cores",
+                message=f"Worker {worker_id[:8]}... registered with {registration.total_cores} cores",
                 node_host=self._config.host,
                 node_port=self._config.tcp_port,
                 node_id=self._node_id,
@@ -88,7 +88,7 @@ class ManagerRegistry:
         """
         registration = self._state._workers.pop(worker_id, None)
         if registration:
-            tcp_addr = (registration.node.host, registration.node.tcp_port)
+            tcp_addr = (registration.node.host, registration.node.port)
             udp_addr = (registration.node.host, registration.node.udp_port)
             self._state._worker_addr_to_id.pop(tcp_addr, None)
             self._state._worker_addr_to_id.pop(udp_addr, None)
@@ -198,7 +198,7 @@ class ManagerRegistry:
                 continue
 
             # Skip workers without capacity
-            if worker.node.total_cores < cores_required:
+            if worker.total_cores < cores_required:
                 continue
 
             health_state = self.get_worker_health_state(worker_id)
@@ -214,7 +214,7 @@ class ManagerRegistry:
         # Sort each bucket by capacity (total_cores descending)
         for bucket_name in buckets:
             buckets[bucket_name].sort(
-                key=lambda w: w.node.total_cores,
+                key=lambda w: w.total_cores,
                 reverse=True,
             )
 

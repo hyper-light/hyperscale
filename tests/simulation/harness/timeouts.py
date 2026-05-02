@@ -33,3 +33,33 @@ class HarnessTimeouts:
 
     invariant_poll_interval: float = 0.1
     """Interval between continuous-invariant checks (Phase 2+)."""
+
+    quiescence_poll_interval: float = 0.05
+    """How often the supervisor checks for asyncio task quiescence during
+    shutdown. Small enough that a healthy system settles in tens of ms."""
+
+    quiescence_stable_ticks: int = 3
+    """Number of consecutive polls during which the count of harness-
+    spawned tasks must NOT increase before declaring quiescence. Three
+    ticks at 50 ms = 150 ms of "no new work being scheduled." This
+    distinguishes "tasks still wrapping up after stop()" from
+    "system is making forward progress and we have not actually
+    quiesced yet."""
+
+    quiescence_max_seconds: float = 30.0
+    """Hard ceiling on the quiescence wait. The expected path is
+    convergence in tens to low hundreds of ms; if we hit this, the
+    cluster is genuinely refusing to settle and the surviving tasks
+    will surface as leaks in the subsequent force-cancel phase."""
+
+    force_cancel_settle_seconds: float = 3.0
+    """Total budget for the persistent-cancel loop in
+    ``Supervisor._force_cancel_survivors``. The loop re-cancels and
+    waits in rounds until tasks either exit or the budget is gone."""
+
+    force_cancel_round_seconds: float = 0.25
+    """Per-round wait inside ``_force_cancel_survivors``. After each
+    round, surviving tasks get cancelled again — this defeats the
+    'while self._running: except CancelledError: pass' pattern that
+    swallows the first cancel. Several short rounds beat one long
+    wait because each round forces a fresh re-cancel."""

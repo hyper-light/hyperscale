@@ -86,16 +86,6 @@ async def test_l3_framework_structure() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.simulation
-@pytest.mark.skip(
-    reason=(
-        "Same production task-cleanup gaps as L2 (see L2 lifecycle skip "
-        "reason). Adds 3 gates on top — same SWIM/timing-wheel/cleanup "
-        "leaks plus gate-side variants. Re-enable once shutdown "
-        "propagation is consistent across HealthAwareServer, "
-        "MercurySyncBaseServer, TaskRunner internals, and per-node bg "
-        "loops."
-    ),
-)
 async def test_l3_cluster_lifecycle() -> None:
     """Full L3 stand-up + gate-cluster formation + tear-down.
 

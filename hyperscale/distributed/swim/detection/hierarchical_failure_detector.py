@@ -233,9 +233,15 @@ class HierarchicalFailureDetector:
             except asyncio.CancelledError:
                 pass
 
-        for task in list(self._pending_clear_tasks):
-            if not task.done():
-                task.cancel()
+        # Cancel-and-await every pending clear task in parallel; merely
+        # cancelling them leaves them alive in asyncio.all_tasks() when the
+        # caller (e.g. simulation harness leak detector) inspects right
+        # after stop().
+        pending_clear = [t for t in self._pending_clear_tasks if not t.done()]
+        for task in pending_clear:
+            task.cancel()
+        if pending_clear:
+            await asyncio.gather(*pending_clear, return_exceptions=True)
         self._pending_clear_tasks.clear()
 
         await self._global_wheel.stop()

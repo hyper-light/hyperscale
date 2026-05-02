@@ -94,10 +94,19 @@ async def wait_until(
 def manager_has_n_peers(
     handle: ServerHandle, expected_peers: int
 ) -> Callable[[], bool]:
-    """True once a manager has discovered the expected number of active peers.
+    """True once a manager has SWIM-confirmed the expected peer count.
 
-    `expected_peers` does NOT include the manager itself. For a 3-manager
-    DC, each manager expects 2 active peers.
+    ``expected_peers`` does NOT include the manager itself. For a
+    3-manager DC, each manager expects 2 SWIM-confirmed peers.
+
+    Uses ``_active_manager_peer_ids`` because that is populated only when
+    SWIM probes succeed and ``_on_peer_confirmed`` fires — i.e. the
+    cluster is genuinely converged, not just registered. ``known``
+    means "we've seen registration"; ``active`` means "we've probed and
+    confirmed liveness." For a real cluster smoke, the active count is
+    the correct gate; if it never reaches the expected count, that is a
+    SWIM-tier defect (failure detection, leadership election, and
+    cross-DC heartbeats all depend on this same path).
     """
     if handle.kind is not ServerKind.MANAGER:
         raise ValueError(

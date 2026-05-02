@@ -67,20 +67,6 @@ async def test_l2_framework_structure() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.simulation
-@pytest.mark.skip(
-    reason=(
-        "L2 cluster (3 managers + 2 workers) trips the supervisor's leaked-"
-        "asyncio-task detector with ~30 surviving tasks attributed to "
-        "TaskRunner._cleanup, SWIM TimingWheel/HierarchicalFailureDetector/"
-        "HealthMonitor loops, MercurySyncBaseServer cleanup tasks, "
-        "UDPProtocol._cleanup, and the worker's named bg loops. The "
-        "harness is correctly surfacing real production cleanup gaps; "
-        "fixing them is a separate dedicated pass beyond Phase 2 scope. "
-        "Re-enable once shutdown propagation is consistent across these "
-        "components. The L1 lifecycle scenario passes cleanly; L2 reveals "
-        "issues that only show under multi-component coordination."
-    ),
-)
 async def test_l2_cluster_lifecycle() -> None:
     """Full L2 cluster stand-up + condition-driven stabilization + tear-down.
 

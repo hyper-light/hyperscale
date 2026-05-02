@@ -75,12 +75,12 @@ class NodeId:
     def short(self) -> str:
         """Short form for logging: DC-EAST-01-f3a2"""
         return f"{self.datacenter}-{self.priority:02d}-{self.random[:4]}"
-    
+
     @property
     def full(self) -> str:
         """Full string representation of the node ID (alias for str())."""
         return str(self)
-    
+
     @property
     def age_seconds(self) -> float:
         """How old this node ID is in seconds."""

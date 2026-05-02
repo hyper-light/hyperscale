@@ -206,20 +206,17 @@ class ClusterHarness:
                 self._allocate_pair() for _ in range(dc_spec.managers)
             ]
 
+        # Each worker owns a 500-port block: TCP at block base, UDP at
+        # block+10, plus headroom for the derived `udp + cores ** 2`
+        # subprocess UDP and any helper ports the local pool spawns.
+        # Mirrors the stride pattern used by the integration tests
+        # (see tests/integration/gates/test_gate_cross_dc_dispatch.py).
         worker_addrs_by_dc: dict[str, list[tuple[int, int]]] = {}
         for dc_id, dc_spec in self.spec.datacenters.items():
             worker_addrs_by_dc[dc_id] = [
-                self._allocate_pair() for _ in range(dc_spec.workers)
+                self._ports.reserve_worker_block(cores=dc_spec.cores_per_worker)
+                for _ in range(dc_spec.workers)
             ]
-            # Reserve the derived `udp + cores ** 2` per worker so a future
-            # worker we allocate after this one cannot collide with it.
-            for _tcp, udp in worker_addrs_by_dc[dc_id]:
-                self._ports.reserve_range(0)  # placeholder; range below
-                # Mark the derived port as reserved by binding it; do this
-                # with the same mechanism so the post-teardown verifier
-                # checks it too.
-                derived = udp + dc_spec.cores_per_worker ** 2
-                self._reserve_specific(derived)
 
         self._build_gates(gate_specs, manager_addrs_by_dc)
         self._build_managers(

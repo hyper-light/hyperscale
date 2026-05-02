@@ -182,11 +182,14 @@ class EventLoopHealthMonitor:
             except asyncio.CancelledError:
                 pass
         self._monitor_task = None
-        
-        # Cancel any pending callback tasks
-        for task in list(self._pending_callback_tasks):
-            if not task.done():
-                task.cancel()
+
+        # Cancel-and-await any pending callback tasks; merely cancelling
+        # leaves them alive when callers inspect asyncio.all_tasks().
+        pending = [t for t in self._pending_callback_tasks if not t.done()]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
         self._pending_callback_tasks.clear()
     
     async def _monitor_loop(self) -> None:

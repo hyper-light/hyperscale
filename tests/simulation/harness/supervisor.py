@@ -116,7 +116,32 @@ class Supervisor:
         self._pid_track_tasks.append(task)
 
     async def shutdown(self) -> None:
-        """Reap everything in reverse order with bounded timeouts."""
+        """Quiescence-driven cluster teardown.
+
+        The naive approach — call ``server.stop()`` per node with a fixed
+        ``wait_for`` budget — is brittle: if the budget fires, cancellation
+        cascades into mid-flight cleanup and leaves partial state. The
+        approach below is convergence-driven instead:
+
+        1. **Signal** every server to stop. Fire `server.stop()` calls in
+           parallel without imposing a wait_for budget. Servers stop
+           accepting new work and begin draining.
+        2. **Quiescence** — poll `asyncio.all_tasks()` until the count of
+           harness-spawned tasks is stable (or strictly decreasing) for
+           ``quiescence_stable_ticks`` consecutive ticks. This means the
+           system has stopped scheduling new work and existing tasks are
+           winding down.
+        3. **Force-cancel** anything that survived quiescence. By
+           definition these tasks are not draining on their own. Cancel
+           in parallel, await briefly. Whatever still survives ignored
+           cancellation — that's a real leak.
+        4. **Subprocess sweep + port verify + leak report** as before.
+
+        The key distinction: quiescence is a *property of the system* we
+        wait for, not a *budget we cross our fingers on*. Healthy
+        teardowns settle in tens of ms; pathological ones surface
+        diagnosable behaviour.
+        """
         if not self._running:
             return
         self._running = False
@@ -125,22 +150,162 @@ class Supervisor:
         # final pid snapshot without races.
         await self._stop_pid_tracking()
 
-        # Reverse-dependency order: workers first (they hold subprocesses),
-        # then managers, then gates. Each kind reaped in parallel within itself.
+        await self._signal_servers_stop()
+        await self._await_task_quiescence()
+        truly_leaked = await self._force_cancel_survivors()
+
+        await self._reap_worker_subprocess_pools()
+        await self._final_descendant_sweep()
+        await self._verify_ports_released()
+        self._report_async_leaks(truly_leaked)
+
+        os.environ.pop(_HARNESS_RUN_ID_ENV, None)
+
+    async def _signal_servers_stop(self) -> None:
+        """Phase 1: fire ``server.stop()`` for every started node in parallel.
+
+        Workers first (they hold subprocesses), then managers, then gates —
+        same dependency order as before, but now without per-node
+        ``wait_for`` budgets. We expect each ``stop`` call to return; if
+        one hangs, the quiescence phase still bounds total time, and the
+        force-cancel phase reaps anything pinned.
+        """
         for kind in (ServerKind.WORKER, ServerKind.MANAGER, ServerKind.GATE):
-            handles = [h for h in self._server_handles if h.kind is kind]
+            handles = [
+                h for h in self._server_handles if h.kind is kind and h.started
+            ]
             if not handles:
                 continue
             await asyncio.gather(
-                *(self._reap_server(h) for h in handles),
+                *(self._signal_server_stop(h) for h in handles),
                 return_exceptions=True,
             )
 
-        await self._final_descendant_sweep()
-        await self._verify_ports_released()
-        self._detect_leaked_async_tasks()
+    async def _signal_server_stop(self, handle: ServerHandle) -> None:
+        """Invoke ``stop`` once for a single handle. Errors recorded, not raised.
 
-        os.environ.pop(_HARNESS_RUN_ID_ENV, None)
+        ``drain_timeout=0`` because the harness tear-down does not need to
+        wait for in-flight messages — quiescence handles that holistically.
+        """
+        try:
+            await handle.instance.stop(drain_timeout=0.0, broadcast_leave=False)
+        except Exception as stop_error:
+            self.cleanup_errors.append(
+                f"server.stop {handle.node_id}: "
+                f"{type(stop_error).__name__}: {stop_error}"
+            )
+
+    async def _await_task_quiescence(self) -> None:
+        """Phase 2: wait until harness-spawned task count stops growing.
+
+        Runs at ``quiescence_poll_interval``. Tracks the count of tasks
+        spawned during the cluster's lifetime that aren't yet ``done()``.
+        Declares quiescence when that count has been stable (or
+        strictly decreasing) for ``quiescence_stable_ticks`` consecutive
+        polls. Hard-bounded by ``quiescence_max_seconds`` so a runaway
+        production loop can't pin teardown forever.
+        """
+        deadline = time.monotonic() + self.timeouts.quiescence_max_seconds
+        last_count = -1
+        stable_ticks = 0
+        while time.monotonic() < deadline:
+            await asyncio.sleep(self.timeouts.quiescence_poll_interval)
+            current = self._count_harness_unfinished_tasks()
+            if last_count >= 0 and current <= last_count:
+                stable_ticks += 1
+                if stable_ticks >= self.timeouts.quiescence_stable_ticks:
+                    return
+            else:
+                stable_ticks = 0
+            last_count = current
+
+        self.cleanup_errors.append(
+            "quiescence not reached within "
+            f"{self.timeouts.quiescence_max_seconds}s; surviving tasks "
+            "will be reported by the leak detector"
+        )
+
+    async def _force_cancel_survivors(self) -> list[asyncio.Task]:
+        """Phase 3: cancel tasks that survived quiescence.
+
+        These tasks did not wind down naturally during quiescence — they
+        are leaked. Per Python's asyncio contract, when a coroutine
+        catches ``CancelledError``, the cancellation is *consumed* — a
+        single ``task.cancel()`` is not enough for cooperatively-bad
+        loops like ``while self._running: try: await ...; except
+        CancelledError: pass`` (which the framework uses in several
+        places). The fix is **persistent cancellation**: cancel,
+        wait briefly, observe what survived, cancel again, repeat —
+        until either the task ends or we exhaust the budget.
+
+        Each round uses ``asyncio.wait`` (not ``wait_for(gather)``) so
+        the supervisor's own coroutine doesn't get cascaded into.
+        """
+        survivors = self._collect_harness_unfinished_tasks()
+        if not survivors:
+            return []
+
+        deadline = time.monotonic() + self.timeouts.force_cancel_settle_seconds
+        outstanding = list(survivors)
+        per_round_budget = max(0.05, self.timeouts.force_cancel_round_seconds)
+
+        while outstanding and time.monotonic() < deadline:
+            for task in outstanding:
+                if not task.done():
+                    task.cancel()
+            _done, pending = await asyncio.wait(
+                outstanding, timeout=per_round_budget
+            )
+            outstanding = [t for t in pending if not t.done()]
+
+        return outstanding
+
+    async def _reap_worker_subprocess_pools(self) -> None:
+        """Reap worker subprocess pools after async cleanup is settled.
+
+        The signal-and-quiesce flow above handles asyncio cleanup; this
+        layer handles the OS subprocess pools the workers spawn via
+        ``ProcessPoolExecutor``. Done after quiescence so the worker has
+        already had the chance to shut its pool down cooperatively;
+        anything left here is an OS-level orphan.
+        """
+        for handle in self._server_handles:
+            if handle.kind is not ServerKind.WORKER:
+                continue
+            await self._reap_worker_subprocesses(handle, graceful_ok=True)
+
+    def _count_harness_unfinished_tasks(self) -> int:
+        return len(self._collect_harness_unfinished_tasks())
+
+    def _collect_harness_unfinished_tasks(self) -> list[asyncio.Task]:
+        try:
+            current = asyncio.current_task()
+        except RuntimeError:
+            current = None
+        result: list[asyncio.Task] = []
+        for task in asyncio.all_tasks():
+            if task in self._baseline_tasks:
+                continue
+            if task in self._pid_track_tasks:
+                continue
+            if task is current:
+                continue
+            if task.done():
+                continue
+            result.append(task)
+        return result
+
+    def _report_async_leaks(self, leaked: list[asyncio.Task]) -> None:
+        if not leaked:
+            return
+        descriptions = sorted(_describe_leaked_task(task) for task in leaked)
+        message = (
+            f"{len(leaked)} async tasks survived cancellation:\n  - "
+            + "\n  - ".join(descriptions)
+        )
+        self.cleanup_errors.append(message)
+        if self.fail_on_async_leak:
+            raise LeakedAsyncTasksError(message)
 
     async def _stop_pid_tracking(self) -> None:
         for task in self._pid_track_tasks:
@@ -179,42 +344,18 @@ class Supervisor:
             return set()
         return set(processes.keys())
 
-    async def _reap_server(self, handle: ServerHandle) -> None:
-        graceful_ok = await self._reap_graceful(handle)
-        if handle.kind is ServerKind.WORKER:
-            await self._reap_worker_subprocesses(handle, graceful_ok)
-
-    async def _reap_graceful(self, handle: ServerHandle) -> bool:
-        """Layer 1: ask the server to stop on its own.
-
-        ``drain_timeout=0`` because the harness is tearing the cluster
-        down — we do not need to wait for in-flight messages to drain,
-        only for the server to release resources and cancel its
-        background tasks. With non-zero drain, larger topologies (L2/L3)
-        exceed the wait-for budget and leave background tasks alive.
-        """
-        if not handle.started:
-            return True
-        try:
-            await asyncio.wait_for(
-                handle.instance.stop(drain_timeout=0.0, broadcast_leave=False),
-                timeout=self.timeouts.stop_default,
-            )
-            return True
-        except asyncio.TimeoutError:
-            self.cleanup_errors.append(f"graceful-stop timeout: {handle.node_id}")
-            return False
-        except Exception as stop_error:
-            self.cleanup_errors.append(
-                f"graceful-stop {handle.node_id}: "
-                f"{type(stop_error).__name__}: {stop_error}"
-            )
-            return False
-
     async def _reap_worker_subprocesses(
         self, handle: ServerHandle, graceful_ok: bool
     ) -> None:
-        """Layers 2 + 3 for workers: forced kill_child_processes, then per-PID."""
+        """OS-level cleanup for the worker subprocess pool.
+
+        Run after the asyncio quiescence pass: anything still alive in
+        the worker's subprocess pool is an OS-level orphan, not an
+        async task. Terminate, wait, kill, wait — same escalation as
+        before. ``graceful_ok=True`` is passed by the new flow because
+        we have already given the worker its chance to wind its pool
+        down through ``server.stop()``.
+        """
         if not graceful_ok:
             await self._invoke_lifecycle_kill(handle)
 
@@ -325,37 +466,6 @@ class Supervisor:
         held = await self.ports.verify_all_released()
         if held:
             self.cleanup_errors.append(f"ports still held after teardown: {held}")
-
-    def _detect_leaked_async_tasks(self) -> None:
-        """Any task that exists now and didn't at __aenter__ is suspect.
-
-        Excludes the supervisor's own tracking tasks (already cancelled) and
-        the currently-running task (the caller). Tasks marked done are fine
-        — the GC will collect them.
-
-        Each leaked task is described by its coroutine's qualified name and
-        the file:line where the coroutine is defined, so generic "Task-N"
-        names point at concrete production sites without further detective
-        work.
-        """
-        now_tasks = set(asyncio.all_tasks())
-        try:
-            current = asyncio.current_task()
-        except RuntimeError:
-            current = None
-        new = now_tasks - self._baseline_tasks - set(self._pid_track_tasks)
-        if current is not None:
-            new.discard(current)
-        leaked = [task for task in new if not task.done()]
-        if leaked:
-            descriptions = sorted(_describe_leaked_task(task) for task in leaked)
-            message = (
-                f"{len(leaked)} async tasks leaked across cluster lifetime:\n  - "
-                + "\n  - ".join(descriptions)
-            )
-            self.cleanup_errors.append(message)
-            if self.fail_on_async_leak:
-                raise LeakedAsyncTasksError(message)
 
     async def _preflight_zombie_reap(self) -> None:
         """Find and kill processes left over from earlier harness runs.

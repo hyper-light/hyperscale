@@ -157,7 +157,7 @@ class ManagerStateSync:
         )
 
         for worker_id, worker in workers.items():
-            worker_addr = (worker.node.host, worker.node.tcp_port)
+            worker_addr = (worker.node.host, worker.node.port)
             snapshot = await self._request_worker_state(worker_addr, request)
             if snapshot:
                 await self._apply_worker_state(snapshot)

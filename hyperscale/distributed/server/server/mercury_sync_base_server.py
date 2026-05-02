@@ -95,8 +95,14 @@ class MercurySyncBaseServer(Generic[T]):
         self._tcp_clock = LamportClock()
         self._udp_clock = LamportClock()
 
-        self._tcp_logger: Logger | None = None
-        self._udp_logger: Logger | None = None
+        # Configure global log level before constructing the loggers so the
+        # eager Logger() instances pick up the right level. We initialize
+        # loggers eagerly (rather than in start_server) because submodules
+        # constructed during __init__ capture these references and would
+        # otherwise see None — leading to AttributeError on first .log().
+        LoggingConfig().update(log_level=env.MERCURY_SYNC_LOG_LEVEL)
+        self._tcp_logger: Logger = Logger()
+        self._udp_logger: Logger = Logger()
 
         self.env = env
 
@@ -265,7 +271,15 @@ class MercurySyncBaseServer(Generic[T]):
             TaskCall,
         ] = {}
 
-        self._task_runner: TaskRunner | None = None
+        # Initialize TaskRunner eagerly so subclasses' `__init__` (and any
+        # submodule they construct that captures `self._task_runner` by
+        # reference) see a usable value. The previous pattern of leaving
+        # this None and populating in `start_server` meant any submodule
+        # captured at __init__ time held a None reference and failed at
+        # first run() with `AttributeError: 'NoneType' object has no
+        # attribute 'run'`. ``TaskRunner.__init__`` does not require a
+        # running event loop.
+        self._task_runner: TaskRunner = TaskRunner(0, env)
         self._task_runs: dict[str, list[Run]] = defaultdict(list)
 
     @property
@@ -1424,7 +1438,7 @@ class MercurySyncBaseServer(Generic[T]):
             self._tcp_drop_counter.increment_malformed_message()
             # Log security event - could be decryption failure, malformed message, etc.
             await self._log_security_warning(
-                f"TCP server request failed: {type(e).__name__}",
+                f"TCP server request failed: {type(e).__name__}: {e}",
                 protocol="tcp",
             )
             # Sanitized error response - don't leak internal details
