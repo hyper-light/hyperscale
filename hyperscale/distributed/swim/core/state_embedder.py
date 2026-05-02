@@ -172,6 +172,10 @@ class WorkerStateEmbedder:
     # AD-26: Required fields for HealthcheckExtensionRequest
     get_extension_estimated_completion: Callable[[], float] | None = None
     get_extension_active_workflow_count: Callable[[], int] | None = None
+    # Phase H3 — multi-dimensional WorkflowProgressSnapshot piggyback
+    get_extension_step_transitions: Callable[[], int] | None = None
+    get_extension_actions_completed: Callable[[], int] | None = None
+    get_extension_snapshot_time: Callable[[], float] | None = None
     # AD-19 addendum (Phase D): uniform LHM gossip across all heartbeat
     # tiers. Worker reports its raw LocalHealthMultiplier.score (0-8)
     # so cross_dc_correlation can correlate worker-tier stress
@@ -230,6 +234,16 @@ class WorkerStateEmbedder:
             extension_active_workflow_count=self.get_extension_active_workflow_count()
             if self.get_extension_active_workflow_count
             else 0,
+            # Phase H3 — multi-dimensional progress snapshot piggyback
+            extension_step_transitions=self.get_extension_step_transitions()
+            if self.get_extension_step_transitions
+            else 0,
+            extension_actions_completed=self.get_extension_actions_completed()
+            if self.get_extension_actions_completed
+            else 0,
+            extension_snapshot_time=self.get_extension_snapshot_time()
+            if self.get_extension_snapshot_time
+            else 0.0,
             # AD-19 addendum (Phase D): uniform LHM
             lhm_score=self.get_lhm_score() if self.get_lhm_score else 0,
         )

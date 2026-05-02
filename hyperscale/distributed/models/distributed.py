@@ -711,6 +711,16 @@ class WorkerHeartbeat(Message):
     # AD-26 Issue 4: Absolute progress metrics (preferred over relative progress)
     extension_completed_items: int = 0  # Absolute count of completed items
     extension_total_items: int = 0  # Total items to complete
+    # Phase H3 — multi-dimensional WorkflowProgressSnapshot fields.
+    # ``extension_completed_items`` is the primary (cores_completed)
+    # signal; the two below are the secondary and tertiary signals
+    # that AD-26 H5 multi-witness decision uses for tamper-resistant
+    # progress validation. All three counters are integer monotonic
+    # on the worker side; the manager rejects extension requests
+    # where any dimension regresses.
+    extension_step_transitions: int = 0  # AD-33 step-state transitions since dispatch
+    extension_actions_completed: int = 0  # Sum of StepStats.completed_count across active steps
+    extension_snapshot_time: float = 0.0  # time.monotonic() on worker when snapshot constructed
     # AD-19 addendum (Phase D): uniform LHM gossip across all heartbeat
     # tiers. Worker reports its raw LocalHealthMultiplier.score (0-8)
     # so cross_dc_correlation can correlate worker stress against
@@ -1231,6 +1241,16 @@ class HealthcheckExtensionRequest(Message):
     # AD-26 Issue 4: Absolute progress metrics (preferred over relative progress)
     completed_items: int | None = None  # Absolute count of completed items
     total_items: int | None = None  # Total items to complete
+    # Phase H3 — multi-dimensional WorkflowProgressSnapshot fields.
+    # ``completed_items`` is the primary (cores_completed) signal;
+    # the three below carry the secondary, tertiary, and timestamp
+    # signals that AD-26 H5 multi-witness decision uses for
+    # tamper-resistant progress validation. Defaults to 0/None for
+    # back-compat with peers that pre-date Phase H.
+    workflow_id: str = ""  # Specific workflow this snapshot belongs to
+    step_transitions: int = 0  # AD-33 step-state transitions since dispatch
+    actions_completed: int = 0  # Sum of StepStats.completed_count across active steps
+    snapshot_time: float = 0.0  # time.monotonic() on worker when snapshot was constructed
 
 
 @dataclass(slots=True)

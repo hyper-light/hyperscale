@@ -124,6 +124,14 @@ class WorkerState:
         self._extension_total_items: int = 0
         self._extension_estimated_completion: float = 0.0
         self._extension_active_workflow_count: int = 0
+        # Phase H3 — multi-dimensional WorkflowProgressSnapshot fields
+        # piggybacked alongside the AD-26 extension request. Identifies
+        # which workflow the snapshot describes, plus secondary/tertiary
+        # progress counters and the worker-side capture timestamp.
+        self._extension_workflow_id: str = ""
+        self._extension_step_transitions: int = 0
+        self._extension_actions_completed: int = 0
+        self._extension_snapshot_time: float = 0.0
 
         # Throughput tracking (AD-19)
         self._throughput_completions: int = 0

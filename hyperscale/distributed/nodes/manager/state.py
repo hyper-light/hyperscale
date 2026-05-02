@@ -26,6 +26,9 @@ from hyperscale.distributed.slo import TimeWindowedTDigest
 
 if TYPE_CHECKING:
     from hyperscale.core.state.context import Context
+    from hyperscale.distributed.health.workflow_progress_snapshot import (
+        WorkflowProgressSnapshot,
+    )
     from hyperscale.distributed.jobs.timeout_strategy import TimeoutStrategy
     from hyperscale.distributed.workflow import WorkflowStateMachine
     from hyperscale.reporting.common.results_types import WorkflowStats
@@ -114,6 +117,15 @@ class ManagerState:
         # cross_dc_correlation. Worker entries are evicted when the
         # worker is removed from the registry.
         self._worker_lhm_scores: dict[str, int] = {}
+        # Phase H3 — per-workflow last-known progress snapshot used by
+        # the AD-26 multi-witness extension decision (H5). Keyed by
+        # ``workflow_id`` so leader transfer can preserve the entry
+        # via TimeoutTrackingState replication (AD-34 addendum,
+        # delivered in H7). Cleared when the workflow terminates or
+        # when its owning worker is reaped.
+        self._workflow_last_progress_snapshot: dict[
+            str, "WorkflowProgressSnapshot"
+        ] = {}
         self._dispatch_semaphores: dict[str, asyncio.Semaphore] = {}
 
         # Versioned state clock
@@ -373,7 +385,42 @@ class ManagerState:
         # rest of per-worker state. Without this the dict would grow
         # unbounded across worker churn.
         self._worker_lhm_scores.pop(worker_id, None)
+        # Phase H3 — drop progress snapshots owned by workflows that
+        # were dispatched to this worker. The workflow_id format
+        # includes the worker_id (TrackingToken sub-workflow tokens),
+        # so substring match is sufficient and avoids a separate
+        # workflow→worker reverse index.
+        stale_workflow_ids = [
+            wf_id
+            for wf_id in self._workflow_last_progress_snapshot
+            if worker_id in wf_id
+        ]
+        for wf_id in stale_workflow_ids:
+            self._workflow_last_progress_snapshot.pop(wf_id, None)
         self._dispatch_semaphores.pop(worker_id, None)
+
+    def get_workflow_last_progress_snapshot(
+        self, workflow_id: str
+    ) -> "WorkflowProgressSnapshot | None":
+        """Return the last accepted progress snapshot for ``workflow_id``.
+
+        Returns ``None`` when no snapshot has been recorded yet —
+        callers should treat this as the workflow's pre-extension
+        baseline (use ``WorkflowProgressSnapshot.initial`` to
+        construct a zero-progress reference for monotonic-progress
+        comparison).
+        """
+        return self._workflow_last_progress_snapshot.get(workflow_id)
+
+    def set_workflow_last_progress_snapshot(
+        self, workflow_id: str, snapshot: "WorkflowProgressSnapshot"
+    ) -> None:
+        """Record the latest accepted progress snapshot for ``workflow_id``."""
+        self._workflow_last_progress_snapshot[workflow_id] = snapshot
+
+    def clear_workflow_progress_snapshot(self, workflow_id: str) -> None:
+        """Drop the per-workflow progress snapshot when the workflow terminates."""
+        self._workflow_last_progress_snapshot.pop(workflow_id, None)
 
         progress_keys_to_remove = [
             key for key in self._worker_job_last_progress if key[0] == worker_id

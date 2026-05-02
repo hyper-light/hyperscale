@@ -275,6 +275,10 @@ class WorkerServer(HealthAwareServer):
             get_extension_total_items=lambda: self._worker_state._extension_total_items,
             get_extension_estimated_completion=lambda: self._worker_state._extension_estimated_completion,
             get_extension_active_workflow_count=lambda: len(self._active_workflows),
+            # Phase H3 — multi-dimensional progress snapshot piggyback
+            get_extension_step_transitions=lambda: self._worker_state._extension_step_transitions,
+            get_extension_actions_completed=lambda: self._worker_state._extension_actions_completed,
+            get_extension_snapshot_time=lambda: self._worker_state._extension_snapshot_time,
             # AD-19 addendum (Phase D): uniform LHM gossip
             get_lhm_score=lambda: self._local_health.score,
         )
@@ -823,6 +827,10 @@ class WorkerServer(HealthAwareServer):
             extension_total_items=self._worker_state._extension_total_items,
             extension_estimated_completion=self._worker_state._extension_estimated_completion,
             extension_active_workflow_count=len(self._active_workflows),
+            # Phase H3 — multi-dimensional progress snapshot piggyback
+            extension_step_transitions=self._worker_state._extension_step_transitions,
+            extension_actions_completed=self._worker_state._extension_actions_completed,
+            extension_snapshot_time=self._worker_state._extension_snapshot_time,
             # AD-19 addendum (Phase D): uniform LHM gossip — workers
             # report their raw LHM score so cross_dc_correlation can
             # see worker-tier stress alongside manager/gate stress.
@@ -836,6 +844,10 @@ class WorkerServer(HealthAwareServer):
         completed_items: int = 0,
         total_items: int = 0,
         estimated_completion: float = 0.0,
+        workflow_id: str = "",
+        step_transitions: int = 0,
+        actions_completed: int = 0,
+        snapshot_time: float = 0.0,
     ) -> None:
         """
         Request a deadline extension via heartbeat piggyback (AD-26).
@@ -848,13 +860,29 @@ class WorkerServer(HealthAwareServer):
         AD-26 Issue 4: Supports absolute metrics (completed_items, total_items)
         which are preferred over relative progress for robustness.
 
+        Phase H3: also accepts the secondary/tertiary progress
+        counters (``step_transitions``, ``actions_completed``) and the
+        worker-side capture timestamp. Together with ``completed_items``
+        these form the ``WorkflowProgressSnapshot`` the manager
+        evaluates against the strict-monotonic-progress witness in
+        H5.
+
         Args:
             reason: Human-readable reason for the extension request.
             progress: Monotonic progress value (not clamped to 0-1). Must strictly
                 increase between extension requests for approval. Prefer completed_items.
-            completed_items: Absolute count of completed items (preferred metric).
+            completed_items: Absolute count of completed items (preferred metric;
+                primary dimension of WorkflowProgressSnapshot).
             total_items: Total items to complete.
             estimated_completion: Estimated seconds until workflow completion.
+            workflow_id: Specific workflow this snapshot belongs to. Phase H3.
+            step_transitions: AD-33 step state-machine transitions since dispatch.
+                Secondary progress dimension.
+            actions_completed: Sum of StepStats.completed_count across active steps.
+                Tertiary progress dimension.
+            snapshot_time: ``time.monotonic()`` on the worker when the
+                snapshot was constructed. Used for rate-limiting and the
+                throughput-witness time-windowed velocity check.
         """
         self._worker_state._extension_requested = True
         self._worker_state._extension_reason = reason
@@ -864,6 +892,11 @@ class WorkerServer(HealthAwareServer):
         self._worker_state._extension_estimated_completion = estimated_completion
         active_workflow_count = len(self._active_workflows)
         self._worker_state._extension_active_workflow_count = active_workflow_count
+        # Phase H3 — multi-dimensional progress snapshot piggyback
+        self._worker_state._extension_workflow_id = workflow_id
+        self._worker_state._extension_step_transitions = step_transitions
+        self._worker_state._extension_actions_completed = actions_completed
+        self._worker_state._extension_snapshot_time = snapshot_time
 
         if self._event_logger is not None:
             self._task_runner.run(
@@ -894,6 +927,11 @@ class WorkerServer(HealthAwareServer):
         self._worker_state._extension_total_items = 0
         self._worker_state._extension_estimated_completion = 0.0
         self._worker_state._extension_active_workflow_count = 0
+        # Phase H3 — clear the WorkflowProgressSnapshot piggyback too
+        self._worker_state._extension_workflow_id = ""
+        self._worker_state._extension_step_transitions = 0
+        self._worker_state._extension_actions_completed = 0
+        self._worker_state._extension_snapshot_time = 0.0
 
     async def get_core_assignments(self) -> dict[int, str | None]:
         """Get a copy of the current core assignments."""
