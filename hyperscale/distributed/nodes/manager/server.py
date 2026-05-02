@@ -969,14 +969,22 @@ class ManagerServer(HealthAwareServer):
         return False
 
     async def _join_swim_clusters(self) -> None:
-        """Join SWIM clusters for managers, gates, and workers."""
+        """Join SWIM clusters for managers, gates, and workers.
+
+        We know the role of each static seed by configuration (manager
+        peers come from ``_manager_udp_peers``, gate seeds from
+        ``_gate_udp_addrs``); pass it through ``join_cluster`` so the
+        seed's entry in ``_peer_roles`` is authoritative immediately —
+        leader-election cohort filtering does not need to wait for
+        gossip to propagate role info.
+        """
         # Join manager SWIM cluster
         for udp_addr in self._manager_udp_peers:
-            await self.join_cluster(udp_addr)
+            await self.join_cluster(udp_addr, seed_role="manager")
 
         # Join gate SWIM cluster if gates configured
         for udp_addr in self._gate_udp_addrs:
-            await self.join_cluster(udp_addr)
+            await self.join_cluster(udp_addr, seed_role="gate")
 
     # =========================================================================
     # SWIM Callbacks

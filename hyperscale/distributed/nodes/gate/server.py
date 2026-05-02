@@ -938,9 +938,12 @@ class GateServer(HealthAwareServer):
             )
         )
 
-        # Join SWIM cluster
+        # Join SWIM cluster. Gate-tier peers come from configuration so
+        # we know their role authoritatively — pre-populate their entry
+        # in ``_peer_roles`` so leader-election cohort filtering and
+        # role-aware scheduling work without waiting for gossip.
         for peer_udp in self._gate_udp_peers:
-            await self.join_cluster(peer_udp)
+            await self.join_cluster(peer_udp, seed_role="gate")
 
         # Start SWIM probe cycle
         self._task_runner.run(self.start_probe_cycle)

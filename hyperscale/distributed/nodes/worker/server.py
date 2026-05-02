@@ -518,10 +518,13 @@ class WorkerServer(HealthAwareServer):
         for manager_addr in self._seed_managers:
             await self._register_with_manager(manager_addr)
 
-        # Join SWIM cluster with all known managers for healthchecks
+        # Join SWIM cluster with all known managers for healthchecks.
+        # Workers know their seeds are managers from configuration —
+        # pass that through so manager peer roles are recorded
+        # authoritatively without waiting for gossip.
         for manager_info in list(self._registry._known_managers.values()):
             manager_udp_addr = (manager_info.udp_host, manager_info.udp_port)
-            await self.join_cluster(manager_udp_addr)
+            await self.join_cluster(manager_udp_addr, seed_role="manager")
 
         # Start SWIM probe cycle. `start_probe_cycle` is an async loop;
         # submit it to the TaskRunner the same way the manager does

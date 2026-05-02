@@ -56,6 +56,18 @@ class ServerInterface(Protocol):
         """Check if a peer has been confirmed."""
         ...
 
+    def record_peer_role(self, peer: tuple[str, int], role: str) -> None:
+        """Record a peer's role into the server's role map.
+
+        Called by message handlers (join, gossip) that observe a
+        peer's self-declared role. The role drives leader-election
+        cohort filtering, role-aware probe scheduling, and any other
+        same-tier membership decision. ``role`` is a lowercase string
+        ("manager", "gate", "worker"); unrecognised values are
+        ignored.
+        """
+        ...
+
     # === Node State ===
 
     async def update_node_state(

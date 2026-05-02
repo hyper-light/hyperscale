@@ -69,6 +69,10 @@ class ServerAdapter:
         """Check if a peer has been confirmed."""
         return self._server.is_peer_confirmed(peer)
 
+    def record_peer_role(self, peer: tuple[str, int], role: str) -> None:
+        """Record a peer's role on the underlying server."""
+        self._server.record_peer_role(peer, role)
+
     # === Node State ===
 
     async def update_node_state(

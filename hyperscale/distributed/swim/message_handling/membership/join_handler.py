@@ -44,8 +44,8 @@ class JoinHandler(BaseHandler):
         source_addr = context.source_addr
         target_addr_bytes = context.target_addr_bytes
 
-        # Parse version and target from join message
-        version, target, target_addr_bytes = self._parse_join_message(
+        # Parse version, role and target from join message
+        version, role, target, target_addr_bytes = self._parse_join_message(
             context.target, target_addr_bytes
         )
 
@@ -65,6 +65,13 @@ class JoinHandler(BaseHandler):
         # Handle self-join
         if self._server.udp_target_is_self(target):
             return self._ack(embed_state=False)
+
+        # Record the joining node's role immediately so leader-election
+        # cohort and role-aware probe scheduling don't have to wait for
+        # gossip to propagate role info. The join is authoritative for
+        # role: the joining node tells us what it is.
+        if role and target is not None:
+            self._server.record_peer_role(target, role)
 
         async with await self._server.context_with_value(target):
             nodes = self._server.read_nodes()
@@ -105,7 +112,7 @@ class JoinHandler(BaseHandler):
 
             await self._server.write_context(target, b"OK")
 
-            await self._propagate_join(target, target_addr_bytes)
+            await self._propagate_join(target, role, target_addr_bytes)
 
             self._server.probe_scheduler.add_member(target)
 
@@ -132,30 +139,55 @@ class JoinHandler(BaseHandler):
         self,
         target: tuple[str, int] | None,
         target_addr_bytes: bytes | None,
-    ) -> tuple[tuple[int, int] | None, tuple[str, int] | None, bytes | None]:
+    ) -> tuple[
+        tuple[int, int] | None,
+        str | None,
+        tuple[str, int] | None,
+        bytes | None,
+    ]:
         """
-        Parse version and target from join message.
+        Parse version, role and target from join message.
 
-        Format: v{major}.{minor}|host:port
+        Format: v{major}.{minor}|{role}|host:port (current)
+        or:     v{major}.{minor}|host:port (legacy, role omitted)
 
         Returns:
-            Tuple of (version, target, target_addr_bytes).
+            Tuple of (version, role, target, addr_part_bytes). ``role``
+            is None when the sender used the legacy 2-field format —
+            receivers must tolerate it for rolling upgrades.
         """
         if not target_addr_bytes or b"|" not in target_addr_bytes:
-            return (None, target, target_addr_bytes)
+            return (None, None, target, target_addr_bytes)
 
-        version_part, addr_part = target_addr_bytes.split(b"|", maxsplit=1)
+        parts = target_addr_bytes.split(b"|", maxsplit=2)
 
-        # Parse version
+        # Always parse version from the first segment.
+        version_part = parts[0]
         version: tuple[int, int] | None = None
         if version_part.startswith(b"v"):
             try:
                 version_str = version_part[1:].decode()
-                parts = version_str.split(".")
-                if len(parts) == 2:
-                    version = (int(parts[0]), int(parts[1]))
+                version_components = version_str.split(".")
+                if len(version_components) == 2:
+                    version = (
+                        int(version_components[0]),
+                        int(version_components[1]),
+                    )
             except (ValueError, UnicodeDecodeError):
                 pass
+
+        role: str | None = None
+        addr_part: bytes
+        if len(parts) == 3:
+            # New format: version | role | host:port
+            try:
+                role = parts[1].decode().lower() or None
+            except UnicodeDecodeError:
+                role = None
+            addr_part = parts[2]
+        else:
+            # Legacy 2-field format
+            addr_part = parts[1]
 
         # Parse target address
         parsed_target: tuple[str, int] | None = None
@@ -165,12 +197,21 @@ class JoinHandler(BaseHandler):
         except (ValueError, UnicodeDecodeError):
             pass
 
-        return (version, parsed_target, addr_part)
+        return (version, role, parsed_target, addr_part)
 
     async def _propagate_join(
-        self, target: tuple[str, int], target_addr_bytes: bytes | None
+        self,
+        target: tuple[str, int],
+        role: str | None,
+        target_addr_bytes: bytes | None,
     ) -> None:
-        """Propagate join to other cluster members."""
+        """Propagate join to other cluster members.
+
+        Re-encodes the message in the current 3-field
+        ``v{ver}|{role}|host:port`` shape (or 2-field legacy when role
+        is unknown) so peers downstream can parse role even if the
+        original sender used the legacy format.
+        """
         if target_addr_bytes is None:
             return
 
@@ -178,7 +219,19 @@ class JoinHandler(BaseHandler):
         base_timeout = await self._server.get_current_timeout()
         gather_timeout = self._server.get_lhm_adjusted_timeout(base_timeout) * 2
 
-        propagate_msg = b"join>" + SWIM_VERSION_PREFIX + b"|" + target_addr_bytes
+        if role:
+            propagate_msg = (
+                b"join>"
+                + SWIM_VERSION_PREFIX
+                + b"|"
+                + role.encode()
+                + b"|"
+                + target_addr_bytes
+            )
+        else:
+            propagate_msg = (
+                b"join>" + SWIM_VERSION_PREFIX + b"|" + target_addr_bytes
+            )
 
         coros = [self._server.send_if_ok(node, propagate_msg) for node in others]
         await self._server.gather_with_errors(

@@ -659,6 +659,29 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                 self._peer_roles[peer],
             )
 
+    def record_peer_role(self, peer: tuple[str, int], role: str) -> None:
+        """Record a peer's self-declared role into ``_peer_roles``.
+
+        Invoked from message handlers (join, gossip) when a peer tells
+        us what role it is. The role drives:
+
+        * leader-election cohort filtering (only same-tier peers count
+          toward majority and receive leader-claim/heartbeat broadcasts);
+        * role-aware probe scheduling and confirmation strategies;
+        * any membership decision that should not blur tier boundaries.
+
+        Unknown / unparseable role strings are dropped; the role map
+        keeps the prior value rather than corrupting it.
+        """
+        from hyperscale.distributed.models.distributed import NodeRole
+
+        if peer == self._get_self_udp_addr():
+            return
+        try:
+            self._peer_roles[peer] = NodeRole(role.lower())
+        except (ValueError, AttributeError):
+            return
+
     async def confirm_peer(self, peer: tuple[str, int], incarnation: int = 0) -> bool:
         """
         Mark a peer as confirmed after successful communication (AD-29 compliant).
@@ -1727,7 +1750,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         """Initialize leader election callbacks after server is started."""
         self._leader_election.set_callbacks(
             broadcast_message=self._broadcast_leadership_message,
-            get_member_count=self._get_member_count,
+            get_member_count=self._get_election_member_count,
             get_lhm_score=lambda: self._local_health.score,
             self_addr=self._get_self_udp_addr(),
             on_error=self._handle_election_error,
@@ -1762,24 +1785,50 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
 
     async def _broadcast_leadership_message(self, message: bytes) -> None:
         """
-        Broadcast a leadership message to all known nodes.
+        Broadcast a leadership message to same-tier peers.
 
-        Leadership messages are critical - schedule them via task runner
-        with error tracking.
+        Leadership lives at the manager / gate tier; workers don't run
+        leader election and don't grant pre-votes. Sending leader-claim
+        to a worker wastes bandwidth and pollutes its log. Filter the
+        SWIM tracker by ``_peer_roles`` so only same-tier peers receive
+        the message. Falls back to the unfiltered tracker if peer roles
+        haven't populated yet (early startup) — same fallback shape as
+        ``_get_election_member_count``.
+
+        Sends are scheduled via the task runner with error tracking;
+        delivery failures bubble through ``_send_leadership_message``
+        retries before reaching the LHM penalty path.
         """
+        from hyperscale.distributed.models.distributed import NodeRole
+
         self_addr = self._get_self_udp_addr()
         base_timeout = await self._context.read("current_timeout")
         timeout = self.get_lhm_adjusted_timeout(base_timeout)
 
-        nodes = list(self._incarnation_tracker.node_states.keys())
-        targets = [node for node in nodes if node != self_addr]
+        all_nodes = list(self._incarnation_tracker.node_states.keys())
+        try:
+            self_role: NodeRole | None = NodeRole(self._node_role.lower())
+        except (ValueError, AttributeError):
+            self_role = None
+
+        if self_role is not None and self._peer_roles:
+            targets = [
+                node
+                for node in all_nodes
+                if node != self_addr
+                and self._peer_roles.get(node) == self_role
+            ]
+        else:
+            targets = [node for node in all_nodes if node != self_addr]
 
         await self._udp_logger.log(
             ServerDebug(
                 message=(
                     f"[Leadership] broadcast self={self_addr} "
+                    f"role={self_role} "
                     f"msg_prefix={message[:32]!r} "
-                    f"tracker_nodes={nodes} targets={targets} "
+                    f"tracker_nodes={len(all_nodes)} "
+                    f"same_tier_targets={targets} "
                     f"timeout={timeout:.3f}"
                 ),
                 node_host=self._host,
@@ -1951,6 +2000,37 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
     def _get_member_count(self) -> int:
         """Get the current number of known members."""
         return len(self._incarnation_tracker.node_states) or 1
+
+    def _get_election_member_count(self) -> int:
+        """Members that participate in *this node's* leader election.
+
+        Leader election majority must be computed against same-tier
+        peers only — a manager's election cohort is the other managers,
+        not the workers it knows about. Mixing tiers caused L2 elections
+        to fail post-fault: when workers were added to the SWIM
+        ``incarnation_tracker``, ``_get_member_count`` rose to 4 and the
+        majority threshold (3) became unreachable from the manager-only
+        candidate set.
+
+        Counts ``self`` + every same-role peer in ``_peer_roles``.
+        Falls back to the broader tracker count if roles haven't been
+        populated yet (early in startup, before any role-bearing gossip
+        has been processed) so we don't return 0.
+        """
+        from hyperscale.distributed.models.distributed import NodeRole
+
+        try:
+            self_role = NodeRole(self._node_role.lower())
+        except (ValueError, AttributeError):
+            return self._get_member_count()
+
+        if not self._peer_roles:
+            return self._get_member_count()
+
+        same_tier_peers = sum(
+            1 for role in self._peer_roles.values() if role == self_role
+        )
+        return same_tier_peers + 1  # plus self
 
     async def _on_suspicion_expired(
         self, node: tuple[str, int], incarnation: int
@@ -2223,6 +2303,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         self,
         seed_node: tuple[str, int],
         timeout: float = 5.0,
+        seed_role: str | None = None,
     ) -> bool:
         """
         Join a cluster via a seed node with retry support.
@@ -2233,19 +2314,46 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         Args:
             seed_node: (host, port) of a node already in the cluster
             timeout: Timeout per attempt
+            seed_role: Optional role of ``seed_node`` (e.g. "manager",
+                "gate", "worker"). Pre-populates ``_peer_roles`` so
+                downstream consumers (leader-election cohort,
+                role-aware confirmation) can rely on the role being
+                known *immediately* — without waiting for gossip to
+                propagate it. Senders that know the seed's role from
+                static configuration (manager peers, gate seeds) should
+                pass it.
 
         Returns:
             True if join succeeded, False if all retries exhausted
         """
+        from hyperscale.distributed.models.distributed import NodeRole
+
         self_addr = self._get_self_udp_addr()
-        # Format: join>v{major}.{minor}|{host}:{port}
-        # Version prefix enables detecting incompatible nodes during join (AD-25)
+        # Format: join>v{major}.{minor}|{role}|{host}:{port}
+        # The role field is mandatory in this protocol minor — receivers
+        # parse it into _peer_roles so leader-election majority and
+        # role-aware probe scheduling don't have to wait for gossip.
+        # Version prefix lets old peers detect incompatible nodes (AD-25).
+        self_role = (self._node_role or "worker").lower()
         join_msg = (
             b"join>"
             + SWIM_VERSION_PREFIX
             + b"|"
+            + self_role.encode()
+            + b"|"
             + f"{self_addr[0]}:{self_addr[1]}".encode()
         )
+
+        # Pre-populate our local view of the seed's role so the very
+        # first election cycle (which fires before any gossip from the
+        # seed) sees a correct cohort. The seed will overwrite this if
+        # its own gossip later disagrees, but for static-seed peers
+        # (manager_udp_peers, gate_udp_addrs) this is authoritative.
+        if seed_role:
+            try:
+                self._peer_roles[seed_node] = NodeRole(seed_role.lower())
+            except ValueError:
+                pass
 
         async def attempt_join() -> bool:
             await self.send(seed_node, join_msg, timeout=timeout)
