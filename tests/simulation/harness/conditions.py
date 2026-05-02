@@ -156,6 +156,47 @@ def worker_subprocesses_alive(
     return _predicate
 
 
+def manager_is_leader(handle: ServerHandle) -> Callable[[], bool]:
+    """True once a manager has won leader election for its DC.
+
+    Job submission requires a known DC leader: the manager rejects
+    submissions with ``Not DC leader, retry at leader: <hint>`` until
+    its ``LocalLeaderElection`` completes pre-vote + election + lease
+    update. For an L1 single-manager DC, that takes ``pre_vote_timeout
+    + election_timeout``; for L2/L3 it includes broadcast/vote rounds.
+    Use this predicate to gate any test that exercises the submit path
+    so the test fails on a *real* dispatch defect rather than racing
+    leader election.
+    """
+    if handle.kind is not ServerKind.MANAGER:
+        raise ValueError(
+            f"manager_is_leader expects a MANAGER handle; got {handle.kind}"
+        )
+
+    def _predicate() -> bool:
+        return bool(handle.instance.is_leader())
+
+    return _predicate
+
+
+def dc_has_leader(handles: list[ServerHandle]) -> Callable[[], bool]:
+    """True once any manager in the DC has been elected leader.
+
+    For multi-manager DCs the test does not care *which* manager wins;
+    only that at least one has, so the submit path can be exercised.
+    """
+    for handle in handles:
+        if handle.kind is not ServerKind.MANAGER:
+            raise ValueError(
+                f"dc_has_leader expects MANAGER handles; got {handle.kind}"
+            )
+
+    def _predicate() -> bool:
+        return any(handle.instance.is_leader() for handle in handles)
+
+    return _predicate
+
+
 def gate_cluster_formed(
     handles: list[ServerHandle], expected_peers: int
 ) -> Callable[[], bool]:

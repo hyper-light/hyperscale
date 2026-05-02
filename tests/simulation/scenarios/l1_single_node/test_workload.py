@@ -103,12 +103,18 @@ def _l1_spec() -> ClusterSpec:
 @pytest.mark.simulation
 @pytest.mark.skip(
     reason=(
-        "Production execute → result-push path does not deliver workflow "
-        "completion under the harness's L1 topology; the client leaves "
-        "tasks waiting for results that never arrive, and pytest's loop "
-        "teardown hangs trying to cancel them. The framework pieces are "
-        "covered by `test_workload_framework_evaluates`. Re-enable once "
-        "the production pipeline can complete a SimpleWorkflow at L1."
+        "Submit path now reaches the manager (Phase 2 closure: leader "
+        "election started in manager.start, workflow allowlist registered "
+        "for tests.simulation.workflows.*, send_tcp tuple unpacking on "
+        "dispatch path, and load-shedder enum signature). However the "
+        "manager's WorkflowDispatcher → worker execution → "
+        "WorkflowResultPush → client callback round-trip is still not "
+        "delivering completion: the job is accepted (submit_errors is "
+        "empty, job_id returned) but no workflow_result push reaches the "
+        "client within budget. This is the Phase 3 prerequisite the "
+        "original skip reason called out, scoped down. Re-enable once "
+        "WorkflowDispatcher actually sends dispatch + worker pushes "
+        "result back end-to-end at L1."
     ),
 )
 async def test_l1_workload_submission_pipeline() -> None:

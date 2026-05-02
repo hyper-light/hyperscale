@@ -184,6 +184,13 @@ class LocalLeaderElection:
             return False
         if not self._get_lhm_score:
             return False
+        # If we are the only member, there is no peer to hand off to.
+        # Stepping down here would leave the DC leaderless until LHM
+        # recovers, blocking the submit path on a single-node cluster
+        # for no benefit. The Lifeguard step-down dance only buys
+        # availability when a healthier peer exists.
+        if self._get_member_count is not None and self._get_member_count() <= 1:
+            return False
         return self.eligibility.should_step_down(self._get_lhm_score())
     
     async def start(self) -> None:

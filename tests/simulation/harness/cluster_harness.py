@@ -24,6 +24,7 @@ from hyperscale.distributed.nodes.worker import WorkerServer
 from tests.simulation.harness.cluster_spec import ClusterSpec
 from tests.simulation.harness.conditions import (
     all_of,
+    dc_has_leader,
     manager_has_n_peers,
     manager_has_n_workers,
     wait_until,
@@ -404,6 +405,12 @@ class ClusterHarness:
             for manager in managers:
                 predicates.append(manager_has_n_peers(manager, dc_spec.managers - 1))
                 predicates.append(manager_has_n_workers(manager, dc_spec.workers))
+            if managers:
+                # The submit path requires a known DC leader. Stabilization
+                # must wait for leader election to complete or any test
+                # exercising submit_job races the election and gets
+                # `Not DC leader, retry at leader: unknown`.
+                predicates.append(dc_has_leader(managers))
             for worker in workers:
                 predicates.append(worker_subprocesses_alive(self, worker))
 

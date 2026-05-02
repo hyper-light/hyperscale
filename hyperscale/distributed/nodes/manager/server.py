@@ -750,6 +750,14 @@ class ManagerServer(HealthAwareServer):
         # Start SWIM probe cycle
         self._task_runner.run(self.start_probe_cycle)
 
+        # Start the SWIM-tier DC-leader election. ``is_leader()`` reads the
+        # state this loop populates and the job submission path rejects
+        # work until ``is_leader()`` returns True for some manager in the
+        # DC. Without this, every submit returns "Not DC leader, retry at
+        # leader: unknown" because the election task is never created. The
+        # gate server starts its election the same way (gate/server.py).
+        await self.start_leader_election()
+
         # Start background tasks
         self._start_background_tasks()
 
@@ -2049,7 +2057,7 @@ class ManagerServer(HealthAwareServer):
                 sent_count = 0
                 for gate_addr in gate_addrs:
                     try:
-                        response = await self.send_tcp(
+                        response, _clock = await self.send_tcp(
                             gate_addr,
                             "manager_status_update",
                             heartbeat.dump(),
@@ -2491,7 +2499,7 @@ class ManagerServer(HealthAwareServer):
                 )
 
                 worker_addr = (worker.node.host, worker.node.port)
-                response = await self.send_tcp(
+                response, _clock = await self.send_tcp(
                     worker_addr,
                     "state_sync_request",
                     request.dump(),
@@ -2531,7 +2539,7 @@ class ManagerServer(HealthAwareServer):
                     since_version=self._manager_state.state_version,
                 )
 
-                response = await self.send_tcp(
+                response, _clock = await self.send_tcp(
                     peer_addr,
                     "manager_state_sync_request",
                     request.dump(),
@@ -3110,12 +3118,13 @@ class ManagerServer(HealthAwareServer):
         timeout: float | None = None,
     ) -> bytes | Exception | None:
         """Send TCP message to worker."""
-        return await self.send_tcp(
+        response, _clock = await self.send_tcp(
             addr,
             method,
             data,
             timeout=timeout or self._config.tcp_timeout_standard_seconds,
         )
+        return response
 
     async def _send_to_peer(
         self,
@@ -3125,12 +3134,13 @@ class ManagerServer(HealthAwareServer):
         timeout: float | None = None,
     ) -> bytes | Exception | None:
         """Send TCP message to peer manager."""
-        return await self.send_tcp(
+        response, _clock = await self.send_tcp(
             addr,
             method,
             data,
             timeout=timeout or self._config.tcp_timeout_standard_seconds,
         )
+        return response
 
     async def _send_to_client(
         self,
@@ -3140,12 +3150,13 @@ class ManagerServer(HealthAwareServer):
         timeout: float | None = None,
     ) -> bytes | Exception | None:
         """Send TCP message to client."""
-        return await self.send_tcp(
+        response, _clock = await self.send_tcp(
             addr,
             method,
             data,
             timeout=timeout or self._config.tcp_timeout_standard_seconds,
         )
+        return response
 
     def _export_stats_checkpoint(self) -> list[tuple[float, float]]:
         """Export pending stats checkpoint for peer recovery (Task 33)."""
@@ -3168,7 +3179,7 @@ class ManagerServer(HealthAwareServer):
     ) -> WorkflowDispatchAck | None:
         """Send workflow dispatch to worker."""
         try:
-            response = await self.send_tcp(
+            response, _clock = await self.send_tcp(
                 worker_addr,
                 "workflow_dispatch",
                 dispatch.dump(),
@@ -4820,7 +4831,7 @@ class ManagerServer(HealthAwareServer):
                     retry_after_seconds=rate_limit_result.retry_after_seconds,
                 ).dump()
 
-            if self._load_shedder.should_shed("JobSubmission"):
+            if self._load_shedder.should_shed_message("JobSubmission"):
                 # get_current_state() returns the same state should_shed() just computed
                 # (both use same default args and HybridOverloadDetector tracks _current_state)
                 overload_state = self._load_shedder.get_current_state()
@@ -5033,7 +5044,10 @@ class ManagerServer(HealthAwareServer):
         except Exception as error:
             await self._udp_logger.log(
                 ServerError(
-                    message=f"Job submission error: {error}",
+                    message=(
+                        f"Job submission error: {type(error).__name__}: {error}\n"
+                        + "".join(traceback.format_exception(error))
+                    ),
                     node_host=self._host,
                     node_port=self._tcp_port,
                     node_id=self._node_id.short,
