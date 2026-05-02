@@ -1386,18 +1386,16 @@ class UDPProtocol(Generic[T, K]):
             except asyncio.CancelledError:
                 pass
 
-        close_task = asyncio.current_task()
-        for task in asyncio.all_tasks():
-            try:
-                if task != close_task and task.cancelled() is False:
-                    task.cancel()
-
-            except Exception:
-                pass
-
-            except asyncio.CancelledError:
-                pass
-
+        # NOTE: deliberately *not* iterating ``asyncio.all_tasks()`` here.
+        # Every task this protocol owns is already accounted for via
+        # ``_pending_responses``, ``_shutdown_task``, ``_sleep_task``,
+        # ``_cleanup_task``, ``self.tasks`` (TaskRunner), and
+        # ``_run_future``. A blanket ``all_tasks()`` cancel is only safe
+        # in single-server processes — in any in-process multi-server
+        # context (tests, supervisors, embedded uses) it cancels tasks
+        # owned by *other* servers sharing the loop, cascading shutdown
+        # across unrelated nodes. The OS reclaims everything in the
+        # production single-process exit path anyway.
         self._pending_responses.clear()
 
         try:
