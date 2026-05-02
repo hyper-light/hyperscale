@@ -426,6 +426,14 @@ class Env(BaseModel):
     # 1.5 per the AD-26/AD-34 design conversation: workflows of declared
     # duration D get a buffered deadline of 1.5×D before SUSPECT.
     HYPERSCALE_DEFAULT_WORKER_TIMEOUT_MULTIPLIER: StrictFloat = 1.5
+    # Phase H6 — cluster-wide tolerated false-positive rate for the
+    # AD-26 throughput witness. Default 0.01 (1%) per the production-
+    # fleet rationale: at ~24K workflows/day and AD-26 max_extensions
+    # =5, this gives ~240 false denies/day across the fleet, an
+    # acceptable rate when extensions are bounded. The hierarchical
+    # α-budget allocator splits this across DC → manager → worker →
+    # workflow via Benjamini-Hochberg FDR.
+    HYPERSCALE_EXTENSION_FPR_BUDGET: StrictFloat = 0.01
 
     # ==========================================================================
     # Orphaned Workflow Scanner Settings
@@ -819,6 +827,7 @@ class Env(BaseModel):
             "EXTENSION_MAX_EXTENSIONS": int,
             "EXTENSION_EVICTION_THRESHOLD": int,
             "HYPERSCALE_DEFAULT_WORKER_TIMEOUT_MULTIPLIER": float,
+            "HYPERSCALE_EXTENSION_FPR_BUDGET": float,
             "EXTENSION_EXHAUSTION_WARNING_THRESHOLD": int,
             "EXTENSION_EXHAUSTION_GRACE_PERIOD": float,
             # Orphaned workflow scanner settings
