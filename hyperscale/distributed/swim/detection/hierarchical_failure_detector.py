@@ -18,7 +18,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 from .timing_wheel import TimingWheel, TimingWheelConfig
 from .job_suspicion_manager import JobSuspicionManager, JobSuspicionConfig
@@ -27,6 +27,9 @@ from hyperscale.distributed.health.extension_tracker import (
     ExtensionTracker,
     ExtensionTrackerConfig,
 )
+
+if TYPE_CHECKING:
+    from hyperscale.distributed.taskex import TaskRunner
 
 
 # Type aliases
@@ -63,7 +66,8 @@ class HierarchicalConfig:
     job_min_timeout: float = 1.0
     job_max_timeout: float = 10.0
 
-    # Timing wheel settings
+    # Timing wheel settings (AD-30): coarse_tick_ms=1000, fine_tick_ms=100,
+    # fine_wheel_size=10. See ``TimingWheelConfig`` for the invariant.
     coarse_tick_ms: int = 1000
     fine_tick_ms: int = 100
 
@@ -131,6 +135,7 @@ class HierarchicalFailureDetector:
         get_n_members: Callable[[], int] | None = None,
         get_job_n_members: Callable[[JobId], int] | None = None,
         get_lhm_multiplier: Callable[[], float] | None = None,
+        task_runner: "TaskRunner | None" = None,
     ) -> None:
         if config is None:
             config = HierarchicalConfig()
@@ -142,6 +147,12 @@ class HierarchicalFailureDetector:
         self._get_n_members = get_n_members
         self._get_job_n_members = get_job_n_members
         self._get_lhm_multiplier = get_lhm_multiplier
+        # CLAUDE.md: never create asyncio orphaned tasks; route async work
+        # through TaskRunner. The task_runner is optional only so existing
+        # unit tests that construct HFD directly without a parent server
+        # keep working — production code paths through HealthAwareServer
+        # always supply one.
+        self._task_runner: "TaskRunner | None" = task_runner
 
         # Initialize global layer (timing wheel)
         timing_wheel_config = TimingWheelConfig(
@@ -279,12 +290,21 @@ class HierarchicalFailureDetector:
                 if incarnation < existing_state.incarnation:
                     return False  # Stale
                 elif incarnation == existing_state.incarnation:
-                    # Add confirmation
-                    existing_state.add_confirmation(from_node)
-                    # Update expiration based on new confirmation count
-                    new_timeout = existing_state.calculate_timeout()
-                    new_expiration = existing_state.start_time + new_timeout
-                    await self._global_wheel.update_expiration(node, new_expiration)
+                    # Only refresh the timer when a *new* confirmation
+                    # arrives. Same from_node calling repeatedly (e.g.
+                    # successive probe timeouts on a single-manager DC)
+                    # would otherwise call ``update_expiration`` with the
+                    # original ``start_time + timeout`` even after that
+                    # moment has passed — and the timing wheel's
+                    # past-due clamp can only do so much. The expiration
+                    # is already correctly set; leave it alone unless
+                    # the confirmation count actually changed.
+                    if existing_state.add_confirmation(from_node):
+                        new_timeout = existing_state.calculate_timeout()
+                        new_expiration = existing_state.start_time + new_timeout
+                        await self._global_wheel.update_expiration(
+                            node, new_expiration
+                        )
                     return True
                 else:
                     # Higher incarnation - remove old and create new
@@ -702,18 +722,30 @@ class HierarchicalFailureDetector:
         )
         self._record_event(event)
 
-        task = asyncio.create_task(self._clear_job_suspicions_for_node(node))
-        self._pending_clear_tasks.add(task)
-        task.add_done_callback(self._pending_clear_tasks.discard)
-        # If the task already completed before the callback was registered,
-        # the discard wouldn't fire — drop it manually so the set doesn't leak.
-        if task.done():
-            self._pending_clear_tasks.discard(task)
+        # Dispatch the per-node job-suspicion cleanup. CLAUDE.md forbids
+        # orphaned asyncio tasks; route through TaskRunner when available.
+        # Fallback to tracked ``asyncio.create_task`` keeps the standalone
+        # unit-test path working — production HealthAwareServer always
+        # provides a TaskRunner.
+        self._dispatch_async_work(
+            self._clear_job_suspicions_for_node,
+            node,
+        )
 
-        # Call callback
+        # Invoke ``on_global_death`` callback. If the callback is async,
+        # the returned coroutine must be scheduled — otherwise the DEAD
+        # transition never executes (the coroutine is silently dropped
+        # at GC time). Routing through TaskRunner gives us proper
+        # lifecycle tracking and cleanup; the fallback path tracks the
+        # task in ``_pending_clear_tasks`` so HFD.stop can drain it.
         if self._on_global_death:
             try:
-                self._on_global_death(node, state.incarnation)
+                self._dispatch_callback(
+                    self._on_global_death,
+                    node,
+                    state.incarnation,
+                    error_context=f"on_global_death callback failed for {node}",
+                )
             except Exception as callback_error:
                 if self._on_error:
                     try:
@@ -746,10 +778,21 @@ class HierarchicalFailureDetector:
         )
         self._record_event(event)
 
-        # Call callback
+        # Invoke ``on_job_death`` callback. Same async-scheduling
+        # discipline as ``_handle_global_expiration`` — async callbacks
+        # must be dispatched, never invoked sync-and-discarded.
         if self._on_job_death:
             try:
-                self._on_job_death(job_id, node, incarnation)
+                self._dispatch_callback(
+                    self._on_job_death,
+                    job_id,
+                    node,
+                    incarnation,
+                    error_context=(
+                        f"on_job_death callback failed for job {job_id}, "
+                        f"node {node}"
+                    ),
+                )
             except Exception as callback_error:
                 if self._on_error:
                     try:
@@ -767,6 +810,80 @@ class HierarchicalFailureDetector:
             # Refute with very high incarnation to ensure clearing
             await self._job_manager.refute_suspicion(job_id, node, 2**31)
             self._job_suspicions_cleared_by_global += 1
+
+    # =========================================================================
+    # Async dispatch helpers (CLAUDE.md: route through TaskRunner)
+    # =========================================================================
+
+    def _dispatch_async_work(
+        self,
+        coro_func: Callable[..., asyncio.Future],
+        *args,
+    ) -> None:
+        """Schedule an async function for execution.
+
+        Routes through ``TaskRunner`` when available so the work is
+        tracked, cancellable, and drained during shutdown — per CLAUDE.md
+        "we never create asyncio orphaned tasks; use the TaskRunner".
+
+        Falls back to a tracked ``asyncio.create_task`` for standalone
+        unit-test paths where HFD is constructed without a parent
+        ``HealthAwareServer``. The fallback registers in
+        ``_pending_clear_tasks`` so ``HFD.stop`` can drain it.
+        """
+        if self._task_runner is not None:
+            self._task_runner.run(coro_func, *args)
+            return
+
+        coro = coro_func(*args)
+        task = asyncio.create_task(coro)
+        self._pending_clear_tasks.add(task)
+        task.add_done_callback(self._pending_clear_tasks.discard)
+        if task.done():
+            self._pending_clear_tasks.discard(task)
+
+    def _dispatch_callback(
+        self,
+        callback: Callable[..., object],
+        *args,
+        error_context: str,
+    ) -> None:
+        """Invoke a user-supplied callback that may be sync or async.
+
+        If the callback is an ``async def`` (or returns a coroutine),
+        the coroutine is scheduled via ``TaskRunner`` when available.
+        Without this, ``async def`` callbacks are silently dropped
+        because invoking them returns a coroutine that has no awaiter
+        — the most consequential symptom is the SUSPECT->DEAD transition
+        never firing because ``_on_suspicion_expired`` (async) was
+        called sync-and-discarded.
+
+        ``error_context`` is forwarded to ``self._on_error`` if
+        scheduling itself raises (the callback's own exceptions are
+        caught at the call sites where this helper is invoked).
+        """
+        if asyncio.iscoroutinefunction(callback):
+            self._dispatch_async_work(callback, *args)
+            return
+
+        result = callback(*args)
+        if asyncio.iscoroutine(result):
+            # Sync callable that happens to return a coroutine (e.g. a
+            # functools.partial wrapping an async func, or a lambda).
+            # Schedule the already-constructed coroutine.
+            if self._task_runner is not None:
+                # TaskRunner.run requires a callable. Wrap the live
+                # coroutine in a zero-arg coroutine function.
+                async def _wrap(_coro=result):
+                    return await _coro
+
+                self._task_runner.run(_wrap)
+                return
+            task = asyncio.create_task(result)
+            self._pending_clear_tasks.add(task)
+            task.add_done_callback(self._pending_clear_tasks.discard)
+            if task.done():
+                self._pending_clear_tasks.discard(task)
 
     def _record_event(self, event: FailureEvent) -> None:
         """Record a failure event for history/debugging."""

@@ -30,25 +30,28 @@ from hyperscale.distributed.swim.detection.suspicion_state import SuspicionState
 
 @pytest.fixture
 def default_config() -> TimingWheelConfig:
-    """Default timing wheel configuration for tests."""
+    """Default timing wheel configuration for tests (AD-30)."""
+    # Coarse tick must equal fine_tick * fine_wheel_size (post-init guard);
+    # 100 * 10 = 1000 (per AD-30).
     return TimingWheelConfig(
         coarse_tick_ms=1000,
         coarse_wheel_size=64,
         fine_tick_ms=100,
-        fine_wheel_size=16,
-        fine_wheel_threshold_ms=2000,
+        fine_wheel_size=10,
+        fine_wheel_threshold_ms=1000,
     )
 
 
 @pytest.fixture
 def fast_config() -> TimingWheelConfig:
     """Fast timing wheel for quick expiration tests."""
+    # 10 * 10 = 100, threshold ≤ 100.
     return TimingWheelConfig(
         coarse_tick_ms=100,
         coarse_wheel_size=10,
         fine_tick_ms=10,
         fine_wheel_size=10,
-        fine_wheel_threshold_ms=200,
+        fine_wheel_threshold_ms=100,
     )
 
 

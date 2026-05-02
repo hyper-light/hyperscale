@@ -225,11 +225,16 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         # - Global layer: Machine-level liveness (via timing wheel)
         # - Job layer: Per-job responsiveness (via adaptive polling)
         # Uses polling instead of cancel/reschedule to avoid timer starvation
+        # ``task_runner`` is threaded in so async callbacks (notably
+        # ``_on_suspicion_expired``) are dispatched correctly per CLAUDE.md
+        # — without it, async-def callbacks are silently dropped at GC
+        # time and the SUSPECT->DEAD transition never executes.
         self._hierarchical_detector = HierarchicalFailureDetector(
             on_global_death=self._on_suspicion_expired,
             on_error=self._on_hierarchical_detector_error,
             get_n_members=self._get_member_count,
             get_lhm_multiplier=self._get_lhm_multiplier,
+            task_runner=self._task_runner,
         )
 
         # Initialize leader election with configurable parameters from Env
@@ -881,6 +886,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             get_n_members=self._get_member_count,
             get_job_n_members=get_job_n_members,
             get_lhm_multiplier=self._get_lhm_multiplier,
+            task_runner=self._task_runner,
         )
         return self._hierarchical_detector
 

@@ -42,18 +42,55 @@ class WheelEntry(Generic[T]):
 
 @dataclass
 class TimingWheelConfig:
-    """Configuration for the timing wheel."""
+    """Configuration for the timing wheel.
+
+    Defaults match AD-30 §"Timing Wheel Internals":
+    ``coarse_tick_ms=1000`` (1s per coarse bucket), ``fine_tick_ms=100``
+    (100ms per fine bucket), ``fine_wheel_size=10`` (1s of fine
+    resolution).
+
+    Invariant (validated in ``__post_init__``):
+    ``coarse_tick_ms == fine_tick_ms * fine_wheel_size``. The coarse
+    wheel advances exactly once per full revolution of the fine wheel
+    (see ``TimingWheel._tick`` — coarse advances when
+    ``_fine_position == 0``). If the configured coarse tick is not
+    equal to a full fine revolution, ``_calculate_bucket_index``
+    routes entries by the *configured* tick rate while the wheel
+    actually advances at the *fine-revolution* rate, so the entry's
+    expiration is silently delayed by the ratio of the two.
+    """
 
     # Coarse wheel: handles longer timeouts (seconds)
-    coarse_tick_ms: int = 1000  # 1 second per tick
+    coarse_tick_ms: int = 1000  # 1 second per coarse bucket (AD-30)
     coarse_wheel_size: int = 64  # 64 seconds max before wrap
 
     # Fine wheel: handles imminent expirations (milliseconds)
     fine_tick_ms: int = 100  # 100ms per tick
-    fine_wheel_size: int = 16  # 1.6 seconds max in fine wheel
+    fine_wheel_size: int = 10  # 1 second of fine resolution (AD-30)
 
-    # When remaining time is below this, move to fine wheel
-    fine_wheel_threshold_ms: int = 2000  # 2 seconds
+    # When remaining time is below this, move to fine wheel.
+    # Must not exceed ``fine_tick_ms * fine_wheel_size`` or the entry
+    # would not fit in the fine wheel.
+    fine_wheel_threshold_ms: int = 1000
+
+    def __post_init__(self) -> None:
+        expected_coarse = self.fine_tick_ms * self.fine_wheel_size
+        if self.coarse_tick_ms != expected_coarse:
+            raise ValueError(
+                f"TimingWheelConfig: coarse_tick_ms must equal "
+                f"fine_tick_ms * fine_wheel_size "
+                f"({self.fine_tick_ms} * {self.fine_wheel_size} = "
+                f"{expected_coarse}); got coarse_tick_ms={self.coarse_tick_ms}. "
+                f"The coarse wheel only advances once per full fine-wheel "
+                f"revolution, so any other ratio silently delays expirations."
+            )
+        if self.fine_wheel_threshold_ms > expected_coarse:
+            raise ValueError(
+                f"TimingWheelConfig: fine_wheel_threshold_ms "
+                f"({self.fine_wheel_threshold_ms}) cannot exceed the fine "
+                f"wheel span ({expected_coarse}); entries above this "
+                f"threshold go to the coarse wheel."
+            )
 
 
 class TimingWheelBucket:
@@ -190,15 +227,22 @@ class TimingWheel:
         expiration_time: float,
         wheel_type: str,
     ) -> int:
-        """Calculate which bucket an expiration time maps to."""
+        """Calculate which bucket an expiration time maps to.
+
+        For past-due times we clamp ``ticks`` to 0 (current bucket) so
+        the entry is processed on the next tick. Without the clamp,
+        ``int(negative/positive)`` rounds toward zero and the modulo
+        of a negative tick count wraps around to the far end of the
+        wheel — silently scheduling the entry tens of seconds out.
+        """
         now = time.monotonic()
         remaining_ms = (expiration_time - now) * 1000
 
         if wheel_type == "fine":
-            ticks = int(remaining_ms / self._config.fine_tick_ms)
+            ticks = max(0, int(remaining_ms / self._config.fine_tick_ms))
             return (self._fine_position + ticks) % self._config.fine_wheel_size
         else:
-            ticks = int(remaining_ms / self._config.coarse_tick_ms)
+            ticks = max(0, int(remaining_ms / self._config.coarse_tick_ms))
             return (self._coarse_position + ticks) % self._config.coarse_wheel_size
 
     def _should_use_fine_wheel(self, expiration_time: float) -> bool:
