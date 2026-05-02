@@ -34,7 +34,7 @@ from tests.simulation.harness import (
     WorkloadObservations,
     WorkloadSpec,
 )
-from tests.simulation.workflows import SimpleWorkflow
+from hyperscale.distributed.testing.workflows import SimpleWorkflow
 
 
 @pytest.mark.simulation
@@ -103,18 +103,22 @@ def _l1_spec() -> ClusterSpec:
 @pytest.mark.simulation
 @pytest.mark.skip(
     reason=(
-        "Submit path now reaches the manager (Phase 2 closure: leader "
-        "election started in manager.start, workflow allowlist registered "
-        "for tests.simulation.workflows.*, send_tcp tuple unpacking on "
-        "dispatch path, and load-shedder enum signature). However the "
-        "manager's WorkflowDispatcher → worker execution → "
-        "WorkflowResultPush → client callback round-trip is still not "
-        "delivering completion: the job is accepted (submit_errors is "
-        "empty, job_id returned) but no workflow_result push reaches the "
-        "client within budget. This is the Phase 3 prerequisite the "
-        "original skip reason called out, scoped down. Re-enable once "
-        "WorkflowDispatcher actually sends dispatch + worker pushes "
-        "result back end-to-end at L1."
+        "Submit + dispatch path is now end-to-end correct (closing several "
+        "production bugs in this run): leader election started in "
+        "manager.start, _send_workflow_dispatch contract fixed "
+        "(worker_id:str, returns bool), JobManager and WorkflowDispatcher "
+        "share manager_id=node_id.full so TrackingTokens round-trip, "
+        "WorkerHeartbeat carries total_cores so the manager-side health "
+        "monitor stops dropping every heartbeat, and load-shedder/"
+        "send_tcp tuple unpacking are corrected. Test workflows moved to "
+        "hyperscale.distributed.testing.workflows so the production "
+        "RestrictedUnpickler accepts them without a security-relaxing hook "
+        "(packaging excludes *.testing.* from wheels). However the worker "
+        "→ manager workflow_final_result push still does not deliver "
+        "WorkflowResultPush to the client within budget; deeper "
+        "investigation needed in the worker executor and the manager's "
+        "result-forwarding-to-client path. Re-enable once the round-trip "
+        "completes end-to-end at L1."
     ),
 )
 async def test_l1_workload_submission_pipeline() -> None:

@@ -6,18 +6,6 @@ cleanup, port allocation, cluster construction. SIM-mode arrives in
 Phases 5–6 once the Clock/Random/Transport refactor lands.
 """
 
-from hyperscale.distributed.models.restricted_unpickler import (
-    register_allowed_module_prefix as _register_allowed_module_prefix,
-)
-
-# Workflows shipped with the simulation suite live under
-# ``tests.simulation.workflows.*`` and are pickled into the manager
-# alongside each ``Submission``. The production unpickler whitelists
-# ``hyperscale.*`` only; register the simulation prefix at import time
-# so any test that imports the harness — pytest or direct — can submit
-# the bundled workflow catalog.
-_register_allowed_module_prefix("tests.simulation.workflows.")
-
 from tests.simulation.harness.cluster_harness import ClusterHarness
 from tests.simulation.harness.cluster_spec import ClusterSpec
 from tests.simulation.harness.conditions import (

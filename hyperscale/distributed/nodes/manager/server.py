@@ -329,9 +329,17 @@ class ManagerServer(HealthAwareServer):
         # JobManager must exist before any coordinator that takes it as a
         # dependency (e.g. cancellation below). Constructed here so the rest
         # of the init sequence can reference it.
+        # JobManager and WorkflowDispatcher must share the same manager_id
+        # because TrackingToken keys built on one side ("manager creates the
+        # workflow token, dispatches to worker, worker echoes it back in
+        # WorkflowFinalResult") have to match what the other side indexed.
+        # Use the full NodeId everywhere — it's the globally-unique form
+        # that's safe to embed in network messages and stable across the
+        # node's lifetime. ``self._node_id.short`` is for human-readable
+        # logging, not for keys.
         self._job_manager = JobManager(
             datacenter=self._node_id.datacenter,
-            manager_id=self._node_id.short,
+            manager_id=self._node_id.full,
         )
 
         # Cancellation coordinator for AD-20
@@ -3174,10 +3182,32 @@ class ManagerServer(HealthAwareServer):
 
     async def _send_workflow_dispatch(
         self,
-        worker_addr: tuple[str, int],
+        worker_id: str,
         dispatch: WorkflowDispatch,
-    ) -> WorkflowDispatchAck | None:
-        """Send workflow dispatch to worker."""
+    ) -> bool:
+        """Send workflow dispatch to worker.
+
+        WorkflowDispatcher's ``send_dispatch`` callback contract is
+        ``(worker_id: str, WorkflowDispatch) -> bool``. Resolve the
+        worker's TCP address from the registry, send, and report
+        success based on whether a non-error WorkflowDispatchAck came
+        back. Previous signature took an address tuple and returned
+        the parsed ack — the dispatcher passed the worker_id string
+        anyway, so send_tcp received a string and never reached the
+        worker.
+        """
+        registration = self._registry.get_worker(worker_id)
+        if registration is None:
+            await self._udp_logger.log(
+                ServerWarning(
+                    message=f"Workflow dispatch: unknown worker {worker_id[:8]}...",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            return False
+        worker_addr = (registration.node.host, registration.node.port)
         try:
             response, _clock = await self.send_tcp(
                 worker_addr,
@@ -3187,7 +3217,8 @@ class ManagerServer(HealthAwareServer):
             )
 
             if response and not isinstance(response, Exception):
-                return WorkflowDispatchAck.load(response)
+                ack = WorkflowDispatchAck.load(response)
+                return bool(getattr(ack, "accepted", True))
 
         except Exception as error:
             await self._udp_logger.log(
@@ -3199,7 +3230,7 @@ class ManagerServer(HealthAwareServer):
                 )
             )
 
-        return None
+        return False
 
     async def _validate_mtls_claims(
         self,

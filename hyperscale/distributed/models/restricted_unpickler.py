@@ -401,25 +401,6 @@ ALLOWED_MODULE_PREFIXES: Tuple[str, ...] = (
 )
 
 
-_EXTRA_ALLOWED_PREFIXES: list[str] = []
-
-
-def register_allowed_module_prefix(prefix: str) -> None:
-    """Register an additional allowed module prefix for the unpickler.
-
-    Intended for test/simulation harnesses that ship workflow code outside
-    the ``hyperscale.*`` namespace. The prefix must end in ``.`` to match
-    the same shape as ``ALLOWED_MODULE_PREFIXES``. Production deployments
-    leave this empty.
-    """
-    if not prefix.endswith('.'):
-        raise ValueError(
-            f"prefix {prefix!r} must end in '.' to match ALLOWED_MODULE_PREFIXES"
-        )
-    if prefix not in _EXTRA_ALLOWED_PREFIXES:
-        _EXTRA_ALLOWED_PREFIXES.append(prefix)
-
-
 class RestrictedUnpickler(pickle.Unpickler):
     """
     A restricted unpickler that only allows safe modules and classes.
@@ -465,11 +446,8 @@ class RestrictedUnpickler(pickle.Unpickler):
         if module in ALLOWED_MODULES:
             return super().find_class(module, name)
         
-        # Allow modules matching allowed prefixes (built-in + harness-registered)
+        # Allow modules matching allowed prefixes
         for prefix in ALLOWED_MODULE_PREFIXES:
-            if module.startswith(prefix):
-                return super().find_class(module, name)
-        for prefix in _EXTRA_ALLOWED_PREFIXES:
             if module.startswith(prefix):
                 return super().find_class(module, name)
         

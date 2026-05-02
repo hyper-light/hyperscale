@@ -677,6 +677,11 @@ class WorkerHeartbeat(Message):
     cpu_percent: float  # CPU utilization 0-100
     memory_percent: float  # Memory utilization 0-100
     version: int  # State version for sync
+    # Total configured cores. Multiple consumers (manager health monitor,
+    # datacenter capacity aggregator, datacenter health manager) need to
+    # know the worker's full core budget alongside available_cores; without
+    # this field they raised AttributeError, dropping every heartbeat.
+    total_cores: int = 0
     # Active workflows and their status
     active_workflows: dict[str, str] = field(default_factory=dict)
     # TCP address for routing (populated in UDP heartbeats)
