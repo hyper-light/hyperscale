@@ -108,6 +108,12 @@ class ManagerState:
         self._worker_deadlines: dict[str, float] = {}
         self._worker_job_last_progress: dict[tuple[str, str], float] = {}
         self._worker_health_states: dict[str, str] = {}
+        # AD-19 addendum (Phase D): per-worker LHM scores reported via
+        # WorkerHeartbeat. Manager aggregates ``max()`` across these
+        # into ``ManagerHeartbeat.worker_max_lhm_score`` for gate-side
+        # cross_dc_correlation. Worker entries are evicted when the
+        # worker is removed from the registry.
+        self._worker_lhm_scores: dict[str, int] = {}
         self._dispatch_semaphores: dict[str, asyncio.Semaphore] = {}
 
         # Versioned state clock
@@ -363,6 +369,10 @@ class ManagerState:
         self._worker_unhealthy_since.pop(worker_id, None)
         self._worker_deadlines.pop(worker_id, None)
         self._worker_health_states.pop(worker_id, None)
+        # AD-19 addendum (Phase D): drop worker LHM tracking with the
+        # rest of per-worker state. Without this the dict would grow
+        # unbounded across worker churn.
+        self._worker_lhm_scores.pop(worker_id, None)
         self._dispatch_semaphores.pop(worker_id, None)
 
         progress_keys_to_remove = [

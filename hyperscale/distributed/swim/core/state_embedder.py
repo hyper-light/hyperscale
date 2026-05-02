@@ -172,6 +172,11 @@ class WorkerStateEmbedder:
     # AD-26: Required fields for HealthcheckExtensionRequest
     get_extension_estimated_completion: Callable[[], float] | None = None
     get_extension_active_workflow_count: Callable[[], int] | None = None
+    # AD-19 addendum (Phase D): uniform LHM gossip across all heartbeat
+    # tiers. Worker reports its raw LocalHealthMultiplier.score (0-8)
+    # so cross_dc_correlation can correlate worker-tier stress
+    # alongside manager/gate stress.
+    get_lhm_score: Callable[[], int] | None = None
 
     def get_state(self) -> bytes | None:
         """Get WorkerHeartbeat to embed in SWIM messages."""
@@ -225,6 +230,8 @@ class WorkerStateEmbedder:
             extension_active_workflow_count=self.get_extension_active_workflow_count()
             if self.get_extension_active_workflow_count
             else 0,
+            # AD-19 addendum (Phase D): uniform LHM
+            lhm_score=self.get_lhm_score() if self.get_lhm_score else 0,
         )
         return heartbeat.dump()
 
@@ -554,6 +561,11 @@ class GateStateEmbedder:
     get_health_throughput: Callable[[], float] | None = None
     get_health_expected_throughput: Callable[[], float] | None = None
     get_health_overload_state: Callable[[], str] | None = None
+    # AD-19 addendum (Phase D): uniform LHM gossip across all heartbeat
+    # tiers. Gate reports its raw LocalHealthMultiplier.score (0-8) so
+    # cross_dc_correlation can correlate gate-tier stress alongside
+    # manager/worker LHM and classify systemic load patterns.
+    get_lhm_score: Callable[[], int] | None = None
 
     def get_state(self) -> bytes | None:
         """Get GateHeartbeat to embed in SWIM messages."""
@@ -609,6 +621,8 @@ class GateStateEmbedder:
             health_overload_state=self.get_health_overload_state()
             if self.get_health_overload_state
             else "healthy",
+            # AD-19 addendum (Phase D): uniform LHM
+            lhm_score=self.get_lhm_score() if self.get_lhm_score else 0,
         )
         return heartbeat.dump()
 

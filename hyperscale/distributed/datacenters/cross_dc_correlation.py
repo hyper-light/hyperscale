@@ -260,9 +260,20 @@ class DCStateInfo:
     max_latency_ms: float = 0.0
     latency_elevated: bool = False
 
-    # LHM tracking (Local Health Multiplier score reported by DC)
+    # LHM tracking (Local Health Multiplier score reported by DC).
+    # ``current_lhm_score`` retains the original semantics for back-compat
+    # (single score representing the DC's overall stress) — it's
+    # populated as the maximum across reporting tiers so a worker
+    # tier saturating still raises the DC-level signal.
     current_lhm_score: int = 0
     lhm_stressed: bool = False
+    # AD-19 addendum (Phase D): per-tier LHM tracking. Keys are
+    # ``"manager"``, ``"worker"``, ``"gate"``. Values are the
+    # most-recently-reported LHM score for that tier in this DC.
+    # Lets correlation analysis distinguish "all workers stressed"
+    # (likely systemic load) from "one manager stressed" (likely
+    # isolated overload) before triggering eviction decisions.
+    per_tier_lhm_scores: dict[str, int] = field(default_factory=dict)
 
     # Extension tracking
     active_extensions: int = 0  # Number of workers currently with extensions
@@ -652,17 +663,31 @@ class CrossDCCorrelationDetector:
         self,
         datacenter_id: str,
         lhm_score: int,
+        node_type: str = "manager",
     ) -> None:
         """
-        Record a Local Health Multiplier (LHM) score for a datacenter.
+        Record a Local Health Multiplier (LHM) score for a datacenter
+        from a particular node tier.
 
-        High LHM scores indicate the node is experiencing resource pressure
+        High LHM scores indicate nodes are experiencing resource pressure
         (event loop lag, missed probes, etc.). If multiple DCs report high
-        LHM, it suggests systemic issues rather than individual DC failures.
+        LHM across multiple tiers, the pattern is systemic load rather
+        than isolated failures and eviction should be deferred (AD-33
+        cross-DC correlation rationale).
+
+        AD-19 addendum (Phase D): all three tiers (manager / worker /
+        gate) report ``lhm_score`` uniformly via heartbeat. This
+        method tracks each tier's most-recent score per DC and
+        retains a DC-level summary as the **max** across tiers so
+        existing ``check_correlation`` code paths see "the
+        most-stressed tier in this DC."
 
         Args:
             datacenter_id: The datacenter reporting.
             lhm_score: Current LHM score (0-8, higher = more stressed).
+            node_type: Reporting tier — one of ``"manager"``,
+                ``"worker"``, ``"gate"``. Defaults to ``"manager"``
+                for back-compat with callers that pre-date Phase D.
         """
         if not self._config.enable_lhm_correlation:
             return
@@ -678,8 +703,16 @@ class CrossDCCorrelationDetector:
             )
 
         state = self._dc_states[datacenter_id]
-        state.current_lhm_score = lhm_score
-        state.lhm_stressed = lhm_score >= self._config.lhm_stressed_threshold
+        state.per_tier_lhm_scores[node_type] = lhm_score
+        # DC-level summary is the max across tiers — any tier saturating
+        # raises the DC-wide signal. Preserves the historic
+        # ``current_lhm_score`` semantics for downstream consumers
+        # (correlation thresholding, metrics) without forcing them to
+        # become per-tier-aware.
+        state.current_lhm_score = max(state.per_tier_lhm_scores.values())
+        state.lhm_stressed = (
+            state.current_lhm_score >= self._config.lhm_stressed_threshold
+        )
 
     def check_correlation(self, datacenter_id: str) -> CorrelationDecision:
         """

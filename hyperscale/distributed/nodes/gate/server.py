@@ -545,6 +545,8 @@ class GateServer(HealthAwareServer):
                 get_health_overload_state=lambda: self._gate_health_state,
                 get_coordinate=lambda: self._coordinate_tracker.get_coordinate(),
                 on_peer_coordinate=self._on_peer_coordinate_update,
+                # AD-19 addendum (Phase D): uniform LHM gossip
+                get_lhm_score=lambda: self._local_health.score,
             )
         )
 
@@ -3117,6 +3119,18 @@ class GateServer(HealthAwareServer):
                 node_id=heartbeat.node_id,
                 tcp_host=heartbeat.tcp_host,
                 tcp_port=heartbeat.tcp_port,
+            )
+
+        # AD-19 addendum (Phase D): peer gates report their LHM in
+        # GateHeartbeat. Feed it into cross_dc_correlation so a
+        # stressed gate-tier surfaces alongside manager- and worker-
+        # tier LHM in correlation analysis. Gate's own DC is
+        # ``heartbeat.datacenter`` — the reporting peer's home DC.
+        if self._health_coordinator is not None and heartbeat.datacenter:
+            self._health_coordinator.record_peer_lhm_score(
+                datacenter_id=heartbeat.datacenter,
+                lhm_score=getattr(heartbeat, "lhm_score", 0),
+                node_type="gate",
             )
 
     def _get_known_managers_for_piggyback(

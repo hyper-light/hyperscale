@@ -487,6 +487,11 @@ class GateHeartbeat(Message):
     health_throughput: float = 0.0
     health_expected_throughput: float = 0.0
     health_overload_state: str = "healthy"
+    # AD-19 addendum (Phase D): uniform LHM gossip across all heartbeat
+    # tiers. Gate reports its raw LocalHealthMultiplier.score (0-8) so
+    # cross_dc_correlation can see gate stress alongside manager/worker
+    # LHM and classify systemic load patterns.
+    lhm_score: int = 0  # Local Health Multiplier score (0-8)
 
 
 @dataclass(slots=True, kw_only=True)
@@ -706,6 +711,12 @@ class WorkerHeartbeat(Message):
     # AD-26 Issue 4: Absolute progress metrics (preferred over relative progress)
     extension_completed_items: int = 0  # Absolute count of completed items
     extension_total_items: int = 0  # Total items to complete
+    # AD-19 addendum (Phase D): uniform LHM gossip across all heartbeat
+    # tiers. Worker reports its raw LocalHealthMultiplier.score (0-8)
+    # so cross_dc_correlation can correlate worker stress against
+    # manager/gate stress and distinguish systemic load (multiple tiers
+    # elevated) from isolated failures (one tier elevated).
+    lhm_score: int = 0  # Local Health Multiplier score (0-8)
 
 
 @dataclass(slots=True)
@@ -793,6 +804,14 @@ class ManagerHeartbeat(Message):
     # Used by gates to distinguish load from failures
     workers_with_extensions: int = 0  # Workers currently with active extensions
     lhm_score: int = 0  # Local Health Multiplier score (0-8, higher = more stressed)
+    # AD-19 addendum (Phase D): worker-tier LHM aggregated by the
+    # manager from incoming WorkerHeartbeats. Gates consume this to
+    # see worker-tier stress in their cross_dc_correlation alongside
+    # the manager-tier ``lhm_score``. Carries the **max** observed
+    # across reporting workers — any worker saturating raises the
+    # DC-wide signal. Zero when no workers are currently registered
+    # or none are reporting.
+    worker_max_lhm_score: int = 0
     # AD-37: Backpressure fields for gate throttling
     # Gates use these to throttle forwarded updates when managers are under load
     backpressure_level: int = (

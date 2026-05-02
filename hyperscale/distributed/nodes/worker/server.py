@@ -275,6 +275,8 @@ class WorkerServer(HealthAwareServer):
             get_extension_total_items=lambda: self._worker_state._extension_total_items,
             get_extension_estimated_completion=lambda: self._worker_state._extension_estimated_completion,
             get_extension_active_workflow_count=lambda: len(self._active_workflows),
+            # AD-19 addendum (Phase D): uniform LHM gossip
+            get_lhm_score=lambda: self._local_health.score,
         )
 
         # Initialize parent HealthAwareServer
@@ -821,6 +823,10 @@ class WorkerServer(HealthAwareServer):
             extension_total_items=self._worker_state._extension_total_items,
             extension_estimated_completion=self._worker_state._extension_estimated_completion,
             extension_active_workflow_count=len(self._active_workflows),
+            # AD-19 addendum (Phase D): uniform LHM gossip — workers
+            # report their raw LHM score so cross_dc_correlation can
+            # see worker-tier stress alongside manager/gate stress.
+            lhm_score=self._local_health.score,
         )
 
     def request_extension(

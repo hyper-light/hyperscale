@@ -2910,6 +2910,11 @@ class ManagerServer(HealthAwareServer):
 
     def _build_manager_heartbeat(self) -> ManagerHeartbeat:
         health_state_counts = self._worker_health_monitor.get_worker_health_state_counts()
+        # AD-19 addendum (Phase D): aggregate worker-tier LHM as the
+        # max across registered workers. Empty dict -> 0 (no workers
+        # reporting yet, or all evicted).
+        worker_lhm_scores = self._manager_state._worker_lhm_scores
+        worker_max_lhm = max(worker_lhm_scores.values()) if worker_lhm_scores else 0
         return ManagerHeartbeat(
             node_id=self._node_id.full,
             datacenter=self._node_id.datacenter,
@@ -2934,6 +2939,9 @@ class ManagerServer(HealthAwareServer):
             stressed_worker_count=health_state_counts.get("stressed", 0),
             busy_worker_count=health_state_counts.get("busy", 0),
             health_overload_state=self._manager_health_state_snapshot,
+            # AD-19 addendum (Phase D): manager's own LHM + max worker LHM
+            lhm_score=self._local_health.score,
+            worker_max_lhm_score=worker_max_lhm,
         )
 
     def _get_healthy_gate_tcp_addrs(self) -> list[tuple[str, int]]:

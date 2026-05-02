@@ -191,10 +191,44 @@ class GateHealthCoordinator:
             self._cross_dc_correlation.record_lhm_score(
                 datacenter_id=datacenter_id,
                 lhm_score=heartbeat.lhm_score,
+                node_type="manager",
+            )
+        # AD-19 addendum (Phase D): worker-tier LHM aggregated by the
+        # manager and gossiped through ManagerHeartbeat. Feed it into
+        # cross_dc_correlation so a saturated worker fleet shows up
+        # as DC stress alongside the manager-tier signal.
+        if (
+            getattr(heartbeat, "worker_max_lhm_score", 0) > 0
+        ):
+            self._cross_dc_correlation.record_lhm_score(
+                datacenter_id=datacenter_id,
+                lhm_score=heartbeat.worker_max_lhm_score,
+                node_type="worker",
             )
 
         self._task_runner.run(
             self._versioned_clock.update_entity, dc_key, heartbeat.version
+        )
+
+    def record_peer_lhm_score(
+        self,
+        datacenter_id: str,
+        lhm_score: int,
+        node_type: str,
+    ) -> None:
+        """Record an LHM score reported by an external tier (Phase D).
+
+        Public entry point for gate-peer ``GateHeartbeat`` LHM
+        ingestion. Centralizes routing into ``cross_dc_correlation``
+        so callers don't reach into private state. Skipped silently
+        when ``lhm_score`` is non-positive (treat 0 as "no signal").
+        """
+        if lhm_score <= 0:
+            return
+        self._cross_dc_correlation.record_lhm_score(
+            datacenter_id=datacenter_id,
+            lhm_score=lhm_score,
+            node_type=node_type,
         )
 
     def classify_datacenter_health(self, datacenter_id: str) -> DatacenterStatus:

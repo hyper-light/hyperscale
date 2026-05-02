@@ -165,6 +165,16 @@ class ManagerHealthMonitor:
                 worker_id, worker_health_state
             )
 
+            # AD-19 addendum (Phase D): record worker-tier LHM. The
+            # max across registered workers is what we publish to gates
+            # via ManagerHeartbeat.worker_max_lhm_score so cross-DC
+            # correlation sees worker-tier stress. Defaulting to 0
+            # when the field is absent keeps us compatible with peers
+            # that haven't been upgraded yet.
+            self._state._worker_lhm_scores[worker_id] = (
+                getattr(heartbeat, "lhm_score", 0) or 0
+            )
+
         if previous_state and previous_state != new_state:
             self._log_worker_health_transition(worker_id, previous_state, new_state)
             self._check_aggregate_health_alerts()
