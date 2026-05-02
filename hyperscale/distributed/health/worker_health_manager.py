@@ -14,9 +14,19 @@ Key responsibilities:
 from dataclasses import dataclass, field
 import time
 
+from hyperscale.distributed.health.extension_decision import (
+    ExtensionDecision,
+    ExtensionDecisionConfig,
+    ExtensionDecisionEvaluator,
+    ExtensionDenialCode,
+)
 from hyperscale.distributed.health.extension_tracker import (
     ExtensionTracker,
     ExtensionTrackerConfig,
+)
+from hyperscale.distributed.health.progress_witness import ThroughputWitness
+from hyperscale.distributed.health.workflow_progress_snapshot import (
+    WorkflowProgressSnapshot,
 )
 from hyperscale.distributed.models import (
     HealthcheckExtensionRequest,
@@ -73,12 +83,25 @@ class WorkerHealthManager:
         should_evict, reason = manager.should_evict_worker(worker_id)
     """
 
-    def __init__(self, config: WorkerHealthManagerConfig | None = None):
+    def __init__(
+        self,
+        config: WorkerHealthManagerConfig | None = None,
+        throughput_witness: ThroughputWitness | None = None,
+        decision_config: ExtensionDecisionConfig | None = None,
+    ):
         """
         Initialize the WorkerHealthManager.
 
         Args:
             config: Configuration for extension tracking. Uses defaults if None.
+            throughput_witness: Optional H6 BOCPD throughput witness.
+                When provided, ``handle_extension_request_with_witnesses``
+                runs the multi-witness H5 decision; otherwise the legacy
+                ``handle_extension_request`` path runs the H1 progress-
+                only check. The H7 ledger and H8 outcome feedback both
+                require the witness be wired through.
+            decision_config: Per-evaluator config for the H5 decision
+                orchestrator (rate limit, etc.). Defaults if None.
         """
         self._config = config or WorkerHealthManagerConfig()
         self._extension_config = ExtensionTrackerConfig(
@@ -94,6 +117,20 @@ class WorkerHealthManager:
 
         # Track consecutive extension failures for eviction decisions
         self._extension_failures: dict[str, int] = {}
+
+        # Phase H5 — multi-witness decision orchestrator. Lazy: a manager
+        # without a witness wired in (e.g. unit tests) gets the legacy
+        # path; the production HealthAwareServer construction passes a
+        # witness so the full multi-witness logic activates.
+        self._throughput_witness: ThroughputWitness | None = throughput_witness
+        self._decision_evaluator: ExtensionDecisionEvaluator | None = (
+            ExtensionDecisionEvaluator(
+                throughput_witness=throughput_witness,
+                config=decision_config,
+            )
+            if throughput_witness is not None
+            else None
+        )
 
     def _get_tracker(self, worker_id: str) -> ExtensionTracker:
         """Get or create an ExtensionTracker for a worker."""
@@ -169,6 +206,131 @@ class WorkerHealthManager:
                 grace_period_remaining=grace_remaining,
                 in_grace_period=in_grace,
             )
+
+    def handle_extension_request_with_witnesses(
+        self,
+        request: HealthcheckExtensionRequest,
+        current_deadline: float,
+        snapshot: WorkflowProgressSnapshot,
+        last_snapshot: WorkflowProgressSnapshot | None,
+        throughput: float,
+        overload_state: str,
+        active_in_cluster: int,
+        active_in_dc: int,
+        active_on_manager: int,
+        active_on_worker: int,
+    ) -> tuple[HealthcheckExtensionResponse, ExtensionDecision]:
+        """Phase H5 multi-witness path.
+
+        Runs the full ``ExtensionDecisionEvaluator`` over all five
+        witnesses (counter monotonicity, throughput, overload-state,
+        rate-limit, max-extensions). Commits the decision via
+        ``ExtensionTracker.commit_grant``/``commit_deny`` so tracker
+        state stays consistent with what's gossipped through the
+        AD-48 channel in H7.
+
+        Returns both the wire response (for the worker) and the
+        full ``ExtensionDecision`` value (for H7 ledger replication
+        and H8 outcome feedback).
+
+        Falls back to the legacy ``handle_extension_request`` path
+        when no throughput witness is wired (i.e. the manager was
+        constructed without one — typically unit-test surfaces).
+        """
+        if self._decision_evaluator is None:
+            # Legacy single-witness path; preserve behavior for callers
+            # that didn't wire a throughput witness.
+            response = self.handle_extension_request(request, current_deadline)
+            # Synthesize a minimal ExtensionDecision matching the
+            # legacy outcome so the caller's H7/H8 hooks see a
+            # consistent shape.
+            tracker = self._get_tracker(request.worker_id)
+            from hyperscale.distributed.health.extension_decision import (
+                ExtensionWitnessEvidence,
+            )
+            from hyperscale.distributed.health.progress_witness import (
+                WitnessVerdictKind,
+            )
+            evidence = ExtensionWitnessEvidence(
+                progress_meaningful=response.granted,
+                progress_all_non_regressed=response.granted,
+                progress_any_advanced=response.granted,
+                throughput_verdict_kind=WitnessVerdictKind.COLD_START,
+                throughput_change_point_probability=0.0,
+                throughput_alpha_workflow=0.0,
+                throughput_predictive_mean_before=0.0,
+                throughput_predictive_mean_after=0.0,
+                overload_state=overload_state,
+                seconds_since_last_extension=0.0,
+                extension_count_pre_decision=tracker.extension_count,
+            )
+            decision = ExtensionDecision(
+                granted=response.granted,
+                extension_seconds=response.extension_seconds,
+                denial_reason_code=ExtensionDenialCode(
+                    response.denial_reason_code or "none"
+                ),
+                denial_message=response.denial_reason,
+                evidence=evidence,
+                is_exhaustion_warning=response.is_exhaustion_warning,
+            )
+            return response, decision
+
+        tracker = self._get_tracker(request.worker_id)
+        decision = self._decision_evaluator.decide(
+            tracker=tracker,
+            snapshot=snapshot,
+            last_snapshot=last_snapshot,
+            throughput=throughput,
+            overload_state=overload_state,
+            active_in_cluster=active_in_cluster,
+            active_in_dc=active_in_dc,
+            active_on_manager=active_on_manager,
+            active_on_worker=active_on_worker,
+        )
+
+        # Commit tracker state mutation.
+        if decision.granted:
+            tracker.commit_grant(
+                grant_seconds=decision.extension_seconds,
+                completed_items=request.completed_items,
+                current_progress=request.current_progress,
+            )
+            self._extension_failures.pop(request.worker_id, None)
+            new_deadline = tracker.get_new_deadline(
+                current_deadline, decision.extension_seconds
+            )
+            response = HealthcheckExtensionResponse(
+                granted=True,
+                extension_seconds=decision.extension_seconds,
+                new_deadline=new_deadline,
+                remaining_extensions=tracker.get_remaining_extensions(),
+                denial_reason=None,
+                is_exhaustion_warning=decision.is_exhaustion_warning,
+                grace_period_remaining=0.0,
+                in_grace_period=False,
+                denial_reason_code=ExtensionDenialCode.NONE.value,
+            )
+        else:
+            tracker.commit_deny(decision.denial_reason_code.value)
+            failures = self._extension_failures.get(request.worker_id, 0) + 1
+            self._extension_failures[request.worker_id] = failures
+            response = HealthcheckExtensionResponse(
+                granted=False,
+                extension_seconds=0.0,
+                new_deadline=current_deadline,
+                remaining_extensions=tracker.get_remaining_extensions(),
+                denial_reason=decision.denial_message,
+                is_exhaustion_warning=False,
+                grace_period_remaining=tracker.grace_period_remaining,
+                in_grace_period=tracker.is_in_grace_period,
+                denial_reason_code=decision.denial_reason_code.value,
+            )
+        return response, decision
+
+    @property
+    def throughput_witness(self) -> ThroughputWitness | None:
+        return self._throughput_witness
 
     def on_worker_healthy(self, worker_id: str) -> None:
         """

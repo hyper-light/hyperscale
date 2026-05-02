@@ -1282,6 +1282,15 @@ class HealthcheckExtensionResponse(Message):
     is_exhaustion_warning: bool = False  # True if about to exhaust extensions
     grace_period_remaining: float = 0.0  # Seconds of grace remaining after exhaustion
     in_grace_period: bool = False  # True if exhausted but within grace period
+    # Phase H5 — structured denial code (string-valued so the wire
+    # format stays stable across enum extensions). One of:
+    # "none" / "max_exhausted" / "counter_regression" / "no_advancement"
+    # / "throughput_regime_down" / "overloaded_state" / "rate_limited".
+    # Workers can branch on this without parsing the free-text
+    # ``denial_reason``; observability tooling (Phase H7 ledger,
+    # Phase H8 outcome feedback) consumes it as the canonical
+    # category.
+    denial_reason_code: str = "none"
 
 
 # =============================================================================

@@ -192,6 +192,50 @@ class ExtensionTracker:
         self.exhaustion_time = None
         self.warning_sent = False
 
+    # =========================================================================
+    # Phase H5 — externally-driven commit API
+    # =========================================================================
+    #
+    # Used by ``ExtensionDecisionEvaluator`` after the multi-witness
+    # decision has been disseminated through the AD-48 channel
+    # (Phase H7). The evaluator returns a pure ``ExtensionDecision``;
+    # the caller then commits via one of these methods so the
+    # tracker's internal state stays consistent with what was
+    # gossipped to the rest of the cluster.
+
+    def commit_grant(
+        self,
+        grant_seconds: float,
+        completed_items: int | None = None,
+        current_progress: float = 0.0,
+    ) -> None:
+        """Apply the state mutation for a granted extension.
+
+        Mirrors the post-grant state changes in ``request_extension``
+        without re-running the witness checks (which already passed
+        in the evaluator).
+        """
+        self.extension_count += 1
+        self.last_progress = current_progress
+        if completed_items is not None:
+            self.last_completed_items = completed_items
+        self.total_extended += grant_seconds
+        self.last_extension_time = time.monotonic()
+        # Track exhaustion warning, matching the existing semantics.
+        remaining = self.get_remaining_extensions()
+        if remaining <= self.warning_threshold and not self.warning_sent:
+            self.warning_sent = True
+
+    def commit_deny(self, code: str) -> None:
+        """Apply the state mutation for a denied extension.
+
+        Currently a no-op for non-exhaustion denies; for
+        ``MAX_EXHAUSTED`` we set ``exhaustion_time`` so the AD-26
+        grace-period logic engages.
+        """
+        if code == "max_exhausted" and self.exhaustion_time is None:
+            self.exhaustion_time = time.monotonic()
+
     def get_remaining_extensions(self) -> int:
         """Get the number of remaining extension requests allowed."""
         return max(0, self.max_extensions - self.extension_count)
