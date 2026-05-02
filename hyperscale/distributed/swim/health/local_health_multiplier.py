@@ -91,17 +91,38 @@ class LocalHealthMultiplier:
         """
         Get the current LHM multiplier for timeout calculations.
 
-        Per Lifeguard paper (Section 4.3, page 5):
-        "ProbeTimeout = BaseProbeTimeout × (LHM(S) + 1)"
+        Authoritative source: ``docs/architecture.md`` line 7221:
+        ``effective_timeout = base_timeout × (1 + LHM_score × 0.25)``
 
-        With max_score=8 (S=8), this gives a multiplier range of 1-9.
-        The paper states: "S defaults to 8, which means the probe interval
-        and timeout will back off as high as 9 seconds and 4.5 seconds"
-        (from base values of 1 second and 500ms respectively).
+        With ``max_score=8`` (S=8), this gives a multiplier range of
+        [1.0, 3.0] — well below the raw Lifeguard-paper formula
+        ``ProbeTimeout = BaseProbeTimeout × (LHM + 1)`` which would
+        produce [1.0, 9.0].
 
-        Returns a value from 1.0 (healthy, score=0) to 9.0 (max unhealthy, score=8).
+        The architecture-doc formula is corroborated by:
+
+        * ``architecture.md`` lines 7140–7155 (Backpressure & Degradation
+          table): NORMAL 1.0×, ELEVATED 1.25×, HIGH 1.5×, SEVERE 2×,
+          CRITICAL 3×. Endpoints match ``1 + score × 0.25`` exactly.
+        * ``JobSuspicionConfig.max_lhm_backoff_multiplier = 3.0``
+          (``job_suspicion_manager.py:45``) — the job layer already
+          caps LHM at 3.0 when applying it to poll intervals.
+        * AD-35 §"For Managers" line 352 worked example uses
+          ``2.5 × LHM`` (in [1, 3]).
+
+        The paper-formula range [1, 9] would push suspicion timers and
+        probe timeouts off the cliff under sustained probe failures.
+        Returning the doc-formula here unifies all consumers (probe
+        path via ``get_lhm_adjusted_timeout``, suspicion timer via
+        ``HierarchicalFailureDetector.suspect_global``, job-layer
+        polling) on a single deployment-stable scale.
+
+        Callers that want the raw 0–8 score (e.g. ``cross_dc_correlation``
+        for systemic-load detection, ``leader_eligibility`` for
+        candidate ranking) read ``self.score`` directly — keep the raw
+        signal and the timeout multiplier conceptually separate.
         """
-        return 1.0 + self.score
+        return 1.0 + (self.score * 0.25)
     
     def reset(self) -> None:
         """Reset LHM to healthy state."""
