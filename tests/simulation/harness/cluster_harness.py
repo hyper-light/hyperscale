@@ -33,6 +33,7 @@ from tests.simulation.harness.dc_spec import DCSpec
 from tests.simulation.harness.diagnostics import DiagnosticDumper
 from tests.simulation.harness.env_overrides import EnvOverrides
 from tests.simulation.harness.execution_mode import ExecutionMode
+from tests.simulation.harness.fault_matrix import FaultMatrix
 from tests.simulation.harness.invariants import (
     InvariantChecker,
     LivenessInvariant,
@@ -82,6 +83,7 @@ class ClusterHarness:
     _ports: PortAllocator = field(init=False)
     _diagnostics: DiagnosticDumper = field(init=False)
     _invariants: InvariantChecker = field(init=False)
+    _faults: FaultMatrix = field(init=False)
     _handles_by_id: dict[str, ServerHandle] = field(init=False, default_factory=dict)
     _gates: list[ServerHandle] = field(init=False, default_factory=list)
     _managers_by_dc: dict[str, list[ServerHandle]] = field(init=False, default_factory=dict)
@@ -121,6 +123,8 @@ class ClusterHarness:
             self._invariants.add_safety(safety)
         for liveness in self.extra_liveness_invariants:
             self._invariants.add_liveness(liveness)
+
+        self._faults = FaultMatrix(harness=self)
 
         await self._supervisor.__aenter__()
 
@@ -175,6 +179,11 @@ class ClusterHarness:
     @property
     def supervisor(self) -> Supervisor:
         return self._supervisor
+
+    @property
+    def faults(self) -> FaultMatrix:
+        """Fault-injection primitives for this harness (Phase 3)."""
+        return self._faults
 
     @property
     def gates(self) -> list[ServerHandle]:
@@ -250,18 +259,25 @@ class ClusterHarness:
             node_id = f"global.gate.{index}"
             peer_tcp = [addr for addr in all_gate_tcp if addr != (self.spec.host, tcp)]
             peer_udp = [addr for addr in all_gate_udp if addr != (self.spec.host, udp)]
-            env = self._build_env(node_id=node_id, dc_id="global", dc_spec=None)
-            gate = GateServer(
-                host=self.spec.host,
-                tcp_port=tcp,
-                udp_port=udp,
-                env=env,
-                dc_id="global",
-                datacenter_managers=datacenter_managers,
-                datacenter_manager_udp=datacenter_manager_udp,
-                gate_peers=peer_tcp,
-                gate_udp_peers=peer_udp,
-            )
+
+            def _build_gate(
+                _node_id=node_id, _tcp=tcp, _udp=udp, _peer_tcp=peer_tcp,
+                _peer_udp=peer_udp,
+            ) -> GateServer:
+                env = self._build_env(node_id=_node_id, dc_id="global", dc_spec=None)
+                return GateServer(
+                    host=self.spec.host,
+                    tcp_port=_tcp,
+                    udp_port=_udp,
+                    env=env,
+                    dc_id="global",
+                    datacenter_managers=datacenter_managers,
+                    datacenter_manager_udp=datacenter_manager_udp,
+                    gate_peers=_peer_tcp,
+                    gate_udp_peers=_peer_udp,
+                )
+
+            gate = _build_gate()
             handle = ServerHandle(
                 node_id=node_id,
                 kind=ServerKind.GATE,
@@ -270,6 +286,7 @@ class ClusterHarness:
                 tcp_port=tcp,
                 udp_port=udp,
                 instance=gate,
+                builder=_build_gate,
             )
             self._handles_by_id[node_id] = handle
             self._gates.append(handle)
@@ -292,18 +309,27 @@ class ClusterHarness:
                 peer_udp = [
                     (self.spec.host, u) for (_t, u) in addrs if u != udp
                 ]
-                env = self._build_env(node_id=node_id, dc_id=dc_id, dc_spec=dc_spec)
-                manager = ManagerServer(
-                    host=self.spec.host,
-                    tcp_port=tcp,
-                    udp_port=udp,
-                    env=env,
-                    dc_id=dc_id,
-                    gate_addrs=gate_tcp or None,
-                    gate_udp_addrs=gate_udp or None,
-                    seed_managers=peer_tcp or None,
-                    manager_udp_peers=peer_udp or None,
-                )
+
+                def _build_manager(
+                    _node_id=node_id, _dc_id=dc_id, _dc_spec=dc_spec,
+                    _tcp=tcp, _udp=udp, _peer_tcp=peer_tcp, _peer_udp=peer_udp,
+                ) -> ManagerServer:
+                    env = self._build_env(
+                        node_id=_node_id, dc_id=_dc_id, dc_spec=_dc_spec,
+                    )
+                    return ManagerServer(
+                        host=self.spec.host,
+                        tcp_port=_tcp,
+                        udp_port=_udp,
+                        env=env,
+                        dc_id=_dc_id,
+                        gate_addrs=gate_tcp or None,
+                        gate_udp_addrs=gate_udp or None,
+                        seed_managers=_peer_tcp or None,
+                        manager_udp_peers=_peer_udp or None,
+                    )
+
+                manager = _build_manager()
                 handle = ServerHandle(
                     node_id=node_id,
                     kind=ServerKind.MANAGER,
@@ -312,6 +338,7 @@ class ClusterHarness:
                     tcp_port=tcp,
                     udp_port=udp,
                     instance=manager,
+                    builder=_build_manager,
                 )
                 self._handles_by_id[node_id] = handle
                 self._managers_by_dc[dc_id].append(handle)
@@ -330,20 +357,27 @@ class ClusterHarness:
             ]
             for index, (tcp, udp) in enumerate(addrs):
                 node_id = f"{dc_id}.worker.{index}"
-                env = self._build_env(
-                    node_id=node_id,
-                    dc_id=dc_id,
-                    dc_spec=dc_spec,
-                    worker_cores=dc_spec.cores_per_worker,
-                )
-                worker = WorkerServer(
-                    host=self.spec.host,
-                    tcp_port=tcp,
-                    udp_port=udp,
-                    env=env,
-                    dc_id=dc_id,
-                    seed_managers=seed_managers,
-                )
+
+                def _build_worker(
+                    _node_id=node_id, _dc_id=dc_id, _dc_spec=dc_spec,
+                    _tcp=tcp, _udp=udp,
+                ) -> WorkerServer:
+                    env = self._build_env(
+                        node_id=_node_id,
+                        dc_id=_dc_id,
+                        dc_spec=_dc_spec,
+                        worker_cores=_dc_spec.cores_per_worker,
+                    )
+                    return WorkerServer(
+                        host=self.spec.host,
+                        tcp_port=_tcp,
+                        udp_port=_udp,
+                        env=env,
+                        dc_id=_dc_id,
+                        seed_managers=seed_managers,
+                    )
+
+                worker = _build_worker()
                 handle = ServerHandle(
                     node_id=node_id,
                     kind=ServerKind.WORKER,
@@ -355,6 +389,7 @@ class ClusterHarness:
                     worker_ports=WorkerPorts.for_worker(
                         tcp=tcp, udp=udp, cores=dc_spec.cores_per_worker
                     ),
+                    builder=_build_worker,
                 )
                 self._handles_by_id[node_id] = handle
                 self._workers_by_dc[dc_id].append(handle)

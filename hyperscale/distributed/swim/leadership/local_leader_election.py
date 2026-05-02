@@ -57,8 +57,15 @@ class LocalLeaderElection:
     # Reference to node address (set by owner)
     self_addr: tuple[str, int] | None = None
     
-    # Callbacks for sending messages (set by owner)
-    _broadcast_message: Callable[[bytes], None] | None = None
+    # Callbacks for sending messages (set by owner). The broadcast is
+    # awaitable because the only real implementation
+    # (HealthAwareServer._broadcast_leadership_message) is async — it
+    # reads current_timeout from the server context and dispatches sends
+    # via the task runner. Earlier this field was typed as sync; calls
+    # silently produced a coroutine that was dropped on the floor and
+    # NO leadership messages ever left the node, so multi-manager
+    # leader election never converged.
+    _broadcast_message: Callable[[bytes], Awaitable[None]] | None = None
     _get_member_count: Callable[[], int] | None = None
     _get_lhm_score: Callable[[], int] | None = None
     _send_to_node: Callable[[tuple[str, int], bytes], None] | None = None
@@ -116,10 +123,34 @@ class LocalLeaderElection:
                 ))
             except Exception:
                 pass  # Don't let logging errors propagate
+
+    def _log_debug_sync(self, message: str) -> None:
+        """Schedule a debug log from a synchronous code path.
+
+        Pre-vote / claim / vote handlers run synchronously but still need
+        observability. Schedule the log via the task runner if available;
+        otherwise drop on the floor (logging is best-effort).
+        """
+        if not self._logger:
+            return
+        if self._task_runner is None:
+            return
+        try:
+            self._task_runner.run(
+                self._logger.log,
+                ServerDebug(
+                    message=f"[LocalLeaderElection] {message}",
+                    node_host=self._node_host,
+                    node_port=self._node_port,
+                    node_id=self._node_id,
+                ),
+            )
+        except Exception:
+            pass
     
     def set_callbacks(
         self,
-        broadcast_message: Callable[[bytes], None],
+        broadcast_message: Callable[[bytes], Awaitable[None]],
         get_member_count: Callable[[], int],
         get_lhm_score: Callable[[], int],
         self_addr: tuple[str, int],
@@ -225,26 +256,42 @@ class LocalLeaderElection:
     
     async def _election_loop(self) -> None:
         """Main election monitoring loop."""
+        await self._log_debug(
+            f"election_loop start self_addr={self.self_addr} dc={self.dc_id}"
+        )
         while self._running:
             try:
                 if self.state.is_leader():
                     # Leader: check if we should step down
                     if self.should_step_down():
+                        await self._log_debug(
+                            f"step_down triggered (LHM-driven) "
+                            f"term={self.state.current_term}"
+                        )
                         await self._step_down()
                     else:
                         await asyncio.sleep(self.heartbeat_interval)
                         await self._send_heartbeat()
-                
+
                 elif self.state.should_start_election():
                     # No leader or lease expired: maybe start election
-                    
+
                     # Check flapping - delay election if needed
                     should_delay, delay = self.flapping_detector.should_delay_election()
                     if should_delay:
+                        await self._log_debug(
+                            f"election delayed by flapping detector ({delay:.2f}s)"
+                        )
                         await asyncio.sleep(delay)
                         continue
-                    
-                    if self.is_self_eligible():
+
+                    eligible = self.is_self_eligible()
+                    await self._log_debug(
+                        f"election_loop tick: starting election "
+                        f"term={self.state.current_term} eligible={eligible} "
+                        f"members={self._get_member_count() if self._get_member_count else '?'}"
+                    )
+                    if eligible:
                         await self._run_election()
                     else:
                         # Not eligible, log and wait for someone else
@@ -317,14 +364,23 @@ class LocalLeaderElection:
     async def _run_pre_vote(self) -> bool:
         """
         Run pre-vote phase before election.
-        
+
         Pre-voting prevents split-brain by checking if other nodes
         would vote for us before actually starting an election.
         This prevents disrupting a healthy leader.
-        
+
         Returns True if pre-vote succeeded and we should proceed.
         """
+        await self._log_debug(
+            f"pre_vote start self={self.self_addr} "
+            f"broadcast_callable={self._broadcast_message is not None} "
+            f"members={self._get_member_count() if self._get_member_count else '?'} "
+            f"current_term={self.state.current_term}"
+        )
         if not self.self_addr or not self._broadcast_message:
+            await self._log_debug(
+                "pre_vote abort: self_addr or broadcast callback unset"
+            )
             return False
         
         # Abort if already in pre-vote (concurrent election attempt)
@@ -351,7 +407,7 @@ class LocalLeaderElection:
                 str(lhm).encode() + b'>' +
                 f'{self.self_addr[0]}:{self.self_addr[1]}'.encode()
             )
-            self._broadcast_message(pre_vote_msg)
+            await self._broadcast_message(pre_vote_msg)
             
             # Wait for pre-votes with timeout protection
             await asyncio.sleep(self.pre_vote_timeout)
@@ -372,8 +428,15 @@ class LocalLeaderElection:
             n_members = self._get_member_count() if self._get_member_count else 1
             # Pre-vote needs majority: floor(n/2) + 1, but at least 1
             pre_votes_needed = max(1, (n_members // 2) + 1)
-            
+
             success = len(self.state.pre_votes_received) >= pre_votes_needed
+            await self._log_debug(
+                f"pre_vote result self={self.self_addr} term={new_term} "
+                f"members={n_members} needed={pre_votes_needed} "
+                f"got={len(self.state.pre_votes_received)} "
+                f"voters={list(self.state.pre_votes_received)} "
+                f"success={success}"
+            )
             return success
         except asyncio.CancelledError:
             # Pre-vote cancelled - clean up state
@@ -385,78 +448,113 @@ class LocalLeaderElection:
     async def _run_election(self) -> None:
         """Run a leader election with pre-voting for split-brain prevention."""
         if not self.self_addr or not self._broadcast_message:
+            await self._log_debug(
+                "run_election abort: self_addr or broadcast callback unset"
+            )
             return
-        
+
         # Phase 1: Pre-vote (split-brain prevention)
         pre_vote_success = await self._run_pre_vote()
-        
+
         if not pre_vote_success:
             # Pre-vote failed - don't start election
             # This likely means there's a healthy leader we can't reach
             # or other nodes wouldn't vote for us
+            await self._log_debug(
+                "run_election abort: pre_vote did not reach majority"
+            )
             return
-        
+
         # Phase 2: Real election
         new_term = self.state.next_term()
-        
+
         # Check for term exhaustion (indicates attack or severe bug)
         if self.state.is_term_exhausted():
             # Log and bail - this should never happen in normal operation
             await self._log_debug(f"CRITICAL: Term exhausted at {self.state.current_term}")
             return
-        
+
         if not self.state.start_election(new_term):
             # Term overflow - shouldn't happen with next_term()
+            await self._log_debug(
+                f"run_election abort: start_election rejected term={new_term}"
+            )
             return
         self.state.update_fencing_token(new_term)
-        
+
         # Notify that election has started (for metrics)
         if self._on_election_started:
             self._on_election_started()
-        
+
         # Vote for self
         self.state.vote_for(self.self_addr, new_term)
         self.state.record_vote(self.self_addr)
-        
+
         # Broadcast claim
         lhm = self._get_lhm_score() if self._get_lhm_score else 0
         claim_msg = (
-            b'leader-claim:' + 
+            b'leader-claim:' +
             str(new_term).encode() + b':' +
             str(lhm).encode() + b'>' +
             f'{self.self_addr[0]}:{self.self_addr[1]}'.encode()
         )
-        self._broadcast_message(claim_msg)
-        
+        await self._log_debug(
+            f"run_election broadcast leader-claim term={new_term} lhm={lhm}"
+        )
+        await self._broadcast_message(claim_msg)
+
         # Wait for votes
-        await asyncio.sleep(self.get_election_timeout())
-        
+        election_timeout = self.get_election_timeout()
+        await asyncio.sleep(election_timeout)
+
         # Check if we won
         if self.state.role == 'candidate':  # Still candidate
             n_members = self._get_member_count() if self._get_member_count else 1
             # Majority = floor(n/2) + 1, equivalent to (n // 2) + 1
             votes_needed = (n_members // 2) + 1
-            
+
+            await self._log_debug(
+                f"run_election tally term={new_term} members={n_members} "
+                f"needed={votes_needed} got={len(self.state.votes_received)} "
+                f"voters={list(self.state.votes_received)}"
+            )
+
             if len(self.state.votes_received) >= votes_needed:
                 # We won!
                 old_leader = self.state.current_leader
                 if not self.state.become_leader(new_term):
                     # Term became invalid (shouldn't happen)
+                    await self._log_debug(
+                        f"run_election abort: become_leader rejected "
+                        f"term={new_term}"
+                    )
                     return
                 self.state.current_leader = self.self_addr
                 await self._record_leader_change(old_leader, self.self_addr, 'election')
                 self.state.update_fencing_token(new_term)
-                
+
                 # Announce victory
                 elected_msg = (
                     b'leader-elected:' +
                     str(new_term).encode() + b'>' +
                     f'{self.self_addr[0]}:{self.self_addr[1]}'.encode()
                 )
-                self._broadcast_message(elected_msg)
-                
+                await self._log_debug(
+                    f"run_election won — broadcasting leader-elected term={new_term}"
+                )
+                await self._broadcast_message(elected_msg)
+
                 # Start heartbeating
                 await self._send_heartbeat()
+            else:
+                await self._log_debug(
+                    f"run_election lost: not enough votes "
+                    f"({len(self.state.votes_received)} < {votes_needed})"
+                )
+        else:
+            await self._log_debug(
+                f"run_election ended as {self.state.role}; not tallying votes"
+            )
     
     async def _send_heartbeat(self) -> None:
         """Send leader heartbeat."""
@@ -470,7 +568,7 @@ class LocalLeaderElection:
             str(self.state.current_term).encode() + b'>' +
             f'{self.self_addr[0]}:{self.self_addr[1]}'.encode()
         )
-        self._broadcast_message(heartbeat_msg)
+        await self._broadcast_message(heartbeat_msg)
         
         # Notify metrics
         if self._on_heartbeat_sent:
@@ -486,7 +584,7 @@ class LocalLeaderElection:
             str(self.state.current_term).encode() + b'>' +
             f'{self.self_addr[0]}:{self.self_addr[1]}'.encode()
         )
-        self._broadcast_message(stepdown_msg)
+        await self._broadcast_message(stepdown_msg)
         
         await self._record_leader_change(self.self_addr, None, 'stepdown')
         self.state.become_follower(self.state.current_term)
@@ -578,10 +676,15 @@ class LocalLeaderElection:
     ) -> bytes | None:
         """
         Handle a pre-vote request.
-        
+
         Returns pre-vote response if we would vote for them, None otherwise.
         Pre-votes don't update our state - they're just a check.
         """
+        self._log_debug_sync(
+            f"handle_pre_vote_request self={self.self_addr} "
+            f"candidate={candidate} term={term} candidate_lhm={candidate_lhm} "
+            f"current_term={self.state.current_term}"
+        )
         if not self.self_addr:
             return None
         
@@ -621,9 +724,14 @@ class LocalLeaderElection:
     ) -> None:
         """
         Handle a pre-vote response.
-        
+
         Records the pre-vote if it was granted and matches our pre-vote term.
         """
+        self._log_debug_sync(
+            f"handle_pre_vote_response voter={voter} term={term} granted={granted} "
+            f"self_pre_vote_term={self.state.pre_vote_term} "
+            f"pre_voting_in_progress={self.state.pre_voting_in_progress}"
+        )
         if term != self.state.pre_vote_term or not self.state.pre_voting_in_progress:
             return
         

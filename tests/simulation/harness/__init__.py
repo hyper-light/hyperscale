@@ -39,6 +39,7 @@ from tests.simulation.harness.expectations import (
     ExpectationResult,
     WorkloadObservations,
 )
+from tests.simulation.harness.fault_matrix import FaultError, FaultMatrix
 from tests.simulation.harness.invariants import (
     InvariantChecker,
     InvariantResult,
@@ -75,6 +76,8 @@ __all__ = [
     "ExpectCompletionWithin",
     "Expectation",
     "ExpectationResult",
+    "FaultError",
+    "FaultMatrix",
     "HarnessError",
     "HarnessTimeouts",
     "InvariantChecker",

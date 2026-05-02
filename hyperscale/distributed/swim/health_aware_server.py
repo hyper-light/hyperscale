@@ -1737,6 +1737,18 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             on_heartbeat_sent=self._on_heartbeat_sent,
         )
 
+        # Wire the project Logger into the leader-election machinery so
+        # _log_debug / _log_debug_sync calls land in the server log
+        # stream alongside everything else. Without this, the election
+        # subsystem is silent — any failure to converge (pre-vote not
+        # reaching peers, broadcast targets empty, etc.) is invisible.
+        self._leader_election.set_logger(
+            logger=self._udp_logger,
+            node_host=self._host,
+            node_port=self._udp_port,
+            node_id=self._node_id.short,
+        )
+
         # Set up leadership event callbacks
         self._leader_election.state.set_callbacks(
             on_become_leader=self._on_become_leader,
@@ -1759,15 +1771,31 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         base_timeout = await self._context.read("current_timeout")
         timeout = self.get_lhm_adjusted_timeout(base_timeout)
 
-        for node in list(self._incarnation_tracker.node_states.keys()):
-            if node != self_addr:
-                # Use task runner but schedule error-aware send
-                self._task_runner.run(
-                    self._send_leadership_message,
-                    node,
-                    message,
-                    timeout,
-                )
+        nodes = list(self._incarnation_tracker.node_states.keys())
+        targets = [node for node in nodes if node != self_addr]
+
+        await self._udp_logger.log(
+            ServerDebug(
+                message=(
+                    f"[Leadership] broadcast self={self_addr} "
+                    f"msg_prefix={message[:32]!r} "
+                    f"tracker_nodes={nodes} targets={targets} "
+                    f"timeout={timeout:.3f}"
+                ),
+                node_host=self._host,
+                node_port=self._udp_port,
+                node_id=self._node_id.short,
+            )
+        )
+
+        for node in targets:
+            # Use task runner but schedule error-aware send
+            self._task_runner.run(
+                self._send_leadership_message,
+                node,
+                message,
+                timeout,
+            )
 
     async def _send_leadership_message(
         self,
@@ -3796,6 +3824,20 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             # probe was rejected as `Missing target address`.
             data = await self._extract_embedded_state(data, addr)
 
+            if data.startswith((b"pre-vote", b"leader-claim", b"leader-elected",
+                                b"leader-heartbeat", b"leader-stepdown",
+                                b"vote-grant", b"vote-deny")):
+                await self._udp_logger.log(
+                    ServerDebug(
+                        message=(
+                            f"[Leadership] inbound from={addr} "
+                            f"data_prefix={data[:48]!r}"
+                        ),
+                        node_host=self._host,
+                        node_port=self._udp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
             # Delegate to the message dispatcher for handler-based processing
             return await self._message_dispatcher.dispatch(addr, data, clock_time)
 

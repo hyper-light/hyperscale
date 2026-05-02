@@ -10,7 +10,7 @@ classes, so any future server kind drops in via the same interface.
 
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any
+from typing import Any, Callable
 
 from tests.simulation.harness.worker_ports import WorkerPorts
 
@@ -33,6 +33,13 @@ class ServerHandle:
     `instance` is the actual server object; the supervisor does not call
     methods on it directly, but downstream modules (FaultMatrix,
     InvariantChecker, DiagnosticDumper) need access to its state.
+
+    `builder` is a zero-arg async (or sync) callable that constructs a
+    *fresh* server instance with the same configuration this handle was
+    created with — same host, ports, env, peers, etc. The harness uses
+    it to rebuild the server on `FaultMatrix.restart()`. Construction is
+    cheap (no network) so the builder closure is captured once at
+    `_build_*` time and reused on every restart.
     """
 
     node_id: str
@@ -49,3 +56,6 @@ class ServerHandle:
 
     started: bool = field(default=False)
     """Flipped by the harness once `await instance.start()` returns."""
+
+    builder: Callable[[], Any] | None = field(default=None)
+    """Zero-arg factory that constructs a fresh instance for restart."""
