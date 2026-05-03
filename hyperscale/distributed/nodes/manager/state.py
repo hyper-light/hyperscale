@@ -594,6 +594,12 @@ class ManagerState:
         """Get existing job context or create a new one if it doesn't exist."""
         context = self._job_contexts.get(job_id)
         if context is None:
+            # ``Context`` is a TYPE_CHECKING-only import at module
+            # scope to avoid a circular import; instantiate via a
+            # runtime local import. The class is small and the
+            # import is cached on first call.
+            from hyperscale.core.state.context import Context
+
             context = Context()
             self._job_contexts[job_id] = context
         return context

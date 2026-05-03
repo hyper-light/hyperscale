@@ -332,9 +332,31 @@ class JobManager:
             self._jobs[job_token_str] = job
             return job
 
-    def get_job(self, job_token: str | TrackingToken) -> JobInfo | None:
-        """Get job info by token. Returns None if not found."""
-        token_str = str(job_token)
+    def get_job(self, job_token_or_id: str | TrackingToken) -> JobInfo | None:
+        """Get job info by token-string or bare job_id.
+
+        Storage is keyed by token-string (``"<DC>:<MANAGER>:<JOB>"``).
+        Callers historically split between two helpers:
+
+        * ``get_job(token)`` for callers that already had a token.
+        * ``get_job_by_id(job_id)`` for callers that had only the
+          bare job_id.
+
+        Many call sites (cancel handler, dispatch handler, query
+        handlers) passed a bare job_id to ``get_job`` and silently
+        got ``None`` — masking real job state behind "Job not
+        found" responses. To eliminate that footgun, ``get_job``
+        now accepts both forms: if the input doesn't carry the
+        token-segment delimiter ``":"`` it is assumed to be a
+        bare job_id and routed through ``create_job_token`` first.
+
+        ``get_job_by_id`` is preserved as the explicit-by-id
+        accessor for callers that want to make their intent
+        unambiguous.
+        """
+        token_str = str(job_token_or_id)
+        if ":" not in token_str:
+            token_str = str(self.create_job_token(token_str))
         return self._jobs.get(token_str)
 
     def get_job_by_id(self, job_id: str) -> JobInfo | None:

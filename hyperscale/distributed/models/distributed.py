@@ -1032,6 +1032,14 @@ class JobCancelResponse(Message):
     - Gate: Aggregated result from all DCs
     - Manager: DC-local result
     - Worker: Workflow-level result
+
+    Leader redirection:
+    A manager that is NOT the leader for ``job_id`` populates
+    ``leader_addr`` with the current leader's TCP address and sets
+    ``success=False``. The client's cancel path follows the redirect
+    analogously to ``JobAck`` on submission. Without this, a
+    non-leader silently completes 0 workflows and reports success
+    while the actual cancel never happens.
     """
 
     job_id: str  # Job that was cancelled
@@ -1040,6 +1048,7 @@ class JobCancelResponse(Message):
     already_cancelled: bool = False  # True if job was already cancelled
     already_completed: bool = False  # True if job was already completed
     error: str | None = None  # Error message if failed
+    leader_addr: tuple[str, int] | None = None  # Leader address for redirect
 
 
 @dataclass(slots=True)
@@ -1209,7 +1218,8 @@ class CancelledWorkflowInfo:
     job_id: str  # Parent job ID
     workflow_id: str  # Cancelled workflow ID
     cancelled_at: float  # When cancelled
-    request_id: str  # Original request ID
+    request_id: str = ""  # Original request ID
+    reason: str = ""  # Free-text cancellation reason
     dependents: list[str] = field(default_factory=list)  # Cancelled dependents
 
 

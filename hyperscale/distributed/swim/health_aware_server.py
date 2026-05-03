@@ -1024,13 +1024,22 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             self._error_handler.record_success(ErrorCategory.NETWORK)
 
     async def handle_error(self, error: SwimError) -> None:
-        """Handle a SWIM protocol error."""
-        # Track error by category
-        if error.category == ErrorCategory.NETWORK:
+        """Handle a SWIM protocol error.
+
+        ``error`` is typed as ``SwimError`` but the receive path may
+        deliver a raw ``Exception`` (e.g. a ``TypeError`` from
+        upstream message parsing) before it has been wrapped into a
+        ``SwimError``. Guard the ``.category`` access so an unwrapped
+        exception doesn't trip an ``AttributeError`` and cascade
+        through the circuit breaker as a spurious INTERNAL error.
+        """
+        # Track error by category — only when category is present
+        category = getattr(error, "category", None)
+        if category == ErrorCategory.NETWORK:
             self._metrics.increment("network_errors")
-        elif error.category == ErrorCategory.PROTOCOL:
+        elif category == ErrorCategory.PROTOCOL:
             self._metrics.increment("protocol_errors")
-        elif error.category == ErrorCategory.RESOURCE:
+        elif category == ErrorCategory.RESOURCE:
             self._metrics.increment("resource_errors")
 
         if self._error_handler:

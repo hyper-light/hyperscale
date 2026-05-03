@@ -271,7 +271,9 @@ class WorkloadDriver:
                     "an explicit job_id."
                 )
             target_job = self._observations.submitted_job_ids[-1]
-        await self._client.cancel_job(job_id=target_job, reason=reason)
+        await self._client.cancel_job(
+            job_id=target_job, reason=reason, timeout=timeout
+        )
         try:
             success, errors = await asyncio.wait_for(
                 self._client.await_job_cancellation(target_job, timeout=timeout),
@@ -349,14 +351,35 @@ class WorkloadDriver:
             if not self._running_event.is_set():
                 self._running_event.set()
 
+    def _mark_running_if_dispatched(self) -> None:
+        """Idempotent helper for the running-event trip wire.
+
+        Called from progress-update and workflow-result callbacks to
+        cover the path where the gate / manager coalesces multiple
+        state pushes (a fast workflow may produce a progress update
+        or final result before any RUNNING status push reaches the
+        client). Either signal definitionally implies the workflow
+        was dispatched and at least started.
+        """
+        if not self._running_event.is_set():
+            self._running_event.set()
+
     def _on_progress_update(self, push: object) -> None:
         self._observations.progress_update_count += 1
+        # Progress updates only flow once a workflow has started
+        # producing telemetry, so the dispatch trip wire fires here
+        # too — a gate that coalesces JobStatusPush.RUNNING into a
+        # downstream state still emits per-workflow progress updates
+        # while execution runs.
+        self._mark_running_if_dispatched()
 
     def _on_workflow_result(self, push: object) -> None:
         workflow_name = getattr(push, "workflow_name", None)
         status = getattr(push, "status", None)
         if not workflow_name or status is None:
             return
+        # A final result implies the workflow ran to terminal state.
+        self._mark_running_if_dispatched()
         self._observations.workflow_results[workflow_name] = status
         if (
             self._expected_workflow_names

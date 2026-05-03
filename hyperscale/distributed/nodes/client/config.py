@@ -21,6 +21,15 @@ TRANSIENT_ERRORS = frozenset({
     "overload",
     "too many",
     "server busy",
+    # Leader-redirect responses produced by a manager that knows it
+    # is not the leader but couldn't resolve the leader's address
+    # (e.g. cluster mid-election, peer heartbeats not yet arrived).
+    # The robust path is for the manager to populate ``leader_addr``
+    # from peer state — see ``ManagerServer._resolve_dc_leader_addr``.
+    # When the manager genuinely cannot resolve, this transient
+    # classification lets the client round-robin to another target.
+    "not dc leader",
+    "not job leader",
 })
 
 

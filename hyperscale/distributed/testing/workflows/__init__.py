@@ -13,9 +13,12 @@ The catalog grows in later phases (DependentWorkflow, LongRunningWorkflow,
 CancellingWorkflow, PanickingWorkflow, LeakyWorkflow).
 """
 
+from hyperscale.distributed.testing.workflows.long_running_workflow import (
+    LongRunningWorkflow,
+)
 from hyperscale.distributed.testing.workflows.simple_workflow import (
     SimpleWorkflow,
 )
 
 
-__all__ = ["SimpleWorkflow"]
+__all__ = ["LongRunningWorkflow", "SimpleWorkflow"]

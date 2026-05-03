@@ -352,9 +352,13 @@ class GateCancellationHandler:
     ) -> None:
         """Push job cancellation completion to client callback."""
         try:
+            # Action name aligned with the client's
+            # @tcp.receive() handler (``job_cancellation_complete``).
+            # A prior incarnation sent ``receive_job_cancellation_complete``
+            # which silently mismatched the client's registered handler.
             await self._send_tcp(
                 callback,
-                "receive_job_cancellation_complete",
+                "job_cancellation_complete",
                 completion.dump(),
                 timeout=2.0,
             )

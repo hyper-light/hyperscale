@@ -544,13 +544,20 @@ class HyperscaleClient(MercurySyncBaseServer):
         return await self._windowed_stats_push_handler.handle(addr, data, clock_time)
 
     @tcp.receive()
-    async def receive_job_cancellation_complete(
+    async def job_cancellation_complete(
         self,
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
     ) -> bytes:
-        """Handle cancellation completion push."""
+        """Handle cancellation completion push (AD-20).
+
+        Wire-action name MUST match what the manager pushes (see
+        ``ManagerServer._push_cancellation_complete_to_origin`` —
+        action ``"job_cancellation_complete"``). The
+        ``@tcp.receive()`` decorator registers handlers by
+        ``func.__name__``; this method name is the wire match.
+        """
         return await self._cancellation_complete_handler.handle(addr, data, clock_time)
 
     @tcp.receive()

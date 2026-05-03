@@ -304,11 +304,21 @@ class ManagerServer(HealthAwareServer):
         )
 
         # Lease coordinator for fencing tokens and job leadership
+        # NOTE: passes ``self._node_id.full`` because the leader's
+        # claim path stores this string in
+        # ``_manager_state._job_leaders``; the leadership-announcement
+        # path on the receiving manager stores
+        # ``announcement.leader_id`` which is also the full id (set
+        # via ``leader_id=self._node_id.full`` at the announcement
+        # construction site). Using ``.short`` here would cause the
+        # leader's self-stored value to disagree with what every
+        # follower stores, tripping the AtMostOneJobLeaderPerJob
+        # safety invariant on every job submit.
         self._leases = ManagerLeaseCoordinator(
             state=self._manager_state,
             config=self._config,
             logger=self._udp_logger,
-            node_id=self._node_id.short,
+            node_id=self._node_id.full,
             task_runner=self._task_runner,
         )
 
@@ -2943,6 +2953,7 @@ class ManagerServer(HealthAwareServer):
         cancelled_count: int = 0,
         already_cancelled: bool = False,
         already_completed: bool = False,
+        leader_addr: tuple[str, int] | None = None,
     ) -> bytes:
         """Build cancel response in AD-20 format."""
         return JobCancelResponse(
@@ -2952,6 +2963,7 @@ class ManagerServer(HealthAwareServer):
             cancelled_workflow_count=cancelled_count,
             already_cancelled=already_cancelled,
             already_completed=already_completed,
+            leader_addr=leader_addr,
         ).dump()
 
     def _build_manager_heartbeat(self) -> ManagerHeartbeat:
@@ -3178,7 +3190,7 @@ class ManagerServer(HealthAwareServer):
             # to record a meaningful event.
             return None
 
-        leader_term = self._leadership_coordinator._get_term()
+        leader_term = self._leader_election.state.current_term
 
         active_on_worker = max(1, request.active_workflow_count)
         active_on_manager = max(active_on_worker, self._count_active_workflows())
@@ -3328,7 +3340,7 @@ class ManagerServer(HealthAwareServer):
         if job is None:
             return
 
-        leader_term = self._leadership_coordinator._get_term()
+        leader_term = self._leader_election.state.current_term
         completed_at = time.monotonic()
         ledger = self._worker_health_manager.ledger
 
@@ -3423,7 +3435,7 @@ class ManagerServer(HealthAwareServer):
         if job is not None:
             fence_token = job.fencing_token
 
-        leader_term = self._leadership_coordinator._get_term()
+        leader_term = self._leader_election.state.current_term
 
         event = self._worker_health_manager.record_workflow_outcome(
             job_id=result.job_id,
@@ -3441,6 +3453,121 @@ class ManagerServer(HealthAwareServer):
         # Release the H7 ledger entry — the workflow is terminal,
         # no further decisions matter.
         self._worker_health_manager.forget_workflow(result.workflow_id)
+
+    def _resolve_dc_leader_addr(self) -> tuple[str, int] | None:
+        """Best-effort lookup of the DC leader's TCP address.
+
+        Falls through three layers in priority order so a manager
+        that hasn't yet won an election locally still returns a
+        usable redirect target whenever *any* peer information is
+        available:
+
+        1. ``self._leader_election.state.current_leader`` — the
+           authoritative source once the local leader-election state
+           machine has converged. Returns the leader's TCP address.
+        2. ``self._manager_state.dc_leader_manager_id`` — set when
+           any peer's ``ManagerHeartbeat.is_leader`` was True. The
+           leader's TCP address is then resolved through the known-
+           manager-peers index.
+        3. Linear scan of every known manager peer's last-known
+           heartbeat for ``is_leader=True``. Backstop for any path
+           that updates heartbeat state without flipping
+           ``dc_leader_manager_id``.
+
+        Returns ``None`` only when every layer is empty — a genuine
+        "cluster has not converged on a leader" state. Clients
+        receiving such a response treat the error as transient
+        (per ``TRANSIENT_ERRORS`` matching) and round-robin retry.
+
+        This is the source-side fix for the otherwise-symptomatic
+        ``"Not DC leader, retry at leader: unknown"`` ack: instead
+        of letting the client guess across N managers, every
+        manager that has *any* leader information forwards it.
+        """
+        # Layer 1: locally-converged election state.
+        election_leader = self._leader_election.state.current_leader
+        if election_leader:
+            return tuple(election_leader)
+
+        # Layer 2: peer-heartbeat-derived dc_leader_manager_id.
+        leader_id = self._manager_state.dc_leader_manager_id
+        if leader_id:
+            info = self._manager_state.get_known_manager_peer(leader_id)
+            if info is not None:
+                return (info.tcp_host, info.tcp_port)
+
+        # Layer 3: linear scan as a last resort. Cheap (peer count
+        # is bounded by cluster size) and only runs in the
+        # already-degenerate case where layers 1 and 2 are empty.
+        for peer_id, info in self._manager_state.iter_known_manager_peers():
+            if peer_id == self._node_id.full:
+                continue
+            if getattr(info, "is_leader", False):
+                return (info.tcp_host, info.tcp_port)
+
+        return None
+
+    async def _push_job_status_to_client(
+        self,
+        job_id: str,
+        status: str,
+        message: str,
+        is_final: bool = False,
+    ) -> None:
+        """Tier-1 status push to the client/gate that registered a
+        callback for this job (AD-26 healthcheck-extension surfaces
+        and AD-32 client visibility both depend on this).
+
+        Resolves the destination via the same job-callback /
+        client-callback fallback as
+        ``_push_cancellation_complete_to_origin``. Silently no-ops
+        when no callback is registered (e.g. fire-and-forget
+        submissions).
+        """
+        callback_addr = self._manager_state.get_job_callback(job_id)
+        if not callback_addr:
+            callback_addr = self._manager_state.get_client_callback(job_id)
+        if not callback_addr:
+            return
+        if isinstance(callback_addr, list):
+            callback_addr = tuple(callback_addr)
+
+        job = self._job_manager.get_job_by_id(job_id)
+        elapsed = job.elapsed_seconds() if job else 0.0
+        total_completed, total_failed, overall_rate = (
+            self._aggregate_job_progress(job) if job else (0, 0, 0.0)
+        )
+
+        push = JobStatusPush(
+            job_id=job_id,
+            status=status,
+            message=message,
+            total_completed=total_completed,
+            total_failed=total_failed,
+            overall_rate=overall_rate,
+            elapsed_seconds=elapsed,
+            is_final=is_final,
+            fence_token=self._leases.get_fence_token(job_id),
+        )
+        try:
+            await self._send_to_client(
+                callback_addr,
+                "job_status_push",
+                push.dump(),
+                timeout=5.0,
+            )
+        except Exception as send_error:
+            await self._udp_logger.log(
+                ServerWarning(
+                    message=(
+                        f"Failed to push job status {status} for "
+                        f"{job_id} to {callback_addr}: {send_error}"
+                    ),
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
 
     async def _push_cancellation_complete_to_origin(
         self,
@@ -4206,6 +4333,17 @@ class ManagerServer(HealthAwareServer):
                 result=result,
             )
 
+            # If we couldn't find the job/sub-workflow on this
+            # manager, return an error so the worker's retry loop
+            # tries the next manager. Without this, a worker that
+            # picks a non-dispatcher manager first would log a
+            # success and stop retrying, silently losing the
+            # result. Most-common scenario: 3 managers, 1 is the
+            # dispatcher; worker.send_final_result iterates
+            # healthy_managers; first hit is the wrong one.
+            if not result_recorded:
+                return b"error"
+
             await self._handle_parent_workflow_completion(
                 result, result_recorded, parent_complete
             )
@@ -4214,8 +4352,7 @@ class ManagerServer(HealthAwareServer):
             # an H8 ExtensionOutcomeEvent, disseminates via #|o, and
             # mirrors into TimeoutTrackingState. Idempotent on
             # workflow_id — duplicate result deliveries are safe.
-            if result_recorded:
-                self._emit_workflow_outcome_event(result)
+            self._emit_workflow_outcome_event(result)
 
             if self._is_job_complete(result.job_id):
                 await self._handle_job_completion(result.job_id)
@@ -4401,7 +4538,7 @@ class ManagerServer(HealthAwareServer):
         return running_cancelled, workflow_errors
 
     @tcp.receive()
-    async def job_cancel(
+    async def cancel_job(
         self,
         addr: tuple[str, int],
         data: bytes,
@@ -4409,6 +4546,17 @@ class ManagerServer(HealthAwareServer):
     ) -> bytes:
         """
         Handle job cancellation request (AD-20).
+
+        Wire-action name MUST match what every sender uses (the
+        client's ``ClientCancellationManager._attempt_with_redirects``
+        and the gate's cancellation coordinator both target
+        ``"cancel_job"``). The ``@tcp.receive()`` decorator
+        registers handlers by ``func.__name__``, so this method
+        being named ``cancel_job`` is what makes the wire match
+        succeed. A previous incarnation of this method was named
+        ``job_cancel`` — every cancel request silently mismatched
+        and the server returned no response, hanging the client
+        until its per-target timeout.
 
         Robust cancellation flow:
         1. Verify job exists
@@ -4435,10 +4583,49 @@ class ManagerServer(HealthAwareServer):
                 self._parse_cancel_request(data, addr)
             )
 
-            job = self._job_manager.get_job(job_id)
+            # ``get_job`` keys by token-string; ``job_id`` here is the
+            # bare job id. ``get_job`` now accepts both forms (token
+            # or bare id) — see ``JobManager.get_job`` — so this
+            # lookup succeeds regardless of which form callers pass.
+            job = self._job_manager.get_job_by_id(job_id)
             if not job:
                 return self._build_cancel_response(
                     job_id, success=False, error="Job not found"
+                )
+
+            # Job-leader fencing: only the manager that owns this job
+            # may execute cancellation against worker state. A
+            # non-leader has neither the dispatch context nor the
+            # workflow-cancellation push chain — silently succeeding
+            # with cancelled_count=0 (the prior behavior) leaves
+            # workers running indefinitely. Redirect to the current
+            # leader instead. The client follows ``leader_addr`` via
+            # its bounded redirect loop.
+            #
+            # Resolution falls through job-leader-table → DC-leader
+            # resolver. The DC-leader fallback is correct here even
+            # though job-leadership and DC-leadership are
+            # technically distinct roles: in this codebase the job
+            # leader IS always a DC manager, and on rare paths
+            # (job leader transferred but local state hasn't synced
+            # the job-leader table yet) the DC leader is the best
+            # available redirect target — at minimum it knows about
+            # the job and can either own it or forward to the
+            # actual job leader.
+            if not self._leases.is_job_leader(job_id):
+                leader_addr = self._leases.get_job_leader_addr(job_id)
+                if leader_addr is None:
+                    leader_addr = self._resolve_dc_leader_addr()
+                leader_hint = (
+                    f"{leader_addr[0]}:{leader_addr[1]}"
+                    if leader_addr
+                    else "unknown"
+                )
+                return self._build_cancel_response(
+                    job_id,
+                    success=False,
+                    error=f"Not job leader, retry at leader: {leader_hint}",
+                    leader_addr=leader_addr,
                 )
 
             stored_fence = self._leases.get_fence_token(job_id)
@@ -4470,6 +4657,29 @@ class ManagerServer(HealthAwareServer):
             running_cancelled, workflow_errors = await self._cancel_running_workflows(
                 job, pending_cancelled, requester_id, timestamp, reason
             )
+
+            # Seed the cancellation-pending tracker with every
+            # workflow we just cancelled. Workers report back via
+            # ``workflow_cancellation_complete`` (handled below),
+            # which decrements pending and — when empty — fires
+            # ``_push_cancellation_complete_to_origin`` so the
+            # client's ``await_job_cancellation`` receives the
+            # completion push. Without this seeding, every worker
+            # report sees an empty pending set and never triggers
+            # the push, hanging the client until its timeout.
+            #
+            # The Raft state machine (state_machine.py:273) also
+            # populates pending on Raft-replicated cancellation
+            # commands. This explicit seeding from the request
+            # handler covers the immediate-after-handler case
+            # where the Raft command may not have committed yet,
+            # and is correct under both single-DC and replicated
+            # setups (``add_cancellation_pending_workflow`` is
+            # idempotent on the (job_id, workflow_id) pair).
+            for workflow_id in running_cancelled:
+                self._manager_state.add_cancellation_pending_workflow(
+                    job_id, workflow_id
+                )
 
             strategy = self._manager_state.get_job_timeout_strategy(job_id)
             if strategy:
@@ -4705,7 +4915,7 @@ class ManagerServer(HealthAwareServer):
                 node_id=self._node_id.full,
                 datacenter=self._config.datacenter_id,
                 is_leader=self._leadership_coordinator.is_leader(),
-                term=self._leadership_coordinator._get_term(),
+                term=self._leader_election.state.current_term,
                 version=current_version,
                 workers=self._build_worker_snapshots(),
                 jobs=dict(self._manager_state._job_progress),
@@ -5511,7 +5721,12 @@ class ManagerServer(HealthAwareServer):
             # Leader fencing: only DC leader accepts new jobs to prevent duplicates
             # during multi-gate submit storms (FIX 2.5)
             if not self.is_leader():
-                leader_addr = self._leader_election.state.current_leader
+                # Multi-source leader resolution — election state +
+                # peer heartbeats + last-known-leader scan. Returns
+                # ``None`` only when no peer has ever reported a
+                # leader, in which case the client treats the
+                # response as transient and round-robins.
+                leader_addr = self._resolve_dc_leader_addr()
                 leader_hint = (
                     f"{leader_addr[0]}:{leader_addr[1]}" if leader_addr else "unknown"
                 )
@@ -5519,6 +5734,7 @@ class ManagerServer(HealthAwareServer):
                     job_id=submission.job_id,
                     accepted=False,
                     error=f"Not DC leader, retry at leader: {leader_hint}",
+                    leader_addr=leader_addr,
                     protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
                     protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
                 ).dump()
@@ -6337,10 +6553,33 @@ class ManagerServer(HealthAwareServer):
                     submission.job_id, submission
                 )
 
-        job = self._job_manager.get_job(submission.job_id)
+        # NOTE: ``get_job`` expects a token string, not a bare job_id;
+        # the previous code passed ``submission.job_id`` and got
+        # ``None`` every time, leaving ``job.status`` stuck at QUEUED
+        # and silently breaking every "wait for RUNNING" path on the
+        # client. ``get_job_by_id`` does the token construction
+        # correctly.
+        job = self._job_manager.get_job_by_id(submission.job_id)
         if job:
+            previous_status = job.status
             job.status = JobStatus.RUNNING.value
             await self._manager_state.increment_state_version()
+            # Tier-1 push to the client per the JobStatusPush
+            # contract ("Sent from Gate/Manager to Client when
+            # significant status changes occur ... Job started ...").
+            # Without this, clients have no signal that the job
+            # has begun executing — they only see WorkflowResultPush
+            # at completion or JobFinalResult at the very end. The
+            # gap blocks any "wait until running" pattern (e.g.
+            # WorkloadDriver.wait_until_running) on L1/L2 deployments
+            # without a gate.
+            if previous_status != JobStatus.RUNNING.value:
+                self._task_runner.run(
+                    self._push_job_status_to_client,
+                    submission.job_id,
+                    JobStatus.RUNNING.value,
+                    "Job started",
+                )
 
     async def _register_with_discovered_worker(
         self,

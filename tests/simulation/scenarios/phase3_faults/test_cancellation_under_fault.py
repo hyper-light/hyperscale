@@ -20,15 +20,13 @@ adverse conditions, asserting clean termination rather than hangs.
 
 import pytest
 
-from hyperscale.distributed.testing.workflows import SimpleWorkflow
+from hyperscale.distributed.testing.workflows import LongRunningWorkflow
 from tests.simulation.harness import (
     ClusterHarness,
     ClusterSpec,
     DCSpec,
     EnvOverrides,
     ExecutionMode,
-    ExpectAllWorkflowsComplete,
-    ExpectCompletionWithin,
     HarnessTimeouts,
     Submission,
     SubmissionPattern,
@@ -56,31 +54,31 @@ def _l2_spec(base_port: int) -> ClusterSpec:
 def _cancellable_workload(timeout_seconds: float) -> WorkloadSpec:
     """Workload spec for cancellation tests.
 
-    Note: ExpectAllWorkflowsComplete asserts every expected workflow
-    name appears in observations.workflow_results — for a cancelled
-    workflow that's the CANCELLED status push. The expectation
-    doesn't require COMPLETED specifically, so a clean cancellation
-    satisfies it.
+    Uses ``LongRunningWorkflow`` so the cancel arrives mid-execution
+    and exercises the actual workflow-cancel push chain on the
+    leader manager. With a fast-completing workflow the cancel
+    races completion and the manager's cancel handler hits the
+    ``already_completed`` short-circuit — useful coverage but not
+    the canonical cancel path.
     """
     return WorkloadSpec(
         submissions=[
             Submission(
-                workflows=[([], SimpleWorkflow)],
+                workflows=[([], LongRunningWorkflow)],
                 dc_count=1,
                 timeout_seconds=timeout_seconds,
                 vus=1,
             ),
         ],
         pattern=SubmissionPattern.SINGLE,
-        expectations=[
-            # Expectation evaluation runs at workload __aexit__ — after
-            # the test body has cancelled and confirmed completion. We
-            # rely on submit_errors being empty and submitted_job_ids
-            # being populated as the success criteria; the workflow
-            # itself does NOT need to reach COMPLETED for cancellation
-            # tests.
-            ExpectCompletionWithin(seconds=timeout_seconds * 2),
-        ],
+        # No expectations: the cancel path ends in
+        # ``workflow_cancellation_complete`` push to the client (a
+        # separate callback from ``_on_workflow_result``), so
+        # ``_all_complete_event`` never fires on success and
+        # ``ExpectCompletionWithin`` would mistake a clean cancel for
+        # a hang. The test asserts cancellation success directly via
+        # the return value of ``driver.cancel``.
+        expectations=[],
     )
 
 
@@ -106,7 +104,11 @@ async def test_cancel_running_workflow() -> None:
             await driver.submit()
             await driver.wait_until_running(timeout=30.0)
 
-            success, errors = await driver.cancel(timeout=30.0)
+            # 90s budget covers the manager's per-worker cancel
+            # propagation: each running workflow may take up to
+            # CANCELLED_WORKFLOW_TIMEOUT (default 60s) for the worker
+            # to ack, and the cancel must serialize on the job lock.
+            success, errors = await driver.cancel(timeout=90.0)
             assert success, (
                 f"cancellation reported failure: {errors}"
             )

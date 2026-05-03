@@ -1264,13 +1264,21 @@ class GateServer(HealthAwareServer):
         return b"error"
 
     @tcp.receive()
-    async def receive_cancel_job(
+    async def cancel_job(
         self,
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
     ):
-        """Handle job cancellation request."""
+        """Handle job cancellation request from client (AD-20).
+
+        Wire-action name must match what the client sends — the
+        ``@tcp.receive()`` decorator registers handlers by
+        ``func.__name__``, and ``ClientCancellationManager``
+        targets the action ``"cancel_job"``. A prior incarnation
+        named this ``receive_cancel_job`` which silently mismatched
+        every inbound cancel request.
+        """
         if self._cancellation_handler:
             return await self._cancellation_handler.handle_cancel_job(
                 addr, data, self.handle_exception
@@ -1278,13 +1286,19 @@ class GateServer(HealthAwareServer):
         return b"error"
 
     @tcp.receive()
-    async def receive_job_cancellation_complete(
+    async def job_cancellation_complete(
         self,
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
     ):
-        """Handle job cancellation complete notification."""
+        """Handle job cancellation complete notification (AD-20).
+
+        Wire-action name aligned with what the manager pushes —
+        the ``@tcp.receive()`` decorator registers by
+        ``func.__name__`` and the manager's push uses action
+        ``"job_cancellation_complete"``.
+        """
         if self._cancellation_handler:
             return await self._cancellation_handler.handle_cancellation_complete(
                 addr, data, self.handle_exception
