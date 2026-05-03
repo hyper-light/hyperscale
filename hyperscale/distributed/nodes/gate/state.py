@@ -268,6 +268,38 @@ class GateRuntimeState:
         dc_status = self._datacenter_manager_status.get(datacenter_id, {})
         return dc_status.get(manager_addr)
 
+    def get_dc_slo_routing_factor(self, datacenter_id: str) -> float:
+        """AD-42 Phase E5: return the freshest SLO routing factor
+        for a DC.
+
+        Picks the manager with the most-recent ``slo_updated_at``
+        and returns its pre-computed routing factor. Defaults to
+        1.0 (neutral) when:
+
+        * no managers are registered for the DC, or
+        * no manager has reported any latency observations yet
+          (``slo_sample_count == 0``).
+
+        Used by AD-36 routing scorer to deprioritize DCs that are
+        violating their latency SLOs.
+        """
+        per_manager = self._datacenter_manager_status.get(datacenter_id)
+        if not per_manager:
+            return 1.0
+
+        freshest: ManagerHeartbeat | None = None
+        for heartbeat in per_manager.values():
+            if heartbeat.slo_sample_count <= 0:
+                continue
+            if (
+                freshest is None
+                or heartbeat.slo_updated_at > freshest.slo_updated_at
+            ):
+                freshest = heartbeat
+        if freshest is None:
+            return 1.0
+        return freshest.slo_routing_factor
+
     def get_dc_backpressure_level(self, datacenter_id: str) -> BackpressureLevel:
         """Get the backpressure level for a datacenter."""
         return self._dc_backpressure.get(datacenter_id, BackpressureLevel.NONE)

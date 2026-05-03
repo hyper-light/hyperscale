@@ -533,6 +533,9 @@ class GateHealthCoordinator:
                     total_cores = capacity.total_cores
                     queue_depth = capacity.pending_workflow_count
 
+            slo_routing_factor = self._state.get_dc_slo_routing_factor(
+                datacenter_id
+            )
             candidates.append(
                 DatacenterCandidate(
                     datacenter_id=datacenter_id,
@@ -551,6 +554,7 @@ class GateHealthCoordinator:
                     overloaded_worker_count=getattr(
                         status, "overloaded_worker_count", 0
                     ),
+                    slo_routing_factor=slo_routing_factor,
                 )
             )
         return candidates

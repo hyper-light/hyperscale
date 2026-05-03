@@ -3320,6 +3320,9 @@ class GateServer(HealthAwareServer):
         candidates: list[DatacenterCandidate] = []
         for datacenter_id in datacenter_ids:
             status = self._classify_datacenter_health(datacenter_id)
+            slo_routing_factor = self._state.get_dc_slo_routing_factor(
+                datacenter_id
+            )
             candidates.append(
                 DatacenterCandidate(
                     datacenter_id=datacenter_id,
@@ -3338,6 +3341,7 @@ class GateServer(HealthAwareServer):
                     overloaded_worker_count=getattr(
                         status, "overloaded_worker_count", 0
                     ),
+                    slo_routing_factor=slo_routing_factor,
                 )
             )
         return candidates
