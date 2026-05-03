@@ -59,6 +59,12 @@ class DatacenterCandidate:
     estimated_latency_ms: float = 0.0
     estimated_throughput_rps: float = 0.0
 
+    # AD-42 Phase E4: per-DC routing factor sourced from the gate's
+    # SLOSummary aggregation. Default 1.0 is the neutral baseline
+    # — DCs with no SLO data report compliant, the routing score
+    # is unchanged.
+    slo_routing_factor: float = 1.0
+
 
 @dataclass(slots=True)
 class ManagerCandidate:

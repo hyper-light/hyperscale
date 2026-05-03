@@ -45,14 +45,23 @@ class DatacenterRoutingScore:
         is_preferred: bool = False,
         preference_multiplier: float = 0.9,
         health_severity_weight: float = 1.0,
+        slo_routing_factor: float = 1.0,
     ) -> "DatacenterRoutingScore":
         """
-        Calculate routing score for a datacenter (AD-36 Part 4).
+        Calculate routing score for a datacenter (AD-36 Part 4 +
+        AD-42 Phase E4 SLO weighting).
 
         Formula:
             load_factor = 1.0 + A_UTIL*util + A_QUEUE*queue + A_CB*cb
             quality_penalty = 1.0 + A_QUALITY*(1.0 - quality)
-            score = rtt_ucb * load_factor * quality_penalty * preference_mult * health_severity_weight
+            score = rtt_ucb * load_factor * quality_penalty *
+                    preference_mult * health_severity_weight *
+                    slo_routing_factor
+
+        ``slo_routing_factor`` is pre-computed by ``SLOSummary.from_
+        observation`` to be ≥ 1.0 when the DC is violating its
+        latency SLO (penalize) and ≤ 1.0 when comfortably meeting
+        (reward). Default 1.0 = neutral, no SLO data.
 
         Lower scores are better.
         """
@@ -77,7 +86,11 @@ class DatacenterRoutingScore:
         quality_penalty = min(quality_penalty, quality_penalty_max)
 
         final_score = (
-            rtt_ucb_ms * load_factor * quality_penalty * health_severity_weight
+            rtt_ucb_ms
+            * load_factor
+            * quality_penalty
+            * health_severity_weight
+            * slo_routing_factor
         )
 
         if is_preferred:

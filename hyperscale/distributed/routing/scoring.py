@@ -78,6 +78,7 @@ class RoutingScorer:
             is_preferred=is_preferred,
             preference_multiplier=self._config.preference_multiplier,
             health_severity_weight=candidate.health_severity_weight,
+            slo_routing_factor=candidate.slo_routing_factor,
         )
 
     def score_datacenters(
