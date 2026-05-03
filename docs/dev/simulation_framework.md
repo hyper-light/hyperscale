@@ -740,7 +740,9 @@ and can be added opportunistically.
   `FaultMatrix.restart` re-installs on rebuild so partition rules
   survive kill / restart cycles.
 
-- 4 scenarios under `tests/simulation/scenarios/phase4_network/`:
+- 8 scenarios under `tests/simulation/scenarios/phase4_network/`:
+
+  *Plumbing (test_partitions.py):*
 
   | Scenario                                     | Topology | What it validates                              |
   |----------------------------------------------|----------|-----------------------------------------------|
@@ -750,11 +752,26 @@ and can be added opportunistically.
   | `flapping_partition`                         | L3 (2DC) | 3 partition/heal cycles; no leaked state      |
   | `intra_dc_delay_does_not_break_quorum`       | L2 (3M)  | 200ms±50ms jitter; leader election succeeds   |
 
+  *Observability (test_partition_observability.py):*
+
+  | Scenario                                          | Topology | What it validates                                 |
+  |---------------------------------------------------|----------|--------------------------------------------------|
+  | `partition_grows_local_health_multiplier`         | L2 (3M)  | LHM grows on partitioned victim per AD-19/AD-30  |
+  |                                                   |          | (the upstream signal for cross-DC correlation)   |
+  | `partition_during_workload_does_not_hang`         | L2 (3M)  | Mid-workload worker↔manager partition resolves   |
+  |                                                   |          | within budget — clean failure or redispatch      |
+  | `leader_side_partition_vs_kill`                   | L2 (3M)  | Old leader steps down via term reconciliation    |
+  |                                                   |          | after heal; no split-brain                       |
+  | `high_loss_rate_triggers_lhm_growth`              | L2 (3M)  | drop_rate=0.7 grows LHM but doesn't escalate     |
+  |                                                   |          | to DEAD — Phase B/C/D adaptive-timeout coverage  |
+
 **Exit criteria — met.** SWIM partition-correlation paths exercised
-at L3 with symmetric, asymmetric, and flapping faults; the FaultMatrix
-primitives compose with the Phase 3 lifecycle faults so any future
-scenario can mix kill/restart with partition/delay/drop without new
-harness code.
+at L3 with symmetric, asymmetric, and flapping faults; LHM growth
+under partition (the upstream signal that drives cross-DC correlation
+detection) verified end-to-end against the production
+``LocalHealthMultiplier``; the FaultMatrix primitives compose with
+the Phase 3 lifecycle faults so any future scenario can mix
+kill/restart with partition/delay/drop without new harness code.
 
 ### Phase 5 — Clock / Random / Transport interface refactor
 
