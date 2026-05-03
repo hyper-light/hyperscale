@@ -13,6 +13,7 @@ Key responsibilities:
 
 from dataclasses import dataclass, field
 import time
+from typing import TYPE_CHECKING
 
 from hyperscale.distributed.health.alpha_posterior import (
     HierarchicalAlphaTuner,
@@ -33,6 +34,9 @@ from hyperscale.distributed.health.extension_outcome import (
     ExtensionOutcomeEvent,
     ExtensionOutcomeKind,
 )
+
+if TYPE_CHECKING:
+    from hyperscale.distributed.models.jobs import TimeoutTrackingState
 from hyperscale.distributed.health.extension_tracker import (
     ExtensionTracker,
     ExtensionTrackerConfig,
@@ -517,6 +521,81 @@ class WorkerHealthManager:
     def alpha_tuner(self) -> HierarchicalAlphaTuner:
         """Read-only access to the H8 Bayesian α tuner."""
         return self._alpha_tuner
+
+    def persist_decision_to_tracking(
+        self,
+        state: "TimeoutTrackingState",
+        decision_event: ExtensionDecisionEvent,
+    ) -> None:
+        """Phase H8c: mirror a just-recorded decision into the
+        AD-34 ``TimeoutTrackingState`` so leader transfer survives.
+
+        The job-leader call site invokes this after every successful
+        decision recording. The new leader on takeover uses these
+        fields (along with ``pending_extension_outcomes`` and
+        ``alpha_tuner_snapshot``) via ``replay_persisted_state`` to
+        rebuild the local manager state without depending on AD-48
+        gossip having reached them yet.
+        """
+        state.last_extension_decisions[decision_event.workflow_id] = (
+            decision_event
+        )
+        state.last_progress_snapshots[decision_event.workflow_id] = (
+            decision_event.progress_snapshot
+        )
+        state.alpha_tuner_snapshot = self._snapshot_alpha_tuner()
+
+    def persist_outcome_to_tracking(
+        self,
+        state: "TimeoutTrackingState",
+        outcome_event: ExtensionOutcomeEvent,
+    ) -> None:
+        """Phase H8c: mirror a just-recorded outcome into the AD-34
+        ``TimeoutTrackingState``.
+
+        The in-flight decision entry is removed (the workflow is
+        terminal — no further decisions matter), and the alpha
+        tuner snapshot is refreshed since this outcome shifted the
+        per-class posterior.
+        """
+        state.pending_extension_outcomes[outcome_event.workflow_id] = (
+            outcome_event
+        )
+        state.last_extension_decisions.pop(outcome_event.workflow_id, None)
+        state.last_progress_snapshots.pop(outcome_event.workflow_id, None)
+        state.alpha_tuner_snapshot = self._snapshot_alpha_tuner()
+
+    def replay_persisted_state(self, state: "TimeoutTrackingState") -> int:
+        """Phase H8c: rebuild local state from a
+        ``TimeoutTrackingState`` on leader takeover.
+
+        The ``alpha_tuner_snapshot`` is the authoritative tuner
+        state at the moment the previous leader last persisted —
+        it already reflects every outcome the previous leader had
+        applied. Restoring the snapshot first establishes that
+        baseline; the outcome events in ``pending_extension_outcomes``
+        are then replayed into the *ledger only* so the workflow-
+        history surface is consistent, NOT into the tuner (that
+        would double-count the Bernoulli observation).
+
+        Returns the number of events replayed.
+        """
+        replayed = 0
+        if state.alpha_tuner_snapshot:
+            self._alpha_tuner.restore(list(state.alpha_tuner_snapshot.values()))
+        for decision_event in state.last_extension_decisions.values():
+            self._ledger.record(decision_event)
+            replayed += 1
+        for outcome_event in state.pending_extension_outcomes.values():
+            self._ledger.record_outcome(outcome_event)
+            replayed += 1
+        return replayed
+
+    def _snapshot_alpha_tuner(self) -> dict[str, bytes]:
+        return {
+            posterior.workflow_class: posterior.to_bytes()
+            for posterior in self._alpha_tuner
+        }
 
     def forget_workflow(self, workflow_id: str) -> None:
         """Drop H7 ledger state for a terminated workflow."""

@@ -41,6 +41,12 @@ from hyperscale.distributed.models.distributed import (
 )
 
 if TYPE_CHECKING:
+    from hyperscale.distributed.health.extension_ledger import (
+        ExtensionDecisionEvent,
+    )
+    from hyperscale.distributed.health.extension_outcome import (
+        ExtensionOutcomeEvent,
+    )
     from hyperscale.distributed.health.workflow_progress_snapshot import (
         WorkflowProgressSnapshot,
     )
@@ -293,6 +299,30 @@ class TimeoutTrackingState:
     last_progress_snapshots: dict[str, "WorkflowProgressSnapshot"] = field(
         default_factory=dict
     )
+    # Phase H7 — most-recent decision per workflow. New leader on
+    # takeover sees the decision history without depending on
+    # AD-48 #|x dissemination having reached them yet. Same
+    # bounded-by-active-workflows discipline as
+    # ``last_progress_snapshots``; entries are dropped via the
+    # ledger's ``forget_workflow`` cascade on workflow termination.
+    last_extension_decisions: dict[str, "ExtensionDecisionEvent"] = field(
+        default_factory=dict
+    )
+    # Phase H8 — workflow outcomes for terminated workflows whose
+    # AD-48 #|o dissemination may not have reached every peer yet.
+    # On leader takeover, the new leader replays these into its
+    # ``WorkerHealthManager.ingest_remote_outcome_event`` so the
+    # Bayesian alpha tuner inherits the cluster's accumulated
+    # learning even when the gossip channel hasn't fully converged.
+    pending_extension_outcomes: dict[str, "ExtensionOutcomeEvent"] = field(
+        default_factory=dict
+    )
+    # Phase H8 — frozen snapshot of the per-workflow-class Beta
+    # posterior so the new leader inherits the entire tuner state.
+    # Each entry is the ``WorkflowClassAlphaPosterior.to_bytes``
+    # serialization keyed by workflow class name. Restored via
+    # ``HierarchicalAlphaTuner.restore`` on takeover.
+    alpha_tuner_snapshot: dict[str, bytes] = field(default_factory=dict)
 
     # State flags (idempotency)
     locally_timed_out: bool = False  # Manager reported/detected timeout
