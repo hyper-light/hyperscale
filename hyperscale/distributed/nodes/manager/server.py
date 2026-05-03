@@ -1179,6 +1179,9 @@ class ManagerServer(HealthAwareServer):
         )
 
         await self._notify_workers_job_leader_transfer(job_id, old_leader_id)
+        # Phase F4: inherit AD-26 H7/H8 state from the previous
+        # leader's persisted TimeoutTrackingState.
+        self._replay_extension_state_for_job(job_id)
         await self._udp_logger.log(
             ServerInfo(
                 message=(
@@ -1642,6 +1645,9 @@ class ManagerServer(HealthAwareServer):
             )
 
             await self._notify_workers_job_leader_transfer(job_id, old_leader_id)
+            # Phase F4: inherit AD-26 H7/H8 state from the previous
+            # leader's persisted TimeoutTrackingState.
+            self._replay_extension_state_for_job(job_id)
             await self._udp_logger.log(
                 ServerInfo(
                     message=f"Took over leadership for job {job_id[:8]}... via Raft consensus",
@@ -3258,6 +3264,28 @@ class ManagerServer(HealthAwareServer):
             return
         self._worker_health_manager.persist_outcome_to_tracking(
             job.timeout_tracking, event
+        )
+
+    def _replay_extension_state_for_job(self, job_id: str) -> int:
+        """Phase F4: replay persisted AD-26 H7/H8 state into the
+        local ``WorkerHealthManager`` on leader takeover.
+
+        Called from both takeover paths (per-job Raft takeover and
+        bulk takeover after a manager dies) so the new leader
+        immediately sees the previous leader's:
+
+        - Most-recent decision per workflow (H7 ledger entries)
+        - In-flight outcome events not yet disseminated (H8)
+        - Frozen Beta posteriors per workflow class (H8 tuner)
+
+        Returns the number of events replayed for observability.
+        """
+        job_token = self._job_manager.create_job_token(job_id)
+        job = self._job_manager.get_job(job_token)
+        if job is None or job.timeout_tracking is None:
+            return 0
+        return self._worker_health_manager.replay_persisted_state(
+            job.timeout_tracking
         )
 
     def _emit_outcomes_for_terminal_job(
