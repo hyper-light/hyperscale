@@ -15,6 +15,7 @@ from hyperscale.distributed.health import (
     ManagerHealthConfig,
 )
 from hyperscale.distributed.reliability import BackpressureLevel
+from hyperscale.distributed.slo import SLOSummary
 
 
 @dataclass(slots=True)
@@ -98,3 +99,49 @@ class DCHealthState:
             if level.value > max_level.value:
                 max_level = level
         self.dc_backpressure[datacenter_id] = max_level
+
+    def get_dc_slo_summary(self, datacenter_id: str) -> SLOSummary:
+        """AD-42 Phase E3: aggregate the most-recent ``SLOSummary``
+        across managers in this DC.
+
+        Strategy: take the manager with the most-recent
+        ``slo_updated_at`` and synthesize a summary from its
+        heartbeat fields. Every manager in the DC observes the
+        same workflows so their summaries should be in close
+        agreement; the most-recent one is the freshest authoritative
+        view.
+
+        Returns ``SLOSummary.empty()`` when the DC has no managers
+        registered yet, or when none have reported any workflow
+        latency observations.
+        """
+        per_manager = self.manager_status.get(datacenter_id)
+        if not per_manager:
+            return SLOSummary.empty()
+
+        freshest: ManagerHeartbeat | None = None
+        for heartbeat in per_manager.values():
+            if heartbeat.slo_sample_count <= 0:
+                continue
+            if freshest is None or heartbeat.slo_updated_at > freshest.slo_updated_at:
+                freshest = heartbeat
+        if freshest is None:
+            return SLOSummary.empty()
+
+        return SLOSummary(
+            p50_ms=freshest.slo_p50_ms,
+            p95_ms=freshest.slo_p95_ms,
+            p99_ms=freshest.slo_p99_ms,
+            sample_count=freshest.slo_sample_count,
+            compliance_score=freshest.slo_compliance_score,
+            routing_factor=freshest.slo_routing_factor,
+            updated_at=freshest.slo_updated_at,
+        )
+
+    def get_all_dc_slo_summaries(self) -> dict[str, SLOSummary]:
+        """Return a dc_id → SLOSummary map across every DC the
+        gate currently knows about. Empty entries are skipped."""
+        return {
+            datacenter_id: self.get_dc_slo_summary(datacenter_id)
+            for datacenter_id in self.manager_status
+        }
