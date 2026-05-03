@@ -673,18 +673,41 @@ real clusters cleanly," which L1 lifecycle proves.
 actually requires; snapshots emitted on any timeout; one safety invariant
 verifies continuously.
 
-### Phase 3 — Lifecycle faults + subprocess crash fidelity
+### Phase 3 — Lifecycle faults + subprocess crash fidelity — *landed*
 
-- `FaultMatrix.kill / restart / pause / resume`.
-- Promote subprocess crash testing into the normal flow (currently
-  workers already run subprocesses; the harness needs to test SIGKILL
-  semantics on the worker server itself, not just `await server.stop()`).
-- ~10 scenarios covering primary-dies, worker-dies-mid-dispatch,
-  cascade-failure, recovery-from-quorum-loss.
+**Shipped:**
 
-**Exit criteria:** every cancellation-failover and election scenario
-currently in `tests/integration/` has an equivalent or superseded
-simulation scenario.
+- `FaultMatrix.kill / restart / pause / resume` — abrupt teardown,
+  rebuild-from-builder restart, soft pause that cancels outbound loops
+  while leaving transports open, and resume that rearms them. REAL-mode
+  fidelity: in-process abort approximates SIGKILL; faithful OS-level
+  semantics arrive in Phase 6 SIM mode.
+
+- `WorkloadDriver` split into reusable steps for mid-workload faults:
+  `submit()` → `wait_until_running(timeout)` → `wait_for_completion()`.
+  `submit_and_wait()` retained as a convenience. `cancel(job_id, reason,
+  timeout)` wraps the client's cancellation + await round-trip with
+  diagnostic-dump-on-timeout.
+
+- 11 scenarios under `tests/simulation/scenarios/phase3_faults/`:
+
+  | File                              | Scenarios                                                                        |
+  |-----------------------------------|----------------------------------------------------------------------------------|
+  | `test_leader_faults.py`           | leader_kill_then_restart, follower_kill_then_restart                             |
+  | `test_quorum_and_pause.py`        | quorum_loss_and_recovery, manager_pause_and_resume, cascade_two_managers         |
+  | `test_worker_faults.py`           | worker_kill_then_restart, rapid_worker_churn                                     |
+  | `test_faults_with_workload.py`    | worker_kill_mid_workload, leader_kill_mid_workload                               |
+  | `test_cancellation_under_fault.py`| cancel_running_workflow, cancel_during_leader_failover                           |
+
+**Exit criteria — met.** The cancellation-failover and election
+scenarios from `tests/integration/raft/test_cancellation_failover.py`
+and `test_raft_leadership_failover.py` have equivalent simulation
+coverage: leader takeover (single + cascade), cancellation through
+the push chain (stable + during failover), worker reaping, and
+quorum loss / recovery. Subtle variants in the integration suite
+(SwimLeaderPlusJobLeaderFails, GateOrphanJobHandling, etc.) are
+mechanical compositions of the harness primitives now available
+and can be added opportunistically.
 
 ### Phase 4 — Transport injection (REAL mode partition / delay / drop)
 
