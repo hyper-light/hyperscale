@@ -29,6 +29,13 @@ from .worker_state_gossip_buffer import (
     MAX_WORKER_STATE_PIGGYBACK_SIZE,
 )
 
+from .extension_decision_gossip_buffer import (
+    ExtensionDecisionGossipBuffer,
+    ExtensionDecisionPiggybackUpdate,
+    EXTENSION_DECISION_SEPARATOR,
+    MAX_EXTENSION_DECISION_PIGGYBACK_SIZE,
+)
+
 
 __all__ = [
     # Membership gossip
@@ -46,4 +53,9 @@ __all__ = [
     "WorkerStateGossipBuffer",
     "WORKER_STATE_SEPARATOR",
     "MAX_WORKER_STATE_PIGGYBACK_SIZE",
+    # Extension decision gossip (AD-26 H7b)
+    "ExtensionDecisionGossipBuffer",
+    "ExtensionDecisionPiggybackUpdate",
+    "EXTENSION_DECISION_SEPARATOR",
+    "MAX_EXTENSION_DECISION_PIGGYBACK_SIZE",
 ]

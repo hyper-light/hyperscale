@@ -1255,6 +1255,10 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
     _MEMBERSHIP_SEPARATOR = b"#|m"
     _HEALTH_SEPARATOR = b"#|h"
     _WORKER_STATE_SEPARATOR = b"#|w"
+    # AD-26 H7b: extension decision dissemination. Sits between
+    # worker-state (#|w) and vivaldi (#|v) on the wire — added
+    # second-to-last when encoding, stripped second when decoding.
+    _EXTENSION_DECISION_SEPARATOR = b"#|x"
 
     def set_state_embedder(self, embedder: StateEmbedder) -> None:
         """
@@ -1305,6 +1309,25 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         piggyback_data: bytes,
         source_addr: tuple[str, int],
     ) -> None:
+        pass
+
+    def _get_extension_decision_piggyback(self, max_size: int) -> bytes:
+        """AD-26 H7b hook: return piggyback bytes for the
+        ``ExtensionDecisionGossipBuffer`` if the subclass provides
+        one. Default implementation returns empty bytes — only
+        ``ManagerServer`` produces extension events.
+        """
+        return b""
+
+    async def _process_extension_decision_piggyback(
+        self,
+        piggyback_data: bytes,
+        source_addr: tuple[str, int],
+    ) -> None:
+        """AD-26 H7b hook: ingest a ``#|x`` piggyback frame received
+        from a peer. Default implementation is a no-op — only
+        ``ManagerServer`` consumes extension events.
+        """
         pass
 
     async def _build_xprobe_response(
@@ -1421,6 +1444,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         """
         msg_end = len(message)
         vivaldi_piggyback: bytes | None = None
+        extension_decision_piggyback: bytes | None = None
         worker_state_piggyback: bytes | None = None
         health_piggyback: bytes | None = None
         membership_piggyback: bytes | None = None
@@ -1429,6 +1453,16 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         if vivaldi_idx > 0:
             vivaldi_piggyback = message[vivaldi_idx + 3 :]
             msg_end = vivaldi_idx
+
+        # AD-26 H7b: extension decision channel sits between
+        # worker-state and vivaldi on the wire — strip it before
+        # we move on to the older worker-state channel.
+        extension_decision_idx = message.find(
+            self._EXTENSION_DECISION_SEPARATOR, 0, msg_end
+        )
+        if extension_decision_idx > 0:
+            extension_decision_piggyback = message[extension_decision_idx:msg_end]
+            msg_end = extension_decision_idx
 
         worker_state_idx = message.find(self._WORKER_STATE_SEPARATOR, 0, msg_end)
         if worker_state_idx > 0:
@@ -1449,6 +1483,12 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         if addr_sep_idx < 0:
             if vivaldi_piggyback:
                 self._process_vivaldi_piggyback(vivaldi_piggyback, source_addr)
+            if extension_decision_piggyback:
+                self._task_runner.run(
+                    self._process_extension_decision_piggyback,
+                    extension_decision_piggyback,
+                    source_addr,
+                )
             if worker_state_piggyback:
                 self._task_runner.run(
                     self._process_worker_state_piggyback,
@@ -1467,6 +1507,12 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
 
         if vivaldi_piggyback:
             self._process_vivaldi_piggyback(vivaldi_piggyback, source_addr)
+        if extension_decision_piggyback:
+            self._task_runner.run(
+                self._process_extension_decision_piggyback,
+                extension_decision_piggyback,
+                source_addr,
+            )
         if worker_state_piggyback:
             self._task_runner.run(
                 self._process_worker_state_piggyback,
@@ -1598,7 +1644,20 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         message_with_worker_state = message_with_health + worker_state_piggyback
 
         remaining_after_worker = MAX_UDP_PAYLOAD - len(message_with_worker_state)
-        if remaining_after_worker >= 150:
+
+        # AD-26 H7b: extension decision dissemination. Encoded after
+        # worker-state so the parser strips it before falling back
+        # to the worker-state channel (the parser walks right-to-
+        # left through #|v -> #|x -> #|w -> #|h -> #|m).
+        extension_decision_piggyback = self._get_extension_decision_piggyback(
+            remaining_after_worker
+        )
+        message_with_extension = (
+            message_with_worker_state + extension_decision_piggyback
+        )
+
+        remaining_after_extension = MAX_UDP_PAYLOAD - len(message_with_extension)
+        if remaining_after_extension >= 150:
             import json
 
             coord = self._coordinate_tracker.get_coordinate()
@@ -1607,12 +1666,12 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             vivaldi_piggyback = b"#|v" + coord_json
 
             if (
-                len(message_with_worker_state) + len(vivaldi_piggyback)
+                len(message_with_extension) + len(vivaldi_piggyback)
                 <= MAX_UDP_PAYLOAD
             ):
-                return message_with_worker_state + vivaldi_piggyback
+                return message_with_extension + vivaldi_piggyback
 
-        return message_with_worker_state
+        return message_with_extension
 
     def _check_message_size(self, message: bytes) -> bool:
         """

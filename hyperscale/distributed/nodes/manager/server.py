@@ -173,6 +173,12 @@ from .worker_dissemination import WorkerDisseminator
 from hyperscale.distributed.swim.gossip.worker_state_gossip_buffer import (
     WorkerStateGossipBuffer,
 )
+from hyperscale.distributed.swim.gossip.extension_decision_gossip_buffer import (
+    ExtensionDecisionGossipBuffer,
+)
+from hyperscale.distributed.health.extension_ledger import (
+    ExtensionDecisionEvent,
+)
 
 
 class ManagerServer(HealthAwareServer):
@@ -492,6 +498,15 @@ class ManagerServer(HealthAwareServer):
 
         # WorkerDisseminator (AD-48, initialized in start())
         self._worker_disseminator: "WorkerDisseminator | None" = None
+
+        # AD-26 H7b: extension decision dissemination. Always
+        # constructed (not deferred to start()) so any decision the
+        # local ``WorkerHealthManager`` produces during early
+        # registration is captured and disseminated as soon as the
+        # SWIM piggyback channels open.
+        self._extension_decision_buffer: ExtensionDecisionGossipBuffer = (
+            ExtensionDecisionGossipBuffer()
+        )
 
         # Federated health monitor for gate probing
         fed_config = self._env.get_federated_health_config()
@@ -2974,6 +2989,55 @@ class ManagerServer(HealthAwareServer):
             await self._worker_disseminator.handle_worker_state_update(
                 update, source_addr
             )
+
+    def _get_extension_decision_piggyback(self, max_size: int) -> bytes:
+        """AD-26 H7b: encode pending extension decisions into a
+        ``#|x``-prefixed piggyback frame bounded by ``max_size``.
+        """
+        return self._extension_decision_buffer.encode_piggyback(
+            max_count=5,
+            max_size=max_size,
+        )
+
+    async def _process_extension_decision_piggyback(
+        self,
+        piggyback_data: bytes,
+        source_addr: tuple[str, int],
+    ) -> None:
+        """AD-26 H7b: decode an inbound ``#|x`` frame and ingest each
+        event into the local ``WorkerHealthManager`` ledger.
+
+        ``ExtensionLedger.record`` is idempotent on
+        (workflow_id, fence_token, timestamp) and rejects stale-term
+        events, so re-disseminated events from multiple peers
+        collapse to one ledger entry. We also re-add accepted events
+        to the local buffer so this manager continues their
+        dissemination — that's how AD-48's
+        ``broadcast_multiplier × log(n+1)`` cluster fan-out is
+        achieved.
+        """
+        events = ExtensionDecisionGossipBuffer.decode_piggyback(piggyback_data)
+        if not events:
+            return
+        number_of_managers = len(self._manager_state._active_manager_peers) + 1
+        for event in events:
+            self._worker_health_manager.ingest_remote_decision_event(event)
+            self._extension_decision_buffer.add_event(
+                event, number_of_managers=number_of_managers
+            )
+
+    def disseminate_extension_decision(
+        self, event: ExtensionDecisionEvent
+    ) -> None:
+        """Queue a locally-produced extension decision for AD-48
+        dissemination. Called by the manager request handler right
+        after ``WorkerHealthManager.handle_extension_request_with_witnesses``
+        commits the decision into the ledger.
+        """
+        number_of_managers = len(self._manager_state._active_manager_peers) + 1
+        self._extension_decision_buffer.add_event(
+            event, number_of_managers=number_of_managers
+        )
 
     async def _push_cancellation_complete_to_origin(
         self,
