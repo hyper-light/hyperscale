@@ -176,8 +176,14 @@ from hyperscale.distributed.swim.gossip.worker_state_gossip_buffer import (
 from hyperscale.distributed.swim.gossip.extension_decision_gossip_buffer import (
     ExtensionDecisionGossipBuffer,
 )
+from hyperscale.distributed.swim.gossip.extension_outcome_gossip_buffer import (
+    ExtensionOutcomeGossipBuffer,
+)
 from hyperscale.distributed.health.extension_ledger import (
     ExtensionDecisionEvent,
+)
+from hyperscale.distributed.health.extension_outcome import (
+    ExtensionOutcomeEvent,
 )
 
 
@@ -506,6 +512,14 @@ class ManagerServer(HealthAwareServer):
         # SWIM piggyback channels open.
         self._extension_decision_buffer: ExtensionDecisionGossipBuffer = (
             ExtensionDecisionGossipBuffer()
+        )
+
+        # AD-26 H8b: extension outcome dissemination. Symmetric to
+        # the H7b decision buffer, ferrying workflow-termination
+        # outcomes (the H8 Bayesian-tuner training signal) across
+        # the cluster.
+        self._extension_outcome_buffer: ExtensionOutcomeGossipBuffer = (
+            ExtensionOutcomeGossipBuffer()
         )
 
         # Federated health monitor for gate probing
@@ -3036,6 +3050,50 @@ class ManagerServer(HealthAwareServer):
         """
         number_of_managers = len(self._manager_state._active_manager_peers) + 1
         self._extension_decision_buffer.add_event(
+            event, number_of_managers=number_of_managers
+        )
+
+    def _get_extension_outcome_piggyback(self, max_size: int) -> bytes:
+        """AD-26 H8b: encode pending outcome events into a
+        ``#|o``-prefixed piggyback frame bounded by ``max_size``.
+        """
+        return self._extension_outcome_buffer.encode_piggyback(
+            max_count=5,
+            max_size=max_size,
+        )
+
+    async def _process_extension_outcome_piggyback(
+        self,
+        piggyback_data: bytes,
+        source_addr: tuple[str, int],
+    ) -> None:
+        """AD-26 H8b: decode an inbound ``#|o`` frame and ingest each
+        outcome event into the local ``WorkerHealthManager``.
+
+        Each accepted event is also re-added to the local buffer so
+        this manager continues its dissemination — same fan-out
+        discipline as the decision channel.
+        """
+        events = ExtensionOutcomeGossipBuffer.decode_piggyback(piggyback_data)
+        if not events:
+            return
+        number_of_managers = len(self._manager_state._active_manager_peers) + 1
+        for event in events:
+            self._worker_health_manager.ingest_remote_outcome_event(event)
+            self._extension_outcome_buffer.add_event(
+                event, number_of_managers=number_of_managers
+            )
+
+    def disseminate_extension_outcome(
+        self, event: ExtensionOutcomeEvent
+    ) -> None:
+        """Queue a locally-produced outcome event for AD-48
+        dissemination. Called by the workflow-termination path
+        after ``WorkerHealthManager.record_workflow_outcome``
+        emits the event.
+        """
+        number_of_managers = len(self._manager_state._active_manager_peers) + 1
+        self._extension_outcome_buffer.add_event(
             event, number_of_managers=number_of_managers
         )
 

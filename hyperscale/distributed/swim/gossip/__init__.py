@@ -36,6 +36,13 @@ from .extension_decision_gossip_buffer import (
     MAX_EXTENSION_DECISION_PIGGYBACK_SIZE,
 )
 
+from .extension_outcome_gossip_buffer import (
+    ExtensionOutcomeGossipBuffer,
+    ExtensionOutcomePiggybackUpdate,
+    EXTENSION_OUTCOME_SEPARATOR,
+    MAX_EXTENSION_OUTCOME_PIGGYBACK_SIZE,
+)
+
 
 __all__ = [
     # Membership gossip
@@ -58,4 +65,9 @@ __all__ = [
     "ExtensionDecisionPiggybackUpdate",
     "EXTENSION_DECISION_SEPARATOR",
     "MAX_EXTENSION_DECISION_PIGGYBACK_SIZE",
+    # Extension outcome gossip (AD-26 H8b)
+    "ExtensionOutcomeGossipBuffer",
+    "ExtensionOutcomePiggybackUpdate",
+    "EXTENSION_OUTCOME_SEPARATOR",
+    "MAX_EXTENSION_OUTCOME_PIGGYBACK_SIZE",
 ]
