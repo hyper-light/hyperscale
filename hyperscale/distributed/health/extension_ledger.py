@@ -39,6 +39,10 @@ from hyperscale.distributed.health.extension_decision import (
     ExtensionDenialCode,
     ExtensionWitnessEvidence,
 )
+from hyperscale.distributed.health.extension_outcome import (
+    ExtensionOutcomeEvent,
+    ExtensionOutcomeKind,
+)
 from hyperscale.distributed.health.progress_witness import (
     WitnessVerdictKind,
 )
@@ -283,6 +287,10 @@ class ExtensionWorkflowEntry:
     last_decision: ExtensionDecisionEvent | None = None
     last_progress_snapshot: WorkflowProgressSnapshot | None = None
     last_leader_term: int = 0
+    # Phase H8: outcome paired with the decision history. ``None``
+    # while the workflow is in flight; populated exactly once when
+    # the leader records a termination via ``record_outcome``.
+    outcome: ExtensionOutcomeEvent | None = None
 
     def append(self, event: ExtensionDecisionEvent, max_decisions: int) -> None:
         """Append an event, evicting the oldest if depth exceeded."""
@@ -300,11 +308,20 @@ class ExtensionWorkflowEntry:
         return sum(1 for d in self.decisions if d.decision == "granted")
 
     @property
+    def denial_count(self) -> int:
+        return sum(1 for d in self.decisions if d.decision == "denied")
+
+    @property
     def is_exhausted(self) -> bool:
         return any(
             d.denial_reason_code == ExtensionDenialCode.MAX_EXHAUSTED.value
             for d in self.decisions
         )
+
+    @property
+    def is_terminated(self) -> bool:
+        """True iff a Phase H8 outcome event has been applied."""
+        return self.outcome is not None
 
 
 # ============================================================================
@@ -404,6 +421,35 @@ class ExtensionLedger:
             and prev.timestamp == event.timestamp
             and prev.decision == event.decision
         )
+
+    def record_outcome(
+        self, event: ExtensionOutcomeEvent
+    ) -> ExtensionWorkflowEntry | None:
+        """Phase H8: record a workflow termination outcome.
+
+        Idempotent: a second outcome with the same workflow_id is
+        accepted only if it carries a higher ``leader_term`` (a
+        new leader's authoritative version supersedes a stale one).
+        Stale-term events are rejected.
+
+        Returns the updated entry, or ``None`` if no decision
+        history exists for this workflow_id (extension never
+        requested → nothing to learn from). The caller should
+        still feed the event into the alpha tuner directly in
+        that case if they want to record the no-extension outcome.
+        """
+        entry = self._by_workflow_id.get(event.workflow_id)
+        if entry is None:
+            return None
+
+        if entry.outcome is not None:
+            if event.leader_term <= entry.outcome.leader_term:
+                return entry
+
+        entry.outcome = event
+        if event.leader_term > entry.last_leader_term:
+            entry.last_leader_term = event.leader_term
+        return entry
 
     def forget_workflow(self, workflow_id: str) -> None:
         """Drop ledger state for a terminated workflow."""

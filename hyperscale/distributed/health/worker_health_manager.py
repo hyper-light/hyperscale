@@ -14,6 +14,10 @@ Key responsibilities:
 from dataclasses import dataclass, field
 import time
 
+from hyperscale.distributed.health.alpha_posterior import (
+    HierarchicalAlphaTuner,
+    HierarchicalAlphaTunerConfig,
+)
 from hyperscale.distributed.health.extension_decision import (
     ExtensionDecision,
     ExtensionDecisionConfig,
@@ -24,6 +28,10 @@ from hyperscale.distributed.health.extension_ledger import (
     ExtensionDecisionEvent,
     ExtensionLedger,
     ExtensionLedgerConfig,
+)
+from hyperscale.distributed.health.extension_outcome import (
+    ExtensionOutcomeEvent,
+    ExtensionOutcomeKind,
 )
 from hyperscale.distributed.health.extension_tracker import (
     ExtensionTracker,
@@ -142,6 +150,15 @@ class WorkerHealthManager:
         # the legacy single-witness path) so observability /
         # cross-DC correlation tooling can query consistently.
         self._ledger: ExtensionLedger = ExtensionLedger(ExtensionLedgerConfig())
+
+        # Phase H8 — Bayesian per-workflow-class α posterior tuner.
+        # Updated whenever an outcome event is applied (locally on
+        # workflow termination, or remotely via AD-48 #|o
+        # dissemination). Composes with H6's hierarchical α budget
+        # via ``alpha_budget(class, floor, ceiling)``.
+        self._alpha_tuner: HierarchicalAlphaTuner = HierarchicalAlphaTuner(
+            HierarchicalAlphaTunerConfig()
+        )
 
     def _get_tracker(self, worker_id: str) -> ExtensionTracker:
         """Get or create an ExtensionTracker for a worker."""
@@ -423,6 +440,83 @@ class WorkerHealthManager:
         directly.
         """
         self._ledger.record(event)
+
+    def record_workflow_outcome(
+        self,
+        *,
+        job_id: str,
+        workflow_id: str,
+        workflow_class: str,
+        worker_id: str,
+        outcome_kind: ExtensionOutcomeKind,
+        final_progress_fraction: float,
+        completed_at: float,
+        fence_token: int,
+        leader_term: int,
+    ) -> ExtensionOutcomeEvent:
+        """Phase H8: record a workflow's terminal outcome.
+
+        Builds an ``ExtensionOutcomeEvent`` from the ledger's
+        accumulated decision history, persists it on the workflow
+        entry, and feeds it into the Bayesian α tuner. The event
+        is returned so the caller (the manager request handler)
+        can hand it to ``ManagerServer.disseminate_extension_outcome``
+        for AD-48 dissemination.
+
+        Idempotent: re-records of the same workflow_id with an
+        equal-or-lower leader_term return the existing event
+        unchanged. Higher-leader-term outcomes supersede.
+        """
+        entry = self._ledger.get_workflow_entry(workflow_id)
+        granted_count = entry.extension_count if entry is not None else 0
+        denied_count = entry.denial_count if entry is not None else 0
+        total_extended = entry.cumulative_extended if entry is not None else 0.0
+
+        event = ExtensionOutcomeEvent(
+            job_id=job_id,
+            workflow_id=workflow_id,
+            workflow_class=workflow_class,
+            worker_id=worker_id,
+            outcome_kind=outcome_kind,
+            granted_extension_count=granted_count,
+            denied_extension_count=denied_count,
+            total_extended_seconds=total_extended,
+            final_progress_fraction=final_progress_fraction,
+            completed_at=completed_at,
+            fence_token=fence_token,
+            leader_term=leader_term,
+        )
+        self._apply_outcome_locally(event)
+        return event
+
+    def ingest_remote_outcome_event(
+        self, event: ExtensionOutcomeEvent
+    ) -> None:
+        """Apply an outcome event received from a peer manager via
+        AD-48 ``#|o`` dissemination. Idempotent through the
+        ledger's stale-term rejection.
+        """
+        self._apply_outcome_locally(event)
+
+    def _apply_outcome_locally(self, event: ExtensionOutcomeEvent) -> None:
+        """Shared codepath for both leader-emitted and follower-
+        ingested outcome events. Pairs the ledger update with the
+        tuner update in a single call so the two stay coherent.
+        """
+        applied = self._ledger.record_outcome(event)
+        # Even when the workflow was never seen as an extension
+        # request locally (``applied is None``), the outcome still
+        # informs the global per-workflow-class posterior. The
+        # only caveat is that we won't have decision counts to
+        # cross-reference; the tuner only needs outcome_kind +
+        # final_progress_fraction.
+        del applied
+        self._alpha_tuner.apply_outcome(event)
+
+    @property
+    def alpha_tuner(self) -> HierarchicalAlphaTuner:
+        """Read-only access to the H8 Bayesian α tuner."""
+        return self._alpha_tuner
 
     def forget_workflow(self, workflow_id: str) -> None:
         """Drop H7 ledger state for a terminated workflow."""
