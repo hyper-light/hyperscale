@@ -1616,6 +1616,14 @@ class JobLeadershipAnnouncement(Message):
     leader_addr: tuple[str, int] | None = None
     target_dc_count: int = 0
     fence_token: int = 0
+    # Push-notification destinations replicated to peers so a manager
+    # that takes over job leadership (Raft takeover after the original
+    # leader dies) can push completion / cancellation notifications to
+    # the originating client and origin gate. Without this, only the
+    # original leader knows the callback addresses, and any post-
+    # takeover completion silently drops on the floor.
+    callback_addr: tuple[str, int] | None = None
+    origin_gate_addr: tuple[str, int] | None = None
 
     def __post_init__(self) -> None:
         """Handle leader_addr alias for leader_host/leader_tcp_port."""

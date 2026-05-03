@@ -5826,12 +5826,17 @@ class ManagerServer(HealthAwareServer):
 
             await self._manager_state.increment_state_version()
 
-            # Broadcast job leadership to peers
+            # Broadcast job leadership to peers, including the
+            # client callback + origin gate addresses so any peer
+            # that later takes over leadership can push terminal-
+            # state notifications back to the originating client.
             workflow_names = [wf.name for _, _, wf in workflows]
             await self._broadcast_job_leadership(
                 submission.job_id,
                 len(workflows),
                 workflow_names,
+                callback_addr=submission.callback_addr,
+                origin_gate_addr=submission.origin_gate_addr,
             )
 
             # Dispatch workflows
@@ -6192,6 +6197,24 @@ class ManagerServer(HealthAwareServer):
                 (announcement.leader_host, announcement.leader_tcp_port),
             )
 
+            # Replicate push-notification destinations from the
+            # announcement so any subsequent leadership takeover on
+            # this node can push terminal-state notifications back
+            # to the originating client / origin gate. Coercing the
+            # tuple normalises the wire-decoded list-of-pairs back
+            # to the (host, port) shape stored in state.
+            if announcement.callback_addr is not None:
+                self._manager_state.set_job_callback(
+                    announcement.job_id, tuple(announcement.callback_addr)
+                )
+                self._manager_state.set_progress_callback(
+                    announcement.job_id, tuple(announcement.callback_addr)
+                )
+            if announcement.origin_gate_addr is not None:
+                self._manager_state.set_job_origin_gate(
+                    announcement.job_id, tuple(announcement.origin_gate_addr)
+                )
+
             # Initialize context for this job
             self._manager_state.get_or_create_job_context(announcement.job_id)
 
@@ -6505,8 +6528,20 @@ class ManagerServer(HealthAwareServer):
         job_id: str,
         workflow_count: int,
         workflow_names: list[str],
+        callback_addr: tuple[str, int] | None = None,
+        origin_gate_addr: tuple[str, int] | None = None,
     ) -> None:
-        """Broadcast job leadership to peer managers."""
+        """Broadcast job leadership to peer managers.
+
+        ``callback_addr`` / ``origin_gate_addr`` are replicated so a
+        peer that subsequently takes over job leadership (Raft
+        takeover after the original leader dies) has the destinations
+        needed to push job-completion / cancellation-completion
+        notifications back to the originating client and origin
+        gate. Without replication, only the original leader knows
+        these addresses and any post-takeover terminal-state push
+        silently no-ops in ``_push_cancellation_complete_to_origin``.
+        """
         announcement = JobLeadershipAnnouncement(
             job_id=job_id,
             leader_id=self._node_id.full,
@@ -6514,6 +6549,8 @@ class ManagerServer(HealthAwareServer):
             leader_tcp_port=self._tcp_port,
             workflow_count=workflow_count,
             workflow_names=workflow_names,
+            callback_addr=callback_addr,
+            origin_gate_addr=origin_gate_addr,
         )
 
         for peer_addr in self._manager_state.get_active_manager_peers():
