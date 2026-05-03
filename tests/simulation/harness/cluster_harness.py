@@ -34,6 +34,7 @@ from tests.simulation.harness.diagnostics import DiagnosticDumper
 from tests.simulation.harness.env_overrides import EnvOverrides
 from tests.simulation.harness.execution_mode import ExecutionMode
 from tests.simulation.harness.fault_matrix import FaultMatrix
+from tests.simulation.harness import fault_transport
 from tests.simulation.harness.invariants import (
     InvariantChecker,
     LivenessInvariant,
@@ -131,6 +132,11 @@ class ClusterHarness:
         try:
             self._build_servers()
             await self._start_servers()
+            # Phase 4: install FaultInjectingTransport on every started
+            # server so partition/delay/drop rules take effect for any
+            # subsequent send. Servers without the wrapper would still
+            # be reachable from rule-blocked peers.
+            fault_transport.install(self)
             await self._invariants.start()
             await self._stabilize()
         except BaseException:
@@ -200,6 +206,30 @@ class ClusterHarness:
 
     def all_handles(self) -> list[ServerHandle]:
         return self._supervisor.server_handles
+
+    def address_to_node_id(
+        self, address: tuple[str, int], *, kind: str = "tcp"
+    ) -> str | None:
+        """Look up the harness-managed node owning ``address``.
+
+        Used by ``FaultInjectingTransport`` to resolve the (src, dst)
+        pair for fault-rule matching. Returns ``None`` for addresses
+        outside the harness — most commonly the
+        ``HyperscaleClient`` port the workload driver opens, which
+        is intentionally not subject to partition rules (the harness
+        treats the client as an external entity).
+
+        ``kind`` is ``"tcp"`` or ``"udp"`` so the lookup uses the
+        right port table; the same handle exposes both.
+        """
+        for handle in self.all_handles():
+            if address[0] != handle.host:
+                continue
+            if kind == "tcp" and address[1] == handle.tcp_port:
+                return handle.node_id
+            if kind == "udp" and address[1] == handle.udp_port:
+                return handle.node_id
+        return None
 
     def _build_servers(self) -> None:
         """Allocate ports and construct (but do not start) every server."""

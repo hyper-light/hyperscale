@@ -41,7 +41,8 @@ Invariants the harness enforces around fault operations:
 """
 
 import asyncio
-from dataclasses import dataclass
+import random
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from tests.simulation.harness.errors import HarnessError
@@ -53,6 +54,47 @@ if TYPE_CHECKING:
 
 class FaultError(HarnessError):
     """A fault primitive failed mid-flight."""
+
+
+@dataclass(slots=True)
+class _PartitionRule:
+    """One bidirectional partition between two node-id groups.
+
+    A send from any node in ``group_a`` to any node in ``group_b``,
+    or vice versa, is dropped (returns synthetic timeout). The
+    matrix can hold multiple ``_PartitionRule`` instances — they
+    OR together, so overlapping partitions are additive.
+    """
+
+    group_a: frozenset[str]
+    group_b: frozenset[str]
+
+
+@dataclass(slots=True)
+class _DelayRule:
+    """One delay rule between optionally-wildcarded src/dst.
+
+    ``src`` / ``dst`` of ``None`` matches any node. The harness
+    applies the most-specific rule (both src and dst named) over
+    less-specific (one or both wildcarded).
+    """
+
+    src: str | None
+    dst: str | None
+    delay_ms: float
+    jitter_ms: float = 0.0
+
+
+@dataclass(slots=True)
+class _DropRule:
+    """One drop-rate rule between optionally-wildcarded src/dst.
+
+    Same matching semantics as ``_DelayRule``.
+    """
+
+    src: str | None
+    dst: str | None
+    probability: float
 
 
 @dataclass(slots=True)
@@ -68,11 +110,17 @@ class FaultMatrix:
     harness: "ClusterHarness"
     _killed: set[str]
     _paused: dict[str, "_PausedState"]
+    _partitions: list[_PartitionRule]
+    _delays: list[_DelayRule]
+    _drops: list[_DropRule]
 
     def __init__(self, harness: "ClusterHarness") -> None:
         self.harness = harness
         self._killed = set()
         self._paused = {}
+        self._partitions = []
+        self._delays = []
+        self._drops = []
 
     # =========================================================================
     # Kill / restart
@@ -132,6 +180,13 @@ class FaultMatrix:
         handle.instance = new_instance
         handle.started = True
         self._killed.discard(handle.node_id)
+        # Phase 4: re-install the fault-injecting transport on the
+        # rebuilt instance. The original methods on the new instance
+        # are unwrapped; without this, partition / delay / drop rules
+        # would silently stop applying to the restarted node.
+        from tests.simulation.harness import fault_transport
+
+        fault_transport.reinstall_for(handle, self.harness)
 
     # =========================================================================
     # Pause / resume
@@ -240,6 +295,212 @@ class FaultMatrix:
             instance._start_background_tasks()
 
     # =========================================================================
+    # Network faults — partition / delay / drop (Phase 4)
+    # =========================================================================
+
+    async def partition(
+        self,
+        group_a: list[ServerHandle] | list[str],
+        group_b: list[ServerHandle] | list[str],
+    ) -> None:
+        """Install a bidirectional partition between two node groups.
+
+        After this returns, sends from any node in ``group_a`` to any
+        node in ``group_b`` (and vice versa) are dropped — the
+        sender sees a synthetic ``asyncio.TimeoutError`` matching
+        the production on-error contract. Existing transports stay
+        open, but every message in flight or attempted across the
+        partition fails fast.
+
+        Multiple partitions compose: a node may participate in more
+        than one ``_PartitionRule``. Drop happens if *any* rule
+        matches — partitions OR together.
+
+        Asymmetric partitions are not yet a separate primitive:
+        call ``partition([a], [b])`` for symmetric, then to model
+        asymmetric drop add a ``drop_rate(src=b, dst=a, probability=1.0)``
+        without the matching ``a → b`` rule.
+        """
+        ids_a = frozenset(self._normalize(group_a))
+        ids_b = frozenset(self._normalize(group_b))
+        if ids_a & ids_b:
+            raise FaultError(
+                f"partition groups overlap: {sorted(ids_a & ids_b)}"
+            )
+        self._partitions.append(_PartitionRule(group_a=ids_a, group_b=ids_b))
+
+    async def heal_partition(self) -> None:
+        """Remove every partition rule installed via ``partition()``.
+
+        Drop-rate and delay rules are unaffected — call
+        ``clear_network_faults()`` if you want a complete reset.
+        """
+        self._partitions.clear()
+
+    async def delay(
+        self,
+        ms: float,
+        *,
+        src: ServerHandle | str | None = None,
+        dst: ServerHandle | str | None = None,
+        jitter_ms: float = 0.0,
+    ) -> None:
+        """Add a one-way ``ms``-millisecond delay on (src, dst).
+
+        ``src`` / ``dst`` of ``None`` is a wildcard. Multiple rules
+        compose: the matcher picks the most-specific rule (both
+        src and dst named beats one wildcard beats both wildcards),
+        and within the same specificity the most-recently-installed
+        rule wins.
+
+        ``jitter_ms`` adds uniform random jitter on top of ``ms``;
+        each send rolls independently.
+        """
+        if ms < 0.0:
+            raise FaultError(f"delay ms must be non-negative; got {ms}")
+        if jitter_ms < 0.0:
+            raise FaultError(f"jitter_ms must be non-negative; got {jitter_ms}")
+        self._delays.append(
+            _DelayRule(
+                src=self._normalize_one(src),
+                dst=self._normalize_one(dst),
+                delay_ms=ms,
+                jitter_ms=jitter_ms,
+            )
+        )
+
+    async def drop_rate(
+        self,
+        probability: float,
+        *,
+        src: ServerHandle | str | None = None,
+        dst: ServerHandle | str | None = None,
+    ) -> None:
+        """Drop sends from ``src`` to ``dst`` with the given probability.
+
+        Wildcards work the same way as ``delay``. ``probability=1.0``
+        is equivalent to a one-way partition (only this direction
+        drops; the reverse direction continues to flow).
+
+        Compositional with ``partition()``: a partition is checked
+        first (binary deterministic block); if not partitioned, the
+        drop_rate dice roll runs.
+        """
+        if not (0.0 <= probability <= 1.0):
+            raise FaultError(
+                f"drop probability must be in [0, 1]; got {probability}"
+            )
+        self._drops.append(
+            _DropRule(
+                src=self._normalize_one(src),
+                dst=self._normalize_one(dst),
+                probability=probability,
+            )
+        )
+
+    async def clear_network_faults(self) -> None:
+        """Wipe every partition, delay, and drop rule. ``kill`` /
+        ``pause`` lifecycle state is unaffected."""
+        self._partitions.clear()
+        self._delays.clear()
+        self._drops.clear()
+
+    def is_partitioned(self, src_node_id: str, dst_node_id: str) -> bool:
+        """True iff any installed partition rule blocks this pair.
+
+        Symmetric: a rule with groups (a, b) blocks both a → b and
+        b → a.
+        """
+        for rule in self._partitions:
+            if (
+                src_node_id in rule.group_a and dst_node_id in rule.group_b
+            ) or (
+                src_node_id in rule.group_b and dst_node_id in rule.group_a
+            ):
+                return True
+        return False
+
+    def drop_probability(
+        self, src_node_id: str, dst_node_id: str
+    ) -> float:
+        """Return the most-specific drop probability for this pair.
+
+        Returns 0.0 (never drop) when no rule matches.
+        """
+        rule = self._most_specific(self._drops, src_node_id, dst_node_id)
+        return 0.0 if rule is None else rule.probability
+
+    def delay_seconds(
+        self,
+        src_node_id: str,
+        dst_node_id: str,
+        rng: random.Random,
+    ) -> float:
+        """Return the most-specific delay for this pair, in seconds.
+
+        Applies jitter via the supplied ``rng`` so the per-source
+        randomness stays deterministic per-test when the harness
+        seeds it.
+        """
+        rule = self._most_specific(self._delays, src_node_id, dst_node_id)
+        if rule is None:
+            return 0.0
+        delay_ms = rule.delay_ms
+        if rule.jitter_ms > 0.0:
+            delay_ms += rng.uniform(0.0, rule.jitter_ms)
+        return delay_ms / 1000.0
+
+    @staticmethod
+    def _most_specific(
+        rules: list,
+        src_node_id: str,
+        dst_node_id: str,
+    ):
+        """Pick the most-specific matching rule.
+
+        Specificity score: 2 = both fields named; 1 = one wildcard;
+        0 = both wildcards. Ties broken by insertion order: the
+        most-recently-added rule wins. This keeps the API
+        compositional — a scenario can install a wildcard baseline
+        then override for specific pairs.
+        """
+        best = None
+        best_score = -1
+        for rule in rules:
+            score = 0
+            if rule.src is not None:
+                if rule.src != src_node_id:
+                    continue
+                score += 1
+            if rule.dst is not None:
+                if rule.dst != dst_node_id:
+                    continue
+                score += 1
+            if score >= best_score:
+                best = rule
+                best_score = score
+        return best
+
+    @staticmethod
+    def _normalize_one(
+        identifier: ServerHandle | str | None,
+    ) -> str | None:
+        if identifier is None:
+            return None
+        if isinstance(identifier, ServerHandle):
+            return identifier.node_id
+        return identifier
+
+    @staticmethod
+    def _normalize(
+        items: list[ServerHandle] | list[str],
+    ) -> list[str]:
+        return [
+            (item.node_id if isinstance(item, ServerHandle) else item)
+            for item in items
+        ]
+
+    # =========================================================================
     # Inspection
     # =========================================================================
 
@@ -254,6 +515,16 @@ class FaultMatrix:
 
     def paused_nodes(self) -> list[str]:
         return sorted(self._paused)
+
+    def partition_count(self) -> int:
+        return len(self._partitions)
+
+    def network_fault_summary(self) -> dict[str, int]:
+        return {
+            "partitions": len(self._partitions),
+            "delays": len(self._delays),
+            "drops": len(self._drops),
+        }
 
     # =========================================================================
     # Helpers
