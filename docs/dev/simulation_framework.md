@@ -709,13 +709,52 @@ quorum loss / recovery. Subtle variants in the integration suite
 mechanical compositions of the harness primitives now available
 and can be added opportunistically.
 
-### Phase 4 — Transport injection (REAL mode partition / delay / drop)
+### Phase 4 — Transport injection (REAL mode partition / delay / drop) — *landed*
 
-- `FaultInjectingTransport` wrapping `send_tcp` / `send_udp`.
-- Partition / delay / drop scenarios, including asymmetric and flapping.
+**Shipped:**
 
-**Exit criteria:** partition correlation logic in the SWIM layer has
-end-to-end coverage at L3.
+- `FaultInjectingTransport` (`tests/simulation/harness/fault_transport.py`)
+  wraps `send_tcp` / `send_udp` at the bound-method level on every
+  harness-managed server. The wrapper closes over a reference to the
+  harness's `FaultMatrix` and the `address_to_node_id` resolver, and:
+
+  1. Returns a synthetic `(asyncio.TimeoutError, clock)` tuple — the
+     same shape the original methods produce on error — when the
+     (src, dst) pair is partitioned or hits a `drop_rate` roll.
+  2. Sleeps for the configured delay (with jitter) before forwarding.
+  3. Forwards to the original bound method when no rule matches.
+
+  External addresses (e.g. the workload's `HyperscaleClient` port)
+  return `None` from `address_to_node_id` and bypass rules — the
+  client is treated as outside the harness.
+
+- `FaultMatrix` extensions: `partition`, `heal_partition`,
+  `delay(ms, *, src, dst, jitter_ms)`, `drop_rate(probability, *,
+  src, dst)`, `clear_network_faults`. Wildcards on `src`/`dst`
+  supported (`None` = any). Most-specific-rule wins; ties broken by
+  insertion order so scenarios can install a wildcard baseline and
+  override for named pairs.
+
+- `ClusterHarness.address_to_node_id(address, kind)` — TCP/UDP
+  port-table lookup. `_install_one` runs after `_start_servers`;
+  `FaultMatrix.restart` re-installs on rebuild so partition rules
+  survive kill / restart cycles.
+
+- 4 scenarios under `tests/simulation/scenarios/phase4_network/`:
+
+  | Scenario                                     | Topology | What it validates                              |
+  |----------------------------------------------|----------|-----------------------------------------------|
+  | `dc_to_dc_partition_then_heal`               | L3 (2DC) | Symmetric cross-DC partition; intra-DC peers  |
+  |                                              |          | stay stable; heal converges                   |
+  | `one_way_drop_rate`                          | L3 (2DC) | Asymmetric east→west 100% drop; reverse OK    |
+  | `flapping_partition`                         | L3 (2DC) | 3 partition/heal cycles; no leaked state      |
+  | `intra_dc_delay_does_not_break_quorum`       | L2 (3M)  | 200ms±50ms jitter; leader election succeeds   |
+
+**Exit criteria — met.** SWIM partition-correlation paths exercised
+at L3 with symmetric, asymmetric, and flapping faults; the FaultMatrix
+primitives compose with the Phase 3 lifecycle faults so any future
+scenario can mix kill/restart with partition/delay/drop without new
+harness code.
 
 ### Phase 5 — Clock / Random / Transport interface refactor
 
