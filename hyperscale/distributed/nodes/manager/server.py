@@ -119,6 +119,9 @@ from hyperscale.distributed.reliability import (
 )
 from hyperscale.distributed.resources import ProcessResourceMonitor, ResourceMetrics
 from hyperscale.distributed.health import WorkerHealthManager, WorkerHealthManagerConfig
+from hyperscale.distributed.health.workflow_progress_snapshot import (
+    WorkflowProgressSnapshot,
+)
 from hyperscale.distributed.protocol.version import (
     CURRENT_PROTOCOL_VERSION,
     NodeCapabilities,
@@ -3097,6 +3100,144 @@ class ManagerServer(HealthAwareServer):
             event, number_of_managers=number_of_managers
         )
 
+    def _route_extension_through_witnesses(
+        self,
+        *,
+        request: HealthcheckExtensionRequest,
+        current_deadline: float,
+    ) -> "HealthcheckExtensionResponse | None":
+        """Phase F1: route an extension request through the H5 multi-
+        witness decision path when the request carries an H3
+        ``workflow_id``.
+
+        Returns the response on success, or ``None`` to fall back
+        to the legacy path (e.g. the workflow can't be looked up
+        in the local ``JobManager`` — typical when the workflow
+        belongs to a job led by a different manager and our state
+        is stale). The caller passes the result of this method
+        through to its existing post-processing (deadline update,
+        SWIM detector, dissemination, persistence).
+
+        The H5 inputs that don't ride on the wire (throughput,
+        overload_state, fence_token, leader_term, workflow_class)
+        are reconstructed locally from:
+
+        - ``WorkerPool.get_worker`` for the AD-19 heartbeat fields
+        - ``JobManager`` for job/workflow lookup
+        - ``LeadershipCoordinator`` for the cluster-wide leader term
+        """
+        snapshot = self._build_progress_snapshot_from_request(request)
+
+        last_snapshot = (
+            self._worker_health_manager.ledger.latest_progress_snapshot(
+                request.workflow_id
+            )
+        )
+
+        throughput = 0.0
+        overload_state = "healthy"
+        worker_status = self._worker_pool.get_worker(request.worker_id)
+        if worker_status is not None and worker_status.heartbeat is not None:
+            throughput = worker_status.heartbeat.health_throughput
+            overload_state = worker_status.heartbeat.health_overload_state
+
+        job_id, workflow_class, fence_token = (
+            self._lookup_workflow_context(request.workflow_id)
+        )
+        if job_id == "":
+            # No local job context — fall back to legacy worker-
+            # level path. The H5 path requires job/workflow context
+            # to record a meaningful event.
+            return None
+
+        leader_term = self._leadership_coordinator._get_term()
+
+        active_on_worker = max(1, request.active_workflow_count)
+        active_on_manager = max(active_on_worker, self._count_active_workflows())
+        active_in_dc = active_on_manager
+        active_in_cluster = active_on_manager
+
+        response, decision, event = (
+            self._worker_health_manager.handle_extension_request_with_witnesses(
+                request=request,
+                current_deadline=current_deadline,
+                snapshot=snapshot,
+                last_snapshot=last_snapshot,
+                throughput=throughput,
+                overload_state=overload_state,
+                active_in_cluster=active_in_cluster,
+                active_in_dc=active_in_dc,
+                active_on_manager=active_on_manager,
+                active_on_worker=active_on_worker,
+                job_id=job_id,
+                fence_token=fence_token,
+                leader_term=leader_term,
+            )
+        )
+        del decision  # Available for future hooks (alerting, etc.)
+        # Disseminate via AD-48 #|x and persist into the job's
+        # TimeoutTrackingState so leader transfer survives.
+        self.disseminate_extension_decision(event)
+        self._persist_decision_for_job(job_id, event)
+        return response
+
+    def _build_progress_snapshot_from_request(
+        self, request: HealthcheckExtensionRequest
+    ) -> WorkflowProgressSnapshot:
+        """Materialize the wire-side H3 fields into a snapshot."""
+        cores_completed = (
+            request.completed_items if request.completed_items is not None else 0
+        )
+        cores_total = (
+            request.total_items if request.total_items is not None else 0
+        )
+        return WorkflowProgressSnapshot(
+            workflow_id=request.workflow_id,
+            cores_completed=cores_completed,
+            cores_total=cores_total,
+            step_transitions=request.step_transitions,
+            actions_completed=request.actions_completed,
+            snapshot_time=request.snapshot_time,
+        )
+
+    def _lookup_workflow_context(
+        self, workflow_id: str
+    ) -> tuple[str, str, int]:
+        """Resolve (job_id, workflow_class, fence_token) for a
+        workflow_id. Returns ("", "", 0) when no matching job is
+        tracked locally."""
+        for job in self._job_manager.iter_jobs():
+            for wf_info in job.workflows.values():
+                if wf_info.token.workflow_id == workflow_id:
+                    return job.job_id, wf_info.name, job.fencing_token
+        return "", "", 0
+
+    def _count_active_workflows(self) -> int:
+        """Count workflows actively running across all jobs on this
+        manager. Used as the H6 ``active_on_manager`` input for
+        hierarchical α-budget allocation."""
+        count = 0
+        for job in self._job_manager.iter_jobs():
+            for wf_info in job.workflows.values():
+                if wf_info.status == WorkflowStatus.RUNNING:
+                    count += 1
+        return count
+
+    def _persist_decision_for_job(
+        self, job_id: str, event: ExtensionDecisionEvent
+    ) -> None:
+        """Mirror the just-recorded decision into the job's
+        ``TimeoutTrackingState`` so leader takeover (AD-34) inherits
+        the H7 ledger view. No-op if the job has no timeout
+        tracking state (e.g. queue-only jobs)."""
+        job_token = self._job_manager.create_job_token(job_id)
+        job = self._job_manager.get_job(job_token)
+        if job is None or job.timeout_tracking is None:
+            return
+        self._worker_health_manager.persist_decision_to_tracking(
+            job.timeout_tracking, event
+        )
+
     async def _push_cancellation_complete_to_origin(
         self,
         job_id: str,
@@ -4441,11 +4582,23 @@ class ManagerServer(HealthAwareServer):
             if current_deadline is None:
                 current_deadline = time.monotonic() + 30.0
 
-            # Handle extension request via worker health manager
-            response = self._worker_health_manager.handle_extension_request(
-                request=request,
-                current_deadline=current_deadline,
-            )
+            # Phase F1: route through the H5 multi-witness path when
+            # the request carries an H3 ``workflow_id`` (workers using
+            # the H4 autonomous trigger always set this). Falls back
+            # to the legacy worker-level path when the workflow can't
+            # be located on this manager (cross-manager workflows or
+            # pre-H4 callers).
+            response: HealthcheckExtensionResponse | None = None
+            if request.workflow_id:
+                response = self._route_extension_through_witnesses(
+                    request=request,
+                    current_deadline=current_deadline,
+                )
+            if response is None:
+                response = self._worker_health_manager.handle_extension_request(
+                    request=request,
+                    current_deadline=current_deadline,
+                )
 
             # Update stored deadline if granted
             if response.granted:
