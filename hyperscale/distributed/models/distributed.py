@@ -832,6 +832,17 @@ class ManagerHeartbeat(Message):
     protocol_version_major: int = 1
     protocol_version_minor: int = 0
     capabilities: str = ""  # Comma-separated feature list
+    # AD-42 Phase E: per-DC SLO summary disseminated manager → gate.
+    # All fields default to a neutral baseline so back-compat with
+    # peers that pre-date Phase E is preserved (a zero-sample summary
+    # gives compliance_score=1.0, routing_factor=1.0).
+    slo_p50_ms: float = 0.0
+    slo_p95_ms: float = 0.0
+    slo_p99_ms: float = 0.0
+    slo_sample_count: int = 0
+    slo_compliance_score: float = 1.0
+    slo_routing_factor: float = 1.0
+    slo_updated_at: float = 0.0
 
 
 # =============================================================================

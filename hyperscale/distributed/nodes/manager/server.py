@@ -2961,6 +2961,12 @@ class ManagerServer(HealthAwareServer):
         # reporting yet, or all evicted).
         worker_lhm_scores = self._manager_state._worker_lhm_scores
         worker_max_lhm = max(worker_lhm_scores.values()) if worker_lhm_scores else 0
+        # AD-42 Phase E2: per-DC SLO summary built from the manager's
+        # T-Digest. Embedded in the heartbeat so gates see fresh
+        # latency percentiles every probe interval without an extra
+        # RPC. Returns SLOSummary.empty() (neutral baseline) when no
+        # workflow latencies have been recorded yet.
+        slo_summary = self._manager_state.get_slo_summary()
         return ManagerHeartbeat(
             node_id=self._node_id.full,
             datacenter=self._node_id.datacenter,
@@ -2988,6 +2994,14 @@ class ManagerServer(HealthAwareServer):
             # AD-19 addendum (Phase D): manager's own LHM + max worker LHM
             lhm_score=self._local_health.score,
             worker_max_lhm_score=worker_max_lhm,
+            # AD-42 Phase E2 SLO piggyback
+            slo_p50_ms=slo_summary.p50_ms,
+            slo_p95_ms=slo_summary.p95_ms,
+            slo_p99_ms=slo_summary.p99_ms,
+            slo_sample_count=slo_summary.sample_count,
+            slo_compliance_score=slo_summary.compliance_score,
+            slo_routing_factor=slo_summary.routing_factor,
+            slo_updated_at=slo_summary.updated_at,
         )
 
     def _get_healthy_gate_tcp_addrs(self) -> list[tuple[str, int]]:
