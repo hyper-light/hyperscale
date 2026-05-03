@@ -234,6 +234,62 @@ class WorkloadDriver:
         await self.submit()
         await self._wait_for_completion()
 
+    async def cancel(
+        self,
+        job_id: str | None = None,
+        reason: str = "harness-injected",
+        timeout: float = 30.0,
+    ) -> tuple[bool, list[str]]:
+        """Cancel a submitted job and await cancellation completion.
+
+        Returns ``(success, errors)`` from ``await_job_cancellation``.
+        When ``job_id`` is omitted, cancels the most-recently-
+        submitted job — the common case for single-submission
+        scenarios.
+
+        The cancellation flow is:
+
+        1. ``client.cancel_job(job_id)`` posts a cancellation request
+           to the manager / gate that owns the job. Handles
+           leadership redirection via ``max_redirects`` and retries
+           transient errors via ``max_retries``.
+        2. ``client.await_job_cancellation(job_id, timeout)`` blocks
+           on the cancellation-complete callback that propagates
+           through the manager → gate → client chain.
+
+        Raises ``HarnessError`` if no job has been submitted yet, or
+        if the cancellation does not complete within ``timeout``.
+        """
+        if self._client is None:
+            raise RuntimeError("call cancel inside the async-with block")
+        target_job = job_id
+        if target_job is None:
+            if not self._observations.submitted_job_ids:
+                raise HarnessError(
+                    "cancel(): no job_id provided and no submissions have "
+                    "registered a job_id yet. Call submit() first or pass "
+                    "an explicit job_id."
+                )
+            target_job = self._observations.submitted_job_ids[-1]
+        await self._client.cancel_job(job_id=target_job, reason=reason)
+        try:
+            success, errors = await asyncio.wait_for(
+                self._client.await_job_cancellation(target_job, timeout=timeout),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            await self.harness.dump_diagnostics(
+                reason=(
+                    f"cancellation of job {target_job} did not complete "
+                    f"within {timeout:.1f}s"
+                )
+            )
+            raise HarnessError(
+                f"cancellation of job {target_job} timed out after "
+                f"{timeout:.1f}s"
+            ) from None
+        return success, errors
+
     def evaluate_expectations(self) -> list[ExpectationResult]:
         """Run every registered expectation against the observations."""
         return [
