@@ -2280,6 +2280,13 @@ class ManagerServer(HealthAwareServer):
                                 job.status = JobStatus.FAILED.value
                                 job.completed_at = time.monotonic()
                                 await self._manager_state.increment_state_version()
+                                # Phase F3: emit TIMED_OUT outcomes
+                                # for every still-in-flight workflow
+                                # on this job. Closes the H8
+                                # feedback loop on hard timeouts.
+                                self._emit_outcomes_for_terminal_job(
+                                    job_id, ExtensionOutcomeKind.TIMED_OUT
+                                )
                     except Exception as check_error:
                         await self._udp_logger.log(
                             ServerError(
@@ -3252,6 +3259,82 @@ class ManagerServer(HealthAwareServer):
         self._worker_health_manager.persist_outcome_to_tracking(
             job.timeout_tracking, event
         )
+
+    def _emit_outcomes_for_terminal_job(
+        self,
+        job_id: str,
+        outcome_kind: ExtensionOutcomeKind,
+    ) -> None:
+        """Phase F3: emit H8 outcome events for every still-in-flight
+        workflow on a job that's hit a terminal state without going
+        through the per-workflow ``WorkflowFinalResult`` path
+        (timeout, cancellation, eviction).
+
+        Iterates the job's sub-workflows: for each one without a
+        result yet (i.e. truly in-flight), emits one outcome event
+        keyed on the sub-workflow's ``workflow_id``. The Bayesian
+        tuner sees one Bernoulli trial per dropped workflow,
+        weighted by the most-recent progress snapshot the H7
+        ledger has for that workflow.
+
+        Idempotent: ``ExtensionLedger.record_outcome`` rejects
+        re-records with equal-or-lower leader_term, and
+        ``forget_workflow`` makes subsequent calls safe.
+        """
+        job_token = self._job_manager.create_job_token(job_id)
+        job = self._job_manager.get_job(job_token)
+        if job is None:
+            return
+
+        leader_term = self._leadership_coordinator._get_term()
+        completed_at = time.monotonic()
+        ledger = self._worker_health_manager.ledger
+
+        for sub_info in list(job.sub_workflows.values()):
+            if sub_info.result is not None:
+                continue
+            workflow_id = sub_info.token.workflow_id or ""
+            if not workflow_id:
+                continue
+
+            # Pull progress fraction from the most-recent H7
+            # snapshot. cores_completed / cores_total = the AD-26
+            # primary progress dimension.
+            progress_fraction = 0.0
+            snapshot = ledger.latest_progress_snapshot(workflow_id)
+            if snapshot is not None and snapshot.cores_total > 0:
+                progress_fraction = (
+                    snapshot.cores_completed / snapshot.cores_total
+                )
+                if progress_fraction > 1.0:
+                    progress_fraction = 1.0
+
+            # Look up workflow_class from the parent WorkflowInfo —
+            # sub-workflows share their parent's name.
+            workflow_class = ""
+            parent_token = sub_info.parent_token
+            if parent_token is not None:
+                parent = job.workflows.get(str(parent_token))
+                if parent is not None:
+                    workflow_class = parent.name
+
+            event = self._worker_health_manager.record_workflow_outcome(
+                job_id=job_id,
+                workflow_id=workflow_id,
+                workflow_class=workflow_class,
+                worker_id=sub_info.worker_id or "",
+                outcome_kind=outcome_kind,
+                final_progress_fraction=progress_fraction,
+                completed_at=completed_at,
+                fence_token=job.fencing_token,
+                leader_term=leader_term,
+            )
+            self.disseminate_extension_outcome(event)
+            if job.timeout_tracking is not None:
+                self._worker_health_manager.persist_outcome_to_tracking(
+                    job.timeout_tracking, event
+                )
+            self._worker_health_manager.forget_workflow(workflow_id)
 
     def _emit_workflow_outcome_event(
         self, result: "WorkflowFinalResult"
@@ -4353,6 +4436,15 @@ class ManagerServer(HealthAwareServer):
             job.status = JobStatus.CANCELLED.value
             job.completed_at = time.monotonic()
             await self._manager_state.increment_state_version()
+
+            # Phase F3: emit FAILED outcomes for any still-in-flight
+            # workflows whose AD-26 extension history hasn't been
+            # closed by a WorkflowFinalResult yet. Cancellation is
+            # treated as failure for the H8 Bayesian tuner — the
+            # extension(s) didn't get the workflow to completion.
+            self._emit_outcomes_for_terminal_job(
+                job_id, ExtensionOutcomeKind.FAILED
+            )
 
             total_cancelled = len(pending_cancelled) + len(running_cancelled)
             total_errors = len(workflow_errors)
