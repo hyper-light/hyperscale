@@ -52,6 +52,23 @@ class WorkloadDriver:
     Used as ``async with cluster.workload(spec) as workload:`` — the
     enter starts the client, the exit stops it AND evaluates all
     expectations, raising :class:`WorkloadFailure` if any fail.
+
+    Three-step submission API for fault-injection scenarios:
+
+    1. ``submit()`` — queue the spec's submissions. Returns when the
+       job_ids have been registered; does NOT wait for execution.
+    2. ``wait_until_running(timeout)`` — block until at least one
+       submitted job's ``JobStatusPush`` reports ``JobStatus.RUNNING``
+       (or a downstream state). The kill / partition / pause must
+       happen between this and ``wait_for_completion`` to land
+       mid-workload.
+    3. ``wait_for_completion()`` — block until every expected
+       workflow has reported a result, bounded by the spec's
+       ``timeout_seconds``.
+
+    ``submit_and_wait()`` is a convenience that does ``submit`` +
+    ``wait_for_completion`` back-to-back (no ``wait_until_running``)
+    for callers that don't need to inject faults during execution.
     """
 
     harness: "ClusterHarness"
@@ -64,6 +81,7 @@ class WorkloadDriver:
     )
     _started_at: float = field(init=False, default=0.0)
     _all_complete_event: asyncio.Event = field(init=False)
+    _running_event: asyncio.Event = field(init=False)
     _expected_workflow_names: set[str] = field(init=False, default_factory=set)
 
     @property
@@ -72,6 +90,7 @@ class WorkloadDriver:
 
     async def __aenter__(self) -> "WorkloadDriver":
         self._all_complete_event = asyncio.Event()
+        self._running_event = asyncio.Event()
         targets = self._select_routing_targets()
         if not targets:
             raise HarnessError(
@@ -123,16 +142,15 @@ class WorkloadDriver:
             joined = "\n  - ".join(f"{r.name}: {r.detail}" for r in failures)
             raise WorkloadFailure(f"workload expectations failed:\n  - {joined}")
 
-    async def submit_and_wait(self) -> None:
-        """Submit per the spec's pattern, then wait for all workflows to complete.
+    async def submit(self) -> None:
+        """Submit per the spec's pattern. Returns once submissions are
+        queued; does NOT wait for completion or even dispatch.
 
-        The wait is bounded by the largest ``Submission.timeout_seconds``
-        across the spec — workload timeout enforcement is the spec's
-        responsibility, not the harness's. ``ExpectCompletionWithin``
-        evaluates against the actual elapsed time.
+        Pair with ``wait_until_running`` and ``wait_for_completion``
+        when fault injection needs to land mid-workload.
         """
         if self._client is None:
-            raise RuntimeError("call submit_and_wait inside the async-with block")
+            raise RuntimeError("call submit inside the async-with block")
         if not self.spec.submissions:
             raise HarnessError("WorkloadSpec has no submissions")
 
@@ -161,6 +179,59 @@ class WorkloadDriver:
                 f"SubmissionPattern {self.spec.pattern} not yet supported in Phase 2"
             )
 
+    async def wait_until_running(self, timeout: float = 30.0) -> None:
+        """Block until at least one submitted job reaches a dispatched
+        state.
+
+        Detection: the gate/manager pushes ``JobStatusPush.status`` =
+        ``JobStatus.RUNNING`` once the first workflow on the job has
+        actually started executing on a worker. Earlier states
+        (SUBMITTED, QUEUED, DISPATCHING) are pre-dispatch — killing
+        a worker now would land before the workflow ever reached it.
+
+        Raises ``HarnessError`` on timeout. The harness's diagnostic
+        dumper is invoked so the failure surface includes the cluster
+        snapshot (which workers exist, which managers are leader,
+        in-flight RPCs).
+        """
+        if self._client is None:
+            raise RuntimeError(
+                "call wait_until_running inside the async-with block"
+            )
+        try:
+            await asyncio.wait_for(self._running_event.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            await self.harness.dump_diagnostics(
+                reason=(
+                    f"workload waited {timeout:.1f}s for first workflow "
+                    f"to reach RUNNING; never observed. "
+                    f"submitted_jobs={self._observations.submitted_job_ids} "
+                    f"submit_errors={self._observations.submit_errors}"
+                )
+            )
+            raise HarnessError(
+                f"workload did not reach RUNNING within {timeout:.1f}s"
+            ) from None
+
+    async def wait_for_completion(self) -> None:
+        """Block until every expected workflow reports a result, bounded
+        by the largest ``Submission.timeout_seconds`` in the spec.
+
+        On timeout, ``observations.completion_seconds`` is left
+        ``None`` so ``ExpectCompletionWithin`` fails with a clear
+        "did not complete" message rather than a flaky pass.
+        """
+        await self._wait_for_completion()
+
+    async def submit_and_wait(self) -> None:
+        """Convenience: ``submit`` + ``wait_for_completion``.
+
+        Backward-compat for callers that don't need to inject faults
+        mid-workload. ``wait_until_running`` is intentionally
+        skipped — the all-complete event is the only completion
+        signal needed for the no-fault path.
+        """
+        await self.submit()
         await self._wait_for_completion()
 
     def evaluate_expectations(self) -> list[ExpectationResult]:
@@ -204,6 +275,23 @@ class WorkloadDriver:
 
     def _on_status_update(self, push: object) -> None:
         self._observations.status_update_count += 1
+        # Fire the dispatch-detected event the first time we see any
+        # post-dispatch state. RUNNING is the canonical "first workflow
+        # is executing on a worker" signal; downstream states
+        # (COMPLETING, COMPLETED, FAILED, etc.) imply it transited
+        # RUNNING earlier and the push for that transition was
+        # delivered out of order or coalesced.
+        status = getattr(push, "status", None)
+        if status in {
+            "running",
+            "completing",
+            "completed",
+            "failed",
+            "cancelled",
+            "timeout",
+        }:
+            if not self._running_event.is_set():
+                self._running_event.set()
 
     def _on_progress_update(self, push: object) -> None:
         self._observations.progress_update_count += 1

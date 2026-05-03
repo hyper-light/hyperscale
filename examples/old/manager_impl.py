@@ -30,6 +30,7 @@ import inspect
 
 import cloudpickle
 from collections import defaultdict
+from typing import Any
 
 from hyperscale.core.hooks import Hook
 from hyperscale.core.graph.workflow import Workflow
