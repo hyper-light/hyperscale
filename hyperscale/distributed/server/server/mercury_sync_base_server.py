@@ -215,7 +215,15 @@ class MercurySyncBaseServer(Generic[T]):
         self._decompressor: zstandard.ZstdDecompressor | None = None
 
         self._tcp_server_cleanup_task: asyncio.Task | None = None
-        self._tcp_server_sleep_task: asyncio.Task | None = None
+        # Cooperative wakeup for the TCP/UDP cleanup loops. ``stop`` /
+        # ``shutdown`` resolves the future via ``set_result(None)`` so
+        # the loop wakes immediately, observes ``_running == False``,
+        # and exits without ever raising ``CancelledError``. Previously
+        # we created a sleep *task* and cancelled it; the cleanup loop
+        # then swallowed ``CancelledError`` and looped forever — three
+        # of these tasks routinely survived ``_force_cancel_survivors``
+        # and tripped the simulation supervisor's leak detector.
+        self._tcp_server_sleep_task: asyncio.Future | None = None
 
         self._udp_server_cleanup_task: asyncio.Future | None = None
         self._udp_server_sleep_task: asyncio.Future | None = None
@@ -1595,15 +1603,18 @@ class MercurySyncBaseServer(Generic[T]):
                 self._udp_drop_counter.increment_load_shed()
 
     async def _cleanup_tcp_server_tasks(self):
+        loop = asyncio.get_running_loop()
         while self._running:
-            self._tcp_server_sleep_task = asyncio.create_task(
-                asyncio.sleep(self._cleanup_interval)
-            )
+            self._tcp_server_sleep_task = loop.create_future()
 
             try:
-                await self._tcp_server_sleep_task
+                await asyncio.wait_for(
+                    self._tcp_server_sleep_task,
+                    timeout=self._cleanup_interval,
+                )
 
-            except (Exception, asyncio.CancelledError, KeyboardInterrupt):
+            except asyncio.TimeoutError:
+                # Normal cycle — sleep elapsed, fall through to cleanup.
                 pass
 
             for pending in list(self._pending_tcp_server_responses):
@@ -1616,15 +1627,19 @@ class MercurySyncBaseServer(Generic[T]):
                     self._pending_tcp_server_responses.pop()
 
     async def _cleanup_udp_server_tasks(self):
+        loop = asyncio.get_running_loop()
         while self._running:
-            self._udp_server_sleep_task = asyncio.create_task(
-                asyncio.sleep(self._cleanup_interval)
-            )
+            self._udp_server_sleep_task = loop.create_future()
 
             try:
-                await self._udp_server_sleep_task
+                await asyncio.wait_for(
+                    self._udp_server_sleep_task,
+                    timeout=self._cleanup_interval,
+                )
 
-            except (Exception, asyncio.CancelledError, KeyboardInterrupt):
+            except asyncio.TimeoutError:
+                # Normal cycle — sleep elapsed, no per-iteration cleanup
+                # for the UDP variant.
                 pass
 
             for pending in list(self._pending_udp_server_responses):
@@ -1695,6 +1710,18 @@ class MercurySyncBaseServer(Generic[T]):
     async def shutdown(self) -> None:
         self._running = False
 
+        # Cooperative wakeup for the cleanup loops. Resolving the
+        # future causes ``wait_for`` to return without raising; the
+        # loop then re-checks ``_running`` (now False) and exits
+        # cleanly. Without this we'd rely on cancellation, which the
+        # loops historically swallowed and looped on indefinitely.
+        for sleep_future in (
+            self._tcp_server_sleep_task,
+            self._udp_server_sleep_task,
+        ):
+            if sleep_future is not None and not sleep_future.done():
+                sleep_future.set_result(None)
+
         await self._task_runner.shutdown()
 
         for client in self._tcp_client_transports.values():
@@ -1740,6 +1767,16 @@ class MercurySyncBaseServer(Generic[T]):
 
     def abort(self) -> None:
         self._running = False
+
+        # Same cooperative-wakeup as ``shutdown`` — resolve the
+        # cleanup-loop futures so they exit on ``_running == False``
+        # rather than via cancellation, which the loops do not honor.
+        for sleep_future in (
+            self._tcp_server_sleep_task,
+            self._udp_server_sleep_task,
+        ):
+            if sleep_future is not None and not sleep_future.done():
+                sleep_future.set_result(None)
 
         self._task_runner.abort()
 
