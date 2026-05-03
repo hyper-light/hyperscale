@@ -187,6 +187,7 @@ from hyperscale.distributed.health.extension_ledger import (
 )
 from hyperscale.distributed.health.extension_outcome import (
     ExtensionOutcomeEvent,
+    ExtensionOutcomeKind,
 )
 
 
@@ -3238,6 +3239,84 @@ class ManagerServer(HealthAwareServer):
             job.timeout_tracking, event
         )
 
+    def _persist_outcome_for_job(
+        self, job_id: str, event: ExtensionOutcomeEvent
+    ) -> None:
+        """Mirror the just-recorded outcome into the job's
+        ``TimeoutTrackingState``. No-op if the job has no timeout
+        tracking state."""
+        job_token = self._job_manager.create_job_token(job_id)
+        job = self._job_manager.get_job(job_token)
+        if job is None or job.timeout_tracking is None:
+            return
+        self._worker_health_manager.persist_outcome_to_tracking(
+            job.timeout_tracking, event
+        )
+
+    def _emit_workflow_outcome_event(
+        self, result: "WorkflowFinalResult"
+    ) -> None:
+        """Phase F2: emit an H8 ``ExtensionOutcomeEvent`` when a
+        workflow terminates.
+
+        This closes the AD-26 outcome feedback loop: every
+        terminating workflow contributes one Bernoulli observation
+        to the per-workflow-class Beta posterior, which the H6
+        ThroughputWitness consults on the next decision via
+        ``HierarchicalAlphaTuner.alpha_budget``.
+
+        Outcome classification:
+
+        * ``status == "COMPLETED"`` — ``ExtensionOutcomeKind.COMPLETED``,
+          progress fraction 1.0.
+        * Otherwise — ``ExtensionOutcomeKind.FAILED``, progress
+          fraction 0.0. (TIMED_OUT and EVICTED are emitted at their
+          own dedicated call sites, not here.)
+
+        Idempotent: the ledger / dissemination layer dedupes on
+        workflow_id, so duplicate result deliveries do not
+        double-count the Bernoulli observation.
+        """
+        if not result.workflow_id:
+            return
+
+        if result.status == WorkflowStatus.COMPLETED.value:
+            outcome_kind = ExtensionOutcomeKind.COMPLETED
+            progress_fraction = 1.0
+        else:
+            outcome_kind = ExtensionOutcomeKind.FAILED
+            progress_fraction = 0.0
+
+        # Look up fence_token from the parent job for AD-10/AD-34
+        # leader-aware idempotency. Without job context (cross-
+        # manager workflows we're tracking at low fidelity), fall
+        # back to 0 — the outcome dissemination still teaches the
+        # tuner; only the per-decision dedup is weakened.
+        fence_token = 0
+        job_token = self._job_manager.create_job_token(result.job_id)
+        job = self._job_manager.get_job(job_token)
+        if job is not None:
+            fence_token = job.fencing_token
+
+        leader_term = self._leadership_coordinator._get_term()
+
+        event = self._worker_health_manager.record_workflow_outcome(
+            job_id=result.job_id,
+            workflow_id=result.workflow_id,
+            workflow_class=result.workflow_name,
+            worker_id=result.worker_id,
+            outcome_kind=outcome_kind,
+            final_progress_fraction=progress_fraction,
+            completed_at=time.monotonic(),
+            fence_token=fence_token,
+            leader_term=leader_term,
+        )
+        self.disseminate_extension_outcome(event)
+        self._persist_outcome_for_job(result.job_id, event)
+        # Release the H7 ledger entry — the workflow is terminal,
+        # no further decisions matter.
+        self._worker_health_manager.forget_workflow(result.workflow_id)
+
     async def _push_cancellation_complete_to_origin(
         self,
         job_id: str,
@@ -4005,6 +4084,13 @@ class ManagerServer(HealthAwareServer):
             await self._handle_parent_workflow_completion(
                 result, result_recorded, parent_complete
             )
+
+            # Phase F2: close the AD-26 outcome feedback loop. Emits
+            # an H8 ExtensionOutcomeEvent, disseminates via #|o, and
+            # mirrors into TimeoutTrackingState. Idempotent on
+            # workflow_id — duplicate result deliveries are safe.
+            if result_recorded:
+                self._emit_workflow_outcome_event(result)
 
             if self._is_job_complete(result.job_id):
                 await self._handle_job_completion(result.job_id)
