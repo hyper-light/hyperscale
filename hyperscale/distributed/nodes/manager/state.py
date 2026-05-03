@@ -32,7 +32,7 @@ if TYPE_CHECKING:
     from hyperscale.distributed.jobs.timeout_strategy import TimeoutStrategy
     from hyperscale.distributed.workflow import WorkflowStateMachine
     from hyperscale.reporting.common.results_types import WorkflowStats
-    from hyperscale.distributed.slo import LatencyObservation
+    from hyperscale.distributed.slo import LatencyObservation, SLOSummary
 
 
 class ManagerState:
@@ -471,6 +471,21 @@ class ManagerState:
         return self._workflow_latency_digest.get_recent_observation(
             target_id="workflows"
         )
+
+    def get_slo_summary(self) -> "SLOSummary":
+        """AD-42 Phase E: build the compact SLOSummary for gossip.
+
+        Returns ``SLOSummary.empty()`` when no workflow latency
+        observations have been recorded yet so receivers see a
+        neutral baseline (compliance_score=1.0, routing_factor=1.0)
+        until real data flows.
+        """
+        from hyperscale.distributed.slo import SLOSummary
+
+        observation = self.get_workflow_latency_observation()
+        if observation is None:
+            return SLOSummary.empty()
+        return SLOSummary.from_observation(observation=observation)
 
     # =========================================================================
     # Worker Accessors (16 direct accesses)
