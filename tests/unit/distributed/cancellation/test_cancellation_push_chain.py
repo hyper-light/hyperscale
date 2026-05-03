@@ -326,7 +326,7 @@ class MockManagerServer:
         if origin_gate:
             await self.send_tcp(
                 origin_gate,
-                "receive_job_cancellation_complete",
+                "job_cancellation_complete",
                 completion.dump(),
                 timeout=2.0,
             )
@@ -337,7 +337,7 @@ class MockManagerServer:
         if callback:
             await self.send_tcp(
                 callback,
-                "receive_job_cancellation_complete",
+                "job_cancellation_complete",
                 completion.dump(),
                 timeout=2.0,
             )
@@ -396,7 +396,7 @@ class MockGateServer:
         self._tcp_calls.append((addr, action, data))
         return (b'{"accepted": true}', 0.01)
 
-    async def receive_job_cancellation_complete(
+    async def job_cancellation_complete(
         self,
         completion: MockJobCancellationComplete,
     ) -> None:
@@ -408,7 +408,7 @@ class MockGateServer:
         if callback:
             await self.send_tcp(
                 callback,
-                "receive_job_cancellation_complete",
+                "job_cancellation_complete",
                 completion.dump(),
                 timeout=2.0,
             )
@@ -431,7 +431,7 @@ class MockClientServer:
         self._cancellation_events: dict[str, asyncio.Event] = {}
         self._cancellation_results: dict[str, tuple[bool, list[str]]] = {}
 
-    async def receive_job_cancellation_complete(
+    async def job_cancellation_complete(
         self,
         completion: MockJobCancellationComplete,
     ) -> None:
@@ -603,7 +603,7 @@ class TestManagerReceiveCancellationComplete:
         # Should have pushed to gate
         gate_calls = [c for c in manager._tcp_calls if c[0] == gate_addr]
         assert len(gate_calls) == 1
-        assert gate_calls[0][1] == "receive_job_cancellation_complete"
+        assert gate_calls[0][1] == "job_cancellation_complete"
 
     @pytest.mark.asyncio
     async def test_push_to_client_callback_if_no_gate(self):
@@ -649,7 +649,7 @@ class TestGateReceiveCancellationComplete:
             cancelled_at=time.monotonic(),
         )
 
-        await gate.receive_job_cancellation_complete(completion)
+        await gate.job_cancellation_complete(completion)
 
         assert len(gate._received_completions) == 1
         assert gate._received_completions[0].job_id == "job-001"
@@ -671,12 +671,12 @@ class TestGateReceiveCancellationComplete:
             cancelled_at=time.monotonic(),
         )
 
-        await gate.receive_job_cancellation_complete(completion)
+        await gate.job_cancellation_complete(completion)
 
         # Should have forwarded to client
         client_calls = [c for c in gate._tcp_calls if c[0] == client_addr]
         assert len(client_calls) == 1
-        assert client_calls[0][1] == "receive_job_cancellation_complete"
+        assert client_calls[0][1] == "job_cancellation_complete"
 
 
 class TestClientReceiveCancellationComplete:
@@ -696,7 +696,7 @@ class TestClientReceiveCancellationComplete:
             cancelled_at=time.monotonic(),
         )
 
-        await client.receive_job_cancellation_complete(completion)
+        await client.job_cancellation_complete(completion)
 
         assert len(client._received_completions) == 1
         assert client._cancellation_results["job-001"] == (True, [])
@@ -716,7 +716,7 @@ class TestClientReceiveCancellationComplete:
             cancelled_at=time.monotonic(),
         )
 
-        await client.receive_job_cancellation_complete(completion)
+        await client.job_cancellation_complete(completion)
 
         success, result_errors = client._cancellation_results["job-001"]
         assert not success
@@ -750,7 +750,7 @@ class TestClientReceiveCancellationComplete:
                 errors=[],
                 cancelled_at=time.monotonic(),
             )
-            await client.receive_job_cancellation_complete(completion)
+            await client.job_cancellation_complete(completion)
 
         # Start sending completion in background
         task = asyncio.create_task(send_completion_later())
@@ -818,7 +818,7 @@ class TestFullPushChain:
         await manager.workflow_cancellation_complete(worker_completion)
 
         # Verify manager pushed to gate
-        gate_pushes = [c for c in manager._tcp_calls if c[1] == "receive_job_cancellation_complete"]
+        gate_pushes = [c for c in manager._tcp_calls if c[1] == "job_cancellation_complete"]
         assert len(gate_pushes) == 1
 
         # Step 3: Gate receives and forwards
@@ -830,14 +830,14 @@ class TestFullPushChain:
             errors=[],
             cancelled_at=time.monotonic(),
         )
-        await gate.receive_job_cancellation_complete(job_completion)
+        await gate.job_cancellation_complete(job_completion)
 
         # Verify gate forwarded to client
-        client_forwards = [c for c in gate._tcp_calls if c[1] == "receive_job_cancellation_complete"]
+        client_forwards = [c for c in gate._tcp_calls if c[1] == "job_cancellation_complete"]
         assert len(client_forwards) == 1
 
         # Step 4: Client receives
-        await client.receive_job_cancellation_complete(job_completion)
+        await client.job_cancellation_complete(job_completion)
 
         # Verify client has result
         assert "job-001" in client._cancellation_results
@@ -882,8 +882,8 @@ class TestFullPushChain:
             errors=["Task stuck in syscall"],
             cancelled_at=time.monotonic(),
         )
-        await gate.receive_job_cancellation_complete(job_completion)
-        await client.receive_job_cancellation_complete(job_completion)
+        await gate.job_cancellation_complete(job_completion)
+        await client.job_cancellation_complete(job_completion)
 
         # Verify errors propagated to client
         success, errors = client._cancellation_results["job-001"]
@@ -918,7 +918,7 @@ class TestFullPushChain:
         assert len(manager._cancellation_completions) == 3
 
         # Should have pushed to gate 3 times (once per workflow completion when all cancelled)
-        gate_pushes = [c for c in manager._tcp_calls if c[1] == "receive_job_cancellation_complete"]
+        gate_pushes = [c for c in manager._tcp_calls if c[1] == "job_cancellation_complete"]
         assert len(gate_pushes) == 3
 
 
@@ -1135,7 +1135,7 @@ class TestNegativePathsGate:
             cancelled_at=time.monotonic(),
         )
 
-        await gate.receive_job_cancellation_complete(completion)
+        await gate.job_cancellation_complete(completion)
 
         # Should record but not forward
         assert len(gate._received_completions) == 1
@@ -1158,7 +1158,7 @@ class TestNegativePathsGate:
             cancelled_at=time.monotonic(),
         )
 
-        await gate.receive_job_cancellation_complete(completion)
+        await gate.job_cancellation_complete(completion)
 
         # Should record but not forward (different job)
         assert len(gate._received_completions) == 1
@@ -1192,7 +1192,7 @@ class TestNegativePathsClient:
             errors=["First error"],
             cancelled_at=time.monotonic(),
         )
-        await client.receive_job_cancellation_complete(completion_1)
+        await client.job_cancellation_complete(completion_1)
 
         # Second completion overwrites
         completion_2 = MockJobCancellationComplete(
@@ -1203,7 +1203,7 @@ class TestNegativePathsClient:
             errors=[],
             cancelled_at=time.monotonic(),
         )
-        await client.receive_job_cancellation_complete(completion_2)
+        await client.job_cancellation_complete(completion_2)
 
         # Latest wins
         success, errors = client._cancellation_results["job-001"]
@@ -1371,7 +1371,7 @@ class TestConcurrencyClient:
             errors=[],
             cancelled_at=time.monotonic(),
         )
-        await client.receive_job_cancellation_complete(completion)
+        await client.job_cancellation_complete(completion)
 
         # All waiters should get result (or timeout if event not shared)
         results = await asyncio.gather(*waiter_tasks)
@@ -1398,7 +1398,7 @@ class TestConcurrencyClient:
         ]
 
         await asyncio.gather(*[
-            client.receive_job_cancellation_complete(c) for c in completions
+            client.job_cancellation_complete(c) for c in completions
         ])
 
         # All recorded
@@ -1531,7 +1531,7 @@ class TestEdgeCasesManager:
         await manager.workflow_cancellation_complete(completion)
 
         # Should NOT push to gate (workflow-002 not cancelled)
-        gate_pushes = [c for c in manager._tcp_calls if c[1] == "receive_job_cancellation_complete"]
+        gate_pushes = [c for c in manager._tcp_calls if c[1] == "job_cancellation_complete"]
         assert len(gate_pushes) == 0
 
     @pytest.mark.asyncio
@@ -1596,7 +1596,7 @@ class TestEdgeCasesClient:
             cancelled_at=time.monotonic(),
         )
 
-        await client.receive_job_cancellation_complete(completion)
+        await client.job_cancellation_complete(completion)
 
         success, errors = client._cancellation_results["job-001"]
         assert success
@@ -1615,7 +1615,7 @@ class TestEdgeCasesClient:
             cancelled_at=time.monotonic(),
         )
 
-        await client.receive_job_cancellation_complete(completion)
+        await client.job_cancellation_complete(completion)
 
         # Should accept as-is
         assert len(client._received_completions) == 1

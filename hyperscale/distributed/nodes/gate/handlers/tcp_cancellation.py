@@ -296,7 +296,7 @@ class GateCancellationHandler:
             )
 
         except Exception as error:
-            await handle_exception(error, "receive_cancel_job")
+            await handle_exception(error, "cancel_job")
             is_ad20 = self._is_ad20_cancel_request(data)
             return self._build_cancel_response(
                 is_ad20, "unknown", success=False, error=str(error)
@@ -341,7 +341,7 @@ class GateCancellationHandler:
             return b"OK"
 
         except Exception as error:
-            await handle_exception(error, "receive_job_cancellation_complete")
+            await handle_exception(error, "job_cancellation_complete")
             return b"ERROR"
 
     async def _push_cancellation_complete_to_client(
