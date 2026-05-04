@@ -1727,11 +1727,21 @@ class MercurySyncBaseServer(Generic[T]):
         for client in self._tcp_client_transports.values():
             client.abort()
 
-        # Close UDP transport to stop receiving datagrams
+        # Close UDP transport to stop receiving datagrams. The
+        # transport's close is deferred via ``loop.call_soon``, so
+        # also close the underlying socket directly to release the
+        # bound port immediately. Same kill→restart race rationale
+        # as ``abort()``.
         if self._udp_transport is not None:
             self._udp_transport.close()
             self._udp_transport = None
             self._udp_connected = False
+        if self._udp_server_socket is not None:
+            try:
+                self._udp_server_socket.close()
+            except Exception:
+                pass
+            self._udp_server_socket = None
 
         # Close TCP server to stop accepting connections
         if self._tcp_server is not None:
@@ -1743,6 +1753,12 @@ class MercurySyncBaseServer(Generic[T]):
                 pass
             self._tcp_server = None
             self._tcp_connected = False
+        if self._tcp_server_socket is not None:
+            try:
+                self._tcp_server_socket.close()
+            except Exception:
+                pass
+            self._tcp_server_socket = None
 
         # Cancel-and-await every server-owned background task in parallel.
         # `cancel_and_release_task` only schedules a done-callback; without
@@ -1780,17 +1796,37 @@ class MercurySyncBaseServer(Generic[T]):
 
         self._task_runner.abort()
 
-        # Close UDP transport to stop receiving datagrams
+        # Close UDP transport to stop receiving datagrams. Transport
+        # close is deferred (scheduled via ``loop.call_soon``); since
+        # ``abort`` is synchronous we cannot ``await`` it. Close the
+        # underlying socket directly afterwards so the OS releases
+        # the bound UDP port immediately — without this, a fast
+        # kill→restart cycle (the simulation harness's FaultMatrix)
+        # races the deferred close and ``restart`` fails with
+        # ``OSError: [Errno 48] Address already in use``.
         if self._udp_transport is not None:
             self._udp_transport.close()
             self._udp_transport = None
             self._udp_connected = False
+        if self._udp_server_socket is not None:
+            try:
+                self._udp_server_socket.close()
+            except Exception:
+                pass
+            self._udp_server_socket = None
 
-        # Close TCP server
+        # Close TCP server (and its underlying socket — see UDP
+        # comment above for the same kill→restart race rationale).
         if self._tcp_server is not None:
             self._tcp_server.close()
             self._tcp_server = None
             self._tcp_connected = False
+        if self._tcp_server_socket is not None:
+            try:
+                self._tcp_server_socket.close()
+            except Exception:
+                pass
+            self._tcp_server_socket = None
 
         # Close all TCP client transports
         for client in self._tcp_client_transports.values():

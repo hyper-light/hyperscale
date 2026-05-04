@@ -24,6 +24,7 @@ log files appear under ``tests/simulation/_artifacts/<run_id>/``.
 
 import os
 import pathlib
+import sys
 import uuid
 
 import pytest
@@ -73,6 +74,28 @@ def pytest_configure(config) -> None:
     config.addinivalue_line(
         "markers", "simulation: distributed simulation harness scenarios"
     )
+
+
+def pytest_runtest_logreport(report) -> None:
+    """Stream the failure traceback to stderr the moment a test fails.
+
+    Pytest's default behaviour is to buffer failure tracebacks into
+    the session-summary block printed at the end of the run. When a
+    teardown finalizer hangs (which is common in distributed-system
+    fixture failures), the summary never flushes and the traceback
+    is invisible. Mirroring the trace to stderr at logreport time
+    surfaces it before any teardown can stall.
+    """
+    if report.when != "call" or not report.failed:
+        return
+    longrepr = getattr(report, "longreprtext", None) or str(report.longrepr)
+    if not longrepr:
+        return
+    sys.stderr.write("\n=== FAILURE TRACE (early-flush) ===\n")
+    sys.stderr.write(f"{report.nodeid}\n")
+    sys.stderr.write(longrepr)
+    sys.stderr.write("\n=== END FAILURE TRACE ===\n")
+    sys.stderr.flush()
 
 
 @pytest.fixture
