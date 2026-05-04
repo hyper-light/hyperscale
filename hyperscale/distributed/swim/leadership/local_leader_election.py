@@ -439,8 +439,14 @@ class LocalLeaderElection:
             )
             return success
         except asyncio.CancelledError:
-            # Pre-vote cancelled - clean up state
-            return False
+            # Pre-vote cancelled — re-raise so the outer election loop's
+            # ``except asyncio.CancelledError: break`` can exit cleanly.
+            # Returning False here masked the cancellation, the election
+            # loop saw a benign "no quorum" and re-iterated forever, and
+            # the supervisor's leak detector caught the loop task as
+            # surviving cancellation. ``finally`` still runs to clean
+            # up pre-vote state before the exception propagates.
+            raise
         finally:
             # Always clean up pre-vote state
             self.state.end_pre_vote()
