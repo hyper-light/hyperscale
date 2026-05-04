@@ -306,6 +306,31 @@ class ServerAdapter:
     async def write_context(self, key: Any, value: Any) -> None:
         await self._server._context.write(key, value)
 
+    def notify_node_join(self, node: tuple[str, int]) -> None:
+        """Fire the registered ``_on_node_join_callbacks`` for ``node``.
+
+        Called from the join handler so rejoin processing always
+        notifies downstream observers (peer-recovery handler, raft,
+        etc.), independent of whether the receiver's tracker still
+        recorded the joiner as DEAD when the join arrived.
+        """
+        callbacks = getattr(self._server, "_on_node_join_callbacks", None)
+        if not callbacks:
+            return
+        task_runner = getattr(self._server, "_task_runner", None)
+        for callback in callbacks:
+            try:
+                callback(node)
+            except Exception as callback_error:
+                if task_runner is not None and hasattr(
+                    self._server, "handle_exception"
+                ):
+                    task_runner.run(
+                        self._server.handle_exception,
+                        callback_error,
+                        "on_node_join_callback (join_handler)",
+                    )
+
     # === Leadership Broadcasting ===
 
     def broadcast_leadership_message(self, message: bytes) -> None:

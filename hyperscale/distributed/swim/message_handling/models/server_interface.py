@@ -301,6 +301,17 @@ class ServerInterface(Protocol):
         """Write value to context."""
         ...
 
+    def notify_node_join(self, node: tuple[str, int]) -> None:
+        """Fire the server's registered on-node-join callbacks for ``node``.
+
+        Used by handlers that semantically signal "this node is back as
+        a member" (the join handler, primarily). Decouples the rejoin
+        notification from ``update_node_state``'s DEAD→OK gate so
+        downstream observers see the join even when the tracker had
+        already drifted back to OK via gossip / probe ACKs.
+        """
+        ...
+
     # === Leadership Broadcasting ===
 
     async def broadcast_leadership_message(self, message: bytes) -> None:

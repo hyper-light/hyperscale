@@ -1489,11 +1489,45 @@ class ManagerServer(HealthAwareServer):
         udp_addr: tuple[str, int],
         tcp_addr: tuple[str, int],
     ) -> None:
+        # Resolve the peer's node_id from the address so we can update
+        # both the address-keyed and id-keyed indices atomically. Without
+        # the id, ``_active_manager_peer_ids`` keeps the dead peer until
+        # the 120 s reap window elapses — too coarse for any liveness
+        # check that needs sub-minute reaction.
+        peer_id_for_addr = next(
+            (
+                peer_id
+                for peer_id, info in self._manager_state.iter_known_manager_peers()
+                if (info.tcp_host, info.tcp_port) == tcp_addr
+            ),
+            None,
+        )
+
         peer_lock = await self._manager_state.get_peer_state_lock(tcp_addr)
         async with peer_lock:
             self._manager_state.increment_peer_state_epoch(tcp_addr)
-            self._manager_state.remove_active_manager_peer(tcp_addr)
+            # ``remove_active_peer`` updates both the address-keyed and
+            # id-keyed indices atomically under the state's counter
+            # lock, keeping ``_active_manager_peers`` and
+            # ``_active_manager_peer_ids`` from drifting out of sync.
+            # When the peer_id can't be resolved (peer was never
+            # registered), fall back to address-only removal — the
+            # reaper still cleans up the id set on its next pass.
+            if peer_id_for_addr is not None:
+                await self._manager_state.remove_active_peer(
+                    tcp_addr, peer_id_for_addr
+                )
+            else:
+                self._manager_state.remove_active_manager_peer(tcp_addr)
             self._manager_state.add_dead_manager(tcp_addr, time.monotonic())
+
+        # Start the unhealthy-since clock so the reap path can later
+        # fully unregister the peer (releasing peer-locks, latency
+        # samples, etc.) once the reap interval elapses.
+        if peer_id_for_addr is not None:
+            self._manager_state.set_manager_peer_unhealthy_since(
+                peer_id_for_addr, time.monotonic()
+            )
 
         await self._udp_logger.log(
             ServerInfo(
@@ -1541,12 +1575,39 @@ class ManagerServer(HealthAwareServer):
                 )
                 return
 
+            # Resolve the peer's id once outside the lock so the
+            # mirrored-set updates inside the critical section are
+            # straight-line.
+            peer_id_for_addr = next(
+                (
+                    peer_id
+                    for peer_id, info in self._manager_state.iter_known_manager_peers()
+                    if (info.tcp_host, info.tcp_port) == tcp_addr
+                ),
+                None,
+            )
+
             async with peer_lock:
                 current_epoch = self._manager_state.get_peer_state_epoch(tcp_addr)
                 if current_epoch != initial_epoch:
                     return
 
-                self._manager_state.add_active_manager_peer(tcp_addr)
+                # ``add_active_peer`` updates both the address-keyed
+                # and id-keyed indices atomically; the failure path
+                # cleared the id set, and using the same paired API
+                # here keeps the two indices consistent. The
+                # unhealthy-since clock cleanup happens outside the
+                # counter lock since it's tracked in a different
+                # dictionary.
+                if peer_id_for_addr is not None:
+                    await self._manager_state.add_active_peer(
+                        tcp_addr, peer_id_for_addr
+                    )
+                    self._manager_state.clear_manager_peer_unhealthy_since(
+                        peer_id_for_addr
+                    )
+                else:
+                    self._manager_state.add_active_manager_peer(tcp_addr)
                 self._manager_state.remove_dead_manager(tcp_addr)
 
         await self._udp_logger.log(
@@ -1560,7 +1621,15 @@ class ManagerServer(HealthAwareServer):
 
     async def _verify_peer_recovery(self, tcp_addr: tuple[str, int]) -> bool:
         try:
-            ping_request = PingRequest(requester_id=self._node_id.full)
+            # ``PingRequest`` is keyed by ``request_id`` — the prior
+            # ``requester_id`` argument raised ``TypeError`` before the
+            # network call ever happened, and the broad except below
+            # silently swallowed the failure. Result: ``verify_peer_recovery``
+            # always returned False, the manager peer-recovery handler
+            # always early-returned, and rejoining peers were never re-
+            # added to ``_active_manager_peer_ids`` even after SWIM
+            # confirmed their liveness.
+            ping_request = PingRequest(request_id=self._node_id.full)
             response = await asyncio.wait_for(
                 self._send_to_peer(
                     tcp_addr,
@@ -1571,7 +1640,20 @@ class ManagerServer(HealthAwareServer):
                 timeout=self._config.tcp_timeout_short_seconds + 1.0,
             )
             return response is not None and response != b"error"
-        except (asyncio.TimeoutError, Exception):
+        except asyncio.TimeoutError:
+            return False
+        except Exception as verify_error:
+            await self._udp_logger.log(
+                ServerWarning(
+                    message=(
+                        f"Manager peer {tcp_addr} ping verification raised "
+                        f"{type(verify_error).__name__}: {verify_error}"
+                    ),
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
             return False
 
     async def _handle_gate_peer_failure(

@@ -43,6 +43,11 @@ class JoinHandler(BaseHandler):
 
         source_addr = context.source_addr
         target_addr_bytes = context.target_addr_bytes
+        # Capture the unparsed payload BEFORE _parse_join_message
+        # rewrites ``target_addr_bytes`` to just the host:port portion.
+        # The trailing ``|i:{inc}`` field needed for the rejoin
+        # zombie-check fix lives in this original blob.
+        original_target_addr_bytes = target_addr_bytes
 
         # Parse version, role and target from join message
         version, role, target, target_addr_bytes = self._parse_join_message(
@@ -78,7 +83,22 @@ class JoinHandler(BaseHandler):
             is_rejoin = target in nodes
 
             incarnation_tracker = self._server.incarnation_tracker
-            claimed_incarnation = incarnation_tracker.get_node_incarnation(target)
+            # Prefer the joiner's live incarnation (carried in the
+            # ``|i:{inc}`` trailer) over the receiver's stale tracker
+            # view. Without this, a node that peers have marked DEAD
+            # but is now alive cannot rejoin: the receiver compares
+            # its own DEAD-marked incarnation against itself, fails
+            # the zombie check, and rejects the rejoin — the recovery
+            # path then never fires.
+            tracker_incarnation = incarnation_tracker.get_node_incarnation(target)
+            sent_incarnation = self._parse_claimed_incarnation(
+                original_target_addr_bytes
+            )
+            claimed_incarnation = (
+                sent_incarnation
+                if sent_incarnation is not None
+                else tracker_incarnation
+            )
 
             if is_rejoin and incarnation_tracker.is_potential_zombie(
                 target, claimed_incarnation
@@ -122,16 +142,44 @@ class JoinHandler(BaseHandler):
             rejoin_incarnation = incarnation_tracker.get_required_rejoin_incarnation(
                 target
             )
-            if rejoin_incarnation > 0:
-                await incarnation_tracker.update_node(
-                    target, b"OK", rejoin_incarnation, time.monotonic()
-                )
-            else:
-                await incarnation_tracker.update_node(
-                    target, b"OK", 0, time.monotonic()
-                )
+            # Ensure the new incarnation strictly exceeds the prior
+            # tracked value. ``NodeState.update`` ignores updates whose
+            # incarnation is < the current one (and only same-or-higher
+            # status priorities under equal incarnation), so reusing 0
+            # — or any value <= the DEAD-marking incarnation — silently
+            # drops the rejoin and leaves the node DEAD in the tracker.
+            current_incarnation = incarnation_tracker.get_node_incarnation(target)
+            new_incarnation = (
+                rejoin_incarnation
+                if rejoin_incarnation > current_incarnation
+                else current_incarnation + 1
+            )
+            # Route through the server's ``update_node_state`` rather
+            # than the incarnation tracker directly so the DEAD→OK
+            # transition fires ``_on_node_join_callbacks``. The
+            # tracker-only path left those callbacks dormant on rejoin,
+            # which meant that downstream observers (manager
+            # peer-recovery handler, gate peer-recovery handler) never
+            # re-added the rejoiner to their active-peer indices — the
+            # cluster looked permanently under-converged from those
+            # nodes' perspective even though SWIM membership had
+            # recovered.
+            await self._server.update_node_state(
+                target, b"OK", new_incarnation, time.monotonic()
+            )
 
             incarnation_tracker.clear_death_record(target)
+
+            # Always fire the join callbacks: the join message
+            # semantically means "add me back as a peer". The
+            # DEAD→OK gate inside ``update_node_state`` only fires
+            # callbacks when the receiver's tracker still records the
+            # joiner as DEAD; gossip-propagated joins and probe-ACK
+            # updates can flip the tracker back to OK before the join
+            # arrives, leaving downstream observers (manager peer-
+            # recovery handler, etc.) un-notified. Firing here makes
+            # rejoin handling deterministic.
+            self._server.notify_node_join(target)
 
             return self._ack()
 
@@ -159,7 +207,9 @@ class JoinHandler(BaseHandler):
         if not target_addr_bytes or b"|" not in target_addr_bytes:
             return (None, None, target, target_addr_bytes)
 
-        parts = target_addr_bytes.split(b"|", maxsplit=2)
+        # Capture up to 4 fields: version | role | host:port | i:{incarnation}
+        # (older 3-field and legacy 2-field encodings still parse cleanly).
+        parts = target_addr_bytes.split(b"|", maxsplit=3)
 
         # Always parse version from the first segment.
         version_part = parts[0]
@@ -178,8 +228,8 @@ class JoinHandler(BaseHandler):
 
         role: str | None = None
         addr_part: bytes
-        if len(parts) == 3:
-            # New format: version | role | host:port
+        if len(parts) >= 3:
+            # New format: version | role | host:port [| i:{inc}]
             try:
                 role = parts[1].decode().lower() or None
             except UnicodeDecodeError:
@@ -198,6 +248,24 @@ class JoinHandler(BaseHandler):
             pass
 
         return (version, role, parsed_target, addr_part)
+
+    def _parse_claimed_incarnation(
+        self, target_addr_bytes: bytes | None
+    ) -> int | None:
+        """Extract the joiner's claimed incarnation from a join message.
+
+        The trailing ``|i:{incarnation}`` field is the live self_incarnation
+        of the joining node. Returns ``None`` when the field is absent
+        (older senders, legacy format) so callers fall back to the
+        receiver-side tracker view (preserving the original behavior).
+        """
+        if not target_addr_bytes or b"|i:" not in target_addr_bytes:
+            return None
+        try:
+            tail = target_addr_bytes.rsplit(b"|i:", maxsplit=1)[1]
+            return int(tail.decode())
+        except (ValueError, UnicodeDecodeError):
+            return None
 
     async def _propagate_join(
         self,

@@ -151,6 +151,32 @@ class IncarnationTracker:
             self.self_incarnation += 1
             return self.self_incarnation
 
+    async def bump_self_incarnation_by(self, count: int) -> int:
+        """
+        Atomically advance own incarnation by ``count``.
+
+        Equivalent to ``count`` sequential ``increment_self_incarnation``
+        calls but acquires the lock once. Used by the rejoin path to
+        clear the receiver-side zombie threshold
+        (``death_incarnation + minimum_rejoin_incarnation_bump``) in a
+        single shot — looping ``await`` per increment serializes through
+        the same lock anyway, so the bulk path is strictly cheaper.
+
+        Raises:
+            OverflowError: If the result would exceed MAX_INCARNATION.
+        """
+        if count <= 0:
+            return self.self_incarnation
+        async with self._lock:
+            target = self.self_incarnation + count
+            if target > MAX_INCARNATION:
+                raise OverflowError(
+                    f"Incarnation bump of {count} from {self.self_incarnation} "
+                    f"would exceed MAX_INCARNATION ({MAX_INCARNATION})."
+                )
+            self.self_incarnation = target
+            return self.self_incarnation
+
     def is_valid_incarnation(self, incarnation: int) -> bool:
         """
         Check if an incarnation number is valid.

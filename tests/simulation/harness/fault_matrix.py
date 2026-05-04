@@ -253,7 +253,32 @@ class FaultMatrix:
         if cancelled:
             await asyncio.gather(*cancelled, return_exceptions=True)
 
-        self._paused[handle.node_id] = _PausedState(handle=handle)
+        # Install a transport-level partition isolating the paused node
+        # from every other harness-managed node. The receive path on
+        # the paused server is still live (REAL mode can't freeze it
+        # without a real SIGSTOP), so without this peers' probes would
+        # still get acked and SWIM would never mark the node DEAD.
+        # Wrapping send_tcp/send_udp at every other node as "drop to
+        # paused_node_id" is the closest REAL-mode approximation of a
+        # frozen receive path: probes go nowhere, peers time out, the
+        # failure detector escalates SUSPECT → DEAD, and the reaper
+        # removes the paused node from active_manager_peer_ids on each
+        # surviving peer. ``resume()`` removes only this rule, leaving
+        # any user-installed partitions intact.
+        other_ids = frozenset(
+            h.node_id
+            for h in self.harness.all_handles()
+            if h.node_id != handle.node_id
+        )
+        isolation_rule = _PartitionRule(
+            group_a=frozenset({handle.node_id}),
+            group_b=other_ids,
+        )
+        self._partitions.append(isolation_rule)
+
+        self._paused[handle.node_id] = _PausedState(
+            handle=handle, isolation_rule=isolation_rule
+        )
 
     async def resume(self, handle: ServerHandle) -> None:
         """Restart the loops cancelled by ``pause()``.
@@ -274,6 +299,16 @@ class FaultMatrix:
                 f"resume({handle.node_id}): node is not paused"
             )
 
+        # Remove only the isolation rule we installed during pause(),
+        # leaving any user-installed partitions intact.
+        if state.isolation_rule is not None:
+            try:
+                self._partitions.remove(state.isolation_rule)
+            except ValueError:
+                # Rule already removed (e.g. by clear_network_faults
+                # or heal_partition); resume should still proceed.
+                pass
+
         instance = handle.instance
 
         # Re-start probe cycle. Different kinds expose this through
@@ -293,6 +328,37 @@ class FaultMatrix:
             instance, "_start_background_tasks"
         ):
             instance._start_background_tasks()
+
+        # Re-announce membership to same-kind SWIM peers. While the
+        # node was paused (and its peers' send_udp wrappers blocked by
+        # the isolation rule), peers' SWIM probes timed out and the
+        # node was marked DEAD. SWIM's ``probe_scheduler.remove_member``
+        # ran on confirm, so peers stop probing the dead node — meaning
+        # passive gossip alone won't surface the resumption. The
+        # production join handler re-arms the recovery path
+        # (incarnation refresh → ``update_node_state`` → DEAD→OK
+        # callbacks → ``_handle_manager_peer_recovery`` →
+        # ``_active_manager_peer_ids`` re-add).
+        #
+        # Restricting to same-kind peers avoids confusing role-aware
+        # join validation (e.g. a manager joining a worker as a seed
+        # exercises a path the production code doesn't normally take
+        # and yields inconsistent recovery on the worker side).
+        if hasattr(instance, "join_cluster"):
+            for peer_handle in self.harness.all_handles():
+                if peer_handle.node_id == handle.node_id:
+                    continue
+                if peer_handle.kind is not handle.kind:
+                    continue
+                if not peer_handle.started:
+                    continue
+                seed_addr = (peer_handle.host, peer_handle.udp_port)
+                try:
+                    await instance.join_cluster(seed_addr, timeout=2.0)
+                except Exception:
+                    # Soft pause is best-effort; if a single peer
+                    # can't process the join it's fine — others will.
+                    continue
 
     # =========================================================================
     # Network faults — partition / delay / drop (Phase 4)
@@ -540,6 +606,14 @@ class FaultMatrix:
 
 @dataclass(slots=True)
 class _PausedState:
-    """Internal bookkeeping for a paused handle."""
+    """Internal bookkeeping for a paused handle.
+
+    ``isolation_rule`` is the partition rule installed by ``pause()`` to
+    drop traffic to/from the paused node — without it the node's UDP
+    receive path is still live and peers' probes still get acked, so
+    SWIM never marks the node DEAD. Stored so ``resume()`` can remove
+    *just* this rule without disturbing user-installed partitions.
+    """
 
     handle: ServerHandle
+    isolation_rule: "_PartitionRule | None" = None

@@ -1029,17 +1029,27 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         ``error`` is typed as ``SwimError`` but the receive path may
         deliver a raw ``Exception`` (e.g. a ``TypeError`` from
         upstream message parsing) before it has been wrapped into a
-        ``SwimError``. Guard the ``.category`` access so an unwrapped
-        exception doesn't trip an ``AttributeError`` and cascade
-        through the circuit breaker as a spurious INTERNAL error.
+        ``SwimError``. Route raw exceptions through
+        ``error_handler.handle_exception`` which wraps them — passing
+        an unwrapped exception to ``error_handler.handle`` directly
+        trips on ``error.cause`` access (the prior guard only covered
+        ``error.category`` and let the ``.cause`` access through,
+        replacing the original exception with an
+        ``AttributeError`` that then masked the real bug).
         """
-        # Track error by category — only when category is present
-        category = getattr(error, "category", None)
-        if category == ErrorCategory.NETWORK:
+        if not isinstance(error, SwimError):
+            if self._error_handler:
+                await self._error_handler.handle_exception(
+                    error, operation="handle_error"
+                )
+            return
+
+        # Track error by category for SwimError instances.
+        if error.category == ErrorCategory.NETWORK:
             self._metrics.increment("network_errors")
-        elif category == ErrorCategory.PROTOCOL:
+        elif error.category == ErrorCategory.PROTOCOL:
             self._metrics.increment("protocol_errors")
-        elif category == ErrorCategory.RESOURCE:
+        elif error.category == ErrorCategory.RESOURCE:
             self._metrics.increment("resource_errors")
 
         if self._error_handler:
@@ -2535,12 +2545,33 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         from hyperscale.distributed.models.distributed import NodeRole
 
         self_addr = self._get_self_udp_addr()
-        # Format: join>v{major}.{minor}|{role}|{host}:{port}
+        # Format: join>v{major}.{minor}|{role}|{host}:{port}|i:{incarnation}
         # The role field is mandatory in this protocol minor — receivers
         # parse it into _peer_roles so leader-election majority and
         # role-aware probe scheduling don't have to wait for gossip.
+        # The trailing ``|i:{incarnation}`` field is the joining node's
+        # current self_incarnation. Without it, a rejoining node whose
+        # peers have already marked it DEAD looks like a zombie to the
+        # receiver (which falls back to its stale tracker view of the
+        # joiner's incarnation); the join is rejected and the recovery
+        # path never fires. Including the live incarnation lets the
+        # zombie check compare against the joiner's actual current
+        # value. The ``i:`` prefix keeps the field self-describing
+        # for receivers older than this minor that ignore unknown
+        # trailing fields.
         # Version prefix lets old peers detect incompatible nodes (AD-25).
         self_role = (self._node_role or "worker").lower()
+        # Bump the local self_incarnation past the receivers' rejoin
+        # threshold (``death_incarnation + minimum_rejoin_incarnation_bump``).
+        # A node whose peers have marked it DEAD must claim a strictly
+        # higher incarnation to clear the zombie check; bumping here
+        # makes ``join_cluster`` self-sufficient for rejoin without
+        # forcing the caller to know whether peers consider the node
+        # dead. ``bump_self_incarnation_by`` does the whole advance in
+        # one lock acquisition.
+        bump = self._incarnation_tracker.minimum_rejoin_incarnation_bump + 1
+        await self._incarnation_tracker.bump_self_incarnation_by(bump)
+        self_incarnation = self._incarnation_tracker.get_self_incarnation()
         join_msg = (
             b"join>"
             + SWIM_VERSION_PREFIX
@@ -2548,6 +2579,8 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             + self_role.encode()
             + b"|"
             + f"{self_addr[0]}:{self_addr[1]}".encode()
+            + b"|i:"
+            + str(self_incarnation).encode()
         )
 
         # Pre-populate our local view of the seed's role so the very
@@ -3506,7 +3539,6 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         # Get previous state before updating
         previous_state = self._incarnation_tracker.get_node_state(node)
         was_dead = previous_state and previous_state.status == b"DEAD"
-        prev_status = previous_state.status if previous_state else b"UNKNOWN"
 
         # Perform the actual update
         updated = await self._incarnation_tracker.update_node(

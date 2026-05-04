@@ -1731,7 +1731,8 @@ class MercurySyncBaseServer(Generic[T]):
         # transport's close is deferred via ``loop.call_soon``, so
         # also close the underlying socket directly to release the
         # bound port immediately. Same kill→restart race rationale
-        # as ``abort()``.
+        # as ``abort()``. ``OSError`` covers double-close after the
+        # transport already ran its deferred close.
         if self._udp_transport is not None:
             self._udp_transport.close()
             self._udp_transport = None
@@ -1739,7 +1740,7 @@ class MercurySyncBaseServer(Generic[T]):
         if self._udp_server_socket is not None:
             try:
                 self._udp_server_socket.close()
-            except Exception:
+            except OSError:
                 pass
             self._udp_server_socket = None
 
@@ -1749,14 +1750,14 @@ class MercurySyncBaseServer(Generic[T]):
             self._tcp_server.close()
             try:
                 await self._tcp_server.wait_closed()
-            except Exception:
+            except (OSError, asyncio.CancelledError):
                 pass
             self._tcp_server = None
             self._tcp_connected = False
         if self._tcp_server_socket is not None:
             try:
                 self._tcp_server_socket.close()
-            except Exception:
+            except OSError:
                 pass
             self._tcp_server_socket = None
 
@@ -1808,10 +1809,15 @@ class MercurySyncBaseServer(Generic[T]):
             self._udp_transport.close()
             self._udp_transport = None
             self._udp_connected = False
+        # Catch ``OSError`` only (covers EBADF / EINTR from a
+        # double-close after the transport's deferred close already
+        # ran). Anything else is unexpected and would be silenced if
+        # we caught the broad ``Exception`` — preserve the contract
+        # that we never swallow non-cleanup-related failures here.
         if self._udp_server_socket is not None:
             try:
                 self._udp_server_socket.close()
-            except Exception:
+            except OSError:
                 pass
             self._udp_server_socket = None
 
@@ -1824,7 +1830,7 @@ class MercurySyncBaseServer(Generic[T]):
         if self._tcp_server_socket is not None:
             try:
                 self._tcp_server_socket.close()
-            except Exception:
+            except OSError:
                 pass
             self._tcp_server_socket = None
 
