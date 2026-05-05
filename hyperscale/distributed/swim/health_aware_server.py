@@ -2404,6 +2404,30 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             status = status_map.get(update.update_type, b"OK")
 
             if self.is_message_fresh(update.node, update.incarnation, status):
+                self_addr = self._get_self_udp_addr()
+
+                # Self-as-target gossip handling — Lifeguard §4.2 / §4.4.
+                # A node receiving any negative-status gossip about
+                # *itself* MUST refute, not apply. Processing
+                # "I'm dead" / "I'm suspect" gossip as actual state
+                # transitions is a fundamental SWIM-correctness
+                # violation that produces split-brain: the alive
+                # node enters its own dead-callback chain (worker
+                # unregistration, leadership election rebalance,
+                # …), while every probe still succeeds because the
+                # node is still running. Refutation publishes a
+                # higher-incarnation alive update; receiving peers
+                # then clear the false suspicion via
+                # ``refute_suspicion``.
+                if update.node == self_addr and update.update_type in (
+                    "suspect",
+                    "dead",
+                    "leave",
+                ):
+                    await self.increase_failure_detector("refutation")
+                    await self.broadcast_refutation()
+                    continue
+
                 # Check previous state BEFORE updating (for callback invocation)
                 previous_state = self._incarnation_tracker.get_node_state(update.node)
                 was_dead = previous_state and previous_state.status == b"DEAD"
@@ -2416,7 +2440,6 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                 )
 
                 if update.update_type == "suspect":
-                    self_addr = self._get_self_udp_addr()
                     if update.node != self_addr:
                         await self.start_suspicion(
                             update.node,
