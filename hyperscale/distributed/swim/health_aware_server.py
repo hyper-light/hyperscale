@@ -2486,23 +2486,57 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         if not coros:
             return [], []
 
-        try:
-            if timeout:
-                results = await asyncio.wait_for(
-                    asyncio.gather(*coros, return_exceptions=True),
-                    timeout=timeout,
+        # ``asyncio.wait_for`` over ``asyncio.gather`` is broken: on
+        # timeout, ``wait_for`` cancels the inner gather, but the
+        # gather's resulting CancelledError is never retrieved (Python
+        # logs ``_GatheringFuture exception was never retrieved`` from
+        # the GC finaliser). ``asyncio.shield`` doesn't help — the
+        # shield future itself becomes cancelled and that cancellation
+        # is also unretrieved. The clean pattern is ``asyncio.wait``
+        # with a timeout: it returns ``(done, pending)`` sets without
+        # cancellation in the timeout path, then we explicitly cancel
+        # and drain the pending set.
+        if timeout:
+            tasks = [asyncio.ensure_future(c) for c in coros]
+            done, pending = await asyncio.wait(tasks, timeout=timeout)
+            for task in pending:
+                task.cancel()
+            if pending:
+                # Drain CancelledError from the cancelled tasks so
+                # their exceptions are retrieved.
+                await asyncio.gather(*pending, return_exceptions=True)
+            if pending:
+                await self.handle_error(
+                    NetworkError(
+                        f"Gather timeout in {operation} "
+                        f"({len(pending)}/{len(tasks)} tasks pending at deadline)",
+                        severity=ErrorSeverity.DEGRADED,
+                        operation=operation,
+                    )
                 )
-            else:
-                results = await asyncio.gather(*coros, return_exceptions=True)
-        except asyncio.TimeoutError:
-            await self.handle_error(
-                NetworkError(
-                    f"Gather timeout in {operation}",
-                    severity=ErrorSeverity.DEGRADED,
-                    operation=operation,
-                )
-            )
-            return [], [asyncio.TimeoutError(f"Gather timeout in {operation}")]
+            results = []
+            timeout_err: list[Exception] = []
+            for task in tasks:
+                if task in done:
+                    try:
+                        results.append(task.result())
+                    except BaseException as exc:
+                        results.append(exc)
+                else:
+                    err = asyncio.TimeoutError(
+                        f"Task in {operation} did not complete within {timeout}s"
+                    )
+                    results.append(err)
+                    timeout_err.append(err)
+            if timeout_err and not done:
+                # Pure-timeout case (no task completed) — preserve the
+                # legacy contract of returning an empty success list
+                # plus a single sentinel TimeoutError.
+                return [], [
+                    asyncio.TimeoutError(f"Gather timeout in {operation}")
+                ]
+        else:
+            results = await asyncio.gather(*coros, return_exceptions=True)
 
         successes = []
         errors = []

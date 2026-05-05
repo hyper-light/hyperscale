@@ -64,7 +64,11 @@ from hyperscale.core.jobs.protocols.constants import (
 from hyperscale.core.utils.cancel_and_release_task import cancel_and_release_task
 from hyperscale.logging import Logger
 from hyperscale.logging.config import LoggingConfig
-from hyperscale.logging.hyperscale_logging_models import ServerWarning, SilentDropStats
+from hyperscale.logging.hyperscale_logging_models import (
+    ServerError,
+    ServerWarning,
+    SilentDropStats,
+)
 from hyperscale.core.jobs.tasks.cancel import cancel
 
 
@@ -933,6 +937,43 @@ class MercurySyncBaseServer(Generic[T]):
                 # UDP message with length-prefixed data to avoid delimiter issues
                 # Format: type<address<handler<clock(64 bytes)data_len(4 bytes)data(N bytes)
                 data_len = len(data).to_bytes(4, "big")
+                if not isinstance(address, tuple):
+                    # asyncio's ``sendto`` raises a TypeError that's
+                    # swallowed by the transport's internal
+                    # ``_fatal_error`` handler and logged as
+                    # ``Fatal write error on datagram transport`` —
+                    # invisible to application code, which keeps thinking
+                    # the send succeeded while messages are silently
+                    # dropped. Surface the type-mismatch via the async
+                    # logger (with a captured stack so the offending
+                    # caller is identifiable) and raise so the failure
+                    # propagates through the existing ``except Exception``
+                    # path rather than going down the silent asyncio
+                    # fatal-error path. ``traceback.format_stack`` is
+                    # the sync-but-non-blocking variant — it returns
+                    # strings instead of writing to stderr, so we can
+                    # include the trace inside the log payload without
+                    # touching stderr from the event loop.
+                    import traceback as _traceback
+                    stack_str = "".join(_traceback.format_stack())
+                    await self._udp_logger.log(
+                        ServerError(
+                            message=(
+                                f"send_udp called with non-tuple address "
+                                f"(type={type(address).__name__}, value={address!r}, "
+                                f"action={action!r}); message dropped. Caller "
+                                f"stack:\n{stack_str}"
+                            ),
+                            node_host=self._host,
+                            node_port=self._udp_port,
+                            node_id=0,
+                            protocol="udp",
+                        )
+                    )
+                    raise TypeError(
+                        f"send_udp address must be tuple[str, int], "
+                        f"got {type(address).__name__}: {address!r}"
+                    )
                 self._udp_transport.sendto(
                     self._encryptor.encrypt(
                         self._compressor.compress(
