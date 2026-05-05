@@ -14,6 +14,7 @@ Key design decisions:
 """
 
 import asyncio
+import inspect
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -388,8 +389,24 @@ class HierarchicalFailureDetector:
                         )
                     return True
                 else:
-                    # Higher incarnation - remove old and create new
-                    await self._global_wheel.remove(node)
+                    # incarnation > existing_state.incarnation
+                    #
+                    # A higher-incarnation observation while we already
+                    # hold a live suspicion is *refutation evidence*, not
+                    # a fresh suspicion: the only authoritative source of
+                    # incarnation increase is the peer itself (Lifeguard
+                    # §4.2 "Refutation"). Removing the live bracket and
+                    # creating a new one — the previous behaviour —
+                    # silently extended detection time by the full new
+                    # bracket period (observed ~17s second bracket
+                    # appearing right when the first should have
+                    # expired), since the original suspicion's expiry
+                    # callback never ran. Refutation belongs in
+                    # ``refute_global``; here we simply absorb the
+                    # higher incarnation into the existing state and
+                    # leave the timer untouched.
+                    existing_state.incarnation = incarnation
+                    return True
 
             # AD-30 suspicion-bracket composition with bounded
             # prob-OR aggregation.
@@ -1011,7 +1028,11 @@ class HierarchicalFailureDetector:
         scheduling itself raises (the callback's own exceptions are
         caught at the call sites where this helper is invoked).
         """
-        if asyncio.iscoroutinefunction(callback):
+        # ``asyncio.iscoroutinefunction`` is deprecated since 3.12 and
+        # slated for removal in 3.16; ``inspect.iscoroutinefunction`` is
+        # the supported replacement and behaves identically for our
+        # use case (detecting native ``async def`` callbacks).
+        if inspect.iscoroutinefunction(callback):
             self._dispatch_async_work(callback, *args)
             return
 
