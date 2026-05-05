@@ -2401,7 +2401,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                 previous_state = self._incarnation_tracker.get_node_state(update.node)
                 was_dead = previous_state and previous_state.status == b"DEAD"
 
-                updated = self.update_node_state(
+                updated = await self.update_node_state(
                     update.node,
                     status,
                     update.incarnation,
