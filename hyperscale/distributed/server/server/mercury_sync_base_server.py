@@ -47,6 +47,7 @@ from hyperscale.distributed.server.protocol import (
     ProtocolInFlightTracker,
     MessagePriority,
     PriorityLimits,
+    _classify_handler_to_priority,
 )
 from hyperscale.distributed.server.protocol.security import MessageSizeError
 from hyperscale.distributed.reliability import ServerRateLimiter
@@ -1255,11 +1256,25 @@ class MercurySyncBaseServer(Generic[T]):
             # Extract payload (remaining bytes)
             payload = rest[68 : 68 + data_len]
 
+            # Classify priority from the handler name (AD-37). SWIM
+            # control messages (probe/ack/suspect/alive/leadership-*)
+            # MUST be CRITICAL — they're the failure-detection layer
+            # that everything else depends on, and load-shedding them
+            # produces cross-suspicion cascades because nodes stop
+            # acking each other under any backlog. The previous code
+            # hardcoded NORMAL with a comment that subclasses would
+            # override to CRITICAL — but no subclass actually did,
+            # so SWIM messages were running at the same priority as
+            # ordinary data traffic.
+            try:
+                handler_priority = _classify_handler_to_priority(
+                    handler_name.decode("utf-8")
+                )
+            except UnicodeDecodeError:
+                handler_priority = MessagePriority.NORMAL
+
             match request_type:
                 case b"c":
-                    # AD-32: Use priority-aware spawn instead of direct append
-                    # UDP client requests: priority determined by handler (subclass can override)
-                    # Default to NORMAL; SWIM handlers override to CRITICAL in subclasses
                     self._spawn_udp_response(
                         self.process_udp_server_request(
                             handler_name,
@@ -1268,12 +1283,10 @@ class MercurySyncBaseServer(Generic[T]):
                             clock_time,
                             transport,
                         ),
-                        priority=MessagePriority.NORMAL,
+                        priority=handler_priority,
                     )
 
                 case b"s":
-                    # AD-32: Use priority-aware spawn for server responses
-                    # These are typically status updates (NORMAL priority)
                     self._spawn_udp_response(
                         self.process_udp_client_response(
                             handler_name,
@@ -1282,7 +1295,7 @@ class MercurySyncBaseServer(Generic[T]):
                             clock_time,
                             transport,
                         ),
-                        priority=MessagePriority.NORMAL,
+                        priority=handler_priority,
                     )
 
         except Exception as err:
