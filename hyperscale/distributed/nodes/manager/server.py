@@ -1847,7 +1847,7 @@ class ManagerServer(HealthAwareServer):
             )
             await self._worker_health_monitor.check_peer_manager_health_alerts()
 
-        self.confirm_peer(source_addr)
+        await self.confirm_peer(source_addr)
 
     async def _handle_gate_heartbeat(
         self,
@@ -1881,7 +1881,7 @@ class ManagerServer(HealthAwareServer):
                 self._manager_state.set_current_gate_leader(gate_id, None)
 
         # Confirm peer
-        self.confirm_peer(source_addr)
+        await self.confirm_peer(source_addr)
 
     # =========================================================================
     # Background Loops
@@ -5370,7 +5370,7 @@ class ManagerServer(HealthAwareServer):
             )
 
             # Add to SWIM probing
-            self.add_unconfirmed_peer(gate_udp_addr)
+            await self.add_unconfirmed_peer(gate_udp_addr)
             self._probe_scheduler.add_member(gate_udp_addr)
 
             # Store negotiated capabilities

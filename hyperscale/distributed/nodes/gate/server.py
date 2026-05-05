@@ -2276,9 +2276,21 @@ class GateServer(HealthAwareServer):
             log_failure=log_failure,
         )
 
-    def _confirm_peer(self, peer_addr: tuple[str, int]) -> None:
-        """Confirm a peer via SWIM."""
-        self.confirm_peer(peer_addr)
+    async def _confirm_peer(self, peer_addr: tuple[str, int]) -> None:
+        """Confirm a peer via SWIM (AD-29 UNCONFIRMED→OK).
+
+        ``HealthAwareServer.confirm_peer`` is a coroutine; the previous
+        sync wrapper invoked it without awaiting, silently dropping the
+        coroutine and leaving the peer's incarnation tracker entry in
+        the UNCONFIRMED state — which then causes
+        ``IncarnationTracker.can_suspect_node`` to refuse suspicion of
+        the peer (AD-29 §"Task 12.3.4: UNCONFIRMED→SUSPECT forbidden").
+        Detection of a genuinely-failed peer is silently delayed by
+        the entire suspicion bracket budget while the SWIM layer
+        retries from scratch through whatever path eventually
+        confirms the peer.
+        """
+        await self.confirm_peer(peer_addr)
 
     async def _complete_job(self, job_id: str, result: object) -> bool:
         """Complete a job and notify client."""

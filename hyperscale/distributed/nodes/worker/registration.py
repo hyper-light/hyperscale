@@ -182,7 +182,7 @@ class WorkerRegistrationHandler:
                 )
             return False
 
-    def process_registration_response(
+    async def process_registration_response(
         self,
         data: bytes,
         node_host: str,
@@ -201,8 +201,12 @@ class WorkerRegistrationHandler:
             node_host: This worker's host
             node_port: This worker's port
             node_id_short: This worker's short node ID
-            add_unconfirmed_peer: Function to add unconfirmed SWIM peer
-            add_to_probe_scheduler: Function to add peer to probe scheduler
+            add_unconfirmed_peer: Async coroutine to add an unconfirmed
+                SWIM peer (HealthAwareServer.add_unconfirmed_peer). It
+                must be awaited; the previous sync invocation silently
+                discarded the coroutine and the manager was never
+                added to the worker's incarnation tracker.
+            add_to_probe_scheduler: Sync function to add peer to probe scheduler
 
         Returns:
             Tuple of (accepted, primary_manager_id)
@@ -214,7 +218,7 @@ class WorkerRegistrationHandler:
                 return (False, None)
 
             # Update known managers
-            self._update_known_managers(
+            await self._update_known_managers(
                 response.healthy_managers,
                 add_unconfirmed_peer,
                 add_to_probe_scheduler,
@@ -254,7 +258,7 @@ class WorkerRegistrationHandler:
         except Exception:
             return (False, None)
 
-    def process_manager_registration(
+    async def process_manager_registration(
         self,
         data: bytes,
         node_id_full: str,
@@ -273,8 +277,12 @@ class WorkerRegistrationHandler:
             node_id_full: This worker's full node ID
             total_cores: Total CPU cores
             available_cores: Available CPU cores
-            add_unconfirmed_peer: Function to add unconfirmed SWIM peer
-            add_to_probe_scheduler: Function to add peer to probe scheduler
+            add_unconfirmed_peer: Async coroutine for adding an unconfirmed
+                SWIM peer; must be awaited. Previously called sync, which
+                left the manager invisible to this worker's incarnation
+                tracker (manager was added via TCP registry but never
+                appeared in node_states for the SWIM layer).
+            add_to_probe_scheduler: Sync function to add peer to probe scheduler
 
         Returns:
             Serialized ManagerToWorkerRegistrationAck
@@ -299,7 +307,7 @@ class WorkerRegistrationHandler:
 
             # Update known managers from registration
             if registration.known_managers:
-                self._update_known_managers(
+                await self._update_known_managers(
                     registration.known_managers,
                     add_unconfirmed_peer,
                     add_to_probe_scheduler,
@@ -315,7 +323,7 @@ class WorkerRegistrationHandler:
                 registration.manager.udp_port,
             )
             if manager_udp_addr[0] and manager_udp_addr[1]:
-                add_unconfirmed_peer(manager_udp_addr)
+                await add_unconfirmed_peer(manager_udp_addr)
                 add_to_probe_scheduler(manager_udp_addr)
 
             return ManagerToWorkerRegistrationAck(
@@ -332,7 +340,7 @@ class WorkerRegistrationHandler:
                 error=str(error),
             ).dump()
 
-    def _update_known_managers(
+    async def _update_known_managers(
         self,
         managers: list[ManagerInfo],
         add_unconfirmed_peer: callable,
@@ -341,10 +349,16 @@ class WorkerRegistrationHandler:
         """
         Update known managers from a list.
 
+        ``add_unconfirmed_peer`` is the async
+        ``HealthAwareServer.add_unconfirmed_peer`` coroutine — it must be
+        awaited, otherwise the manager is silently never recorded in
+        the worker's incarnation tracker (AD-29 UNCONFIRMED state) and
+        cannot be confirmed via SWIM probes.
+
         Args:
             managers: List of ManagerInfo to add
-            add_unconfirmed_peer: Function to add unconfirmed SWIM peer
-            add_to_probe_scheduler: Function to add peer to probe scheduler
+            add_unconfirmed_peer: Async coroutine to add unconfirmed SWIM peer
+            add_to_probe_scheduler: Sync function to add peer to probe scheduler
         """
         for manager in managers:
             self._registry.add_manager(manager.node_id, manager)
@@ -352,7 +366,7 @@ class WorkerRegistrationHandler:
             # Track as unconfirmed peer (AD-29)
             if manager.udp_host and manager.udp_port:
                 manager_udp_addr = (manager.udp_host, manager.udp_port)
-                add_unconfirmed_peer(manager_udp_addr)
+                await add_unconfirmed_peer(manager_udp_addr)
                 add_to_probe_scheduler(manager_udp_addr)
 
             # Add to discovery service (AD-28)

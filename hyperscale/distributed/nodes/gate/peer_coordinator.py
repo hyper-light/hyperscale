@@ -67,7 +67,7 @@ class GatePeerCoordinator:
         get_host: Callable[[], str],
         get_tcp_port: Callable[[], int],
         get_udp_port: Callable[[], int],
-        confirm_peer: Callable[[tuple[str, int]], None],
+        confirm_peer: Callable[[tuple[str, int]], Awaitable[None]],
         handle_job_leader_failure: Callable[[tuple[str, int]], "asyncio.Task"],
         remove_peer_circuit: Callable[[tuple[str, int]], Awaitable[None]],
         is_leader: Callable[[], bool] | None = None,
@@ -112,7 +112,7 @@ class GatePeerCoordinator:
         self._get_host: Callable[[], str] = get_host
         self._get_tcp_port: Callable[[], int] = get_tcp_port
         self._get_udp_port: Callable[[], int] = get_udp_port
-        self._confirm_peer: Callable[[tuple[str, int]], None] = confirm_peer
+        self._confirm_peer: Callable[[tuple[str, int]], Awaitable[None]] = confirm_peer
         self._handle_job_leader_failure: Callable[[tuple[str, int]], "asyncio.Task"] = (
             handle_job_leader_failure
         )
@@ -357,7 +357,7 @@ class GatePeerCoordinator:
         peer_tcp_port = heartbeat.tcp_port if heartbeat.tcp_port else source_addr[1]
         peer_tcp_addr = (peer_tcp_host, peer_tcp_port)
 
-        self._confirm_peer(source_addr)
+        await self._confirm_peer(source_addr)
 
         udp_addr = source_addr
         if udp_addr not in self._state._gate_udp_to_tcp:

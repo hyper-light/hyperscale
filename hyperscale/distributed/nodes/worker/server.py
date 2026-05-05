@@ -1251,7 +1251,7 @@ class WorkerServer(HealthAwareServer):
                 name="worker_events",
             )
 
-        self._heartbeat_handler.process_manager_heartbeat(
+        await self._heartbeat_handler.process_manager_heartbeat(
             heartbeat=heartbeat,
             source_addr=source_addr,
             confirm_peer=self.confirm_peer,
@@ -1586,7 +1586,7 @@ class WorkerServer(HealthAwareServer):
         register with workers they discover via state sync from peer managers.
         This speeds up cluster formation.
         """
-        return self._registration_handler.process_manager_registration(
+        return await self._registration_handler.process_manager_registration(
             data=data,
             node_id_full=self._node_id.full,
             total_cores=self._total_cores,
@@ -1606,7 +1606,7 @@ class WorkerServer(HealthAwareServer):
         acknowledgments to workers.
         """
         accepted, primary_manager_id = (
-            self._registration_handler.process_registration_response(
+            await self._registration_handler.process_registration_response(
                 data=data,
                 node_host=self._host,
                 node_port=self._tcp_port,

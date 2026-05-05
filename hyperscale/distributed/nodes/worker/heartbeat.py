@@ -57,7 +57,7 @@ class WorkerHeartbeatHandler:
         self._on_new_manager_discovered = on_new_manager_discovered
         self._on_job_leadership_update = on_job_leadership_update
 
-    def process_manager_heartbeat(
+    async def process_manager_heartbeat(
         self,
         heartbeat: ManagerHeartbeat,
         source_addr: tuple[str, int],
@@ -76,14 +76,19 @@ class WorkerHeartbeatHandler:
         Args:
             heartbeat: ManagerHeartbeat from SWIM
             source_addr: Source UDP address
-            confirm_peer: Function to confirm peer in SWIM
+            confirm_peer: Async coroutine for SWIM peer confirmation
+                (HealthAwareServer.confirm_peer). Must be awaited; the
+                previous sync invocation discarded the coroutine and the
+                manager's UNCONFIRMED→OK transition never fired, leaving
+                the worker's incarnation tracker treating the manager
+                as never-confirmed.
             node_host: This worker's host
             node_port: This worker's port
             node_id_short: This worker's short node ID
             task_runner_run: Function to run async tasks
         """
         # Confirm peer in SWIM layer (AD-29)
-        confirm_peer(source_addr)
+        await confirm_peer(source_addr)
 
         manager_id = heartbeat.node_id
         existing_manager = self._registry.get_manager(manager_id)
