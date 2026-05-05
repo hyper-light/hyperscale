@@ -3988,9 +3988,9 @@ class ManagerServer(HealthAwareServer):
             True if allowed, False if rate limited
         """
         # Use the .check() compatibility method on ServerRateLimiter
-        return self._rate_limiter.check(addr)
+        return await self._rate_limiter.check(addr)
 
-    def _check_rate_limit_for_operation(self, client_id: str, operation: str) -> tuple[bool, float]:
+    async def _check_rate_limit_for_operation(self, client_id: str, operation: str) -> tuple[bool, float]:
         """
         Check if a client request is within rate limits for a specific operation.
 
@@ -4002,21 +4002,21 @@ class ManagerServer(HealthAwareServer):
             Tuple of (allowed, retry_after_seconds). If not allowed,
             retry_after_seconds indicates when client can retry.
         """
-        result = self._rate_limiter.check_rate_limit(client_id, operation)
+        result = await self._rate_limiter.check_rate_limit(client_id, operation)
         return result.allowed, result.retry_after_seconds
 
     def _get_rate_limit_metrics(self) -> dict:
         """Get rate limiting metrics for monitoring."""
         return self._rate_limiter.get_metrics()
 
-    def _cleanup_inactive_rate_limit_clients(self) -> int:
+    async def _cleanup_inactive_rate_limit_clients(self) -> int:
         """
         Clean up inactive clients from rate limiter.
 
         Returns:
             Number of clients cleaned up
         """
-        return self._rate_limiter.cleanup_inactive_clients()
+        return await self._rate_limiter.cleanup_inactive_clients()
 
     async def _build_xprobe_response(
         self,

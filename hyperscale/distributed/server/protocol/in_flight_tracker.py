@@ -43,9 +43,14 @@ from enum import IntEnum
 # message_class.py imports MessagePriority from this module, so we can't import back
 _CONTROL_HANDLERS: frozenset[str] = frozenset(
     {
-        # SWIM protocol
+        # SWIM protocol — Hyperscale SWIM uses ``probe``/``ping-req``
+        # in place of the AD-37-documented ``ping``/``ping_req``;
+        # both forms are listed so the classifier matches whichever
+        # actually flows through the dispatcher.
         "ping",
         "ping_req",
+        "ping-req",
+        "probe",
         "ack",
         "nack",
         "indirect_ping",
@@ -60,11 +65,21 @@ _CONTROL_HANDLERS: frozenset[str] = frozenset(
         "job_leader_transfer",
         "receive_job_leader_transfer",
         "job_leader_worker_transfer",
+        # Leader election (AD-30 §"Leadership messages")
+        "pre-vote",
+        "vote-grant",
+        "vote-deny",
+        "leader-claim",
+        "leader-elected",
+        "leader-heartbeat",
+        "leader-stepdown",
         # Failure detection
         "suspect",
         "alive",
         "dead",
         "leave",
+        "join",
+        "join_ack",
     }
 )
 

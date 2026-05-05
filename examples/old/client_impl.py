@@ -33,6 +33,7 @@ from typing import Callable
 import cloudpickle
 
 from hyperscale.distributed.server import tcp
+from hyperscale.distributed.jobs import WindowedStatsPush
 from hyperscale.distributed.server.server.mercury_sync_base_server import MercurySyncBaseServer
 from hyperscale.core.jobs.protocols.constants import MAX_DECOMPRESSED_SIZE
 from hyperscale.distributed.errors import MessageTooLargeError
@@ -1545,7 +1546,7 @@ class HyperscaleClient(MercurySyncBaseServer):
             # Client ID is "client-local" since we're the receiver
             # Operation is "progress_update" which has limits of (300, 10.0) = 30/s
             client_id = f"{addr[0]}:{addr[1]}"
-            result = self._rate_limiter.check(
+            result = await self._rate_limiter.check(
                 client_id=client_id,
                 operation="progress_update",
                 priority=RequestPriority.NORMAL,
@@ -1553,9 +1554,6 @@ class HyperscaleClient(MercurySyncBaseServer):
             if not result.allowed:
                 return b'rate_limited'
 
-            import cloudpickle
-            import time as time_module
-            from hyperscale.distributed.jobs import WindowedStatsPush
             push: WindowedStatsPush = cloudpickle.loads(data)
 
             # Call user callback if registered

@@ -41,7 +41,7 @@ class WindowedStatsPushHandler:
             # Rate limiting: operation "progress_update" has limits of (300, 10.0) = 30/s
             if self._rate_limiter:
                 client_id = f"{addr[0]}:{addr[1]}"
-                result = self._rate_limiter.check(
+                result = await self._rate_limiter.check(
                     client_id=client_id,
                     operation="progress_update",
                     priority=RequestPriority.NORMAL,
