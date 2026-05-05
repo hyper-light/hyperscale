@@ -237,26 +237,49 @@ class EventLoopHealthMonitor:
         # Check for lag
         is_lagging = sample.lag_ratio > self.lag_threshold
         is_critical = sample.lag_ratio > self.critical_lag_threshold
-        
+
+        # Track sample stats (counters + consecutive run-length) on
+        # every observation so degradation thresholds and recovery
+        # debouncing work the same as before. The callback fires below
+        # are gated on *state transitions*, not raw samples.
         if is_critical:
             self._total_critical_samples += 1
-            self._consecutive_lag_count = min(self._consecutive_lag_count + 1, self.MAX_CONSECUTIVE_COUNT)
+            self._consecutive_lag_count = min(
+                self._consecutive_lag_count + 1, self.MAX_CONSECUTIVE_COUNT
+            )
             self._consecutive_ok_count = 0
-            await self._trigger_callback(self._on_critical_lag, sample.lag_ratio)
         elif is_lagging:
             self._total_lag_samples += 1
-            self._consecutive_lag_count = min(self._consecutive_lag_count + 1, self.MAX_CONSECUTIVE_COUNT)
+            self._consecutive_lag_count = min(
+                self._consecutive_lag_count + 1, self.MAX_CONSECUTIVE_COUNT
+            )
             self._consecutive_ok_count = 0
-            await self._trigger_callback(self._on_lag_detected, sample.lag_ratio)
         else:
-            self._consecutive_ok_count = min(self._consecutive_ok_count + 1, self.MAX_CONSECUTIVE_COUNT)
+            self._consecutive_ok_count = min(
+                self._consecutive_ok_count + 1, self.MAX_CONSECUTIVE_COUNT
+            )
             self._consecutive_lag_count = 0
-        
-        # State transitions
-        if not self._is_degraded and self._consecutive_lag_count >= self.lag_count_to_degrade:
+
+        # State transitions — only fire LHM callbacks on the OK→degraded
+        # and degraded→OK edges. The previous implementation fired
+        # ``on_lag_detected`` on every lagging sample, which (with a
+        # default 100 ms sample interval) pumped LHM at up to 10/s
+        # under any sustained lag. Per the Lifeguard paper LHM
+        # responds to *events*, not raw measurements; the consecutive
+        # debouncing already in place gives us the correct edges.
+        was_degraded = self._is_degraded
+        if not was_degraded and self._consecutive_lag_count >= self.lag_count_to_degrade:
             self._is_degraded = True
             self._degraded_transitions += 1
-        elif self._is_degraded and self._consecutive_ok_count >= self.ok_count_to_recover:
+            if is_critical:
+                await self._trigger_callback(
+                    self._on_critical_lag, sample.lag_ratio
+                )
+            else:
+                await self._trigger_callback(
+                    self._on_lag_detected, sample.lag_ratio
+                )
+        elif was_degraded and self._consecutive_ok_count >= self.ok_count_to_recover:
             self._is_degraded = False
             await self._trigger_callback(self._on_recovered)
     
@@ -265,26 +288,28 @@ class EventLoopHealthMonitor:
         callback: Callable[..., Awaitable[None] | None] | None,
         *args: Any,
     ) -> None:
-        """Trigger a callback, handling both sync and async."""
+        """Trigger a callback, handling both sync and async.
+
+        Async callbacks are awaited directly. ``_trigger_callback`` is
+        itself ``async`` and runs on the health-monitor loop, so there
+        is no benefit to deferring through ``TaskRunner`` — and a real
+        cost: ``TaskRunner.run`` keys tasks by ``call.__name__``, and
+        the previous implementation wrapped the awaitable in a closure
+        named ``_run_callback`` that collided on every invocation. The
+        second invocation onward reused the first task instance and
+        silently dropped the freshly-captured ``result`` coroutine —
+        the source of the ``coroutine 'HealthAwareServer._on_event_loop_recovered'
+        was never awaited`` runtime warnings, and the reason
+        ``on_recovered`` only ever ran once (so LHM grew monotonically
+        once the loop registered any lag).
+        """
         if callback is None:
             return
-        
+
         try:
             result = callback(*args)
             if asyncio.iscoroutine(result):
-                # Use TaskRunner if available, otherwise fall back
-                if self._task_runner:
-                    # Wrap the awaitable in a lambda for TaskRunner
-                    async def _run_callback():
-                        await result
-                    self._task_runner.run(_run_callback)
-                else:
-                    # Fallback: create task but track it for cleanup
-                    self._unmanaged_tasks_created += 1
-                    task = asyncio.create_task(result)
-                    self._pending_callback_tasks.add(task)
-                    # Clean up task from set when done
-                    task.add_done_callback(self._pending_callback_tasks.discard)
+                await result
         except Exception as e:
             await self._log_debug(f"Callback error: {type(e).__name__}: {e}")
     

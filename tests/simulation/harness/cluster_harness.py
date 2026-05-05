@@ -24,7 +24,9 @@ from hyperscale.distributed.nodes.worker import WorkerServer
 from tests.simulation.harness.cluster_spec import ClusterSpec
 from tests.simulation.harness.conditions import (
     all_of,
+    lhm_at_baseline,
     manager_has_n_peers,
+    manager_has_n_swim_confirmed_workers,
     manager_has_n_workers,
     wait_until,
     worker_subprocesses_alive,
@@ -469,8 +471,30 @@ class ClusterHarness:
             for manager in managers:
                 predicates.append(manager_has_n_peers(manager, dc_spec.managers - 1))
                 predicates.append(manager_has_n_workers(manager, dc_spec.workers))
+                # SWIM-confirmation is required for fault-injection
+                # tests: AD-29 forbids UNCONFIRMED→SUSPECT transitions,
+                # so a fault injected in the window between worker
+                # registration (TCP) and SWIM confirmation (first
+                # successful UDP probe round) results in suspicion
+                # being silently skipped — and detection blowing past
+                # any documented budget. This predicate enforces full
+                # SWIM-tier readiness, the same invariant
+                # ``manager_has_n_peers`` already enforces for
+                # manager-peer relationships.
+                predicates.append(
+                    manager_has_n_swim_confirmed_workers(manager, dc_spec.workers)
+                )
+                # LHM-quiescence is the actual readiness invariant the
+                # downstream tests assume — registered+reachable is
+                # weaker than "in steady state with self-health at
+                # baseline." Without this gate, spin-up jitter can
+                # leave LHM elevated when the harness declares ready,
+                # and the test's detection-budget assertions (which
+                # assume LHM=0) silently inflate.
+                predicates.append(lhm_at_baseline(manager))
             for worker in workers:
                 predicates.append(worker_subprocesses_alive(self, worker))
+                predicates.append(lhm_at_baseline(worker))
 
         if not predicates:
             return

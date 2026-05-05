@@ -391,37 +391,82 @@ class HierarchicalFailureDetector:
                     # Higher incarnation - remove old and create new
                     await self._global_wheel.remove(node)
 
-            # Phase C — multiplicative composition of independent
-            # adjustment factors per AD-35:186:
+            # AD-30 suspicion-bracket composition with bounded
+            # prob-OR aggregation.
             #
-            #     T_suspect_bracket =
-            #         (global_min_timeout, global_max_timeout)
-            #         × self_lhm
-            #         × peer_load
-            #         × vivaldi_quality
+            # AD-30 specifies the suspicion bracket scales with three
+            # independent measurement-reliability multipliers:
             #
-            # The Lifeguard confirmation/cluster term is applied via
-            # ``SuspicionState.calculate_timeout`` (log(c+1)/log(n+1))
-            # using the composed (min, max) bracket. Each factor is
-            # independent and bounded:
-            #   self_lhm: [1, 3] (architecture.md:7221, Phase B)
-            #   peer_load: [1, 2.5] (PeerHealthAwarenessConfig)
-            #   vivaldi_quality: ~[1, 1.5] (AD-35:183 confidence_adjustment)
+            #     self_lhm        — global self-health (Lifeguard LHM)
+            #     peer_load       — target's reported load class
+            #     vivaldi_quality — our network-coordinate confidence
             #
-            # See AD-30 addendum "Suspicion-timer composition".
+            # The original ``×`` composition (each multiplier ≥ 1
+            # multiplied together) compounds explosively at scale —
+            # observed brackets of 10× to 30× under modest concurrent
+            # signal elevation, with positive-feedback pathologies.
+            # The cure is *not* to remove any of these inputs — each
+            # is in AD-30 for documented architectural reasons (LHM
+            # extends refutation time when the prober itself is
+            # degraded, per Lifeguard §4) — but to replace the
+            # composition operator with one that is bounded by
+            # construction.
+            #
+            # Treat each multiplier ``m_i ≥ 1`` as the inverse of an
+            # independent reliability probability:
+            #
+            #     r_i = 1 / m_i              ∈ (0, 1]   reliable-prob
+            #     u_i = 1 − r_i              ∈ [0, 1)   unreliable-prob
+            #
+            # Independent reliabilities compose multiplicatively
+            # (probability law); equivalently:
+            #
+            #     R = ∏ r_i = 1 / (m_lhm · m_peer · m_vivaldi)
+            #     U = 1 − R                  ∈ [0, 1)
+            #
+            # ``U`` is mathematically bounded below 1.0 regardless of
+            # input magnitudes — even pathological inputs (e.g.
+            # ``self_lhm=10⁶``) cannot push ``U`` to or beyond 1.0.
+            # Bracket extension is linear in ``U`` against the
+            # operator-configured headroom ``(base_max − base_min)``,
+            # so the post-adjustment maximum is strictly bounded by
+            # ``2·base_max − base_min``. Explosion is impossible at
+            # any cluster scale. AD-30's three signals are preserved
+            # in full; only the operator changed.
+            #
+            # The Lifeguard confirmation/cluster term ``log(C+1)/log(N+1)``
+            # remains intact via ``SuspicionState.calculate_timeout``
+            # on top of this bracket.
             self_lhm = (
                 self._get_lhm_multiplier() if self._get_lhm_multiplier else 1.0
             )
             peer_load = self._compute_peer_load_multiplier(node)
             vivaldi_quality = self._compute_vivaldi_quality_multiplier(node)
-            composite_multiplier = self_lhm * peer_load * vivaldi_quality
+
+            # Defensive clamp: producers are documented to return
+            # multipliers ≥ 1.0, but a value < 1.0 would invert the
+            # composition (treat "extra-healthy" as "extra-noisy").
+            self_lhm_multiplier = max(1.0, self_lhm)
+            peer_load_multiplier = max(1.0, peer_load)
+            vivaldi_quality_multiplier = max(1.0, vivaldi_quality)
+
+            combined_reliability = 1.0 / (
+                self_lhm_multiplier
+                * peer_load_multiplier
+                * vivaldi_quality_multiplier
+            )
+            combined_unreliability = 1.0 - combined_reliability
+
+            base_max = self._config.global_max_timeout
+            base_min = self._config.global_min_timeout
+            adjusted_max = base_max + (base_max - base_min) * combined_unreliability
 
             state = SuspicionState(
                 node=node,
                 incarnation=incarnation,
                 start_time=time.monotonic(),
-                min_timeout=self._config.global_min_timeout * composite_multiplier,
-                max_timeout=self._config.global_max_timeout * composite_multiplier,
+                min_timeout=base_min,
+                max_timeout=adjusted_max,
                 n_members=self._get_current_n_members(),
             )
             state.add_confirmation(from_node)

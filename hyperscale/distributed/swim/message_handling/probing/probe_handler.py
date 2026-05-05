@@ -66,10 +66,29 @@ class ProbeHandler(BaseHandler):
             return self._ack()
 
     async def _handle_self_probe(self) -> HandlerResult:
-        """Handle probe about self - send refutation."""
-        await self._server.increase_failure_detector("refutation")
-        new_incarnation = await self._server.broadcast_refutation()
+        """Handle probe about self — respond ALIVE.
 
+        A SWIM probe-about-self is a routine health check, not a
+        suspicion. The original implementation treated it as a
+        refutation event (bumping LHM, broadcasting a full refutation),
+        which conflated probe semantics with the SUSPECT-about-self
+        path. Two real-world consequences observed:
+
+        1. Every received probe pumped self-LHM. With ``probe_interval``
+           ≈ 1 s and one or more peers probing this node, LHM grew at
+           ~1/s — the suspicion bracket lengthened proportionally and
+           dead-peer detection got unboundedly slower as the cluster
+           started up.
+        2. Every probe triggered ``broadcast_refutation`` (an
+           N-fanout), saturating the gossip channel with redundant
+           ALIVE messages on every probe round.
+
+        Per the Lifeguard paper (and AD-30), LHM is bumped on
+        ``on_refutation_needed`` — receipt of suspicion gossip about
+        self. A probe is not suspicion; it's just "are you alive?".
+        Reply with the current incarnation and embedded state.
+        """
+        new_incarnation = self._server.incarnation_tracker.get_self_incarnation()
         base = (
             b"alive:"
             + str(new_incarnation).encode()

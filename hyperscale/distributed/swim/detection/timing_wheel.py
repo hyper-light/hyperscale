@@ -438,19 +438,38 @@ class TimingWheel:
         self,
         entries: list[WheelEntry[SuspicionState]],
     ) -> None:
-        """Process expired entries by calling the callback."""
+        """Process expired entries by calling the callback.
+
+        Callback runs BEFORE ``_node_locations.pop`` so the callback's
+        side effects (e.g. ``_handle_global_expiration`` adding the
+        node to its ``_globally_dead`` set) are visible to any
+        concurrent ``suspect_global`` before this wheel forgets the
+        node. The popping happens outside the wheel's own lock, so
+        without this ordering there is a window where the wheel no
+        longer tracks the node and the HFD has not yet marked it
+        globally dead — ``suspect_global`` slips into its else-branch
+        in that window and adds a *fresh* suspicion entry, which then
+        expires later and fires the callback a second time. The
+        second firing races a restart-then-register: a freshly-
+        registered new instance at the same address gets unregistered
+        by the second ``addr → current_worker_id`` lookup, silently
+        nuking the recovered registration.
+        """
         for entry in entries:
-            # Remove from tracking
-            self._node_locations.pop(entry.node, None)
             self._entries_expired += 1
 
-            # Call callback outside of lock
+            # Call callback BEFORE releasing the location entry.
+            # ``_handle_global_expiration`` is synchronous (sets
+            # ``_globally_dead``) so concurrent coroutines cannot
+            # interleave between the callback and the pop below.
             if self._on_expired:
                 try:
                     self._on_expired(entry.node, entry.state)
                 except Exception:
                     # Don't let callback errors stop the wheel
                     pass
+
+            self._node_locations.pop(entry.node, None)
 
     async def _tick(self) -> None:
         """

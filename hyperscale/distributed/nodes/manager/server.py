@@ -1482,7 +1482,18 @@ class ManagerServer(HealthAwareServer):
                     reassignments=running_sub_workflows,
                 )
 
-        self._manager_state.remove_worker_state(worker_id)
+        # Fully unregister the worker on DEAD detection. The previous
+        # ``remove_worker_state`` call cleaned up auxiliary tracking
+        # (latency samples, circuit breaker, deadlines, etc.) but left
+        # the worker in ``_workers`` until ``_reap_dead_workers`` ran
+        # 60 s later — far too coarse for any liveness check that
+        # needs sub-minute reaction (SWIM marks DEAD instantly, the
+        # registry should reflect that). ``unregister_worker`` removes
+        # the registration plus all the auxiliary tracking; the LHM
+        # scores cleanup that ``remove_worker_state`` covered is
+        # mirrored explicitly here so we keep the same surface.
+        self._registry.unregister_worker(worker_id)
+        self._manager_state._worker_lhm_scores.pop(worker_id, None)
 
     async def _handle_manager_peer_failure(
         self,

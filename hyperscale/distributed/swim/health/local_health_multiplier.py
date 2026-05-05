@@ -9,25 +9,32 @@ from dataclasses import dataclass
 class LocalHealthMultiplier:
     """
     Lifeguard Local Health Multiplier (LHM).
-    
+
     Tracks the node's own health state. A score of 0 indicates healthy,
     higher scores indicate potential issues with this node's ability
     to process messages in a timely manner.
-    
+
     The score saturates at max_score to prevent unbounded growth.
-    
+
     Events that increment LHM:
     - Missed nack (failed to respond in time)
     - Failed refutation (suspicion about self received)
     - Probe timeout when we initiated the probe
-    
+
     Events that decrement LHM:
     - Successful probe round completion
     - Successful nack response received
     """
     score: int = 0
     max_score: int = 8  # Saturation limit 'S' from paper
-    
+
+    # Per architecture.md line 7221:
+    #     effective_timeout = base_timeout × (1 + LHM_score × MULTIPLIER_WEIGHT)
+    # Centralised here so callers (probe-path adjustment, suspicion-
+    # bracket composition) can derive the saturation cap without
+    # duplicating the constant.
+    MULTIPLIER_WEIGHT: float = 0.25
+
     # Scoring weights for different events
     # Per Lifeguard paper (Section 4.3): all events are +1 or -1
     PROBE_TIMEOUT_PENALTY: int = 1
@@ -122,7 +129,17 @@ class LocalHealthMultiplier:
         candidate ranking) read ``self.score`` directly — keep the raw
         signal and the timeout multiplier conceptually separate.
         """
-        return 1.0 + (self.score * 0.25)
+        return 1.0 + (self.score * self.MULTIPLIER_WEIGHT)
+
+    def get_max_multiplier(self) -> float:
+        """Return the multiplier value at full LHM saturation.
+
+        With the doc-formula weights this equals ``1 + max_score *
+        MULTIPLIER_WEIGHT`` (default 3.0). Probe-path bounded
+        composition uses this as the upper cap on uncertainty padding
+        — see ``HealthAwareServer.get_lhm_adjusted_timeout``.
+        """
+        return 1.0 + (self.max_score * self.MULTIPLIER_WEIGHT)
     
     def reset(self) -> None:
         """Reset LHM to healthy state."""

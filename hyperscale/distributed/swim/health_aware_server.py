@@ -14,6 +14,7 @@ This server provides:
 """
 
 import asyncio
+import math
 import random
 import time
 from base64 import b64decode, b64encode
@@ -79,6 +80,10 @@ from .detection.hierarchical_failure_detector import (
     HierarchicalFailureDetector,
     HierarchicalConfig,
     NodeStatus,
+)
+from .detection.peer_probe_reliability_tracker import (
+    PeerProbeReliabilityTracker,
+    PeerProbeReliabilityConfig,
 )
 
 # Gossip
@@ -221,6 +226,16 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             self._peer_health_awareness.on_health_update
         )
 
+        # Per-peer probe-reliability tracker. Tracks each peer's
+        # recent probe-success rate. Consumed by the direct-probe
+        # retry-budget formula (``_compute_direct_probe_budget``) —
+        # *not* by the suspicion bracket. AD-30 specifies the bracket
+        # uses LHM/peer_load/vivaldi only; per-peer probe history is
+        # an operational signal for the retry layer.
+        self._peer_probe_reliability = PeerProbeReliabilityTracker(
+            config=PeerProbeReliabilityConfig(),
+        )
+
         # Hierarchical failure detector for multi-layer detection (AD-30)
         # - Global layer: Machine-level liveness (via timing wheel)
         # - Job layer: Per-job responsiveness (via adaptive polling)
@@ -232,8 +247,10 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         # time and the SUSPECT->DEAD transition never executes.
         #
         # ``peer_health_awareness`` and the Vivaldi-quality callable feed
-        # the Phase C multiplicative composition of suspicion timers per
-        # AD-30 addendum "Suspicion-timer composition" and AD-35:186.
+        # the AD-30 prob-OR composition of suspicion timers (LHM is
+        # supplied via ``get_lhm_multiplier``; the bracket uses all
+        # three of the AD-30 signals together via bounded
+        # reliability composition).
         self._hierarchical_detector = HierarchicalFailureDetector(
             on_global_death=self._on_suspicion_expired,
             on_error=self._on_hierarchical_detector_error,
@@ -2037,8 +2054,20 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         error: Exception,
         delay: float,
     ) -> None:
-        """Callback for leadership retry attempts."""
-        await self.increase_failure_detector("leadership_retry")
+        """Callback for leadership retry attempts.
+
+        Per Lifeguard §4.3, LHM is incremented only on probe-timeout,
+        refutation-needed, missed-nack, and (Hyperscale extension)
+        event-loop-lag/critical events — *not* on protocol-level
+        retries. An election retry could indicate peer slowness,
+        network jitter, or any number of non-self-health causes;
+        bumping LHM here would conflate operational retries with
+        prober self-health and inflate every probe-timeout and
+        suspicion bracket cluster-wide during normal election churn
+        (especially during cluster spin-up). Election retry telemetry
+        belongs in metrics, not LHM.
+        """
+        self._metrics.increment("leadership_retries")
 
     def _on_election_started(self) -> None:
         """Called when this node starts an election."""
@@ -2193,21 +2222,33 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
     def _is_target_already_suspect_or_dead(
         self, target: tuple[str, int]
     ) -> bool:
-        """Return True if ``target`` is already SUSPECT or DEAD.
+        """Return True if probe failures to ``target`` should *not* bump LHM.
 
-        Phase C signal-hygiene gate: probe failures to a peer that
-        we've already concluded is in trouble are evidence of peer-side
-        deadness, not local slowness, and must not feed back into our
-        self-LHM. Catches the positive-feedback loop on small clusters
-        (single dead peer pumps LHM to saturation; suspicion timer
-        scales accordingly; detection gets slower under failure load).
+        Phase C signal-hygiene gate covering three peer-state cases
+        where a missed ack is *not* evidence of prober self-slowness:
+
+        * **SUSPECT** / **DEAD** — peer already concluded to be in
+          trouble; further misses are peer-side deadness, not us.
+          Without this gate a single dead peer pumps LHM to
+          saturation while the suspicion timer scales accordingly,
+          slowing detection under failure load (the canonical SWIM
+          positive-feedback pathology).
+        * **UNCONFIRMED** (AD-29) — peer recorded in our incarnation
+          tracker but not yet verified. During cluster spin-up many
+          peers are UNCONFIRMED while their startup completes; probes
+          from us to them race their socket-bind / handler-registration.
+          A timeout in that window is peer-not-ready-yet, not
+          our slowness, and bumping LHM here would inflate every
+          probe-timeout and suspicion-bracket cluster-wide for the
+          duration of cluster formation.
 
         Reads from the incarnation-tracker's authoritative state per
         AD-46 ("All node state stored in IncarnationTracker.node_states").
-        Returns False conservatively when the tracker has no entry for
-        the target — that's a fresh-or-unknown peer, and probe failures
-        in that case *are* evidence of self-slowness (we may simply not
-        have established communication).
+
+        Returns False (i.e. *do* bump LHM) when the tracker has no
+        entry for the target. That case is an actual ambiguous miss —
+        we have no peer-state context, so the conservative Lifeguard
+        default applies.
         """
         try:
             node_state = self._incarnation_tracker.get_node_state(target)
@@ -2215,7 +2256,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             return False
         if node_state is None:
             return False
-        return node_state.status in (b"SUSPECT", b"DEAD")
+        return node_state.status in (b"SUSPECT", b"DEAD", b"UNCONFIRMED")
 
     def _get_election_member_count(self) -> int:
         """Members that participate in *this node's* leader election.
@@ -2269,6 +2310,13 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         self.queue_gossip_update("dead", node, incarnation)
 
         self.update_probe_scheduler_membership()
+
+        # Drop the dead peer's probe-reliability history. CLAUDE.md
+        # requires explicit cleanup of long-running per-peer state to
+        # prevent leaks across the kill/restart lifecycle. If the peer
+        # rejoins it starts with a fresh, empty window (defaulting to
+        # reliability=1.0 — the SWIM "assume healthy" baseline).
+        self._peer_probe_reliability.remove_peer(node)
 
         # Invoke registered callbacks (composition pattern)
         for callback in self._on_node_dead_callbacks:
@@ -2603,7 +2651,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         result = await retry_with_result(
             attempt_join,
             policy=ELECTION_RETRY_POLICY,  # Use election policy for joining
-            on_retry=lambda a, e, d: self.increase_failure_detector("join_retry"),
+            on_retry=lambda a, e, d: self._metrics.increment("join_retries"),
         )
 
         if result.success:
@@ -2702,10 +2750,27 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
 
             if response_received:
                 await self.decrease_failure_detector("successful_probe")
+                self._peer_probe_reliability.record_probe_outcome(
+                    target, success=True
+                )
                 ctx.record_success(
                     ErrorCategory.NETWORK
                 )  # Help circuit breaker recover
                 return
+
+            # Per-peer probe-failure record. Unlike the LHM bump below
+            # — which is gated to avoid feeding-back into our own
+            # self-health signal — the per-peer tracker *must* record
+            # every probe outcome to ``target``. Its purpose is exactly
+            # to capture this peer's reliability over recent probes;
+            # the architectural fix relies on this signal being
+            # specific to ``target`` and isolated from cross-peer
+            # contamination. The bracket bound ensures even an
+            # all-failed window cannot push the suspicion timer past
+            # ``2·base_max − base_min``.
+            self._peer_probe_reliability.record_probe_outcome(
+                target, success=False
+            )
 
             # Phase C signal hygiene — only pump self-LHM when the
             # probe failure is evidence of *our* slowness. If the
@@ -2718,7 +2783,15 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             # again. The result is detection getting *slower* as the
             # cluster gets *unhealthier* — opposite of SWIM's intent.
             #
-            # See AD-30 addendum "Self-LHM growth gating".
+            # See AD-30 addendum "Self-LHM growth gating". Note: this
+            # gate is now belt-and-braces — the suspicion bracket no
+            # longer reads global LHM (it reads
+            # ``_peer_probe_reliability`` per-peer instead), so a
+            # leaked LHM bump can no longer lengthen the very bracket
+            # that gates dead-detection. The gate stays because LHM
+            # still affects ``get_lhm_adjusted_timeout`` (probe-layer)
+            # and we want that signal to remain a faithful measure of
+            # this prober's own health.
             if not self._is_target_already_suspect_or_dead(target):
                 await self.increase_failure_detector("probe_timeout")
             indirect_sent = await self.initiate_indirect_probe(target, incarnation)
@@ -2737,6 +2810,9 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                 probe = self._indirect_probe_manager.get_pending_probe(target)
                 if probe and probe.is_completed():
                     await self.decrease_failure_detector("successful_probe")
+                    self._peer_probe_reliability.record_probe_outcome(
+                        target, success=True
+                    )
                     ctx.record_success(ErrorCategory.NETWORK)
                     return
 
@@ -2748,33 +2824,136 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             await self.start_suspicion(target, incarnation, self_addr)
             await self.broadcast_suspicion(target, incarnation)
 
+    def _compute_direct_probe_budget(
+        self,
+        target: tuple[str, int],
+        base_timeout: float,
+    ) -> float:
+        """Continuous time budget for the direct-probe phase, derived from
+        cluster health and per-peer behaviour.
+
+        Lifeguard prescribes a *single* direct probe with an LHM-stretched
+        timeout, then K indirect probes via random proxies, then suspicion.
+        That maps cleanly to the "all signals healthy" case here:
+        ``budget = base_timeout``. Under noise — peer overload, small
+        cluster (less indirect coverage), reliable peer with a transient
+        miss — we extend the budget by a bounded continuous factor so
+        retries can fire within the same probe round. Under self-overload
+        (high LHM) the budget shrinks again because each LHM-stretched
+        attempt already buys patience and retries would double-pay.
+
+        Composition follows the same prob-OR pattern used in the
+        suspicion-bracket and probe-timeout layers:
+
+        * ``peer_load_noise``  — reported peer load normalised against
+          its configured saturation (PHA's ``timeout_multiplier_overloaded``).
+        * ``cluster_pressure`` — ``1 / log2(n_members)``: small clusters
+          have less indirect-probe redundancy and warrant more direct
+          retries; large clusters have abundant proxies and don't.
+        * ``peer_reliability`` — sliding-window probe-success rate to
+          this peer. Multiplicative modulator: only retry peers with a
+          good track record. A peer whose recent probes have all failed
+          is dying, not noisy — extra retries waste detection time.
+        * ``inhibition``       — ``1 / lhm_multiplier``. High self-LHM
+          inhibits retries because each attempt is already stretched.
+
+        Bounded by construction: ``warrant``, ``inhibition``, and
+        ``peer_reliability`` are all in ``[0, 1]``; ``max_extra`` is
+        ``lhm_max_multiplier − 1`` (default 2.0, derived from the same
+        Lifeguard saturation cap that bounds the suspicion bracket and
+        probe-timeout layers). Total budget is therefore strictly in
+        ``[base_timeout, base_timeout × lhm_max_multiplier]`` regardless
+        of input magnitudes — explosion is impossible at any cluster
+        scale.
+
+        Continuous in every input — small signal change → small budget
+        change, never a step. Per-round attempt counts vary smoothly
+        with conditions, eliminating the integer-boundary flap that
+        afflicts a discrete attempts-count formulation.
+        """
+        target_node_id = f"{target[0]}:{target[1]}"
+
+        peer_load_multiplier = max(
+            1.0,
+            self._peer_health_awareness.get_load_multiplier(target_node_id),
+        )
+        peer_reliability = self._peer_probe_reliability.get_reliability(target)
+        n_members = max(2, self._get_member_count())
+        lhm_multiplier = max(1.0, self._local_health.get_multiplier())
+
+        peer_load_max = (
+            self._peer_health_awareness.config.timeout_multiplier_overloaded
+        )
+        if peer_load_max > 1.0:
+            peer_load_noise = (peer_load_multiplier - 1.0) / (
+                peer_load_max - 1.0
+            )
+        else:
+            peer_load_noise = 0.0
+        peer_load_noise = min(1.0, max(0.0, peer_load_noise))
+
+        cluster_pressure = 1.0 / math.log2(n_members)
+
+        combined_noise = 1.0 - (1.0 - peer_load_noise) * (1.0 - cluster_pressure)
+        warrant = combined_noise * peer_reliability
+
+        inhibition = 1.0 / lhm_multiplier
+
+        # ``max_extra`` is derived from LHM saturation, the same
+        # ceiling used by the suspicion-bracket and probe-timeout
+        # layers. Coherent across the architecture: any signal-driven
+        # extension stays inside the Lifeguard saturation envelope.
+        # With default config (``LHM.max_score=8``,
+        # ``MULTIPLIER_WEIGHT=0.25``) this is ``2.0``, making the
+        # direct-probe budget bounded in ``[base_timeout,
+        # 3·base_timeout]`` regardless of input magnitudes — strictly
+        # bounded; explosion is impossible at any cluster scale.
+        max_extra = self._local_health.get_max_multiplier() - 1.0
+
+        return base_timeout * (1.0 + max_extra * warrant * inhibition)
+
     async def _probe_with_timeout(
         self,
         target: tuple[str, int],
         message: bytes,
         timeout: float,
     ) -> bool:
-        """
-        Send a probe message with retries before falling back to indirect.
+        """Direct-probe phase under a continuous adaptive deadline.
 
-        Uses PROBE_RETRY_POLICY for retry logic with exponential backoff.
-        Returns True if probe succeeded (ACK received), False if all retries exhausted.
+        The direct-probe budget is computed once at round start (see
+        ``_compute_direct_probe_budget``) and consumed via successive
+        send/wait_for cycles until either an ACK arrives or the
+        deadline elapses. Each iteration sends one probe and waits up
+        to ``timeout`` (the LHM-adjusted per-attempt timeout) for the
+        ACK; the trailing iteration's wait is clamped to whatever budget
+        remains. There are no magic retry counts, no per-attempt
+        timeout fractions, no exponential-backoff sleeps between
+        attempts — the four signals fed into the budget already encode
+        every operator-meaningful pacing decision.
 
-        Uses Future-based ACK tracking: we wait for the actual ACK message to arrive,
-        not just checking cached node state which could be stale.
+        Future-based ACK tracking (``_pending_probe_acks``) ensures we
+        wait for the actual ACK message arrival, not stale cached node
+        state.
         """
         self._metrics.increment("probes_sent")
-        attempt = 0
-        max_attempts = PROBE_RETRY_POLICY.max_attempts + 1
 
-        while attempt < max_attempts:
-            # Exit early if shutting down
+        if not self._running:
+            return False
+
+        budget = self._compute_direct_probe_budget(target, timeout)
+        deadline = time.monotonic() + budget
+
+        while True:
             if not self._running:
                 return False
 
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+
             try:
-                # Create a Future to wait for ACK from this specific probe
-                # Cancel any existing pending probe to the same target (stale)
+                # Cancel any stale pending probe to the same target, then
+                # install a fresh future for this attempt.
                 existing_future = self._pending_probe_acks.pop(target, None)
                 if existing_future and not existing_future.done():
                     existing_future.cancel()
@@ -2783,47 +2962,35 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                     asyncio.get_event_loop().create_future()
                 )
                 self._pending_probe_acks[target] = ack_future
-
                 self._pending_probe_start[target] = time.monotonic()
+
                 await self.send(target, message, timeout=timeout)
 
-                # Wait for ACK with timeout (reduced time for retries)
-                wait_time = (
-                    timeout * 0.5 if attempt < max_attempts - 1 else timeout * 0.8
-                )
+                attempt_window = min(timeout, deadline - time.monotonic())
+                if attempt_window <= 0:
+                    break
 
                 try:
-                    await asyncio.wait_for(ack_future, timeout=wait_time)
-                    # Future completed means ACK was received
+                    await asyncio.wait_for(ack_future, timeout=attempt_window)
                     self._metrics.increment("probes_received")
                     return True
                 except asyncio.TimeoutError:
-                    # No ACK received within timeout, try again
                     pass
                 finally:
                     self._pending_probe_acks.pop(target, None)
                     self._pending_probe_start.pop(target, None)
 
-                attempt += 1
-                if attempt < max_attempts:
-                    # Exponential backoff with jitter before retry
-                    backoff = PROBE_RETRY_POLICY.base_delay * (
-                        PROBE_RETRY_POLICY.exponential_base ** (attempt - 1)
-                    )
-                    jitter = random.uniform(0, PROBE_RETRY_POLICY.jitter * backoff)
-                    await asyncio.sleep(backoff + jitter)
-
             except asyncio.CancelledError:
-                # Clean up on cancellation
                 self._pending_probe_acks.pop(target, None)
                 self._pending_probe_start.pop(target, None)
                 raise
             except OSError as e:
-                # Network error - wrap with appropriate error type
                 self._pending_probe_acks.pop(target, None)
                 self._pending_probe_start.pop(target, None)
                 self._metrics.increment("probes_failed")
-                await self.handle_error(self._make_network_error(e, target, "Probe"))
+                await self.handle_error(
+                    self._make_network_error(e, target, "Probe")
+                )
                 return False
             except Exception as e:
                 self._pending_probe_acks.pop(target, None)
@@ -3023,7 +3190,22 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         return self._leader_election.get_status()
 
     async def increase_failure_detector(self, event_type: str = "probe_timeout"):
-        """Increase local health score based on event type."""
+        """Increase local health score based on event type.
+
+        Per Lifeguard §4.3 LHM is bumped only on documented self-
+        health events. The Hyperscale ``architecture.md`` extension
+        adds ``event_loop_lag`` and ``event_loop_critical`` (proactive
+        signals from the local event-loop monitor). All other inputs
+        are *not* self-health events — protocol retries (election,
+        join, send) reflect peer/network state, not prober slowness.
+        Routing them through LHM would conflate operational retry
+        traffic with self-health and inflate probe timeouts and
+        suspicion brackets cluster-wide during normal startup churn.
+
+        Unknown event types are surfaced as a warning rather than
+        silently bumping LHM, so future callers cannot regress this
+        invariant.
+        """
         if event_type == "probe_timeout":
             self._local_health.on_probe_timeout()
         elif event_type == "refutation":
@@ -3035,10 +3217,36 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         elif event_type == "event_loop_critical":
             self._local_health.on_event_loop_critical()
         else:
-            self._local_health.increment()
+            if self._task_runner and self._udp_logger:
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerWarning(
+                        message=(
+                            f"increase_failure_detector called with unrecognised "
+                            f"event_type={event_type!r} — LHM not bumped. Per "
+                            f"Lifeguard §4.3, LHM tracks self-health events only "
+                            f"(probe_timeout/refutation/missed_nack/event_loop_lag/"
+                            f"event_loop_critical). Operational retry telemetry "
+                            f"belongs in metrics."
+                        ),
+                        node_host=self._host,
+                        node_port=self._port,
+                        node_id=(
+                            self._node_id.numeric_id
+                            if hasattr(self, "_node_id")
+                            else 0
+                        ),
+                    ),
+                )
 
     async def decrease_failure_detector(self, event_type: str = "successful_probe"):
-        """Decrease local health score based on event type."""
+        """Decrease local health score based on event type.
+
+        Symmetric to ``increase_failure_detector`` — only Lifeguard-
+        documented self-health recovery events shrink LHM. Unknown
+        event types surface a warning rather than silently
+        decrementing.
+        """
         if event_type == "successful_probe":
             self._local_health.on_successful_probe()
         elif event_type == "successful_nack":
@@ -3046,65 +3254,126 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         elif event_type == "event_loop_recovered":
             self._local_health.on_event_loop_recovered()
         else:
-            self._local_health.decrement()
+            if self._task_runner and self._udp_logger:
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerWarning(
+                        message=(
+                            f"decrease_failure_detector called with unrecognised "
+                            f"event_type={event_type!r} — LHM not decremented. "
+                            f"See ``increase_failure_detector`` docstring."
+                        ),
+                        node_host=self._host,
+                        node_port=self._port,
+                        node_id=(
+                            self._node_id.numeric_id
+                            if hasattr(self, "_node_id")
+                            else 0
+                        ),
+                    ),
+                )
 
     def get_lhm_adjusted_timeout(
         self, base_timeout: float, target_node_id: str | None = None
     ) -> float:
-        """
-        Get timeout adjusted by Local Health Multiplier, degradation level, peer health,
-        and Vivaldi-based latency (AD-35 Task 12.6.3).
+        """Adjust ``base_timeout`` via two-stage bounded composition.
 
-        Phase 6.2: When probing a peer that we know is overloaded (via health gossip),
-        we extend the timeout to avoid false failure detection.
+        **Stage 1 — per-peer base RTT scaling (real network distance).**
+        Vivaldi's ``latency_multiplier`` is the geometric estimate of
+        round-trip time relative to a 10 ms same-DC reference. This is
+        a *real* cost — a cross-continent peer's ack physically takes
+        longer to arrive — so it scales the base timeout linearly,
+        outside the uncertainty-padding stage.
 
-        AD-35: When Vivaldi coordinates are available, adjust timeout based on estimated RTT
-        to account for geographic distance.
+        **Stage 2 — bounded uncertainty padding via prob-OR.** Four
+        independent measurement-reliability signals collapse to a
+        single bounded padding factor:
 
-        Formula: timeout = base × lhm × degradation × latency_mult × confidence_adj
-        - latency_mult = min(10.0, max(1.0, estimated_rtt / reference_rtt))
-        - confidence_adj = 1.0 + (coordinate_error / 10.0)
+        * ``self_lhm``           — global self-health (LHM)
+        * ``degradation``        — global graceful-degradation level
+        * ``coord_quality``      — per-peer Vivaldi confidence
+        * ``peer_load``          — per-peer reported load class
+
+        Each multiplier ``m_i ≥ 1`` becomes a reliability
+        ``r_i = 1 / m_i ∈ (0, 1]``. Independent reliabilities compose
+        multiplicatively: ``R = ∏ r_i``. Unreliability is
+        ``U = 1 − R ∈ [0, 1)``. Padding scales linearly within the
+        cap derived from LHM saturation:
+
+            timeout = peer_base × (1 + (lhm_max_multiplier − 1) × U)
+
+        With default config (``LHM.max_score=8``,
+        ``MULTIPLIER_WEIGHT=0.25``) the cap is ``3 × peer_base`` —
+        matching the existing LHM-saturated bound — and remains there
+        even if every signal is simultaneously at its individual
+        worst-case. The previous code multiplied every signal
+        ``base × lhm × degradation × latency × confidence × peer_load``
+        which (e.g.) at all-saturated produced ``> 90×`` blow-ups.
+
+        Why drop ``peer_health_awareness.get_probe_timeout`` here?
+        Because that helper just multiplied ``peer_load`` on top of
+        ``base_adjusted`` — which is exactly the multiplicative
+        compounding this rewrite eliminates. ``peer_load_multiplier``
+        is now folded into the prob-OR composition where it belongs,
+        with the rest of the per-peer reliability inputs.
 
         Args:
-            base_timeout: Base probe timeout in seconds
-            target_node_id: Optional node ID of the probe target for peer-aware adjustment
+            base_timeout: Base probe timeout in seconds.
+            target_node_id: Optional probe target. When supplied,
+                per-peer Vivaldi (RTT scaling, coord quality) and PHA
+                (peer load) signals participate; otherwise only the
+                two global signals (LHM, degradation) do.
 
         Returns:
-            Adjusted timeout in seconds
+            Adjusted timeout in seconds, strictly bounded by
+            ``base_timeout × latency_multiplier × lhm_max_multiplier``.
         """
-        lhm_multiplier = self._local_health.get_multiplier()
-        degradation_multiplier = self._degradation.get_timeout_multiplier()
-        base_adjusted = base_timeout * lhm_multiplier * degradation_multiplier
-
-        # AD-35 Task 12.6.3: Apply Vivaldi-based latency multiplier
+        latency_multiplier = 1.0
+        coord_quality_multiplier = 1.0
         if target_node_id:
             peer_coord = self._coordinate_tracker.get_peer_coordinate(target_node_id)
             if peer_coord is not None:
-                # Estimate RTT with upper confidence bound for conservative timeout
                 estimated_rtt_ms = self._coordinate_tracker.estimate_rtt_ucb_ms(
                     peer_coordinate=peer_coord
                 )
                 reference_rtt_ms = 10.0  # Same-datacenter baseline (10ms)
-
-                # Latency multiplier: 1.0x for same-DC, up to 10.0x for cross-continent
                 latency_multiplier = min(
                     10.0, max(1.0, estimated_rtt_ms / reference_rtt_ms)
                 )
-
-                # Confidence adjustment based on coordinate quality
-                # Lower quality (higher error) → higher adjustment (more conservative)
+                # Vivaldi coord quality ∈ [0, 1]; convert to a
+                # multiplier ≥ 1 the same way the previous formula did
+                # (``1 + (1 − quality) × 0.5``) so saturation gives a
+                # 1.5× factor — preserves the existing per-peer
+                # reliability semantic with the new composition.
                 quality = self._coordinate_tracker.coordinate_quality(peer_coord)
-                confidence_adjustment = 1.0 + (1.0 - quality) * 0.5
+                coord_quality_multiplier = 1.0 + (1.0 - quality) * 0.5
 
-                base_adjusted *= latency_multiplier * confidence_adjustment
+        peer_base = base_timeout * latency_multiplier
 
-        # Apply peer health-aware timeout adjustment (Phase 6.2)
+        peer_load_multiplier = 1.0
         if target_node_id:
-            return self._peer_health_awareness.get_probe_timeout(
-                target_node_id, base_adjusted
+            peer_load_multiplier = self._peer_health_awareness.get_load_multiplier(
+                target_node_id
             )
 
-        return base_adjusted
+        lhm_multiplier = max(1.0, self._local_health.get_multiplier())
+        degradation_multiplier = max(
+            1.0, self._degradation.get_timeout_multiplier()
+        )
+        coord_quality_multiplier = max(1.0, coord_quality_multiplier)
+        peer_load_multiplier = max(1.0, peer_load_multiplier)
+
+        combined_reliability = (
+            (1.0 / lhm_multiplier)
+            * (1.0 / degradation_multiplier)
+            * (1.0 / coord_quality_multiplier)
+            * (1.0 / peer_load_multiplier)
+        )
+        combined_unreliability = 1.0 - combined_reliability
+
+        max_padding_factor = self._local_health.get_max_multiplier() - 1.0
+
+        return peer_base * (1.0 + max_padding_factor * combined_unreliability)
 
     def get_self_incarnation(self) -> int:
         """Get this node's current incarnation number."""
@@ -3814,6 +4083,9 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         if is_alive:
             if self._indirect_probe_manager.record_ack(target):
                 await self.decrease_failure_detector("successful_probe")
+                self._peer_probe_reliability.record_probe_outcome(
+                    target, success=True
+                )
 
     async def broadcast_refutation(self) -> int:
         """
@@ -3920,8 +4192,21 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         error: Exception,
         delay: float,
     ) -> None:
-        """Callback for retry attempts - update LHM."""
-        await self.increase_failure_detector("send_retry")
+        """Callback for UDP send retry attempts.
+
+        UDP send retries indicate that ``socket.sendto`` raised an
+        OSError (e.g. EAGAIN, ENOBUFS) and the retry policy retried.
+        That can mean local socket pressure (our fault), kernel buffer
+        saturation (could be ours, could be a peer flooding us), or
+        ephemeral network issues — none of which are unambiguously
+        "this prober is slow at processing messages," which is what
+        LHM is supposed to measure (Lifeguard §4.3). Bumping LHM
+        here would falsely conflate transient send-failure with
+        prober self-health and inflate every probe-timeout and
+        suspicion bracket cluster-wide. Send retry telemetry belongs
+        in metrics, not LHM.
+        """
+        self._metrics.increment("send_retries")
 
     async def broadcast_suspicion(
         self,

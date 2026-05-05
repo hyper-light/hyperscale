@@ -51,6 +51,11 @@ from .hierarchical_failure_detector import (
     FailureEvent,
 )
 
+from .peer_probe_reliability_tracker import (
+    PeerProbeReliabilityTracker,
+    PeerProbeReliabilityConfig,
+)
+
 
 __all__ = [
     "IncarnationTracker",
@@ -75,4 +80,6 @@ __all__ = [
     "NodeStatus",
     "FailureSource",
     "FailureEvent",
+    "PeerProbeReliabilityTracker",
+    "PeerProbeReliabilityConfig",
 ]

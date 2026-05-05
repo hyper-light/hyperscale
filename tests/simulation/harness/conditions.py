@@ -136,6 +136,57 @@ def manager_has_n_workers(
     return _predicate
 
 
+def manager_has_n_swim_confirmed_workers(
+    handle: ServerHandle, expected_workers: int
+) -> Callable[[], bool]:
+    """True once a manager's incarnation tracker has SWIM-confirmed the expected workers.
+
+    AD-29 distinguishes UNCONFIRMED (peer known but never successfully
+    probed) from OK/SUSPECT/DEAD. The state machine forbids
+    UNCONFIRMED→SUSPECT transitions: ``start_suspicion`` calls
+    ``can_suspect_node`` and silently drops the suspicion if the
+    target is still UNCONFIRMED, on the rationale that we can't
+    declare a peer dead before having ever confirmed it alive.
+
+    That guard interacts badly with the harness's previous "registered
+    is enough" stabilization gate — workers register via TCP but
+    SWIM confirmation requires a successful UDP probe round, which
+    typically completes within one ``protocol_period`` *after*
+    registration. If a fault is injected in that window, every
+    suspicion attempt is silently skipped and detection budgets blow
+    past their assumed bounds. This predicate enforces the full
+    SWIM-tier readiness invariant: the manager has not just
+    registered the workers but has also exchanged probes with them
+    and seen their state transition out of UNCONFIRMED in the
+    incarnation tracker.
+
+    The analogous gate for manager peers is ``manager_has_n_peers``,
+    which already uses ``_active_manager_peer_ids`` (populated only
+    when SWIM confirmation fires). This predicate is its worker-side
+    counterpart.
+    """
+    if handle.kind is not ServerKind.MANAGER:
+        raise ValueError(
+            f"manager_has_n_swim_confirmed_workers expects a MANAGER handle; got {handle.kind}"
+        )
+
+    def _predicate() -> bool:
+        instance = handle.instance
+        state = instance._manager_state
+        tracker = instance._incarnation_tracker
+        confirmed = 0
+        for _worker_id, registration in state.iter_workers():
+            udp_addr = (
+                registration.node.host,
+                registration.node.udp_port,
+            )
+            if tracker.is_node_confirmed(udp_addr):
+                confirmed += 1
+        return confirmed >= expected_workers
+
+    return _predicate
+
+
 def worker_subprocesses_alive(
     harness: "ClusterHarness", worker_handle: ServerHandle
 ) -> Callable[[], bool]:
@@ -152,6 +203,40 @@ def worker_subprocesses_alive(
 
     def _predicate() -> bool:
         return bool(harness.supervisor.tracked_pids(worker_handle.node_id))
+
+    return _predicate
+
+
+def lhm_at_baseline(handle: ServerHandle) -> Callable[[], bool]:
+    """True when a node's Lifeguard LHM has returned to ``score=0``.
+
+    LHM accumulates during cluster spin-up as initial probes race
+    peer-readiness — even with the AD-29 UNCONFIRMED-state gate
+    suppressing bumps for not-yet-verified peers, transient
+    event-loop lag during process-startup jitter can still push LHM
+    above zero. Subsequent successful probes decrement LHM back to
+    baseline once the cluster is genuinely quiescent.
+
+    Tests that perturb the cluster (kill, partition, pause/resume,
+    workload injection) assume "steady state" pre-conditions — LHM
+    elevated at the start of the experiment is itself a confounding
+    variable, since downstream detection budgets are computed
+    against the Lifeguard ``T = T_base × (1 + LHM × MULTIPLIER_WEIGHT)``
+    formula and would silently inflate. Wiring this predicate into
+    ``ClusterHarness._stabilize`` enforces the actual readiness
+    invariant downstream tests depend on, rather than the weaker
+    "registered + reachable" criteria the harness used previously.
+
+    For node kinds without an ``_local_health`` instance (e.g. gates
+    in the current architecture) this predicate returns True
+    unconditionally — there's no LHM to settle.
+    """
+    def _predicate() -> bool:
+        instance = handle.instance
+        local_health = getattr(instance, "_local_health", None)
+        if local_health is None:
+            return True
+        return local_health.score == 0
 
     return _predicate
 
