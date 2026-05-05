@@ -26,5 +26,4 @@ from .in_flight_tracker import (
     ProtocolInFlightTracker as ProtocolInFlightTracker,
     MessagePriority as MessagePriority,
     PriorityLimits as PriorityLimits,
-    _classify_handler_to_priority as _classify_handler_to_priority,
 )
