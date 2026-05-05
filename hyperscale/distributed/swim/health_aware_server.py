@@ -2293,6 +2293,13 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         self, node: tuple[str, int], incarnation: int
     ) -> None:
         """Callback when a suspicion expires - mark node as DEAD."""
+        import sys as _sys, time as _time
+        self_addr = self._get_self_udp_addr()
+        print(
+            f"[swim-trace] {_time.monotonic():.2f} DEAD node={node} "
+            f"on={self._node_id.short} self_udp={self_addr}",
+            file=_sys.stderr, flush=True,
+        )
         self._metrics.increment("suspicions_expired")
         self._audit_log.record(
             AuditEventType.NODE_CONFIRMED_DEAD,
@@ -2725,6 +2732,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             for node in list(self._incarnation_tracker.node_states.keys())
             if node != self_addr
         ]
+
         self._probe_scheduler.update_members(members)
 
         protocol_period = await self._context.read("udp_poll_interval", 1.0)
@@ -2808,24 +2816,17 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
 
             # Phase C signal hygiene — only pump self-LHM when the
             # probe failure is evidence of *our* slowness. If the
-            # target is already SUSPECT or DEAD, further probe-timeouts
-            # to it are evidence of *peer* deadness and must not feed
-            # back into our self-health signal. Without this gate, a
-            # single dead peer creates a positive feedback loop:
-            # probe-timeout -> self-LHM++ -> longer suspicion timer ->
-            # more probe-timeouts before DEAD declared -> self-LHM++
-            # again. The result is detection getting *slower* as the
-            # cluster gets *unhealthier* — opposite of SWIM's intent.
+            # target is already SUSPECT, DEAD, or UNCONFIRMED, further
+            # probe-timeouts to it are evidence of *peer* deadness or
+            # peer-not-yet-ready, not local slowness, and must not
+            # feed back into our self-health signal.
             #
-            # See AD-30 addendum "Self-LHM growth gating". Note: this
-            # gate is now belt-and-braces — the suspicion bracket no
-            # longer reads global LHM (it reads
-            # ``_peer_probe_reliability`` per-peer instead), so a
-            # leaked LHM bump can no longer lengthen the very bracket
-            # that gates dead-detection. The gate stays because LHM
-            # still affects ``get_lhm_adjusted_timeout`` (probe-layer)
-            # and we want that signal to remain a faithful measure of
-            # this prober's own health.
+            # Per Lifeguard §4: missed pings/ping-reqs *do* bump LHM —
+            # the protocol relies on it to let probes self-pace under
+            # local overload. The signal-hygiene gate is the AD-30
+            # extension that keeps the bump from feeding back through
+            # ``_is_target_already_suspect_or_dead`` (or UNCONFIRMED
+            # per AD-29).
             if not self._is_target_already_suspect_or_dead(target):
                 await self.increase_failure_detector("probe_timeout")
             indirect_sent = await self.initiate_indirect_probe(target, incarnation)
@@ -3890,10 +3891,24 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         """
         # AD-29: Guard against suspecting unconfirmed peers
         # Use formal state machine check which prevents UNCONFIRMED → SUSPECT
+        import sys as _sys, time as _time
+        self_addr = self._get_self_udp_addr()
         if not self._incarnation_tracker.can_suspect_node(node):
+            print(
+                f"[swim-trace] {_time.monotonic():.2f} SUSPECT-SKIP "
+                f"target={node} on={self._node_id.short} "
+                f"self_udp={self_addr} reason=unconfirmed",
+                file=_sys.stderr, flush=True,
+            )
             self._metrics.increment("suspicions_skipped_unconfirmed")
             return None
 
+        print(
+            f"[swim-trace] {_time.monotonic():.2f} SUSPECT-START "
+            f"target={node} on={self._node_id.short} "
+            f"self_udp={self_addr} lhm={self._local_health.score}",
+            file=_sys.stderr, flush=True,
+        )
         self._metrics.increment("suspicions_started")
         self._audit_log.record(
             AuditEventType.NODE_SUSPECTED,

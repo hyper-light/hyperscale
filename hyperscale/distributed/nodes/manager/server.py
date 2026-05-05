@@ -1047,6 +1047,11 @@ class ManagerServer(HealthAwareServer):
 
     def _on_node_dead(self, node_addr: tuple[str, int]) -> None:
         """Handle node death detected by SWIM."""
+        import sys as _sys, time as _time
+        print(
+            f"[mgr-trace] {_time.monotonic():.2f} _on_node_dead addr={node_addr}",
+            file=_sys.stderr, flush=True,
+        )
         worker_id = self._manager_state.get_worker_id_from_addr(node_addr)
         if worker_id:
             self._manager_state.setdefault_worker_unhealthy_since(
@@ -1459,6 +1464,12 @@ class ManagerServer(HealthAwareServer):
     # =========================================================================
 
     async def _handle_worker_failure(self, worker_id: str) -> None:
+        import sys as _sys, time as _time
+        print(
+            f"[mgr-trace] {_time.monotonic():.2f} _handle_worker_failure "
+            f"worker={worker_id[:8]} workers_before={len(self._manager_state._workers)}",
+            file=_sys.stderr, flush=True,
+        )
         await self._worker_health_monitor.handle_worker_failure(worker_id)
 
         if self._workflow_dispatcher and self._job_manager:
@@ -1494,6 +1505,12 @@ class ManagerServer(HealthAwareServer):
         # mirrored explicitly here so we keep the same surface.
         self._registry.unregister_worker(worker_id)
         self._manager_state._worker_lhm_scores.pop(worker_id, None)
+        import sys as _sys, time as _time
+        print(
+            f"[mgr-trace] {_time.monotonic():.2f} unregistered worker={worker_id[:8]} "
+            f"workers_after={len(self._manager_state._workers)}",
+            file=_sys.stderr, flush=True,
+        )
 
     async def _handle_manager_peer_failure(
         self,
@@ -4069,7 +4086,21 @@ class ManagerServer(HealthAwareServer):
                 ).dump()
 
             # Register worker
+            import sys as _sys, time as _time
+            print(
+                f"[mgr-trace] {_time.monotonic():.2f} worker_register "
+                f"worker={registration.node.node_id[:8]} "
+                f"udp={registration.node.host}:{registration.node.udp_port} "
+                f"workers_before={len(self._manager_state._workers)}",
+                file=_sys.stderr, flush=True,
+            )
             self._registry.register_worker(registration)
+            print(
+                f"[mgr-trace] {_time.monotonic():.2f} registered "
+                f"worker={registration.node.node_id[:8]} "
+                f"workers_after={len(self._manager_state._workers)}",
+                file=_sys.stderr, flush=True,
+            )
 
             # Add to worker pool
             await self._worker_pool.register_worker(registration)

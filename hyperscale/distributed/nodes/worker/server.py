@@ -470,6 +470,12 @@ class WorkerServer(HealthAwareServer):
 
     async def start(self, timeout: float | None = None) -> None:
         """Start the worker server."""
+        import sys as _sys, time as _time
+        print(
+            f"[wrk-trace] {_time.monotonic():.2f} worker start "
+            f"id={self._node_id.short} udp={self._host}:{self._udp_port}",
+            file=_sys.stderr, flush=True,
+        )
         # Setup logging config
         self._lifecycle_manager.setup_logging_config()
 
@@ -546,7 +552,18 @@ class WorkerServer(HealthAwareServer):
 
         # Register with all seed managers
         for manager_addr in self._seed_managers:
-            await self._register_with_manager(manager_addr)
+            import sys as _sys, time as _time
+            print(
+                f"[wrk-trace] {_time.monotonic():.2f} register-attempt "
+                f"id={self._node_id.short} -> mgr={manager_addr}",
+                file=_sys.stderr, flush=True,
+            )
+            ok = await self._register_with_manager(manager_addr)
+            print(
+                f"[wrk-trace] {_time.monotonic():.2f} register-result "
+                f"id={self._node_id.short} mgr={manager_addr} ok={ok}",
+                file=_sys.stderr, flush=True,
+            )
 
         # Join SWIM cluster with all known managers for healthchecks.
         # Workers know their seeds are managers from configuration —

@@ -57,9 +57,15 @@ class ProbeScheduler:
         """
         Update the member list and reshuffle.
         Called when membership changes.
-        
+
         Lockless: Creates new immutable tuple and swaps atomically.
         """
+        for member in members:
+            if not isinstance(member, tuple) or len(member) != 2:
+                raise TypeError(
+                    f"ProbeScheduler.update_members: every member must be "
+                    f"tuple[str, int], got {type(member).__name__}: {member!r}"
+                )
         new_set = frozenset(members)
         
         # No change - skip
@@ -131,9 +137,14 @@ class ProbeScheduler:
     def add_member(self, member: tuple[str, int]) -> None:
         """
         Add a new member to the probe list.
-        
+
         Lockless: Creates new tuple with the member at random position.
         """
+        if not isinstance(member, tuple) or len(member) != 2:
+            raise TypeError(
+                f"ProbeScheduler.add_member: member must be tuple[str, int], "
+                f"got {type(member).__name__}: {member!r}"
+            )
         if member in self._member_set:
             return
         

@@ -1017,6 +1017,43 @@ class ServerRateLimiter:
 
         return result.allowed
 
+    def check_sync(self, addr: tuple[str, int]) -> bool:
+        """Synchronous rate-limit fast-path for transport-layer callers.
+
+        UDP transport callbacks (``MercurySyncBaseServer.read_udp``) run
+        in a sync ``DatagramProtocol.datagram_received`` context where
+        ``await`` is unavailable. The previous code called the async
+        ``check(...)`` from there, which created a coroutine and
+        immediately discarded it (``RuntimeWarning: coroutine
+        'ServerRateLimiter.check' was never awaited``); the rate-limit
+        path silently never ran and ``if not <coroutine>:`` always
+        evaluated False.
+
+        This sync variant uses the *existing* per-client counters'
+        non-blocking ``try_acquire`` to enforce the rate limit
+        without requiring an event loop. The first contact from a
+        new client is permitted (no counter exists yet); a follow-up
+        async pass through ``check`` will lazily allocate the counter
+        on demand. After that, all subsequent sync calls hit the
+        per-client counter directly.
+        """
+        client_id = f"{addr[0]}:{addr[1]}"
+
+        # CRITICAL priority and HEALTHY-state HIGH/NORMAL traffic are
+        # rate-limited via per-client operation counters. Read the
+        # cached counter; if absent, allow (the next async path will
+        # populate it).
+        counters = self._adaptive._operation_counters.get(client_id)
+        if counters is None:
+            return True
+
+        operation_counter = counters.get("default")
+        if operation_counter is None:
+            return True
+
+        acquired, _wait_time = operation_counter.try_acquire(1)
+        return acquired
+
     async def check_rate_limit(
         self,
         client_id: str,

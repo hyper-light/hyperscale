@@ -1211,9 +1211,14 @@ class MercurySyncBaseServer(Generic[T]):
             return
 
         try:
-            # Rate limiting (if sender address available)
+            # Rate limiting (if sender address available). ``read_udp``
+            # is invoked from ``MercurySyncUDPProtocol.datagram_received``
+            # which is sync, so we need a synchronous rate-limit
+            # primitive — use ``check_sync`` rather than the async
+            # ``check`` (the latter created a discarded coroutine and
+            # silently disabled rate-limiting entirely).
             if sender_addr is not None:
-                if not self._rate_limiter.check(sender_addr):
+                if not self._rate_limiter.check_sync(sender_addr):
                     self._udp_drop_counter.increment_rate_limited()
                     return
 
