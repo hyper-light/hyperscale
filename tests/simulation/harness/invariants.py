@@ -87,11 +87,23 @@ class LivenessInvariant:
 
 @dataclass(slots=True)
 class _LivenessState:
-    """Per-invariant tracking the checker maintains."""
+    """Per-invariant tracking the checker maintains.
+
+    ``regression_start_at`` is the time the counter first dropped
+    below ``last_value`` (the running peak) without recovering.
+    Steady state at the peak is the cluster's healthy resting
+    position, not a deadlock — so we don't measure staleness while
+    the counter sits at the peak. We *do* measure staleness while
+    the counter sits below the peak: that's the
+    "advanced-then-regressed-and-stuck" deadlock signature the
+    invariant docstring describes. ``None`` means we're either at
+    the peak or have not yet regressed.
+    """
 
     last_value: int = 0
     last_advance_at: float = 0.0
     has_started: bool = False
+    regression_start_at: float | None = None
 
 
 @dataclass(slots=True)
@@ -188,16 +200,35 @@ class InvariantChecker:
             counter = invariant.progress_counter(self.harness)
             state = self._liveness_state[invariant.name]
             if counter > state.last_value:
+                # New peak — fresh progress. Clear any tracked
+                # regression: the cluster moved forward.
                 state.last_value = counter
                 state.last_advance_at = now
                 state.has_started = True
+                state.regression_start_at = None
                 continue
             if not state.has_started:
                 continue
-            if now - state.last_advance_at > invariant.staleness_budget_seconds:
+            if counter == state.last_value:
+                # Steady at peak — the cluster is at its healthy
+                # resting state. Per the invariant docstring this is
+                # explicitly *not* a stall: "once steady, it stops
+                # advancing — at which point the liveness check has
+                # nothing to measure". Clear any prior regression
+                # tracking and continue.
+                state.regression_start_at = None
+                continue
+            # counter < state.last_value — regression from peak.
+            # Start the staleness clock from the moment the regression
+            # began; if the cluster doesn't recover within the budget,
+            # this is the "advanced-then-stopped" deadlock signature.
+            if state.regression_start_at is None:
+                state.regression_start_at = now
+            if now - state.regression_start_at > invariant.staleness_budget_seconds:
                 raise InvariantViolation(
                     f"liveness invariant {invariant.name!r} stalled: "
-                    f"counter={counter}, last_advance={now - state.last_advance_at:.1f}s ago"
+                    f"counter={counter} regressed from peak {state.last_value} "
+                    f"and stuck for {now - state.regression_start_at:.1f}s"
                 )
 
 
