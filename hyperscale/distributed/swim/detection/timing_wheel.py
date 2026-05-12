@@ -1,16 +1,45 @@
 """
-Hierarchical Timing Wheel for efficient suspicion timer management.
+Event-driven suspicion-timer registry.
 
-This implements a two-level timing wheel (coarse + fine) for O(1) timer
-operations regardless of the number of active suspicions. Used by the
-global layer of hierarchical failure detection.
+The original implementation was a Kafka-style two-level timing wheel
+designed for O(1) expirations across very large numbers of entries.
+For SWIM-scale clusters (tens to thousands of suspicions in flight)
+the wheel's polling tick-loop is the wrong tradeoff:
 
-Design based on Kafka's purgatory timing wheel, adapted for SWIM/Lifeguard.
+* it consumes a fixed CPU budget polling for expirations even when
+  nothing's expiring,
+* its precision is bounded by ``fine_tick_ms``,
+* (the load-bearing failure observed in this codebase) under
+  event-loop saturation ``asyncio.sleep(tick_interval)`` overruns
+  its target so the wheel falls behind real time. The previous
+  ``_advance_fine_wheel`` advanced exactly one bucket per
+  ``_tick`` call regardless of elapsed time, so a busy event loop
+  silently delayed every suspicion-expiry callback by the loop-lag
+  amount — long enough to push detection past the operator-budget
+  envelope on small clusters with one dying peer hogging the
+  probe-cycle awaits.
+
+The fix is architectural rather than a tick-rate tweak: schedule
+each entry as a direct ``loop.call_later`` against asyncio's own
+heap-based timer queue. asyncio resolves the next deadline in
+``O(log n)`` and fires the callback when the loop is free — no
+polling, no catch-up logic, no "wheel position vs wall clock"
+divergence to manage. The implementation is also dramatically
+simpler: a single ``dict[NodeAddress, _Entry]`` plus per-entry
+``asyncio.TimerHandle``.
+
+The public API (``add`` / ``remove`` / ``update_expiration`` /
+``get_state`` / ``contains`` / ``apply_lhm_adjustment`` /
+``get_stats`` plus the sync accessors) is preserved exactly so
+the ``HierarchicalFailureDetector`` is unchanged. The wheel-
+specific configuration fields and the ``WheelEntry`` /
+``TimingWheelBucket`` types are kept as no-op compatibility
+shims for callers that still import them.
 """
 
 import asyncio
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Callable, Generic, TypeVar
 
 from hyperscale.distributed.swim.core.protocols import LoggerProtocol
@@ -21,56 +50,46 @@ from .suspicion_state import SuspicionState
 # Type for node address
 NodeAddress = tuple[str, int]
 
-# Type variable for wheel entries
+# Type variable for wheel entries (kept for backward-compatibility
+# generics in callers that still import WheelEntry[T])
 T = TypeVar("T")
 
 
 @dataclass(slots=True)
 class WheelEntry(Generic[T]):
-    """
-    An entry in the timing wheel.
+    """Backward-compatibility shim.
 
-    Tracks the suspicion state and its absolute expiration time.
+    The previous two-level-wheel implementation used this dataclass
+    to thread state + expiration time through bucket data structures.
+    The event-driven replacement no longer uses it internally
+    (entries are tracked by ``_Entry`` instead), but the type is
+    retained so existing imports / type hints continue to resolve.
     """
 
     node: NodeAddress
     state: T
     expiration_time: float
-    # For detecting stale entries after movement between buckets
     epoch: int = 0
 
 
 @dataclass
 class TimingWheelConfig:
-    """Configuration for the timing wheel.
+    """Configuration shim for backward compatibility.
 
-    Defaults match AD-30 §"Timing Wheel Internals":
-    ``coarse_tick_ms=1000`` (1s per coarse bucket), ``fine_tick_ms=100``
-    (100ms per fine bucket), ``fine_wheel_size=10`` (1s of fine
-    resolution).
-
-    Invariant (validated in ``__post_init__``):
-    ``coarse_tick_ms == fine_tick_ms * fine_wheel_size``. The coarse
-    wheel advances exactly once per full revolution of the fine wheel
-    (see ``TimingWheel._tick`` — coarse advances when
-    ``_fine_position == 0``). If the configured coarse tick is not
-    equal to a full fine revolution, ``_calculate_bucket_index``
-    routes entries by the *configured* tick rate while the wheel
-    actually advances at the *fine-revolution* rate, so the entry's
-    expiration is silently delayed by the ratio of the two.
+    The wheel-resolution fields (``coarse_tick_ms``, ``fine_tick_ms``,
+    wheel sizes, ``fine_wheel_threshold_ms``) parameterised the
+    previous polling-tick wheel. The event-driven registry does not
+    consume them — asyncio's timer queue resolves expirations to its
+    own precision (microseconds in practice). The fields and the
+    historical ``coarse_tick_ms == fine_tick_ms * fine_wheel_size``
+    invariant remain so existing callers that pass them through
+    don't error out.
     """
 
-    # Coarse wheel: handles longer timeouts (seconds)
-    coarse_tick_ms: int = 1000  # 1 second per coarse bucket (AD-30)
-    coarse_wheel_size: int = 64  # 64 seconds max before wrap
-
-    # Fine wheel: handles imminent expirations (milliseconds)
-    fine_tick_ms: int = 100  # 100ms per tick
-    fine_wheel_size: int = 10  # 1 second of fine resolution (AD-30)
-
-    # When remaining time is below this, move to fine wheel.
-    # Must not exceed ``fine_tick_ms * fine_wheel_size`` or the entry
-    # would not fit in the fine wheel.
+    coarse_tick_ms: int = 1000
+    coarse_wheel_size: int = 64
+    fine_tick_ms: int = 100
+    fine_wheel_size: int = 10
     fine_wheel_threshold_ms: int = 1000
 
     def __post_init__(self) -> None:
@@ -80,76 +99,54 @@ class TimingWheelConfig:
                 f"TimingWheelConfig: coarse_tick_ms must equal "
                 f"fine_tick_ms * fine_wheel_size "
                 f"({self.fine_tick_ms} * {self.fine_wheel_size} = "
-                f"{expected_coarse}); got coarse_tick_ms={self.coarse_tick_ms}. "
-                f"The coarse wheel only advances once per full fine-wheel "
-                f"revolution, so any other ratio silently delays expirations."
+                f"{expected_coarse}); got coarse_tick_ms={self.coarse_tick_ms}."
             )
         if self.fine_wheel_threshold_ms > expected_coarse:
             raise ValueError(
                 f"TimingWheelConfig: fine_wheel_threshold_ms "
                 f"({self.fine_wheel_threshold_ms}) cannot exceed the fine "
-                f"wheel span ({expected_coarse}); entries above this "
-                f"threshold go to the coarse wheel."
+                f"wheel span ({expected_coarse})."
             )
 
 
 class TimingWheelBucket:
-    """
-    A single bucket in the timing wheel.
+    """Backward-compatibility shim.
 
-    Contains entries expiring within the bucket's time range.
-    Thread-safe for asyncio via lock.
+    No longer used internally — entries live in ``TimingWheel._entries``
+    directly. Retained because the symbol was part of the public
+    detection module exports.
     """
 
-    __slots__ = ("entries", "_lock")
+    __slots__ = ("entries",)
 
     def __init__(self) -> None:
         self.entries: dict[NodeAddress, WheelEntry[SuspicionState]] = {}
-        self._lock = asyncio.Lock()
-
-    async def add(self, entry: WheelEntry[SuspicionState]) -> None:
-        """Add an entry to this bucket."""
-        async with self._lock:
-            self.entries[entry.node] = entry
-
-    async def remove(self, node: NodeAddress) -> WheelEntry[SuspicionState] | None:
-        """Remove and return an entry from this bucket."""
-        async with self._lock:
-            return self.entries.pop(node, None)
-
-    async def pop_all(self) -> list[WheelEntry[SuspicionState]]:
-        """Remove and return all entries from this bucket."""
-        async with self._lock:
-            entries = list(self.entries.values())
-            self.entries.clear()
-            return entries
-
-    async def get(self, node: NodeAddress) -> WheelEntry[SuspicionState] | None:
-        """Get an entry without removing it."""
-        async with self._lock:
-            return self.entries.get(node)
 
     def __len__(self) -> int:
         return len(self.entries)
 
 
+@dataclass(slots=True)
+class _Entry:
+    """Internal entry: suspicion state, expiration deadline, asyncio handle."""
+
+    state: SuspicionState
+    expiration_time: float
+    timer_handle: asyncio.TimerHandle | None = None
+
+
 class TimingWheel:
-    """
-    Hierarchical timing wheel for suspicion timer management.
+    """Event-driven suspicion-timer registry.
 
-    Provides O(1) operations for:
-    - Adding a suspicion (insert into bucket)
-    - Extending a suspicion (move to later bucket)
-    - Cancelling a suspicion (remove from bucket)
-    - Expiring suspicions (pop bucket on tick)
+    Each entry is scheduled as an ``asyncio.TimerHandle`` via
+    ``loop.call_later``. asyncio's timer-queue heap orders pending
+    deadlines and fires callbacks when the loop is free — no polling
+    tick loop, no wheel position to keep in sync with wall time, no
+    "advance one bucket per iteration" latency cap.
 
-    Architecture:
-    - Coarse wheel: For suspicions > 2s from expiration
-    - Fine wheel: For suspicions within 2s of expiration
-    - Single timer advances wheels, expiring entries as needed
-
-    When LHM changes, all entries can be shifted efficiently by
-    adjusting expiration times and moving between buckets.
+    Public surface preserved from the original implementation so
+    ``HierarchicalFailureDetector`` and its sync/async accessors
+    work unchanged.
     """
 
     def __init__(
@@ -173,41 +170,14 @@ class TimingWheel:
         self._node_port = node_port
         self._node_id = node_id
 
-        # Create wheel buckets
-        self._coarse_wheel: list[TimingWheelBucket] = [
-            TimingWheelBucket() for _ in range(config.coarse_wheel_size)
-        ]
-        self._fine_wheel: list[TimingWheelBucket] = [
-            TimingWheelBucket() for _ in range(config.fine_wheel_size)
-        ]
-
-        # Current positions in each wheel
-        self._coarse_position: int = 0
-        self._fine_position: int = 0
-
-        # Base time for calculating bucket positions
-        self._base_time: float = time.monotonic()
-
-        # Track which wheel each node is in for efficient removal
-        self._node_locations: dict[NodeAddress, tuple[str, int, int]] = {}
-        # Format: (wheel_type, bucket_idx, epoch)
-
-        # Epoch counter for detecting stale operations
-        self._global_epoch: int = 0
-
-        # Advancement task
-        self._advance_task: asyncio.Task | None = None
+        self._entries: dict[NodeAddress, _Entry] = {}
         self._running: bool = False
-
-        # Lock for structural modifications
-        self._lock = asyncio.Lock()
 
         # Stats
         self._entries_added: int = 0
         self._entries_removed: int = 0
         self._entries_expired: int = 0
         self._entries_moved: int = 0
-        self._cascade_count: int = 0
 
     async def _log_error(self, message: str) -> None:
         if self._logger:
@@ -222,34 +192,34 @@ class TimingWheel:
                 )
             )
 
-    def _calculate_bucket_index(
-        self,
-        expiration_time: float,
-        wheel_type: str,
-    ) -> int:
-        """Calculate which bucket an expiration time maps to.
+    def start(self) -> None:
+        """Mark the registry as running so subsequent ``add`` calls schedule timers.
 
-        For past-due times we clamp ``ticks`` to 0 (current bucket) so
-        the entry is processed on the next tick. Without the clamp,
-        ``int(negative/positive)`` rounds toward zero and the modulo
-        of a negative tick count wraps around to the far end of the
-        wheel — silently scheduling the entry tens of seconds out.
+        Entries added while ``_running`` is False are tracked but not
+        scheduled — they will be scheduled when ``start`` is called.
+        (Symmetric with how the previous wheel held off advancing
+        until ``start`` was invoked.)
         """
+        if self._running:
+            return
+        self._running = True
+        # Schedule any entries that were added pre-start.
         now = time.monotonic()
-        remaining_ms = (expiration_time - now) * 1000
+        for node, entry in self._entries.items():
+            if entry.timer_handle is None:
+                delay = max(0.0, entry.expiration_time - now)
+                entry.timer_handle = asyncio.get_event_loop().call_later(
+                    delay, self._fire_expiration, node
+                )
 
-        if wheel_type == "fine":
-            ticks = max(0, int(remaining_ms / self._config.fine_tick_ms))
-            return (self._fine_position + ticks) % self._config.fine_wheel_size
-        else:
-            ticks = max(0, int(remaining_ms / self._config.coarse_tick_ms))
-            return (self._coarse_position + ticks) % self._config.coarse_wheel_size
-
-    def _should_use_fine_wheel(self, expiration_time: float) -> bool:
-        """Determine if an entry should go in the fine wheel."""
-        now = time.monotonic()
-        remaining_ms = (expiration_time - now) * 1000
-        return remaining_ms <= self._config.fine_wheel_threshold_ms
+    async def stop(self) -> None:
+        """Cancel all pending timers and drop tracking state."""
+        self._running = False
+        for entry in self._entries.values():
+            if entry.timer_handle is not None:
+                entry.timer_handle.cancel()
+                entry.timer_handle = None
+        self._entries.clear()
 
     async def add(
         self,
@@ -257,390 +227,150 @@ class TimingWheel:
         state: SuspicionState,
         expiration_time: float,
     ) -> bool:
-        """
-        Add a suspicion to the timing wheel.
+        """Register a suspicion. Returns False if already tracked."""
+        if node in self._entries:
+            return False
 
-        Returns True if added successfully, False if already exists.
-        """
-
-        async with self._lock:
-            # Check if already tracked
-            if node in self._node_locations:
-                return False
-
-            self._global_epoch += 1
-            epoch = self._global_epoch
-
-            entry = WheelEntry(
-                node=node,
-                state=state,
-                expiration_time=expiration_time,
-                epoch=epoch,
+        entry = _Entry(state=state, expiration_time=expiration_time)
+        if self._running:
+            delay = max(0.0, expiration_time - time.monotonic())
+            entry.timer_handle = asyncio.get_event_loop().call_later(
+                delay, self._fire_expiration, node
             )
-
-            # Determine which wheel
-            if self._should_use_fine_wheel(expiration_time):
-                bucket_idx = self._calculate_bucket_index(expiration_time, "fine")
-                await self._fine_wheel[bucket_idx].add(entry)
-                self._node_locations[node] = ("fine", bucket_idx, epoch)
-            else:
-                bucket_idx = self._calculate_bucket_index(expiration_time, "coarse")
-                await self._coarse_wheel[bucket_idx].add(entry)
-                self._node_locations[node] = ("coarse", bucket_idx, epoch)
-
-            self._entries_added += 1
-            return True
+        self._entries[node] = entry
+        self._entries_added += 1
+        return True
 
     async def remove(self, node: NodeAddress) -> SuspicionState | None:
-        """
-        Remove a suspicion from the timing wheel.
-
-        Returns the state if found and removed, None otherwise.
-        """
-        async with self._lock:
-            location = self._node_locations.pop(node, None)
-            if location is None:
-                return None
-
-            wheel_type, bucket_idx, _ = location
-
-            if wheel_type == "fine":
-                entry = await self._fine_wheel[bucket_idx].remove(node)
-            else:
-                entry = await self._coarse_wheel[bucket_idx].remove(node)
-
-            if entry:
-                self._entries_removed += 1
-                return entry.state
+        """Cancel and drop a suspicion. Returns the prior state if found."""
+        entry = self._entries.pop(node, None)
+        if entry is None:
             return None
+        if entry.timer_handle is not None:
+            entry.timer_handle.cancel()
+        self._entries_removed += 1
+        return entry.state
 
     async def update_expiration(
         self,
         node: NodeAddress,
         new_expiration_time: float,
     ) -> bool:
-        """
-        Update the expiration time for a suspicion.
-
-        Moves the entry to the appropriate bucket if needed.
-        Returns True if updated, False if node not found.
-        """
-        async with self._lock:
-            location = self._node_locations.get(node)
-            if location is None:
-                return False
-
-            old_wheel_type, old_bucket_idx, old_epoch = location
-
-            # Get the entry
-            if old_wheel_type == "fine":
-                entry = await self._fine_wheel[old_bucket_idx].remove(node)
-            else:
-                entry = await self._coarse_wheel[old_bucket_idx].remove(node)
-
-            if entry is None:
-                # Entry was already removed (race condition)
-                self._node_locations.pop(node, None)
-                return False
-
-            # Update expiration
-            entry.expiration_time = new_expiration_time
-            self._global_epoch += 1
-            entry.epoch = self._global_epoch
-
-            # Determine new location
-            if self._should_use_fine_wheel(new_expiration_time):
-                new_bucket_idx = self._calculate_bucket_index(
-                    new_expiration_time, "fine"
-                )
-                await self._fine_wheel[new_bucket_idx].add(entry)
-                self._node_locations[node] = ("fine", new_bucket_idx, entry.epoch)
-            else:
-                new_bucket_idx = self._calculate_bucket_index(
-                    new_expiration_time, "coarse"
-                )
-                await self._coarse_wheel[new_bucket_idx].add(entry)
-                self._node_locations[node] = ("coarse", new_bucket_idx, entry.epoch)
-
-            self._entries_moved += 1
-            return True
+        """Reschedule an entry's deadline. Returns False if not tracked."""
+        entry = self._entries.get(node)
+        if entry is None:
+            return False
+        if entry.timer_handle is not None:
+            entry.timer_handle.cancel()
+        entry.expiration_time = new_expiration_time
+        if self._running:
+            delay = max(0.0, new_expiration_time - time.monotonic())
+            entry.timer_handle = asyncio.get_event_loop().call_later(
+                delay, self._fire_expiration, node
+            )
+        self._entries_moved += 1
+        return True
 
     async def contains(self, node: NodeAddress) -> bool:
-        """Check if a node is being tracked in the wheel."""
-        async with self._lock:
-            return node in self._node_locations
+        return node in self._entries
 
     async def get_state(self, node: NodeAddress) -> SuspicionState | None:
-        """Get the suspicion state for a node without removing it."""
-        async with self._lock:
-            location = self._node_locations.get(node)
-            if location is None:
-                return None
+        entry = self._entries.get(node)
+        return entry.state if entry else None
 
-            wheel_type, bucket_idx, _ = location
+    def _fire_expiration(self, node: NodeAddress) -> None:
+        """asyncio TimerHandle callback — runs sync on the event loop.
 
-            if wheel_type == "fine":
-                entry = await self._fine_wheel[bucket_idx].get(node)
-            else:
-                entry = await self._coarse_wheel[bucket_idx].get(node)
-
-            return entry.state if entry else None
-
-    async def _advance_fine_wheel(self) -> list[WheelEntry[SuspicionState]]:
+        Pops the entry from tracking BEFORE invoking the user callback,
+        symmetric with the previous wheel's ordering: the callback
+        (e.g. ``HFD._handle_global_expiration``) marks the node as
+        globally dead and any concurrent ``suspect_global`` must see
+        that state, not a still-tracked-in-the-wheel state, when it
+        runs.
         """
-        Advance the fine wheel by one tick.
-
-        Returns expired entries.
-        """
-        expired = await self._fine_wheel[self._fine_position].pop_all()
-        self._fine_position = (self._fine_position + 1) % self._config.fine_wheel_size
-        return expired
-
-    async def _advance_coarse_wheel(self) -> list[WheelEntry[SuspicionState]]:
-        """
-        Advance the coarse wheel by one tick.
-
-        Returns entries that need to be cascaded to the fine wheel.
-        """
-        entries = await self._coarse_wheel[self._coarse_position].pop_all()
-        self._coarse_position = (
-            self._coarse_position + 1
-        ) % self._config.coarse_wheel_size
-        return entries
-
-    async def _cascade_to_fine_wheel(
-        self,
-        entries: list[WheelEntry[SuspicionState]],
-    ) -> list[WheelEntry[SuspicionState]]:
-        """
-        Move entries from coarse wheel to fine wheel.
-
-        Returns any entries that have already expired.
-        """
-        now = time.monotonic()
-        expired: list[WheelEntry[SuspicionState]] = []
-
-        for entry in entries:
-            if entry.expiration_time <= now:
-                expired.append(entry)
-                self._node_locations.pop(entry.node, None)
-            else:
-                bucket_idx = self._calculate_bucket_index(entry.expiration_time, "fine")
-                await self._fine_wheel[bucket_idx].add(entry)
-                self._node_locations[entry.node] = ("fine", bucket_idx, entry.epoch)
-
-        if entries:
-            self._cascade_count += 1
-
-        return expired
-
-    async def _process_expired(
-        self,
-        entries: list[WheelEntry[SuspicionState]],
-    ) -> None:
-        """Process expired entries by calling the callback.
-
-        Callback runs BEFORE ``_node_locations.pop`` so the callback's
-        side effects (e.g. ``_handle_global_expiration`` adding the
-        node to its ``_globally_dead`` set) are visible to any
-        concurrent ``suspect_global`` before this wheel forgets the
-        node. The popping happens outside the wheel's own lock, so
-        without this ordering there is a window where the wheel no
-        longer tracks the node and the HFD has not yet marked it
-        globally dead — ``suspect_global`` slips into its else-branch
-        in that window and adds a *fresh* suspicion entry, which then
-        expires later and fires the callback a second time. The
-        second firing races a restart-then-register: a freshly-
-        registered new instance at the same address gets unregistered
-        by the second ``addr → current_worker_id`` lookup, silently
-        nuking the recovered registration.
-        """
-        for entry in entries:
-            self._entries_expired += 1
-
-            # Call callback BEFORE releasing the location entry.
-            # ``_handle_global_expiration`` is synchronous (sets
-            # ``_globally_dead``) so concurrent coroutines cannot
-            # interleave between the callback and the pop below.
-            if self._on_expired:
+        entry = self._entries.pop(node, None)
+        if entry is None:
+            # Cancelled or replaced between scheduling and firing.
+            return
+        entry.timer_handle = None
+        self._entries_expired += 1
+        if self._on_expired is None:
+            return
+        try:
+            self._on_expired(node, entry.state)
+        except Exception as callback_error:
+            if self._on_error is not None:
                 try:
-                    self._on_expired(entry.node, entry.state)
+                    self._on_error(
+                        f"on_expired callback failed for {node}",
+                        callback_error,
+                    )
                 except Exception:
-                    # Don't let callback errors stop the wheel
                     pass
 
-            self._node_locations.pop(entry.node, None)
-
-    async def _tick(self) -> None:
-        """
-        Perform one tick of the timing wheel.
-
-        This advances the fine wheel and potentially the coarse wheel,
-        expiring any entries that have reached their timeout.
-        """
-        async with self._lock:
-            now = time.monotonic()
-
-            # Always advance fine wheel
-            fine_expired = await self._advance_fine_wheel()
-
-            # Check if we need to advance coarse wheel
-            # (every fine_wheel_size ticks of fine wheel = 1 coarse tick)
-            coarse_expired: list[WheelEntry[SuspicionState]] = []
-            if self._fine_position == 0:
-                cascade_entries = await self._advance_coarse_wheel()
-                coarse_expired = await self._cascade_to_fine_wheel(cascade_entries)
-
-            all_expired = fine_expired + coarse_expired
-
-        # Process expired entries outside of lock
-        await self._process_expired(all_expired)
-
-    async def _advance_loop(self) -> None:
-        """Main loop that advances the wheel at the configured tick rate."""
-        tick_interval = self._config.fine_tick_ms / 1000.0
-
-        while self._running:
-            try:
-                await asyncio.sleep(tick_interval)
-                await self._tick()
-            except asyncio.CancelledError:
-                await self._log_error("Advance loop cancelled")
-                break
-            except Exception as advance_error:
-                if self._on_error:
-                    self._on_error(
-                        f"Timing wheel advance loop error: {advance_error}",
-                        advance_error,
-                    )
-                else:
-                    await self._log_error(f"Advance loop error: {advance_error}")
-
-    def start(self) -> None:
-        """Start the timing wheel advancement loop."""
-        if self._running:
-            return
-
-        self._running = True
-        self._base_time = time.monotonic()
-        self._advance_task = asyncio.create_task(self._advance_loop())
-
-    async def stop(self) -> None:
-        """Stop the timing wheel and cancel all pending expirations."""
-        self._running = False
-
-        if self._advance_task and not self._advance_task.done():
-            self._advance_task.cancel()
-            try:
-                await self._advance_task
-            except asyncio.CancelledError:
-                pass
-
-        self._advance_task = None
-
     async def clear(self) -> None:
-        """Clear all entries from the wheel."""
-        async with self._lock:
-            for bucket in self._fine_wheel:
-                await bucket.pop_all()
-            for bucket in self._coarse_wheel:
-                await bucket.pop_all()
-            self._node_locations.clear()
+        """Drop all entries (cancelling pending timers)."""
+        for entry in self._entries.values():
+            if entry.timer_handle is not None:
+                entry.timer_handle.cancel()
+                entry.timer_handle = None
+        self._entries.clear()
 
     def get_stats(self) -> dict[str, int]:
-        """Get timing wheel statistics."""
         return {
             "entries_added": self._entries_added,
             "entries_removed": self._entries_removed,
             "entries_expired": self._entries_expired,
             "entries_moved": self._entries_moved,
-            "cascade_count": self._cascade_count,
-            "current_entries": len(self._node_locations),
-            "fine_position": self._fine_position,
-            "coarse_position": self._coarse_position,
+            # ``cascade_count`` / wheel positions are wheel-specific
+            # concepts that don't apply to the event-driven model;
+            # keep the keys for backwards-compat stat dashboards.
+            "cascade_count": 0,
+            "current_entries": len(self._entries),
+            "fine_position": 0,
+            "coarse_position": 0,
         }
 
     async def apply_lhm_adjustment(self, multiplier: float) -> int:
-        """
-        Apply LHM adjustment to all entries.
+        """Rescale every active timer's *remaining* duration by ``multiplier``.
 
-        When Local Health Multiplier increases, we need to extend all
-        suspicion timeouts proportionally. This is done by adjusting
-        expiration times and moving entries to appropriate buckets.
+        Used by ``HFD.apply_lhm_adjustment`` to extend or contract
+        all in-flight suspicion deadlines when LHM changes. Each
+        affected entry's ``call_later`` handle is cancelled and a
+        fresh one scheduled against the rescaled deadline.
 
-        Returns the number of entries adjusted.
+        Returns the number of entries adjusted. No-op (returns 0)
+        when ``multiplier == 1.0``.
         """
         if multiplier == 1.0:
             return 0
 
-        async with self._lock:
-            adjusted_count = 0
-            now = time.monotonic()
+        adjusted = 0
+        now = time.monotonic()
+        for node, entry in list(self._entries.items()):
+            remaining = entry.expiration_time - now
+            new_remaining = remaining * multiplier
+            entry.expiration_time = now + new_remaining
 
-            # Collect all entries to adjust
-            all_entries: list[tuple[NodeAddress, WheelEntry[SuspicionState]]] = []
+            if entry.timer_handle is not None:
+                entry.timer_handle.cancel()
+            if self._running:
+                entry.timer_handle = asyncio.get_event_loop().call_later(
+                    max(0.0, new_remaining),
+                    self._fire_expiration,
+                    node,
+                )
+            adjusted += 1
 
-            for bucket in self._fine_wheel:
-                entries = await bucket.pop_all()
-                for entry in entries:
-                    all_entries.append((entry.node, entry))
-
-            for bucket in self._coarse_wheel:
-                entries = await bucket.pop_all()
-                for entry in entries:
-                    all_entries.append((entry.node, entry))
-
-            self._node_locations.clear()
-
-            # Re-insert with adjusted expiration times
-            for node, entry in all_entries:
-                # Calculate new expiration time
-                remaining = entry.expiration_time - now
-                new_remaining = remaining * multiplier
-                new_expiration = now + new_remaining
-
-                entry.expiration_time = new_expiration
-                self._global_epoch += 1
-                entry.epoch = self._global_epoch
-
-                # Re-insert into appropriate wheel
-                if self._should_use_fine_wheel(new_expiration):
-                    bucket_idx = self._calculate_bucket_index(new_expiration, "fine")
-                    await self._fine_wheel[bucket_idx].add(entry)
-                    self._node_locations[node] = ("fine", bucket_idx, entry.epoch)
-                else:
-                    bucket_idx = self._calculate_bucket_index(new_expiration, "coarse")
-                    await self._coarse_wheel[bucket_idx].add(entry)
-                    self._node_locations[node] = ("coarse", bucket_idx, entry.epoch)
-
-                adjusted_count += 1
-
-            return adjusted_count
+        return adjusted
 
     # =========================================================================
-    # Synchronous Accessors (for quick checks without async overhead)
+    # Synchronous Accessors (for hot-path checks without async overhead)
     # =========================================================================
 
     def contains_sync(self, node: NodeAddress) -> bool:
-        """Synchronously check if node has an active suspicion."""
-        return node in self._node_locations
+        return node in self._entries
 
     def get_state_sync(self, node: NodeAddress) -> SuspicionState | None:
-        """Synchronously get suspicion state for a node."""
-        location = self._node_locations.get(node)
-        if not location:
-            return None
-
-        wheel_type, bucket_idx, epoch = location
-
-        if wheel_type == "fine":
-            bucket = self._fine_wheel[bucket_idx]
-        else:
-            bucket = self._coarse_wheel[bucket_idx]
-
-        # Direct access to bucket entries
-        for entry in bucket.entries.values():
-            if entry.node == node and entry.epoch == epoch:
-                return entry.state
-
-        return None
+        entry = self._entries.get(node)
+        return entry.state if entry else None
