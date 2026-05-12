@@ -190,6 +190,7 @@ class WorkerRegistrationHandler:
         node_id_short: str,
         add_unconfirmed_peer: callable,
         add_to_probe_scheduler: callable,
+        mark_registered: callable | None = None,
     ) -> tuple[bool, str | None]:
         """
         Process registration response from manager.
@@ -222,6 +223,7 @@ class WorkerRegistrationHandler:
                 response.healthy_managers,
                 add_unconfirmed_peer,
                 add_to_probe_scheduler,
+                mark_registered=mark_registered,
             )
 
             # Find primary manager (prefer leader)
@@ -266,6 +268,7 @@ class WorkerRegistrationHandler:
         available_cores: int,
         add_unconfirmed_peer: callable,
         add_to_probe_scheduler: callable,
+        mark_registered: callable | None = None,
     ) -> bytes:
         """
         Process registration request from a manager.
@@ -311,6 +314,7 @@ class WorkerRegistrationHandler:
                     registration.known_managers,
                     add_unconfirmed_peer,
                     add_to_probe_scheduler,
+                    mark_registered=mark_registered,
                 )
 
             # Update primary if this is the leader
@@ -325,6 +329,13 @@ class WorkerRegistrationHandler:
             if manager_udp_addr[0] and manager_udp_addr[1]:
                 await add_unconfirmed_peer(manager_udp_addr)
                 add_to_probe_scheduler(manager_udp_addr)
+                # Explicit registration handshake (manager → worker
+                # direction): the manager has just registered with us
+                # and we know about it as an authoritative cluster
+                # member. Mark it registered so SUSPECT can fire if
+                # SWIM later detects it dead.
+                if mark_registered is not None:
+                    mark_registered(manager_udp_addr)
 
             return ManagerToWorkerRegistrationAck(
                 accepted=True,
@@ -345,6 +356,7 @@ class WorkerRegistrationHandler:
         managers: list[ManagerInfo],
         add_unconfirmed_peer: callable,
         add_to_probe_scheduler: callable,
+        mark_registered: callable | None = None,
     ) -> None:
         """
         Update known managers from a list.
@@ -359,6 +371,10 @@ class WorkerRegistrationHandler:
             managers: List of ManagerInfo to add
             add_unconfirmed_peer: Async coroutine to add unconfirmed SWIM peer
             add_to_probe_scheduler: Sync function to add peer to probe scheduler
+            mark_registered: Sync function to mark a peer as registered.
+                Called only when this method is reached via an explicit
+                registration handshake completion (caller passes the
+                callback in those cases; passive observers omit it).
         """
         for manager in managers:
             self._registry.add_manager(manager.node_id, manager)
@@ -368,6 +384,8 @@ class WorkerRegistrationHandler:
                 manager_udp_addr = (manager.udp_host, manager.udp_port)
                 await add_unconfirmed_peer(manager_udp_addr)
                 add_to_probe_scheduler(manager_udp_addr)
+                if mark_registered is not None:
+                    mark_registered(manager_udp_addr)
 
             # Add to discovery service (AD-28)
             self._discovery_service.add_peer(

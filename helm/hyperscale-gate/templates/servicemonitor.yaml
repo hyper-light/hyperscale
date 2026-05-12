@@ -1,0 +1,28 @@
+{{- if .Values.observability.prometheus.serviceMonitor.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "hyperscale-gate.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "hyperscale-gate.labels" . | nindent 4 }}
+    {{- with .Values.observability.prometheus.serviceMonitor.additionalLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  # Scrapes the admin Service so that endpoints follow the Service's
+  # selector. The cluster Service exposes the same port but is reserved
+  # for cluster RPC.
+  selector:
+    matchLabels:
+      {{- include "hyperscale-gate.selectorLabels" . | nindent 6 }}
+      hyperscale.io/service-kind: admin
+  namespaceSelector:
+    matchNames:
+      - {{ .Release.Namespace }}
+  endpoints:
+    - port: metrics
+      interval: {{ .Values.observability.prometheus.serviceMonitor.interval }}
+      scrapeTimeout: {{ .Values.observability.prometheus.serviceMonitor.scrapeTimeout }}
+      honorLabels: true
+{{- end }}

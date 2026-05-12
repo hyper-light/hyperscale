@@ -360,6 +360,32 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         ] = {}  # For stale detection
         self._peer_confirmation_callbacks: list[Callable[[tuple[str, int]], None]] = []
 
+        # Peers that have completed an explicit registration handshake
+        # with this node. This is a stricter gate than ``_confirmed_peers``:
+        # passive observation (a probe-ack from a peer we've never heard
+        # of) confirms a peer in ``_confirmed_peers`` for liveness
+        # purposes, but does not register them. Only the explicit
+        # registration handshakes do:
+        #
+        #   * TCP register endpoints — ``worker_register``,
+        #     ``manager_peer_register``, ``gate_register`` (manager
+        #     side) and ``register_node`` (worker side, when a manager
+        #     registers down).
+        #   * SWIM ``join`` handshake — ``join_handler``.
+        #   * ``reset_peer_for_rejoin`` — TCP-register-driven rejoin
+        #     of an address that was previously registered.
+        #
+        # ``start_suspicion`` checks membership in this set; a peer
+        # that has not registered cannot be SUSPECTed. This prevents
+        # boot-time false-positive suspicion on peers that probes
+        # have transiently observed (e.g. a peer that probed *us*
+        # before completing its own registration), and it cleanly
+        # separates "we've seen this node alive" from "this node is
+        # an authoritative cluster member whose liveness we are
+        # responsible for". Removed on DEAD/LEAVE; re-added on
+        # explicit re-registration.
+        self._registered_peers: set[tuple[str, int]] = set()
+
         # Hierarchical detector callbacks already set in __init__
         # Debug: track port for logging
         self._hierarchical_detector._node_port = self._udp_port
@@ -779,6 +805,34 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         # Fall back to incarnation tracker for formal state
         return self._incarnation_tracker.is_node_confirmed(peer)
 
+    def register_peer(self, peer: tuple[str, int]) -> None:
+        """Mark ``peer`` as having completed a registration handshake.
+
+        Idempotent. Called from every explicit registration entry
+        point so ``start_suspicion`` can authoritatively gate on
+        "this peer is a cluster member I am responsible for". Passive
+        observation paths (probe-ack, alive gossip, suspect gossip)
+        must *not* call this — they update liveness without granting
+        registration status.
+        """
+        if peer == self._get_self_udp_addr():
+            return
+        self._registered_peers.add(peer)
+
+    def unregister_peer(self, peer: tuple[str, int]) -> None:
+        """Drop ``peer`` from the registration set.
+
+        Called when the peer is declared DEAD or has explicitly LEFT
+        the cluster; the peer must complete a fresh registration
+        handshake (TCP register or SWIM JOIN) before SUSPECT can fire
+        on them again.
+        """
+        self._registered_peers.discard(peer)
+
+    def is_peer_registered(self, peer: tuple[str, int]) -> bool:
+        """Whether ``peer`` has completed an explicit registration handshake."""
+        return peer in self._registered_peers
+
     def is_peer_unconfirmed(self, peer: tuple[str, int]) -> bool:
         """
         Check if a peer is known but unconfirmed (AD-29 compliant).
@@ -950,6 +1004,13 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         # confirmation, but pinned to the rejoin incarnation.
         await self._incarnation_tracker.confirm_node(peer, rejoin_incarnation)
         self._confirmed_peers.add(peer)
+        # The caller of ``reset_peer_for_rejoin`` is by contract a TCP
+        # registration handler processing a fresh register for this
+        # address (i.e. the new instance is going through the
+        # registration handshake). Mark the peer as registered so
+        # SUSPECT can fire once the cluster's gossip catches up; the
+        # ``_on_suspicion_expired`` path will unregister on DEAD.
+        self._registered_peers.add(peer)
 
         # Gossip an ALIVE at the rejoin incarnation so other peers
         # supersede their stale DEAD entries for this address.
@@ -2471,6 +2532,10 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         # rejoins it starts with a fresh, empty window (defaulting to
         # reliability=1.0 — the SWIM "assume healthy" baseline).
         self._peer_probe_reliability.remove_peer(node)
+        # The peer is dead; their registration is no longer valid. The
+        # rejoin path (TCP register or SWIM JOIN) will re-add them to
+        # ``_registered_peers`` when the new instance arrives.
+        self._registered_peers.discard(node)
 
         # Invoke registered callbacks (composition pattern)
         for callback in self._on_node_dead_callbacks:
@@ -4059,10 +4124,28 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         AD-29 Task 12.3.4: UNCONFIRMED → SUSPECT transitions are explicitly
         prevented by the formal state machine.
         """
-        # AD-29: Guard against suspecting unconfirmed peers
-        # Use formal state machine check which prevents UNCONFIRMED → SUSPECT
+        # Registration gate: a peer must have completed an explicit
+        # registration handshake (TCP register endpoint or SWIM JOIN)
+        # before this node may suspect them. Passive observation —
+        # for instance an inbound probe from a peer we've never been
+        # introduced to — does not promote them into a suspectable
+        # state. This eliminates the "boot-time false positive": a
+        # peer that's still completing its startup handshake cannot
+        # be SUSPECTed by transient probe-timeouts.
         import sys as _sys, time as _time
         self_addr = self._get_self_udp_addr()
+        if not self.is_peer_registered(node):
+            print(
+                f"[swim-trace] {_time.monotonic():.2f} SUSPECT-SKIP "
+                f"target={node} on={self._node_id.short} "
+                f"self_udp={self_addr} reason=not-registered",
+                file=_sys.stderr, flush=True,
+            )
+            self._metrics.increment("suspicions_skipped_unregistered")
+            return None
+
+        # AD-29: Guard against suspecting unconfirmed peers
+        # Use formal state machine check which prevents UNCONFIRMED → SUSPECT
         if not self._incarnation_tracker.can_suspect_node(node):
             print(
                 f"[swim-trace] {_time.monotonic():.2f} SUSPECT-SKIP "

@@ -1,0 +1,294 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "hyperscale-gate.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "hyperscale-gate.labels" . | nindent 4 }}
+spec:
+  # AD-52 §1 forbids PVCs. No volumeClaimTemplates here, ever.
+  serviceName: {{ include "hyperscale-gate.headlessServiceName" . }}
+  replicas: {{ .Values.replicas }}
+  podManagementPolicy: Parallel
+  # Pods may start in any order; AD-52 §4 bootstrap converges as quorum
+  # reaches the founding set, not as ordinals come up sequentially.
+  selector:
+    matchLabels:
+      {{- include "hyperscale-gate.selectorLabels" . | nindent 6 }}
+  updateStrategy:
+    type: {{ .Values.updateStrategy.type }}
+    {{- if eq .Values.updateStrategy.type "RollingUpdate" }}
+    rollingUpdate:
+      maxUnavailable: {{ .Values.updateStrategy.rollingUpdate.maxUnavailable }}
+      partition: {{ .Values.updateStrategy.rollingUpdate.partition }}
+    {{- end }}
+  template:
+    metadata:
+      labels:
+        {{- include "hyperscale-gate.labels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        # Force pod rotation when ConfigMaps the pod depends on change.
+        checksum/seeds-configmap: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "hyperscale-gate.serviceAccountName" . }}
+      {{- if .Values.priorityClassName }}
+      priorityClassName: {{ .Values.priorityClassName }}
+      {{- end }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.securityContext.pod | nindent 8 }}
+
+      # AD-52 §17 + general SOTA: control-plane pods never share a node.
+      affinity:
+        podAntiAffinity:
+          {{- if .Values.podAntiAffinity.enforceNodeSpread }}
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  {{- include "hyperscale-gate.selectorLabels" . | nindent 18 }}
+              topologyKey: kubernetes.io/hostname
+          {{- end }}
+        {{- with .Values.affinity }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+
+      # AD-52 §17 cross-zone spread: gate quorum survives a zone failure.
+      topologySpreadConstraints:
+        - maxSkew: {{ .Values.topologySpread.zoneSkew }}
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              {{- include "hyperscale-gate.selectorLabels" . | nindent 14 }}
+
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+
+      containers:
+        - name: gate
+          image: {{ include "hyperscale-gate.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext.container | nindent 12 }}
+
+          ports:
+            - name: cluster
+              containerPort: {{ .Values.listen.port }}
+              protocol: TCP
+            - name: swim
+              containerPort: {{ .Values.listen.swimPort }}
+              protocol: UDP
+            - name: metrics
+              containerPort: {{ .Values.listen.metricsPort }}
+              protocol: TCP
+
+          # AD-52 §21 flag surface. Every flag below traces to a section
+          # in AD-52; values come from the chart's values.yaml.
+          args:
+            - "--cluster-id"
+            - {{ .Values.cluster.id | quote }}
+            - "--mtls-cert"
+            - "{{ .Values.mtls.mountPath }}/{{ .Values.mtls.secret.certKey }}"
+            - "--mtls-key"
+            - "{{ .Values.mtls.mountPath }}/{{ .Values.mtls.secret.keyKey }}"
+            - "--mtls-ca"
+            - "{{ .Values.mtls.mountPath }}/{{ .Values.mtls.secret.caKey }}"
+            - "--listen-address"
+            - "{{ .Values.listen.host }}:{{ .Values.listen.port }}"
+            - "--swim-port"
+            - {{ .Values.listen.swimPort | quote }}
+            - "--datacenter-id"
+            - {{ .Values.cluster.datacenterId | quote }}
+            # Stable per-pod advertised identity via the headless DNS name.
+            # AD-52 §5: peers see the FQDN, not the (mutable) pod IP.
+            - "--advertised-address"
+            - "$(POD_NAME).{{ include "hyperscale-gate.headlessServiceFQDN" . }}:{{ .Values.listen.port }}"
+            {{- if .Values.listen.verifyAdvertisedAddress }}
+            - "--verify-advertised-address"
+            - "true"
+            {{- end }}
+            {{- if .Values.bootstrap.enabled }}
+            # AD-52 §4 cold bootstrap. Pods that aren't in the founding
+            # set fall through to JOIN automatically — AD-52 §4 explicitly
+            # specifies this behavior.
+            - "--initial-members"
+            - {{ include "hyperscale-gate.initialMembers" . | quote }}
+            - "--cluster-size"
+            - {{ .Values.cluster.size | quote }}
+            {{- end }}
+            - "--seeds"
+            - {{ include "hyperscale-gate.seeds" . | quote }}
+            # AD-52 §17 federation knob. 0 means informational only.
+            {{- if gt (int .Values.cluster.federationQuorum) 0 }}
+            - "--federation-quorum"
+            - {{ .Values.cluster.federationQuorum | quote }}
+            {{- end }}
+            # AD-52 §21 tuning surface.
+            - "--bootstrap-window"
+            - {{ .Values.tuning.bootstrapWindow | quote }}
+            - "--seed-refresh-interval"
+            - {{ .Values.tuning.seedRefreshInterval | quote }}
+            - "--learner-promote-threshold"
+            - {{ .Values.tuning.learnerPromoteThreshold | quote }}
+            - "--learner-max-lifetime"
+            - {{ .Values.tuning.learnerMaxLifetime | quote }}
+            - "--tombstone-retention"
+            - {{ .Values.tuning.tombstoneRetention | quote }}
+            - "--disconnected-mode-threshold"
+            - {{ .Values.tuning.disconnectedModeThreshold | quote }}
+            - "--snapshot-interval-entries"
+            - {{ .Values.tuning.snapshotIntervalEntries | quote }}
+            - "--max-inflight-appendentries"
+            - {{ .Values.tuning.maxInflightAppendEntries | quote }}
+            - "--max-seed-candidates"
+            - {{ .Values.tuning.maxSeedCandidates | quote }}
+            {{- if .Values.tuning.leaderLeaseEnabled }}
+            - "--leader-lease-enabled"
+            - "true"
+            {{- end }}
+
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+
+          {{- if eq .Values.probes.type "tcp" }}
+          startupProbe:
+            tcpSocket:
+              port: cluster
+            failureThreshold: {{ .Values.probes.startup.failureThreshold }}
+            periodSeconds: {{ .Values.probes.startup.periodSeconds }}
+          readinessProbe:
+            tcpSocket:
+              port: cluster
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
+          livenessProbe:
+            tcpSocket:
+              port: cluster
+            failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
+          {{- else if eq .Values.probes.type "http" }}
+          startupProbe:
+            httpGet:
+              path: {{ .Values.probes.http.readyPath }}
+              port: metrics
+            failureThreshold: {{ .Values.probes.startup.failureThreshold }}
+            periodSeconds: {{ .Values.probes.startup.periodSeconds }}
+          readinessProbe:
+            httpGet:
+              path: {{ .Values.probes.http.readyPath }}
+              port: metrics
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
+          livenessProbe:
+            httpGet:
+              path: {{ .Values.probes.http.alivePath }}
+              port: metrics
+            failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
+          {{- else }}
+          {{- fail (printf "probes.type must be 'tcp' or 'http', got %q" .Values.probes.type) }}
+          {{- end }}
+
+          lifecycle:
+            preStop:
+              {{- if eq .Values.preStop.mode "drain" }}
+              # AD-52 §13: POST /admin/drain, then wait for in-flight RPCs
+              # to settle. The Helm chart's drain endpoint will be wired
+              # once AD-52 Phase 3 ships the /admin endpoints.
+              httpGet:
+                path: {{ .Values.preStop.drainPath }}
+                port: metrics
+              {{- else }}
+              # Until /admin/drain lands, the simple sleep gives in-flight
+              # work a grace window. The process still receives SIGTERM
+              # after the sleep and the asyncio shutdown handler installed
+              # by hyperscale/commands/serve.py runs in serve()._run_server_lifecycle.
+              exec:
+                command:
+                  - "/bin/sh"
+                  - "-c"
+                  - "sleep {{ .Values.preStop.sleepSeconds }}"
+              {{- end }}
+
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+
+          volumeMounts:
+            - name: mtls
+              mountPath: {{ .Values.mtls.mountPath }}
+              readOnly: true
+            - name: wal
+              mountPath: /var/lib/hyperscale
+            - name: tmp
+              # Required because securityContext.readOnlyRootFilesystem=true
+              # blocks writes to /tmp; some libraries still write there.
+              mountPath: /tmp
+            {{- if and (eq .Values.seeds.mode "file") (gt (len .Values.seeds.fileEntries) 0) }}
+            - name: seeds
+              mountPath: /etc/hyperscale/seeds
+              readOnly: true
+            {{- end }}
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+
+      volumes:
+        - name: mtls
+          secret:
+            secretName: {{ .Values.mtls.secret.name }}
+            defaultMode: 0400
+        - name: wal
+          emptyDir:
+            {{- if eq .Values.wal.medium "memory" }}
+            medium: Memory
+            {{- end }}
+            sizeLimit: {{ .Values.wal.sizeLimit }}
+        - name: tmp
+          emptyDir:
+            sizeLimit: "64Mi"
+        {{- if and (eq .Values.seeds.mode "file") (gt (len .Values.seeds.fileEntries) 0) }}
+        - name: seeds
+          configMap:
+            name: {{ include "hyperscale-gate.seedsConfigMapName" . }}
+        {{- end }}
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}

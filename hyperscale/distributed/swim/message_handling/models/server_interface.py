@@ -56,6 +56,20 @@ class ServerInterface(Protocol):
         """Check if a peer has been confirmed."""
         ...
 
+    def register_peer(self, peer: tuple[str, int]) -> None:
+        """Mark a peer as having completed a registration handshake.
+
+        Called by explicit registration handlers (TCP register
+        endpoints, SWIM ``join_handler``) to clear the SUSPECT-gate
+        on this peer. Passive observation handlers must not call
+        this.
+        """
+        ...
+
+    def is_peer_registered(self, peer: tuple[str, int]) -> bool:
+        """Whether the peer has completed a registration handshake."""
+        ...
+
     def record_peer_role(self, peer: tuple[str, int], role: str) -> None:
         """Record a peer's role into the server's role map.
 

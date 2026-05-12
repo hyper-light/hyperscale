@@ -4318,6 +4318,10 @@ class ManagerServer(HealthAwareServer):
                 peer_udp_addr, (registration.node.tcp_host, registration.node.tcp_port)
             )
             self._probe_scheduler.add_member(peer_udp_addr)
+            # Explicit registration handshake — the peer is now an
+            # authoritative cluster member from our perspective and
+            # SUSPECT may fire on them once probes detect a failure.
+            self.register_peer(peer_udp_addr)
 
             response = ManagerPeerRegistrationResponse(
                 accepted=True,
@@ -5492,6 +5496,8 @@ class ManagerServer(HealthAwareServer):
             # Add to SWIM probing
             await self.add_unconfirmed_peer(gate_udp_addr)
             self._probe_scheduler.add_member(gate_udp_addr)
+            # Explicit registration handshake — see ``manager_peer_register``.
+            self.register_peer(gate_udp_addr)
 
             # Store negotiated capabilities
             self._manager_state.set_gate_negotiated_caps(

@@ -69,6 +69,14 @@ class ServerAdapter:
         """Check if a peer has been confirmed."""
         return self._server.is_peer_confirmed(peer)
 
+    def register_peer(self, peer: tuple[str, int]) -> None:
+        """Mark a peer as registered (explicit handshake completed)."""
+        self._server.register_peer(peer)
+
+    def is_peer_registered(self, peer: tuple[str, int]) -> bool:
+        """Whether the peer has completed a registration handshake."""
+        return self._server.is_peer_registered(peer)
+
     def record_peer_role(self, peer: tuple[str, int], role: str) -> None:
         """Record a peer's role on the underlying server."""
         self._server.record_peer_role(peer, role)

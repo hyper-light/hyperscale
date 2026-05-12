@@ -1638,6 +1638,7 @@ class WorkerServer(HealthAwareServer):
             available_cores=self._core_allocator.available_cores,
             add_unconfirmed_peer=self.add_unconfirmed_peer,
             add_to_probe_scheduler=self.add_to_probe_scheduler,
+            mark_registered=self.register_peer,
         )
 
     @tcp.handle("worker_register")
@@ -1658,6 +1659,7 @@ class WorkerServer(HealthAwareServer):
                 node_id_short=self._node_id.short,
                 add_unconfirmed_peer=self.add_unconfirmed_peer,
                 add_to_probe_scheduler=self.add_to_probe_scheduler,
+                mark_registered=self.register_peer,
             )
         )
 

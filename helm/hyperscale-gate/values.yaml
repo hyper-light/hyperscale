@@ -1,0 +1,309 @@
+# -----------------------------------------------------------------------------
+# hyperscale-gate default values.
+#
+# AD-52 §21 maps 1:1 to the cluster.* keys below. Every flag has a
+# documented source-of-truth section in AD-52; comments point at it.
+# -----------------------------------------------------------------------------
+
+# Optional name overrides. By default the release name is used.
+nameOverride: ""
+fullnameOverride: ""
+
+# Number of founding gate nodes (AD-52 §4 cluster_size). Quorum needs a
+# majority, so use an odd number ≥ 3 in production. Subsequent scale-up
+# is operator-driven via the AD-52 ResizeCluster log entry, not by simply
+# editing this value after the cluster has bootstrapped.
+replicas: 3
+
+# Container image. See docker/images/Dockerfile.gate.
+image:
+  repository: hyperscale/gate
+  tag: ""  # defaults to .Chart.AppVersion
+  pullPolicy: IfNotPresent
+  pullSecrets: []
+
+# AD-52 §3 cluster identity.
+cluster:
+  # Human-readable identifier (--cluster-id).
+  id: "hyperscale-gates"
+  # AD-52 §17 datacenter identifier. Gates default to "global".
+  datacenterId: "global"
+  # AD-52 §17. Minimum DCs that must be reachable for federation health.
+  # Informational; 0 disables the check.
+  federationQuorum: 0
+  # AD-52 §1 — workers and managers each have their own quorum size; this
+  # is the gate cluster's. Must match `replicas` at cold bootstrap.
+  size: 3
+
+# AD-52 §21 listen + advertised addresses.
+listen:
+  # Container-side bind address. 0.0.0.0 listens on all interfaces; podIP
+  # would also work and tighten the surface. AD-52 §1 makes no assumption
+  # about specific addresses.
+  host: "0.0.0.0"
+  # TCP cluster port.
+  port: 8080
+  # Legacy SWIM UDP port (until AD-52 §8 lands). Default = port + 1.
+  swimPort: 8081
+  # AD-52 §18 metrics surface. Used only if observability.prometheus is
+  # enabled below.
+  metricsPort: 9090
+  # AD-52 §21 advertised-address override. Leave empty to use the
+  # source-of-truth-is-what-worked default in AD-52 §5.
+  advertisedAddress: ""
+  verifyAdvertisedAddress: false
+
+# AD-52 §2 seed locators. The gate cluster receives both --initial-members
+# (for cold bootstrap) and --seeds (for restart-as-join). seeds.mode picks
+# how --seeds is rendered.
+#
+#   "dns"         → dns://<headless-service>.<ns>.svc.<clusterDomain>:<port>
+#                   Default for single-cluster deployments.
+#
+#   "tcp"         → tcp:// for each entry in seeds.entries.
+#                   Use when DNS isn't trustworthy or for cross-cluster
+#                   reachability with explicit external addresses.
+#
+#   "file"        → file:///etc/hyperscale/seeds, sourced from a ConfigMap
+#                   mounted at that path. Lets operators update seeds
+#                   without restarting pods (AD-52 §2: re-read on mtime).
+seeds:
+  mode: "dns"
+  entries: []
+  # Used when mode = "file". Each entry becomes one line in the mounted
+  # ConfigMap; AD-52 §2 picks up changes via mtime watch.
+  fileEntries: []
+  # Used when mode = "dns". Overrides the default headless Service FQDN
+  # if the cluster domain isn't cluster.local.
+  clusterDomain: "cluster.local"
+
+# AD-52 §4 cold-bootstrap configuration. When enabled, the StatefulSet
+# renders --initial-members from pod ordinals. The protocol's bootstrap-
+# falls-through-to-join behavior (AD-52 §4) makes it safe to keep this
+# enabled across the lifetime of the cluster — restarted pods take the
+# join path because the others are already JOINED, not BOOTSTRAPPING.
+#
+# Set to false ONLY if your operator workflow has explicit gating for
+# bootstrap vs join (e.g., a separate bootstrap Job).
+bootstrap:
+  enabled: true
+
+# AD-52 §1 — no PVCs. Raft WAL goes to emptyDir. Operator chooses the
+# medium per environment.
+#
+#   "default" → host disk; real fsync; AD-52 §16 group-commit semantics.
+#               Survives container restart within the pod's lifetime.
+#
+#   "memory"  → tmpfs; fsync is a no-op. Highest throughput. Acceptable
+#               per AD-52 §1 ("no local-disk dependencies for correctness")
+#               since restart is always a new join.
+wal:
+  medium: "default"
+  # Hard cap on WAL emptyDir size. Group commit can churn fast; oversizing
+  # is fine since the pod's lifetime bounds it.
+  sizeLimit: "2Gi"
+
+# AD-52 §21 optional knobs (durations parsed by hyperscale.distributed.env.time_parser).
+tuning:
+  bootstrapWindow: "5s"
+  seedRefreshInterval: "60s"
+  learnerPromoteThreshold: 256
+  learnerMaxLifetime: "30m"
+  tombstoneRetention: "10m"
+  disconnectedModeThreshold: "30s"
+  leaderLeaseEnabled: false
+  snapshotIntervalEntries: 10000
+  maxInflightAppendEntries: 256
+  maxSeedCandidates: 64
+
+# mTLS material per AD-52 §3.
+#
+#   source: "secret"      → mount an existing Kubernetes Secret. Operator
+#                           manages issuance and rotation externally
+#                           (Vault PKI, internal CMS, etc.).
+#
+#   source: "cert-manager" → render an Issuer reference + Certificate
+#                            that produces the Secret. cert-manager rotates;
+#                            hyperscale hot-reloads via mtime watch.
+#                            Requires cert-manager installed in the cluster.
+mtls:
+  source: "secret"
+  # When source == "secret": name of the Secret (in the release namespace)
+  # holding tls.crt, tls.key, and ca.crt. The Secret must already exist.
+  secret:
+    name: "hyperscale-gate-tls"
+    certKey: "tls.crt"
+    keyKey: "tls.key"
+    caKey: "ca.crt"
+  # When source == "cert-manager":
+  certManager:
+    issuerRef:
+      kind: "Issuer"          # or "ClusterIssuer"
+      name: "hyperscale-ca"
+    # Subject — AD-28 connection matrix expects organizationalUnit == role.
+    subject:
+      organizations:
+        - "hyperscale"
+      organizationalUnits:
+        - "gate"
+    duration: "2160h"          # 90d
+    renewBefore: "720h"        # 30d
+    # SAN list. The chart appends the pod headless DNS names automatically;
+    # add additional ones here (e.g., external NLB hostnames) if needed.
+    dnsNames: []
+    ipAddresses: []
+  # Container mount path. The serve command reads --mtls-cert/--mtls-key/
+  # --mtls-ca from these paths.
+  mountPath: "/etc/hyperscale/tls"
+
+# Pod service account. Hyperscale does NOT call the Kubernetes API
+# (AD-52 §1 forbids it); the account exists only for audit and to keep
+# the default `default` SA out of the picture.
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+# AD-52 §16 SLO-aligned probes. The chart supports both TCP probes (work
+# today) and HTTP probes (work once AD-52 §13's /ready, /alive, and
+# /admin/drain endpoints land in Phase 3).
+probes:
+  type: "tcp"
+  startup:
+    failureThreshold: 60
+    periodSeconds: 2
+  readiness:
+    failureThreshold: 3
+    periodSeconds: 5
+    timeoutSeconds: 2
+  liveness:
+    failureThreshold: 5
+    periodSeconds: 10
+    timeoutSeconds: 3
+  # Only used when type == "http".
+  http:
+    readyPath: "/ready"
+    alivePath: "/alive"
+
+# preStop hook. POST /admin/drain (AD-52 §13). Until that endpoint lands
+# in Phase 3, the chart can fall back to a graceful sleep.
+preStop:
+  mode: "sleep"      # "drain" once /admin/drain is wired
+  sleepSeconds: 30
+  drainPath: "/admin/drain"
+
+# Termination grace must accommodate drain + in-flight RPC settlement.
+terminationGracePeriodSeconds: 60
+
+# Resource requests/limits. Tune per environment. Gates carry the global
+# Raft log; CPU spikes during commit storms, memory grows with watchers
+# and ring-buffer retention (AD-52 §9). These are illustrative.
+resources:
+  requests:
+    cpu: "500m"
+    memory: "512Mi"
+  limits:
+    cpu: "2"
+    memory: "2Gi"
+
+# Pod placement. Defaults preserve quorum across zones (AD-52 §17) and
+# refuse to co-tenant control-plane pods on a single node.
+priorityClassName: "system-cluster-critical"
+
+podAntiAffinity:
+  # Hard required: no two gate pods on the same node.
+  enforceNodeSpread: true
+
+topologySpread:
+  # Across zones: spread evenly. If your cluster has only one zone this
+  # constraint is satisfied trivially.
+  zoneSkew: 1
+
+nodeSelector: {}
+tolerations: []
+affinity: {}        # operator-supplied affinity, merged with the above
+
+# Pod security. PodSecurityStandards "restricted" profile.
+securityContext:
+  pod:
+    runAsNonRoot: true
+    runAsUser: 65532
+    runAsGroup: 65532
+    fsGroup: 65532
+    seccompProfile:
+      type: "RuntimeDefault"
+  container:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    runAsNonRoot: true
+    runAsUser: 65532
+    runAsGroup: 65532
+    capabilities:
+      drop:
+        - "ALL"
+
+# Disruption budget. Gate cluster must keep majority available; this
+# is the operator-visible knob.
+podDisruptionBudget:
+  enabled: true
+  maxUnavailable: 1
+
+# AD-52 §18 metrics surface. Off by default — turn on per environment.
+observability:
+  prometheus:
+    serviceMonitor:
+      enabled: false
+      interval: "15s"
+      scrapeTimeout: "10s"
+      additionalLabels: {}
+    rules:
+      enabled: false
+      additionalLabels: {}
+
+# AD-28 NetworkPolicy. Off by default to avoid surprising operators
+# whose clusters don't have a NetworkPolicy controller; turn on for
+# production. When enabled, the rendered policy is default-deny except
+# for the AD-28 connection matrix entries below.
+networkPolicy:
+  enabled: false
+  # CIDRs / namespace selectors permitted to submit jobs to the gate
+  # data Service. Add explicit allow rules here; the chart never assumes.
+  clientIngress:
+    namespaceSelectors: []
+    ipBlocks: []
+  # Manager-cluster selectors (AD-52 §17). The chart's default selector
+  # matches pods labeled app.kubernetes.io/name=hyperscale-manager in any
+  # namespace; tighten as needed.
+  managerSelectors:
+    - matchLabels:
+        app.kubernetes.io/name: hyperscale-manager
+  # Prometheus scrape source (used only when observability.prometheus
+  # surface is enabled).
+  prometheusSelectors:
+    - matchLabels:
+        app.kubernetes.io/name: prometheus
+
+# Extra env vars propagated to the container (Env model overrides etc.).
+extraEnv: []
+# - name: HYPERSCALE_LOG_LEVEL
+#   value: "info"
+
+# Extra volumes / volume mounts. The chart already mounts:
+#   - mTLS secret at .Values.mtls.mountPath
+#   - WAL emptyDir at /var/lib/hyperscale
+#   - (conditionally) seeds ConfigMap at /etc/hyperscale/seeds
+#   - tmpfs at /tmp for read-only-rootfs compatibility
+extraVolumes: []
+extraVolumeMounts: []
+
+# Pod labels and annotations.
+podLabels: {}
+podAnnotations: {}
+
+# Update strategy. RollingUpdate with maxUnavailable=1 keeps quorum.
+# Use the partition field for canary upgrades.
+updateStrategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxUnavailable: 1
+    partition: 0

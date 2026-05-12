@@ -1,0 +1,58 @@
+{{- if eq .Values.mtls.source "cert-manager" }}
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ include "hyperscale-gate.fullname" . }}-tls
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "hyperscale-gate.labels" . | nindent 4 }}
+spec:
+  # cert-manager writes the issued material into a Secret of this name.
+  # The StatefulSet mounts it at .Values.mtls.mountPath. Hyperscale
+  # hot-reloads via mtime watch so cert rotation needs no pod restart.
+  secretName: {{ .Values.mtls.secret.name }}
+  duration: {{ .Values.mtls.certManager.duration }}
+  renewBefore: {{ .Values.mtls.certManager.renewBefore }}
+  privateKey:
+    algorithm: ECDSA
+    size: 384
+    rotationPolicy: Always
+  subject:
+    organizations:
+      {{- range .Values.mtls.certManager.subject.organizations }}
+      - {{ . | quote }}
+      {{- end }}
+    organizationalUnits:
+      # AD-28 connection matrix expects organizationalUnit == role.
+      {{- range .Values.mtls.certManager.subject.organizationalUnits }}
+      - {{ . | quote }}
+      {{- end }}
+  commonName: {{ include "hyperscale-gate.fullname" . }}
+  usages:
+    - server auth
+    - client auth
+    - key encipherment
+    - digital signature
+  # SANs include every founding pod's headless FQDN plus any
+  # operator-supplied entries (e.g., external LB hostnames).
+  dnsNames:
+    - {{ include "hyperscale-gate.headlessServiceFQDN" . }}
+    - {{ include "hyperscale-gate.adminServiceName" . }}.{{ .Release.Namespace }}.svc.{{ .Values.seeds.clusterDomain }}
+    {{- $fqdn := include "hyperscale-gate.headlessServiceFQDN" . }}
+    {{- $name := include "hyperscale-gate.fullname" . }}
+    {{- range $podOrdinal, $unused := until (int .Values.replicas) }}
+    - {{ printf "%s-%d.%s" $name $podOrdinal $fqdn }}
+    {{- end }}
+    {{- range .Values.mtls.certManager.dnsNames }}
+    - {{ . }}
+    {{- end }}
+  {{- with .Values.mtls.certManager.ipAddresses }}
+  ipAddresses:
+    {{- range . }}
+    - {{ . }}
+    {{- end }}
+  {{- end }}
+  issuerRef:
+    kind: {{ .Values.mtls.certManager.issuerRef.kind }}
+    name: {{ .Values.mtls.certManager.issuerRef.name }}
+{{- end }}

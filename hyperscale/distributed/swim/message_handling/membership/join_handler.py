@@ -138,6 +138,13 @@ class JoinHandler(BaseHandler):
 
             await self._server.confirm_peer(source_addr)
             await self._server.confirm_peer(target)
+            # JOIN is the SWIM-level registration handshake. Mark the
+            # joining peer (and the source if different — for forwarded
+            # joins the source is the propagator, but it too is a
+            # registered cluster member by definition) as registered
+            # so the ``start_suspicion`` registration gate clears.
+            self._server.register_peer(target)
+            self._server.register_peer(source_addr)
 
             rejoin_incarnation = incarnation_tracker.get_required_rejoin_incarnation(
                 target
