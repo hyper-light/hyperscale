@@ -4323,9 +4323,19 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         successful = 0
         failed = 0
 
+        # Send to *all* peers, including the target. Lifeguard §4.2's
+        # refutation flow requires the suspected node to receive the
+        # SUSPECT — it's the only node that can refute by incrementing
+        # its own incarnation and broadcasting ALIVE. Excluding the
+        # target leaves refutation dependent on indirect gossip from
+        # third parties, which in small clusters (or whenever the only
+        # other peers are themselves suspect/dead) means the target
+        # never learns it's being suspected and the bracket fires on
+        # an alive peer. Direct delivery is also strictly cheaper than
+        # waiting for the SUSPECT to propagate via random gossip.
         node_addresses = list(self._incarnation_tracker.node_states.keys())
         for node in node_addresses:
-            if node != self_addr and node != target:
+            if node != self_addr:
                 success = await self._send_broadcast_message(node, msg, timeout)
                 if success:
                     successful += 1
