@@ -1,0 +1,52 @@
+{{- if eq .Values.mtls.source "cert-manager" }}
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ include "hyperscale-manager.fullname" . }}-tls
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "hyperscale-manager.labels" . | nindent 4 }}
+spec:
+  secretName: {{ .Values.mtls.secret.name }}
+  duration: {{ .Values.mtls.certManager.duration }}
+  renewBefore: {{ .Values.mtls.certManager.renewBefore }}
+  privateKey:
+    algorithm: ECDSA
+    size: 384
+    rotationPolicy: Always
+  subject:
+    organizations:
+      {{- range .Values.mtls.certManager.subject.organizations }}
+      - {{ . | quote }}
+      {{- end }}
+    organizationalUnits:
+      {{- range .Values.mtls.certManager.subject.organizationalUnits }}
+      - {{ . | quote }}
+      {{- end }}
+  commonName: {{ include "hyperscale-manager.fullname" . }}
+  usages:
+    - server auth
+    - client auth
+    - key encipherment
+    - digital signature
+  dnsNames:
+    - {{ include "hyperscale-manager.headlessServiceFQDN" . }}
+    - {{ include "hyperscale-manager.adminServiceName" . }}.{{ .Release.Namespace }}.svc.{{ .Values.seeds.clusterDomain }}
+    {{- $fqdn := include "hyperscale-manager.headlessServiceFQDN" . }}
+    {{- $name := include "hyperscale-manager.fullname" . }}
+    {{- range $podOrdinal, $unused := until (int .Values.replicas) }}
+    - {{ printf "%s-%d.%s" $name $podOrdinal $fqdn }}
+    {{- end }}
+    {{- range .Values.mtls.certManager.dnsNames }}
+    - {{ . }}
+    {{- end }}
+  {{- with .Values.mtls.certManager.ipAddresses }}
+  ipAddresses:
+    {{- range . }}
+    - {{ . }}
+    {{- end }}
+  {{- end }}
+  issuerRef:
+    kind: {{ .Values.mtls.certManager.issuerRef.kind }}
+    name: {{ .Values.mtls.certManager.issuerRef.name }}
+{{- end }}

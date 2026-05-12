@@ -1,0 +1,48 @@
+Hyperscale manager cluster "{{ .Values.cluster.id }}" (datacenter
+"{{ .Values.cluster.datacenterId }}") has been deployed to namespace
+{{ .Release.Namespace }} with {{ .Values.replicas }} founding nodes.
+
+  cluster.id              : {{ .Values.cluster.id }}
+  cluster.datacenterId    : {{ .Values.cluster.datacenterId }}
+  cluster.size            : {{ .Values.replicas }}
+  cluster.gateSeeds       :
+{{- if gt (len .Values.cluster.gateSeeds) 0 }}
+{{- range .Values.cluster.gateSeeds }}
+      - {{ . }}
+{{- end }}
+{{- else }}
+      (none — manager cluster runs standalone, no gate tier above it)
+{{- end }}
+  listen.port             : {{ .Values.listen.port }}
+  seeds.mode              : {{ .Values.seeds.mode }}
+  mtls.source             : {{ .Values.mtls.source }}
+  wal.medium              : {{ .Values.wal.medium }}
+
+Operations:
+
+  # Watch the pods come up.
+  kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/instance={{ .Release.Name }} -w
+
+  # In-cluster connectivity:
+  Headless DNS  : {{ include "hyperscale-manager.headlessServiceFQDN" . }}
+  Admin / metrics: {{ include "hyperscale-manager.adminServiceName" . }}.{{ .Release.Namespace }}.svc.{{ .Values.seeds.clusterDomain }}:{{ .Values.listen.metricsPort }}
+
+{{- if gt (len .Values.cluster.gateSeeds) 0 }}
+
+AD-52 §17 federation: after cold bootstrap completes, the manager leader
+will call RegisterDatacenter into the gate cluster automatically. Verify
+the registration with:
+
+  kubectl -n <gate-namespace> logs <gate-pod> | grep DatacenterRegistered
+{{- end }}
+
+Next steps:
+  1. Confirm cluster bootstrap completed:
+       kubectl -n {{ .Release.Namespace }} logs <pod> | grep -E "ClusterBootstrapCompleted|ClusterMemberPromoted"
+
+  2. Deploy workers (helm/hyperscale-worker) with --manager-seeds pointing
+     at this cluster's headless Service.
+
+  3. (Optional) Enable observability (AD-52 §18):
+       --set observability.prometheus.serviceMonitor.enabled=true \
+       --set observability.prometheus.rules.enabled=true

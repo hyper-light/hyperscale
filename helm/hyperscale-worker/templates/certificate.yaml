@@ -1,0 +1,49 @@
+{{- if eq .Values.mtls.source "cert-manager" }}
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ include "hyperscale-worker.fullname" . }}-tls
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "hyperscale-worker.labels" . | nindent 4 }}
+spec:
+  secretName: {{ .Values.mtls.secret.name }}
+  duration: {{ .Values.mtls.certManager.duration }}
+  renewBefore: {{ .Values.mtls.certManager.renewBefore }}
+  privateKey:
+    algorithm: ECDSA
+    size: 384
+    rotationPolicy: Always
+  subject:
+    organizations:
+      {{- range .Values.mtls.certManager.subject.organizations }}
+      - {{ . | quote }}
+      {{- end }}
+    organizationalUnits:
+      # AD-28: workers carry organizationalUnit "worker"; manager-side
+      # validation refuses worker certs from gate cert paths.
+      {{- range .Values.mtls.certManager.subject.organizationalUnits }}
+      - {{ . | quote }}
+      {{- end }}
+  commonName: {{ include "hyperscale-worker.fullname" . }}
+  usages:
+    - client auth
+    - key encipherment
+    - digital signature
+  # Workers don't have stable DNS names (Deployment pods come and go).
+  # The cert is mostly a client cert; SANs are operator-supplied for
+  # the rare cases where workers expose anything externally (debug builds).
+  dnsNames:
+    {{- range .Values.mtls.certManager.dnsNames }}
+    - {{ . }}
+    {{- end }}
+  {{- with .Values.mtls.certManager.ipAddresses }}
+  ipAddresses:
+    {{- range . }}
+    - {{ . }}
+    {{- end }}
+  {{- end }}
+  issuerRef:
+    kind: {{ .Values.mtls.certManager.issuerRef.kind }}
+    name: {{ .Values.mtls.certManager.issuerRef.name }}
+{{- end }}

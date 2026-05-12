@@ -1,0 +1,215 @@
+# -----------------------------------------------------------------------------
+# hyperscale-worker default values.
+#
+# Workers (AD-52 §12) are ephemeral. No PVCs, no Raft, no PodDisruption-
+# Budget that protects "quorum" — they're fungible. Drain on preStop
+# yields graceful job reassignment via AD-31.
+# -----------------------------------------------------------------------------
+
+nameOverride: ""
+fullnameOverride: ""
+
+# Initial replicas. HPA / KEDA below override this once enabled.
+replicas: 1
+
+image:
+  # The default image ships with NO workload-client extras — HTTP/1.1 is
+  # in core; everything else is opt-in via HYPERSCALE_EXTRAS at build
+  # time or via FROM-extension at deploy time. See docker/images/Dockerfile.worker.
+  repository: hyperscale/worker
+  tag: ""
+  pullPolicy: IfNotPresent
+  pullSecrets: []
+
+cluster:
+  # Human-readable identifier for the worker fleet. Per AD-52 §3 this is
+  # not the worker's owner manager cluster — workers identify themselves
+  # by this id when registering, but do not form their own cluster.
+  id: "hyperscale-workers"
+  datacenterId: "default"
+  # AD-52 §12: manager seeds for this worker's owner-manager discovery.
+  # Each entry is an AD-52 §2 locator URI. Required.
+  managerSeeds: []
+  # Example (in-cluster manager Service):
+  #   - "dns://hyperscale-manager-headless.hyperscale.svc.cluster.local:8080"
+
+listen:
+  host: "0.0.0.0"
+  port: 8080
+  swimPort: 8081
+  metricsPort: 9090
+  advertisedAddress: ""
+  verifyAdvertisedAddress: false
+
+# AD-52 §21 tuning subset relevant to workers. Workers don't have
+# learners, joint consensus, or snapshot intervals (no Raft).
+tuning:
+  seedRefreshInterval: "60s"
+  disconnectedModeThreshold: "30s"
+  maxSeedCandidates: 64
+
+mtls:
+  source: "secret"
+  secret:
+    name: "hyperscale-worker-tls"
+    certKey: "tls.crt"
+    keyKey: "tls.key"
+    caKey: "ca.crt"
+  certManager:
+    issuerRef:
+      kind: "Issuer"
+      name: "hyperscale-ca"
+    subject:
+      organizations:
+        - "hyperscale"
+      organizationalUnits:
+        - "worker"
+    duration: "2160h"
+    renewBefore: "720h"
+    dnsNames: []
+    ipAddresses: []
+  mountPath: "/etc/hyperscale/tls"
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+probes:
+  type: "tcp"
+  startup:
+    failureThreshold: 30
+    periodSeconds: 2
+  readiness:
+    failureThreshold: 3
+    periodSeconds: 5
+    timeoutSeconds: 2
+  liveness:
+    failureThreshold: 5
+    periodSeconds: 10
+    timeoutSeconds: 3
+  http:
+    readyPath: "/ready"
+    alivePath: "/alive"
+
+preStop:
+  mode: "sleep"
+  # Workers may hold in-flight workflows. AD-4 makes workers the source
+  # of truth; the drain protocol yields gracefully back to managers per
+  # AD-31. terminationGracePeriodSeconds bounds the wait.
+  sleepSeconds: 60
+  drainPath: "/admin/drain"
+
+# Longer than gate/manager: workers may hold long-running workloads.
+# Operators tune this based on the maximum acceptable job runtime.
+terminationGracePeriodSeconds: 300
+
+resources:
+  requests:
+    cpu: "500m"
+    memory: "512Mi"
+  limits:
+    cpu: "4"
+    memory: "4Gi"
+
+# Workers don't preempt other workloads. system-cluster-critical is the
+# control-plane tier; workers use the operator's default class.
+priorityClassName: ""
+
+podAntiAffinity:
+  # Workers are fungible. Soft anti-affinity is enough; hard would block
+  # scale-up beyond node count.
+  enforceNodeSpread: false
+
+topologySpread:
+  zoneSkew: 2
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+securityContext:
+  pod:
+    runAsNonRoot: true
+    runAsUser: 65532
+    runAsGroup: 65532
+    fsGroup: 65532
+    seccompProfile:
+      type: "RuntimeDefault"
+  container:
+    allowPrivilegeEscalation: false
+    # Workers' FROM-extended images may need writable rootfs for some
+    # client libraries; operators can override.
+    readOnlyRootFilesystem: true
+    runAsNonRoot: true
+    runAsUser: 65532
+    runAsGroup: 65532
+    capabilities:
+      drop:
+        - "ALL"
+
+# Workers are fungible; maxUnavailable can be a percentage of the fleet
+# rather than the "preserve quorum" semantic of the control plane.
+podDisruptionBudget:
+  enabled: true
+  maxUnavailable: "25%"
+
+# HPA — CPU-driven by default. Custom metrics require prometheus-adapter
+# or KEDA (see scaledObject below).
+autoscaling:
+  hpa:
+    enabled: false
+    minReplicas: 1
+    maxReplicas: 100
+    metrics:
+      cpu:
+        enabled: true
+        targetAverageUtilization: 70
+      memory:
+        enabled: false
+        targetAverageUtilization: 80
+    behavior: {}
+  # KEDA ScaledObject. Optional; chart renders only the object — the KEDA
+  # controller must be installed cluster-wide. Use this for queue-depth
+  # driven scaling against manager metrics, scale-to-zero, etc.
+  keda:
+    enabled: false
+    minReplicaCount: 1
+    maxReplicaCount: 100
+    pollingInterval: 15
+    cooldownPeriod: 300
+    triggers: []
+
+observability:
+  prometheus:
+    serviceMonitor:
+      enabled: false
+      interval: "15s"
+      scrapeTimeout: "10s"
+      additionalLabels: {}
+
+networkPolicy:
+  enabled: false
+  # Workers connect only to managers per AD-28. The chart's default
+  # selector matches pods labeled app.kubernetes.io/name=hyperscale-manager.
+  managerSelectors:
+    - matchLabels:
+        app.kubernetes.io/name: hyperscale-manager
+  prometheusSelectors:
+    - matchLabels:
+        app.kubernetes.io/name: prometheus
+
+extraEnv: []
+extraVolumes: []
+extraVolumeMounts: []
+
+podLabels: {}
+podAnnotations: {}
+
+# RollingUpdate works for Deployments without any quorum considerations.
+# maxSurge > 0 lets HPA scale-up overlap with rollouts.
+updateStrategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxSurge: "25%"
+    maxUnavailable: "25%"

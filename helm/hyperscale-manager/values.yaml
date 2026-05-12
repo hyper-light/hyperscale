@@ -1,0 +1,198 @@
+# -----------------------------------------------------------------------------
+# hyperscale-manager default values.
+#
+# Mirror of hyperscale-gate with role-specific differences:
+#   - cluster.gateSeeds (AD-52 §17 federation; managers register with gates)
+#   - cluster.datacenterId (real DC identifier, not "global")
+#   - networkPolicy.workerSelectors (AD-28: managers ↔ workers)
+# -----------------------------------------------------------------------------
+
+nameOverride: ""
+fullnameOverride: ""
+
+# Number of founding manager nodes (AD-52 §4 cluster_size). Use an odd
+# number ≥ 3 in production. Per-DC Raft groups are typically 3-5.
+replicas: 3
+
+image:
+  repository: hyperscale/manager
+  tag: ""
+  pullPolicy: IfNotPresent
+  pullSecrets: []
+
+# AD-52 §3 cluster identity. Managers carry a DC-scoped identifier; the
+# datacenterId is what gates use to address this cluster via AD-52 §17.
+cluster:
+  id: "hyperscale-managers"
+  datacenterId: "default"
+  size: 3
+  # AD-52 §17: gate seeds for federation. Each entry is an AD-52 §2
+  # locator URI. Leave empty for single-cluster deployments without
+  # a gate tier.
+  gateSeeds: []
+  # Example (in-cluster gate Service):
+  #   - "dns://hyperscale-gate-headless.hyperscale.svc.cluster.local:8080"
+
+listen:
+  host: "0.0.0.0"
+  port: 8080
+  swimPort: 8081
+  metricsPort: 9090
+  advertisedAddress: ""
+  verifyAdvertisedAddress: false
+
+seeds:
+  mode: "dns"
+  entries: []
+  fileEntries: []
+  clusterDomain: "cluster.local"
+
+bootstrap:
+  enabled: true
+
+wal:
+  medium: "default"
+  sizeLimit: "2Gi"
+
+tuning:
+  bootstrapWindow: "5s"
+  seedRefreshInterval: "60s"
+  learnerPromoteThreshold: 256
+  learnerMaxLifetime: "30m"
+  tombstoneRetention: "10m"
+  disconnectedModeThreshold: "30s"
+  leaderLeaseEnabled: false
+  snapshotIntervalEntries: 10000
+  maxInflightAppendEntries: 256
+  maxSeedCandidates: 64
+
+mtls:
+  source: "secret"
+  secret:
+    name: "hyperscale-manager-tls"
+    certKey: "tls.crt"
+    keyKey: "tls.key"
+    caKey: "ca.crt"
+  certManager:
+    issuerRef:
+      kind: "Issuer"
+      name: "hyperscale-ca"
+    subject:
+      organizations:
+        - "hyperscale"
+      organizationalUnits:
+        - "manager"
+    duration: "2160h"
+    renewBefore: "720h"
+    dnsNames: []
+    ipAddresses: []
+  mountPath: "/etc/hyperscale/tls"
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+probes:
+  type: "tcp"
+  startup:
+    failureThreshold: 60
+    periodSeconds: 2
+  readiness:
+    failureThreshold: 3
+    periodSeconds: 5
+    timeoutSeconds: 2
+  liveness:
+    failureThreshold: 5
+    periodSeconds: 10
+    timeoutSeconds: 3
+  http:
+    readyPath: "/ready"
+    alivePath: "/alive"
+
+preStop:
+  mode: "sleep"
+  sleepSeconds: 30
+  drainPath: "/admin/drain"
+
+terminationGracePeriodSeconds: 60
+
+resources:
+  requests:
+    cpu: "500m"
+    memory: "512Mi"
+  limits:
+    cpu: "2"
+    memory: "2Gi"
+
+priorityClassName: "system-cluster-critical"
+
+podAntiAffinity:
+  enforceNodeSpread: true
+
+topologySpread:
+  zoneSkew: 1
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+securityContext:
+  pod:
+    runAsNonRoot: true
+    runAsUser: 65532
+    runAsGroup: 65532
+    fsGroup: 65532
+    seccompProfile:
+      type: "RuntimeDefault"
+  container:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    runAsNonRoot: true
+    runAsUser: 65532
+    runAsGroup: 65532
+    capabilities:
+      drop:
+        - "ALL"
+
+podDisruptionBudget:
+  enabled: true
+  maxUnavailable: 1
+
+observability:
+  prometheus:
+    serviceMonitor:
+      enabled: false
+      interval: "15s"
+      scrapeTimeout: "10s"
+      additionalLabels: {}
+    rules:
+      enabled: false
+      additionalLabels: {}
+
+networkPolicy:
+  enabled: false
+  # Gate selectors (AD-52 §17 federation — gates dispatch jobs to managers).
+  gateSelectors:
+    - matchLabels:
+        app.kubernetes.io/name: hyperscale-gate
+  # Worker selectors (AD-52 §12 — workers register with their owner manager).
+  workerSelectors:
+    - matchLabels:
+        app.kubernetes.io/name: hyperscale-worker
+  prometheusSelectors:
+    - matchLabels:
+        app.kubernetes.io/name: prometheus
+
+extraEnv: []
+extraVolumes: []
+extraVolumeMounts: []
+
+podLabels: {}
+podAnnotations: {}
+
+updateStrategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxUnavailable: 1
+    partition: 0

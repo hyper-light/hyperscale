@@ -1,0 +1,36 @@
+apiVersion: v2
+name: hyperscale-worker
+description: |
+  Hyperscale worker fleet — AD-52 §12 data plane.
+
+  Deploys a Deployment of worker nodes that register with their owner
+  manager per AD-52 §12 (not in any Raft group). Workers are ephemeral
+  and high-churn; the chart wires HPA (and optional KEDA) for autoscaling.
+
+  Workers are the source of truth for their in-flight workflows (AD-4).
+  Drain on preStop yields graceful job reassignment via AD-31.
+
+  Designed to FROM-extend the published hyperscale/worker image with
+  workload-specific clients (grpc, gql, http3, sql, kafka, …) and
+  external reporters (datadog, prometheus, statsd, …) — see
+  docker/images/Dockerfile.worker.
+type: application
+version: 0.1.0
+appVersion: "0.7.2"
+kubeVersion: ">=1.27.0-0"
+keywords:
+  - hyperscale
+  - load-testing
+  - distributed
+  - data-plane
+home: https://github.com/hyper-light/hyperscale
+sources:
+  - https://github.com/hyper-light/hyperscale
+maintainers:
+  - name: Hyperscale Maintainers
+    url: https://github.com/hyper-light/hyperscale
+annotations:
+  artifacthub.io/changes: |
+    - kind: added
+      description: Initial AD-52 chart.
+  artifacthub.io/license: MIT

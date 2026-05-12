@@ -1,0 +1,51 @@
+Hyperscale worker fleet "{{ .Values.cluster.id }}" (datacenter
+"{{ .Values.cluster.datacenterId }}") has been deployed to namespace
+{{ .Release.Namespace }} with {{ .Values.replicas }} initial replicas.
+
+  cluster.id              : {{ .Values.cluster.id }}
+  cluster.datacenterId    : {{ .Values.cluster.datacenterId }}
+  cluster.managerSeeds    :
+{{- range .Values.cluster.managerSeeds }}
+      - {{ . }}
+{{- end }}
+  image                   : {{ include "hyperscale-worker.image" . }}
+  hpa.enabled             : {{ .Values.autoscaling.hpa.enabled }}
+  keda.enabled            : {{ .Values.autoscaling.keda.enabled }}
+
+Operations:
+
+  # Watch workers register with their owner managers.
+  kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/instance={{ .Release.Name }} -w
+
+  # Verify registration on the manager side:
+  kubectl -n <manager-namespace> logs <manager-pod> | grep WorkerStateUpdate
+
+Image extension:
+
+The default hyperscale/worker image ships HTTP/1.1 in core but no
+additional workload clients. Extend it for your workload:
+
+  FROM {{ include "hyperscale-worker.image" . }}
+  USER root
+  RUN apt-get update && apt-get install -y --no-install-recommends \
+          libpq5 && rm -rf /var/lib/apt/lists/*
+  USER hyperscale
+  RUN /opt/hyperscale/.venv/bin/uv pip install --no-deps \
+      psycopg2-binary asyncpg my-internal-reporter
+
+Then set image.repository to your extended image.
+
+{{- if .Values.autoscaling.hpa.enabled }}
+
+HPA active: scaling between {{ .Values.autoscaling.hpa.minReplicas }} and
+{{ .Values.autoscaling.hpa.maxReplicas }} replicas based on CPU utilization
+target {{ .Values.autoscaling.hpa.metrics.cpu.targetAverageUtilization }}%.
+{{- end }}
+
+{{- if .Values.autoscaling.keda.enabled }}
+
+KEDA ScaledObject active: scaling between {{ .Values.autoscaling.keda.minReplicaCount }}
+and {{ .Values.autoscaling.keda.maxReplicaCount }} replicas. Verify with:
+
+  kubectl -n {{ .Release.Namespace }} get scaledobject {{ include "hyperscale-worker.fullname" . }}
+{{- end }}

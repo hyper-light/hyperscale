@@ -1,0 +1,246 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "hyperscale-worker.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "hyperscale-worker.labels" . | nindent 4 }}
+spec:
+  {{- if not (or .Values.autoscaling.hpa.enabled .Values.autoscaling.keda.enabled) }}
+  # When HPA / KEDA is enabled, leave replicas unset so the controller owns it.
+  replicas: {{ .Values.replicas }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "hyperscale-worker.selectorLabels" . | nindent 6 }}
+  strategy:
+    type: {{ .Values.updateStrategy.type }}
+    {{- if eq .Values.updateStrategy.type "RollingUpdate" }}
+    rollingUpdate:
+      maxSurge: {{ .Values.updateStrategy.rollingUpdate.maxSurge }}
+      maxUnavailable: {{ .Values.updateStrategy.rollingUpdate.maxUnavailable }}
+    {{- end }}
+  template:
+    metadata:
+      labels:
+        {{- include "hyperscale-worker.labels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "hyperscale-worker.serviceAccountName" . }}
+      {{- if .Values.priorityClassName }}
+      priorityClassName: {{ .Values.priorityClassName }}
+      {{- end }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.securityContext.pod | nindent 8 }}
+
+      {{- if or .Values.podAntiAffinity.enforceNodeSpread .Values.affinity }}
+      affinity:
+        {{- if .Values.podAntiAffinity.enforceNodeSpread }}
+        podAntiAffinity:
+          # Soft anti-affinity: workers are fungible (AD-52 §12) and HPA
+          # may scale beyond node count.
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    {{- include "hyperscale-worker.selectorLabels" . | nindent 20 }}
+                topologyKey: kubernetes.io/hostname
+        {{- end }}
+        {{- with .Values.affinity }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- end }}
+
+      topologySpreadConstraints:
+        - maxSkew: {{ .Values.topologySpread.zoneSkew }}
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              {{- include "hyperscale-worker.selectorLabels" . | nindent 14 }}
+
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+
+      containers:
+        - name: worker
+          image: {{ include "hyperscale-worker.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext.container | nindent 12 }}
+
+          ports:
+            - name: cluster
+              containerPort: {{ .Values.listen.port }}
+              protocol: TCP
+            - name: swim
+              containerPort: {{ .Values.listen.swimPort }}
+              protocol: UDP
+            - name: metrics
+              containerPort: {{ .Values.listen.metricsPort }}
+              protocol: TCP
+
+          args:
+            - "--cluster-id"
+            - {{ .Values.cluster.id | quote }}
+            - "--mtls-cert"
+            - "{{ .Values.mtls.mountPath }}/{{ .Values.mtls.secret.certKey }}"
+            - "--mtls-key"
+            - "{{ .Values.mtls.mountPath }}/{{ .Values.mtls.secret.keyKey }}"
+            - "--mtls-ca"
+            - "{{ .Values.mtls.mountPath }}/{{ .Values.mtls.secret.caKey }}"
+            - "--listen-address"
+            - "{{ .Values.listen.host }}:{{ .Values.listen.port }}"
+            - "--swim-port"
+            - {{ .Values.listen.swimPort | quote }}
+            - "--datacenter-id"
+            - {{ .Values.cluster.datacenterId | quote }}
+            # AD-52 §12 worker registration requires --manager-seeds.
+            # The helper fails the install if no seeds are configured.
+            - "--manager-seeds"
+            - {{ include "hyperscale-worker.managerSeeds" . | quote }}
+            # Workers' advertised address: pod IP is stable for the
+            # lifetime of the pod, and a worker that disappears is just
+            # re-registered as a new node_id per AD-52 §3.
+            - "--advertised-address"
+            - "$(POD_IP):{{ .Values.listen.port }}"
+            {{- if .Values.listen.verifyAdvertisedAddress }}
+            - "--verify-advertised-address"
+            - "true"
+            {{- end }}
+            - "--seed-refresh-interval"
+            - {{ .Values.tuning.seedRefreshInterval | quote }}
+            - "--disconnected-mode-threshold"
+            - {{ .Values.tuning.disconnectedModeThreshold | quote }}
+            - "--max-seed-candidates"
+            - {{ .Values.tuning.maxSeedCandidates | quote }}
+
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+
+          {{- if eq .Values.probes.type "tcp" }}
+          startupProbe:
+            tcpSocket:
+              port: cluster
+            failureThreshold: {{ .Values.probes.startup.failureThreshold }}
+            periodSeconds: {{ .Values.probes.startup.periodSeconds }}
+          readinessProbe:
+            tcpSocket:
+              port: cluster
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
+          livenessProbe:
+            tcpSocket:
+              port: cluster
+            failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
+          {{- else if eq .Values.probes.type "http" }}
+          startupProbe:
+            httpGet:
+              path: {{ .Values.probes.http.readyPath }}
+              port: metrics
+            failureThreshold: {{ .Values.probes.startup.failureThreshold }}
+            periodSeconds: {{ .Values.probes.startup.periodSeconds }}
+          readinessProbe:
+            httpGet:
+              path: {{ .Values.probes.http.readyPath }}
+              port: metrics
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
+          livenessProbe:
+            httpGet:
+              path: {{ .Values.probes.http.alivePath }}
+              port: metrics
+            failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
+          {{- else }}
+          {{- fail (printf "probes.type must be 'tcp' or 'http', got %q" .Values.probes.type) }}
+          {{- end }}
+
+          lifecycle:
+            preStop:
+              {{- if eq .Values.preStop.mode "drain" }}
+              httpGet:
+                path: {{ .Values.preStop.drainPath }}
+                port: metrics
+              {{- else }}
+              exec:
+                command:
+                  - "/bin/sh"
+                  - "-c"
+                  - "sleep {{ .Values.preStop.sleepSeconds }}"
+              {{- end }}
+
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+
+          volumeMounts:
+            - name: mtls
+              mountPath: {{ .Values.mtls.mountPath }}
+              readOnly: true
+            - name: workdir
+              # Workers may need writable scratch for in-flight workflow
+              # state (cloudpickle, large fixtures). AD-52 §1 still
+              # forbids PVCs; emptyDir suffices since workers never have
+              # restart durability requirements.
+              mountPath: /var/lib/hyperscale
+            - name: tmp
+              mountPath: /tmp
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+
+      volumes:
+        - name: mtls
+          secret:
+            secretName: {{ .Values.mtls.secret.name }}
+            defaultMode: 0400
+        - name: workdir
+          emptyDir:
+            sizeLimit: "8Gi"
+        - name: tmp
+          emptyDir:
+            sizeLimit: "256Mi"
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}

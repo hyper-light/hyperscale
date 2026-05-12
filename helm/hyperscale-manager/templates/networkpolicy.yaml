@@ -1,0 +1,123 @@
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "hyperscale-manager.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "hyperscale-manager.labels" . | nindent 4 }}
+spec:
+  # AD-28 connection matrix from the manager's side.
+  podSelector:
+    matchLabels:
+      {{- include "hyperscale-manager.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+
+  ingress:
+    # Manager ↔ Manager (peer cluster RPC, SWIM).
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "hyperscale-manager.selectorLabels" . | nindent 14 }}
+      ports:
+        - port: cluster
+          protocol: TCP
+        - port: swim
+          protocol: UDP
+
+    # Gate → Manager (AD-52 §17 federation; job dispatch).
+    {{- with .Values.networkPolicy.gateSelectors }}
+    - from:
+        {{- range . }}
+        - podSelector:
+            {{- toYaml . | nindent 12 }}
+        {{- end }}
+      ports:
+        - port: cluster
+          protocol: TCP
+        - port: swim
+          protocol: UDP
+    {{- end }}
+
+    # Worker → Manager (AD-52 §12: worker registration, heartbeats,
+    # status reports).
+    {{- with .Values.networkPolicy.workerSelectors }}
+    - from:
+        {{- range . }}
+        - podSelector:
+            {{- toYaml . | nindent 12 }}
+        {{- end }}
+      ports:
+        - port: cluster
+          protocol: TCP
+        - port: swim
+          protocol: UDP
+    {{- end }}
+
+    # Prometheus → Manager (metrics scrape).
+    {{- if and .Values.observability.prometheus.serviceMonitor.enabled (gt (len .Values.networkPolicy.prometheusSelectors) 0) }}
+    - from:
+        {{- range .Values.networkPolicy.prometheusSelectors }}
+        - podSelector:
+            {{- toYaml . | nindent 12 }}
+        {{- end }}
+      ports:
+        - port: metrics
+          protocol: TCP
+    {{- end }}
+
+  egress:
+    # Manager ↔ Manager.
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "hyperscale-manager.selectorLabels" . | nindent 14 }}
+      ports:
+        - port: {{ .Values.listen.port }}
+          protocol: TCP
+        - port: {{ .Values.listen.swimPort }}
+          protocol: UDP
+
+    # Manager → Gate (AD-52 §17 federation: RegisterDatacenter,
+    # heartbeats back to gates).
+    {{- with .Values.networkPolicy.gateSelectors }}
+    - to:
+        {{- range . }}
+        - podSelector:
+            {{- toYaml . | nindent 12 }}
+        {{- end }}
+      ports:
+        - port: {{ .Values.listen.port }}
+          protocol: TCP
+        - port: {{ .Values.listen.swimPort }}
+          protocol: UDP
+    {{- end }}
+
+    # Manager → Worker (AD-52 §12: dispatch).
+    {{- with .Values.networkPolicy.workerSelectors }}
+    - to:
+        {{- range . }}
+        - podSelector:
+            {{- toYaml . | nindent 12 }}
+        {{- end }}
+      ports:
+        - port: {{ .Values.listen.port }}
+          protocol: TCP
+        - port: {{ .Values.listen.swimPort }}
+          protocol: UDP
+    {{- end }}
+
+    # DNS resolution.
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+{{- end }}

@@ -1,0 +1,22 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "hyperscale-manager.headlessServiceName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "hyperscale-manager.labels" . | nindent 4 }}
+    hyperscale.io/service-kind: headless
+spec:
+  publishNotReadyAddresses: true
+  clusterIP: None
+  selector:
+    {{- include "hyperscale-manager.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: cluster
+      port: {{ .Values.listen.port }}
+      targetPort: cluster
+      protocol: TCP
+    - name: swim
+      port: {{ .Values.listen.swimPort }}
+      targetPort: swim
+      protocol: UDP

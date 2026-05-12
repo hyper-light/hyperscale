@@ -1,0 +1,17 @@
+{{- if .Values.podDisruptionBudget.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "hyperscale-worker.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "hyperscale-worker.labels" . | nindent 4 }}
+spec:
+  # Workers are fungible (AD-52 §12). The PDB protects against voluntary
+  # disruptions taking out too much of the fleet at once; it doesn't
+  # protect a Raft quorum (workers aren't in Raft).
+  maxUnavailable: {{ .Values.podDisruptionBudget.maxUnavailable }}
+  selector:
+    matchLabels:
+      {{- include "hyperscale-worker.selectorLabels" . | nindent 6 }}
+{{- end }}

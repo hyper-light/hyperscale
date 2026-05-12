@@ -1,0 +1,37 @@
+apiVersion: v2
+name: hyperscale-manager
+description: |
+  Hyperscale manager cluster — AD-52 per-DC control plane (regional Raft).
+
+  Deploys a StatefulSet of manager nodes that form a single per-DC Raft
+  group via the AD-52 §4 bootstrap protocol and the AD-52 §5 join
+  protocol. Managers orchestrate workflow execution within a datacenter:
+  receive jobs from gates, dispatch to workers, aggregate status, and
+  participate in AD-31 job leadership.
+
+  On bootstrap completion the manager leader calls RegisterDatacenter
+  into the gate cluster per AD-52 §17. Workers register with their owner
+  manager via AD-52 §12 (not in any Raft group).
+
+  Requires no PVCs (AD-52 §1). Mounts mTLS material from a Secret.
+type: application
+version: 0.1.0
+appVersion: "0.7.2"
+kubeVersion: ">=1.27.0-0"
+keywords:
+  - hyperscale
+  - load-testing
+  - distributed
+  - raft
+  - control-plane
+home: https://github.com/hyper-light/hyperscale
+sources:
+  - https://github.com/hyper-light/hyperscale
+maintainers:
+  - name: Hyperscale Maintainers
+    url: https://github.com/hyper-light/hyperscale
+annotations:
+  artifacthub.io/changes: |
+    - kind: added
+      description: Initial AD-52 chart.
+  artifacthub.io/license: MIT

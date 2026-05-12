@@ -1,0 +1,70 @@
+{{- if .Values.observability.prometheus.rules.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "hyperscale-manager.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "hyperscale-manager.labels" . | nindent 4 }}
+    {{- with .Values.observability.prometheus.rules.additionalLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    - name: hyperscale-manager.cluster
+      rules:
+        - alert: HyperscaleManagerLeaderMissing
+          expr: |
+            absent(cluster_raft_term{cluster=~"{{ .Values.cluster.id }}"}) == 1
+            or
+            (max by (cluster) (cluster_raft_term{cluster=~"{{ .Values.cluster.id }}"})
+              - min by (cluster) (cluster_raft_term{cluster=~"{{ .Values.cluster.id }}"})) > 2
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Manager cluster {{ "{{ $labels.cluster }}" }} has no stable leader"
+
+        - alert: HyperscaleManagerMembershipChangeLatencyHigh
+          expr: |
+            histogram_quantile(0.99,
+              sum by (cluster, le) (
+                rate(cluster_membership_change_latency_seconds_bucket{cluster=~"{{ .Values.cluster.id }}"}[5m])
+              )
+            ) > 0.05
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Manager cluster {{ "{{ $labels.cluster }}" }} p99 membership-change latency over 50ms"
+
+        - alert: HyperscaleManagerDisconnectedMode
+          expr: |
+            max by (cluster, node_id) (cluster_disconnected_mode_active{cluster=~"{{ .Values.cluster.id }}"}) == 1
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Manager {{ "{{ $labels.node_id }}" }} in disconnected mode > 5m"
+
+        - alert: HyperscaleManagerRaftCommitLagging
+          expr: |
+            max by (cluster, follower_id) (cluster_raft_apply_lag_entries{cluster=~"{{ .Values.cluster.id }}"}) > 5000
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Manager follower {{ "{{ $labels.follower_id }}" }} apply-lag > 5000 entries"
+
+        - alert: HyperscaleManagerGateRegistrationFailing
+          # AD-52 §17: manager leader must successfully RegisterDatacenter
+          # with the gate cluster. Repeated failures suggest network or
+          # cert issues between this DC and the gate tier.
+          expr: |
+            increase(cluster_join_attempt_total{cluster=~"{{ .Values.cluster.id }}",outcome!~"success"}[10m]) > 5
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Manager cluster {{ "{{ $labels.cluster }}" }} failing to register with gates"
+{{- end }}
