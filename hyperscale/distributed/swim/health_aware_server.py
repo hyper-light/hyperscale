@@ -253,6 +253,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         # reliability composition).
         self._hierarchical_detector = HierarchicalFailureDetector(
             on_global_death=self._on_suspicion_expired,
+            on_global_death_sync=self._record_global_death_sync,
             on_error=self._on_hierarchical_detector_error,
             get_n_members=self._get_member_count,
             get_lhm_multiplier=self._get_lhm_multiplier,
@@ -879,12 +880,82 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
 
         Use when a peer is intentionally removed from the cluster.
         Also removes from incarnation tracker state machine.
+
+        For the "address re-use by a new instance" case (e.g. a worker
+        restarts and re-registers at the same UDP address) call
+        :meth:`reset_peer_for_rejoin` instead — that variant promotes
+        the tracker entry to OK at a *higher* incarnation than the
+        dead predecessor, so any stale DEAD gossip still in flight is
+        rejected by the freshness check rather than re-marking the
+        new instance as dead.
         """
         self._confirmed_peers.discard(peer)
         self._unconfirmed_peers.discard(peer)
         self._unconfirmed_peer_added_at.pop(peer, None)
         # AD-29: Also remove from formal state machine
         await self._incarnation_tracker.remove_node(peer)
+
+    async def reset_peer_for_rejoin(self, peer: tuple[str, int]) -> int:
+        """Reset SWIM state for ``peer`` so a brand-new instance can join.
+
+        Called when an out-of-band signal (e.g. ``worker_register``
+        over TCP) tells us the process at ``peer`` is a new instance
+        rather than the predecessor we had been tracking. The reset
+        wipes every per-peer cache that would short-circuit fresh
+        SWIM engagement (``_confirmed_peers`` membership, active
+        suspicion bracket, ``globally_dead`` marker, adaptive
+        extension tracker, probe-reliability history, death record)
+        and seeds the incarnation tracker with a fresh ``OK`` entry
+        at the predecessor's documented rejoin threshold
+        (``death_incarnation + minimum_rejoin_incarnation_bump``).
+        Returns the rejoin incarnation so the caller can gossip an
+        ALIVE for it — without that gossip, peers that still hold the
+        dead predecessor's entry will keep treating the address as
+        dead.
+
+        Picking the rejoin threshold (not just ``previous + 1``) is
+        load-bearing for stale-gossip resistance: any in-flight DEAD
+        update propagating at the zombie-bound incarnation would
+        otherwise beat a smaller bump and re-mark the new instance
+        as DEAD. Clearing the death record alongside is the
+        symmetric step — it keeps the zombie check from later
+        flagging the new instance's own gossip if its self-incarnation
+        happens to fall below the threshold (e.g. fresh-state restart
+        with no persisted incarnation).
+        """
+        rejoin_incarnation = max(
+            1,
+            self._incarnation_tracker.get_required_rejoin_incarnation(peer),
+        )
+
+        self._confirmed_peers.discard(peer)
+        self._unconfirmed_peers.discard(peer)
+        self._unconfirmed_peer_added_at.pop(peer, None)
+        await self._incarnation_tracker.remove_node(peer)
+        self._incarnation_tracker.clear_death_record(peer)
+        self._peer_probe_reliability.remove_peer(peer)
+        if self._hierarchical_detector is not None:
+            # Clear any active suspicion bracket and ``globally_dead``
+            # marker; both would survive ``remove_node`` and short-
+            # circuit the new instance's SWIM engagement.
+            await self._hierarchical_detector.refute_global(
+                peer, incarnation=rejoin_incarnation
+            )
+            await self._hierarchical_detector.clear_global_death(peer)
+            self._hierarchical_detector.remove_extension_tracker(peer)
+
+        # Re-seat at the bumped incarnation. ``confirm_node`` creates
+        # a fresh ``OK`` entry because ``remove_node`` left the slot
+        # empty — same code path as a brand-new peer's first
+        # confirmation, but pinned to the rejoin incarnation.
+        await self._incarnation_tracker.confirm_node(peer, rejoin_incarnation)
+        self._confirmed_peers.add(peer)
+
+        # Gossip an ALIVE at the rejoin incarnation so other peers
+        # supersede their stale DEAD entries for this address.
+        self.queue_gossip_update("alive", peer, rejoin_incarnation)
+
+        return rejoin_incarnation
 
     # =========================================================================
     # Hierarchical Failure Detection
@@ -926,6 +997,11 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         self._hierarchical_detector = HierarchicalFailureDetector(
             config=config,
             on_global_death=on_global_death,
+            # Synchronous death record happens BEFORE the async DEAD
+            # callback drains, so a concurrent ``reset_peer_for_rejoin``
+            # can read the right rejoin threshold rather than defaulting
+            # to ``1`` and getting overwritten by the queued async fire.
+            on_global_death_sync=self._record_global_death_sync,
             on_job_death=on_job_death,
             on_error=self._on_hierarchical_detector_error,
             get_n_members=self._get_member_count,
@@ -938,6 +1014,25 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             ),
         )
         return self._hierarchical_detector
+
+    def _record_global_death_sync(
+        self, node: tuple[str, int], incarnation: int
+    ) -> None:
+        """Synchronous death-event hook for HFD wheel expirations.
+
+        Records the death in the incarnation tracker the moment the
+        wheel fires, before the async ``_on_suspicion_expired``
+        callback drains. The recording is what
+        ``get_required_rejoin_incarnation`` reads, so any concurrent
+        rejoin (e.g. TCP worker_register handler running while the
+        async fire is queued) sees the correct ``death_incarnation +
+        minimum_rejoin_incarnation_bump`` threshold rather than the
+        default-zero fallback that lets a stale async fire overwrite
+        the freshly-installed OK entry.
+        """
+        self._incarnation_tracker.record_node_death(
+            node, incarnation, time.monotonic()
+        )
 
     async def start_hierarchical_detector(self) -> None:
         """Start the hierarchical failure detector if initialized."""
@@ -2314,9 +2409,44 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
     async def _on_suspicion_expired(
         self, node: tuple[str, int], incarnation: int
     ) -> None:
-        """Callback when a suspicion expires - mark node as DEAD."""
+        """Callback when a suspicion expires - mark node as DEAD.
+
+        Wheel expirations are dispatched via the TaskRunner and may
+        execute with arbitrary lag after the wheel's ``call_later``
+        fires (the TaskRunner queue can backlog under contention).
+        During that window the tracker entry for ``node`` may have
+        been replaced — most commonly by ``reset_peer_for_rejoin``
+        when a new instance registers at the same address. In that
+        case the suspicion expiry is for the *predecessor* and must
+        not flow into the post-DEAD pipeline (gossip, probe-scheduler
+        refresh, ``_on_node_dead_callbacks``). The freshness check on
+        ``update_node`` rejects the DEAD write when the tracker
+        carries a higher incarnation; we gate every downstream side
+        effect on that result so the new instance is not
+        re-unregistered by a stale fire.
+        """
         import sys as _sys, time as _time
         self_addr = self._get_self_udp_addr()
+        now = time.monotonic()
+        applied = await self._incarnation_tracker.update_node(
+            node,
+            b"DEAD",
+            incarnation,
+            now,
+        )
+        if not applied:
+            # Stale wheel-expiration: the tracker has already moved
+            # past this incarnation (e.g. via rejoin). Discard the
+            # entire post-DEAD pipeline.
+            print(
+                f"[swim-trace] {_time.monotonic():.2f} DEAD-STALE node={node} "
+                f"on={self._node_id.short} self_udp={self_addr} "
+                f"stale_inc={incarnation}",
+                file=_sys.stderr, flush=True,
+            )
+            self._metrics.increment("suspicions_expired_stale")
+            return
+
         print(
             f"[swim-trace] {_time.monotonic():.2f} DEAD node={node} "
             f"on={self._node_id.short} self_udp={self_addr}",
@@ -2328,14 +2458,9 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             node=node,
             incarnation=incarnation,
         )
-        now = time.monotonic()
-        await self._incarnation_tracker.update_node(
-            node,
-            b"DEAD",
-            incarnation,
-            now,
-        )
-        self._incarnation_tracker.record_node_death(node, incarnation, now)
+        # ``record_node_death`` already ran synchronously from HFD's
+        # ``_handle_global_expiration`` via ``on_global_death_sync``;
+        # no need to repeat it here.
         self.queue_gossip_update("dead", node, incarnation)
 
         self.update_probe_scheduler_membership()

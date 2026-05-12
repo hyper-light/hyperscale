@@ -134,6 +134,7 @@ class HierarchicalFailureDetector:
         self,
         config: HierarchicalConfig | None = None,
         on_global_death: Callable[[NodeAddress, int], None] | None = None,
+        on_global_death_sync: Callable[[NodeAddress, int], None] | None = None,
         on_job_death: Callable[[JobId, NodeAddress, int], None] | None = None,
         on_error: Callable[[str, Exception], None] | None = None,
         get_n_members: Callable[[], int] | None = None,
@@ -149,6 +150,14 @@ class HierarchicalFailureDetector:
 
         self._config = config
         self._on_global_death = on_global_death
+        # ``on_global_death_sync`` runs synchronously inside the wheel
+        # expiration handler before the async ``on_global_death`` is
+        # dispatched. It exists so observers that need the death-
+        # event recorded *before* any later task can read it (e.g. a
+        # concurrent ``reset_peer_for_rejoin`` reading
+        # ``get_required_rejoin_incarnation``) get the data they need
+        # without racing the TaskRunner queue.
+        self._on_global_death_sync = on_global_death_sync
         self._on_job_death = on_job_death
         self._on_error = on_error
         self._get_n_members = get_n_members
@@ -875,6 +884,24 @@ class HierarchicalFailureDetector:
         # Mark as globally dead
         self._globally_dead.add(node)
         self._global_deaths += 1
+
+        # Synchronous death-event hook. Runs *before* the async
+        # ``on_global_death`` dispatch so any task scheduled after the
+        # wheel fired but before the async callback drains (e.g. a
+        # concurrent ``reset_peer_for_rejoin``) can observe the death
+        # record without racing the TaskRunner queue.
+        if self._on_global_death_sync is not None:
+            try:
+                self._on_global_death_sync(node, state.incarnation)
+            except Exception as sync_error:
+                if self._on_error is not None:
+                    try:
+                        self._on_error(
+                            f"on_global_death_sync failed for {node}",
+                            sync_error,
+                        )
+                    except Exception:
+                        pass
 
         # Clean up extension tracker for this node (AD-26)
         self.remove_extension_tracker(node)

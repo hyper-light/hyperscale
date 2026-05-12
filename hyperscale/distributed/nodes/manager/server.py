@@ -4123,6 +4123,22 @@ class ManagerServer(HealthAwareServer):
 
             # Add to SWIM
             worker_udp_addr = (registration.node.host, registration.node.udp_port)
+            # TCP registration is the authoritative "fresh start" signal
+            # for this address: it tells the manager that the worker
+            # process at ``worker_udp_addr`` is brand-new (a different
+            # ``node_id`` from any predecessor that may have died there).
+            # ``reset_peer_for_rejoin`` wipes leftover SWIM state and
+            # re-seats the tracker entry at a *bumped* incarnation so
+            # stale DEAD gossip about the predecessor (still in flight
+            # at this point) is rejected by the freshness check rather
+            # than regressing the new instance back to DEAD. Without
+            # this reset every path that needs to engage on the new
+            # instance short-circuits: ``confirm_peer`` no-ops because
+            # the address looks already-confirmed, ``can_suspect_node``
+            # blocks SUSPECT because the tracker still says DEAD, and
+            # the only remaining path back to unregister is the coarse
+            # deadline-enforcement fallback.
+            await self.reset_peer_for_rejoin(worker_udp_addr)
             self._manager_state.set_worker_addr_mapping(
                 worker_udp_addr, registration.node.node_id
             )
