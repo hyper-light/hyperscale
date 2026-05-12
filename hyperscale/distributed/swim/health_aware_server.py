@@ -743,6 +743,14 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         # This transitions UNCONFIRMED → OK in the state machine
         await self._incarnation_tracker.confirm_node(peer, incarnation)
 
+        # Enrol the newly-confirmed peer in the probe scheduler. Without this
+        # step the probe cycle (whose membership snapshot is taken once at
+        # start-up and refreshed only on death/leave) will never probe peers
+        # that joined after start-up — leaving SWIM's failure detector dark
+        # for the rest of the run and forcing detection onto the coarser
+        # deadline-enforcement fallback.
+        self._probe_scheduler.add_member(peer)
+
         # AD-35 Task 12.5.6: Notify RoleAwareConfirmationManager
         peer_id = f"{peer[0]}:{peer[1]}"
         self._task_runner.run(self._confirmation_manager.confirm_peer, peer_id)
@@ -904,6 +912,17 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         Returns:
             The initialized HierarchicalFailureDetector.
         """
+        # Calling ``init_hierarchical_detector`` replaces the HFD instance
+        # that ``HealthAwareServer.__init__`` already constructed with the
+        # canonical ``_on_suspicion_expired`` callback wired in. If the
+        # caller does not supply ``on_global_death`` we must re-wire the
+        # default here — otherwise the new HFD has ``None`` for
+        # ``on_global_death`` and wheel expirations fire but no callback
+        # runs: no DEAD log, no incarnation-tracker transition to DEAD,
+        # no ``dead`` gossip, no ``_on_node_dead_callbacks`` fan-out, no
+        # unregister. The bracket fires into the void.
+        if on_global_death is None:
+            on_global_death = self._on_suspicion_expired
         self._hierarchical_detector = HierarchicalFailureDetector(
             config=config,
             on_global_death=on_global_death,
@@ -4488,9 +4507,21 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                 if not pending_future.done():
                     pending_future.set_result(True)
 
-        # Extract embedded state from response (Serf-style)
-        # Response format: msg_type>host:port#|sbase64_state
-        clean_data = await self._extract_embedded_state(data, addr)
+        # Extract embedded state from response (Serf-style). Pass the
+        # *tuple* address so every downstream consumer — most importantly
+        # ``confirm_peer`` → ``incarnation_tracker.confirm_node`` — keys
+        # the peer the same way the rest of the SWIM layer does. Passing
+        # the raw ``bytes`` ``host:port`` here produced phantom tracker
+        # entries (one tuple-keyed and one bytes-keyed for every node),
+        # inflating ``N`` and stretching every Lifeguard suspicion
+        # bracket past the operator-budgeted detection envelope.
+        if addr_tuple is None:
+            # Source-address parse failed; we can't attribute embedded
+            # state to a peer, so just strip piggyback and return the
+            # clean message. Skipping is safe: piggyback is auxiliary
+            # to the request/response.
+            return data
+        clean_data = await self._extract_embedded_state(data, addr_tuple)
         return clean_data
 
     @udp.receive()

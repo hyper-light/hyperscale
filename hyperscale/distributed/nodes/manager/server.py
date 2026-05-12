@@ -615,15 +615,31 @@ class ManagerServer(HealthAwareServer):
         self.register_on_node_join(self._on_node_join)
         self.register_on_peer_confirmed(self._on_peer_confirmed)
 
-        # Initialize hierarchical failure detector (AD-30)
+        # Initialize hierarchical failure detector (AD-30). Keep the
+        # global-layer Lifeguard bracket on its tuned defaults
+        # (5 s / 30 s); the previously hard-coded 10 s / 60 s manager
+        # override was a magic number that — once the bounded prob-OR
+        # LHM extension kicks in — pushed the worst-case suspicion
+        # bracket past 45 s (the operator-budgeted detection envelope
+        # for worker liveness). The job-layer override stays: jobs
+        # need tighter detection than full SWIM probes because their
+        # liveness check is workflow-local.
+        #
+        # We deliberately do NOT pass ``on_global_death`` here. Passing
+        # a custom callback *replaces* ``HealthAwareServer._on_suspicion_expired``,
+        # which is the canonical post-DEAD pipeline: it updates the
+        # incarnation tracker to DEAD, queues the ``dead`` gossip
+        # update, refreshes the probe scheduler, and fans into the
+        # ``_on_node_dead_callbacks`` list (where ``_on_node_dead`` —
+        # the unregister path — is registered). With no override the
+        # pipeline runs end-to-end. Per-role post-DEAD work belongs in
+        # callbacks registered against that pipeline rather than in
+        # an HFD-level override.
         self.init_hierarchical_detector(
             config=HierarchicalConfig(
-                global_min_timeout=10.0,
-                global_max_timeout=60.0,
                 job_min_timeout=2.0,
                 job_max_timeout=15.0,
             ),
-            on_global_death=self._on_worker_globally_dead,
             on_job_death=self._on_worker_dead_for_job,
             get_job_n_members=self._get_job_worker_count,
         )
@@ -1208,14 +1224,6 @@ class ManagerServer(HealthAwareServer):
                 node_id=self._node_id.short,
             )
         )
-
-    def _on_worker_globally_dead(self, worker_id: str) -> None:
-        """Handle worker global death (AD-30)."""
-        self._worker_health_monitor.on_global_death(worker_id)
-        if self._worker_disseminator:
-            self._task_runner.run(
-                self._worker_disseminator.broadcast_worker_dead, worker_id, "dead"
-            )
 
     def _on_worker_dead_for_job(self, job_id: str, worker_id: str) -> None:
         if not self._workflow_dispatcher or not self._job_manager:
@@ -1827,6 +1835,14 @@ class ManagerServer(HealthAwareServer):
         worker_id = heartbeat.node_id
         if self._manager_state.has_worker(worker_id):
             await self._worker_pool.process_heartbeat(worker_id, heartbeat)
+
+        # SWIM-confirm the worker so failure detection actually engages.
+        # Without this, ``can_suspect_node`` (AD-29) blocks all attempts to
+        # SUSPECT the worker because the manager never marked it as a
+        # confirmed peer, and detection falls back to the coarse
+        # deadline-enforcement loop. Manager-peer and gate heartbeat
+        # handlers already do this; the worker handler must match.
+        await self.confirm_peer(source_addr)
 
     async def _handle_manager_peer_heartbeat(
         self,
