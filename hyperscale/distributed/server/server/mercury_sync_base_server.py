@@ -1137,6 +1137,19 @@ class MercurySyncBaseServer(Generic[T]):
         Returns True if task spawned, False if shed due to load.
         Called from sync protocol callbacks.
 
+        For CRITICAL messages (SWIM probes/acks/suspects/alives,
+        leadership traffic) the task creation is scheduled via
+        ``loop.call_soon`` rather than executed inline. This places
+        the eventual ``Task.__step`` call in the ready queue for the
+        *next* loop iteration, ahead of coroutines that have already
+        yielded earlier — giving SWIM control traffic preferential
+        scheduling over any non-control coroutines that have
+        accumulated awaitables. The receive callback also returns
+        faster (skips the ``ensure_future`` cost), so subsequent
+        UDP packets can be drained from the OS buffer sooner. Lower
+        priorities use the direct synchronous spawn path because
+        deferral would only add unnecessary loop iterations.
+
         Args:
             coro: The coroutine to execute.
             priority: Message priority for load shedding decisions.
@@ -1149,10 +1162,40 @@ class MercurySyncBaseServer(Generic[T]):
             self._udp_drop_counter.increment_load_shed()
             return False
 
+        if priority == MessagePriority.CRITICAL:
+            # Defer the task creation to the next loop tick so SWIM
+            # responses don't get stuck behind a deep synchronous
+            # ``read_udp`` chain processing a backlog.
+            asyncio.get_event_loop().call_soon(
+                self._spawn_udp_response_deferred, coro, priority
+            )
+            return True
+
         task = asyncio.ensure_future(coro)
         task.add_done_callback(lambda t: self._on_udp_task_done(t, priority))
         self._pending_udp_server_responses.append(task)
         return True
+
+    def _spawn_udp_response_deferred(
+        self,
+        coro: Coroutine,
+        priority: MessagePriority,
+    ) -> None:
+        """``call_soon`` callback that completes a deferred CRITICAL spawn.
+
+        Splitting the spawn so the deferred path can still install the
+        done-callback and track the task in
+        ``_pending_udp_server_responses`` for shutdown drain.
+        """
+        if not self._running:
+            # Server stopped between schedule and execution; release
+            # the priority slot we acquired in ``_spawn_udp_response``
+            # so the in-flight tracker doesn't leak it.
+            self._udp_in_flight_tracker.release(priority)
+            return
+        task = asyncio.ensure_future(coro)
+        task.add_done_callback(lambda t: self._on_udp_task_done(t, priority))
+        self._pending_udp_server_responses.append(task)
 
     def _on_udp_task_done(
         self,
