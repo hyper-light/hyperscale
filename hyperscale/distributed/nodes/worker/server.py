@@ -1215,7 +1215,7 @@ class WorkerServer(HealthAwareServer):
 
     async def _handle_manager_recovery_async(self, manager_id: str) -> None:
         """Handle manager recovery - mark as healthy."""
-        self._registry.mark_manager_healthy(manager_id)
+        await self._registry.mark_manager_healthy(manager_id)
 
         await self._udp_logger.log(
             ServerInfo(
