@@ -2179,8 +2179,11 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                 )
 
     def _get_member_count(self) -> int:
-        """Get the current number of known members."""
-        return len(self._incarnation_tracker.node_states) or 1
+        # Lifeguard's N is the cluster size including self; the tracker only
+        # holds peers, so add 1. The floor of 2 prevents the n<=1 branch in
+        # SuspicionState.calculate_timeout from returning max_timeout and
+        # blowing past the detection budget.
+        return max(2, len(self._incarnation_tracker.node_states) + 1)
 
     def _compute_vivaldi_quality_multiplier_for_node(
         self, node: tuple[str, int]
