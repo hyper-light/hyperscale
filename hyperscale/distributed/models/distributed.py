@@ -711,6 +711,12 @@ class WorkerHeartbeat(Message):
     # AD-26 Issue 4: Absolute progress metrics (preferred over relative progress)
     extension_completed_items: int = 0  # Absolute count of completed items
     extension_total_items: int = 0  # Total items to complete
+    # Phase F1 — workflow id of the snapshot the extension request
+    # describes. Required for the manager's H5 multi-witness routing
+    # path; absent means the manager falls back to the worker-level
+    # legacy path. Empty string when no workflow-scoped extension is
+    # being requested.
+    extension_workflow_id: str = ""
     # Phase H3 — multi-dimensional WorkflowProgressSnapshot fields.
     # ``extension_completed_items`` is the primary (cores_completed)
     # signal; the two below are the secondary and tertiary signals

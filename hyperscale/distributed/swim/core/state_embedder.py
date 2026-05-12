@@ -176,6 +176,9 @@ class WorkerStateEmbedder:
     get_extension_step_transitions: Callable[[], int] | None = None
     get_extension_actions_completed: Callable[[], int] | None = None
     get_extension_snapshot_time: Callable[[], float] | None = None
+    # Phase F1 — workflow id the extension request is for. Required
+    # for the manager's H5 multi-witness routing path.
+    get_extension_workflow_id: Callable[[], str] | None = None
     # AD-19 addendum (Phase D): uniform LHM gossip across all heartbeat
     # tiers. Worker reports its raw LocalHealthMultiplier.score (0-8)
     # so cross_dc_correlation can correlate worker-tier stress
@@ -244,6 +247,9 @@ class WorkerStateEmbedder:
             extension_snapshot_time=self.get_extension_snapshot_time()
             if self.get_extension_snapshot_time
             else 0.0,
+            extension_workflow_id=self.get_extension_workflow_id()
+            if self.get_extension_workflow_id
+            else "",
             # AD-19 addendum (Phase D): uniform LHM
             lhm_score=self.get_lhm_score() if self.get_lhm_score else 0,
         )

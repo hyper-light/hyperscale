@@ -303,6 +303,7 @@ class WorkerServer(HealthAwareServer):
             get_extension_step_transitions=lambda: self._worker_state._extension_step_transitions,
             get_extension_actions_completed=lambda: self._worker_state._extension_actions_completed,
             get_extension_snapshot_time=lambda: self._worker_state._extension_snapshot_time,
+            get_extension_workflow_id=lambda: self._worker_state._extension_workflow_id,
             # AD-19 addendum (Phase D): uniform LHM gossip
             get_lhm_score=lambda: self._local_health.score,
         )
@@ -1398,6 +1399,33 @@ class WorkerServer(HealthAwareServer):
             node_port=self._tcp_port,
             send_final_result_callback=send_final_result_callback,
         )
+
+        # AD-26 dispatch-time extension. The worker has just accepted
+        # a workflow with a declared timeout; tell the manager so the
+        # SWIM bracket and the worker-deadline are extended *before*
+        # the heavy startup phase of the workflow (subprocess spawn,
+        # state hydration, initial heartbeat round) can starve probe
+        # acks and trigger false-positive SUSPECT. Without this, the
+        # autonomous ExtensionTrigger only fires once a workflow has
+        # been running for ``deadline × lookahead_fraction`` seconds
+        # (75% by default) — too late to defend the first 5–10 s
+        # window where the actual contention lives. The extension is
+        # heartbeat-piggybacked; the manager's
+        # ``_handle_embedded_worker_heartbeat`` processes it through
+        # the same ``_process_extension_request_core`` path the TCP
+        # endpoint uses.
+        if dispatch.timeout_seconds > 0:
+            self.request_extension(
+                reason="dispatch-accepted",
+                progress=0.0,
+                completed_items=0,
+                total_items=len(allocation_result.allocated_cores),
+                estimated_completion=dispatch.timeout_seconds,
+                workflow_id=dispatch.workflow_id,
+                step_transitions=0,
+                actions_completed=0,
+                snapshot_time=time.monotonic(),
+            )
 
         await self._check_pending_transfer_for_job(
             dispatch.job_id, dispatch.workflow_id

@@ -1844,6 +1844,38 @@ class ManagerServer(HealthAwareServer):
         # handlers already do this; the worker handler must match.
         await self.confirm_peer(source_addr)
 
+        # AD-26 heartbeat-piggyback extension request. The worker
+        # carries ``extension_requested`` plus the supporting metric
+        # fields on every heartbeat once its ExtensionTrigger has
+        # marked an extension as pending; without this branch the
+        # piggyback was load-bearing on paper only — the manager
+        # never processed it, so AD-26's whole point (workers self-
+        # reporting they need bracket room) failed silently and the
+        # SWIM-vs-workload contention window produced false-positive
+        # deaths on live workers. The same shared processor as the
+        # TCP ``extension_request`` endpoint runs here, so the H5
+        # multi-witness route, deadline write, SWIM-bracket extension
+        # and timeout-strategy notification all fire end-to-end.
+        if getattr(heartbeat, "extension_requested", False):
+            worker = self._manager_state.get_worker(worker_id)
+            if worker is not None:
+                request = HealthcheckExtensionRequest(
+                    worker_id=worker_id,
+                    reason=heartbeat.extension_reason or "heartbeat-piggyback",
+                    current_progress=heartbeat.extension_current_progress,
+                    estimated_completion=heartbeat.extension_estimated_completion,
+                    active_workflow_count=heartbeat.extension_active_workflow_count,
+                    completed_items=heartbeat.extension_completed_items,
+                    total_items=heartbeat.extension_total_items,
+                    workflow_id=heartbeat.extension_workflow_id,
+                    step_transitions=heartbeat.extension_step_transitions,
+                    actions_completed=heartbeat.extension_actions_completed,
+                    snapshot_time=heartbeat.extension_snapshot_time,
+                )
+                await self._process_extension_request_core(
+                    request, worker_id, worker
+                )
+
     async def _handle_manager_peer_heartbeat(
         self,
         heartbeat: ManagerHeartbeat,
@@ -5163,98 +5195,9 @@ class ManagerServer(HealthAwareServer):
                     denial_reason="Worker not found",
                 ).dump()
 
-            # Get current deadline (or set default)
-            current_deadline = self._manager_state.get_worker_deadline(worker_id)
-            if current_deadline is None:
-                current_deadline = time.monotonic() + 30.0
-
-            # Phase F1: route through the H5 multi-witness path when
-            # the request carries an H3 ``workflow_id`` (workers using
-            # the H4 autonomous trigger always set this). Falls back
-            # to the legacy worker-level path when the workflow can't
-            # be located on this manager (cross-manager workflows or
-            # pre-H4 callers).
-            response: HealthcheckExtensionResponse | None = None
-            if request.workflow_id:
-                response = self._route_extension_through_witnesses(
-                    request=request,
-                    current_deadline=current_deadline,
-                )
-            if response is None:
-                response = self._worker_health_manager.handle_extension_request(
-                    request=request,
-                    current_deadline=current_deadline,
-                )
-
-            # Update stored deadline if granted
-            if response.granted:
-                self._manager_state.set_worker_deadline(
-                    worker_id, response.new_deadline
-                )
-
-                # AD-26 Issue 3: Integrate with SWIM timing wheels (SWIM as authority)
-                hierarchical_detector = self.get_hierarchical_detector()
-                if hierarchical_detector:
-                    worker_addr = (worker.node.host, worker.node.udp_port)
-                    (
-                        swim_granted,
-                        swim_extension,
-                        swim_denial,
-                        is_warning,
-                    ) = await hierarchical_detector.request_extension(
-                        node=worker_addr,
-                        reason=request.reason,
-                        current_progress=request.current_progress,
-                    )
-                    if not swim_granted:
-                        await self._udp_logger.log(
-                            ServerWarning(
-                                message=f"SWIM denied extension for {worker_id[:8]}... despite WorkerHealthManager grant: {swim_denial}",
-                                node_host=self._host,
-                                node_port=self._tcp_port,
-                                node_id=self._node_id.short,
-                            )
-                        )
-
-                # Notify timeout strategies of extension (AD-34 Part 10.4.7)
-                await self._notify_timeout_strategies_of_extension(
-                    worker_id=worker_id,
-                    extension_seconds=response.extension_seconds,
-                    worker_progress=request.current_progress,
-                )
-
-                await self._udp_logger.log(
-                    ServerInfo(
-                        message=f"Granted {response.extension_seconds:.1f}s extension to worker {worker_id[:8]}... (reason: {request.reason})",
-                        node_host=self._host,
-                        node_port=self._tcp_port,
-                        node_id=self._node_id.short,
-                    )
-                )
-            else:
-                await self._udp_logger.log(
-                    ServerWarning(
-                        message=f"Denied extension to worker {worker_id[:8]}...: {response.denial_reason}",
-                        node_host=self._host,
-                        node_port=self._tcp_port,
-                        node_id=self._node_id.short,
-                    )
-                )
-
-                # Check if worker should be evicted
-                should_evict, eviction_reason = (
-                    self._worker_health_manager.should_evict_worker(worker_id)
-                )
-                if should_evict:
-                    await self._udp_logger.log(
-                        ServerWarning(
-                            message=f"Worker {worker_id[:8]}... should be evicted: {eviction_reason}",
-                            node_host=self._host,
-                            node_port=self._tcp_port,
-                            node_id=self._node_id.short,
-                        )
-                    )
-
+            response = await self._process_extension_request_core(
+                request, worker_id, worker
+            )
             return response.dump()
 
         except Exception as error:
@@ -5273,6 +5216,120 @@ class ManagerServer(HealthAwareServer):
                 remaining_extensions=0,
                 denial_reason=str(error),
             ).dump()
+
+    async def _process_extension_request_core(
+        self,
+        request: HealthcheckExtensionRequest,
+        worker_id: str,
+        worker,
+    ) -> HealthcheckExtensionResponse:
+        """Apply an AD-26 extension request once it's been validated.
+
+        Shared by the TCP ``extension_request`` endpoint and the
+        heartbeat-piggyback path on ``_handle_embedded_worker_heartbeat``.
+        The caller is responsible for parsing the request and looking
+        up ``worker_id`` / ``worker`` — this helper handles the route
+        through H5 witnesses (or the legacy worker-level path), the
+        worker-deadline write, the SWIM-bracket extension via the
+        hierarchical failure detector, and the AD-34 Part 10.4.7
+        timeout-strategy notification.
+
+        Returning the response object (rather than a serialized blob)
+        lets the heartbeat path inspect ``granted`` without needing
+        to re-parse it.
+        """
+        # Get current deadline (or set default)
+        current_deadline = self._manager_state.get_worker_deadline(worker_id)
+        if current_deadline is None:
+            current_deadline = time.monotonic() + 30.0
+
+        # Phase F1: route through the H5 multi-witness path when
+        # the request carries an H3 ``workflow_id`` (workers using
+        # the H4 autonomous trigger always set this). Falls back
+        # to the legacy worker-level path when the workflow can't
+        # be located on this manager (cross-manager workflows or
+        # pre-H4 callers).
+        response: HealthcheckExtensionResponse | None = None
+        if request.workflow_id:
+            response = self._route_extension_through_witnesses(
+                request=request,
+                current_deadline=current_deadline,
+            )
+        if response is None:
+            response = self._worker_health_manager.handle_extension_request(
+                request=request,
+                current_deadline=current_deadline,
+            )
+
+        if response.granted:
+            self._manager_state.set_worker_deadline(
+                worker_id, response.new_deadline
+            )
+
+            # AD-26 Issue 3: Integrate with SWIM timing wheels (SWIM as authority)
+            hierarchical_detector = self.get_hierarchical_detector()
+            if hierarchical_detector:
+                worker_addr = (worker.node.host, worker.node.udp_port)
+                (
+                    swim_granted,
+                    swim_extension,
+                    swim_denial,
+                    is_warning,
+                ) = await hierarchical_detector.request_extension(
+                    node=worker_addr,
+                    reason=request.reason,
+                    current_progress=request.current_progress,
+                )
+                if not swim_granted:
+                    await self._udp_logger.log(
+                        ServerWarning(
+                            message=f"SWIM denied extension for {worker_id[:8]}... despite WorkerHealthManager grant: {swim_denial}",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
+
+            # Notify timeout strategies of extension (AD-34 Part 10.4.7)
+            await self._notify_timeout_strategies_of_extension(
+                worker_id=worker_id,
+                extension_seconds=response.extension_seconds,
+                worker_progress=request.current_progress,
+            )
+
+            await self._udp_logger.log(
+                ServerInfo(
+                    message=f"Granted {response.extension_seconds:.1f}s extension to worker {worker_id[:8]}... (reason: {request.reason})",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+        else:
+            await self._udp_logger.log(
+                ServerWarning(
+                    message=f"Denied extension to worker {worker_id[:8]}...: {response.denial_reason}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+
+            # Check if worker should be evicted
+            should_evict, eviction_reason = (
+                self._worker_health_manager.should_evict_worker(worker_id)
+            )
+            if should_evict:
+                await self._udp_logger.log(
+                    ServerWarning(
+                        message=f"Worker {worker_id[:8]}... should be evicted: {eviction_reason}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+
+        return response
 
     @tcp.receive()
     async def ping(
