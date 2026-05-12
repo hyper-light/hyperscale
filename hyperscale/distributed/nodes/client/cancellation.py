@@ -147,54 +147,87 @@ class ClientCancellationManager:
             KeyError: If job not found (never submitted through this
                 client).
         """
-        request = JobCancelRequest(
-            job_id=job_id,
-            requester_id=f"client-{self._config.host}:{self._config.tcp_port}",
-            timestamp=time.time(),
-            fence_token=0,
-            reason=reason,
+        # Initialize cancellation tracking BEFORE sending the request.
+        # The manager → client ``job_cancellation_complete`` push can
+        # arrive within milliseconds of the request returning (it's
+        # sent from a TaskRunner background task the moment all
+        # worker completions land), and the inbound TCP handler must
+        # find the event in ``_cancellation_events`` to signal it.
+        # If we defer initialization to ``await_job_cancellation``,
+        # the notification can land first and silently no-op — the
+        # subsequent ``await`` then blocks on an event that will
+        # never be set. The fix is structural: ensure the event
+        # exists before the request goes out. This mirrors the
+        # ``seed-pending-before-send`` discipline the manager-side
+        # cancellation flow uses for the same class of race.
+        we_initialized_tracking = (
+            job_id not in self._state._cancellation_events
         )
+        if we_initialized_tracking:
+            self._state.initialize_cancellation_tracking(job_id)
 
-        configured_targets = self._targets.get_targets_for_job(job_id)
-        if not configured_targets:
-            raise RuntimeError("No managers or gates configured")
-
-        # Pending = the failover fleet; tried = targets that have
-        # returned a transient error already this call (so we don't
-        # cycle back into them). The job-specific target is at
-        # index 0 by ``get_targets_for_job`` contract; preserve order.
-        pending: list[tuple[str, int]] = list(configured_targets)
-        tried: set[tuple[str, int]] = set()
-
-        last_error: str | None = None
-        retries_used = 0
-
-        while pending and retries_used <= max_retries:
-            target = pending.pop(0)
-            tried.add(target)
-
-            result = await self._attempt_with_redirects(
-                initial_target=target,
-                request=request,
+        try:
+            request = JobCancelRequest(
                 job_id=job_id,
-                timeout=timeout,
-                max_redirects=max_redirects,
-                tried=tried,
+                requester_id=f"client-{self._config.host}:{self._config.tcp_port}",
+                timestamp=time.time(),
+                fence_token=0,
+                reason=reason,
             )
 
-            if isinstance(result, JobCancelResponse):
-                return result
+            configured_targets = self._targets.get_targets_for_job(job_id)
+            if not configured_targets:
+                raise RuntimeError("No managers or gates configured")
 
-            # ``result`` is a transient error string — back off then
-            # fall over to the next pending target.
-            last_error = result
-            await self._apply_retry_delay(retries_used, max_retries, retry_base_delay)
-            retries_used += 1
+            # Pending = the failover fleet; tried = targets that have
+            # returned a transient error already this call (so we don't
+            # cycle back into them). The job-specific target is at
+            # index 0 by ``get_targets_for_job`` contract; preserve order.
+            pending: list[tuple[str, int]] = list(configured_targets)
+            tried: set[tuple[str, int]] = set()
 
-        raise RuntimeError(
-            f"Job cancellation failed after {retries_used} retries "
-            f"across {len(tried)} target(s): {last_error}"
-        )
+            last_error: str | None = None
+            retries_used = 0
+
+            while pending and retries_used <= max_retries:
+                target = pending.pop(0)
+                tried.add(target)
+
+                result = await self._attempt_with_redirects(
+                    initial_target=target,
+                    request=request,
+                    job_id=job_id,
+                    timeout=timeout,
+                    max_redirects=max_redirects,
+                    tried=tried,
+                )
+
+                if isinstance(result, JobCancelResponse):
+                    return result
+
+                # ``result`` is a transient error string — back off then
+                # fall over to the next pending target.
+                last_error = result
+                await self._apply_retry_delay(
+                    retries_used, max_retries, retry_base_delay
+                )
+                retries_used += 1
+
+            raise RuntimeError(
+                f"Job cancellation failed after {retries_used} retries "
+                f"across {len(tried)} target(s): {last_error}"
+            )
+        except BaseException:
+            # Drop the tracking we installed if the request itself
+            # failed — the caller will not reach ``await_job_cancellation``
+            # to clean it up. Only clean what *we* set up; if the
+            # tracker was pre-existing (concurrent caller), leave it
+            # for that other caller to manage.
+            if we_initialized_tracking:
+                self._state._cancellation_events.pop(job_id, None)
+                self._state._cancellation_success.pop(job_id, None)
+                self._state._cancellation_errors.pop(job_id, None)
+            raise
 
     async def _attempt_with_redirects(
         self,
@@ -299,30 +332,49 @@ class ClientCancellationManager:
             - success: True if all workflows were cancelled successfully
             - errors: List of error messages from workflows that failed to cancel
         """
-        # Create event if not exists (in case called before cancel_job)
+        # Create event if not exists. ``cancel_job`` already
+        # pre-installs tracking in the common case so the inbound
+        # ``job_cancellation_complete`` handler always finds an event
+        # to signal; this branch covers the "await without prior
+        # cancel" case (e.g. a second awaiter or external job_id
+        # passed in).
         if job_id not in self._state._cancellation_events:
             self._state.initialize_cancellation_tracking(job_id)
 
         event = self._state._cancellation_events[job_id]
 
         try:
-            if timeout is not None:
-                await asyncio.wait_for(event.wait(), timeout=timeout)
-            else:
-                await event.wait()
-        except asyncio.TimeoutError:
-            return (False, [f"Timeout waiting for cancellation completion after {timeout}s"])
+            # ``event.wait()`` is the slow path; if the notification
+            # has already arrived between ``cancel_job`` returning and
+            # this call, ``event.is_set()`` is already True and
+            # ``wait()`` returns immediately. The handler writes
+            # success/errors *before* it sets the event, so any
+            # caller that observes the event set is guaranteed to
+            # see the consistent post-notification state below.
+            try:
+                if timeout is not None:
+                    await asyncio.wait_for(event.wait(), timeout=timeout)
+                else:
+                    await event.wait()
+            except asyncio.TimeoutError:
+                return (
+                    False,
+                    [f"Timeout waiting for cancellation completion after {timeout}s"],
+                )
 
-        # Get the results
-        success = self._state._cancellation_success.get(job_id, False)
-        errors = self._state._cancellation_errors.get(job_id, [])
-
-        # Cleanup tracking structures
-        self._state._cancellation_events.pop(job_id, None)
-        self._state._cancellation_success.pop(job_id, None)
-        self._state._cancellation_errors.pop(job_id, None)
-
-        return (success, errors)
+            return (
+                self._state._cancellation_success.get(job_id, False),
+                self._state._cancellation_errors.get(job_id, []),
+            )
+        finally:
+            # Cleanup on every exit path — success, timeout, or
+            # exception. Without ``finally`` a cancellation that
+            # never completes (e.g. cancel_job got a response but the
+            # asynchronous completion push was lost) would leave the
+            # tracker entries dangling for the lifetime of the client.
+            self._state._cancellation_events.pop(job_id, None)
+            self._state._cancellation_success.pop(job_id, None)
+            self._state._cancellation_errors.pop(job_id, None)
 
     def _is_transient_error(self, error: str) -> bool:
         """

@@ -4676,10 +4676,25 @@ class ManagerServer(HealthAwareServer):
         """Get list of (workflow_id, worker_id, worker_addr) for running workflows to cancel."""
         workflows_to_cancel: list[tuple[str, str, tuple[str, int]]] = []
 
+        # A workflow is "in-flight on a worker" — and therefore needs
+        # a worker-side cancel push — once it is in ``ASSIGNED`` or
+        # ``RUNNING`` state. ``ASSIGNED`` means the manager has
+        # dispatched the workflow to a worker; the worker has the
+        # sub-workflow token bound to it but may not have reported
+        # the RUNNING transition back yet (that report can race
+        # against the worker-side RUNNING state the client observes).
+        # If we exclude ``ASSIGNED``, a cancel that arrives in that
+        # window finds zero workflows to cancel, sends no
+        # ``cancel_workflow`` to the worker, never seeds the
+        # cancellation-pending tracker, and the client times out
+        # waiting for the ``job_cancellation_complete`` push that
+        # only fires when pending hits zero — even though the worker
+        # is actively running the workflow.
+        cancellable_statuses = (WorkflowStatus.ASSIGNED, WorkflowStatus.RUNNING)
         for workflow_id, workflow_info in job.workflows.items():
             if workflow_id in pending_cancelled:
                 continue
-            if workflow_info.status != WorkflowStatus.RUNNING:
+            if workflow_info.status not in cancellable_statuses:
                 continue
 
             for sub_workflow_token in workflow_info.sub_workflow_tokens:
@@ -4690,8 +4705,25 @@ class ManagerServer(HealthAwareServer):
                 worker = self._manager_state.get_worker(sub_workflow.token.worker_id)
                 if worker:
                     worker_addr = (worker.node.host, worker.node.port)
+                    # The dispatcher sends ``workflow_id=str(sub_token)``
+                    # to the worker (see ``WorkflowDispatcher`` line ~679),
+                    # so the worker stores the workflow in
+                    # ``_active_workflows`` keyed by the sub-token string —
+                    # *not* by the parent ``workflow_id``. Cancelling under
+                    # the parent ``workflow_id`` makes the worker's cancel
+                    # handler short-circuit on "workflow not found / already
+                    # completed", silently returning success without
+                    # actually cancelling and without scheduling the
+                    # ``workflow_cancellation_complete`` push. The pending
+                    # tracker on the manager then waits forever for a
+                    # completion that will never arrive, and the client's
+                    # ``await_job_cancellation`` times out.
                     workflows_to_cancel.append(
-                        (workflow_id, sub_workflow.token.worker_id, worker_addr)
+                        (
+                            str(sub_workflow.token),
+                            sub_workflow.token.worker_id,
+                            worker_addr,
+                        )
                     )
 
         return workflows_to_cancel
@@ -4703,14 +4735,22 @@ class ManagerServer(HealthAwareServer):
         requester_id: str,
         timestamp: float,
         reason: str,
+        workflows_to_cancel: list[tuple[str, str, tuple[str, int]]] | None = None,
     ) -> tuple[list[str], dict[str, str]]:
-        """Cancel all running workflows on workers. Returns (cancelled_list, errors_dict)."""
+        """Cancel all running workflows on workers. Returns (cancelled_list, errors_dict).
+
+        ``workflows_to_cancel`` may be passed in by the caller when it
+        has already computed the list (and seeded the pending tracker)
+        — this lets the caller close the race where worker completions
+        arrive before the manager's pending tracker is seeded.
+        """
         running_cancelled: list[str] = []
         workflow_errors: dict[str, str] = {}
 
-        workflows_to_cancel = self._get_running_workflows_to_cancel(
-            job, pending_cancelled
-        )
+        if workflows_to_cancel is None:
+            workflows_to_cancel = self._get_running_workflows_to_cancel(
+                job, pending_cancelled
+            )
 
         for workflow_id, worker_id, worker_addr in workflows_to_cancel:
             success, error_msg = await self._cancel_running_workflow_on_worker(
@@ -4846,32 +4886,33 @@ class ManagerServer(HealthAwareServer):
                 job_id, timestamp, reason
             )
 
-            running_cancelled, workflow_errors = await self._cancel_running_workflows(
-                job, pending_cancelled, requester_id, timestamp, reason
-            )
-
-            # Seed the cancellation-pending tracker with every
-            # workflow we just cancelled. Workers report back via
-            # ``workflow_cancellation_complete`` (handled below),
-            # which decrements pending and — when empty — fires
-            # ``_push_cancellation_complete_to_origin`` so the
-            # client's ``await_job_cancellation`` receives the
-            # completion push. Without this seeding, every worker
-            # report sees an empty pending set and never triggers
-            # the push, hanging the client until its timeout.
+            # Seed the cancellation-pending tracker BEFORE sending any
+            # ``cancel_workflow`` TCP request to workers. Workers reply
+            # asynchronously via ``workflow_cancellation_complete``;
+            # because worker→manager TCP roundtrips can complete
+            # *inside the same event-loop tick* as the manager→worker
+            # send, post-send seeding races with the inbound completion.
+            # When the race is lost, the completion arrives with an
+            # empty pending set, the decrement no-ops, and once
+            # seeding finally happens the pending entry never gets
+            # cleared — the client times out.
             #
-            # The Raft state machine (state_machine.py:273) also
-            # populates pending on Raft-replicated cancellation
-            # commands. This explicit seeding from the request
-            # handler covers the immediate-after-handler case
-            # where the Raft command may not have committed yet,
-            # and is correct under both single-DC and replicated
-            # setups (``add_cancellation_pending_workflow`` is
-            # idempotent on the (job_id, workflow_id) pair).
-            for workflow_id in running_cancelled:
+            # Seeding before send guarantees the completion handler
+            # sees the pending entry. ``add_cancellation_pending_workflow``
+            # is idempotent so re-adding on Raft replay (state_machine.py)
+            # remains correct.
+            workflows_to_cancel = self._get_running_workflows_to_cancel(
+                job, pending_cancelled
+            )
+            for sub_token_str, _, _ in workflows_to_cancel:
                 self._manager_state.add_cancellation_pending_workflow(
-                    job_id, workflow_id
+                    job_id, sub_token_str
                 )
+
+            running_cancelled, workflow_errors = await self._cancel_running_workflows(
+                job, pending_cancelled, requester_id, timestamp, reason,
+                workflows_to_cancel=workflows_to_cancel,
+            )
 
             strategy = self._manager_state.get_job_timeout_strategy(job_id)
             if strategy:
