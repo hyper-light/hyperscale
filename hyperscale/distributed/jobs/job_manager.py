@@ -1083,12 +1083,24 @@ class JobManager:
         return job.status
 
     async def update_job_status(
-        self, job_token: str | TrackingToken, status: str
+        self,
+        job_token: str | TrackingToken,
+        status: str,
+        timestamp: float | None = None,
     ) -> bool:
         """
         Update job status.
 
         Thread-safe: acquires job lock.
+
+        ``timestamp`` is the wall-clock seconds value to record on
+        ``job.timestamp``. When called from the Raft apply path, the caller
+        passes ``entry.timestamp`` (the HLC-derived value replicated in the log)
+        so every follower converges on identical state. When called outside
+        the apply path -- e.g. local manager handlers updating their own view --
+        the default ``time.time()`` records the current wall-clock seconds.
+        Never call ``time.monotonic()`` here: ``job.timestamp`` is a wall-clock
+        field, consumed by readers that compare against ``time.time()``.
         """
         job = self.get_job(job_token)
         if not job:
@@ -1096,7 +1108,7 @@ class JobManager:
 
         async with job.lock:
             job.status = status
-            job.timestamp = time.monotonic()
+            job.timestamp = time.time() if timestamp is None else timestamp
             return True
 
     # =========================================================================

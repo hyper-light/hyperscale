@@ -169,6 +169,7 @@ from hyperscale.distributed.routing import (
     GateJobRouter,
 )
 from hyperscale.distributed.swim.coordinates import CoordinateTracker
+from hyperscale.logging.lsn import HybridLamportClock
 from hyperscale.distributed.capacity import (
     DatacenterCapacityAggregator,
     SpilloverEvaluator,
@@ -794,6 +795,12 @@ class GateServer(HealthAwareServer):
             orphan_grace_period_seconds=self._orphan_grace_period,
         )
 
+        # Shared HybridLamportClock (AD-38). Wired into Raft so RaftLogEntry.timestamp
+        # carries a replicated wall-clock-derived value. Apply handlers consume
+        # entry.timestamp directly, producing byte-equal state across followers.
+        if not hasattr(self, "_hlc"):
+            self._hlc = HybridLamportClock(node_id=hash(self._node_id.full) & 0xFFFF)
+
         # Raft consensus integration
         self._raft = GateRaftIntegration(
             node_id=self._node_id.short,
@@ -805,6 +812,7 @@ class GateServer(HealthAwareServer):
             send_tcp=self._send_tcp,
             on_job_raft_leader=self._on_job_raft_leader,
             on_job_raft_lose_leader=self._on_job_raft_lose_leader,
+            clock=self._hlc,
         )
 
     def _init_handlers(self) -> None:

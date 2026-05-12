@@ -433,6 +433,14 @@ class ManagerServer(HealthAwareServer):
             task_runner=self._task_runner,
         )
 
+        # Shared HybridLamportClock (AD-38). Used by Raft so that
+        # RaftLogEntry.timestamp is a replicated, wall-clock-derived value -- this
+        # is what state-machine apply handlers read for any time-related state
+        # so all followers converge byte-equal. The same clock instance is
+        # reused for the WAL on start() so HLC ordering is coherent across
+        # subsystems.
+        self._hlc = HybridLamportClock(node_id=hash(self._node_id.full) & 0xFFFF)
+
         # Raft consensus integration
         self._raft_leadership_tracker: JobLeadershipTracker[int] = JobLeadershipTracker(
             node_id=self._node_id.short,
@@ -448,6 +456,7 @@ class ManagerServer(HealthAwareServer):
             on_job_raft_leader=self._on_job_raft_leader,
             on_job_raft_lose_leader=self._on_job_raft_lose_leader,
             manager_state=self._manager_state,
+            clock=self._hlc,
         )
 
         self._worker_pool = WorkerPool(
@@ -746,10 +755,11 @@ class ManagerServer(HealthAwareServer):
         await self.start_server(init_context=self._env.get_swim_init_context())
 
         if self._config.wal_data_dir is not None:
-            wal_clock = HybridLamportClock(node_id=hash(self._node_id.full) & 0xFFFF)
+            # Reuse the shared HLC created in __init__ so Raft proposals and
+            # WAL writes are causally ordered against the same logical clock.
             self._node_wal = await NodeWAL.open(
                 path=self._config.wal_data_dir / "wal",
-                clock=wal_clock,
+                clock=self._hlc,
                 logger=self._udp_logger,
             )
 
@@ -2374,7 +2384,9 @@ class ManagerServer(HealthAwareServer):
             try:
                 await asyncio.sleep(cleanup_interval)
 
-                current_time = time.monotonic()
+                # Wall-clock seconds: matches the semantic of job.completed_at
+                # which is set from Raft entry.timestamp (HLC) or local time.time().
+                current_time = time.time()
                 jobs_cleaned = 0
 
                 for job in list(self._job_manager.iter_jobs()):
@@ -2452,7 +2464,7 @@ class ManagerServer(HealthAwareServer):
                                 JobStatus.CANCELLED.value,
                             ):
                                 job.status = JobStatus.FAILED.value
-                                job.completed_at = time.monotonic()
+                                job.completed_at = time.time()
                                 await self._manager_state.increment_state_version()
                                 # Phase F3: emit TIMED_OUT outcomes
                                 # for every still-in-flight workflow
@@ -4919,7 +4931,7 @@ class ManagerServer(HealthAwareServer):
                 await strategy.stop_tracking(job_id, "cancelled")
 
             job.status = JobStatus.CANCELLED.value
-            job.completed_at = time.monotonic()
+            job.completed_at = time.time()
             await self._manager_state.increment_state_version()
 
             # Phase F3: emit FAILED outcomes for any still-in-flight
@@ -6529,7 +6541,7 @@ class ManagerServer(HealthAwareServer):
                 job.workflows_total = sync_msg.workflows_total
                 job.workflows_completed = sync_msg.workflows_completed
                 job.workflows_failed = sync_msg.workflows_failed
-                job.timestamp = time.monotonic()
+                job.timestamp = time.time()
 
                 if (
                     sync_msg.context_snapshot
@@ -6654,8 +6666,8 @@ class ManagerServer(HealthAwareServer):
             self._manager_state.set_job_callback(job_id, request.callback_addr)
             self._manager_state.set_progress_callback(job_id, request.callback_addr)
 
-            # Calculate elapsed time
-            elapsed = time.monotonic() - job.timestamp if job.timestamp > 0 else 0.0
+            # Calculate elapsed time (job.timestamp is wall-clock seconds set by Raft apply or local handlers)
+            elapsed = time.time() - job.timestamp if job.timestamp > 0 else 0.0
 
             # Aggregate completed/failed from sub-workflows (WorkflowInfo has no counts;
             # they live on SubWorkflowInfo.progress)
@@ -6974,7 +6986,7 @@ class ManagerServer(HealthAwareServer):
 
         async with job.lock:
             job.status = JobStatus.COMPLETED.value
-            job.completed_at = time.monotonic()
+            job.completed_at = time.time()
             elapsed_seconds = job.elapsed_seconds()
             final_status = self._determine_final_job_status(job)
             workflow_results, errors, total_completed, total_failed = (

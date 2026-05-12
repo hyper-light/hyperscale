@@ -4,9 +4,16 @@ Raft state machine for manager JobManager mutations.
 Applies committed Raft log entries to the JobManager by
 deserializing commands and dispatching to the correct method.
 Each command type maps to exactly one handler.
+
+Determinism contract: handlers MUST source any time-related state from
+``entry.timestamp`` (the leader-set, log-replicated wall-clock seconds value
+minted from the shared ``HybridLamportClock`` at proposal time, AD-38). They
+MUST NOT call ``time.monotonic()`` / ``time.time()`` / random / etc.
+inside handlers; doing so produces follower-divergent state and breaks Raft
+safety. The replay test in tests/unit/distributed/raft/test_apply_replay.py
+asserts byte-equal state across two independently constructed replicas.
 """
 
-import time
 from typing import TYPE_CHECKING
 
 import cloudpickle
@@ -83,6 +90,11 @@ class RaftStateMachine:
         Apply a single committed log entry to the state machine.
 
         Deserializes the command and dispatches to the appropriate handler.
+        The entry is passed alongside the command so handlers can read
+        replicated metadata (term, index, timestamp) for any state mutation
+        that needs a deterministic value -- in particular, ``entry.timestamp``
+        is the AD-38 HLC wall-clock seconds value minted at proposal time and
+        is identical on every replica.
         """
         handler = self._handlers.get(entry.command_type)
         if handler is None:
@@ -97,7 +109,7 @@ class RaftStateMachine:
         if command is None:
             return
 
-        await handler(command)
+        await handler(command, entry)
 
     def _deserialize(self, entry: RaftLogEntry) -> RaftCommand | None:
         """Deserialize command bytes. Returns None on failure."""
@@ -118,14 +130,14 @@ class RaftStateMachine:
     # Job Lifecycle Handlers
     # =========================================================================
 
-    async def _apply_create_job(self, command: RaftCommand) -> None:
+    async def _apply_create_job(self, command: RaftCommand, entry: RaftLogEntry) -> None:
         """Apply CREATE_JOB: create a new job."""
         await self._job_manager.create_job(
             submission=command.submission,
             callback_addr=command.callback_addr,
         )
 
-    async def _apply_track_remote_job(self, command: RaftCommand) -> None:
+    async def _apply_track_remote_job(self, command: RaftCommand, entry: RaftLogEntry) -> None:
         """Apply TRACK_REMOTE_JOB: track a job from another manager."""
         await self._job_manager.track_remote_job(
             job_id=command.job_id,
@@ -133,7 +145,7 @@ class RaftStateMachine:
             leader_addr=command.leader_addr,
         )
 
-    async def _apply_complete_job(self, command: RaftCommand) -> None:
+    async def _apply_complete_job(self, command: RaftCommand, entry: RaftLogEntry) -> None:
         """Apply COMPLETE_JOB: mark job as completed."""
         await self._job_manager.complete_job(job_id=command.job_id)
 
@@ -141,7 +153,7 @@ class RaftStateMachine:
     # Workflow Registration Handlers
     # =========================================================================
 
-    async def _apply_register_workflow(self, command: RaftCommand) -> None:
+    async def _apply_register_workflow(self, command: RaftCommand, entry: RaftLogEntry) -> None:
         """Apply REGISTER_WORKFLOW: register a workflow for a job."""
         await self._job_manager.register_workflow(
             job_id=command.job_id,
@@ -150,7 +162,7 @@ class RaftStateMachine:
             workflow=command.workflow,
         )
 
-    async def _apply_register_sub_workflow(self, command: RaftCommand) -> None:
+    async def _apply_register_sub_workflow(self, command: RaftCommand, entry: RaftLogEntry) -> None:
         """Apply REGISTER_SUB_WORKFLOW: register sub-workflow dispatch."""
         await self._job_manager.register_sub_workflow(
             job_id=command.job_id,
@@ -163,14 +175,14 @@ class RaftStateMachine:
     # Progress and Results Handlers
     # =========================================================================
 
-    async def _apply_update_workflow_progress(self, command: RaftCommand) -> None:
+    async def _apply_update_workflow_progress(self, command: RaftCommand, entry: RaftLogEntry) -> None:
         """Apply UPDATE_WORKFLOW_PROGRESS: update sub-workflow progress."""
         await self._job_manager.update_workflow_progress(
             sub_workflow_token=command.sub_workflow_token,
             progress=command.progress,
         )
 
-    async def _apply_record_sub_workflow_result(self, command: RaftCommand) -> None:
+    async def _apply_record_sub_workflow_result(self, command: RaftCommand, entry: RaftLogEntry) -> None:
         """Apply RECORD_SUB_WORKFLOW_RESULT: record final result."""
         await self._job_manager.record_sub_workflow_result(
             sub_workflow_token=command.sub_workflow_token,
@@ -181,28 +193,28 @@ class RaftStateMachine:
     # Workflow Completion Handlers
     # =========================================================================
 
-    async def _apply_mark_workflow_completed(self, command: RaftCommand) -> None:
+    async def _apply_mark_workflow_completed(self, command: RaftCommand, entry: RaftLogEntry) -> None:
         """Apply MARK_WORKFLOW_COMPLETED: mark workflow completed."""
         await self._job_manager.mark_workflow_completed(
             workflow_token=command.workflow_token,
             from_worker=command.from_worker,
         )
 
-    async def _apply_mark_workflow_failed(self, command: RaftCommand) -> None:
+    async def _apply_mark_workflow_failed(self, command: RaftCommand, entry: RaftLogEntry) -> None:
         """Apply MARK_WORKFLOW_FAILED: mark workflow failed."""
         await self._job_manager.mark_workflow_failed(
             workflow_token=command.workflow_token,
             error=command.error,
         )
 
-    async def _apply_mark_aggregation_failed(self, command: RaftCommand) -> None:
+    async def _apply_mark_aggregation_failed(self, command: RaftCommand, entry: RaftLogEntry) -> None:
         """Apply MARK_AGGREGATION_FAILED: mark aggregation failed."""
         await self._job_manager.mark_aggregation_failed(
             workflow_token=command.workflow_token,
             error=command.error,
         )
 
-    async def _apply_update_workflow_status(self, command: RaftCommand) -> None:
+    async def _apply_update_workflow_status(self, command: RaftCommand, entry: RaftLogEntry) -> None:
         """Apply UPDATE_WORKFLOW_STATUS: update workflow status."""
         await self._job_manager.update_workflow_status(
             job_id=command.job_id,
@@ -215,14 +227,20 @@ class RaftStateMachine:
     # State Management Handlers
     # =========================================================================
 
-    async def _apply_update_job_status(self, command: RaftCommand) -> None:
-        """Apply UPDATE_JOB_STATUS: update job status string."""
+    async def _apply_update_job_status(self, command: RaftCommand, entry: RaftLogEntry) -> None:
+        """Apply UPDATE_JOB_STATUS: update job status string.
+
+        Passes ``entry.timestamp`` so the update is recorded with the
+        replicated HLC wall-clock value rather than each follower's local
+        monotonic clock.
+        """
         await self._job_manager.update_job_status(
             job_token=command.job_token,
             status=command.status,
+            timestamp=entry.timestamp,
         )
 
-    async def _apply_update_context(self, command: RaftCommand) -> None:
+    async def _apply_update_context(self, command: RaftCommand, entry: RaftLogEntry) -> None:
         """Apply UPDATE_CONTEXT: merge context updates into job."""
         await self._job_manager.update_context(
             job_token=command.job_token,
@@ -233,7 +251,7 @@ class RaftStateMachine:
     # Job Leadership Handlers
     # =========================================================================
 
-    async def _apply_assume_leadership(self, command: RaftCommand) -> None:
+    async def _apply_assume_leadership(self, command: RaftCommand, entry: RaftLogEntry) -> None:
         """Apply ASSUME_JOB_LEADERSHIP: this node assumes leadership."""
         self._leadership_tracker.assume_leadership(
             job_id=command.job_id,
@@ -241,14 +259,14 @@ class RaftStateMachine:
             initial_token=command.initial_token,
         )
 
-    async def _apply_takeover_leadership(self, command: RaftCommand) -> None:
+    async def _apply_takeover_leadership(self, command: RaftCommand, entry: RaftLogEntry) -> None:
         """Apply TAKEOVER_JOB_LEADERSHIP: this node takes over leadership."""
         self._leadership_tracker.takeover_leadership(
             job_id=command.job_id,
             metadata=command.metadata,
         )
 
-    async def _apply_release_leadership(self, command: RaftCommand) -> None:
+    async def _apply_release_leadership(self, command: RaftCommand, entry: RaftLogEntry) -> None:
         """Apply RELEASE_JOB_LEADERSHIP: release leadership of a job."""
         self._leadership_tracker.release_leadership(job_id=command.job_id)
 
@@ -256,33 +274,41 @@ class RaftStateMachine:
     # Cancellation Handlers
     # =========================================================================
 
-    async def _apply_initiate_cancellation(self, command: RaftCommand) -> None:
-        """Apply INITIATE_CANCELLATION: begin cancellation of a job."""
+    async def _apply_initiate_cancellation(self, command: RaftCommand, entry: RaftLogEntry) -> None:
+        """Apply INITIATE_CANCELLATION: begin cancellation of a job.
+
+        Uses ``entry.timestamp`` (replicated HLC wall-clock seconds) for the
+        recorded transition time so every follower sets identical state.
+        """
         if not (job := self._job_manager.get_job_by_id(command.job_id)):
             return
 
         async with job.lock:
             job.status = "cancelling"
-            job.timestamp = time.monotonic()
+            job.timestamp = entry.timestamp
 
         if self._manager_state and command.pending_workflows:
             self._manager_state.set_cancellation_initiated_at(
-                command.job_id, time.monotonic()
+                command.job_id, entry.timestamp
             )
             for workflow_id in command.pending_workflows:
                 self._manager_state.add_cancellation_pending_workflow(
                     command.job_id, workflow_id
                 )
 
-    async def _apply_complete_cancellation(self, command: RaftCommand) -> None:
-        """Apply COMPLETE_CANCELLATION: finalize cancellation of a job."""
+    async def _apply_complete_cancellation(self, command: RaftCommand, entry: RaftLogEntry) -> None:
+        """Apply COMPLETE_CANCELLATION: finalize cancellation of a job.
+
+        Uses ``entry.timestamp`` for both ``completed_at`` and ``timestamp`` so
+        every follower converges on identical state.
+        """
         if not (job := self._job_manager.get_job_by_id(command.job_id)):
             return
 
         async with job.lock:
             job.status = "cancelled"
-            job.completed_at = time.monotonic()
-            job.timestamp = time.monotonic()
+            job.completed_at = entry.timestamp
+            job.timestamp = entry.timestamp
 
         if self._manager_state:
             self._manager_state.clear_cancellation_state(command.job_id)
@@ -291,7 +317,7 @@ class RaftStateMachine:
     # Provisioning Handlers
     # =========================================================================
 
-    async def _apply_provision_confirmed(self, command: RaftCommand) -> None:
+    async def _apply_provision_confirmed(self, command: RaftCommand, entry: RaftLogEntry) -> None:
         """Apply PROVISION_CONFIRMED: record a provision confirmation."""
         if not self._manager_state or not command.confirming_node_id:
             return
@@ -307,7 +333,7 @@ class RaftStateMachine:
     # Stats Handlers
     # =========================================================================
 
-    async def _apply_flush_stats_window(self, command: RaftCommand) -> None:
+    async def _apply_flush_stats_window(self, command: RaftCommand, entry: RaftLogEntry) -> None:
         """Apply FLUSH_STATS_WINDOW: apply aggregated stats window data."""
         if not command.stats_data:
             return
@@ -334,7 +360,7 @@ class RaftStateMachine:
     # Membership Handlers
     # =========================================================================
 
-    async def _apply_node_membership_event(self, command: RaftCommand) -> None:
+    async def _apply_node_membership_event(self, command: RaftCommand, entry: RaftLogEntry) -> None:
         """Apply NODE_MEMBERSHIP_EVENT: record a cluster membership change."""
         if not command.event_type or not command.node_id:
             return
@@ -349,6 +375,6 @@ class RaftStateMachine:
     # Raft Control
     # =========================================================================
 
-    async def _apply_no_op(self, command: RaftCommand) -> None:
+    async def _apply_no_op(self, command: RaftCommand, entry: RaftLogEntry) -> None:
         """Apply NO_OP: no state change. Used for leadership confirmation."""
         pass

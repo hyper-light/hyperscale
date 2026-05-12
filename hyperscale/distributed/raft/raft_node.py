@@ -25,6 +25,7 @@ from .raft_log import RaftLog
 
 if TYPE_CHECKING:
     from hyperscale.logging import Logger
+    from hyperscale.logging.lsn import HybridLamportClock
 
 
 # Raft timing constants (seconds)
@@ -52,6 +53,7 @@ class RaftNode:
         "_on_become_leader",
         "_on_lose_leadership",
         "_logger",
+        "_clock",
         "_lock",
         "_log",
         "_role",
@@ -79,6 +81,7 @@ class RaftNode:
         on_become_leader: Callable[[], None] | None,
         on_lose_leadership: Callable[[], None] | None,
         logger: "Logger",
+        clock: "HybridLamportClock | None" = None,
     ) -> None:
         self._job_id = job_id
         self._node_id = node_id
@@ -89,6 +92,7 @@ class RaftNode:
         self._on_become_leader = on_become_leader
         self._on_lose_leadership = on_lose_leadership
         self._logger = logger
+        self._clock = clock
 
         self._lock = asyncio.Lock()
         self._log = RaftLog(job_id)
@@ -444,6 +448,14 @@ class RaftNode:
         """
         Propose a new command (leader only).
 
+        The entry timestamp is minted from the shared HybridLamportClock when
+        one is supplied; this gives all followers an identical wall-clock-derived
+        seconds value when the entry is replicated, so apply handlers can use
+        ``entry.timestamp`` as a deterministic time source. When no clock is
+        configured, the timestamp falls back to the leader's monotonic clock --
+        still replicated (single-source), but not comparable to wall-clock
+        consumers; production paths always supply a clock.
+
         Returns:
             (success, index) -- success is False if not leader or log at capacity.
         """
@@ -453,13 +465,19 @@ class RaftNode:
             if self._log.is_at_capacity:
                 return False, 0
 
+            if self._clock is not None:
+                lsn = await self._clock.generate()
+                entry_timestamp = lsn.wall_clock / 1000.0
+            else:
+                entry_timestamp = time.monotonic()
+
             entry = RaftLogEntry(
                 term=self._current_term,
                 index=self._log.last_index() + 1,
                 command=command,
                 command_type=command_type,
                 job_id=self._job_id,
-                timestamp=time.monotonic(),
+                timestamp=entry_timestamp,
             )
             index = self._log.append(entry)
             return True, index

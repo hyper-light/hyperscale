@@ -346,9 +346,9 @@ class JobInfo:
     workflows_total: int = 0
     workflows_completed: int = 0
     workflows_failed: int = 0
-    started_at: float = 0.0  # time.monotonic() when job started
-    completed_at: float = 0.0  # time.monotonic() when job reached terminal state
-    timestamp: float = 0.0  # Last update time
+    started_at: float = 0.0  # time.monotonic() when job started (local-only; do not compare across nodes)
+    completed_at: float = 0.0  # Wall-clock seconds; set from RaftLogEntry.timestamp (HLC) in apply, time.time() locally
+    timestamp: float = 0.0  # Wall-clock seconds of last update; same semantic as completed_at; compare with time.time()
 
     # Workflow tracking - keyed by token string for fast lookup
     workflows: dict[str, WorkflowInfo] = field(

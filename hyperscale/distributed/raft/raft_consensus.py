@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     from hyperscale.distributed.nodes.manager.state import ManagerState
     from hyperscale.distributed.taskex import TaskRunner
     from hyperscale.logging import Logger
+    from hyperscale.logging.lsn import HybridLamportClock
 
 
 class RaftConsensus:
@@ -41,6 +42,7 @@ class RaftConsensus:
         "_logger",
         "_task_runner",
         "_send_message",
+        "_clock",
         "_members",
         "_member_addrs",
         "_nodes",
@@ -62,6 +64,7 @@ class RaftConsensus:
         on_become_leader: Callable[[str], None] | None = None,
         on_lose_leadership: Callable[[str], None] | None = None,
         manager_state: "ManagerState | None" = None,
+        clock: "HybridLamportClock | None" = None,
     ) -> None:
         self._node_id = node_id
         self._job_manager = job_manager
@@ -72,6 +75,7 @@ class RaftConsensus:
         self._logger = logger
         self._task_runner = task_runner
         self._send_message = send_message
+        self._clock = clock
 
         self._members: set[str] = set()
         self._member_addrs: dict[str, tuple[str, int]] = {}
@@ -160,6 +164,7 @@ class RaftConsensus:
             on_become_leader=self._make_leader_callback(job_id),
             on_lose_leadership=self._make_lose_leadership_callback(job_id),
             logger=self._logger,
+            clock=self._clock,
         )
         self._nodes[job_id] = node
 
