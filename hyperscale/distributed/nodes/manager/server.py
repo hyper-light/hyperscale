@@ -4048,6 +4048,16 @@ class ManagerServer(HealthAwareServer):
             return await self._stats.import_stats_checkpoint(checkpoint)
         return 0
 
+    async def _mark_worker_dispatch_unreachable(self, worker_id: str) -> None:
+        """Temporarily remove a worker from workflow dispatch routing."""
+        if self._worker_pool.update_health(worker_id, WorkerState.OFFLINE):
+            await self._worker_pool.notify_cores_available()
+
+    async def _mark_worker_dispatch_reachable(self, worker_id: str) -> None:
+        """Restore a worker to dispatch routing after a successful TCP dispatch."""
+        if self._worker_pool.update_health(worker_id, WorkerState.HEALTHY):
+            await self._worker_pool.notify_cores_available()
+
     async def _send_workflow_dispatch(
         self,
         worker_id: str,
@@ -4074,6 +4084,7 @@ class ManagerServer(HealthAwareServer):
                     node_id=self._node_id.short,
                 )
             )
+            await self._mark_worker_dispatch_unreachable(worker_id)
             return False
         if dispatch.job_leader_addr is None:
             dispatch.job_leader_addr = (self._host, self._tcp_port)
@@ -4088,9 +4099,15 @@ class ManagerServer(HealthAwareServer):
 
             if response and not isinstance(response, Exception):
                 ack = WorkflowDispatchAck.load(response)
-                return bool(getattr(ack, "accepted", True))
+                if bool(getattr(ack, "accepted", True)):
+                    await self._mark_worker_dispatch_reachable(worker_id)
+                    return True
+                return False
+
+            await self._mark_worker_dispatch_unreachable(worker_id)
 
         except Exception as error:
+            await self._mark_worker_dispatch_unreachable(worker_id)
             await self._udp_logger.log(
                 ServerError(
                     message=f"Workflow dispatch error: {error}",

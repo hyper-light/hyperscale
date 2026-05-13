@@ -223,11 +223,18 @@ class WorkerPool:
         Check if a worker is considered healthy.
 
         A worker is healthy if:
-        1. SWIM reports it as OK, OR
-        2. It was recently registered (within grace period)
+        1. The local routing state allows new work, AND
+        2. SWIM reports it as OK, or it has explicit healthy state, or it is
+           within the new-registration grace period.
         """
         worker = self._workers.get(node_id)
         if not worker:
+            return False
+
+        # Direct routing state is more specific than SWIM membership. A worker
+        # can still be visible to UDP/SWIM while its TCP dispatch path is
+        # unavailable or it is draining.
+        if worker.health in (WorkerState.DRAINING, WorkerState.OFFLINE):
             return False
 
         # Check SWIM status if callback provided
@@ -245,8 +252,6 @@ class WorkerPool:
         # Check explicit health status
         if worker.health == WorkerState.HEALTHY:
             return True
-        if worker.health in (WorkerState.DRAINING, WorkerState.OFFLINE):
-            return False
 
         # Grace period for newly registered workers
         now = time.monotonic()
@@ -444,12 +449,16 @@ class WorkerPool:
         async with self._cores_condition:
             if (
                 worker.heartbeat is not None
-                and heartbeat.version <= worker.heartbeat.version
+                and heartbeat.version < worker.heartbeat.version
             ):
                 return True
 
             worker.heartbeat = heartbeat
             worker.last_seen = time.monotonic()
+            try:
+                worker.health = WorkerState(heartbeat.state)
+            except ValueError:
+                worker.health = WorkerState.DEGRADED
 
             old_available = worker.available_cores
             worker.available_cores = heartbeat.available_cores

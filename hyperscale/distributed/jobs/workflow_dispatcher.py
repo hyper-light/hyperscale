@@ -464,7 +464,7 @@ class WorkflowDispatcher:
 
         Allocation strategy:
         1. Explicit priority workflows (non-AUTO) are allocated first, proportionally by VUs
-        2. AUTO priority workflows split remaining cores equally (minimum 1 core each)
+        2. AUTO priority workflows use no more cores than they can keep busy
         3. If not enough cores for all workflows, only allocate what fits - rest stay pending
 
         Returns only workflows that can actually be allocated within available cores.
@@ -513,21 +513,34 @@ class WorkflowDispatcher:
                 allocations.append((pending, cores))
                 remaining_cores -= cores
 
-        # Step 2: Split remaining cores equally among AUTO workflows (min 1 core each)
+        # Step 2: AUTO uses up to one core per VU. A 1-VU workflow should
+        # not fan out across every worker in a large cluster; that turns a
+        # tiny workload into a cluster-wide dispatch handshake barrier and
+        # adds no useful parallelism.
         if auto and remaining_cores > 0:
-            # Each AUTO workflow needs minimum 1 core
-            # Only allocate as many workflows as we have cores for
-            num_auto_to_allocate = min(len(auto), remaining_cores)
-            cores_per_auto = remaining_cores // num_auto_to_allocate
-            leftover = remaining_cores - (cores_per_auto * num_auto_to_allocate)
+            auto = sorted(auto, key=lambda pending: pending.vus, reverse=True)
+            auto_to_allocate = auto[:remaining_cores]
+            auto_core_caps = [max(1, pending.vus) for pending in auto_to_allocate]
+            total_auto_core_cap = sum(auto_core_caps)
+            available_auto_cores = remaining_cores
 
-            for i, pending in enumerate(auto):
-                if i >= num_auto_to_allocate:
-                    # No more cores - remaining AUTO workflows stay pending
+            for index, pending in enumerate(auto_to_allocate):
+                if remaining_cores <= 0:
                     break
+                useful_cores = auto_core_caps[index]
+                remaining_workflows = len(auto_to_allocate) - index
+                reserved_for_rest = remaining_workflows - 1
 
-                # Give one extra core to first workflows if there's leftover
-                cores = cores_per_auto + (1 if i < leftover else 0)
+                if index == len(auto_to_allocate) - 1:
+                    cores = min(useful_cores, remaining_cores)
+                else:
+                    share = useful_cores / total_auto_core_cap
+                    proportional_cores = max(1, int(available_auto_cores * share))
+                    cores = min(
+                        useful_cores,
+                        proportional_cores,
+                        remaining_cores - reserved_for_rest,
+                    )
 
                 allocations.append((pending, cores))
                 remaining_cores -= cores
