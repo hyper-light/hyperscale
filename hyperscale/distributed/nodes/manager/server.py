@@ -4228,6 +4228,26 @@ class ManagerServer(HealthAwareServer):
                     protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
                 ).dump()
 
+            max_workers = self._config.max_workers_per_manager
+            is_new_worker = self._registry.get_worker(registration.node.node_id) is None
+            if (
+                max_workers is not None
+                and max_workers >= 0
+                and is_new_worker
+                and self._manager_state.get_worker_count() >= max_workers
+            ):
+                return RegistrationResponse(
+                    accepted=False,
+                    manager_id=self._node_id.full,
+                    healthy_managers=[],
+                    error=(
+                        "Worker registration rejected: "
+                        f"MAX_WORKERS_PER_MANAGER={max_workers} reached"
+                    ),
+                    protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+                    protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+                ).dump()
+
             # Register worker
             self._registry.register_worker(registration)
 

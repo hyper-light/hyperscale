@@ -91,6 +91,7 @@ class ClusterHarness:
     _gates: list[ServerHandle] = field(init=False, default_factory=list)
     _managers_by_dc: dict[str, list[ServerHandle]] = field(init=False, default_factory=dict)
     _workers_by_dc: dict[str, list[ServerHandle]] = field(init=False, default_factory=dict)
+    _next_worker_index_by_dc: dict[str, int] = field(init=False, default_factory=dict)
     _entered: bool = field(init=False, default=False)
 
     async def __aenter__(self) -> "ClusterHarness":
@@ -209,6 +210,35 @@ class ClusterHarness:
     def all_handles(self) -> list[ServerHandle]:
         return self._supervisor.server_handles
 
+    async def add_worker(self, dc_id: str) -> ServerHandle:
+        """Construct, start, and register one additional worker in ``dc_id``."""
+        if dc_id not in self.spec.datacenters:
+            raise KeyError(f"unknown datacenter {dc_id!r}")
+        dc_spec = self.spec.datacenters[dc_id]
+        tcp, udp = self._ports.reserve_worker_block(
+            cores=dc_spec.cores_per_worker,
+            block_size=dc_spec.worker_port_block_size,
+        )
+        worker_index = self._next_worker_index_by_dc.get(
+            dc_id, len(self._workers_by_dc.get(dc_id, []))
+        )
+        handle = self._build_worker_handle(
+            dc_id=dc_id,
+            dc_spec=dc_spec,
+            index=worker_index,
+            tcp=tcp,
+            udp=udp,
+        )
+        self._next_worker_index_by_dc[dc_id] = worker_index + 1
+        self._handles_by_id[handle.node_id] = handle
+        self._workers_by_dc.setdefault(dc_id, []).append(handle)
+        self._supervisor.register_server(handle)
+        await handle.instance.start()
+        handle.started = True
+        self._supervisor.start_worker_pid_tracking(handle)
+        fault_transport.reinstall_for(handle, self)
+        return handle
+
     def address_to_node_id(
         self, address: tuple[str, int], *, kind: str = "tcp"
     ) -> str | None:
@@ -255,7 +285,10 @@ class ClusterHarness:
         worker_addrs_by_dc: dict[str, list[tuple[int, int]]] = {}
         for dc_id, dc_spec in self.spec.datacenters.items():
             worker_addrs_by_dc[dc_id] = [
-                self._ports.reserve_worker_block(cores=dc_spec.cores_per_worker)
+                self._ports.reserve_worker_block(
+                    cores=dc_spec.cores_per_worker,
+                    block_size=dc_spec.worker_port_block_size,
+                )
                 for _ in range(dc_spec.workers)
             ]
 
@@ -384,48 +417,71 @@ class ClusterHarness:
         for dc_id, addrs in worker_addrs_by_dc.items():
             dc_spec = self.spec.datacenters[dc_id]
             self._workers_by_dc[dc_id] = []
-            seed_managers = [
-                (self.spec.host, tcp) for tcp, _udp in manager_addrs_by_dc[dc_id]
-            ]
             for index, (tcp, udp) in enumerate(addrs):
-                node_id = f"{dc_id}.worker.{index}"
-
-                def _build_worker(
-                    _node_id=node_id, _dc_id=dc_id, _dc_spec=dc_spec,
-                    _tcp=tcp, _udp=udp,
-                ) -> WorkerServer:
-                    env = self._build_env(
-                        node_id=_node_id,
-                        dc_id=_dc_id,
-                        dc_spec=_dc_spec,
-                        worker_cores=_dc_spec.cores_per_worker,
-                    )
-                    return WorkerServer(
-                        host=self.spec.host,
-                        tcp_port=_tcp,
-                        udp_port=_udp,
-                        env=env,
-                        dc_id=_dc_id,
-                        seed_managers=seed_managers,
-                    )
-
-                worker = _build_worker()
-                handle = ServerHandle(
-                    node_id=node_id,
-                    kind=ServerKind.WORKER,
+                handle = self._build_worker_handle(
                     dc_id=dc_id,
-                    host=self.spec.host,
-                    tcp_port=tcp,
-                    udp_port=udp,
-                    instance=worker,
-                    worker_ports=WorkerPorts.for_worker(
-                        tcp=tcp, udp=udp, cores=dc_spec.cores_per_worker
-                    ),
-                    builder=_build_worker,
+                    dc_spec=dc_spec,
+                    index=index,
+                    tcp=tcp,
+                    udp=udp,
+                    seed_managers=[
+                        (self.spec.host, manager_tcp)
+                        for manager_tcp, _manager_udp in manager_addrs_by_dc[dc_id]
+                    ],
                 )
-                self._handles_by_id[node_id] = handle
+                self._handles_by_id[handle.node_id] = handle
                 self._workers_by_dc[dc_id].append(handle)
                 self._supervisor.register_server(handle)
+            self._next_worker_index_by_dc[dc_id] = len(addrs)
+
+    def _build_worker_handle(
+        self,
+        dc_id: str,
+        dc_spec: DCSpec,
+        index: int,
+        tcp: int,
+        udp: int,
+        seed_managers: list[tuple[str, int]] | None = None,
+    ) -> ServerHandle:
+        node_id = f"{dc_id}.worker.{index}"
+        manager_seeds = seed_managers or [
+            (manager.host, manager.tcp_port)
+            for manager in self._managers_by_dc.get(dc_id, [])
+        ]
+
+        def _build_worker(
+            _node_id=node_id, _dc_id=dc_id, _dc_spec=dc_spec,
+            _tcp=tcp, _udp=udp, _seed_managers=manager_seeds,
+        ) -> WorkerServer:
+            env = self._build_env(
+                node_id=_node_id,
+                dc_id=_dc_id,
+                dc_spec=_dc_spec,
+                worker_cores=_dc_spec.cores_per_worker,
+            )
+            return WorkerServer(
+                host=self.spec.host,
+                tcp_port=_tcp,
+                udp_port=_udp,
+                env=env,
+                dc_id=_dc_id,
+                seed_managers=_seed_managers,
+            )
+
+        worker = _build_worker()
+        return ServerHandle(
+            node_id=node_id,
+            kind=ServerKind.WORKER,
+            dc_id=dc_id,
+            host=self.spec.host,
+            tcp_port=tcp,
+            udp_port=udp,
+            instance=worker,
+            worker_ports=WorkerPorts.for_worker(
+                tcp=tcp, udp=udp, cores=dc_spec.cores_per_worker
+            ),
+            builder=_build_worker,
+        )
 
     async def _start_servers(self) -> None:
         # Start order matters: gates first (so managers can register with
@@ -589,6 +645,8 @@ class ClusterHarness:
             kwargs["RECOVERY_JITTER_MAX"] = layered.recovery_jitter_max
         if worker_cores is not None:
             kwargs["WORKER_MAX_CORES"] = layered.worker_max_cores or worker_cores
+        if layered.max_workers_per_manager is not None:
+            kwargs["MAX_WORKERS_PER_MANAGER"] = layered.max_workers_per_manager
         return Env(**kwargs)
 
     def _layered_overrides(
@@ -619,6 +677,9 @@ def _merge(base: EnvOverrides, overlay: EnvOverrides) -> EnvOverrides:
         worker_max_cores=overlay.worker_max_cores
         if overlay.worker_max_cores is not None
         else base.worker_max_cores,
+        max_workers_per_manager=overlay.max_workers_per_manager
+        if overlay.max_workers_per_manager is not None
+        else base.max_workers_per_manager,
         recovery_jitter_min=overlay.recovery_jitter_min
         if overlay.recovery_jitter_min is not None
         else base.recovery_jitter_min,

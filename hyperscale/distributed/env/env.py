@@ -199,6 +199,13 @@ class Env(BaseModel):
     MANAGER_HEARTBEAT_INTERVAL: StrictFloat = (
         5.0  # Seconds between manager heartbeats to gates
     )
+    MAX_WORKERS_PER_MANAGER: StrictInt | None = None
+    """Optional hard cap for worker registrations accepted by a manager.
+
+    ``None`` preserves the historical unlimited behavior. Tests and
+    deployments can set this to a non-negative integer when they need a
+    bounded worker fan-in per manager.
+    """
     MANAGER_PEER_SYNC_INTERVAL: StrictFloat = (
         10.0  # Seconds between job state sync to peer managers
     )
@@ -771,6 +778,7 @@ class Env(BaseModel):
             "MANAGER_STATE_SYNC_RETRIES": int,
             "MANAGER_DISPATCH_CORE_WAIT_TIMEOUT": float,
             "MANAGER_HEARTBEAT_INTERVAL": float,
+            "MAX_WORKERS_PER_MANAGER": int,
             "MANAGER_PEER_SYNC_INTERVAL": float,
             # Job cleanup settings
             "COMPLETED_JOB_MAX_AGE": float,

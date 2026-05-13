@@ -21,5 +21,6 @@ class EnvOverrides:
     log_level: str | None = None
     connect_timeout_seconds: float | None = None
     worker_max_cores: int | None = None
+    max_workers_per_manager: int | None = None
     recovery_jitter_min: float | None = None
     recovery_jitter_max: float | None = None

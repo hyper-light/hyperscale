@@ -197,6 +197,15 @@ class LocalLeaderElection:
             term=self.state.current_term,
             reason=reason,
         )
+
+    async def _record_election_failure(self, reason: str) -> None:
+        """Record a failed election attempt for flapping/backoff detection."""
+        await self.flapping_detector.record_change(
+            old_leader=self.state.current_leader,
+            new_leader=self.state.current_leader,
+            term=self.state.current_term,
+            reason=reason,
+        )
     
     def is_self_eligible(self) -> bool:
         """Check if this node is eligible to become leader."""
@@ -469,6 +478,7 @@ class LocalLeaderElection:
             await self._log_debug(
                 "run_election abort: pre_vote did not reach majority"
             )
+            await self._record_election_failure("pre_vote_failed")
             return
 
         # Phase 2: Real election
@@ -478,6 +488,7 @@ class LocalLeaderElection:
         if self.state.is_term_exhausted():
             # Log and bail - this should never happen in normal operation
             await self._log_debug(f"CRITICAL: Term exhausted at {self.state.current_term}")
+            await self._record_election_failure("term_exhausted")
             return
 
         if not self.state.start_election(new_term):
@@ -485,6 +496,7 @@ class LocalLeaderElection:
             await self._log_debug(
                 f"run_election abort: start_election rejected term={new_term}"
             )
+            await self._record_election_failure("start_election_rejected")
             return
         self.state.update_fencing_token(new_term)
 
@@ -557,6 +569,7 @@ class LocalLeaderElection:
                     f"run_election lost: not enough votes "
                     f"({len(self.state.votes_received)} < {votes_needed})"
                 )
+                await self._record_election_failure("election_lost_no_quorum")
         else:
             await self._log_debug(
                 f"run_election ended as {self.state.role}; not tallying votes"
@@ -811,4 +824,3 @@ class LocalLeaderElection:
     def get_flapping_stats(self) -> dict:
         """Get flapping detector statistics."""
         return self.flapping_detector.get_stats()
-

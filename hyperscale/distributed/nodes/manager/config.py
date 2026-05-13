@@ -129,6 +129,7 @@ class ManagerConfig:
     # Heartbeat settings (from env)
     heartbeat_interval_seconds: float = 5.0
     gate_heartbeat_interval_seconds: float = 10.0
+    max_workers_per_manager: int | None = None
 
     # Peer sync settings (from env)
     peer_sync_interval_seconds: float = 30.0
@@ -252,6 +253,7 @@ def create_manager_config_from_env(
         gate_heartbeat_interval_seconds=getattr(
             env, "MANAGER_GATE_HEARTBEAT_INTERVAL", 10.0
         ),
+        max_workers_per_manager=env.MAX_WORKERS_PER_MANAGER,
         peer_sync_interval_seconds=env.MANAGER_PEER_SYNC_INTERVAL,
         peer_job_sync_interval_seconds=getattr(
             env, "MANAGER_PEER_JOB_SYNC_INTERVAL", 15.0

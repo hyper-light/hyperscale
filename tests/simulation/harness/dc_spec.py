@@ -18,5 +18,13 @@ class DCSpec:
     cores_per_worker: int = 2
     """Cores each worker advertises. Drives subprocess count."""
 
+    worker_port_block_size: int = 500
+    """Contiguous port block reserved per worker.
+
+    Large topologies with one-core workers can set a smaller block to
+    avoid exhausting the local port range while retaining collision-free
+    derived worker-pool ports.
+    """
+
     env: EnvOverrides | None = None
     """DC-level env overrides applied to every node in this DC."""

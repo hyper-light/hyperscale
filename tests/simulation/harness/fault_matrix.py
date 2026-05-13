@@ -42,8 +42,11 @@ Invariants the harness enforces around fault operations:
 
 import asyncio
 import random
-from dataclasses import dataclass, field
+from collections.abc import Callable
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
+
+import psutil
 
 from tests.simulation.harness.errors import HarnessError
 from tests.simulation.harness.server_handle import ServerHandle, ServerKind
@@ -113,6 +116,8 @@ class FaultMatrix:
     _partitions: list[_PartitionRule]
     _delays: list[_DelayRule]
     _drops: list[_DropRule]
+    _resource_overrides: dict[str, tuple[Callable[[], float], Callable[[], float]]]
+    _suspended_processes: dict[int, psutil.Process]
 
     def __init__(self, harness: "ClusterHarness") -> None:
         self.harness = harness
@@ -121,6 +126,8 @@ class FaultMatrix:
         self._partitions = []
         self._delays = []
         self._drops = []
+        self._resource_overrides = {}
+        self._suspended_processes = {}
 
     # =========================================================================
     # Kill / restart
@@ -203,6 +210,31 @@ class FaultMatrix:
         from tests.simulation.harness import fault_transport
 
         fault_transport.reinstall_for(handle, self.harness)
+
+    async def kill_many(self, handles: list[ServerHandle]) -> None:
+        """Abruptly kill every handle concurrently."""
+        await asyncio.gather(*(self.kill(handle) for handle in handles))
+
+    async def graceful_stop(
+        self,
+        handle: ServerHandle,
+        drain_timeout: float = 5.0,
+    ) -> None:
+        """Gracefully stop ``handle`` while broadcasting a leave event."""
+        self._require_known(handle)
+        if handle.node_id in self._killed:
+            return
+        if not handle.started:
+            raise FaultError(
+                f"graceful_stop({handle.node_id}): node has not been started"
+            )
+        await handle.instance.stop(
+            drain_timeout=drain_timeout,
+            broadcast_leave=True,
+        )
+        handle.started = False
+        self._killed.add(handle.node_id)
+        await asyncio.sleep(0.05)
 
     # =========================================================================
     # Pause / resume
@@ -487,6 +519,125 @@ class FaultMatrix:
         self._delays.clear()
         self._drops.clear()
 
+    # =========================================================================
+    # Resource / subprocess faults — Phase 3 resource-pressure primitives
+    # =========================================================================
+
+    async def inject_worker_resources(
+        self,
+        handle: ServerHandle,
+        *,
+        cpu_percent: float | None = None,
+        memory_percent: float | None = None,
+    ) -> None:
+        """Override a worker's CPU/memory samples until cleared."""
+        self._require_worker(handle, "inject_worker_resources")
+        instance = handle.instance
+        if handle.node_id not in self._resource_overrides:
+            self._resource_overrides[handle.node_id] = (
+                instance._get_cpu_percent,
+                instance._get_memory_percent,
+            )
+        original_cpu, original_memory = self._resource_overrides[handle.node_id]
+
+        def get_cpu_percent() -> float:
+            return cpu_percent if cpu_percent is not None else original_cpu()
+
+        def get_memory_percent() -> float:
+            return (
+                memory_percent
+                if memory_percent is not None
+                else original_memory()
+            )
+
+        instance._get_cpu_percent = get_cpu_percent
+        instance._get_memory_percent = get_memory_percent
+        instance._backpressure_manager.set_resource_getters(
+            get_cpu_percent,
+            get_memory_percent,
+        )
+        await asyncio.sleep(0)
+
+    async def clear_worker_resource_injection(self, handle: ServerHandle) -> None:
+        """Restore worker resource getters after ``inject_worker_resources``."""
+        self._require_worker(handle, "clear_worker_resource_injection")
+        originals = self._resource_overrides.pop(handle.node_id, None)
+        if originals is None:
+            return
+        original_cpu, original_memory = originals
+        handle.instance._get_cpu_percent = original_cpu
+        handle.instance._get_memory_percent = original_memory
+        handle.instance._backpressure_manager.set_resource_getters(
+            original_cpu,
+            original_memory,
+        )
+        await asyncio.sleep(0)
+
+    async def inject_event_loop_lag(
+        self,
+        handle: ServerHandle,
+        *,
+        critical: bool = False,
+        repeats: int = 1,
+    ) -> None:
+        """Inject event-loop lag callbacks into a node's health pipeline."""
+        self._require_known(handle)
+        if repeats < 1:
+            raise FaultError(f"repeats must be >= 1; got {repeats}")
+        for _repeat_index in range(repeats):
+            if critical:
+                await handle.instance._on_event_loop_critical(1.0)
+            else:
+                await handle.instance._on_event_loop_lag(1.0)
+
+    async def crash_worker_subprocess(
+        self,
+        handle: ServerHandle,
+        *,
+        index: int = 0,
+    ) -> int:
+        """Terminate one worker-pool child process and return its PID."""
+        pid = self._select_worker_pid(handle, index, "crash_worker_subprocess")
+        process = psutil.Process(pid)
+        process.terminate()
+        try:
+            _gone, alive = psutil.wait_procs([process], timeout=2.0)
+        except psutil.NoSuchProcess:
+            return pid
+        if alive:
+            try:
+                process.kill()
+            except psutil.NoSuchProcess:
+                return pid
+        return pid
+
+    async def hang_worker_subprocess(
+        self,
+        handle: ServerHandle,
+        *,
+        index: int = 0,
+    ) -> int:
+        """Suspend one worker-pool child process and return its PID."""
+        pid = self._select_worker_pid(handle, index, "hang_worker_subprocess")
+        process = psutil.Process(pid)
+        process.suspend()
+        self._suspended_processes[pid] = process
+        await asyncio.sleep(0)
+        return pid
+
+    async def resume_worker_subprocess(self, pid: int) -> None:
+        """Resume a worker-pool child suspended by ``hang_worker_subprocess``."""
+        process = self._suspended_processes.pop(pid, None)
+        if process is None:
+            if not psutil.pid_exists(pid):
+                return
+            process = psutil.Process(pid)
+        try:
+            process.resume()
+        except psutil.NoSuchProcess:
+            return
+        await asyncio.sleep(0)
+
     def is_partitioned(self, src_node_id: str, dst_node_id: str) -> bool:
         """True iff any installed partition rule blocks this pair.
 
@@ -618,6 +769,32 @@ class FaultMatrix:
                 f"unknown handle {handle.node_id!r}; not registered with "
                 f"this harness"
             )
+
+    def _require_worker(self, handle: ServerHandle, operation: str) -> None:
+        self._require_known(handle)
+        if handle.kind is not ServerKind.WORKER:
+            raise FaultError(
+                f"{operation} expects a WORKER handle; got {handle.kind}"
+            )
+
+    def _select_worker_pid(
+        self,
+        handle: ServerHandle,
+        index: int,
+        operation: str,
+    ) -> int:
+        self._require_worker(handle, operation)
+        pids = sorted(self.harness.supervisor.tracked_pids(handle.node_id))
+        if not pids:
+            raise FaultError(
+                f"{operation}({handle.node_id}): no worker subprocess PIDs tracked"
+            )
+        if index < 0 or index >= len(pids):
+            raise FaultError(
+                f"{operation}({handle.node_id}): index {index} out of range "
+                f"for {len(pids)} tracked subprocesses"
+            )
+        return pids[index]
 
 
 @dataclass(slots=True)
