@@ -42,6 +42,7 @@ Invariants the harness enforces around fault operations:
 
 import asyncio
 import random
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -600,15 +601,16 @@ class FaultMatrix:
         pid = self._select_worker_pid(handle, index, "crash_worker_subprocess")
         process = psutil.Process(pid)
         process.terminate()
-        try:
-            _gone, alive = psutil.wait_procs([process], timeout=2.0)
-        except psutil.NoSuchProcess:
+        if await self._wait_for_process_exit(pid, timeout=2.0):
             return pid
-        if alive:
+
+        if psutil.pid_exists(pid):
             try:
                 process.kill()
             except psutil.NoSuchProcess:
                 return pid
+
+        await self._wait_for_process_exit(pid, timeout=2.0)
         return pid
 
     async def hang_worker_subprocess(
@@ -795,6 +797,23 @@ class FaultMatrix:
                 f"for {len(pids)} tracked subprocesses"
             )
         return pids[index]
+
+    async def _wait_for_process_exit(self, pid: int, timeout: float) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self._process_is_gone_or_zombie(pid):
+                return True
+
+            await asyncio.sleep(0.05)
+
+        return self._process_is_gone_or_zombie(pid)
+
+    @staticmethod
+    def _process_is_gone_or_zombie(pid: int) -> bool:
+        try:
+            return psutil.Process(pid).status() == psutil.STATUS_ZOMBIE
+        except psutil.NoSuchProcess:
+            return True
 
 
 @dataclass(slots=True)

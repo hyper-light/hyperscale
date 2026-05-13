@@ -169,19 +169,67 @@ async def test_swim_leader_and_raft_job_leader_can_diverge_safely() -> None:
 
         swim_leader = _find_leader(managers)
         raft_job_leader = _find_follower(managers)
+        job_id = "synthetic-job"
         tracker: JobLeadershipTracker[int] = (
             raft_job_leader.instance._raft_leadership_tracker
         )
-        tracker.assume_leadership("synthetic-job", metadata=1, initial_token=7)
+        token = await tracker.assume_leadership_async(
+            job_id,
+            metadata=1,
+            initial_token=7,
+        )
+
+        for manager in managers:
+            manager_tracker: JobLeadershipTracker[int] = (
+                manager.instance._raft_leadership_tracker
+            )
+            if manager is raft_job_leader:
+                continue
+            accepted = await manager_tracker.process_leadership_claim_async(
+                job_id=job_id,
+                claimer_id=tracker.node_id,
+                claimer_addr=tracker.node_addr,
+                fencing_token=token,
+                metadata=1,
+            )
+            assert accepted is True
+
+        stale_claim_results = [
+            await manager.instance._raft_leadership_tracker.process_leadership_claim_async(
+                job_id=job_id,
+                claimer_id=swim_leader.node_id,
+                claimer_addr=(swim_leader.host, swim_leader.tcp_port),
+                fencing_token=token - 1,
+                metadata=1,
+            )
+            for manager in managers
+        ]
 
         leaderships = tracker.get_all_leaderships()
         assert raft_job_leader.instance.is_leader() is False
         assert swim_leader.node_id != raft_job_leader.node_id
+        assert stale_claim_results == [False, False, False]
         assert len(leaderships) == 1
-        assert leaderships[0][0] == "synthetic-job"
+        assert leaderships[0][0] == job_id
         assert leaderships[0][1] == tracker.node_id
-        assert leaderships[0][3] == 7
+        assert leaderships[0][3] == token
+
+        local_job_leaders = [
+            manager
+            for manager in managers
+            if manager.instance._raft_leadership_tracker.is_leader(job_id)
+        ]
+        assert local_job_leaders == [raft_job_leader]
+        assert {
+            manager.instance._raft_leadership_tracker.get_leader(job_id)
+            for manager in managers
+        } == {tracker.node_id}
+        assert {
+            manager.instance._raft_leadership_tracker.get_fencing_token(job_id)
+            for manager in managers
+        } == {token}
 
         heartbeat_time = swim_leader.instance._leader_election.state.leader_lease_start
         assert heartbeat_time <= time.monotonic()
+        assert swim_leader.instance._leader_election.state.is_lease_valid()
         assert dc_has_leader(managers)() is True

@@ -5,14 +5,22 @@ Phase 3 resource-pressure and worker-pool scenarios from ``docs/SCENARIOS.md`` Â
 import psutil
 import pytest
 
+from hyperscale.distributed.testing.workflows import LongRunningWorkflow
 from tests.simulation.harness import (
     ClusterHarness,
     ClusterSpec,
     DCSpec,
     EnvOverrides,
     ExecutionMode,
+    ExpectAllWorkflowsComplete,
+    ExpectCompletionWithin,
+    ExpectWorkflowTerminal,
+    Expectation,
     HarnessTimeouts,
     ServerHandle,
+    Submission,
+    SubmissionPattern,
+    WorkloadSpec,
     dc_has_leader,
     manager_has_n_workers,
     wait_until,
@@ -40,6 +48,43 @@ def _l2_manager_spec(base_port: int) -> ClusterSpec:
         env=EnvOverrides(request_timeout="5s", log_level="error"),
         base_port=base_port,
         timeouts=HarnessTimeouts(stabilization_default=60.0),
+    )
+
+
+def _long_workload(
+    timeout_seconds: float,
+    allowed_terminal_statuses: set[str] | None = None,
+) -> WorkloadSpec:
+    expectations: list[Expectation] = [
+        ExpectCompletionWithin(seconds=timeout_seconds),
+    ]
+    if allowed_terminal_statuses is None:
+        expectations.insert(
+            0,
+            ExpectAllWorkflowsComplete(
+                expected_workflow_names=["LongRunningWorkflow"]
+            ),
+        )
+    else:
+        expectations.insert(
+            0,
+            ExpectWorkflowTerminal(
+                expected_workflow_names=["LongRunningWorkflow"],
+                allowed_statuses=allowed_terminal_statuses,
+            ),
+        )
+
+    return WorkloadSpec(
+        submissions=[
+            Submission(
+                workflows=[([], LongRunningWorkflow)],
+                dc_count=1,
+                timeout_seconds=timeout_seconds,
+                vus=1,
+            ),
+        ],
+        pattern=SubmissionPattern.SINGLE,
+        expectations=expectations,
     )
 
 
@@ -114,7 +159,7 @@ async def test_memory_pressure_marks_worker_overloaded() -> None:
 @pytest.mark.asyncio
 @pytest.mark.simulation
 async def test_worker_subprocess_crash_is_reaped() -> None:
-    """A crashed worker-pool child is visible and reaped by the harness."""
+    """A crashed worker-pool child gives active work an explicit terminal outcome."""
     spec = _l1_worker_spec(base_port=55000)
     async with ClusterHarness(
         spec,
@@ -123,21 +168,36 @@ async def test_worker_subprocess_crash_is_reaped() -> None:
     ) as cluster:
         manager = cluster.managers("local")[0]
         worker = cluster.workers("local")[0]
-        pid = await cluster.faults.crash_worker_subprocess(worker)
 
-        await wait_until(
-            lambda: _process_gone_or_zombie(pid),
-            timeout=10.0,
-            poll=0.25,
-            description="worker subprocess exits after injected crash",
-        )
+        assert len(cluster.supervisor.tracked_pids(worker.node_id)) == 1
+        async with cluster.workload(
+            _long_workload(60.0, {"completed", "failed", "cancelled", "timeout"})
+        ) as driver:
+            await driver.submit()
+            await driver.wait_until_running(timeout=30.0)
+            await wait_until(
+                lambda: len(worker.instance._active_workflows) == 1,
+                timeout=10.0,
+                poll=0.1,
+                description="one active workflow is executing before child crash",
+            )
+
+            pid = await cluster.faults.crash_worker_subprocess(worker)
+            await wait_until(
+                lambda: _process_gone_or_zombie(pid),
+                timeout=10.0,
+                poll=0.25,
+                description="worker subprocess exits after injected crash",
+            )
+            await driver.wait_for_completion()
+
         assert manager_has_n_workers(manager, 1)() is True
 
 
 @pytest.mark.asyncio
 @pytest.mark.simulation
 async def test_worker_subprocess_hang_can_be_resumed() -> None:
-    """A suspended worker-pool child models a subprocess hang and can recover."""
+    """A suspended active worker-pool child models a hang and can recover."""
     spec = _l1_worker_spec(base_port=56500)
     async with ClusterHarness(
         spec,
@@ -145,22 +205,36 @@ async def test_worker_subprocess_hang_can_be_resumed() -> None:
         scenario_name="worker_subprocess_hang_can_be_resumed",
     ) as cluster:
         worker = cluster.workers("local")[0]
-        pid = await cluster.faults.hang_worker_subprocess(worker)
+        assert len(cluster.supervisor.tracked_pids(worker.node_id)) == 1
+        async with cluster.workload(_long_workload(90.0)) as driver:
+            await driver.submit()
+            await driver.wait_until_running(timeout=30.0)
+            await wait_until(
+                lambda: len(worker.instance._active_workflows) == 1,
+                timeout=10.0,
+                poll=0.1,
+                description="one active workflow is executing before child hang",
+            )
 
-        await wait_until(
-            lambda: psutil.Process(pid).status() == psutil.STATUS_STOPPED,
-            timeout=5.0,
-            poll=0.1,
-            description="worker subprocess is suspended",
-        )
+            pid = await cluster.faults.hang_worker_subprocess(worker)
+            try:
+                await wait_until(
+                    lambda: psutil.Process(pid).status() == psutil.STATUS_STOPPED,
+                    timeout=5.0,
+                    poll=0.1,
+                    description="worker subprocess is suspended",
+                )
+                assert len(worker.instance._active_workflows) == 1
+            finally:
+                await cluster.faults.resume_worker_subprocess(pid)
 
-        await cluster.faults.resume_worker_subprocess(pid)
-        await wait_until(
-            lambda: psutil.Process(pid).status() != psutil.STATUS_STOPPED,
-            timeout=5.0,
-            poll=0.1,
-            description="worker subprocess resumes",
-        )
+            await wait_until(
+                lambda: psutil.Process(pid).status() != psutil.STATUS_STOPPED,
+                timeout=5.0,
+                poll=0.1,
+                description="worker subprocess resumes",
+            )
+            await driver.wait_for_completion()
 
 
 @pytest.mark.asyncio

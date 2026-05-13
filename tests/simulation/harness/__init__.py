@@ -37,6 +37,7 @@ from tests.simulation.harness.execution_mode import ExecutionMode
 from tests.simulation.harness.expectations import (
     ExpectAllWorkflowsComplete,
     ExpectCompletionWithin,
+    ExpectWorkflowTerminal,
     Expectation,
     ExpectationResult,
     WorkloadObservations,
@@ -76,6 +77,7 @@ __all__ = [
     "ExecutionMode",
     "ExpectAllWorkflowsComplete",
     "ExpectCompletionWithin",
+    "ExpectWorkflowTerminal",
     "Expectation",
     "ExpectationResult",
     "FaultError",

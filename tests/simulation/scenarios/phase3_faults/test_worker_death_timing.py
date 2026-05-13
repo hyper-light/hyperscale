@@ -6,6 +6,9 @@ manager exercises unstarted-dispatch cleanup, orphan reclaim, lost-result
 reassignment, and same/new-incarnation rejoin handling.
 """
 
+import asyncio
+from types import SimpleNamespace
+
 import pytest
 
 from hyperscale.distributed.models import WorkflowDispatch
@@ -68,25 +71,23 @@ async def test_worker_dies_mid_dispatch_before_ack() -> None:
         mode=ExecutionMode.REAL,
         scenario_name="worker_dies_mid_dispatch_before_ack",
     ) as cluster:
-        manager = cluster.managers("local")[0]
         victim = cluster.workers("local")[0]
-        victim_id = victim.instance._node_id.full
-        dispatcher = manager.instance._workflow_dispatcher
-        original_send_dispatch = dispatcher._send_dispatch
+        original_dispatch_handle = victim.instance._dispatch_handler.handle
         fault_landed = False
 
-        async def send_dispatch_with_rst(
-            worker_id: str,
-            dispatch: WorkflowDispatch,
-        ) -> bool:
+        async def cancel_before_ack(
+            addr: tuple[str, int],
+            data: bytes,
+            clock_time: int,
+        ) -> bytes:
             nonlocal fault_landed
-            if worker_id == victim_id and not fault_landed:
+            if not fault_landed:
                 fault_landed = True
                 await cluster.faults.kill(victim)
-                return False
-            return await original_send_dispatch(worker_id, dispatch)
+                raise asyncio.CancelledError("harness cancelled dispatch before ack")
+            return await original_dispatch_handle(addr, data, clock_time)
 
-        dispatcher._send_dispatch = send_dispatch_with_rst
+        victim.instance._dispatch_handler.handle = cancel_before_ack
         async with cluster.workload(_workload(SimpleWorkflow, 45.0)) as driver:
             await driver.submit_and_wait()
 
@@ -108,7 +109,22 @@ async def test_worker_dies_post_ack_before_workload_finishes() -> None:
         victim_id = victim.instance._node_id.full
         dispatcher = manager.instance._workflow_dispatcher
         original_send_dispatch = dispatcher._send_dispatch
+        original_task_runner_run = victim.instance._task_runner.run
         fault_landed = False
+        execution_deferred = False
+
+        def defer_workflow_execution(
+            call: object,
+            *args: object,
+            alias: str | None = None,
+            **kwargs: object,
+        ) -> object:
+            nonlocal execution_deferred
+            if alias is not None and alias.startswith("workflow:") and not execution_deferred:
+                execution_deferred = True
+                return SimpleNamespace(token=f"harness-deferred:{alias}")
+
+            return original_task_runner_run(call, *args, alias=alias, **kwargs)
 
         async def send_dispatch_then_kill(
             worker_id: str,
@@ -116,11 +132,17 @@ async def test_worker_dies_post_ack_before_workload_finishes() -> None:
         ) -> bool:
             nonlocal fault_landed
             accepted = await original_send_dispatch(worker_id, dispatch)
-            if worker_id == victim_id and accepted and not fault_landed:
+            if (
+                worker_id == victim_id
+                and accepted
+                and execution_deferred
+                and not fault_landed
+            ):
                 fault_landed = True
                 await cluster.faults.kill(victim)
             return accepted
 
+        victim.instance._task_runner.run = defer_workflow_execution
         dispatcher._send_dispatch = send_dispatch_then_kill
         async with cluster.workload(_workload(LongRunningWorkflow, 75.0)) as driver:
             await driver.submit()
@@ -128,6 +150,7 @@ async def test_worker_dies_post_ack_before_workload_finishes() -> None:
             await driver.wait_for_completion()
 
         assert fault_landed is True
+        assert execution_deferred is True
 
 
 @pytest.mark.asyncio

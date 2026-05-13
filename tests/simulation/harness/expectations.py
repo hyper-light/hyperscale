@@ -101,6 +101,40 @@ class ExpectAllWorkflowsComplete:
 
 
 @dataclass(slots=True, frozen=True)
+class ExpectWorkflowTerminal:
+    """Every named workflow must reach one of the allowed terminal statuses."""
+
+    expected_workflow_names: list[str]
+    allowed_statuses: set[str]
+    name: str = "ExpectWorkflowTerminal"
+
+    def evaluate(self, observations: WorkloadObservations) -> ExpectationResult:
+        expected = set(self.expected_workflow_names)
+        actual = observations.workflow_results
+        missing = sorted(expected - set(actual.keys()))
+        wrong_status = sorted(
+            name
+            for name in expected & set(actual.keys())
+            if actual[name] not in self.allowed_statuses
+        )
+        if not missing and not wrong_status:
+            return ExpectationResult(name=self.name, holds=True)
+
+        parts: list[str] = []
+        if missing:
+            parts.append(f"missing={missing}")
+        if wrong_status:
+            parts.append(
+                f"wrong_status={[(name, actual[name]) for name in wrong_status]}"
+            )
+        return ExpectationResult(
+            name=self.name,
+            holds=False,
+            detail="; ".join(parts),
+        )
+
+
+@dataclass(slots=True, frozen=True)
 class ExpectCompletionWithin:
     """The workload must finish within the given wall-clock budget."""
 
