@@ -173,6 +173,23 @@ class DiagnosticDumper:
     def _snapshot_manager(self, handle: ServerHandle) -> dict[str, Any]:
         instance = handle.instance
         state = getattr(instance, "_manager_state", None)
+        local_health = getattr(instance, "_local_health", None)
+        worker_count = state.get_worker_count() if state else None
+        swim_confirmed_worker_count = None
+        worker_ids: list[str] | None = None
+        if state is not None:
+            worker_ids = [worker_id for worker_id, _worker in state.iter_workers()]
+            tracker = getattr(instance, "_incarnation_tracker", None)
+            if tracker is not None:
+                swim_confirmed_worker_count = 0
+                for _worker_id, registration in state.iter_workers():
+                    worker_udp_addr = (
+                        registration.node.host,
+                        registration.node.udp_port,
+                    )
+                    if tracker.is_node_confirmed(worker_udp_addr):
+                        swim_confirmed_worker_count += 1
+
         return {
             "node_id": handle.node_id,
             "kind": "manager",
@@ -182,7 +199,10 @@ class DiagnosticDumper:
             "known_peer_count": (
                 state.get_known_manager_peer_count() if state else None
             ),
-            "worker_count": state.get_worker_count() if state else None,
+            "worker_count": worker_count,
+            "worker_ids": worker_ids,
+            "swim_confirmed_worker_count": swim_confirmed_worker_count,
+            "lhm_score": local_health.score if local_health else None,
             "is_leader": getattr(instance, "is_leader", lambda: None)(),
         }
 
@@ -190,10 +210,20 @@ class DiagnosticDumper:
         instance = handle.instance
         registry = getattr(instance, "_registry", None)
         primary = getattr(registry, "_primary_manager_id", None) if registry else None
+        local_health = getattr(instance, "_local_health", None)
         return {
             "node_id": handle.node_id,
             "kind": "worker",
             "primary_manager_id": primary,
+            "known_manager_count": (
+                len(getattr(registry, "_known_managers", {})) if registry else None
+            ),
+            "healthy_manager_count": (
+                len(getattr(registry, "_healthy_manager_ids", set()))
+                if registry
+                else None
+            ),
+            "lhm_score": local_health.score if local_health else None,
             "tracked_subprocess_count": len(
                 self.harness.supervisor.tracked_pids(handle.node_id)
             ),

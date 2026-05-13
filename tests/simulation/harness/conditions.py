@@ -51,6 +51,7 @@ async def wait_until(
     poll: float = 0.25,
     description: str = "",
     on_fail: Callable[[], Awaitable[None]] | None = None,
+    failure_detail: Callable[[], str] | None = None,
 ) -> WaitContext:
     """Poll ``predicate`` until it returns True or ``timeout`` elapses.
 
@@ -59,6 +60,7 @@ async def wait_until(
     :class:`ConditionTimeoutError`. ``on_fail`` is the harness's
     diagnostic dump in normal use — by running it before the exception
     propagates, the test report carries the cluster snapshot.
+    ``failure_detail`` is appended to the timeout message when provided.
 
     Predicates may be sync or async; both forms are awaited uniformly.
     """
@@ -78,9 +80,17 @@ async def wait_until(
                 except Exception:
                     # Diagnostic dump must never mask the original timeout.
                     pass
+            detail = ""
+            if failure_detail is not None:
+                try:
+                    extra = failure_detail()
+                except Exception:
+                    extra = ""
+                if extra:
+                    detail = f": {extra}"
             raise ConditionTimeoutError(
                 f"{description or 'predicate'} did not hold within {timeout}s "
-                f"(polled every {poll}s)"
+                f"(polled every {poll}s){detail}"
             )
         await asyncio.sleep(poll)
 

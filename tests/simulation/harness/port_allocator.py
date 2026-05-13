@@ -9,9 +9,39 @@ ports — rather than letting a server later fail with an opaque
 
 import asyncio
 import socket
+import time
 from dataclasses import dataclass, field
 
 from tests.simulation.harness.errors import PortConflictError
+
+
+_PROCESS_PORT_RETIRE_SECONDS = 300.0
+"""Do not reuse a harness port in the same test process for this long.
+
+Sequential simulation tests create and tear down clusters in one event
+loop. The OS may report a just-used port as bindable while asyncio
+transport cleanup and late UDP/TCP callbacks from the previous cluster
+are still draining. Reusing the same range immediately lets old traffic
+and stale transports interfere with the next cluster's startup. A
+process-local retirement table makes every new ``PortAllocator`` skip
+recently allocated ranges even when individual bind probes succeed.
+"""
+
+_PROCESS_RETIRED_PORTS: dict[int, float] = {}
+
+
+def _retire_port(port: int) -> None:
+    _PROCESS_RETIRED_PORTS[port] = time.monotonic() + _PROCESS_PORT_RETIRE_SECONDS
+
+
+def _is_process_retired(port: int) -> bool:
+    expires_at = _PROCESS_RETIRED_PORTS.get(port)
+    if expires_at is None:
+        return False
+    if expires_at <= time.monotonic():
+        _PROCESS_RETIRED_PORTS.pop(port, None)
+        return False
+    return True
 
 
 @dataclass(slots=True)
@@ -78,17 +108,18 @@ class PortAllocator:
         because the worker derives offsets from the block base.
         """
         attempts = 0
-        max_attempts = 1_000
+        max_attempts = 10_000
         while attempts < max_attempts:
             block_base = self._next_port
             attempts += 1
             block_ports = list(range(block_base, block_base + block_size))
-            if any(p in self._reserved for p in block_ports):
+            if any(p in self._reserved or _is_process_retired(p) for p in block_ports):
                 self._next_port += 1
                 continue
             if all(self._is_bindable(p) for p in block_ports):
                 for p in block_ports:
                     self._reserved.add(p)
+                    _retire_port(p)
                 self._next_port = block_base + block_size
                 return block_base
             self._next_port += 1
@@ -106,10 +137,11 @@ class PortAllocator:
             candidate = self._next_port
             self._next_port += 1
             attempts += 1
-            if candidate in self._reserved:
+            if candidate in self._reserved or _is_process_retired(candidate):
                 continue
             if self._is_bindable(candidate):
                 self._reserved.add(candidate)
+                _retire_port(candidate)
                 return candidate
         raise PortConflictError(
             f"Could not find a bindable port after {max_attempts} attempts"

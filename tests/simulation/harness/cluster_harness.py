@@ -14,6 +14,7 @@ until the production-side Clock/Random/Transport refactor lands.
 
 import asyncio
 import pathlib
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from hyperscale.distributed.env.env import Env
@@ -23,7 +24,6 @@ from hyperscale.distributed.nodes.worker import WorkerServer
 
 from tests.simulation.harness.cluster_spec import ClusterSpec
 from tests.simulation.harness.conditions import (
-    all_of,
     lhm_at_baseline,
     manager_has_n_peers,
     manager_has_n_swim_confirmed_workers,
@@ -464,13 +464,18 @@ class ClusterHarness:
         if budget <= 0:
             return
 
-        predicates: list = []
+        labelled: list[tuple[str, Callable[[], bool]]] = []
         for dc_id, dc_spec in self.spec.datacenters.items():
             managers = self._managers_by_dc.get(dc_id, [])
             workers = self._workers_by_dc.get(dc_id, [])
             for manager in managers:
-                predicates.append(manager_has_n_peers(manager, dc_spec.managers - 1))
-                predicates.append(manager_has_n_workers(manager, dc_spec.workers))
+                tag = f"{dc_id}/manager/{manager.node_id}"
+                labelled.append(
+                    (f"{tag}/peers", manager_has_n_peers(manager, dc_spec.managers - 1))
+                )
+                labelled.append(
+                    (f"{tag}/workers", manager_has_n_workers(manager, dc_spec.workers))
+                )
                 # SWIM-confirmation is required for fault-injection
                 # tests: AD-29 forbids UNCONFIRMED→SUSPECT transitions,
                 # so a fault injected in the window between worker
@@ -481,8 +486,11 @@ class ClusterHarness:
                 # SWIM-tier readiness, the same invariant
                 # ``manager_has_n_peers`` already enforces for
                 # manager-peer relationships.
-                predicates.append(
-                    manager_has_n_swim_confirmed_workers(manager, dc_spec.workers)
+                labelled.append(
+                    (
+                        f"{tag}/swim_confirmed_workers",
+                        manager_has_n_swim_confirmed_workers(manager, dc_spec.workers),
+                    )
                 )
                 # LHM-quiescence is the actual readiness invariant the
                 # downstream tests assume — registered+reachable is
@@ -491,21 +499,50 @@ class ClusterHarness:
                 # leave LHM elevated when the harness declares ready,
                 # and the test's detection-budget assertions (which
                 # assume LHM=0) silently inflate.
-                predicates.append(lhm_at_baseline(manager))
+                labelled.append((f"{tag}/lhm_baseline", lhm_at_baseline(manager)))
             for worker in workers:
-                predicates.append(worker_subprocesses_alive(self, worker))
-                predicates.append(lhm_at_baseline(worker))
+                tag = f"{dc_id}/worker/{worker.node_id}"
+                labelled.append(
+                    (f"{tag}/subprocesses", worker_subprocesses_alive(self, worker))
+                )
+                labelled.append((f"{tag}/lhm_baseline", lhm_at_baseline(worker)))
 
-        if not predicates:
+        if not labelled:
             return
 
+        # Capture the most-recent set of unsatisfied predicates so the
+        # timeout message and diagnostic dump can name the laggards
+        # directly. A single composite boolean is not enough when the
+        # stabilization gate spans managers, workers, SWIM confirmation,
+        # subprocess pools, and LHM baseline checks.
+        failing_labels: list[str] = []
+
+        def _composite() -> bool:
+            fails: list[str] = []
+            for label, pred in labelled:
+                try:
+                    holds = pred()
+                except Exception:
+                    holds = False
+                if not holds:
+                    fails.append(label)
+            failing_labels[:] = fails
+            return not fails
+
+        async def _on_fail() -> None:
+            reason = "stabilization timeout"
+            if failing_labels:
+                reason = f"{reason}: unsatisfied predicates={failing_labels}"
+            await self._diagnostics.dump(reason=reason)
+
         await wait_until(
-            all_of(*predicates),
+            _composite,
             timeout=budget,
             poll=0.5,
-            description=f"cluster stabilizes ({len(predicates)} predicates)",
-            on_fail=lambda: self._diagnostics.dump(
-                reason="stabilization timeout"
+            description=f"cluster stabilizes ({len(labelled)} predicates)",
+            on_fail=_on_fail,
+            failure_detail=lambda: (
+                f"unsatisfied predicates={failing_labels}" if failing_labels else ""
             ),
         )
 

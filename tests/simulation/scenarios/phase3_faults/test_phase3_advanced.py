@@ -96,7 +96,7 @@ async def test_leader_graceful_stepdown() -> None:
          high-term-observation path takes a few protocol periods
          after the new leader is elected).
     """
-    spec = _l2_spec(base_port=22000)
+    spec = _l2_spec(base_port=24000)
     async with ClusterHarness(
         spec,
         mode=ExecutionMode.REAL,
@@ -151,7 +151,7 @@ async def test_lhm_driven_leader_stepdown() -> None:
       3. Wait for the leader to step down and another manager to
          take over.
     """
-    spec = _l2_spec(base_port=22100)
+    spec = _l2_spec(base_port=25500)
     async with ClusterHarness(
         spec,
         mode=ExecutionMode.REAL,
@@ -205,7 +205,7 @@ async def test_all_managers_die_then_quorum_returns() -> None:
       3. Assert a leader is elected among the 2 returning managers.
       4. Assert at least one worker re-registers with the new leader.
     """
-    spec = _l2_spec(base_port=22200)
+    spec = _l2_spec(base_port=27000)
     async with ClusterHarness(
         spec,
         mode=ExecutionMode.REAL,
@@ -269,7 +269,7 @@ async def test_worker_permanent_failure() -> None:
       * No diagnostic noise (cleanup completes cleanly at teardown —
         port allocator releases, no asyncio leaks).
     """
-    spec = _l2_spec(base_port=22300)
+    spec = _l2_spec(base_port=28500)
     async with ClusterHarness(
         spec,
         mode=ExecutionMode.REAL,
@@ -315,7 +315,7 @@ async def test_concurrent_candidates() -> None:
 
     Assertion: after stabilization, exactly one survivor is leader.
     """
-    spec = _l2_spec(base_port=22400)
+    spec = _l2_spec(base_port=30000)
     async with ClusterHarness(
         spec,
         mode=ExecutionMode.REAL,
