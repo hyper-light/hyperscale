@@ -26,5 +26,14 @@ class DCSpec:
     derived worker-pool ports.
     """
 
+    stabilization_lhm_max_score: int | None = 0
+    """Maximum LHM score allowed during stabilization.
+
+    ``0`` is the default steady-state baseline. Large membership-churn
+    scenarios may set this to ``None`` because startup pressure itself is
+    the scenario and waiting for total LHM quiescence can make the
+    harness refuse to enter the test body.
+    """
+
     env: EnvOverrides | None = None
     """DC-level env overrides applied to every node in this DC."""

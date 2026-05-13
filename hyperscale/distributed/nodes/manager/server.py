@@ -1578,11 +1578,11 @@ class ManagerServer(HealthAwareServer):
         await self._worker_health_monitor.handle_worker_failure(worker_id)
 
         if self._workflow_dispatcher and self._job_manager:
-            running_sub_workflows = (
-                self._job_manager.get_running_sub_workflows_on_worker(worker_id)
+            reassignable_sub_workflows = (
+                self._job_manager.get_reassignable_sub_workflows_on_worker(worker_id)
             )
 
-            for job_id, workflow_id, sub_token in running_sub_workflows:
+            for job_id, workflow_id, sub_token in reassignable_sub_workflows:
                 await self._apply_workflow_reassignment_state(
                     job_id=job_id,
                     workflow_id=workflow_id,
@@ -1591,11 +1591,11 @@ class ManagerServer(HealthAwareServer):
                     reason="worker_dead",
                 )
 
-            if running_sub_workflows and self._worker_disseminator:
+            if reassignable_sub_workflows and self._worker_disseminator:
                 await self._worker_disseminator.broadcast_workflow_reassignments(
                     failed_worker_id=worker_id,
                     reason="worker_dead",
-                    reassignments=running_sub_workflows,
+                    reassignments=reassignable_sub_workflows,
                 )
 
         # Fully unregister the worker on DEAD detection. The previous
@@ -1610,6 +1610,12 @@ class ManagerServer(HealthAwareServer):
         # mirrored explicitly here so we keep the same surface.
         self._registry.unregister_worker(worker_id)
         self._manager_state._worker_lhm_scores.pop(worker_id, None)
+
+        if (
+            self._job_manager
+            and self._manager_state.get_worker_count() == 0
+        ):
+            await self._fail_unfinished_workflows_with_no_workers()
 
     async def _handle_manager_peer_failure(
         self,
@@ -4623,6 +4629,58 @@ class ManagerServer(HealthAwareServer):
                     node_id=self._node_id.short,
                 )
             )
+
+    async def _fail_unfinished_workflows_with_no_workers(self) -> None:
+        """Fail and notify unfinished workflows when no worker remains."""
+        if not self._job_manager:
+            return
+
+        reason = "all workers unavailable"
+        failed_workflows = await self._job_manager.fail_unfinished_workflows(reason)
+        completed_job_ids: set[str] = set()
+
+        for job_id, workflow_id, workflow_name, error in failed_workflows:
+            callback_addr = self._manager_state.get_job_callback(job_id)
+            if callback_addr:
+                if isinstance(callback_addr, list):
+                    callback_addr = tuple(callback_addr)
+                push = WorkflowResultPush(
+                    job_id=job_id,
+                    workflow_id=workflow_id,
+                    workflow_name=workflow_name,
+                    datacenter=self._node_id.datacenter,
+                    status=WorkflowStatus.FAILED.value,
+                    fence_token=self._leases.get_fence_token(job_id),
+                    results=[],
+                    error=error,
+                    elapsed_seconds=0.0,
+                    completed_at=time.time(),
+                )
+                try:
+                    await self._send_to_client(
+                        callback_addr,
+                        "workflow_result_push",
+                        push.dump(),
+                        timeout=5.0,
+                    )
+                except Exception as send_error:
+                    await self._udp_logger.log(
+                        ServerWarning(
+                            message=(
+                                "Failed to push no-worker workflow failure to client: "
+                                f"{send_error}"
+                            ),
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
+
+            if self._is_job_complete(job_id):
+                completed_job_ids.add(job_id)
+
+        for job_id in completed_job_ids:
+            await self._handle_job_completion(job_id)
 
     def _is_job_complete(self, job_id: str) -> bool:
         job = self._job_manager.get_job(job_id)

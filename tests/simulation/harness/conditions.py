@@ -217,8 +217,11 @@ def worker_subprocesses_alive(
     return _predicate
 
 
-def lhm_at_baseline(handle: ServerHandle) -> Callable[[], bool]:
-    """True when a node's Lifeguard LHM has returned to ``score=0``.
+def lhm_at_baseline(
+    handle: ServerHandle,
+    max_score: int = 0,
+) -> Callable[[], bool]:
+    """True when a node's Lifeguard LHM is at or below ``max_score``.
 
     LHM accumulates during cluster spin-up as initial probes race
     peer-readiness — even with the AD-29 UNCONFIRMED-state gate
@@ -233,9 +236,12 @@ def lhm_at_baseline(handle: ServerHandle) -> Callable[[], bool]:
     variable, since downstream detection budgets are computed
     against the Lifeguard ``T = T_base × (1 + LHM × MULTIPLIER_WEIGHT)``
     formula and would silently inflate. Wiring this predicate into
-    ``ClusterHarness._stabilize`` enforces the actual readiness
+    ``ClusterHarness._stabilize`` enforces the default readiness
     invariant downstream tests depend on, rather than the weaker
     "registered + reachable" criteria the harness used previously.
+    High-N membership-churn tests can explicitly raise or disable this
+    gate through ``DCSpec.stabilization_lhm_max_score`` because nonzero
+    LHM during large fan-in startup is the load condition under test.
 
     For node kinds without an ``_local_health`` instance (e.g. gates
     in the current architecture) this predicate returns True
@@ -246,7 +252,7 @@ def lhm_at_baseline(handle: ServerHandle) -> Callable[[], bool]:
         local_health = getattr(instance, "_local_health", None)
         if local_health is None:
             return True
-        return local_health.score == 0
+        return local_health.score <= max_score
 
     return _predicate
 

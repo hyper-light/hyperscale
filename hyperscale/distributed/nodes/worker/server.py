@@ -944,6 +944,7 @@ class WorkerServer(HealthAwareServer):
         WorkerStateEmbedder, but available for other uses like diagnostics
         or explicit TCP status updates if needed.
         """
+        health_overload_state = self._backpressure_manager.get_overload_state_str()
         return WorkerHeartbeat(
             node_id=self._node_id.full,
             state=self._get_worker_state().value,
@@ -956,6 +957,11 @@ class WorkerServer(HealthAwareServer):
             active_workflows={
                 wf_id: wf.status for wf_id, wf in self._active_workflows.items()
             },
+            health_accepting_work=(
+                self._get_worker_state() is not WorkerStateEnum.DRAINING
+                and health_overload_state not in {"overloaded", "critical"}
+            ),
+            health_overload_state=health_overload_state,
             extension_requested=self._worker_state._extension_requested,
             extension_reason=self._worker_state._extension_reason,
             extension_current_progress=self._worker_state._extension_current_progress,

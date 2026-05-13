@@ -58,6 +58,9 @@ def _single_manager_spec(
                 workers=workers,
                 cores_per_worker=1,
                 worker_port_block_size=_COMPACT_WORKER_BLOCK,
+                stabilization_lhm_max_score=(
+                    None if workers >= _LARGE_WORKER_COUNT else 0
+                ),
             ),
         },
         env=EnvOverrides(

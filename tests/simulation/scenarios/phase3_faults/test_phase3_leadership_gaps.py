@@ -52,6 +52,30 @@ def _find_follower(managers: list[ServerHandle]) -> ServerHandle:
     raise AssertionError("no follower available")
 
 
+def _find_followers(managers: list[ServerHandle]) -> list[ServerHandle]:
+    followers = [manager for manager in managers if not manager.instance.is_leader()]
+    if not followers:
+        raise AssertionError("no followers available")
+    return followers
+
+
+def _followers_observe_stable_leader(managers: list[ServerHandle]) -> bool:
+    try:
+        leader = _find_leader(managers)
+    except AssertionError:
+        return False
+
+    leader_addr = (leader.host, leader.udp_port)
+    for follower in managers:
+        if follower is leader:
+            continue
+        state = follower.instance._leader_election.state
+        if state.current_leader != leader_addr or not state.is_lease_valid():
+            return False
+
+    return True
+
+
 @pytest.mark.asyncio
 @pytest.mark.simulation
 async def test_pre_vote_rejected_during_stable_lease() -> None:
@@ -69,14 +93,21 @@ async def test_pre_vote_rejected_during_stable_lease() -> None:
             poll=0.5,
             description="initial leader elected",
         )
+        await wait_until(
+            lambda: _followers_observe_stable_leader(managers),
+            timeout=60.0,
+            poll=0.25,
+            description="followers observe stable leader lease",
+        )
 
-        leader = _find_leader(managers)
-        follower = _find_follower(managers)
-        follower_election = follower.instance._leader_election
-        original_term = follower_election.state.current_term
-        candidate_addr = (leader.host, leader.udp_port)
+        followers = _find_followers(managers)
+        target_follower = followers[0]
+        candidate_follower = followers[-1]
+        target_election = target_follower.instance._leader_election
+        original_term = target_election.state.current_term
+        candidate_addr = (candidate_follower.host, candidate_follower.udp_port)
 
-        response = follower_election.handle_pre_vote_request(
+        response = target_election.handle_pre_vote_request(
             candidate=candidate_addr,
             term=original_term + 1,
             candidate_lhm=0,
@@ -84,11 +115,11 @@ async def test_pre_vote_rejected_during_stable_lease() -> None:
 
         assert response is not None
         assert f"pre-vote-resp:{original_term + 1}:0>".encode() in response
-        assert follower_election.state.current_term == original_term
-        assert follower_election.state.role == "follower"
-        assert follower_election.state.is_lease_valid()
-        assert follower_election.state.pre_voting_in_progress is False
-        assert follower_election.state.pre_votes_received == set()
+        assert target_election.state.current_term == original_term
+        assert target_election.state.role == "follower"
+        assert target_election.state.is_lease_valid()
+        assert target_election.state.pre_voting_in_progress is False
+        assert target_election.state.pre_votes_received == set()
 
 
 @pytest.mark.asyncio

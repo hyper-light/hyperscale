@@ -555,13 +555,31 @@ class ClusterHarness:
                 # leave LHM elevated when the harness declares ready,
                 # and the test's detection-budget assertions (which
                 # assume LHM=0) silently inflate.
-                labelled.append((f"{tag}/lhm_baseline", lhm_at_baseline(manager)))
+                if dc_spec.stabilization_lhm_max_score is not None:
+                    labelled.append(
+                        (
+                            f"{tag}/lhm_baseline",
+                            lhm_at_baseline(
+                                manager,
+                                max_score=dc_spec.stabilization_lhm_max_score,
+                            ),
+                        )
+                    )
             for worker in workers:
                 tag = f"{dc_id}/worker/{worker.node_id}"
                 labelled.append(
                     (f"{tag}/subprocesses", worker_subprocesses_alive(self, worker))
                 )
-                labelled.append((f"{tag}/lhm_baseline", lhm_at_baseline(worker)))
+                if dc_spec.stabilization_lhm_max_score is not None:
+                    labelled.append(
+                        (
+                            f"{tag}/lhm_baseline",
+                            lhm_at_baseline(
+                                worker,
+                                max_score=dc_spec.stabilization_lhm_max_score,
+                            ),
+                        )
+                    )
 
         if not labelled:
             return

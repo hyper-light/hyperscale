@@ -1089,6 +1089,15 @@ class JobManager:
             if not wf:
                 return False
 
+            if wf.status in (
+                WorkflowStatus.COMPLETED,
+                WorkflowStatus.FAILED,
+                WorkflowStatus.AGGREGATED,
+                WorkflowStatus.AGGREGATION_FAILED,
+                WorkflowStatus.CANCELLED,
+            ):
+                return False
+
             wf.status = WorkflowStatus.FAILED
             wf.error = error
             wf.completion_event.set()
@@ -1107,6 +1116,52 @@ class JobManager:
             await self._on_workflow_completed(job.job_id, workflow_id)
 
         return True
+
+    async def fail_unfinished_workflows(
+        self,
+        error: str,
+    ) -> list[tuple[str, str, str, str]]:
+        """Mark every non-terminal workflow as failed and terminal-pushed.
+
+        Used when the manager has no workers left. In that state there is no
+        valid reassignment target, so keeping workflows pending would strand
+        clients indefinitely.
+        """
+        terminal_statuses = {
+            WorkflowStatus.COMPLETED,
+            WorkflowStatus.FAILED,
+            WorkflowStatus.AGGREGATED,
+            WorkflowStatus.AGGREGATION_FAILED,
+            WorkflowStatus.CANCELLED,
+        }
+        failed: list[tuple[str, str, str, str]] = []
+        notifications: list[tuple[str, str]] = []
+
+        for job in list(self._jobs.values()):
+            async with job.lock:
+                for workflow in list(job.workflows.values()):
+                    if (
+                        workflow.terminal_pushed
+                        or workflow.status in terminal_statuses
+                    ):
+                        continue
+
+                    workflow.status = WorkflowStatus.FAILED
+                    workflow.error = error
+                    workflow.terminal_pushed = True
+                    workflow.terminal_status = WorkflowStatus.FAILED.value
+                    workflow.completion_event.set()
+                    job.workflows_failed += 1
+
+                    workflow_id = workflow.token.workflow_id or ""
+                    failed.append((job.job_id, workflow_id, workflow.name, error))
+                    notifications.append((job.job_id, workflow_id))
+
+        if self._on_workflow_completed:
+            for job_id, workflow_id in notifications:
+                await self._on_workflow_completed(job_id, workflow_id)
+
+        return failed
 
     async def mark_aggregation_failed(
         self,
@@ -1497,15 +1552,66 @@ class JobManager:
         self,
         worker_id: str,
     ) -> list[tuple[str, str, str]]:
-        jobs_snapshot = list(self._jobs.values())
         return [
-            (job.job_id, wf.token.workflow_id or "", sub.token_str)
-            for job in jobs_snapshot
-            for wf in list(job.workflows.values())
-            if wf.status == WorkflowStatus.RUNNING
-            for sub in list(job.sub_workflows.values())
-            if sub.worker_id == worker_id and sub.result is None and not sub.superseded
+            item
+            for item in self.get_reassignable_sub_workflows_on_worker(worker_id)
+            if self._parent_status_for_sub_workflow(item[2]) == WorkflowStatus.RUNNING
         ]
+
+    def get_reassignable_sub_workflows_on_worker(
+        self,
+        worker_id: str,
+    ) -> list[tuple[str, str, str]]:
+        """Return unfinished sub-workflows on a worker that can be reassigned."""
+        jobs_snapshot = list(self._jobs.values())
+        terminal_statuses = {
+            WorkflowStatus.COMPLETED,
+            WorkflowStatus.FAILED,
+            WorkflowStatus.AGGREGATED,
+            WorkflowStatus.AGGREGATION_FAILED,
+            WorkflowStatus.CANCELLED,
+        }
+        reassignable: list[tuple[str, str, str]] = []
+        for job in jobs_snapshot:
+            for sub_workflow in list(job.sub_workflows.values()):
+                if (
+                    sub_workflow.worker_id != worker_id
+                    or sub_workflow.result is not None
+                    or sub_workflow.superseded
+                ):
+                    continue
+
+                parent = job.workflows.get(str(sub_workflow.parent_token))
+                if (
+                    parent is None
+                    or parent.terminal_pushed
+                    or parent.status in terminal_statuses
+                ):
+                    continue
+
+                workflow_id = (
+                    parent.token.workflow_id
+                    or sub_workflow.token.workflow_id
+                    or ""
+                )
+                reassignable.append((job.job_id, workflow_id, sub_workflow.token_str))
+
+        return reassignable
+
+    def _parent_status_for_sub_workflow(
+        self,
+        sub_workflow_token: str,
+    ) -> WorkflowStatus | None:
+        job = self.get_job_for_sub_workflow(sub_workflow_token)
+        if job is None:
+            return None
+        sub_workflow = job.sub_workflows.get(sub_workflow_token)
+        if sub_workflow is None:
+            return None
+        parent = job.workflows.get(str(sub_workflow.parent_token))
+        if parent is None:
+            return None
+        return parent.status
 
     # =========================================================================
     # Job Cleanup
