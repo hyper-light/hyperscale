@@ -720,22 +720,40 @@ class WorkflowDispatcher:
                         )
                         successful_dispatches.append((worker_id, worker_cores))
                     else:
-                        await self._worker_pool.release_cores(worker_id, worker_cores)
-                        await self._job_manager.remove_unstarted_sub_workflow(
-                            str(sub_token)
+                        await self._record_failed_dispatch_plan(
+                            worker_id=worker_id,
+                            worker_cores=worker_cores,
+                            sub_token=sub_token,
+                            failed_dispatches=failed_dispatches,
                         )
-                        failed_dispatches.append((worker_id, worker_cores))
+                except asyncio.CancelledError as dispatch_error:
+                    if self._shutting_down or pending.job_id in self._cancelling_jobs:
+                        raise
+
+                    await self._log_warning(
+                        "Dispatch was cancelled by worker-side transport failure "
+                        f"for worker {worker_id}: {dispatch_error}",
+                        job_id=pending.job_id,
+                        workflow_id=pending.workflow_id,
+                    )
+                    await self._record_failed_dispatch_plan(
+                        worker_id=worker_id,
+                        worker_cores=worker_cores,
+                        sub_token=sub_token,
+                        failed_dispatches=failed_dispatches,
+                    )
                 except Exception as dispatch_error:
                     await self._log_warning(
                         f"Exception dispatching to worker {worker_id} for workflow {pending.workflow_id}: {dispatch_error}",
                         job_id=pending.job_id,
                         workflow_id=pending.workflow_id,
                     )
-                    await self._worker_pool.release_cores(worker_id, worker_cores)
-                    await self._job_manager.remove_unstarted_sub_workflow(
-                        str(sub_token)
+                    await self._record_failed_dispatch_plan(
+                        worker_id=worker_id,
+                        worker_cores=worker_cores,
+                        sub_token=sub_token,
+                        failed_dispatches=failed_dispatches,
                     )
-                    failed_dispatches.append((worker_id, worker_cores))
 
             # Determine outcome based on dispatch results
             if len(successful_dispatches) == 0:
@@ -771,6 +789,18 @@ class WorkflowDispatcher:
         )
         # Clear ready state - will be re-signaled after backoff
         pending.clear_ready()
+
+    async def _record_failed_dispatch_plan(
+        self,
+        *,
+        worker_id: str,
+        worker_cores: int,
+        sub_token: TrackingToken,
+        failed_dispatches: list[tuple[str, int]],
+    ) -> None:
+        await self._worker_pool.release_cores(worker_id, worker_cores)
+        await self._job_manager.remove_unstarted_sub_workflow(str(sub_token))
+        failed_dispatches.append((worker_id, worker_cores))
 
     # =========================================================================
     # Event-Driven Dispatch Loop

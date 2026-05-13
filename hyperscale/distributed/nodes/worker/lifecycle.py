@@ -285,6 +285,10 @@ class WorkerLifecycleManager:
         """Shut down the local server pool."""
         await self._server_pool.shutdown()
 
+    def get_server_pool_process_exitcodes(self) -> dict[int, int | None]:
+        """Return the local workflow-runner process exit-code snapshot."""
+        return self._server_pool.get_process_exitcodes()
+
     async def kill_child_processes(self) -> None:
         """Kill any remaining child processes."""
         try:

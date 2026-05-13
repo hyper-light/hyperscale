@@ -17,6 +17,7 @@ except ImportError:
     HAS_PSUTIL = False
 
 from hyperscale.distributed.swim import HealthAwareServer, WorkerStateEmbedder
+from hyperscale.distributed.swim.health.graceful_degradation import DegradationLevel
 from hyperscale.distributed.env import Env
 from hyperscale.distributed.discovery import DiscoveryService
 from hyperscale.distributed.models import (
@@ -30,6 +31,7 @@ from hyperscale.distributed.models import (
     WorkflowDispatch,
     WorkflowFinalResult,
     WorkflowProgress,
+    WorkflowStatus,
     WorkerHeartbeat,
 )
 from hyperscale.distributed.jobs import AllocationResult
@@ -44,6 +46,7 @@ from hyperscale.logging import Logger
 from hyperscale.logging.config import DurabilityMode
 from hyperscale.logging.hyperscale_logging_models import (
     ServerInfo,
+    ServerWarning,
     WorkerExtensionRequested,
     WorkerHealthcheckReceived,
     WorkerStarted,
@@ -236,6 +239,8 @@ class WorkerServer(HealthAwareServer):
         self._discovery_maintenance_task: asyncio.Task | None = None
         self._overload_poll_task: asyncio.Task | None = None
         self._pending_result_retry_task: asyncio.Task | None = None
+        self._worker_pool_health_task: asyncio.Task | None = None
+        self._known_worker_pool_process_ids: set[int] = set()
         # Phase H4 — autonomous extension trigger background task
         self._extension_trigger_task: asyncio.Task | None = None
         self._extension_trigger: ExtensionTrigger = ExtensionTrigger(
@@ -577,6 +582,12 @@ class WorkerServer(HealthAwareServer):
 
         # Connect to workers
         await self._lifecycle_manager.connect_to_workers(timeout)
+        process_exitcodes = self._lifecycle_manager.get_server_pool_process_exitcodes()
+        self._known_worker_pool_process_ids = {
+            process_id
+            for process_id, exitcode in process_exitcodes.items()
+            if exitcode is None
+        }
 
         # Set core availability callback
         self._lifecycle_manager.set_on_cores_available(self._on_cores_available)
@@ -810,6 +821,12 @@ class WorkerServer(HealthAwareServer):
         )
         self._lifecycle_manager.add_background_task(self._resource_sample_task)
 
+        self._worker_pool_health_task = self._create_background_task(
+            self._run_worker_pool_health_loop(),
+            "worker_pool_health",
+        )
+        self._lifecycle_manager.add_background_task(self._worker_pool_health_task)
+
         # Phase H4 — autonomous extension trigger. Scans active
         # workflows on a heartbeat-aligned cadence and invokes
         # ``request_extension`` for any workflow approaching its
@@ -863,6 +880,123 @@ class WorkerServer(HealthAwareServer):
                     level="debug",
                 )
                 await asyncio.sleep(1.0)
+
+    async def _run_worker_pool_health_loop(self) -> None:
+        """Fail active workflows when a local runner process exits mid-flight."""
+        while self._running:
+            try:
+                await self._check_worker_pool_health()
+                await asyncio.sleep(0.25)
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                await self._udp_logger.log(
+                    f"Worker pool health check failed: {exc}",
+                    level="debug",
+                )
+                await asyncio.sleep(1.0)
+
+    async def _check_worker_pool_health(self) -> None:
+        process_exitcodes = self._lifecycle_manager.get_server_pool_process_exitcodes()
+        live_process_ids = {
+            process_id
+            for process_id, exitcode in process_exitcodes.items()
+            if exitcode is None
+        }
+
+        if not self._active_workflows:
+            self._known_worker_pool_process_ids = live_process_ids
+            return
+
+        if not self._known_worker_pool_process_ids:
+            self._known_worker_pool_process_ids = live_process_ids
+            return
+
+        exited_process_ids = {
+            process_id
+            for process_id in self._known_worker_pool_process_ids
+            if process_id not in live_process_ids
+        }
+        exited_process_ids.update(
+            process_id
+            for process_id, exitcode in process_exitcodes.items()
+            if process_id in self._known_worker_pool_process_ids
+            and exitcode is not None
+        )
+
+        if not exited_process_ids:
+            return
+
+        await self._degradation.force_level(DegradationLevel.HEAVY)
+        await self._udp_logger.log(
+            ServerWarning(
+                message=(
+                    "Worker pool process exited while workflows were active: "
+                    f"{sorted(exited_process_ids)}"
+                ),
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+        self._known_worker_pool_process_ids = live_process_ids
+        await self._fail_active_workflows_for_pool_exit(exited_process_ids)
+
+    async def _fail_active_workflows_for_pool_exit(
+        self,
+        exited_process_ids: set[int],
+    ) -> None:
+        reason = (
+            "Worker subprocess exited during workflow execution "
+            f"(pids={sorted(exited_process_ids)})"
+        )
+        for workflow_id, progress in list(self._active_workflows.items()):
+            await self._fail_active_workflow(workflow_id, progress, reason)
+
+    async def _fail_active_workflow(
+        self,
+        workflow_id: str,
+        progress: WorkflowProgress,
+        reason: str,
+    ) -> None:
+        fence_token = await self._worker_state.get_workflow_fence_token(workflow_id)
+        job_leader_addr = self._worker_state.get_workflow_job_leader(workflow_id)
+        workflow_name = (
+            progress.workflow_name
+            or self._worker_state._workflow_id_to_name.get(workflow_id)
+            or workflow_id
+        )
+
+        progress.status = WorkflowStatus.FAILED.value
+        await self._core_allocator.free(workflow_id)
+
+        final_result = WorkflowFinalResult(
+            job_id=progress.job_id,
+            workflow_id=workflow_id,
+            workflow_name=workflow_name,
+            status=WorkflowStatus.FAILED.value,
+            results=[],
+            context_updates=b"",
+            error=reason,
+            worker_id=self._node_id.full,
+            worker_available_cores=self._core_allocator.available_cores,
+            fence_token=fence_token,
+            job_leader_addr=job_leader_addr,
+        )
+
+        await self._progress_reporter.send_final_result(
+            final_result=final_result,
+            send_tcp=self.send_tcp,
+            node_host=self._host,
+            node_port=self._tcp_port,
+            node_id_short=self._node_id.short,
+            task_runner_run=self._task_runner.run,
+        )
+
+        workflow_token = self._workflow_tokens.get(workflow_id)
+        self._cleanup_workflow_state(workflow_id)
+        if workflow_token is not None:
+            await self._task_runner.cancel(workflow_token)
 
     async def _stop_background_loops(self) -> None:
         """Stop all background loops."""

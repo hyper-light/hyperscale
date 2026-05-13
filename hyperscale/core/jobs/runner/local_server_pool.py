@@ -323,6 +323,25 @@ class LocalServerPool:
             except (Exception, KeyboardInterrupt):
                 pass
 
+    def get_process_exitcodes(self) -> dict[int, int | None]:
+        """Return a snapshot of worker-process PID to exit code.
+
+        ``None`` means the process is still running. A non-``None`` exit code
+        means the process exited and any workflow assigned to that local
+        controller is no longer making progress.
+        """
+        if self._executor is None:
+            return {}
+
+        processes = getattr(self._executor, "_processes", None)
+        if not processes:
+            return {}
+
+        return {
+            int(process_id): process.exitcode
+            for process_id, process in list(processes.items())
+        }
+
     async def shutdown(self, wait: bool = True):
         # Prevent double cleanup
         if self._cleaned_up:
