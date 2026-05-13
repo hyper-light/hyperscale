@@ -572,6 +572,7 @@ class MercurySyncBaseServer(Generic[T]):
                 lambda: MercurySyncTCPProtocol(self, mode="server"),
                 sock=self._tcp_server_socket,
                 ssl=self._server_tcp_ssl_context,
+                backlog=self.env.MERCURY_SYNC_TCP_SERVER_BACKLOG,
             )
 
             self._tcp_server = server

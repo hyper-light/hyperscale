@@ -84,8 +84,9 @@ class WorkerConfig:
     recovery_semaphore_size: int = 5
 
     # Registration
-    registration_max_retries: int = 3
-    registration_base_delay_seconds: float = 0.5
+    registration_max_retries: int = 5
+    registration_base_delay_seconds: float = 0.25
+    initial_registration_jitter_max_seconds: float = 0.25
 
     # Event log configuration (AD-47)
     event_log_dir: Path | None = None
@@ -169,6 +170,15 @@ class WorkerConfig:
             recovery_jitter_min_seconds=getattr(env, "RECOVERY_JITTER_MIN", 0.0),
             recovery_jitter_max_seconds=getattr(env, "RECOVERY_JITTER_MAX", 1.0),
             recovery_semaphore_size=getattr(env, "RECOVERY_SEMAPHORE_SIZE", 5),
+            registration_max_retries=getattr(
+                env, "WORKER_REGISTRATION_MAX_RETRIES", 5
+            ),
+            registration_base_delay_seconds=getattr(
+                env, "WORKER_REGISTRATION_BASE_DELAY", 0.25
+            ),
+            initial_registration_jitter_max_seconds=getattr(
+                env, "WORKER_INITIAL_REGISTRATION_JITTER_MAX", 0.25
+            ),
         )
 
 
@@ -237,5 +247,14 @@ def create_worker_config_from_env(
         ),
         throughput_interval_seconds=float(
             os.getenv("WORKER_THROUGHPUT_INTERVAL_SECONDS", "10.0")
+        ),
+        registration_max_retries=int(
+            os.getenv("WORKER_REGISTRATION_MAX_RETRIES", "5")
+        ),
+        registration_base_delay_seconds=float(
+            os.getenv("WORKER_REGISTRATION_BASE_DELAY", "0.25")
+        ),
+        initial_registration_jitter_max_seconds=float(
+            os.getenv("WORKER_INITIAL_REGISTRATION_JITTER_MAX", "0.25")
         ),
     )

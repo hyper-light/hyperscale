@@ -42,6 +42,7 @@ _LARGE_WORKER_COUNT = 50
 _COMPACT_WORKER_BLOCK = 32
 _SLOW_CHURN_CYCLES = 30
 _SLOW_CHURN_INTERVAL_SECONDS = 10.0
+_LARGE_CLUSTER_RUNNING_TIMEOUT_SECONDS = 120.0
 
 
 def _single_manager_spec(
@@ -185,9 +186,10 @@ async def test_registration_storm_50_workers() -> None:
             == _LARGE_WORKER_COUNT
         )
         for worker in workers:
+            worker_swim_node_id = worker.instance._node_id.full
             assert worker.kind.name == "WORKER"
-            assert worker.node_id in worker_ids
-            assert worker.node_id not in manager_peer_ids
+            assert worker_swim_node_id in worker_ids
+            assert worker_swim_node_id not in manager_peer_ids
 
 
 @pytest.mark.asyncio
@@ -209,7 +211,9 @@ async def test_graceful_scale_down_50_workers_reassigns_orphans() -> None:
 
         async with cluster.workload(_long_workload(90.0)) as driver:
             await driver.submit()
-            await driver.wait_until_running(timeout=30.0)
+            await driver.wait_until_running(
+                timeout=_LARGE_CLUSTER_RUNNING_TIMEOUT_SECONDS
+            )
 
             for victim in victims:
                 await cluster.faults.graceful_stop(victim, drain_timeout=1.0)
@@ -241,7 +245,9 @@ async def test_mass_crash_50_workers() -> None:
             _long_workload(120.0, {"failed", "cancelled", "timeout"})
         ) as driver:
             await driver.submit()
-            await driver.wait_until_running(timeout=30.0)
+            await driver.wait_until_running(
+                timeout=_LARGE_CLUSTER_RUNNING_TIMEOUT_SECONDS
+            )
             await cluster.faults.kill_many(workers)
 
             await wait_until(

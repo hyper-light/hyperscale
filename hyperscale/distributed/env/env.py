@@ -24,6 +24,7 @@ class Env(BaseModel):
     MERCURY_SYNC_TASK_RUNNER_MAX_THREADS: StrictInt = os.cpu_count() or 1
     MERCURY_SYNC_MAX_REQUEST_CACHE_SIZE: StrictInt = 100
     MERCURY_SYNC_ENABLE_REQUEST_CACHING: StrictBool = False
+    MERCURY_SYNC_TCP_SERVER_BACKLOG: StrictInt = 1024
     MERCURY_SYNC_VERIFY_SSL_CERT: Literal["REQUIRED", "OPTIONAL", "NONE"] = "REQUIRED"
     MERCURY_SYNC_TLS_VERIFY_HOSTNAME: StrictStr = "false"  # Set to "true" in production
 
@@ -168,6 +169,9 @@ class Env(BaseModel):
     WORKER_TCP_TIMEOUT_STANDARD: StrictFloat = (
         5.0  # Standard timeout for progress/result pushes
     )
+    WORKER_REGISTRATION_MAX_RETRIES: StrictInt = 5
+    WORKER_REGISTRATION_BASE_DELAY: StrictFloat = 0.25
+    WORKER_INITIAL_REGISTRATION_JITTER_MAX: StrictFloat = 0.25
 
     # Worker Orphan Grace Period Settings (Section 2.7)
     # Grace period before cancelling workflows when job leader manager fails

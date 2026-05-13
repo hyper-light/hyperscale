@@ -6,6 +6,7 @@ All business logic is delegated to specialized modules.
 """
 
 import asyncio
+import random
 import time
 
 try:
@@ -588,6 +589,12 @@ class WorkerServer(HealthAwareServer):
             for process_id, exitcode in process_exitcodes.items()
             if exitcode is None
         }
+
+        registration_jitter_max_seconds = (
+            self._config.initial_registration_jitter_max_seconds
+        )
+        if registration_jitter_max_seconds > 0.0:
+            await asyncio.sleep(random.uniform(0.0, registration_jitter_max_seconds))
 
         # Set core availability callback
         self._lifecycle_manager.set_on_cores_available(self._on_cores_available)
@@ -1346,6 +1353,8 @@ class WorkerServer(HealthAwareServer):
             cluster_id=self._env.CLUSTER_ID,
             environment_id=self._env.ENVIRONMENT_ID,
             send_func=self._send_registration,
+            max_retries=self._config.registration_max_retries,
+            base_delay=self._config.registration_base_delay_seconds,
         )
 
     async def _send_registration(
