@@ -429,6 +429,18 @@ class Env(BaseModel):
     DISPATCH_MAX_CONCURRENT_PER_WORKER: StrictInt = (
         3  # Max concurrent dispatches to a single worker
     )
+    DISPATCH_MAX_CONCURRENT_WORKERS: StrictInt = (
+        16  # Max workers to dispatch to concurrently for one workflow
+    )
+    DISPATCH_ROUTING_FAILURE_BASE_COOLDOWN: StrictFloat = (
+        0.25  # Base seconds to cool down worker routing after TCP dispatch failure
+    )
+    DISPATCH_ROUTING_FAILURE_MAX_COOLDOWN: StrictFloat = (
+        5.0  # Max seconds to cool down worker routing after repeated failures
+    )
+    DISPATCH_ROUTING_READINESS_COOLDOWN: StrictFloat = (
+        0.5  # Seconds to cool down routing after worker-side readiness rejection
+    )
 
     # Message queue backpressure - prevent memory exhaustion under load
     MESSAGE_QUEUE_MAX_SIZE: StrictInt = (
@@ -944,6 +956,10 @@ class Env(BaseModel):
             "RECOVERY_MAX_CONCURRENT": int,
             "RECOVERY_SEMAPHORE_SIZE": int,
             "DISPATCH_MAX_CONCURRENT_PER_WORKER": int,
+            "DISPATCH_MAX_CONCURRENT_WORKERS": int,
+            "DISPATCH_ROUTING_FAILURE_BASE_COOLDOWN": float,
+            "DISPATCH_ROUTING_FAILURE_MAX_COOLDOWN": float,
+            "DISPATCH_ROUTING_READINESS_COOLDOWN": float,
             "MESSAGE_QUEUE_MAX_SIZE": int,
             "MESSAGE_QUEUE_WARN_SIZE": int,
             # Bounded pending response queues settings (AD-32)

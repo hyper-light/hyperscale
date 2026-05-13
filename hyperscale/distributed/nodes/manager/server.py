@@ -465,6 +465,15 @@ class ManagerServer(HealthAwareServer):
             get_swim_status=self._get_swim_status_for_worker,
             manager_id=self._node_id.short,
             datacenter=self._node_id.datacenter,
+            dispatch_failure_base_cooldown_seconds=(
+                self._config.dispatch_routing_failure_base_cooldown_seconds
+            ),
+            dispatch_failure_max_cooldown_seconds=(
+                self._config.dispatch_routing_failure_max_cooldown_seconds
+            ),
+            dispatch_readiness_cooldown_seconds=(
+                self._config.dispatch_routing_readiness_cooldown_seconds
+            ),
         )
 
         self._registry.set_worker_pool(self._worker_pool)
@@ -836,6 +845,7 @@ class ManagerServer(HealthAwareServer):
             datacenter=self._node_id.datacenter,
             send_dispatch=self._send_workflow_dispatch,
             env=self.env,
+            max_concurrent_dispatches=self._config.dispatch_max_concurrent_workers,
         )
 
         self._worker_disseminator = WorkerDisseminator(
@@ -4048,15 +4058,45 @@ class ManagerServer(HealthAwareServer):
             return await self._stats.import_stats_checkpoint(checkpoint)
         return 0
 
-    async def _mark_worker_dispatch_unreachable(self, worker_id: str) -> None:
-        """Temporarily remove a worker from workflow dispatch routing."""
-        if self._worker_pool.update_health(worker_id, WorkerState.OFFLINE):
+    async def _record_worker_dispatch_success(self, worker_id: str) -> None:
+        """Record successful workflow dispatch routing without mutating SWIM health."""
+        if self._worker_pool.record_dispatch_success(worker_id):
             await self._worker_pool.notify_cores_available()
 
-    async def _mark_worker_dispatch_reachable(self, worker_id: str) -> None:
-        """Restore a worker to dispatch routing after a successful TCP dispatch."""
-        if self._worker_pool.update_health(worker_id, WorkerState.HEALTHY):
+    async def _record_worker_dispatch_transport_failure(
+        self,
+        worker_id: str,
+        error: str,
+    ) -> None:
+        """Record temporary dispatch-route failure without mutating SWIM health."""
+        if self._worker_pool.record_dispatch_transport_failure(worker_id, error):
             await self._worker_pool.notify_cores_available()
+
+    async def _record_worker_dispatch_readiness_rejection(
+        self,
+        worker_id: str,
+        error: str,
+    ) -> None:
+        """Record worker-side readiness rejection without mutating SWIM health."""
+        if self._worker_pool.record_dispatch_readiness_rejection(worker_id, error):
+            await self._worker_pool.notify_cores_available()
+
+    def _is_dispatch_readiness_rejection(self, error: str | None) -> bool:
+        """Return whether a dispatch rejection should cool down worker routing."""
+        if not error:
+            return False
+
+        normalized_error = error.lower()
+        readiness_markers = (
+            "draining",
+            "not accepting",
+            "queue depth",
+            "pending",
+            "capacity",
+            "allocate",
+            "cores",
+        )
+        return any(marker in normalized_error for marker in readiness_markers)
 
     async def _send_workflow_dispatch(
         self,
@@ -4084,7 +4124,6 @@ class ManagerServer(HealthAwareServer):
                     node_id=self._node_id.short,
                 )
             )
-            await self._mark_worker_dispatch_unreachable(worker_id)
             return False
         if dispatch.job_leader_addr is None:
             dispatch.job_leader_addr = (self._host, self._tcp_port)
@@ -4100,14 +4139,28 @@ class ManagerServer(HealthAwareServer):
             if response and not isinstance(response, Exception):
                 ack = WorkflowDispatchAck.load(response)
                 if bool(getattr(ack, "accepted", True)):
-                    await self._mark_worker_dispatch_reachable(worker_id)
+                    await self._record_worker_dispatch_success(worker_id)
                     return True
+                error = getattr(ack, "error", None)
+                if self._is_dispatch_readiness_rejection(error):
+                    await self._record_worker_dispatch_readiness_rejection(
+                        worker_id,
+                        error or "workflow dispatch rejected",
+                    )
+                else:
+                    await self._record_worker_dispatch_success(worker_id)
                 return False
 
-            await self._mark_worker_dispatch_unreachable(worker_id)
+            await self._record_worker_dispatch_transport_failure(
+                worker_id,
+                "workflow dispatch returned no response",
+            )
 
         except Exception as error:
-            await self._mark_worker_dispatch_unreachable(worker_id)
+            await self._record_worker_dispatch_transport_failure(
+                worker_id,
+                str(error),
+            )
             await self._udp_logger.log(
                 ServerError(
                     message=f"Workflow dispatch error: {error}",

@@ -84,6 +84,7 @@ class WorkflowDispatcher:
         get_leader_term: Callable[[], int] | None = None,
         retry_budget_manager: RetryBudgetManager | None = None,
         env: Env | None = None,
+        max_concurrent_dispatches: int = 16,
     ):
         """
         Initialize WorkflowDispatcher.
@@ -105,6 +106,8 @@ class WorkflowDispatcher:
                             Returns the current term for fence token generation.
             retry_budget_manager: Optional retry budget manager (AD-44). If None, one is created.
             env: Optional environment config. Used to create retry budget manager if not provided.
+            max_concurrent_dispatches: Maximum workers to dispatch to concurrently
+                                       for one workflow fanout.
         """
         self._job_manager = job_manager
         self._worker_pool = worker_pool
@@ -116,6 +119,7 @@ class WorkflowDispatcher:
         self._on_workflow_evicted = on_workflow_evicted
         self._on_dispatch_failed = on_dispatch_failed
         self._get_leader_term = get_leader_term
+        self._max_concurrent_dispatches = max(1, max_concurrent_dispatches)
         self._logger = Logger()
 
         # Phase H2: hold onto env for the deadline resolver. Falls back
@@ -663,7 +667,9 @@ class WorkflowDispatcher:
             successful_dispatches: list[tuple[str, int]] = []  # (worker_id, cores)
             failed_dispatches: list[tuple[str, int]] = []  # (worker_id, cores)
 
-            dispatch_plans = []
+            dispatch_plans: list[
+                tuple[str, int, TrackingToken, WorkflowDispatch]
+            ] = []
             for worker_id, worker_cores in allocations:
                 # Calculate VUs for this worker
                 worker_vus = max(1, int(pending.vus * (worker_cores / total_allocated)))
@@ -720,53 +726,28 @@ class WorkflowDispatcher:
                     layer_version=layer_version,
                 )
 
-                dispatch_plans.append(
-                    (worker_id, worker_cores, sub_token, dispatch)
-                )
+                dispatch_plans.append((worker_id, worker_cores, sub_token, dispatch))
 
-            for worker_id, worker_cores, sub_token, dispatch in dispatch_plans:
-                try:
-                    success = await self._send_dispatch(worker_id, dispatch)
-                    if success:
-                        await self._worker_pool.confirm_allocation(
-                            worker_id, worker_cores
-                        )
-                        successful_dispatches.append((worker_id, worker_cores))
-                    else:
-                        await self._record_failed_dispatch_plan(
-                            worker_id=worker_id,
-                            worker_cores=worker_cores,
-                            sub_token=sub_token,
-                            failed_dispatches=failed_dispatches,
-                        )
-                except asyncio.CancelledError as dispatch_error:
-                    if self._shutting_down or pending.job_id in self._cancelling_jobs:
-                        raise
+            dispatch_results = await self._send_dispatch_plans(
+                pending,
+                dispatch_plans,
+            )
 
-                    await self._log_warning(
-                        "Dispatch was cancelled by worker-side transport failure "
-                        f"for worker {worker_id}: {dispatch_error}",
-                        job_id=pending.job_id,
-                        workflow_id=pending.workflow_id,
+            for worker_id, worker_cores, sub_token, success in dispatch_results:
+                if success:
+                    await self._worker_pool.confirm_allocation(
+                        worker_id, worker_cores
                     )
+                    successful_dispatches.append((worker_id, worker_cores))
+                else:
                     await self._record_failed_dispatch_plan(
                         worker_id=worker_id,
                         worker_cores=worker_cores,
                         sub_token=sub_token,
                         failed_dispatches=failed_dispatches,
                     )
-                except Exception as dispatch_error:
-                    await self._log_warning(
-                        f"Exception dispatching to worker {worker_id} for workflow {pending.workflow_id}: {dispatch_error}",
-                        job_id=pending.job_id,
-                        workflow_id=pending.workflow_id,
-                    )
-                    await self._record_failed_dispatch_plan(
-                        worker_id=worker_id,
-                        worker_cores=worker_cores,
-                        sub_token=sub_token,
-                        failed_dispatches=failed_dispatches,
-                    )
+
+            pending.cores_allocated = sum(cores for _, cores in successful_dispatches)
 
             # Determine outcome based on dispatch results
             if len(successful_dispatches) == 0:
@@ -780,9 +761,10 @@ class WorkflowDispatcher:
                 # PARTIAL success - some dispatches succeeded, some failed
                 # This is still considered a success, but we log the partial failure
                 # The workflow will complete with reduced parallelism
+                dispatch_count = len(successful_dispatches) + len(failed_dispatches)
                 await self._log_warning(
                     f"Partial dispatch for workflow {pending.workflow_id}: "
-                    f"{len(successful_dispatches)}/{len(successful_dispatches) + len(failed_dispatches)} workers succeeded",
+                    f"{len(successful_dispatches)}/{dispatch_count} workers succeeded",
                     job_id=pending.job_id,
                     workflow_id=pending.workflow_id,
                 )
@@ -802,6 +784,54 @@ class WorkflowDispatcher:
         )
         # Clear ready state - will be re-signaled after backoff
         pending.clear_ready()
+
+    async def _send_dispatch_plans(
+        self,
+        pending: PendingWorkflow,
+        dispatch_plans: list[tuple[str, int, TrackingToken, WorkflowDispatch]],
+    ) -> list[tuple[str, int, TrackingToken, bool]]:
+        """Send workflow dispatch plans with bounded concurrency."""
+        if not dispatch_plans:
+            return []
+
+        semaphore = asyncio.Semaphore(self._max_concurrent_dispatches)
+
+        async def send_one(
+            worker_id: str,
+            worker_cores: int,
+            sub_token: TrackingToken,
+            dispatch: WorkflowDispatch,
+        ) -> tuple[str, int, TrackingToken, bool]:
+            async with semaphore:
+                if self._shutting_down or pending.job_id in self._cancelling_jobs:
+                    return worker_id, worker_cores, sub_token, False
+
+                try:
+                    success = await self._send_dispatch(worker_id, dispatch)
+                    return worker_id, worker_cores, sub_token, success
+                except asyncio.CancelledError as dispatch_error:
+                    if self._shutting_down or pending.job_id in self._cancelling_jobs:
+                        raise
+
+                    await self._log_warning(
+                        "Dispatch was cancelled by worker-side transport failure "
+                        f"for worker {worker_id}: {dispatch_error}",
+                        job_id=pending.job_id,
+                        workflow_id=pending.workflow_id,
+                    )
+                    return worker_id, worker_cores, sub_token, False
+                except Exception as dispatch_error:
+                    await self._log_warning(
+                        f"Exception dispatching to worker {worker_id} for "
+                        f"workflow {pending.workflow_id}: {dispatch_error}",
+                        job_id=pending.job_id,
+                        workflow_id=pending.workflow_id,
+                    )
+                    return worker_id, worker_cores, sub_token, False
+
+        return await asyncio.gather(
+            *(send_one(*dispatch_plan) for dispatch_plan in dispatch_plans)
+        )
 
     async def _record_failed_dispatch_plan(
         self,

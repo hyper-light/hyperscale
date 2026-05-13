@@ -28,6 +28,9 @@ from hyperscale.distributed.health import (
     WorkerHealthConfig,
     RoutingDecision,
 )
+from hyperscale.distributed.jobs.worker_dispatch_routing_state import (
+    WorkerDispatchRoutingState,
+)
 from hyperscale.distributed.jobs.logging_models import (
     WorkerPoolTrace,
     WorkerPoolDebug,
@@ -59,6 +62,9 @@ class WorkerPool:
         get_swim_status: Callable[[tuple[str, int]], str | None] | None = None,
         manager_id: str = "",
         datacenter: str = "",
+        dispatch_failure_base_cooldown_seconds: float = 0.25,
+        dispatch_failure_max_cooldown_seconds: float = 5.0,
+        dispatch_readiness_cooldown_seconds: float = 0.5,
     ):
         """
         Initialize WorkerPool.
@@ -70,11 +76,24 @@ class WorkerPool:
                             Returns 'OK', 'SUSPECT', 'DEAD', or None
             manager_id: Manager node ID for log context
             datacenter: Datacenter identifier for log context
+            dispatch_failure_base_cooldown_seconds: Base routing cooldown for TCP
+                                                   dispatch transport failures
+            dispatch_failure_max_cooldown_seconds: Maximum routing cooldown for TCP
+                                                  dispatch transport failures
+            dispatch_readiness_cooldown_seconds: Routing cooldown for worker-side
+                                                 readiness rejections
         """
         self._health_grace_period = health_grace_period
         self._get_swim_status = get_swim_status
         self._manager_id = manager_id
         self._datacenter = datacenter
+        self._dispatch_failure_base_cooldown_seconds = (
+            dispatch_failure_base_cooldown_seconds
+        )
+        self._dispatch_failure_max_cooldown_seconds = (
+            dispatch_failure_max_cooldown_seconds
+        )
+        self._dispatch_readiness_cooldown_seconds = dispatch_readiness_cooldown_seconds
         self._logger = Logger()
 
         # Worker storage - node_id -> WorkerStatus
@@ -83,6 +102,7 @@ class WorkerPool:
         # Three-signal health state tracking (AD-19)
         self._worker_health: dict[str, WorkerHealthState] = {}
         self._health_config = WorkerHealthConfig()
+        self._dispatch_routing: dict[str, WorkerDispatchRoutingState] = {}
 
         # Quick lookup by address
         self._addr_to_worker: dict[tuple[str, int], str] = {}
@@ -119,37 +139,62 @@ class WorkerPool:
             # Check if already registered
             if node_id in self._workers:
                 worker = self._workers[node_id]
+                if worker.registration:
+                    old_addr = (
+                        worker.registration.node.host,
+                        worker.registration.node.port,
+                    )
+                    self._addr_to_worker.pop(old_addr, None)
+
                 worker.registration = registration
                 worker.last_seen = time.monotonic()
-                return worker
+                worker.total_cores = registration.total_cores or 0
+                worker.available_cores = registration.available_cores or 0
+                worker.reserved_cores = 0
+                worker.health = WorkerState.HEALTHY
 
-            # Create new worker status
-            worker = WorkerStatus(
-                worker_id=node_id,
-                state=WorkerState.HEALTHY.value,
-                registration=registration,
-                last_seen=time.monotonic(),
-                total_cores=registration.total_cores or 0,
-                available_cores=registration.available_cores or 0,
-            )
+                health_state = self._worker_health.get(node_id)
+                if health_state:
+                    health_state.update_liveness(success=True)
+                    health_state.update_readiness(
+                        accepting=True,
+                        capacity=registration.available_cores or 0,
+                    )
 
-            self._workers[node_id] = worker
+                self._get_or_create_dispatch_routing_state(node_id).record_success()
 
-            # Initialize three-signal health state (AD-19)
-            health_state = WorkerHealthState(
-                worker_id=node_id,
-                config=self._health_config,
-            )
-            health_state.update_liveness(success=True)
-            health_state.update_readiness(
-                accepting=True,
-                capacity=registration.available_cores or 0,
-            )
-            self._worker_health[node_id] = health_state
+                addr = (registration.node.host, registration.node.port)
+                self._addr_to_worker[addr] = node_id
 
-            # Add address lookup
-            addr = (registration.node.host, registration.node.port)
-            self._addr_to_worker[addr] = node_id
+            else:
+                # Create new worker status
+                worker = WorkerStatus(
+                    worker_id=node_id,
+                    state=WorkerState.HEALTHY.value,
+                    registration=registration,
+                    last_seen=time.monotonic(),
+                    total_cores=registration.total_cores or 0,
+                    available_cores=registration.available_cores or 0,
+                )
+
+                self._workers[node_id] = worker
+
+                # Initialize three-signal health state (AD-19)
+                health_state = WorkerHealthState(
+                    worker_id=node_id,
+                    config=self._health_config,
+                )
+                health_state.update_liveness(success=True)
+                health_state.update_readiness(
+                    accepting=True,
+                    capacity=registration.available_cores or 0,
+                )
+                self._worker_health[node_id] = health_state
+                self._get_or_create_dispatch_routing_state(node_id).record_success()
+
+                # Add address lookup
+                addr = (registration.node.host, registration.node.port)
+                self._addr_to_worker[addr] = node_id
 
         # Signal outside registration lock to avoid nested lock acquisition
         async with self._cores_condition:
@@ -171,6 +216,7 @@ class WorkerPool:
 
             # Remove health state tracking
             self._worker_health.pop(node_id, None)
+            self._dispatch_routing.pop(node_id, None)
 
             # Remove address lookup
             if worker.registration:
@@ -198,6 +244,115 @@ class WorkerPool:
     # Health Tracking
     # =========================================================================
 
+    def _get_or_create_dispatch_routing_state(
+        self,
+        node_id: str,
+    ) -> WorkerDispatchRoutingState:
+        routing_state = self._dispatch_routing.get(node_id)
+        if routing_state is None:
+            routing_state = WorkerDispatchRoutingState(
+                worker_id=node_id,
+                base_cooldown_seconds=self._dispatch_failure_base_cooldown_seconds,
+                max_cooldown_seconds=self._dispatch_failure_max_cooldown_seconds,
+            )
+            self._dispatch_routing[node_id] = routing_state
+
+        return routing_state
+
+    def record_dispatch_success(self, node_id: str) -> bool:
+        """
+        Clear dispatch routing cooldown after a successful workflow dispatch.
+
+        This does not mutate SWIM or lifecycle health.
+        """
+        if node_id not in self._workers:
+            return False
+
+        self._get_or_create_dispatch_routing_state(node_id).record_success()
+        return True
+
+    def record_dispatch_transport_failure(
+        self,
+        node_id: str,
+        error: str = "",
+    ) -> bool:
+        """
+        Temporarily cool down workflow dispatch routing after a TCP failure.
+
+        This intentionally does not change SWIM membership or worker lifecycle
+        state. It only prevents the allocator from repeatedly selecting a
+        worker whose dispatch path is currently failing.
+        """
+        if node_id not in self._workers:
+            return False
+
+        self._get_or_create_dispatch_routing_state(node_id).record_failure(
+            error=error,
+        )
+        return True
+
+    def record_dispatch_readiness_rejection(
+        self,
+        node_id: str,
+        error: str = "",
+    ) -> bool:
+        """
+        Temporarily cool down routing after a worker rejects dispatch as not ready.
+
+        This is a readiness/routing signal, not SWIM health.
+        """
+        if node_id not in self._workers:
+            return False
+
+        self._get_or_create_dispatch_routing_state(node_id).record_failure(
+            error=error,
+            cooldown_seconds=self._dispatch_readiness_cooldown_seconds,
+        )
+        return True
+
+    def is_worker_dispatch_routable(self, node_id: str) -> bool:
+        """Return whether dispatch allocation may currently select this worker."""
+        if node_id not in self._workers:
+            return False
+
+        routing_state = self._dispatch_routing.get(node_id)
+        if routing_state is None:
+            return True
+
+        return routing_state.is_routable()
+
+    def get_worker_dispatch_routing_snapshot(
+        self,
+        node_id: str,
+    ) -> dict[str, str | int | float | bool] | None:
+        """Return diagnostic dispatch routing state for a worker."""
+        routing_state = self._dispatch_routing.get(node_id)
+        if routing_state is None:
+            return None
+
+        return {
+            "worker_id": routing_state.worker_id,
+            "routable": routing_state.is_routable(),
+            "consecutive_failures": routing_state.consecutive_failures,
+            "remaining_cooldown_seconds": routing_state.remaining_cooldown_seconds(),
+            "last_failure_at": routing_state.last_failure_at,
+            "last_success_at": routing_state.last_success_at,
+            "last_error": routing_state.last_error,
+        }
+
+    def _next_dispatch_routing_ready_delay(self) -> float | None:
+        now = time.monotonic()
+        cooldown_delays = [
+            routing_state.remaining_cooldown_seconds(now)
+            for node_id, routing_state in self._dispatch_routing.items()
+            if node_id in self._workers and not routing_state.is_routable(now)
+        ]
+        positive_delays = [delay for delay in cooldown_delays if delay > 0]
+        if not positive_delays:
+            return None
+
+        return min(positive_delays)
+
     def update_health(self, node_id: str, health: WorkerState) -> bool:
         """
         Update worker health status.
@@ -223,18 +378,25 @@ class WorkerPool:
         Check if a worker is considered healthy.
 
         A worker is healthy if:
-        1. The local routing state allows new work, AND
-        2. SWIM reports it as OK, or it has explicit healthy state, or it is
+        1. Local dispatch routing is not cooling down this worker, AND
+        2. Worker lifecycle state allows new work, AND
+        3. SWIM reports it as OK, or it has explicit healthy state, or it is
            within the new-registration grace period.
         """
         worker = self._workers.get(node_id)
         if not worker:
             return False
 
-        # Direct routing state is more specific than SWIM membership. A worker
-        # can still be visible to UDP/SWIM while its TCP dispatch path is
-        # unavailable or it is draining.
+        if not self.is_worker_dispatch_routable(node_id):
+            return False
+
+        # Lifecycle state is more specific than SWIM membership. A worker can
+        # still be visible to UDP/SWIM while it is explicitly draining.
         if worker.health in (WorkerState.DRAINING, WorkerState.OFFLINE):
+            return False
+
+        routing_decision = self.get_worker_routing_decision(node_id)
+        if routing_decision in (RoutingDecision.DRAIN, RoutingDecision.EVICT):
             return False
 
         # Check SWIM status if callback provided
@@ -270,6 +432,10 @@ class WorkerPool:
 
         if not self.is_worker_healthy(node_id):
             return "UNHEALTHY"
+
+        routing_decision = self.get_worker_routing_decision(node_id)
+        if routing_decision == RoutingDecision.INVESTIGATE:
+            return "DEGRADED"
 
         overload_state = worker.overload_state
 
@@ -453,6 +619,7 @@ class WorkerPool:
             ):
                 return True
 
+            was_healthy = self.is_worker_healthy(node_id)
             worker.heartbeat = heartbeat
             worker.last_seen = time.monotonic()
             try:
@@ -480,9 +647,15 @@ class WorkerPool:
                 health_state.update_liveness(success=True)
 
                 health_state.update_readiness(
-                    accepting=worker.available_cores > 0,
+                    accepting=(
+                        heartbeat.health_accepting_work
+                        and worker.available_cores > 0
+                    ),
                     capacity=worker.available_cores,
                 )
+
+            if not was_healthy and self.is_worker_healthy(node_id):
+                self._cores_condition.notify_all()
 
         return True
 
@@ -563,10 +736,17 @@ class WorkerPool:
                             )
 
                 remaining = timeout - elapsed
+                wait_timeout = min(5.0, remaining)
+                routing_ready_delay = self._next_dispatch_routing_ready_delay()
+                if routing_ready_delay is not None:
+                    if routing_ready_delay <= 0:
+                        continue
+                    wait_timeout = min(wait_timeout, routing_ready_delay)
+
                 try:
                     await asyncio.wait_for(
                         self._cores_condition.wait(),
-                        timeout=min(5.0, remaining),
+                        timeout=wait_timeout,
                     )
                 except asyncio.TimeoutError:
                     pass

@@ -61,6 +61,10 @@ class ManagerConfig:
 
     # Dispatch settings (from env)
     dispatch_max_concurrent_per_worker: int = 10
+    dispatch_max_concurrent_workers: int = 16
+    dispatch_routing_failure_base_cooldown_seconds: float = 0.25
+    dispatch_routing_failure_max_cooldown_seconds: float = 5.0
+    dispatch_routing_readiness_cooldown_seconds: float = 0.5
 
     # Job cleanup settings (from env)
     completed_job_max_age_seconds: float = 3600.0
@@ -209,6 +213,16 @@ def create_manager_config_from_env(
         recovery_jitter_min_seconds=env.RECOVERY_JITTER_MIN,
         recovery_jitter_max_seconds=env.RECOVERY_JITTER_MAX,
         dispatch_max_concurrent_per_worker=env.DISPATCH_MAX_CONCURRENT_PER_WORKER,
+        dispatch_max_concurrent_workers=env.DISPATCH_MAX_CONCURRENT_WORKERS,
+        dispatch_routing_failure_base_cooldown_seconds=(
+            env.DISPATCH_ROUTING_FAILURE_BASE_COOLDOWN
+        ),
+        dispatch_routing_failure_max_cooldown_seconds=(
+            env.DISPATCH_ROUTING_FAILURE_MAX_COOLDOWN
+        ),
+        dispatch_routing_readiness_cooldown_seconds=(
+            env.DISPATCH_ROUTING_READINESS_COOLDOWN
+        ),
         completed_job_max_age_seconds=env.COMPLETED_JOB_MAX_AGE,
         failed_job_max_age_seconds=env.FAILED_JOB_MAX_AGE,
         job_cleanup_interval_seconds=env.JOB_CLEANUP_INTERVAL,
