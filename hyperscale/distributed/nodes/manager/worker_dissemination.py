@@ -349,6 +349,119 @@ class WorkerDisseminator:
             return_exceptions=True,
         )
 
+    async def push_registration_to_remote_workers(
+        self,
+        is_leader: bool,
+        term: int,
+    ) -> None:
+        """Push ``ManagerToWorkerRegistration`` to every remote worker.
+
+        After ``request_worker_list_from_peers`` populates the remote-
+        worker registry, this manager knows *about* the workers
+        (host, tcp_port, udp_port) but the workers do not yet know
+        about *this* manager — their TCP-level ``_known_managers``
+        registry was built from whichever manager(s) they last
+        registered with. Without an explicit notification, the
+        workers' next manager-aware operation (heartbeat-piggyback
+        AD-26 extension request, ``send_cancellation_complete`` fall-
+        back) cannot route through this manager. AD-48 already
+        documents the bidirectional registration but the manager-side
+        send was never wired.
+
+        Each push uses the same payload shape the manager-initiated
+        ``ManagerToWorkerRegistration`` path on the worker
+        (``handle_manager_register``) already processes: full
+        ``ManagerInfo`` for this manager + the active peer-manager
+        list so the worker rebuilds its known-managers view in one
+        round-trip. The worker's handler is idempotent — if the
+        worker already knows us it simply refreshes the entry.
+
+        Failures are fire-and-forget at the per-worker level: the
+        steady-state SWIM gossip / dead-manager-reap loops on the
+        worker will eventually re-converge. We log warnings so
+        operationally-visible regressions don't slip through.
+        """
+        remote_workers = self._worker_pool.iter_remote_workers()
+        if not remote_workers:
+            return
+
+        from hyperscale.distributed.models import (
+            ManagerInfo,
+            ManagerToWorkerRegistration,
+        )
+
+        manager_info = ManagerInfo(
+            node_id=self._node_id,
+            tcp_host=self._config.host,
+            tcp_port=self._config.tcp_port,
+            udp_host=self._config.host,
+            udp_port=self._config.udp_port,
+            datacenter=self._datacenter,
+            is_leader=is_leader,
+        )
+        known_managers = self._state.get_active_known_manager_peers()
+
+        registration = ManagerToWorkerRegistration(
+            manager=manager_info,
+            is_leader=is_leader,
+            term=term,
+            known_managers=known_managers,
+        )
+        payload = registration.dump()
+
+        async def push_to_worker(worker_addr: tuple[str, int]) -> None:
+            try:
+                await asyncio.wait_for(
+                    self._send_tcp(
+                        worker_addr,
+                        "manager_register",
+                        payload,
+                        5.0,
+                    ),
+                    timeout=5.0,
+                )
+            except asyncio.TimeoutError:
+                self._task_runner.run(
+                    self._logger.log,
+                    ServerWarning(
+                        message=(
+                            f"Manager-to-worker register push to {worker_addr} "
+                            f"timed out; SWIM gossip will eventually converge"
+                        ),
+                        node_host=self._config.host,
+                        node_port=self._config.tcp_port,
+                        node_id=self._node_id,
+                    ),
+                )
+            except Exception as push_error:
+                self._task_runner.run(
+                    self._logger.log,
+                    ServerWarning(
+                        message=(
+                            f"Manager-to-worker register push to {worker_addr} "
+                            f"failed: {push_error}"
+                        ),
+                        node_host=self._config.host,
+                        node_port=self._config.tcp_port,
+                        node_id=self._node_id,
+                    ),
+                )
+
+        addresses: list[tuple[str, int]] = []
+        for worker in remote_workers:
+            if worker.registration is None:
+                continue
+            node = worker.registration.node
+            addresses.append((node.host, node.port))
+
+        if not addresses:
+            return
+
+        await asyncio.gather(
+            *[push_to_worker(addr) for addr in addresses],
+            return_exceptions=True,
+        )
+
     def build_worker_list_response(self) -> WorkerListResponse:
         workers = self._worker_pool.iter_workers()
 

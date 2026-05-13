@@ -465,6 +465,7 @@ class JobManager:
         workflow_id: str,
         worker_id: str,
         cores_allocated: int,
+        fence_token: int = 0,
     ) -> SubWorkflowInfo | None:
         """
         Register a sub-workflow dispatch to a worker.
@@ -506,11 +507,27 @@ class JobManager:
                 )
                 return None
 
+            if existing := job.sub_workflows.get(sub_workflow_token_str):
+                if existing.result is not None and not existing.superseded:
+                    return existing
+                existing.cores_allocated = cores_allocated
+                existing.fence_token = fence_token
+                existing.result = None
+                existing.progress = None
+                existing.superseded = False
+                if sub_workflow_token_str not in parent.sub_workflow_tokens:
+                    parent.sub_workflow_tokens.append(sub_workflow_token_str)
+                self._sub_workflow_to_job[sub_workflow_token_str] = str(job.token)
+                if parent.status == WorkflowStatus.PENDING:
+                    parent.status = WorkflowStatus.ASSIGNED
+                return existing
+
             # Create sub-workflow info
             info = SubWorkflowInfo(
                 token=sub_workflow_token,
                 parent_token=workflow_token,
                 cores_allocated=cores_allocated,
+                fence_token=fence_token,
             )
 
             # Register in both places
@@ -523,6 +540,32 @@ class JobManager:
                 parent.status = WorkflowStatus.ASSIGNED
 
             return info
+
+    async def remove_unstarted_sub_workflow(
+        self,
+        sub_workflow_token: str,
+    ) -> bool:
+        """Remove a planned sub-workflow that was never accepted by a worker."""
+        token_str = str(sub_workflow_token)
+        job = self.get_job_for_sub_workflow(token_str)
+        if not job:
+            return False
+
+        async with job.lock:
+            sub_workflow = job.sub_workflows.get(token_str)
+            if sub_workflow is None or sub_workflow.result is not None:
+                return False
+
+            parent = job.workflows.get(str(sub_workflow.parent_token))
+            if parent:
+                parent.sub_workflow_tokens = [
+                    sid for sid in parent.sub_workflow_tokens if sid != token_str
+                ]
+
+            job.sub_workflows.pop(token_str, None)
+            self._sub_workflow_to_job.pop(token_str, None)
+
+        return True
 
     async def apply_workflow_reassignment(
         self,
@@ -623,23 +666,24 @@ class JobManager:
             ]
 
             if removed_tokens:
-                parent.sub_workflow_tokens = [
-                    token_str
-                    for token_str in parent.sub_workflow_tokens
-                    if token_str not in removed_tokens
-                ]
-
                 for token_str in removed_tokens:
-                    if sub_workflow := job.sub_workflows.pop(token_str, None):
+                    if sub_workflow := job.sub_workflows.get(token_str):
+                        sub_workflow.superseded = True
                         if sub_workflow.dispatched_context:
                             removed_context = sub_workflow.dispatched_context
                         removed_version = max(
                             removed_version, sub_workflow.dispatched_version
                         )
                         removed_cores = max(removed_cores, sub_workflow.cores_allocated)
-                    self._sub_workflow_to_job.pop(token_str, None)
 
-                if not parent.sub_workflow_tokens and parent.status not in (
+                active_tokens = [
+                    token_str
+                    for token_str in parent.sub_workflow_tokens
+                    if (sub_workflow := job.sub_workflows.get(token_str))
+                    and not sub_workflow.superseded
+                ]
+
+                if not active_tokens and parent.status not in (
                     WorkflowStatus.COMPLETED,
                     WorkflowStatus.FAILED,
                     WorkflowStatus.AGGREGATED,
@@ -744,46 +788,228 @@ class JobManager:
             - result_recorded: True if result was stored
             - parent_complete: True if all sub-workflows for parent are now complete
         """
+        result_recorded, parent_complete, _duplicate, _stale, _reason = (
+            await self.record_sub_workflow_result_checked(
+                sub_workflow_token,
+                result,
+            )
+        )
+        return result_recorded, parent_complete
+
+    async def record_sub_workflow_result_checked(
+        self,
+        sub_workflow_token: str | TrackingToken,
+        result: WorkflowFinalResult,
+    ) -> tuple[bool, bool, bool, bool, str | None]:
+        """Record a sub-workflow result with duplicate/stale classification."""
         token_str = str(sub_workflow_token)
         job = self.get_job_for_sub_workflow(token_str)
         if not job:
             await self._logger.log(
                 JobManagerError(
-                    message=f"[record_sub_workflow_result] FAILED: job not found for token={token_str}, JobManager id={id(self)}, _sub_workflow_to_job keys={list(self._sub_workflow_to_job.keys())[:10]}...",
+                    message=(
+                        "[record_sub_workflow_result] FAILED: job not found "
+                        f"for token={token_str}, JobManager id={id(self)}, "
+                        "_sub_workflow_to_job keys="
+                        f"{list(self._sub_workflow_to_job.keys())[:10]}..."
+                    ),
                     manager_id=self._manager_id,
                     datacenter=self._datacenter,
                     sub_workflow_token=token_str,
                 )
             )
-            return False, False
+            return False, False, False, False, "unknown_sub_workflow"
 
         async with job.lock:
             sub_wf = job.sub_workflows.get(token_str)
             if not sub_wf:
                 await self._logger.log(
                     JobManagerError(
-                        message=f"[record_sub_workflow_result] FAILED: sub_wf not found for token={token_str}, job.sub_workflows keys={list(job.sub_workflows.keys())}",
+                        message=(
+                            "[record_sub_workflow_result] FAILED: sub_wf not "
+                            f"found for token={token_str}, job.sub_workflows "
+                            f"keys={list(job.sub_workflows.keys())}"
+                        ),
                         manager_id=self._manager_id,
                         datacenter=self._datacenter,
                         job_id=job.job_id,
                         sub_workflow_token=token_str,
                     )
                 )
-                return False, False
+                return False, False, False, False, "unknown_sub_workflow"
 
-            sub_wf.result = result
             # Check if all sub-workflows for parent are complete
             parent_token_str = str(sub_wf.parent_token)
             parent = job.workflows.get(parent_token_str)
             if not parent:
-                return True, False
+                return False, False, False, False, "unknown_parent_workflow"
+
+            if parent.terminal_pushed:
+                return False, False, True, False, "parent_terminal_already_pushed"
+
+            if sub_wf.result is not None:
+                return False, False, True, False, "duplicate_sub_workflow_result"
+
+            if sub_wf.superseded:
+                return False, False, False, True, "superseded_sub_workflow"
+
+            if (
+                result.worker_id
+                and sub_wf.worker_id
+                and result.worker_id != sub_wf.worker_id
+            ):
+                return False, False, False, True, "worker_mismatch"
+
+            if (
+                sub_wf.fence_token
+                and result.fence_token
+                and result.fence_token != sub_wf.fence_token
+            ):
+                return False, False, False, True, "stale_fence_token"
+
+            sub_wf.result = result
+            active_sub_workflow_tokens = [
+                sid
+                for sid in parent.sub_workflow_tokens
+                if (sub_workflow := job.sub_workflows.get(sid))
+                and not sub_workflow.superseded
+            ]
+            if not active_sub_workflow_tokens:
+                return True, False, False, False, None
 
             all_complete = all(
-                job.sub_workflows.get(sid) and job.sub_workflows[sid].result is not None
-                for sid in parent.sub_workflow_tokens
+                job.sub_workflows.get(sid)
+                and job.sub_workflows[sid].result is not None
+                for sid in active_sub_workflow_tokens
             )
 
-            return True, all_complete
+            return True, all_complete, False, False, None
+
+    async def aggregate_parent_workflow_outcome(
+        self,
+        sub_workflow_token: str,
+    ) -> tuple[str, str | None, list[dict]] | None:
+        """Compute the parent's aggregate terminal state across sub-workflows.
+
+        A parent workflow's terminal status is *not* the status of whichever
+        sub-workflow happened to be recorded last — that's a race when a
+        worker dies mid-execution and one sub-workflow comes back
+        ``CANCELLED`` while another comes back ``COMPLETED``. The right
+        answer is to look at every sub-workflow's stored result and reduce:
+
+          * any sub-workflow ``COMPLETED`` => the parent COMPLETED (the
+            cluster delivered usable results)
+          * else if any sub-workflow ``FAILED`` => the parent FAILED with
+            that error
+          * else (everything CANCELLED) => the parent CANCELLED with the
+            first cancellation reason
+
+        Returns ``(status, error, aggregated_results)`` or ``None`` if the
+        parent cannot be located. ``aggregated_results`` concatenates the
+        ``results`` payloads from every sub-workflow that produced one so
+        the caller can forward a single combined push.
+        """
+        token_str = str(sub_workflow_token)
+        job = self.get_job_for_sub_workflow(token_str)
+        if not job:
+            return None
+
+        sub_wf = job.sub_workflows.get(token_str)
+        if not sub_wf:
+            return None
+
+        async with job.lock:
+            parent = job.workflows.get(str(sub_wf.parent_token))
+            if not parent or parent.terminal_pushed:
+                return None
+
+            aggregated_results: list[dict] = []
+            first_error: str | None = None
+            any_completed = False
+            any_failed = False
+            first_failed_error: str | None = None
+
+            for sid in parent.sub_workflow_tokens:
+                sub = job.sub_workflows.get(sid)
+                if sub is None or sub.superseded or sub.result is None:
+                    continue
+                sub_status = sub.result.status
+                if sub_status == WorkflowStatus.COMPLETED.value:
+                    any_completed = True
+                elif sub_status == WorkflowStatus.FAILED.value:
+                    any_failed = True
+                    if first_failed_error is None:
+                        first_failed_error = sub.result.error
+                elif first_error is None and sub.result.error:
+                    first_error = sub.result.error
+                if sub.result.results:
+                    aggregated_results.extend(sub.result.results)
+
+            if any_completed:
+                parent.terminal_pushed = True
+                parent.terminal_status = WorkflowStatus.COMPLETED.value
+                return WorkflowStatus.COMPLETED.value, None, aggregated_results
+            if any_failed:
+                parent.terminal_pushed = True
+                parent.terminal_status = WorkflowStatus.FAILED.value
+                return (
+                    WorkflowStatus.FAILED.value,
+                    first_failed_error,
+                    aggregated_results,
+                )
+
+            parent.terminal_pushed = True
+            parent.terminal_status = WorkflowStatus.CANCELLED.value
+            return WorkflowStatus.CANCELLED.value, first_error, aggregated_results
+
+    async def get_parent_ready_result(
+        self,
+        job_id: str,
+        workflow_id: str,
+    ) -> WorkflowFinalResult | None:
+        """Return an existing active result when a parent is complete."""
+        job = self.get_job_by_id(job_id)
+        if not job:
+            return None
+
+        workflow_token = self.create_workflow_token(job_id, workflow_id)
+        async with job.lock:
+            parent = job.workflows.get(str(workflow_token))
+            if not parent or parent.terminal_pushed:
+                return None
+
+            active_sub_workflows = [
+                sub_workflow
+                for sid in parent.sub_workflow_tokens
+                if (sub_workflow := job.sub_workflows.get(sid))
+                and not sub_workflow.superseded
+            ]
+            if not active_sub_workflows:
+                return None
+            if any(sub_workflow.result is None for sub_workflow in active_sub_workflows):
+                return None
+            return active_sub_workflows[0].result
+
+    async def has_active_sub_workflows(
+        self,
+        job_id: str,
+        workflow_id: str,
+    ) -> bool:
+        """Return whether the parent still has non-superseded sub-workflows."""
+        job = self.get_job_by_id(job_id)
+        if not job:
+            return False
+
+        workflow_token = self.create_workflow_token(job_id, workflow_id)
+        async with job.lock:
+            parent = job.workflows.get(str(workflow_token))
+            if not parent or parent.terminal_pushed:
+                return False
+
+            return any(
+                job.sub_workflows.get(sid) and not job.sub_workflows[sid].superseded
+                for sid in parent.sub_workflow_tokens
+            )
 
     # =========================================================================
     # Workflow Completion
@@ -1046,7 +1272,11 @@ class JobManager:
             return False
 
         return all(
-            job.sub_workflows.get(sid) and job.sub_workflows[sid].result is not None
+            job.sub_workflows.get(sid)
+            and (
+                job.sub_workflows[sid].superseded
+                or job.sub_workflows[sid].result is not None
+            )
             for sid in wf.sub_workflow_tokens
         )
 
@@ -1274,7 +1504,7 @@ class JobManager:
             for wf in list(job.workflows.values())
             if wf.status == WorkflowStatus.RUNNING
             for sub in list(job.sub_workflows.values())
-            if sub.worker_id == worker_id and sub.result is None
+            if sub.worker_id == worker_id and sub.result is None and not sub.superseded
         ]
 
     # =========================================================================

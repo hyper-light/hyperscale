@@ -2486,8 +2486,6 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         effect on that result so the new instance is not
         re-unregistered by a stale fire.
         """
-        import sys as _sys, time as _time
-        self_addr = self._get_self_udp_addr()
         now = time.monotonic()
         applied = await self._incarnation_tracker.update_node(
             node,
@@ -2499,20 +2497,9 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             # Stale wheel-expiration: the tracker has already moved
             # past this incarnation (e.g. via rejoin). Discard the
             # entire post-DEAD pipeline.
-            print(
-                f"[swim-trace] {_time.monotonic():.2f} DEAD-STALE node={node} "
-                f"on={self._node_id.short} self_udp={self_addr} "
-                f"stale_inc={incarnation}",
-                file=_sys.stderr, flush=True,
-            )
             self._metrics.increment("suspicions_expired_stale")
             return
 
-        print(
-            f"[swim-trace] {_time.monotonic():.2f} DEAD node={node} "
-            f"on={self._node_id.short} self_udp={self_addr}",
-            file=_sys.stderr, flush=True,
-        )
         self._metrics.increment("suspicions_expired")
         self._audit_log.record(
             AuditEventType.NODE_CONFIRMED_DEAD,
@@ -4132,36 +4119,16 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         # state. This eliminates the "boot-time false positive": a
         # peer that's still completing its startup handshake cannot
         # be SUSPECTed by transient probe-timeouts.
-        import sys as _sys, time as _time
-        self_addr = self._get_self_udp_addr()
         if not self.is_peer_registered(node):
-            print(
-                f"[swim-trace] {_time.monotonic():.2f} SUSPECT-SKIP "
-                f"target={node} on={self._node_id.short} "
-                f"self_udp={self_addr} reason=not-registered",
-                file=_sys.stderr, flush=True,
-            )
             self._metrics.increment("suspicions_skipped_unregistered")
             return None
 
         # AD-29: Guard against suspecting unconfirmed peers
         # Use formal state machine check which prevents UNCONFIRMED → SUSPECT
         if not self._incarnation_tracker.can_suspect_node(node):
-            print(
-                f"[swim-trace] {_time.monotonic():.2f} SUSPECT-SKIP "
-                f"target={node} on={self._node_id.short} "
-                f"self_udp={self_addr} reason=unconfirmed",
-                file=_sys.stderr, flush=True,
-            )
             self._metrics.increment("suspicions_skipped_unconfirmed")
             return None
 
-        print(
-            f"[swim-trace] {_time.monotonic():.2f} SUSPECT-START "
-            f"target={node} on={self._node_id.short} "
-            f"self_udp={self_addr} lhm={self._local_health.score}",
-            file=_sys.stderr, flush=True,
-        )
         self._metrics.increment("suspicions_started")
         self._audit_log.record(
             AuditEventType.NODE_SUSPECTED,

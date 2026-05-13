@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 
 from hyperscale.distributed.models import (
     WorkflowFinalResult,
+    WorkflowFinalResultAck,
     WorkflowProgress,
     WorkflowProgressAck,
     WorkflowCancellationComplete,
@@ -394,21 +395,51 @@ class WorkerProgressReporter:
             max_retries: Maximum retries per manager
             base_delay: Base delay for backoff
         """
-        target_managers = []
+        target_addrs: list[tuple[str | None, tuple[str, int]]] = []
+        seen_addrs: set[tuple[str, int]] = set()
+
+        def add_target(
+            manager_id: str | None,
+            manager_addr: tuple[str, int] | None,
+        ) -> None:
+            if manager_addr is None or manager_addr in seen_addrs:
+                return
+            target_addrs.append((manager_id, manager_addr))
+            seen_addrs.add(manager_addr)
+
+        job_leader_addr = (
+            self._state.get_workflow_job_leader(final_result.workflow_id)
+            or final_result.job_leader_addr
+        )
+        if isinstance(job_leader_addr, list):
+            job_leader_addr = tuple(job_leader_addr)
+        leader_manager = (
+            self._registry.get_manager_by_addr(job_leader_addr)
+            if job_leader_addr
+            else None
+        )
+        add_target(
+            leader_manager.node_id if leader_manager else None,
+            job_leader_addr,
+        )
 
         if primary_id := self._registry._primary_manager_id:
-            target_managers.append(primary_id)
+            if manager := self._registry.get_manager(primary_id):
+                add_target(primary_id, (manager.tcp_host, manager.tcp_port))
 
-        for manager_id in self._registry._healthy_manager_ids:
-            if manager_id not in target_managers:
-                target_managers.append(manager_id)
+        for manager_id in sorted(self._registry._healthy_manager_ids):
+            if manager := self._registry.get_manager(manager_id):
+                add_target(manager_id, (manager.tcp_host, manager.tcp_port))
 
-        if not target_managers:
+        if not target_addrs:
             if self._logger:
                 task_runner_run(
                     self._logger.log,
                     ServerWarning(
-                        message=f"Cannot send final result for {final_result.workflow_id}: no healthy managers",
+                        message=(
+                            f"Cannot send final result for {final_result.workflow_id}: "
+                            "no healthy managers"
+                        ),
                         node_host=node_host,
                         node_port=node_port,
                         node_id=node_id_short,
@@ -416,73 +447,141 @@ class WorkerProgressReporter:
                 )
             return
 
-        for manager_id in target_managers:
-            if self._registry.is_circuit_open(manager_id):
-                continue
-
-            if not (manager := self._registry.get_manager(manager_id)):
-                continue
-
-            manager_addr = (manager.tcp_host, manager.tcp_port)
-            circuit = self._registry.get_or_create_circuit(manager_id)
-
-            retry_config = RetryConfig(
-                max_attempts=max_retries + 1,
-                base_delay=base_delay,
-                max_delay=base_delay * (2**max_retries),
-                jitter=JitterStrategy.FULL,
+        async def send_once(
+            manager_addr: tuple[str, int],
+        ) -> tuple[bool, tuple[str, int] | None, str | None]:
+            response, _ = await send_tcp(
+                manager_addr,
+                "workflow_final_result",
+                final_result.dump(),
+                timeout=5.0,
             )
-            executor = RetryExecutor(retry_config)
+            if isinstance(response, Exception):
+                raise response
+            if not response or not isinstance(response, bytes):
+                raise ConnectionError("Invalid empty response")
+            if response == b"ok":
+                return True, None, None
+            if response == b"error":
+                return False, None, "error response"
 
-            async def attempt_send() -> bytes:
-                response, _ = await send_tcp(
-                    manager_addr,
-                    "workflow_final_result",
-                    final_result.dump(),
-                    timeout=5.0,
+            ack = WorkflowFinalResultAck.load(response)
+            leader_addr = ack.leader_addr
+            if isinstance(leader_addr, list):
+                leader_addr = tuple(leader_addr)
+            if leader_addr:
+                self._state.set_workflow_job_leader(
+                    final_result.workflow_id,
+                    leader_addr,
                 )
-                if response and isinstance(response, bytes) and response != b"error":
-                    return response
-                raise ConnectionError("Invalid or error response")
+            if ack.is_leader and ack.manager_id:
+                self._registry.set_primary_manager(ack.manager_id)
+            if ack.accepted or ack.forwarded or ack.duplicate or ack.stale:
+                return True, leader_addr, None
+            return False, leader_addr, ack.error or ack.reason or "not accepted"
 
-            try:
-                await executor.execute(attempt_send, "final_result")
-                circuit.record_success()
+        target_index = 0
+        while target_index < len(target_addrs):
+            manager_id, manager_addr = target_addrs[target_index]
+            target_index += 1
 
-                if self._logger:
-                    task_runner_run(
-                        self._logger.log,
-                        ServerDebug(
-                            message=f"Sent final result for {final_result.workflow_id} status={final_result.status}",
-                            node_host=node_host,
-                            node_port=node_port,
-                            node_id=node_id_short,
-                        ),
+            if manager_id and self._registry.is_circuit_open(manager_id):
+                continue
+
+            circuit = (
+                self._registry.get_or_create_circuit(manager_id)
+                if manager_id
+                else self._registry.get_or_create_circuit_by_addr(manager_addr)
+            )
+
+            for attempt in range(max_retries + 1):
+                try:
+                    accepted, redirect_addr, error_message = await send_once(
+                        manager_addr
                     )
-                return
+                    if accepted:
+                        circuit.record_success()
 
-            except Exception as err:
-                record_circuit, category = _classify_send_error(err)
-                if record_circuit:
-                    circuit.record_error()
-                if self._logger:
-                    await self._logger.log(
-                        ServerError(
-                            message=(
-                                f"Failed to send final result for {final_result.workflow_id} "
-                                f"to {manager_id} [{category}]: {type(err).__name__}: {err}"
-                            ),
-                            node_host=node_host,
-                            node_port=node_port,
-                            node_id=node_id_short,
+                        if self._logger:
+                            task_runner_run(
+                                self._logger.log,
+                                ServerDebug(
+                                    message=(
+                                        f"Sent final result for {final_result.workflow_id} "
+                                        f"status={final_result.status}"
+                                    ),
+                                    node_host=node_host,
+                                    node_port=node_port,
+                                    node_id=node_id_short,
+                                ),
+                            )
+                        return
+
+                    if redirect_addr and redirect_addr not in seen_addrs:
+                        redirect_manager = self._registry.get_manager_by_addr(
+                            redirect_addr
                         )
-                    )
+                        target_addrs.insert(
+                            target_index,
+                            (
+                                redirect_manager.node_id
+                                if redirect_manager
+                                else None,
+                                redirect_addr,
+                            ),
+                        )
+                        seen_addrs.add(redirect_addr)
+                    if self._logger:
+                        await self._logger.log(
+                            ServerDebug(
+                                message=(
+                                    f"Final result rejected by {manager_addr}: "
+                                    f"{error_message or 'not accepted'}"
+                                ),
+                                node_host=node_host,
+                                node_port=node_port,
+                                node_id=node_id_short,
+                            )
+                        )
+                    break
+
+                except Exception as err:
+                    record_circuit, category = _classify_send_error(err)
+                    if record_circuit:
+                        circuit.record_error()
+                    if attempt < max_retries:
+                        delay = min(
+                            base_delay * (2**attempt),
+                            base_delay * (2**max_retries),
+                        )
+                        await asyncio.sleep(
+                            delay
+                        )
+                        continue
+                    if self._logger:
+                        await self._logger.log(
+                            ServerError(
+                                message=(
+                                    "Failed to send final result for "
+                                    f"{final_result.workflow_id} to {manager_addr} "
+                                    f"[{category}]: {type(err).__name__}: {err}"
+                                ),
+                                node_host=node_host,
+                                node_port=node_port,
+                                node_id=node_id_short,
+                            )
+                        )
+                    break
 
         self._enqueue_pending_result(final_result)
         if self._logger:
             await self._logger.log(
                 ServerWarning(
-                    message=f"Queued final result for {final_result.workflow_id} for background retry ({len(self._pending_results)} pending)",
+                    message=(
+                        f"Queued final result for {final_result.workflow_id} "
+                        "for background retry "
+                        f"({len(self._pending_results)} pending)"
+                    ),
                     node_host=node_host,
                     node_port=node_port,
                     node_id=node_id_short,
@@ -737,14 +836,38 @@ class WorkerProgressReporter:
         node_port: int,
         node_id_short: str,
     ) -> bool:
-        for manager_id in list(self._registry._healthy_manager_ids):
-            if self._registry.is_circuit_open(manager_id):
-                continue
+        target_addrs: list[tuple[str | None, tuple[str, int]]] = []
+        seen_addrs: set[tuple[str, int]] = set()
 
-            if not (manager := self._registry.get_manager(manager_id)):
-                continue
+        def add_target(
+            manager_id: str | None,
+            manager_addr: tuple[str, int] | None,
+        ) -> None:
+            if manager_addr is None or manager_addr in seen_addrs:
+                return
+            target_addrs.append((manager_id, manager_addr))
+            seen_addrs.add(manager_addr)
 
-            manager_addr = (manager.tcp_host, manager.tcp_port)
+        leader_addr = final_result.job_leader_addr
+        if isinstance(leader_addr, list):
+            leader_addr = tuple(leader_addr)
+        leader_manager = (
+            self._registry.get_manager_by_addr(leader_addr)
+            if leader_addr
+            else None
+        )
+        add_target(leader_manager.node_id if leader_manager else None, leader_addr)
+
+        for manager_id in sorted(self._registry._healthy_manager_ids):
+            if manager := self._registry.get_manager(manager_id):
+                add_target(manager_id, (manager.tcp_host, manager.tcp_port))
+
+        target_index = 0
+        while target_index < len(target_addrs):
+            manager_id, manager_addr = target_addrs[target_index]
+            target_index += 1
+            if manager_id and self._registry.is_circuit_open(manager_id):
+                continue
             try:
                 response, _ = await send_tcp(
                     manager_addr,
@@ -752,13 +875,54 @@ class WorkerProgressReporter:
                     final_result.dump(),
                     timeout=5.0,
                 )
-                if response and isinstance(response, bytes) and response != b"error":
-                    self._registry.get_or_create_circuit(manager_id).record_success()
+                if isinstance(response, Exception):
+                    raise response
+                if not response or not isinstance(response, bytes):
+                    continue
+                if response == b"ok":
+                    self._registry.get_or_create_circuit_by_addr(
+                        manager_addr
+                    ).record_success()
+                    return True
+                if response == b"error":
+                    continue
+
+                ack = WorkflowFinalResultAck.load(response)
+                leader_addr = ack.leader_addr
+                if isinstance(leader_addr, list):
+                    leader_addr = tuple(leader_addr)
+                if leader_addr:
+                    self._state.set_workflow_job_leader(
+                        final_result.workflow_id,
+                        leader_addr,
+                    )
+                    if leader_addr not in seen_addrs:
+                        redirect_manager = self._registry.get_manager_by_addr(
+                            leader_addr
+                        )
+                        target_addrs.insert(
+                            target_index,
+                            (
+                                redirect_manager.node_id
+                                if redirect_manager
+                                else None,
+                                leader_addr,
+                            ),
+                        )
+                        seen_addrs.add(leader_addr)
+                if ack.is_leader and ack.manager_id:
+                    self._registry.set_primary_manager(ack.manager_id)
+                if ack.accepted or ack.forwarded or ack.duplicate or ack.stale:
+                    self._registry.get_or_create_circuit_by_addr(
+                        manager_addr
+                    ).record_success()
                     return True
             except Exception as error:
                 record_circuit, category = _classify_send_error(error)
                 if record_circuit:
-                    self._registry.get_or_create_circuit(manager_id).record_error()
+                    self._registry.get_or_create_circuit_by_addr(
+                        manager_addr
+                    ).record_error()
                 if self._logger:
                     log_model = ServerError if category == "local_bug" else ServerDebug
                     await self._logger.log(

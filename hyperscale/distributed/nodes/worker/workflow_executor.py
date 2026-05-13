@@ -331,13 +331,6 @@ class WorkerWorkflowExecutor:
 
             await increment_version()
 
-            self._state.remove_active_workflow(dispatch.workflow_id)
-            self._state._workflow_fence_tokens.pop(dispatch.workflow_id, None)
-            self._state._workflow_cancel_events.pop(dispatch.workflow_id, None)
-            self._state._workflow_tokens.pop(dispatch.workflow_id, None)
-            self._state._workflow_id_to_name.pop(dispatch.workflow_id, None)
-            self._state._workflow_cores_completed.pop(dispatch.workflow_id, None)
-
             self._lifecycle.start_server_cleanup()
 
         elapsed_seconds = time.monotonic() - start_time
@@ -387,9 +380,20 @@ class WorkerWorkflowExecutor:
             error=workflow_error,
             worker_id=node_id_full,
             worker_available_cores=self._core_allocator.available_cores,
+            fence_token=dispatch.fence_token,
+            job_leader_addr=dispatch.job_leader_addr
+            or self._state.get_workflow_job_leader(dispatch.workflow_id),
         )
 
-        await send_final_result_callback(final_result)
+        try:
+            await send_final_result_callback(final_result)
+        finally:
+            self._state.remove_active_workflow(dispatch.workflow_id)
+            self._state._workflow_fence_tokens.pop(dispatch.workflow_id, None)
+            self._state._workflow_cancel_events.pop(dispatch.workflow_id, None)
+            self._state._workflow_tokens.pop(dispatch.workflow_id, None)
+            self._state._workflow_id_to_name.pop(dispatch.workflow_id, None)
+            self._state._workflow_cores_completed.pop(dispatch.workflow_id, None)
 
     async def monitor_workflow_progress(
         self,

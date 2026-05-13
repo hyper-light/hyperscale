@@ -134,6 +134,25 @@ class Env(BaseModel):
         60.0  # Seconds between dead manager checks
     )
 
+    # Worker Cluster-Connection Liveness Settings.
+    # ``WorkerClusterConnection`` runs a periodic watchdog that
+    # downgrades a manager to unhealthy when its last heartbeat is
+    # older than the staleness threshold. The watchdog catches the
+    # "address stays alive but identity changed" case (kill-and-
+    # restart at the same UDP/TCP port) that SWIM's address-keyed
+    # probe cannot see. Default sized for ≥3 SWIM protocol periods
+    # plus headroom for jitter under load — tighten for faster
+    # recovery only when the cluster is otherwise quiescent.
+    WORKER_CLUSTER_LIVENESS_CHECK_INTERVAL: StrictFloat = (
+        2.0  # Seconds between staleness scans
+    )
+    WORKER_CLUSTER_HEARTBEAT_STALENESS_THRESHOLD: StrictFloat = (
+        20.0  # Seconds a manager may go silent before being downgraded
+    )
+    WORKER_CLUSTER_REJOIN_BASE_BACKOFF: StrictFloat = (
+        2.0  # Base inter-pass backoff for rejoin loop (LHM-scaled)
+    )
+
     # Worker Cancellation Polling Settings
     WORKER_CANCELLATION_POLL_INTERVAL: StrictFloat = (
         5.0  # Seconds between cancellation poll requests
@@ -728,6 +747,10 @@ class Env(BaseModel):
             # Worker dead manager cleanup settings
             "WORKER_DEAD_MANAGER_REAP_INTERVAL": float,
             "WORKER_DEAD_MANAGER_CHECK_INTERVAL": float,
+            # Worker cluster-connection liveness settings
+            "WORKER_CLUSTER_LIVENESS_CHECK_INTERVAL": float,
+            "WORKER_CLUSTER_HEARTBEAT_STALENESS_THRESHOLD": float,
+            "WORKER_CLUSTER_REJOIN_BASE_BACKOFF": float,
             # Worker cancellation polling settings
             "WORKER_CANCELLATION_POLL_INTERVAL": float,
             # Worker backpressure delay settings (AD-37)

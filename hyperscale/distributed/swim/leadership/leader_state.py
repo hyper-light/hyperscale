@@ -172,26 +172,26 @@ class LeaderState:
     def become_leader(self, term: int) -> bool:
         """
         Transition to leader state.
-        
+
         Returns False if term is invalid (e.g., overflow).
         """
         if not self.is_term_valid(term):
             return False
-        
+
         was_leader = self.role == 'leader'
         self.role = 'leader'
         self.current_term = term
         self.leader_term = term
         self.leader_lease_start = time.monotonic()
         self.current_leader = None  # We are the leader, set by caller
-        
+
         # Clear vote sets to free memory - we're done with the election
         self.votes_received.clear()
         self.pre_votes_received.clear()
-        
+
         if not was_leader and self._on_become_leader:
             self._on_become_leader()
-        
+
         return True
     
     def become_follower(self, term: int, leader: tuple[str, int] | None = None) -> None:

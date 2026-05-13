@@ -409,6 +409,42 @@ class WorkerServer(HealthAwareServer):
         self._progress_handler: WorkflowProgressHandler = WorkflowProgressHandler(self)
         self._sync_handler: StateSyncHandler = StateSyncHandler(self)
 
+        # Cluster-membership invariant owner. Every registry path that
+        # mutates ``_healthy_manager_ids`` (mark_healthy /
+        # mark_unhealthy / remove_manager_state /
+        # register-response processing) signals this component via
+        # ``update()`` so the worker re-establishes connectivity
+        # against its seed list when isolated.
+        from .cluster_connection import WorkerClusterConnection
+        self._cluster_connection: WorkerClusterConnection = WorkerClusterConnection(
+            seed_manager_tcp_addrs=self._seed_managers,
+            register_with_manager=self._register_with_manager,
+            get_lhm_multiplier=lambda: self._local_health.get_multiplier(),
+            get_healthy_manager_ids=lambda: set(
+                self._registry._healthy_manager_ids
+            ),
+            mark_manager_unhealthy=self._registry.mark_manager_unhealthy,
+            invalidate_tcp_client=self._invalidate_tcp_client_transport,
+            task_runner=self._task_runner,
+            logger=self._udp_logger,
+            node_host=self._host,
+            node_port=self._tcp_port,
+            node_id_short=self._node_id.short,
+            liveness_check_interval_seconds=(
+                self._env.WORKER_CLUSTER_LIVENESS_CHECK_INTERVAL
+            ),
+            heartbeat_staleness_threshold_seconds=(
+                self._env.WORKER_CLUSTER_HEARTBEAT_STALENESS_THRESHOLD
+            ),
+            rejoin_base_backoff_seconds=(
+                self._env.WORKER_CLUSTER_REJOIN_BASE_BACKOFF
+            ),
+        )
+        # Wire the registry's healthy-set-changed signal so every
+        # mark_healthy / mark_unhealthy / remove_manager_state path
+        # flows through the connection state machine.
+        self._registry._on_healthy_set_changed = self._cluster_connection.update
+
     def _wire_logger_to_modules(self) -> None:
         """Wire logger to all modules after parent init."""
         self._registry._logger = self._udp_logger
@@ -471,12 +507,6 @@ class WorkerServer(HealthAwareServer):
 
     async def start(self, timeout: float | None = None) -> None:
         """Start the worker server."""
-        import sys as _sys, time as _time
-        print(
-            f"[wrk-trace] {_time.monotonic():.2f} worker start "
-            f"id={self._node_id.short} udp={self._host}:{self._udp_port}",
-            file=_sys.stderr, flush=True,
-        )
         # Setup logging config
         self._lifecycle_manager.setup_logging_config()
 
@@ -553,18 +583,7 @@ class WorkerServer(HealthAwareServer):
 
         # Register with all seed managers
         for manager_addr in self._seed_managers:
-            import sys as _sys, time as _time
-            print(
-                f"[wrk-trace] {_time.monotonic():.2f} register-attempt "
-                f"id={self._node_id.short} -> mgr={manager_addr}",
-                file=_sys.stderr, flush=True,
-            )
-            ok = await self._register_with_manager(manager_addr)
-            print(
-                f"[wrk-trace] {_time.monotonic():.2f} register-result "
-                f"id={self._node_id.short} mgr={manager_addr} ok={ok}",
-                file=_sys.stderr, flush=True,
-            )
+            await self._register_with_manager(manager_addr)
 
         # Join SWIM cluster with all known managers for healthchecks.
         # Workers know their seeds are managers from configuration —
@@ -582,6 +601,12 @@ class WorkerServer(HealthAwareServer):
 
         # Start background loops
         await self._start_background_loops()
+
+        # Start the cluster-connection liveness watchdog now that we
+        # have at least attempted registration and the SWIM probe
+        # cycle is running. Starting earlier would risk the watchdog
+        # marking managers stale before their first heartbeat.
+        self._cluster_connection.start()
 
         await self._udp_logger.log(
             ServerInfo(
@@ -603,6 +628,12 @@ class WorkerServer(HealthAwareServer):
         survive past shutdown and surface as leaked asyncio tasks.
         """
         self._running = False
+
+        # Tear down the cluster-connection state machine first so any
+        # in-flight rejoin task is cancelled before the rest of the
+        # shutdown begins to dismantle dependent state.
+        if hasattr(self, "_cluster_connection") and self._cluster_connection is not None:
+            await self._cluster_connection.stop()
 
         await self._stop_background_loops()
         await self._cancel_cores_notification_task()
@@ -675,6 +706,14 @@ class WorkerServer(HealthAwareServer):
 
         if self._cores_notification_task and not self._cores_notification_task.done():
             self._cores_notification_task.cancel()
+
+        # Mark the cluster-connection lifecycle stopped so any
+        # in-flight rejoin task self-terminates on its next state
+        # check. We cannot ``await stop()`` from sync abort, but
+        # setting ``_running = False`` is enough — the rejoin loop
+        # checks it on every iteration.
+        if hasattr(self, "_cluster_connection") and self._cluster_connection is not None:
+            self._cluster_connection._running = False
 
         # Abort modules
         self._lifecycle_manager.abort_monitors()
@@ -1130,6 +1169,31 @@ class WorkerServer(HealthAwareServer):
         """
         self._probe_scheduler.add_member(peer_udp_addr)
 
+    def _invalidate_tcp_client_transport(
+        self, manager_addr: tuple[str, int]
+    ) -> None:
+        """Drop any cached TCP client transport to ``manager_addr``.
+
+        The base server caches one ``asyncio.Transport`` per remote
+        address and reuses it across ``send_tcp`` calls; reuse is
+        keyed on ``is_closing()``, which only returns True once the
+        loop has observed ``connection_lost``. In the kill+restart
+        case at the same address, asyncio on the surviving worker
+        has no way to observe that the original listener died — the
+        peer's accepted protocol just stops responding. Dropping the
+        cached transport here forces the next ``_connect_tcp_client``
+        to open a fresh socket against whoever is listening on the
+        port at that moment, which is the only way the worker can
+        recover after the cluster reforms.
+        """
+        cached = self._tcp_client_transports.pop(manager_addr, None)
+        if cached is None:
+            return
+        try:
+            cached.abort()
+        except Exception:
+            pass
+
     async def _register_with_manager(self, manager_addr: tuple[str, int]) -> bool:
         """Register this worker with a manager."""
         return await self._registration_handler.register_with_manager(
@@ -1188,6 +1252,23 @@ class WorkerServer(HealthAwareServer):
 
     async def _handle_manager_failure_async(self, manager_id: str) -> None:
         """Handle manager failure - mark workflows as orphaned."""
+        # Drop any cached TCP client transport to this manager before
+        # flipping the registry. ``send_tcp`` only reconnects when the
+        # cached transport's ``is_closing()`` is True; without an
+        # explicit invalidation here a worker that already has a
+        # persistent TCP session to the dying manager will keep
+        # sending RPCs over it — fatal once the process restarts at
+        # the same address but with a different identity, since the
+        # asyncio transport has no way to observe the peer's death
+        # short of a write error. Invalidating here ensures the next
+        # ``send_tcp`` for any addr that resolved to this manager
+        # opens a fresh socket against whoever is listening now.
+        manager_info = self._registry.get_manager(manager_id)
+        if manager_info is not None:
+            self._invalidate_tcp_client_transport(
+                (manager_info.tcp_host, manager_info.tcp_port)
+            )
+
         await self._registry.mark_manager_unhealthy(manager_id)
 
         if self._primary_manager_id == manager_id:
@@ -1241,6 +1322,10 @@ class WorkerServer(HealthAwareServer):
         for manager_id, manager_info in self._registry._known_managers.items():
             if (manager_info.udp_host, manager_info.udp_port) == peer:
                 self._registry._healthy_manager_ids.add(manager_id)
+                # Signal the connection-state machine — this is the only
+                # ``_healthy_manager_ids`` mutation outside the registry's
+                # own helpers, so we route it through the same signal.
+                self._registry._signal_healthy_set_changed()
                 self._task_runner.run(
                     self._udp_logger.log,
                     ServerInfo(
@@ -1278,6 +1363,14 @@ class WorkerServer(HealthAwareServer):
             node_id_short=self._node_id.short,
             task_runner_run=self._task_runner.run,
         )
+
+        # Record the heartbeat as an application-level liveness
+        # signal for the cluster-connection watchdog. SWIM probe
+        # success alone is insufficient to prove the manager still
+        # knows about us — only an actual heartbeat (which the
+        # manager only sends to workers in its registry) proves the
+        # cluster-membership relationship is intact.
+        self._cluster_connection.record_heartbeat(heartbeat.node_id)
 
     def _on_new_manager_discovered(self, manager_addr: tuple[str, int]) -> None:
         """Handle discovery of new manager via heartbeat."""
@@ -1664,6 +1757,15 @@ class WorkerServer(HealthAwareServer):
         )
 
         if accepted and primary_manager_id:
+            # A successful registration round-trip is the strongest
+            # application-level liveness signal we get from a manager:
+            # the manager not only answered our TCP but accepted us
+            # into its worker registry. Record this as a heartbeat
+            # against every manager we now know is healthy so the
+            # cluster-connection watchdog does not immediately mark
+            # them stale before their first SWIM heartbeat arrives.
+            for manager_id in list(self._registry._healthy_manager_ids):
+                self._cluster_connection.record_heartbeat(manager_id)
             self._task_runner.run(
                 self._udp_logger.log,
                 ServerInfo(

@@ -650,6 +650,7 @@ class WorkflowDispatcher:
             successful_dispatches: list[tuple[str, int]] = []  # (worker_id, cores)
             failed_dispatches: list[tuple[str, int]] = []  # (worker_id, cores)
 
+            dispatch_plans = []
             for worker_id, worker_cores in allocations:
                 # Calculate VUs for this worker
                 worker_vus = max(1, int(pending.vus * (worker_cores / total_allocated)))
@@ -688,26 +689,41 @@ class WorkflowDispatcher:
                     context_version=layer_version,
                 )
 
+                sub_workflow = await self._job_manager.register_sub_workflow(
+                    job_id=pending.job_id,
+                    workflow_id=pending.workflow_id,
+                    worker_id=worker_id,
+                    cores_allocated=worker_cores,
+                    fence_token=fence_token,
+                )
+                if sub_workflow is None:
+                    await self._worker_pool.release_cores(worker_id, worker_cores)
+                    failed_dispatches.append((worker_id, worker_cores))
+                    continue
+
+                await self._job_manager.set_sub_workflow_dispatched_context(
+                    sub_workflow_token=str(sub_token),
+                    context_bytes=context_bytes,
+                    layer_version=layer_version,
+                )
+
+                dispatch_plans.append(
+                    (worker_id, worker_cores, sub_token, dispatch)
+                )
+
+            for worker_id, worker_cores, sub_token, dispatch in dispatch_plans:
                 try:
                     success = await self._send_dispatch(worker_id, dispatch)
                     if success:
-                        await self._job_manager.register_sub_workflow(
-                            job_id=pending.job_id,
-                            workflow_id=pending.workflow_id,
-                            worker_id=worker_id,
-                            cores_allocated=worker_cores,
-                        )
-                        await self._job_manager.set_sub_workflow_dispatched_context(
-                            sub_workflow_token=str(sub_token),
-                            context_bytes=context_bytes,
-                            layer_version=layer_version,
-                        )
                         await self._worker_pool.confirm_allocation(
                             worker_id, worker_cores
                         )
                         successful_dispatches.append((worker_id, worker_cores))
                     else:
                         await self._worker_pool.release_cores(worker_id, worker_cores)
+                        await self._job_manager.remove_unstarted_sub_workflow(
+                            str(sub_token)
+                        )
                         failed_dispatches.append((worker_id, worker_cores))
                 except Exception as dispatch_error:
                     await self._log_warning(
@@ -716,6 +732,9 @@ class WorkflowDispatcher:
                         workflow_id=pending.workflow_id,
                     )
                     await self._worker_pool.release_cores(worker_id, worker_cores)
+                    await self._job_manager.remove_unstarted_sub_workflow(
+                        str(sub_token)
+                    )
                     failed_dispatches.append((worker_id, worker_cores))
 
             # Determine outcome based on dispatch results
@@ -1241,16 +1260,32 @@ class WorkflowDispatcher:
         key = f"{job_id}:{workflow_id}"
 
         async with self._pending_lock:
-            if pending := self._pending.get(key):
-                pending.dispatched = False
-                pending.dispatch_in_progress = False
-                pending.dispatched_at = 0.0
-                pending.dispatch_attempts = 0
-                pending.next_retry_delay = self.INITIAL_RETRY_DELAY
-                pending.check_and_signal_ready()
-                self.signal_dispatch()
-                return True
-            return False
+            pending = self._pending.get(key)
+            if pending is None:
+                return False
+            pending.dispatched = False
+            pending.dispatch_in_progress = False
+            pending.dispatched_at = 0.0
+            pending.dispatch_attempts = 0
+            pending.next_retry_delay = self.INITIAL_RETRY_DELAY
+            pending.check_and_signal_ready()
+            self.signal_dispatch()
+
+        # The job's dispatch loop exits once every workflow has been
+        # dispatched once — there's no consumer for the trigger we
+        # just signalled if the loop has already returned. Worker-
+        # death reassignment can land long after that point, so we
+        # have to restart the loop ourselves. ``start_job_dispatch``
+        # is idempotent (no-op if a task is already tracked), which
+        # keeps this safe under racing requeues. Done outside the
+        # pending lock because ``start_job_dispatch`` creates a task
+        # that takes the same lock.
+        submission = self._job_submissions.get(job_id)
+        if submission is not None:
+            existing_task = self._job_dispatch_tasks.get(job_id)
+            if existing_task is None or existing_task.done():
+                await self.start_job_dispatch(job_id, submission)
+        return True
 
     async def unassign_workflow(self, job_id: str, workflow_id: str) -> bool:
         key = f"{job_id}:{workflow_id}"

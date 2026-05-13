@@ -1918,6 +1918,10 @@ class MercurySyncBaseServer(Generic[T]):
         # that we never swallow non-cleanup-related failures here.
         if self._udp_server_socket is not None:
             try:
+                self._udp_server_socket.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
                 self._udp_server_socket.close()
             except OSError:
                 pass
@@ -1925,11 +1929,29 @@ class MercurySyncBaseServer(Generic[T]):
 
         # Close TCP server (and its underlying socket — see UDP
         # comment above for the same kill→restart race rationale).
+        # ``socket.shutdown(SHUT_RDWR)`` BEFORE ``close()`` is
+        # load-bearing for the simulation harness's tight
+        # kill→restart cycle: under ``SO_REUSEADDR`` macOS will
+        # happily let a fresh socket bind to the same port even
+        # while the previous listener still has the descriptor
+        # open, and new connections can route to either socket
+        # — usually the older one, because its accept queue is
+        # already warm. Calling ``shutdown`` first invalidates
+        # the kernel-side accept queue immediately so subsequent
+        # connections cannot land on the dying instance regardless
+        # of when asyncio gets around to running the deferred
+        # ``Server.close`` cleanup. Without this, a restart at the
+        # same port silently inherits requests for the dead
+        # process's identity for many seconds.
         if self._tcp_server is not None:
             self._tcp_server.close()
             self._tcp_server = None
             self._tcp_connected = False
         if self._tcp_server_socket is not None:
+            try:
+                self._tcp_server_socket.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
             try:
                 self._tcp_server_socket.close()
             except OSError:

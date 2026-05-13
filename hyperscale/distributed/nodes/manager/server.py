@@ -56,6 +56,7 @@ from hyperscale.distributed.models import (
     WorkflowProgress,
     WorkflowProgressAck,
     WorkflowFinalResult,
+    WorkflowFinalResultAck,
     WorkflowResult,
     WorkflowResultPush,
     WorkflowStatus,
@@ -720,8 +721,46 @@ class ManagerServer(HealthAwareServer):
 
     @property
     def _quorum_size(self) -> int:
-        """Calculate required quorum size."""
-        return (self._manager_state.get_active_peer_count() // 2) + 1
+        """Required quorum size based on **configured** cluster size (AD-3).
+
+        Per AD-3, quorum is derived from the CONFIGURED manager peer
+        count, not the runtime ``_active_manager_peers`` count. The
+        active set is for *monitoring* whether quorum is achievable
+        right now; it must not feed the quorum threshold itself.
+        Doing the latter is the canonical split-brain bug: a manager
+        whose peers are all temporarily down (network partition,
+        kill+restart window) sees ``active_peer_count == 0`` and
+        computes ``quorum = 1`` — i.e. itself — and self-elects. Two
+        partitioned-from-each-other managers both elect themselves
+        and the cluster has multiple leaders simultaneously.
+
+        Configured size = ``len(self._manager_udp_peers) + 1``: every
+        manager from the static seed list plus this node itself.
+        """
+        configured_managers = len(self._manager_udp_peers) + 1
+        return (configured_managers // 2) + 1
+
+    def _get_election_member_count(self) -> int:
+        """Configured manager cluster size for SWIM-tier leader election.
+
+        Overrides ``HealthAwareServer._get_election_member_count``,
+        which counts the dynamically-discovered ``_peer_roles`` (or
+        falls back to the incarnation tracker). Both of those are
+        runtime views and shrink to the local node alone immediately
+        after a restart, before peer registrations have re-converged.
+        Using them feeds a quorum of ``1`` into ``_run_election`` /
+        ``_run_pre_vote`` (``(1 // 2) + 1 == 1``); a freshly-restarted
+        manager whose peers haven't yet registered with it will see
+        itself as the entire cluster and grant itself leadership —
+        precisely the split-brain scenario AD-3 forbids.
+
+        For the manager tier the configured cohort is the static
+        ``_manager_udp_peers`` seed list plus self. That count is
+        immutable across restarts and yields the correct Raft-style
+        majority threshold regardless of how many peer registrations
+        have landed at any given moment.
+        """
+        return len(self._manager_udp_peers) + 1
 
     def _get_manager_health_state_snapshot(self) -> str:
         return self._manager_health_state_snapshot
@@ -821,9 +860,23 @@ class ManagerServer(HealthAwareServer):
         # Join SWIM clusters
         await self._join_swim_clusters()
 
-        # Request worker lists from peer managers (AD-48)
+        # Request worker lists from peer managers (AD-48). Then push
+        # ``ManagerToWorkerRegistration`` down to every learned worker
+        # so they update their TCP-level ``_known_managers`` registry
+        # to include this manager — the second half of AD-48's
+        # bidirectional-registration spec that the original landing
+        # never wired. Without this push the cluster looks healthy
+        # at the manager tier (every manager sees every worker via
+        # state-sync) but workers continue to dispatch only to the
+        # managers they originally registered with, leaving a
+        # returning manager invisible to the very workers it was
+        # told about.
         if self._worker_disseminator:
             await self._worker_disseminator.request_worker_list_from_peers()
+            await self._worker_disseminator.push_registration_to_remote_workers(
+                is_leader=self.is_leader(),
+                term=self._leader_election.state.current_term,
+            )
 
         # Start SWIM probe cycle
         self._task_runner.run(self.start_probe_cycle)
@@ -1073,11 +1126,6 @@ class ManagerServer(HealthAwareServer):
 
     def _on_node_dead(self, node_addr: tuple[str, int]) -> None:
         """Handle node death detected by SWIM."""
-        import sys as _sys, time as _time
-        print(
-            f"[mgr-trace] {_time.monotonic():.2f} _on_node_dead addr={node_addr}",
-            file=_sys.stderr, flush=True,
-        )
         worker_id = self._manager_state.get_worker_id_from_addr(node_addr)
         if worker_id:
             self._manager_state.setdefault_worker_unhealthy_since(
@@ -1318,6 +1366,7 @@ class ManagerServer(HealthAwareServer):
         requeued = False
         applied = False
         dispatch_state_updated = False
+        ready_result: WorkflowFinalResult | None = None
 
         async with self._workflow_reassignment_lock:
             applied = await self._job_manager.apply_workflow_reassignment(
@@ -1327,14 +1376,53 @@ class ManagerServer(HealthAwareServer):
                 failed_worker_id=failed_worker_id,
             )
 
+            if applied:
+                ready_result = await self._job_manager.get_parent_ready_result(
+                    job_id,
+                    workflow_id,
+                )
+
             if (
                 reassignment_token.worker_id == failed_worker_id
                 or not reassignment_token.worker_id
             ):
-                requeued = await self._workflow_dispatcher.requeue_workflow(
-                    sub_workflow_token
+                parent_has_active_sub_workflows = (
+                    await self._job_manager.has_active_sub_workflows(
+                        job_id,
+                        workflow_id,
+                    )
                 )
-                dispatch_state_updated = requeued
+                if ready_result is not None:
+                    await self._udp_logger.log(
+                        ServerInfo(
+                            message=(
+                                f"Workflow {workflow_id[:8]}... is ready after "
+                                f"superseding failed worker {failed_worker_id[:8]}..."
+                            ),
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
+                elif parent_has_active_sub_workflows:
+                    await self._udp_logger.log(
+                        ServerInfo(
+                            message=(
+                                f"Workflow {workflow_id[:8]}... still has active "
+                                f"sub-workflows after worker {failed_worker_id[:8]}... "
+                                "failed"
+                            ),
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
+                else:
+                    requeued = await self._workflow_dispatcher.requeue_workflow(
+                        sub_workflow_token
+                    )
+                    dispatch_state_updated = requeued
+
                 if requeued:
                     await self._udp_logger.log(
                         ServerInfo(
@@ -1347,7 +1435,7 @@ class ManagerServer(HealthAwareServer):
                             node_id=self._node_id.short,
                         )
                     )
-                else:
+                elif ready_result is None and not parent_has_active_sub_workflows:
                     await self._udp_logger.log(
                         ServerWarning(
                             message=(
@@ -1396,6 +1484,11 @@ class ManagerServer(HealthAwareServer):
                 reason=reason,
                 new_worker_id=new_worker_id,
             )
+
+        if ready_result is not None:
+            await self._handle_parent_workflow_completion(ready_result, True, True)
+            if self._is_job_complete(job_id):
+                await self._handle_job_completion(job_id)
 
         return applied, requeued
 
@@ -1482,12 +1575,6 @@ class ManagerServer(HealthAwareServer):
     # =========================================================================
 
     async def _handle_worker_failure(self, worker_id: str) -> None:
-        import sys as _sys, time as _time
-        print(
-            f"[mgr-trace] {_time.monotonic():.2f} _handle_worker_failure "
-            f"worker={worker_id[:8]} workers_before={len(self._manager_state._workers)}",
-            file=_sys.stderr, flush=True,
-        )
         await self._worker_health_monitor.handle_worker_failure(worker_id)
 
         if self._workflow_dispatcher and self._job_manager:
@@ -1523,12 +1610,6 @@ class ManagerServer(HealthAwareServer):
         # mirrored explicitly here so we keep the same surface.
         self._registry.unregister_worker(worker_id)
         self._manager_state._worker_lhm_scores.pop(worker_id, None)
-        import sys as _sys, time as _time
-        print(
-            f"[mgr-trace] {_time.monotonic():.2f} unregistered worker={worker_id[:8]} "
-            f"workers_after={len(self._manager_state._workers)}",
-            file=_sys.stderr, flush=True,
-        )
 
     async def _handle_manager_peer_failure(
         self,
@@ -3988,6 +4069,8 @@ class ManagerServer(HealthAwareServer):
                 )
             )
             return False
+        if dispatch.job_leader_addr is None:
+            dispatch.job_leader_addr = (self._host, self._tcp_port)
         worker_addr = (registration.node.host, registration.node.port)
         try:
             response, _clock = await self.send_tcp(
@@ -4146,21 +4229,7 @@ class ManagerServer(HealthAwareServer):
                 ).dump()
 
             # Register worker
-            import sys as _sys, time as _time
-            print(
-                f"[mgr-trace] {_time.monotonic():.2f} worker_register "
-                f"worker={registration.node.node_id[:8]} "
-                f"udp={registration.node.host}:{registration.node.udp_port} "
-                f"workers_before={len(self._manager_state._workers)}",
-                file=_sys.stderr, flush=True,
-            )
             self._registry.register_worker(registration)
-            print(
-                f"[mgr-trace] {_time.monotonic():.2f} registered "
-                f"worker={registration.node.node_id[:8]} "
-                f"workers_after={len(self._manager_state._workers)}",
-                file=_sys.stderr, flush=True,
-            )
 
             # Add to worker pool
             await self._worker_pool.register_worker(registration)
@@ -4372,11 +4441,9 @@ class ManagerServer(HealthAwareServer):
                 self._worker_health_monitor.record_job_progress(progress.job_id, worker_id)
 
             # Update job manager
-            self._job_manager.update_workflow_progress(
-                job_id=progress.job_id,
-                workflow_id=progress.workflow_id,
-                completed_count=progress.completed_count,
-                failed_count=progress.failed_count,
+            await self._job_manager.update_workflow_progress(
+                sub_workflow_token=progress.workflow_id,
+                progress=progress,
             )
 
             stats_worker_id = worker_id or f"{addr[0]}:{addr[1]}"
@@ -4442,11 +4509,26 @@ class ManagerServer(HealthAwareServer):
         if not parent_workflow_token:
             return
 
-        if result.status == WorkflowStatus.COMPLETED.value:
+        # Aggregate across *all* sub-workflows for the parent rather than
+        # forwarding whichever result happened to be the last to land. A
+        # worker that died mid-execution races the manager's reassignment
+        # path: its CANCELLED final-result can arrive after the surviving
+        # workers reported COMPLETED, and using ``result.status`` directly
+        # would push that misleading CANCELLED terminal state to the
+        # client. The aggregator returns the same payload shape the legacy
+        # path produced when only one sub-workflow existed.
+        aggregate = await self._job_manager.aggregate_parent_workflow_outcome(
+            result.workflow_id
+        )
+        if aggregate is None:
+            return
+        aggregate_status, aggregate_error, aggregated_results = aggregate
+
+        if aggregate_status == WorkflowStatus.COMPLETED.value:
             await self._job_manager.mark_workflow_completed(parent_workflow_token)
-        elif result.error:
+        elif aggregate_status == WorkflowStatus.FAILED.value:
             await self._job_manager.mark_workflow_failed(
-                parent_workflow_token, result.error
+                parent_workflow_token, aggregate_error or "workflow failed"
             )
 
         # Push aggregated WorkflowResultPush to the client when no gate is
@@ -4456,30 +4538,48 @@ class ManagerServer(HealthAwareServer):
         # manager and the client's on_workflow_result callback never fires.
         # Gates handle the cross-DC aggregation case via their own
         # workflow_result_push handler.
-        await self._push_workflow_result_to_client(result, sub_token)
+        await self._push_workflow_result_to_client(
+            result,
+            sub_token,
+            aggregate_status=aggregate_status,
+            aggregate_error=aggregate_error,
+            aggregated_results=aggregated_results,
+        )
 
     async def _push_workflow_result_to_client(
         self,
         result: WorkflowFinalResult,
         sub_token: TrackingToken,
+        aggregate_status: str | None = None,
+        aggregate_error: str | None = None,
+        aggregated_results: list[dict] | None = None,
     ) -> None:
         callback_addr = self._manager_state.get_job_callback(result.job_id)
         if not callback_addr:
             return
         if isinstance(callback_addr, list):
             callback_addr = tuple(callback_addr)
-        # ``result.results`` already carries the worker's per-core
-        # WorkflowStats list. For single-DC L1/L2 the aggregation is
-        # the identity; multi-DC aggregation is a gate concern.
+        # The aggregate computed across every sub-workflow is the
+        # authoritative terminal state for the parent. Falling back to
+        # ``result.*`` keeps callers without an aggregate (legacy paths)
+        # working unchanged, but the standard push goes through the
+        # aggregated values so a CANCELLED sub-workflow from a dying
+        # worker cannot override a sibling's COMPLETED result.
+        push_status = aggregate_status if aggregate_status is not None else result.status
+        push_error = aggregate_error if aggregate_status is not None else result.error
+        if aggregated_results is not None:
+            push_results = aggregated_results
+        else:
+            push_results = list(result.results) if result.results else []
         push = WorkflowResultPush(
             job_id=result.job_id,
             workflow_id=sub_token.workflow_id or result.workflow_id,
             workflow_name=result.workflow_name,
             datacenter=self._node_id.datacenter,
-            status=result.status,
+            status=push_status,
             fence_token=self._leases.get_fence_token(result.job_id),
-            results=list(result.results) if result.results else [],
-            error=result.error,
+            results=push_results,
+            error=push_error,
             elapsed_seconds=0.0,
             completed_at=time.time(),
         )
@@ -4510,6 +4610,82 @@ class ManagerServer(HealthAwareServer):
             return False
         return job.workflows_completed + job.workflows_failed >= job.workflows_total
 
+    def _workflow_final_result_ack(
+        self,
+        *,
+        accepted: bool,
+        forwarded: bool = False,
+        duplicate: bool = False,
+        stale: bool = False,
+        leader_addr: tuple[str, int] | None = None,
+        error: str | None = None,
+        reason: str = "",
+    ) -> bytes:
+        return WorkflowFinalResultAck(
+            accepted=accepted,
+            manager_id=self._node_id.full,
+            is_leader=self.is_leader(),
+            forwarded=forwarded,
+            duplicate=duplicate,
+            stale=stale,
+            leader_addr=leader_addr,
+            error=error,
+            reason=reason,
+        ).dump()
+
+    def _resolve_job_leader_addr_for_result(
+        self,
+        job_id: str,
+    ) -> tuple[str, int] | None:
+        leader_addr = self._leases.get_job_leader_addr(job_id)
+        if leader_addr is None:
+            leader_addr = self._resolve_dc_leader_addr()
+        if isinstance(leader_addr, list):
+            leader_addr = tuple(leader_addr)
+        return leader_addr
+
+    async def _forward_workflow_final_result_to_leader(
+        self,
+        result: WorkflowFinalResult,
+        data: bytes,
+    ) -> bytes:
+        leader_addr = self._resolve_job_leader_addr_for_result(result.job_id)
+        if leader_addr is None:
+            return self._workflow_final_result_ack(
+                accepted=False,
+                error="not job leader and no leader is known",
+                reason="unknown_job_leader",
+            )
+        if leader_addr == (self._host, self._tcp_port):
+            return self._workflow_final_result_ack(
+                accepted=False,
+                leader_addr=leader_addr,
+                error="local manager does not own job lease",
+                reason="local_lease_not_held",
+            )
+
+        response, _clock = await self.send_tcp(
+            leader_addr,
+            "workflow_final_result",
+            data,
+            timeout=5.0,
+        )
+        if isinstance(response, Exception):
+            return self._workflow_final_result_ack(
+                accepted=False,
+                leader_addr=leader_addr,
+                error=str(response),
+                reason="forward_failed",
+            )
+        if response and isinstance(response, bytes) and response != b"error":
+            return response
+        return self._workflow_final_result_ack(
+            accepted=False,
+            leader_addr=leader_addr,
+            error="leader rejected workflow final result",
+            reason="leader_rejected",
+        )
+
     @tcp.receive()
     async def workflow_final_result(
         self,
@@ -4520,6 +4696,40 @@ class ManagerServer(HealthAwareServer):
         try:
             result = WorkflowFinalResult.load(data)
 
+            if not self._leases.is_job_leader(result.job_id):
+                return await self._forward_workflow_final_result_to_leader(
+                    result,
+                    data,
+                )
+
+            (
+                result_recorded,
+                parent_complete,
+                duplicate_result,
+                stale_result,
+                record_reason,
+            ) = await self._job_manager.record_sub_workflow_result_checked(
+                sub_workflow_token=result.workflow_id,
+                result=result,
+            )
+
+            if duplicate_result or stale_result:
+                return self._workflow_final_result_ack(
+                    accepted=True,
+                    duplicate=duplicate_result,
+                    stale=stale_result,
+                    leader_addr=(self._host, self._tcp_port),
+                    reason=record_reason or "",
+                )
+
+            if not result_recorded:
+                return self._workflow_final_result_ack(
+                    accepted=False,
+                    leader_addr=(self._host, self._tcp_port),
+                    error=record_reason or "workflow final result was not recorded",
+                    reason=record_reason or "not_recorded",
+                )
+
             self._record_workflow_latency_from_results(result.results)
 
             if result.context_updates:
@@ -4529,24 +4739,15 @@ class ManagerServer(HealthAwareServer):
                     context_updates_bytes=result.context_updates,
                 )
 
-            (
-                result_recorded,
-                parent_complete,
-            ) = await self._job_manager.record_sub_workflow_result(
-                sub_workflow_token=result.workflow_id,
-                result=result,
-            )
-
-            # If we couldn't find the job/sub-workflow on this
-            # manager, return an error so the worker's retry loop
-            # tries the next manager. Without this, a worker that
-            # picks a non-dispatcher manager first would log a
-            # success and stop retrying, silently losing the
-            # result. Most-common scenario: 3 managers, 1 is the
-            # dispatcher; worker.send_final_result iterates
-            # healthy_managers; first hit is the wrong one.
-            if not result_recorded:
-                return b"error"
+            if result.worker_id:
+                cores_updated = (
+                    await self._worker_pool.update_worker_cores_from_progress(
+                        result.worker_id,
+                        result.worker_available_cores,
+                    )
+                )
+                if cores_updated and self._workflow_dispatcher:
+                    self._workflow_dispatcher.signal_cores_available()
 
             await self._handle_parent_workflow_completion(
                 result, result_recorded, parent_complete
@@ -4561,7 +4762,10 @@ class ManagerServer(HealthAwareServer):
             if self._is_job_complete(result.job_id):
                 await self._handle_job_completion(result.job_id)
 
-            return b"ok"
+            return self._workflow_final_result_ack(
+                accepted=True,
+                leader_addr=(self._host, self._tcp_port),
+            )
 
         except Exception as error:
             await self._udp_logger.log(
@@ -4572,7 +4776,11 @@ class ManagerServer(HealthAwareServer):
                     node_id=self._node_id.short,
                 )
             )
-            return b"error"
+            return self._workflow_final_result_ack(
+                accepted=False,
+                error=str(error),
+                reason="exception",
+            )
 
     def _parse_cancel_request(
         self,

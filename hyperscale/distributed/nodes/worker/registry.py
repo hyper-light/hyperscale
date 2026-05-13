@@ -6,7 +6,7 @@ Handles manager registration, health tracking, and peer management.
 
 import asyncio
 import time
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 from hyperscale.distributed.models import ManagerInfo
 from hyperscale.distributed.swim.core import ErrorStats, CircuitState
@@ -45,6 +45,14 @@ class WorkerRegistry:
         self._recovery_semaphore: asyncio.Semaphore = asyncio.Semaphore(
             recovery_semaphore_size
         )
+
+        # Hook the cluster-connection lifecycle owner. Set by the
+        # worker server after both registry and connection exist
+        # (chicken/egg: connection needs ``_get_healthy_manager_count``
+        # which reads this registry). Called sync after every mutation
+        # of ``_healthy_manager_ids`` so the connection state stays in
+        # sync with the registry's view.
+        self._on_healthy_set_changed: Callable[[], None] | None = None
 
         # Manager tracking
         self._known_managers: dict[str, ManagerInfo] = {}
@@ -85,12 +93,26 @@ class WorkerRegistry:
         async with self._counter_lock:
             self._healthy_manager_ids.add(manager_id)
             self._manager_unhealthy_since.pop(manager_id, None)
+        self._signal_healthy_set_changed()
 
     async def mark_manager_unhealthy(self, manager_id: str) -> None:
         async with self._counter_lock:
             self._healthy_manager_ids.discard(manager_id)
             if manager_id not in self._manager_unhealthy_since:
                 self._manager_unhealthy_since[manager_id] = time.monotonic()
+        self._signal_healthy_set_changed()
+
+    def _signal_healthy_set_changed(self) -> None:
+        """Notify the cluster-connection owner of a healthy-set mutation.
+
+        Wrapper exists so both async mutation paths (mark_healthy /
+        mark_unhealthy under the counter lock) and sync paths
+        (``remove_manager_state``) share the same notification. The
+        callback runs *outside* the counter lock so it can safely
+        read other registry state.
+        """
+        if self._on_healthy_set_changed is not None:
+            self._on_healthy_set_changed()
 
     def is_manager_healthy(self, manager_id: str) -> bool:
         """Check if a manager is healthy."""
@@ -147,6 +169,7 @@ class WorkerRegistry:
         self._manager_state_epoch.pop(manager_id, None)
         if manager_addr is not None:
             self._manager_addr_circuits.pop(manager_addr, None)
+        self._signal_healthy_set_changed()
 
     def get_or_create_circuit(
         self,

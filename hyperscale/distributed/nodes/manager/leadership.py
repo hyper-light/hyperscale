@@ -133,20 +133,24 @@ class ManagerLeadershipCoordinator:
         Returns:
             True if quorum is available
         """
-        active_count = self._state.get_active_peer_count()
-        known_count = len(self._state._known_manager_peers) + 1  # Include self
-        quorum_size = known_count // 2 + 1
-        return active_count >= quorum_size
+        active_count = self._state.get_active_peer_count() + 1  # plus self
+        return active_count >= self.get_quorum_size()
 
     def get_quorum_size(self) -> int:
-        """
-        Get required quorum size.
+        """Quorum size from **configured** cluster size (AD-3).
 
-        Returns:
-            Number of managers needed for quorum
+        Per AD-3, quorum is derived from the static seed list at
+        startup, not from the runtime ``_known_manager_peers``
+        dictionary. The known dict is dynamically built as managers
+        learn about each other via TCP register; using it for the
+        quorum threshold collapses to a single-node majority during
+        the post-restart window when no peer registrations have
+        landed yet, and a manager whose peer-discovery is in-flight
+        sees ``known_count = 1`` and self-elects with quorum = 1 —
+        the canonical split-brain bug AD-3 was written to prevent.
         """
-        known_count = len(self._state._known_manager_peers) + 1
-        return known_count // 2 + 1
+        configured_managers = len(self._config.manager_udp_peers) + 1
+        return configured_managers // 2 + 1
 
     def detect_split_brain(self) -> bool:
         if not self._is_leader():

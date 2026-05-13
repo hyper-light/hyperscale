@@ -77,6 +77,7 @@ from .distributed import (
     StepStats as StepStats,
     WorkflowProgress as WorkflowProgress,
     WorkflowFinalResult as WorkflowFinalResult,
+    WorkflowFinalResultAck as WorkflowFinalResultAck,
     WorkflowResult as WorkflowResult,
     WorkflowDCResult as WorkflowDCResult,
     WorkflowResultPush as WorkflowResultPush,

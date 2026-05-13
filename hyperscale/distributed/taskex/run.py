@@ -317,11 +317,21 @@ class Run:
         if self._process:
             self._process.kill()
 
-        try:
-            self._task.set_result(None)
-
-        except Exception:
-            pass
+        # ``self._task`` is an ``asyncio.Task`` (set by ``execute``),
+        # not a bare ``Future``. ``Task.set_result`` does not exist;
+        # the previous call quietly raised ``AttributeError`` and got
+        # swallowed by the broad ``except``, so the underlying task
+        # kept running long after ``abort()`` returned. The
+        # simulation harness relies on ``abort()`` actually stopping
+        # in-flight work — workflow executors, registration retries,
+        # heartbeat loops — to mirror real process death. ``cancel()``
+        # delivers the ``CancelledError`` to whatever the task is
+        # awaiting, which is the correct stop signal.
+        if self._task is not None and not self._task.done():
+            try:
+                self._task.cancel()
+            except Exception:
+                pass
 
         self.status = RunStatus.CANCELLED
 

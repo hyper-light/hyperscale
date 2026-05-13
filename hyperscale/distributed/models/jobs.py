@@ -227,6 +227,8 @@ class WorkflowInfo:
     completion_event: asyncio.Event = field(default_factory=asyncio.Event)
     error: str | None = None
     aggregation_error: str | None = None  # Separate from workflow error
+    terminal_pushed: bool = False
+    terminal_status: str | None = None
 
     @property
     def token_str(self) -> str:
@@ -239,10 +241,12 @@ class SubWorkflowInfo:
     token: TrackingToken
     parent_token: TrackingToken
     cores_allocated: int
+    fence_token: int = 0
     progress: WorkflowProgress | None = None
     result: WorkflowFinalResult | None = None
     dispatched_context: bytes = b""
     dispatched_version: int = 0
+    superseded: bool = False
 
     @property
     def token_str(self) -> str:

@@ -154,6 +154,22 @@ class FaultMatrix:
         handle.started = False
         self._killed.add(handle.node_id)
 
+        # ``abort`` is synchronous — it closes the listener socket,
+        # but ``asyncio.Server.close`` is deferred and the loop has
+        # not yet had a chance to run ``connection_lost`` on the
+        # already-accepted inbound connections. In production those
+        # connections are torn down by the OS when the process dies;
+        # the simulation harness has to mimic that by yielding to
+        # the event loop long enough for the deferred cleanup to
+        # complete. Without this yield, a fresh server bound to the
+        # same port via ``SO_REUSEADDR`` will share request flow
+        # with the dying instance for many seconds and the test sees
+        # the dead manager continue handling requests on its old
+        # node_id. A short sleep is the lightest mechanism — we are
+        # not waiting on a state condition, just giving the loop a
+        # turn or two to drain scheduled callbacks.
+        await asyncio.sleep(0.05)
+
     async def restart(self, handle: ServerHandle) -> None:
         """Bring a killed node back. Construction is fresh.
 
