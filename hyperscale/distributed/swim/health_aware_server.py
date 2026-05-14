@@ -14,6 +14,7 @@ This server provides:
 """
 
 import asyncio
+import collections
 import math
 import random
 import time
@@ -235,6 +236,30 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         self._peer_probe_reliability = PeerProbeReliabilityTracker(
             config=PeerProbeReliabilityConfig(),
         )
+
+        # AD-53 burst-failure cluster-degradation signal.
+        # When K direct+indirect probe failures occur within W seconds
+        # the prober speculatively starts global SUSPECT for every
+        # alive member of the probe scheduler that has no recent
+        # successful probe. This composes a new "cluster is degraded"
+        # signal into the hierarchical detector's global layer instead
+        # of waiting for the serial probe walk to reach each target.
+        # See ``docs/architecture/AD_53.md`` for the design.
+        _burst_env = kwargs.get("env")
+        self._burst_failure_threshold: int = (
+            int(getattr(_burst_env, "BURST_FAILURE_THRESHOLD", 3))
+            if _burst_env is not None
+            else 3
+        )
+        self._burst_failure_window_seconds: float = (
+            float(getattr(_burst_env, "BURST_FAILURE_WINDOW_SECONDS", 10.0))
+            if _burst_env is not None
+            else 10.0
+        )
+        self._burst_failure_observations: collections.deque[float] = (
+            collections.deque()
+        )
+        self._burst_failure_active: bool = False
 
         # Hierarchical failure detector for multi-layer detection (AD-30)
         # - Global layer: Machine-level liveness (via timing wheel)
@@ -3050,6 +3075,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                 ctx.record_success(
                     ErrorCategory.NETWORK
                 )  # Help circuit breaker recover
+                self._reset_burst_failure_state()
                 return
 
             # Per-peer probe-failure record. Unlike the LHM bump below
@@ -3101,6 +3127,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                         target, success=True
                     )
                     ctx.record_success(ErrorCategory.NETWORK)
+                    self._reset_burst_failure_state()
                     return
 
             # Don't start suspicions during shutdown
@@ -3110,6 +3137,107 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             self_addr = self._get_self_udp_addr()
             await self.start_suspicion(target, incarnation, self_addr)
             await self.broadcast_suspicion(target, incarnation)
+
+            # AD-53 burst-failure detection (after start_suspicion for the
+            # confirmed-dead target, so the failure window only counts
+            # *actual* full direct+indirect failures, not partial ones).
+            await self._record_probe_failure_and_check_burst(self_addr)
+
+    def _reset_burst_failure_state(self) -> None:
+        """Clear the burst-failure observation window on any probe success.
+
+        A single successful probe is evidence the cluster has not fully
+        collapsed; the speculative-SUSPECT path is only meant to fire
+        during a true bulk failure where no peer is reachable. Resetting
+        on success ensures the trigger requires ``K`` *consecutive*
+        failures (within the window) rather than ``K`` failures
+        interleaved with successes.
+        """
+        if self._burst_failure_observations:
+            self._burst_failure_observations.clear()
+        self._burst_failure_active = False
+
+    async def _record_probe_failure_and_check_burst(
+        self,
+        self_addr: tuple[str, int],
+    ) -> None:
+        """Record a probe failure and, on threshold, trigger speculative SUSPECT.
+
+        AD-53. Appends ``now`` to the observation window, evicts entries
+        older than ``BURST_FAILURE_WINDOW_SECONDS``, and if the active
+        observation count crosses ``BURST_FAILURE_THRESHOLD`` while the
+        prober is not already in burst mode, triggers
+        :meth:`_speculatively_suspect_all_silent`. The flag is one-shot
+        per burst — repeated invocations within the same window do not
+        re-fire the speculative scan (already-SUSPECT targets are skipped
+        by the inner loop, but the bookkeeping is cheaper to gate at
+        the entry point).
+        """
+        now = time.monotonic()
+        observations = self._burst_failure_observations
+        observations.append(now)
+        cutoff = now - self._burst_failure_window_seconds
+        while observations and observations[0] < cutoff:
+            observations.popleft()
+
+        if self._burst_failure_active:
+            return
+        if len(observations) < self._burst_failure_threshold:
+            return
+
+        self._burst_failure_active = True
+        await self._speculatively_suspect_all_silent(self_addr)
+
+    async def _speculatively_suspect_all_silent(
+        self,
+        self_addr: tuple[str, int],
+    ) -> None:
+        """Start global SUSPECT for every alive member with no recent probe success.
+
+        AD-53. The probe-walk is serial; at large ``N`` it cannot
+        individually visit every dead peer within Phase-3 reap budgets.
+        When the burst-failure signal indicates a cluster-wide failure
+        event the prober is already observing, this method extends the
+        observation to the rest of the membership: each scheduler entry
+        that the SWIM layer has *not* recently confirmed is moved into
+        SUSPECT, and its Lifeguard timer begins ticking immediately in
+        the timing wheel. Suspicions for actually-alive peers are
+        cleanly refuted via the standard SWIM path
+        (peer-incarnation-bump on receipt of the suspect gossip).
+
+        Gates:
+
+        * Skip targets that have been SWIM-confirmed alive within
+          ``2 × SWIM_UDP_POLL_INTERVAL`` — those are exactly the peers
+          burst-failure must *not* speculatively kill.
+        * Skip targets already in a terminal state (SUSPECT/DEAD/UNCONFIRMED).
+        * Skip ``self_addr`` (cannot suspect the prober).
+        * Skip targets that ``start_suspicion`` would itself reject
+          (e.g. ``can_suspect_node`` returns False per AD-29).
+
+        The broadcast step that normally accompanies probe-driven
+        SUSPECT (``broadcast_suspicion``) is **omitted** here: in the
+        bulk-failure regime peers are by definition not reachable, so
+        broadcasting would burn ``O(N²)`` UDP sends to silent
+        destinations and would not change the outcome. The local SWIM
+        timing wheel does the work.
+        """
+        recent_success_window = 2.0 * float(
+            await self._context.read("udp_poll_interval", 1.0)
+        )
+        members = list(self._probe_scheduler.members)
+        for member in members:
+            if member == self_addr:
+                continue
+            if self._peer_probe_reliability.had_recent_success(
+                member, within_seconds=recent_success_window
+            ):
+                continue
+            if self._is_target_already_suspect_or_dead(member):
+                continue
+            node_state = self._incarnation_tracker.get_node_state(member)
+            incarnation = node_state.incarnation if node_state else 0
+            await self.start_suspicion(member, incarnation, self_addr)
 
     def _compute_direct_probe_budget(
         self,

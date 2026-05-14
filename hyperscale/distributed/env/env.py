@@ -60,6 +60,16 @@ class Env(BaseModel):
     SWIM_SUSPICION_MAX_TIMEOUT: StrictFloat = (
         8.0  # Reduced from 15.0 - faster failure declaration
     )
+    # AD-53 burst-failure cluster-degradation signal.
+    # When the prober observes ``BURST_FAILURE_THRESHOLD`` direct+indirect
+    # probe failures within ``BURST_FAILURE_WINDOW_SECONDS``, it
+    # speculatively starts global SUSPECT for every alive member of the
+    # probe scheduler that has no recent successful probe. This feeds a
+    # cluster-wide degradation signal into the AD-30 hierarchical
+    # detector's global layer so the serial SWIM probe walk is not the
+    # only path to dead-node detection at large N. See AD-53.
+    BURST_FAILURE_THRESHOLD: StrictInt = 3
+    BURST_FAILURE_WINDOW_SECONDS: StrictFloat = 10.0
     # Refutation rate limiting - prevents incarnation exhaustion attacks
     # If an attacker sends many probes/suspects about us, we limit how fast we increment incarnation
     SWIM_REFUTATION_RATE_LIMIT_TOKENS: StrictInt = 5  # Max refutations per window
@@ -743,6 +753,8 @@ class Env(BaseModel):
             "SWIM_UDP_POLL_INTERVAL": int,
             "SWIM_SUSPICION_MIN_TIMEOUT": float,
             "SWIM_SUSPICION_MAX_TIMEOUT": float,
+            "BURST_FAILURE_THRESHOLD": int,
+            "BURST_FAILURE_WINDOW_SECONDS": float,
             "SWIM_REFUTATION_RATE_LIMIT_TOKENS": int,
             "SWIM_REFUTATION_RATE_LIMIT_WINDOW": float,
             # Circuit breaker settings
