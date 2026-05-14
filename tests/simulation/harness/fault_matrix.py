@@ -45,7 +45,7 @@ import random
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import psutil
 
@@ -87,6 +87,10 @@ class _DelayRule:
     dst: str | None
     delay_ms: float
     jitter_ms: float = 0.0
+    started_at: float = 0.0
+    target_delay_ms: float | None = None
+    duration_seconds: float = 0.0
+    expires_at: float | None = None
 
 
 @dataclass(slots=True)
@@ -99,6 +103,53 @@ class _DropRule:
     src: str | None
     dst: str | None
     probability: float
+    expires_at: float | None = None
+
+
+@dataclass(slots=True)
+class _BandwidthRule:
+    """One token-bucket bandwidth cap between optionally-wildcarded endpoints."""
+
+    src: str | None
+    dst: str | None
+    bytes_per_second: float
+    burst_bytes: float
+    available_tokens: float
+    last_refill_at: float
+
+
+@dataclass(slots=True)
+class _ReorderRule:
+    """One synthetic reordering rule, defaulting to UDP-only realism."""
+
+    src: str | None
+    dst: str | None
+    probability: float
+    delay_ms: float
+    jitter_ms: float
+    protocol: Literal["udp", "tcp", "both"]
+
+
+@dataclass(slots=True)
+class _DuplicateRule:
+    """One duplicate-delivery rule for datagram-style traffic."""
+
+    src: str | None
+    dst: str | None
+    probability: float
+    copies: int
+    protocol: Literal["udp", "tcp", "both"]
+
+
+@dataclass(slots=True)
+class _TcpResetRule:
+    """One TCP reset rule, optionally scoped by action and count."""
+
+    src: str | None
+    dst: str | None
+    probability: float
+    action: str | None
+    remaining: int | None = None
 
 
 @dataclass(slots=True)
@@ -117,6 +168,10 @@ class FaultMatrix:
     _partitions: list[_PartitionRule]
     _delays: list[_DelayRule]
     _drops: list[_DropRule]
+    _bandwidth_caps: list[_BandwidthRule]
+    _reorders: list[_ReorderRule]
+    _duplicates: list[_DuplicateRule]
+    _tcp_resets: list[_TcpResetRule]
     _resource_overrides: dict[str, tuple[Callable[[], float], Callable[[], float]]]
     _suspended_processes: dict[int, psutil.Process]
 
@@ -127,6 +182,10 @@ class FaultMatrix:
         self._partitions = []
         self._delays = []
         self._drops = []
+        self._bandwidth_caps = []
+        self._reorders = []
+        self._duplicates = []
+        self._tcp_resets = []
         self._resource_overrides = {}
         self._suspended_processes = {}
 
@@ -410,7 +469,7 @@ class FaultMatrix:
                     continue
 
     # =========================================================================
-    # Network faults — partition / delay / drop (Phase 4)
+    # Network faults — partition / delay / drop / reorder / reset (Phase 4)
     # =========================================================================
 
     async def partition(
@@ -481,6 +540,47 @@ class FaultMatrix:
                 dst=self._normalize_one(dst),
                 delay_ms=ms,
                 jitter_ms=jitter_ms,
+                started_at=time.monotonic(),
+            )
+        )
+
+    async def latency_drift(
+        self,
+        *,
+        start_ms: float,
+        end_ms: float,
+        duration_seconds: float,
+        src: ServerHandle | str | None = None,
+        dst: ServerHandle | str | None = None,
+        jitter_ms: float = 0.0,
+    ) -> None:
+        """Add a one-way delay that linearly drifts over ``duration_seconds``.
+
+        This models slowly degrading RTT without scheduling a background
+        task. The active delay is computed at send time from the rule's
+        monotonic install timestamp, so clearing faults is immediate and
+        there are no orphaned timers.
+        """
+        if start_ms < 0.0 or end_ms < 0.0:
+            raise FaultError(
+                f"latency drift endpoints must be non-negative; got "
+                f"start_ms={start_ms}, end_ms={end_ms}"
+            )
+        if duration_seconds <= 0.0:
+            raise FaultError(
+                f"duration_seconds must be positive; got {duration_seconds}"
+            )
+        if jitter_ms < 0.0:
+            raise FaultError(f"jitter_ms must be non-negative; got {jitter_ms}")
+        self._delays.append(
+            _DelayRule(
+                src=self._normalize_one(src),
+                dst=self._normalize_one(dst),
+                delay_ms=start_ms,
+                jitter_ms=jitter_ms,
+                started_at=time.monotonic(),
+                target_delay_ms=end_ms,
+                duration_seconds=duration_seconds,
             )
         )
 
@@ -513,12 +613,180 @@ class FaultMatrix:
             )
         )
 
+    async def drop_burst(
+        self,
+        *,
+        duration_seconds: float,
+        src: ServerHandle | str | None = None,
+        dst: ServerHandle | str | None = None,
+        probability: float = 1.0,
+    ) -> None:
+        """Drop matching sends for a bounded wall-clock window.
+
+        The burst expires lazily during send-rule lookup and summary
+        inspection, avoiding scheduled cleanup tasks while preserving a
+        precise fault window.
+        """
+        if duration_seconds <= 0.0:
+            raise FaultError(
+                f"duration_seconds must be positive; got {duration_seconds}"
+            )
+        if not (0.0 <= probability <= 1.0):
+            raise FaultError(
+                f"drop probability must be in [0, 1]; got {probability}"
+            )
+        self._drops.append(
+            _DropRule(
+                src=self._normalize_one(src),
+                dst=self._normalize_one(dst),
+                probability=probability,
+                expires_at=time.monotonic() + duration_seconds,
+            )
+        )
+
+    async def bandwidth_cap(
+        self,
+        *,
+        bytes_per_second: float,
+        src: ServerHandle | str | None = None,
+        dst: ServerHandle | str | None = None,
+        burst_bytes: float | None = None,
+    ) -> None:
+        """Throttle matching sends with a token bucket.
+
+        The cap is evaluated synchronously at send time and returns a
+        synthetic delay for the caller to await. This models a saturated
+        link without spinning a queue manager or background refill task.
+        """
+        if bytes_per_second <= 0.0:
+            raise FaultError(
+                f"bytes_per_second must be positive; got {bytes_per_second}"
+            )
+        normalized_burst_bytes = (
+            bytes_per_second if burst_bytes is None else burst_bytes
+        )
+        if normalized_burst_bytes <= 0.0:
+            raise FaultError(f"burst_bytes must be positive; got {burst_bytes}")
+        now = time.monotonic()
+        self._bandwidth_caps.append(
+            _BandwidthRule(
+                src=self._normalize_one(src),
+                dst=self._normalize_one(dst),
+                bytes_per_second=bytes_per_second,
+                burst_bytes=normalized_burst_bytes,
+                available_tokens=normalized_burst_bytes,
+                last_refill_at=now,
+            )
+        )
+
+    async def reorder(
+        self,
+        *,
+        probability: float,
+        delay_ms: float,
+        src: ServerHandle | str | None = None,
+        dst: ServerHandle | str | None = None,
+        jitter_ms: float = 0.0,
+        protocol: Literal["udp", "tcp", "both"] = "udp",
+    ) -> None:
+        """Delay a subset of matching sends so later packets can overtake them.
+
+        Real TCP streams preserve byte order, so the default protocol is
+        ``"udp"``. Tests may explicitly pass ``"tcp"`` or ``"both"`` when
+        modeling application-level RPC reordering across separate calls.
+        """
+        if not (0.0 <= probability <= 1.0):
+            raise FaultError(
+                f"reorder probability must be in [0, 1]; got {probability}"
+            )
+        if delay_ms < 0.0:
+            raise FaultError(f"delay_ms must be non-negative; got {delay_ms}")
+        if jitter_ms < 0.0:
+            raise FaultError(f"jitter_ms must be non-negative; got {jitter_ms}")
+        self._validate_protocol(protocol)
+        self._reorders.append(
+            _ReorderRule(
+                src=self._normalize_one(src),
+                dst=self._normalize_one(dst),
+                probability=probability,
+                delay_ms=delay_ms,
+                jitter_ms=jitter_ms,
+                protocol=protocol,
+            )
+        )
+
+    async def duplicate(
+        self,
+        *,
+        probability: float,
+        copies: int = 1,
+        src: ServerHandle | str | None = None,
+        dst: ServerHandle | str | None = None,
+        protocol: Literal["udp", "tcp", "both"] = "udp",
+    ) -> None:
+        """Deliver extra copies of matching sends.
+
+        Defaulting to UDP mirrors real networks: datagrams can duplicate,
+        while TCP byte streams cannot. Duplicate TCP RPCs remain available
+        for explicit application-level retry tests.
+        """
+        if not (0.0 <= probability <= 1.0):
+            raise FaultError(
+                f"duplicate probability must be in [0, 1]; got {probability}"
+            )
+        if copies < 1:
+            raise FaultError(f"copies must be >= 1; got {copies}")
+        self._validate_protocol(protocol)
+        self._duplicates.append(
+            _DuplicateRule(
+                src=self._normalize_one(src),
+                dst=self._normalize_one(dst),
+                probability=probability,
+                copies=copies,
+                protocol=protocol,
+            )
+        )
+
+    async def tcp_reset(
+        self,
+        *,
+        probability: float = 1.0,
+        src: ServerHandle | str | None = None,
+        dst: ServerHandle | str | None = None,
+        action: str | None = None,
+        count: int | None = None,
+    ) -> None:
+        """Inject TCP connection resets for matching RPC attempts.
+
+        ``count`` bounds how many resets the rule can produce. ``None``
+        means the rule remains active until ``clear_network_faults``.
+        """
+        if not (0.0 <= probability <= 1.0):
+            raise FaultError(
+                f"tcp reset probability must be in [0, 1]; got {probability}"
+            )
+        if count is not None and count < 1:
+            raise FaultError(f"count must be >= 1 when provided; got {count}")
+        self._tcp_resets.append(
+            _TcpResetRule(
+                src=self._normalize_one(src),
+                dst=self._normalize_one(dst),
+                probability=probability,
+                action=action,
+                remaining=count,
+            )
+        )
+
     async def clear_network_faults(self) -> None:
-        """Wipe every partition, delay, and drop rule. ``kill`` /
+        """Wipe every active network fault rule. ``kill`` /
         ``pause`` lifecycle state is unaffected."""
         self._partitions.clear()
         self._delays.clear()
         self._drops.clear()
+        self._bandwidth_caps.clear()
+        self._reorders.clear()
+        self._duplicates.clear()
+        self._tcp_resets.clear()
 
     # =========================================================================
     # Resource / subprocess faults — Phase 3 resource-pressure primitives
@@ -662,6 +930,7 @@ class FaultMatrix:
 
         Returns 0.0 (never drop) when no rule matches.
         """
+        self._prune_expired_network_rules()
         rule = self._most_specific(self._drops, src_node_id, dst_node_id)
         return 0.0 if rule is None else rule.probability
 
@@ -677,13 +946,109 @@ class FaultMatrix:
         randomness stays deterministic per-test when the harness
         seeds it.
         """
+        self._prune_expired_network_rules()
         rule = self._most_specific(self._delays, src_node_id, dst_node_id)
         if rule is None:
+            return 0.0
+        delay_ms = self._current_delay_ms(rule)
+        if rule.jitter_ms > 0.0:
+            delay_ms += rng.uniform(0.0, rule.jitter_ms)
+        return delay_ms / 1000.0
+
+    def bandwidth_delay_seconds(
+        self,
+        src_node_id: str,
+        dst_node_id: str,
+        payload_size_bytes: int,
+    ) -> float:
+        """Return the token-bucket delay for a payload on this link."""
+        rule = self._most_specific(
+            self._bandwidth_caps,
+            src_node_id,
+            dst_node_id,
+        )
+        if rule is None:
+            return 0.0
+
+        now = time.monotonic()
+        elapsed = max(0.0, now - rule.last_refill_at)
+        rule.available_tokens = min(
+            rule.burst_bytes,
+            rule.available_tokens + elapsed * rule.bytes_per_second,
+        )
+        rule.last_refill_at = now
+
+        payload_size = max(0, payload_size_bytes)
+        if rule.available_tokens >= payload_size:
+            rule.available_tokens -= payload_size
+            return 0.0
+
+        missing_tokens = payload_size - rule.available_tokens
+        rule.available_tokens = 0.0
+        return missing_tokens / rule.bytes_per_second
+
+    def reorder_delay_seconds(
+        self,
+        kind: str,
+        src_node_id: str,
+        dst_node_id: str,
+        rng: random.Random,
+    ) -> float:
+        """Return extra hold time for a packet selected for reordering."""
+        rule = self._most_specific_protocol(
+            self._reorders,
+            kind,
+            src_node_id,
+            dst_node_id,
+        )
+        if rule is None or rng.random() >= rule.probability:
             return 0.0
         delay_ms = rule.delay_ms
         if rule.jitter_ms > 0.0:
             delay_ms += rng.uniform(0.0, rule.jitter_ms)
         return delay_ms / 1000.0
+
+    def duplicate_count(
+        self,
+        kind: str,
+        src_node_id: str,
+        dst_node_id: str,
+        rng: random.Random,
+    ) -> int:
+        """Return how many additional copies should be delivered."""
+        rule = self._most_specific_protocol(
+            self._duplicates,
+            kind,
+            src_node_id,
+            dst_node_id,
+        )
+        if rule is None or rng.random() >= rule.probability:
+            return 0
+        return rule.copies
+
+    def should_reset_tcp(
+        self,
+        src_node_id: str,
+        dst_node_id: str,
+        action: str,
+        rng: random.Random,
+    ) -> bool:
+        """Return whether a matching TCP reset should fire now."""
+        for rule in reversed(self._tcp_resets):
+            if rule.action is not None and rule.action != action:
+                continue
+            if rule.src is not None and rule.src != src_node_id:
+                continue
+            if rule.dst is not None and rule.dst != dst_node_id:
+                continue
+            if rule.remaining == 0:
+                continue
+            if rng.random() >= rule.probability:
+                continue
+            if rule.remaining is not None:
+                rule.remaining -= 1
+            return True
+        return False
 
     @staticmethod
     def _most_specific(
@@ -715,6 +1080,48 @@ class FaultMatrix:
                 best = rule
                 best_score = score
         return best
+
+    @staticmethod
+    def _most_specific_protocol(
+        rules: list,
+        kind: str,
+        src_node_id: str,
+        dst_node_id: str,
+    ):
+        protocol_rules = [
+            rule
+            for rule in rules
+            if rule.protocol == "both" or rule.protocol == kind
+        ]
+        return FaultMatrix._most_specific(protocol_rules, src_node_id, dst_node_id)
+
+    @staticmethod
+    def _current_delay_ms(rule: _DelayRule) -> float:
+        if rule.target_delay_ms is None or rule.duration_seconds <= 0.0:
+            return rule.delay_ms
+        elapsed = max(0.0, time.monotonic() - rule.started_at)
+        progress = min(1.0, elapsed / rule.duration_seconds)
+        return rule.delay_ms + (rule.target_delay_ms - rule.delay_ms) * progress
+
+    @staticmethod
+    def _validate_protocol(protocol: str) -> None:
+        if protocol not in {"udp", "tcp", "both"}:
+            raise FaultError(
+                f"protocol must be 'udp', 'tcp', or 'both'; got {protocol!r}"
+            )
+
+    def _prune_expired_network_rules(self) -> None:
+        now = time.monotonic()
+        self._drops = [
+            rule
+            for rule in self._drops
+            if rule.expires_at is None or rule.expires_at > now
+        ]
+        self._delays = [
+            rule
+            for rule in self._delays
+            if rule.expires_at is None or rule.expires_at > now
+        ]
 
     @staticmethod
     def _normalize_one(
@@ -755,10 +1162,21 @@ class FaultMatrix:
         return len(self._partitions)
 
     def network_fault_summary(self) -> dict[str, int]:
+        self._prune_expired_network_rules()
         return {
             "partitions": len(self._partitions),
             "delays": len(self._delays),
             "drops": len(self._drops),
+            "bandwidth_caps": len(self._bandwidth_caps),
+            "reorders": len(self._reorders),
+            "duplicates": len(self._duplicates),
+            "tcp_resets": len(
+                [
+                    rule
+                    for rule in self._tcp_resets
+                    if rule.remaining is None or rule.remaining > 0
+                ]
+            ),
         }
 
     # =========================================================================

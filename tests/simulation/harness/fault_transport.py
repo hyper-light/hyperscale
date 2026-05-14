@@ -1,8 +1,9 @@
 """
 FaultInjectingTransport — wraps every harness-managed server's
 ``send_tcp`` and ``send_udp`` methods at the instance level so the
-``FaultMatrix`` can drop, delay, or partition messages between
-specific (src, dst) pairs without touching production code.
+``FaultMatrix`` can drop, delay, partition, throttle, duplicate, reorder,
+or reset messages between specific (src, dst) pairs without touching
+production code.
 
 REAL-mode wiring: Python's bound-method assignment lets us replace
 the methods on a per-instance basis without subclassing or
@@ -16,6 +17,13 @@ maps, consults the matrix's rules on every send, and:
   consuming the result sees an indistinguishable timeout.
 * Sleeps for a configured delay (with optional jitter) before
   forwarding. Real-network delay simulation.
+* Adds token-bucket bandwidth delay and UDP-style reordering holds at
+  the same point, before the original send method.
+* Delivers bounded duplicate copies by invoking the original send method
+  for extra copies with a short timeout, so duplicate delivery never
+  creates an orphaned background task.
+* Closes the cached TCP transport and returns ``ConnectionResetError``
+  for configured TCP-reset rules.
 * Otherwise forwards to the original bound method.
 
 The address-to-node-id resolution uses the harness's ServerHandle
@@ -176,9 +184,38 @@ async def _send_with_faults(
         if drop_p > 0.0 and rng.random() < drop_p:
             return _synthetic_timeout(instance, kind, "dropped")
 
+        if kind == "tcp" and matrix.should_reset_tcp(
+            src_node_id,
+            dst_node_id,
+            action,
+            rng,
+        ):
+            _close_cached_tcp_transport(instance, address)
+            return _synthetic_reset(instance, action)
+
         delay_seconds = matrix.delay_seconds(src_node_id, dst_node_id, rng)
+        delay_seconds += matrix.reorder_delay_seconds(
+            kind,
+            src_node_id,
+            dst_node_id,
+            rng,
+        )
+        delay_seconds += matrix.bandwidth_delay_seconds(
+            src_node_id,
+            dst_node_id,
+            _estimate_payload_size(action, data),
+        )
         if delay_seconds > 0.0:
             await asyncio.sleep(delay_seconds)
+
+        duplicate_count = matrix.duplicate_count(
+            kind,
+            src_node_id,
+            dst_node_id,
+            rng,
+        )
+        for _duplicate_index in range(duplicate_count):
+            await original(address, action, data, timeout=0.05)
 
     return await original(address, action, data, timeout=timeout)
 
@@ -192,3 +229,42 @@ def _synthetic_timeout(
     clock = getattr(instance, clock_attr, None)
     clock_value = getattr(clock, "time", 0)
     return (asyncio.TimeoutError(reason), clock_value)
+
+
+def _synthetic_reset(instance: Any, action: str) -> tuple[Any, int]:
+    """Return the on-error tuple for a configured TCP reset."""
+    clock = getattr(instance, "_tcp_clock", None)
+    clock_value = getattr(clock, "time", 0)
+    return (ConnectionResetError(f"tcp reset during {action}"), clock_value)
+
+
+def _close_cached_tcp_transport(instance: Any, address: tuple[str, int]) -> None:
+    """Abort the cached TCP transport for ``address`` if one exists."""
+    transports = getattr(instance, "_tcp_client_transports", None)
+    if not isinstance(transports, dict):
+        return
+    transport = transports.pop(address, None)
+    if transport is None or transport.is_closing():
+        return
+    abort = getattr(transport, "abort", None)
+    if callable(abort):
+        abort()
+        return
+    transport.close()
+
+
+def _estimate_payload_size(action: str, data: Any) -> int:
+    """Estimate application payload size before production framing/encryption."""
+    if isinstance(data, bytes):
+        return len(data) + len(action)
+    if isinstance(data, bytearray | memoryview):
+        return len(data) + len(action)
+    dump = getattr(data, "dump", None)
+    if callable(dump):
+        try:
+            dumped = dump()
+        except Exception:
+            dumped = None
+        if isinstance(dumped, bytes):
+            return len(dumped) + len(action)
+    return len(repr(data).encode("utf-8")) + len(action)

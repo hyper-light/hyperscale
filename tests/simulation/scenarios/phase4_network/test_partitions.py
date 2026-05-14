@@ -183,7 +183,7 @@ async def test_one_way_drop_rate() -> None:
 
         await cluster.faults.clear_network_faults()
         summary = cluster.faults.network_fault_summary()
-        assert summary == {"partitions": 0, "delays": 0, "drops": 0}
+        assert all(count == 0 for count in summary.values())
 
 
 @pytest.mark.asyncio
