@@ -57,6 +57,7 @@ class TestWorkerStateInitialization:
         assert len(state._active_workflows) == 0
         assert len(state._workflow_tokens) == 0
         assert len(state._orphaned_workflows) == 0
+        assert len(state._suppressed_final_result_reasons) == 0
         assert len(state._pending_transfers) == 0
 
     def test_initial_counters(self):
@@ -280,6 +281,7 @@ class TestWorkerStateWorkflowTracking:
         state._workflow_id_to_name["wf-1"] = "my-workflow"
         state._workflow_cancel_events["wf-1"] = asyncio.Event()
         state._orphaned_workflows["wf-1"] = time.monotonic()
+        state.suppress_final_result("wf-1", "server_shutdown")
 
         removed = state.remove_active_workflow("wf-1")
 
@@ -291,6 +293,26 @@ class TestWorkerStateWorkflowTracking:
         assert "wf-1" not in state._workflow_id_to_name
         assert "wf-1" not in state._workflow_cancel_events
         assert "wf-1" not in state._orphaned_workflows
+        assert state.is_final_result_suppressed("wf-1") is False
+
+    def test_suppress_active_final_results(self):
+        """Test suppressing non-success final results for active workflows."""
+        allocator = MockCoreAllocator()
+        state = WorkerState(allocator)
+
+        first_progress = MagicMock(spec=WorkflowProgress)
+        second_progress = MagicMock(spec=WorkflowProgress)
+        state.add_active_workflow("wf-1", first_progress, ("h", 1))
+        state.add_active_workflow("wf-2", second_progress, ("h", 1))
+
+        state.suppress_active_final_results("server_shutdown")
+
+        assert state.is_final_result_suppressed("wf-1") is True
+        assert state.is_final_result_suppressed("wf-2") is True
+        assert state._suppressed_final_result_reasons == {
+            "wf-1": "server_shutdown",
+            "wf-2": "server_shutdown",
+        }
 
     def test_remove_active_workflow_not_found(self):
         """Test removing a non-existent workflow."""

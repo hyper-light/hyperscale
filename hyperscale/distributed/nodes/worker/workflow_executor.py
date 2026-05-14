@@ -386,7 +386,8 @@ class WorkerWorkflowExecutor:
         )
 
         try:
-            await send_final_result_callback(final_result)
+            if self._should_send_final_result(dispatch.workflow_id, progress.status):
+                await send_final_result_callback(final_result)
         finally:
             self._state.remove_active_workflow(dispatch.workflow_id)
             self._state._workflow_fence_tokens.pop(dispatch.workflow_id, None)
@@ -394,6 +395,13 @@ class WorkerWorkflowExecutor:
             self._state._workflow_tokens.pop(dispatch.workflow_id, None)
             self._state._workflow_id_to_name.pop(dispatch.workflow_id, None)
             self._state._workflow_cores_completed.pop(dispatch.workflow_id, None)
+
+    def _should_send_final_result(self, workflow_id: str, status: str) -> bool:
+        """Return whether this worker may publish the workflow's final result."""
+        if status == WorkflowStatus.COMPLETED.value:
+            return True
+
+        return not self._state.is_final_result_suppressed(workflow_id)
 
     async def monitor_workflow_progress(
         self,

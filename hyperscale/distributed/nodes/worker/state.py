@@ -82,6 +82,7 @@ class WorkerState:
         self._pending_workflows: list[WorkflowDispatch] = []
         self._workflow_start_times: dict[str, float] = {}
         self._workflow_timeout_seconds: dict[str, float] = {}
+        self._suppressed_final_result_reasons: dict[str, str] = {}
         # Phase H4 — callbacks invoked on every workflow termination
         # path (success / failure / cancel / orphan-eviction). The
         # autonomous extension trigger registers here so its
@@ -269,6 +270,7 @@ class WorkerState:
         self._orphaned_workflows.pop(workflow_id, None)
         self._workflow_start_times.pop(workflow_id, None)
         self._workflow_timeout_seconds.pop(workflow_id, None)
+        self._suppressed_final_result_reasons.pop(workflow_id, None)
         # Phase H4 — fire registered termination callbacks (e.g. the
         # autonomous extension trigger's forget_workflow). Catches the
         # workflow_executor termination path as well as the worker
@@ -294,6 +296,19 @@ class WorkerState:
         its per-workflow bookkeeping dict.
         """
         self._workflow_termination_callbacks.append(callback)
+
+    def suppress_final_result(self, workflow_id: str, reason: str) -> None:
+        """Suppress non-success final-result pushes for a locally orphaned workflow."""
+        self._suppressed_final_result_reasons[workflow_id] = reason
+
+    def suppress_active_final_results(self, reason: str) -> None:
+        """Suppress non-success final-result pushes for all active workflows."""
+        for workflow_id in list(self._active_workflows.keys()):
+            self.suppress_final_result(workflow_id, reason)
+
+    def is_final_result_suppressed(self, workflow_id: str) -> bool:
+        """Return whether a workflow's non-success final result is locally suppressed."""
+        return workflow_id in self._suppressed_final_result_reasons
 
     def get_workflow_job_leader(self, workflow_id: str) -> tuple[str, int] | None:
         """Get job leader address for a workflow."""

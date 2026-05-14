@@ -83,6 +83,9 @@ from .handlers import (
 )
 
 
+SERVER_SHUTDOWN_CANCELLATION_REASON = "server_shutdown"
+
+
 class WorkerServer(HealthAwareServer):
     """
     Worker node composition root.
@@ -645,17 +648,20 @@ class WorkerServer(HealthAwareServer):
     ) -> None:
         """Stop the worker server gracefully.
 
-        Voluntary leave is announced before workflow cancellation and local
-        pool teardown. Those steps can take seconds for long-running
-        workloads, while manager membership must converge immediately so the
-        control plane can stop routing work to this worker and reassign any
-        in-flight sub-workflows.
+        Active workflows are first marked locally orphaned, then voluntary
+        leave is announced before workflow cancellation and local pool teardown.
+        Those steps can take seconds for long-running workloads, while manager
+        membership must converge immediately so the control plane can stop
+        routing work to this worker and reassign any in-flight sub-workflows.
 
         After the leave is sent, background loops are cancelled before
         teardown that can raise or be externally cancelled. That keeps the
         worker's named background tasks from surviving past shutdown.
         """
         self._stopping = True
+        self._worker_state.suppress_active_final_results(
+            SERVER_SHUTDOWN_CANCELLATION_REASON
+        )
 
         if broadcast_leave:
             await self._broadcast_leave()
@@ -770,7 +776,10 @@ class WorkerServer(HealthAwareServer):
 
     async def _cancel_all_active_workflows(self) -> None:
         for workflow_id in list(self._workflow_tokens.keys()):
-            await self._cancel_workflow(workflow_id, "server_shutdown")
+            await self._cancel_workflow(
+                workflow_id,
+                SERVER_SHUTDOWN_CANCELLATION_REASON,
+            )
 
     async def _shutdown_lifecycle_components(self) -> None:
         await self._lifecycle_manager.shutdown_remote_manager()
@@ -785,6 +794,9 @@ class WorkerServer(HealthAwareServer):
         """Abort the worker server immediately."""
         self._stopping = True
         self._running = False
+        self._worker_state.suppress_active_final_results(
+            SERVER_SHUTDOWN_CANCELLATION_REASON
+        )
 
         # Cancel background tasks synchronously
         self._lifecycle_manager.cancel_background_tasks_sync()
@@ -1760,12 +1772,18 @@ class WorkerServer(HealthAwareServer):
         self, workflow_id: str, reason: str
     ) -> tuple[bool, list[str]]:
         """Cancel a workflow and clean up resources."""
+        if reason == SERVER_SHUTDOWN_CANCELLATION_REASON:
+            self._worker_state.suppress_final_result(workflow_id, reason)
+
         success, errors = await self._cancellation_handler_impl.cancel_workflow(
             workflow_id=workflow_id,
             reason=reason,
             task_runner_cancel=self._task_runner.cancel,
             increment_version=self._increment_version,
         )
+
+        if reason == SERVER_SHUTDOWN_CANCELLATION_REASON:
+            return (success, errors)
 
         # Push cancellation complete to manager (fire-and-forget via task runner)
         progress = self._active_workflows.get(workflow_id)
