@@ -60,6 +60,17 @@ class Env(BaseModel):
     SWIM_SUSPICION_MAX_TIMEOUT: StrictFloat = (
         8.0  # Reduced from 15.0 - faster failure declaration
     )
+    # SWIM probe fanout: number of probe-loop workers that cooperatively
+    # round-robin through the membership each protocol period. The probe
+    # scheduler's index is GIL-atomic, so K workers naturally pick K
+    # distinct targets per period without contention. At fanout=1 (legacy)
+    # a cycle through N members takes N protocol periods, so dead-node
+    # reap time scales O(N) — at N=50 that's ~58 s of probe walk plus the
+    # suspicion timeout, blowing past Phase 3 mass-crash test budgets.
+    # A modest default fanout brings reap time down to ~O(N/K) while
+    # remaining harmless at small N (redundant probes to the same peer
+    # are bounded by the per-target ack future and short-circuit cleanly).
+    SWIM_PROBE_FANOUT: StrictInt = 4
     # Refutation rate limiting - prevents incarnation exhaustion attacks
     # If an attacker sends many probes/suspects about us, we limit how fast we increment incarnation
     SWIM_REFUTATION_RATE_LIMIT_TOKENS: StrictInt = 5  # Max refutations per window
@@ -743,6 +754,7 @@ class Env(BaseModel):
             "SWIM_UDP_POLL_INTERVAL": int,
             "SWIM_SUSPICION_MIN_TIMEOUT": float,
             "SWIM_SUSPICION_MAX_TIMEOUT": float,
+            "SWIM_PROBE_FANOUT": int,
             "SWIM_REFUTATION_RATE_LIMIT_TOKENS": int,
             "SWIM_REFUTATION_RATE_LIMIT_WINDOW": float,
             # Circuit breaker settings

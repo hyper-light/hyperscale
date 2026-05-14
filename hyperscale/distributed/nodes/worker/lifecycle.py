@@ -290,17 +290,32 @@ class WorkerLifecycleManager:
         return self._server_pool.get_process_exitcodes()
 
     async def kill_child_processes(self) -> None:
-        """Kill any remaining child processes."""
+        """Kill any of *this worker's* pool subprocesses that survived shutdown.
+
+        Scoping is load-bearing: ``multiprocessing.active_children()``
+        returns every multiprocessing child of the current process, not
+        only the children this worker owns. In deployments where each
+        worker runs in its own OS process the two are equivalent, but
+        in the simulation harness (and any k8s sidecar arrangement
+        that runs multiple workers under one process) a worker's
+        shutdown would otherwise SIGKILL its peers' still-active pool
+        subprocesses, causing their in-flight workflows to terminate
+        with ``Worker subprocess exited during workflow execution``.
+        Restricting to ``self._server_pool``'s own ``_processes`` keeps
+        the safety net while preserving cross-worker isolation.
+        """
+        executor = getattr(self._server_pool, "_executor", None)
+        owned = list(getattr(executor, "_processes", {}).values()) if executor else []
+        if not owned:
+            return
         try:
             loop = asyncio.get_running_loop()
-            children = await loop.run_in_executor(None, active_children)
-            if children:
-                await asyncio.gather(
-                    *[loop.run_in_executor(None, child.kill) for child in children],
-                    return_exceptions=True,
-                )
+            await asyncio.gather(
+                *[loop.run_in_executor(None, child.kill) for child in owned],
+                return_exceptions=True,
+            )
         except RuntimeError:
-            for child in active_children():
+            for child in owned:
                 try:
                     child.kill()
                 except Exception:
