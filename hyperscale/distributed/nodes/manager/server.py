@@ -1622,6 +1622,23 @@ class ManagerServer(HealthAwareServer):
         self._registry.unregister_worker(worker_id)
         self._manager_state._worker_lhm_scores.pop(worker_id, None)
 
+    def _get_registered_node_id_for_addr(self, addr: tuple[str, int]) -> str | None:
+        """Return the registered node identity currently bound to ``addr``."""
+        if worker_id := self._manager_state.get_worker_id_from_addr(addr):
+            return worker_id
+
+        if self._manager_state.get_manager_tcp_from_udp(addr):
+            for peer_id, peer_info in self._manager_state.iter_known_manager_peers():
+                if (peer_info.udp_host, peer_info.udp_port) == addr:
+                    return peer_id
+
+        if self._manager_state.get_gate_tcp_from_udp(addr):
+            for gate_id, gate_info in self._manager_state.iter_known_gates():
+                if (gate_info.udp_host, gate_info.udp_port) == addr:
+                    return gate_id
+
+        return None
+
     async def _handle_manager_peer_failure(
         self,
         udp_addr: tuple[str, int],

@@ -25,6 +25,7 @@ class Env(BaseModel):
     MERCURY_SYNC_MAX_REQUEST_CACHE_SIZE: StrictInt = 100
     MERCURY_SYNC_ENABLE_REQUEST_CACHING: StrictBool = False
     MERCURY_SYNC_TCP_SERVER_BACKLOG: StrictInt = 1024
+    MERCURY_SYNC_UDP_SERVER_RCVBUF: StrictInt = 4 * 1024 * 1024
     MERCURY_SYNC_VERIFY_SSL_CERT: Literal["REQUIRED", "OPTIONAL", "NONE"] = "REQUIRED"
     MERCURY_SYNC_TLS_VERIFY_HOSTNAME: StrictStr = "false"  # Set to "true" in production
 
@@ -729,6 +730,7 @@ class Env(BaseModel):
             "MERCURY_SYNC_TASK_RUNNER_MAX_THREADS": int,
             "MERCURY_SYNC_MAX_REQUEST_CACHE_SIZE": int,
             "MERCURY_SYNC_ENABLE_REQUEST_CACHING": str,
+            "MERCURY_SYNC_UDP_SERVER_RCVBUF": int,
             # Monitor settings
             "MERCURY_SYNC_MONITOR_SAMPLE_WINDOW": str,
             "MERCURY_SYNC_MONITOR_SAMPLE_INTERVAL": float,

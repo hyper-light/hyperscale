@@ -342,6 +342,10 @@ class ServerInterface(Protocol):
         """
         ...
 
+    def get_registered_node_id_for_addr(self, addr: tuple[str, int]) -> str | None:
+        """Return the registered node identity currently bound to ``addr``."""
+        ...
+
     # === Leadership Broadcasting ===
 
     async def broadcast_leadership_message(self, message: bytes) -> None:

@@ -124,6 +124,24 @@ class MockIncarnationTracker:
         incarnation: int,
         timestamp: float,
     ) -> bool:
+        existing = self._nodes.get(node)
+        if existing is not None:
+            current_status, current_incarnation, _ = existing
+            if incarnation < current_incarnation:
+                return False
+            if incarnation == current_incarnation:
+                status_priority = {
+                    b"UNCONFIRMED": -1,
+                    b"OK": 0,
+                    b"JOIN": 0,
+                    b"SUSPECT": 1,
+                    b"DEAD": 2,
+                }
+                if status_priority.get(status, 0) <= status_priority.get(
+                    current_status, 0
+                ):
+                    return False
+
         self._nodes[node] = (status, incarnation, timestamp)
         return True
 
@@ -214,6 +232,7 @@ class MockServerInterface:
         self._sent_messages: list[tuple[tuple[str, int], bytes]] = []
         self._errors: list[Exception] = []
         self._dead_notifications: list[tuple[tuple[str, int], int, str]] = []
+        self._registered_node_ids_by_addr: dict[tuple[str, int], str] = {}
 
         # Configurable behaviors
         self._validate_target_result = True
@@ -524,6 +543,9 @@ class MockServerInterface:
         source: str,
     ) -> None:
         self._dead_notifications.append((node, incarnation, source))
+
+    def get_registered_node_id_for_addr(self, addr: tuple[str, int]) -> str | None:
+        return self._registered_node_ids_by_addr.get(addr)
 
     # === Context Management ===
 

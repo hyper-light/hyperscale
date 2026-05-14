@@ -124,6 +124,7 @@ class WorkerServer(HealthAwareServer):
 
         # Centralized runtime state (single source of truth)
         self._worker_state: WorkerState = WorkerState(self._core_allocator)
+        self._stopping: bool = False
 
         self._resource_monitor: ProcessResourceMonitor = ProcessResourceMonitor()
 
@@ -513,6 +514,8 @@ class WorkerServer(HealthAwareServer):
 
     async def start(self, timeout: float | None = None) -> None:
         """Start the worker server."""
+        self._stopping = False
+
         # Setup logging config
         self._lifecycle_manager.setup_logging_config()
 
@@ -650,11 +653,50 @@ class WorkerServer(HealthAwareServer):
         teardown that can raise or be externally cancelled. That keeps the
         worker's named background tasks from surviving past shutdown.
         """
-        self._running = False
+        self._stopping = True
 
         if broadcast_leave:
             await self._broadcast_leave()
 
+        self._running = False
+
+        if drain_timeout <= 0:
+            self.abort()
+            return
+
+        try:
+            await asyncio.wait_for(
+                self._stop_after_leave(),
+                timeout=drain_timeout,
+            )
+        except asyncio.TimeoutError:
+            await self._udp_logger.log(
+                ServerWarning(
+                    message=(
+                        "Worker graceful shutdown exceeded drain timeout; "
+                        "aborting remaining local resources"
+                    ),
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            self.abort()
+            return
+
+        await super().stop(drain_timeout=0.0, broadcast_leave=False)
+
+        await self._udp_logger.log(
+            ServerInfo(
+                message="Worker stopped",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+
+    async def _stop_after_leave(self) -> None:
+        """Stop worker-local resources after membership leave has been sent."""
         # Tear down the cluster-connection state machine first so any
         # in-flight rejoin task is cancelled before the rest of the
         # shutdown begins to dismantle dependent state.
@@ -667,16 +709,18 @@ class WorkerServer(HealthAwareServer):
         await self._log_worker_stopping()
         await self._cancel_all_active_workflows()
         await self._shutdown_lifecycle_components()
-        await super().stop(drain_timeout, broadcast_leave=False)
 
-        await self._udp_logger.log(
-            ServerInfo(
-                message="Worker stopped",
-                node_host=self._host,
-                node_port=self._tcp_port,
-                node_id=self._node_id.short,
-            )
-        )
+    def _get_leave_targets(self) -> list[tuple[str, int]]:
+        """Return manager UDP targets for worker voluntary leave."""
+        targets: dict[tuple[str, int], None] = {}
+        for manager in self._registry.get_known_manager_values():
+            if manager.udp_host and manager.udp_port:
+                targets[(manager.udp_host, manager.udp_port)] = None
+
+        if targets:
+            return list(targets.keys())
+
+        return super()._get_leave_targets()
 
     def _get_additional_leave_targets(self) -> list[tuple[str, int]]:
         """Return known manager UDP addresses that must receive worker leave."""
@@ -685,6 +729,10 @@ class WorkerServer(HealthAwareServer):
             for manager in self._registry.get_known_manager_values()
             if manager.udp_host and manager.udp_port
         ]
+
+    def _get_registered_node_id_for_addr(self, addr: tuple[str, int]) -> str | None:
+        """Return the manager identity currently registered at ``addr``."""
+        return self._registry.find_manager_by_udp_addr(addr)
 
     async def _log_worker_stopping(self) -> None:
         if self._event_logger is None:
@@ -733,6 +781,7 @@ class WorkerServer(HealthAwareServer):
 
     def abort(self):
         """Abort the worker server immediately."""
+        self._stopping = True
         self._running = False
 
         # Cancel background tasks synchronously
@@ -1033,6 +1082,8 @@ class WorkerServer(HealthAwareServer):
         """Determine current worker state."""
         if not self._running:
             return WorkerStateEnum.OFFLINE
+        if self._stopping:
+            return WorkerStateEnum.DRAINING
         if self._degradation.current_level.value >= 3:
             return WorkerStateEnum.DRAINING
         if self._degradation.current_level.value >= 2:

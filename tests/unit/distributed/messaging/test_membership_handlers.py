@@ -459,13 +459,15 @@ class TestLeaveHandlerNegativePath:
         self, mock_server: MockServerInterface
     ) -> None:
         """Direct self-originated leave detaches even if tracker state was absent."""
+        node_addr = ("192.168.1.99", 9001)
+        mock_server._registered_node_ids_by_addr[node_addr] = "worker-99"
         handler = LeaveHandler(mock_server)
         context = MessageContext(
-            source_addr=("192.168.1.99", 9001),
-            target=("192.168.1.99", 9001),
+            source_addr=node_addr,
+            target=node_addr,
             target_addr_bytes=b"192.168.1.99:9001",
             message_type=b"leave",
-            message=b"leave:11",
+            message=b"leave:11:worker-99",
             clock_time=12345,
         )
 
@@ -474,6 +476,33 @@ class TestLeaveHandlerNegativePath:
         assert result.response.startswith(b"ack>")
         assert mock_server._dead_notifications == [
             (("192.168.1.99", 9001), 11, "direct_leave_handler")
+        ]
+
+    @pytest.mark.asyncio
+    async def test_handle_stale_authorized_direct_leave(
+        self, mock_server: MockServerInterface
+    ) -> None:
+        """Direct leave from current node identity wins a higher local incarnation."""
+        node_addr = ("192.168.1.50", 9001)
+        mock_server.add_node(node_addr)
+        mock_server._registered_node_ids_by_addr[node_addr] = "worker-50"
+        await mock_server.update_node_state(node_addr, b"OK", 20, 0.0)
+
+        handler = LeaveHandler(mock_server)
+        context = MessageContext(
+            source_addr=node_addr,
+            target=node_addr,
+            target_addr_bytes=b"192.168.1.50:9001",
+            message_type=b"leave",
+            message=b"leave:12:worker-50",
+            clock_time=12345,
+        )
+
+        result = await handler.handle(context)
+
+        assert result.response.startswith(b"ack>")
+        assert mock_server._dead_notifications == [
+            (node_addr, 20, "leave_handler")
         ]
 
 

@@ -669,6 +669,10 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                     f"on_node_dead_callback ({source})",
                 )
 
+    def _get_registered_node_id_for_addr(self, addr: tuple[str, int]) -> str | None:
+        """Return the registered node identity currently bound to ``addr``."""
+        return None
+
     def register_on_peer_confirmed(
         self,
         callback: Callable[[tuple[str, int]], None],
@@ -3425,7 +3429,10 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         """Best-effort broadcast of this node's SWIM leave message."""
         self_addr = self._get_self_udp_addr()
         incarnation = await self._prepare_leave_incarnation()
-        leave_msg = f"leave:{incarnation}>{self_addr[0]}:{self_addr[1]}".encode()
+        leave_msg = (
+            f"leave:{incarnation}:{self._node_id.full}>"
+            f"{self_addr[0]}:{self_addr[1]}"
+        ).encode()
         timeout = self.get_lhm_adjusted_timeout(1.0)
 
         node_addresses = self._get_leave_targets()
@@ -3476,8 +3483,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
 
     async def _prepare_leave_incarnation(self) -> int:
         """Advance self incarnation so direct leave wins receiver freshness checks."""
-        bump = self._incarnation_tracker.minimum_rejoin_incarnation_bump + 1
-        return await self._incarnation_tracker.bump_self_incarnation_by(bump)
+        return await self._incarnation_tracker.increment_self_incarnation()
 
     async def stop(
         self, drain_timeout: float = 5, broadcast_leave: bool = True

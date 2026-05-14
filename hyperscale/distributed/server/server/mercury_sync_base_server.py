@@ -478,6 +478,11 @@ class MercurySyncBaseServer(Generic[T]):
             self._udp_server_socket.setsockopt(
                 socket.SOL_SOCKET, socket.SO_REUSEADDR, 1
             )
+            self._udp_server_socket.setsockopt(
+                socket.SOL_SOCKET,
+                socket.SO_RCVBUF,
+                self.env.MERCURY_SYNC_UDP_SERVER_RCVBUF,
+            )
             self._udp_server_socket.bind((self._udp_host, self._udp_port))
 
             self._udp_server_socket.setblocking(False)

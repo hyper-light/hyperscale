@@ -353,6 +353,10 @@ class ServerAdapter:
         """Fire the registered ``_on_node_dead_callbacks`` for ``node``."""
         self._server.notify_node_dead(node, incarnation, source)
 
+    def get_registered_node_id_for_addr(self, addr: tuple[str, int]) -> str | None:
+        """Return the registered node identity currently bound to ``addr``."""
+        return self._server._get_registered_node_id_for_addr(addr)
+
     # === Leadership Broadcasting ===
 
     def broadcast_leadership_message(self, message: bytes) -> None:
