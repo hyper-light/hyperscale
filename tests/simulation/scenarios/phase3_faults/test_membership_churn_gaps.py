@@ -47,6 +47,33 @@ _SCALE_DOWN_WINDOW_SECONDS = 10.0
 _LARGE_CLUSTER_RUNNING_TIMEOUT_SECONDS = 120.0
 
 
+# Each scenario gets a contiguous, non-overlapping port range. A single
+# manager + W workers reserves ``2 + W * _COMPACT_WORKER_BLOCK`` ports
+# (manager TCP/UDP pair + W worker blocks). The base_ports below are
+# spaced with enough headroom that a slow teardown from one scenario
+# cannot leak a socket into the next scenario's range — see the
+# assertion at the bottom of this module which guards against future
+# regressions when worker counts or block sizes change.
+_BASE_REGISTRATION_STORM = 43500
+_BASE_GRACEFUL_SCALE_DOWN = 45500
+_BASE_MASS_CRASH = 47500
+_BASE_SLOW_CHURN = 49500
+_BASE_BEYOND_MAX = 50500
+
+
+def _scenario_port_ceiling(base_port: int, workers: int) -> int:
+    """Return the first port *past* the range a scenario will reserve.
+
+    A single manager reserves two ports (TCP/UDP pair) and each worker
+    reserves ``_COMPACT_WORKER_BLOCK`` ports for its TCP/UDP pair plus
+    the derived per-subprocess UDP ports the worker pool spawns. The
+    ceiling exists so neighbouring scenarios can detect overlap at
+    import time rather than racing each other for the same socket on
+    sequential test execution.
+    """
+    return base_port + 2 + workers * _COMPACT_WORKER_BLOCK
+
+
 def _single_manager_spec(
     base_port: int,
     workers: int,
@@ -156,7 +183,7 @@ async def _graceful_stop_after_delay(
 @pytest.mark.simulation
 async def test_registration_storm_50_workers() -> None:
     """A manager accepts 50 concurrent real worker registrations without dropping them."""
-    spec = _single_manager_spec(base_port=43500, workers=0)
+    spec = _single_manager_spec(base_port=_BASE_REGISTRATION_STORM, workers=0)
     async with ClusterHarness(
         spec,
         mode=ExecutionMode.REAL,
@@ -210,7 +237,7 @@ async def test_registration_storm_50_workers() -> None:
 async def test_graceful_scale_down_50_workers_reassigns_orphans() -> None:
     """Fifty workers leave gracefully while one survivor completes reassigned work."""
     spec = _single_manager_spec(
-        base_port=45500,
+        base_port=_BASE_GRACEFUL_SCALE_DOWN,
         workers=_LARGE_WORKER_COUNT + 1,
     )
     async with ClusterHarness(
@@ -257,7 +284,7 @@ async def test_graceful_scale_down_50_workers_reassigns_orphans() -> None:
 @pytest.mark.simulation
 async def test_mass_crash_50_workers() -> None:
     """Fifty workers crash at once; the manager drains them and terminates active work."""
-    spec = _single_manager_spec(base_port=47500, workers=_LARGE_WORKER_COUNT)
+    spec = _single_manager_spec(base_port=_BASE_MASS_CRASH, workers=_LARGE_WORKER_COUNT)
     async with ClusterHarness(
         spec,
         mode=ExecutionMode.REAL,
@@ -289,7 +316,7 @@ async def test_mass_crash_50_workers() -> None:
 @pytest.mark.simulation
 async def test_slow_worker_churn_one_worker_every_10_seconds() -> None:
     """A time-spaced churn stream repeatedly removes and restores one worker."""
-    spec = _single_manager_spec(base_port=49500, workers=2)
+    spec = _single_manager_spec(base_port=_BASE_SLOW_CHURN, workers=2)
     async with ClusterHarness(
         spec,
         mode=ExecutionMode.REAL,
@@ -321,7 +348,7 @@ async def test_slow_worker_churn_one_worker_every_10_seconds() -> None:
 async def test_beyond_max_workers_per_manager_cap_rejected_cleanly() -> None:
     """A manager with a configured worker cap rejects registrations beyond it."""
     spec = _single_manager_spec(
-        base_port=50500,
+        base_port=_BASE_BEYOND_MAX,
         workers=1,
         max_workers_per_manager=1,
     )
@@ -355,3 +382,29 @@ async def test_beyond_max_workers_per_manager_cap_rejected_cleanly() -> None:
         assert response.error is not None
         assert "MAX_WORKERS_PER_MANAGER=1" in response.error
         assert manager.instance._manager_state.get_worker_count() == 1
+
+
+# --- Port range overlap guard ---------------------------------------------
+# Each scenario reserves a contiguous block of ports; running the suite
+# sequentially can leak sockets from one scenario into the next if their
+# ranges overlap. Validate at import time so a future increase in
+# ``_LARGE_WORKER_COUNT`` or ``_COMPACT_WORKER_BLOCK`` fails loudly
+# instead of producing flaky ECONNREFUSED errors at runtime when a
+# manager silently fails to bind because the previous scenario still
+# owns the port.
+_SCENARIO_PORT_RANGES = [
+    ("registration_storm",   _BASE_REGISTRATION_STORM,   _LARGE_WORKER_COUNT),
+    ("graceful_scale_down",  _BASE_GRACEFUL_SCALE_DOWN,  _LARGE_WORKER_COUNT + 1),
+    ("mass_crash",           _BASE_MASS_CRASH,           _LARGE_WORKER_COUNT),
+    ("slow_churn",           _BASE_SLOW_CHURN,           2),
+    ("beyond_max",           _BASE_BEYOND_MAX,           1),
+]
+for _i in range(len(_SCENARIO_PORT_RANGES) - 1):
+    _name_a, _base_a, _workers_a = _SCENARIO_PORT_RANGES[_i]
+    _name_b, _base_b, _workers_b = _SCENARIO_PORT_RANGES[_i + 1]
+    _ceiling_a = _scenario_port_ceiling(_base_a, _workers_a)
+    assert _ceiling_a <= _base_b, (
+        f"port-range overlap: {_name_a} reserves [{_base_a},{_ceiling_a}), "
+        f"{_name_b} starts at {_base_b}. Increase {_name_b.upper()}'s "
+        "base_port or reduce earlier scenario worker counts."
+    )
