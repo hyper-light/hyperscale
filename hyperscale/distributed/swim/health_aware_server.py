@@ -444,15 +444,19 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         host, port = self._get_self_udp_addr()
 
         if self._task_runner is not None and self._udp_logger is not None:
+            # Pass the bound method + args separately so the TaskRunner is
+            # the one to actually invoke and await the coroutine. The
+            # earlier ``run(logger.log(msg))`` form built the coroutine
+            # inline and handed it to ``run`` (which expects a callable),
+            # leaking it as an unawaited coroutine.
             self._task_runner.run(
-                self._udp_logger.log(
-                    ServerError(
-                        message=f"Background task '{name}' failed ({type(exception).__name__}): {exception}",
-                        node_id=node_id_short,
-                        node_host=host,
-                        node_port=port,
-                    )
-                )
+                self._udp_logger.log,
+                ServerError(
+                    message=f"Background task '{name}' failed ({type(exception).__name__}): {exception}",
+                    node_id=node_id_short,
+                    node_host=host,
+                    node_port=port,
+                ),
             )
 
     @property
@@ -1428,14 +1432,18 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                 ),
             )
 
-        # Log the change
+        # Log the change. ``_on_degradation_level_change`` runs from a
+        # sync health-callback path, so ``await`` is unavailable — route
+        # the coroutine through the TaskRunner with the callable + args
+        # form so it is actually awaited (not constructed and dropped).
         if hasattr(self, "_udp_logger"):
             try:
                 from hyperscale.logging.hyperscale_logging_models import (
                     ServerInfo as ServerInfoLog,
                 )
 
-                self._udp_logger.log(
+                self._task_runner.run(
+                    self._udp_logger.log,
                     ServerInfoLog(
                         message=f"Degradation {direction}: {old_level.name} -> {new_level.name} ({policy.description})",
                         node_host=self._host,
@@ -1443,7 +1451,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                         node_id=self._node_id.numeric_id
                         if hasattr(self, "_node_id")
                         else 0,
-                    )
+                    ),
                 )
             except Exception as e:
                 # Don't let logging failure prevent degradation handling

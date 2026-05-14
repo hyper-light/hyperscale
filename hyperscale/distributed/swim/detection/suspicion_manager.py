@@ -91,21 +91,33 @@ class SuspicionManager:
         self._node_id = node_id
 
     def _log_warning(self, message: str) -> None:
-        """Log a warning message."""
-        if self._logger:
-            try:
-                from hyperscale.logging.hyperscale_logging_models import ServerDebug
+        """Log a warning message.
 
-                self._logger.log(
-                    ServerDebug(
-                        message=message,
-                        node_host=self._node_host,
-                        node_port=self._node_port,
-                        node_id=self._node_id,
-                    )
-                )
-            except Exception:
-                pass  # Don't let logging errors propagate
+        ``_log_warning`` is called from sync paths (timer callbacks,
+        confirmation handlers), so the coroutine returned by
+        ``Logger.log`` has nowhere to be awaited inline. Route it
+        through the TaskRunner with the callable + args form when one
+        is bound — otherwise drop the entry silently rather than leak
+        the coroutine. CLAUDE.md prohibits orphaned tasks/futures, so
+        the bare ``self._logger.log(...)`` form (which created and
+        dropped a coroutine) is replaced.
+        """
+        if self._logger is None or self._task_runner is None:
+            return
+        try:
+            from hyperscale.logging.hyperscale_logging_models import ServerDebug
+
+            self._task_runner.run(
+                self._logger.log,
+                ServerDebug(
+                    message=message,
+                    node_host=self._node_host,
+                    node_port=self._node_port,
+                    node_id=self._node_id,
+                ),
+            )
+        except Exception:
+            pass  # Don't let logging errors propagate
 
     def set_callbacks(
         self,
