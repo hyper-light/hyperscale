@@ -90,7 +90,7 @@ class ServerInterface(Protocol):
         status: bytes,
         incarnation: int,
         timestamp: float,
-    ) -> None: ...
+    ) -> bool: ...
 
     def is_message_fresh(
         self,
@@ -323,6 +323,22 @@ class ServerInterface(Protocol):
         notification from ``update_node_state``'s DEAD→OK gate so
         downstream observers see the join even when the tracker had
         already drifted back to OK via gossip / probe ACKs.
+        """
+        ...
+
+    def notify_node_dead(
+        self,
+        node: tuple[str, int],
+        incarnation: int,
+        source: str,
+    ) -> None:
+        """Fire registered on-node-dead callbacks for ``node``.
+
+        Used by membership handlers that have already accepted a DEAD/leave
+        transition in the incarnation tracker. The callback path is where
+        managers unregister workers and reassign in-flight work; direct
+        voluntary leave must therefore use the same notification path as
+        suspicion expiry and dead gossip.
         """
         ...
 

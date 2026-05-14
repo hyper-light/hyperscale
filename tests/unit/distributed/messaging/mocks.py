@@ -105,6 +105,15 @@ class MockProbeScheduler:
 
 
 @dataclass
+class MockTrackedNodeState:
+    """Mock incarnation-tracker node state."""
+
+    status: bytes
+    incarnation: int
+    last_update_time: float
+
+
+@dataclass
 class MockIncarnationTracker:
     _nodes: dict = field(default_factory=dict)
 
@@ -117,6 +126,16 @@ class MockIncarnationTracker:
     ) -> bool:
         self._nodes[node] = (status, incarnation, timestamp)
         return True
+
+    def get_node_state(self, node: tuple[str, int]) -> MockTrackedNodeState | None:
+        if node not in self._nodes:
+            return None
+        status, incarnation, timestamp = self._nodes[node]
+        return MockTrackedNodeState(
+            status=status,
+            incarnation=incarnation,
+            last_update_time=timestamp,
+        )
 
     def get_node_incarnation(self, node: tuple[str, int]) -> int:
         if node in self._nodes:
@@ -194,6 +213,7 @@ class MockServerInterface:
         self._pending_probe_acks: dict[tuple[str, int], asyncio.Future] = {}
         self._sent_messages: list[tuple[tuple[str, int], bytes]] = []
         self._errors: list[Exception] = []
+        self._dead_notifications: list[tuple[tuple[str, int], int, str]] = []
 
         # Configurable behaviors
         self._validate_target_result = True
@@ -250,8 +270,8 @@ class MockServerInterface:
         status: bytes,
         incarnation: int,
         timestamp: float,
-    ) -> None:
-        await self._incarnation_tracker.update_node(
+    ) -> bool:
+        return await self._incarnation_tracker.update_node(
             node, status, incarnation, timestamp
         )
 
@@ -496,6 +516,14 @@ class MockServerInterface:
 
     def update_probe_scheduler_membership(self) -> None:
         pass
+
+    def notify_node_dead(
+        self,
+        node: tuple[str, int],
+        incarnation: int,
+        source: str,
+    ) -> None:
+        self._dead_notifications.append((node, incarnation, source))
 
     # === Context Management ===
 

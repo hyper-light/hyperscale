@@ -89,8 +89,13 @@ class ServerAdapter:
         status: bytes,
         incarnation: int,
         timestamp: float,
-    ) -> None:
-        await self._server.update_node_state(node, status, incarnation, timestamp)
+    ) -> bool:
+        return await self._server.update_node_state(
+            node,
+            status,
+            incarnation,
+            timestamp,
+        )
 
     def is_message_fresh(
         self,
@@ -338,6 +343,15 @@ class ServerAdapter:
                         callback_error,
                         "on_node_join_callback (join_handler)",
                     )
+
+    def notify_node_dead(
+        self,
+        node: tuple[str, int],
+        incarnation: int,
+        source: str,
+    ) -> None:
+        """Fire the registered ``_on_node_dead_callbacks`` for ``node``."""
+        self._server.notify_node_dead(node, incarnation, source)
 
     # === Leadership Broadcasting ===
 

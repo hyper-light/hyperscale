@@ -55,20 +55,35 @@ class LeaveHandler(BaseHandler):
                 await self._server.increase_failure_detector("missed_nack")
                 return self._nack()
 
-            # Record audit event
-            self._server.audit_log.record(
-                AuditEventType.NODE_LEFT,
-                node=target,
-                source=source_addr,
+            incarnation = await self._server.parse_incarnation_safe(
+                message,
+                source_addr,
             )
-
-            # Propagate leave to other nodes
-            await self._propagate_leave(target, target_addr_bytes, message)
-
-            await self._server.incarnation_tracker.update_node(
-                target, b"DEAD", 0, time.monotonic()
+            previous_state = self._server.incarnation_tracker.get_node_state(target)
+            was_dead = (
+                previous_state is not None and previous_state.status == b"DEAD"
+            )
+            updated = await self._server.update_node_state(
+                target,
+                b"DEAD",
+                incarnation,
+                time.monotonic(),
             )
             self._server.update_probe_scheduler_membership()
+
+            if updated:
+                self._server.audit_log.record(
+                    AuditEventType.NODE_LEFT,
+                    node=target,
+                    source=source_addr,
+                )
+                if not was_dead:
+                    self._server.notify_node_dead(
+                        target,
+                        incarnation,
+                        "leave_handler",
+                    )
+                await self._propagate_leave(target, target_addr_bytes, message)
 
             return self._ack()
 

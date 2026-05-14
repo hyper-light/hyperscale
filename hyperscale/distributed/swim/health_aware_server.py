@@ -643,6 +643,32 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         """
         self._on_node_join_callbacks.append(callback)
 
+    def notify_node_dead(
+        self,
+        node: tuple[str, int],
+        incarnation: int,
+        source: str,
+    ) -> None:
+        """Invoke registered node-dead callbacks for an accepted DEAD transition."""
+        self._incarnation_tracker.record_node_death(
+            node,
+            incarnation,
+            time.monotonic(),
+        )
+        self._probe_scheduler.remove_member(node)
+        self._peer_probe_reliability.remove_peer(node)
+        self._registered_peers.discard(node)
+
+        for callback in self._on_node_dead_callbacks:
+            try:
+                callback(node)
+            except Exception as error:
+                self._task_runner.run(
+                    self.handle_exception,
+                    error,
+                    f"on_node_dead_callback ({source})",
+                )
+
     def register_on_peer_confirmed(
         self,
         callback: Callable[[tuple[str, int]], None],
@@ -2662,19 +2688,11 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                         source="gossip",
                     )
 
-                    # Update probe scheduler to stop probing this dead node
-                    self._probe_scheduler.remove_member(update.node)
-
-                    # Invoke registered callbacks (same pattern as _on_suspicion_expired)
-                    for callback in self._on_node_dead_callbacks:
-                        try:
-                            callback(update.node)
-                        except Exception as callback_error:
-                            self._task_runner.run(
-                                self.handle_exception,
-                                callback_error,
-                                "on_node_dead_callback (gossip)",
-                            )
+                    self.notify_node_dead(
+                        update.node,
+                        update.incarnation,
+                        "gossip",
+                    )
 
                 self.queue_gossip_update(
                     update.update_type,
@@ -3326,7 +3344,10 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         # 2. Broadcast leave message to cluster
         if broadcast_leave:
             try:
-                leave_msg = b"leave>" + f"{self_addr[0]}:{self_addr[1]}".encode()
+                incarnation = self._incarnation_tracker.get_self_incarnation()
+                leave_msg = (
+                    f"leave:{incarnation}>{self_addr[0]}:{self_addr[1]}".encode()
+                )
                 timeout = self.get_lhm_adjusted_timeout(1.0)
 
                 send_failures = 0
@@ -4783,4 +4804,3 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         except Exception as error:
             await self.handle_exception(error, "receive")
             return b"nack"
-

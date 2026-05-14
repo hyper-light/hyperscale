@@ -400,13 +400,16 @@ class TestLeaveHandlerHappyPath:
             target=("192.168.1.2", 9001),
             target_addr_bytes=b"192.168.1.2:9001",
             message_type=b"leave",
-            message=b"leave",
+            message=b"leave:7",
             clock_time=12345,
         )
 
         result = await handler.handle(context)
 
         assert result.response.startswith(b"ack>")
+        assert mock_server._dead_notifications == [
+            (("192.168.1.2", 9001), 7, "leave_handler")
+        ]
 
 
 class TestLeaveHandlerNegativePath:
