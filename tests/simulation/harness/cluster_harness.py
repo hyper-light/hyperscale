@@ -92,6 +92,7 @@ class ClusterHarness:
     _managers_by_dc: dict[str, list[ServerHandle]] = field(init=False, default_factory=dict)
     _workers_by_dc: dict[str, list[ServerHandle]] = field(init=False, default_factory=dict)
     _next_worker_index_by_dc: dict[str, int] = field(init=False, default_factory=dict)
+    _expected_worker_count_by_dc: dict[str, int] = field(init=False, default_factory=dict)
     _entered: bool = field(init=False, default=False)
 
     async def __aenter__(self) -> "ClusterHarness":
@@ -102,6 +103,10 @@ class ClusterHarness:
             )
 
         self._ports = PortAllocator(host=self.spec.host, base_port=self.spec.base_port)
+        self._expected_worker_count_by_dc = {
+            dc_id: dc_spec.workers
+            for dc_id, dc_spec in self.spec.datacenters.items()
+        }
         self._supervisor = Supervisor(
             timeouts=self.spec.timeouts,
             ports=self._ports,
@@ -210,6 +215,21 @@ class ClusterHarness:
     def all_handles(self) -> list[ServerHandle]:
         return self._supervisor.server_handles
 
+    def expected_worker_count(self, dc_id: str) -> int:
+        """Return the scenario's current expected registered worker count."""
+        return self._expected_worker_count_by_dc.get(
+            dc_id, self.spec.datacenters[dc_id].workers
+        )
+
+    def set_expected_worker_count(self, dc_id: str, count: int) -> None:
+        """Update the worker-count target for intentional membership churn."""
+        if dc_id not in self.spec.datacenters:
+            raise KeyError(f"unknown datacenter {dc_id!r}")
+        if count < 0:
+            raise ValueError("expected worker count cannot be negative")
+        self._expected_worker_count_by_dc[dc_id] = count
+        self._invariants.reset_liveness("ClusterMembershipProgress")
+
     async def add_worker(self, dc_id: str) -> ServerHandle:
         """Construct, start, and register one additional worker in ``dc_id``."""
         if dc_id not in self.spec.datacenters:
@@ -232,6 +252,10 @@ class ClusterHarness:
         self._next_worker_index_by_dc[dc_id] = worker_index + 1
         self._handles_by_id[handle.node_id] = handle
         self._workers_by_dc.setdefault(dc_id, []).append(handle)
+        self._expected_worker_count_by_dc[dc_id] = max(
+            self.expected_worker_count(dc_id),
+            len(self._workers_by_dc[dc_id]),
+        )
         self._supervisor.register_server(handle)
         await handle.instance.start()
         handle.started = True

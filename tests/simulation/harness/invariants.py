@@ -135,6 +135,11 @@ class InvariantChecker:
         self.liveness.append(invariant)
         self._liveness_state[invariant.name] = _LivenessState()
 
+    def reset_liveness(self, name: str) -> None:
+        """Reset one liveness invariant after an intentional scenario phase shift."""
+        if name in self._liveness_state:
+            self._liveness_state[name] = _LivenessState()
+
     @property
     def violation(self) -> InvariantViolation | None:
         """The first violation observed, if any. Cleared on ``start``."""
@@ -277,12 +282,11 @@ def at_most_one_job_leader_per_job() -> SafetyInvariant:
 def cluster_membership_progress(staleness_budget: float = 30.0) -> LivenessInvariant:
     """Cluster membership must reach steady state within the staleness budget.
 
-    Progress counter: sum of (active manager peers + worker count) across
-    all managers. While the cluster is forming, every new peer or worker
-    advances this; once steady, it stops advancing — at which point the
-    liveness check has nothing to measure (it only fires if the counter
-    started moving and then stopped, which is the deadlock-pretending-
-    to-be-slowness signature).
+    Progress counter: sum of bounded active manager peers and worker
+    counts across all managers. Worker counts are bounded by the
+    harness's expected worker count for the DC, so planned scale-downs
+    can move the target without turning intentional membership
+    regression into an invariant failure.
     """
 
     def _counter(harness: "ClusterHarness") -> int:
@@ -293,8 +297,12 @@ def cluster_membership_progress(staleness_budget: float = 30.0) -> LivenessInvar
             state = getattr(handle.instance, "_manager_state", None)
             if state is None:
                 continue
-            total += len(state.get_active_manager_peer_ids())
-            total += state.get_worker_count()
+            expected_manager_peers = max(
+                0, harness.spec.datacenters[handle.dc_id].managers - 1
+            )
+            expected_workers = harness.expected_worker_count(handle.dc_id)
+            total += min(len(state.get_active_manager_peer_ids()), expected_manager_peers)
+            total += min(state.get_worker_count(), expected_workers)
         return total
 
     return LivenessInvariant(

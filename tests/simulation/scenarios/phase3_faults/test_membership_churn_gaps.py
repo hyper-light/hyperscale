@@ -31,6 +31,7 @@ from tests.simulation.harness import (
     HarnessTimeouts,
     Submission,
     SubmissionPattern,
+    ServerHandle,
     WorkloadSpec,
     manager_has_n_swim_confirmed_workers,
     manager_has_n_workers,
@@ -42,6 +43,7 @@ _LARGE_WORKER_COUNT = 50
 _COMPACT_WORKER_BLOCK = 32
 _SLOW_CHURN_CYCLES = 30
 _SLOW_CHURN_INTERVAL_SECONDS = 10.0
+_SCALE_DOWN_WINDOW_SECONDS = 10.0
 _LARGE_CLUSTER_RUNNING_TIMEOUT_SECONDS = 120.0
 
 
@@ -139,6 +141,17 @@ def _fake_worker_registration(
     )
 
 
+async def _graceful_stop_after_delay(
+    cluster: ClusterHarness,
+    worker: ServerHandle,
+    delay_seconds: float,
+) -> None:
+    """Start a graceful worker stop at a scheduled offset."""
+    if delay_seconds > 0:
+        await asyncio.sleep(delay_seconds)
+    await cluster.faults.graceful_stop(worker, drain_timeout=1.0)
+
+
 @pytest.mark.asyncio
 @pytest.mark.simulation
 async def test_registration_storm_50_workers() -> None:
@@ -215,9 +228,21 @@ async def test_graceful_scale_down_50_workers_reassigns_orphans() -> None:
                 timeout=_LARGE_CLUSTER_RUNNING_TIMEOUT_SECONDS
             )
 
-            for victim in victims:
-                await cluster.faults.graceful_stop(victim, drain_timeout=1.0)
-                await asyncio.sleep(0.2)
+            cluster.set_expected_worker_count("local", 1)
+            async with asyncio.TaskGroup() as task_group:
+                for victim_index, victim in enumerate(victims):
+                    delay_seconds = (
+                        victim_index
+                        * _SCALE_DOWN_WINDOW_SECONDS
+                        / _LARGE_WORKER_COUNT
+                    )
+                    task_group.create_task(
+                        _graceful_stop_after_delay(
+                            cluster,
+                            victim,
+                            delay_seconds,
+                        )
+                    )
 
             await wait_until(
                 lambda: manager.instance._manager_state.get_worker_count() == 1,
@@ -248,6 +273,7 @@ async def test_mass_crash_50_workers() -> None:
             await driver.wait_until_running(
                 timeout=_LARGE_CLUSTER_RUNNING_TIMEOUT_SECONDS
             )
+            cluster.set_expected_worker_count("local", 0)
             await cluster.faults.kill_many(workers)
 
             await wait_until(
