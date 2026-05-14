@@ -3424,7 +3424,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
     async def _broadcast_leave(self) -> None:
         """Best-effort broadcast of this node's SWIM leave message."""
         self_addr = self._get_self_udp_addr()
-        incarnation = self._incarnation_tracker.get_self_incarnation()
+        incarnation = await self._prepare_leave_incarnation()
         leave_msg = f"leave:{incarnation}>{self_addr[0]}:{self_addr[1]}".encode()
         timeout = self.get_lhm_adjusted_timeout(1.0)
 
@@ -3473,6 +3473,11 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                     node_id=self._node_id.numeric_id,
                 )
             )
+
+    async def _prepare_leave_incarnation(self) -> int:
+        """Advance self incarnation so direct leave wins receiver freshness checks."""
+        bump = self._incarnation_tracker.minimum_rejoin_incarnation_bump + 1
+        return await self._incarnation_tracker.bump_self_incarnation_by(bump)
 
     async def stop(
         self, drain_timeout: float = 5, broadcast_leave: bool = True

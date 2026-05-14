@@ -454,6 +454,28 @@ class TestLeaveHandlerNegativePath:
 
         assert b"nack" in result.response
 
+    @pytest.mark.asyncio
+    async def test_handle_direct_leave_unknown_node(
+        self, mock_server: MockServerInterface
+    ) -> None:
+        """Direct self-originated leave detaches even if tracker state was absent."""
+        handler = LeaveHandler(mock_server)
+        context = MessageContext(
+            source_addr=("192.168.1.99", 9001),
+            target=("192.168.1.99", 9001),
+            target_addr_bytes=b"192.168.1.99:9001",
+            message_type=b"leave",
+            message=b"leave:11",
+            clock_time=12345,
+        )
+
+        result = await handler.handle(context)
+
+        assert result.response.startswith(b"ack>")
+        assert mock_server._dead_notifications == [
+            (("192.168.1.99", 9001), 11, "direct_leave_handler")
+        ]
+
 
 class TestLeaveHandlerEdgeCases:
     """Edge case tests for LeaveHandler."""

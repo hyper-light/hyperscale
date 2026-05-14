@@ -667,7 +667,7 @@ class WorkerServer(HealthAwareServer):
         await self._log_worker_stopping()
         await self._cancel_all_active_workflows()
         await self._shutdown_lifecycle_components()
-        await super().stop(drain_timeout, broadcast_leave)
+        await super().stop(drain_timeout, broadcast_leave=False)
 
         await self._udp_logger.log(
             ServerInfo(

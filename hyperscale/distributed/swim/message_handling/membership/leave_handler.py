@@ -52,6 +52,31 @@ class LeaveHandler(BaseHandler):
             nodes = self._server.read_nodes()
 
             if target not in nodes:
+                if target == source_addr:
+                    incarnation = await self._server.parse_incarnation_safe(
+                        message,
+                        source_addr,
+                    )
+                    updated = await self._server.update_node_state(
+                        target,
+                        b"DEAD",
+                        incarnation,
+                        time.monotonic(),
+                    )
+                    self._server.update_probe_scheduler_membership()
+                    if updated:
+                        self._server.audit_log.record(
+                            AuditEventType.NODE_LEFT,
+                            node=target,
+                            source=source_addr,
+                        )
+                        self._server.notify_node_dead(
+                            target,
+                            incarnation,
+                            "direct_leave_handler",
+                        )
+                    return self._ack()
+
                 await self._server.increase_failure_detector("missed_nack")
                 return self._nack()
 
