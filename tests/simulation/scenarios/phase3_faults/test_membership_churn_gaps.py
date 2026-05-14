@@ -210,7 +210,7 @@ async def test_registration_storm_50_workers() -> None:
 async def test_graceful_scale_down_50_workers_reassigns_orphans() -> None:
     """Fifty workers leave gracefully while one survivor completes reassigned work."""
     spec = _single_manager_spec(
-        base_port=45000,
+        base_port=45500,
         workers=_LARGE_WORKER_COUNT + 1,
     )
     async with ClusterHarness(
@@ -289,7 +289,7 @@ async def test_mass_crash_50_workers() -> None:
 @pytest.mark.simulation
 async def test_slow_worker_churn_one_worker_every_10_seconds() -> None:
     """A time-spaced churn stream repeatedly removes and restores one worker."""
-    spec = _single_manager_spec(base_port=49000, workers=2)
+    spec = _single_manager_spec(base_port=49500, workers=2)
     async with ClusterHarness(
         spec,
         mode=ExecutionMode.REAL,

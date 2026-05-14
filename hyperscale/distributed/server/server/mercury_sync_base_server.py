@@ -422,15 +422,20 @@ class MercurySyncBaseServer(Generic[T]):
         # Mark server as running before starting network listeners
         self._running = True
 
-        await self._start_udp_server(
-            worker_socket=udp_server_worker_socket,
-            worker_transport=udp_server_worker_transport,
-        )
+        try:
+            await self._start_udp_server(
+                worker_socket=udp_server_worker_socket,
+                worker_transport=udp_server_worker_transport,
+            )
 
-        await self._start_tcp_server(
-            worker_socket=tcp_server_worker_socket,
-            worker_server=tcp_server_worker_server,
-        )
+            await self._start_tcp_server(
+                worker_socket=tcp_server_worker_socket,
+                worker_server=tcp_server_worker_server,
+            )
+        except Exception:
+            self._running = False
+            self._close_startup_transports()
+            raise
 
         if self._tcp_server_cleanup_task is None:
             self._tcp_server_cleanup_task = asyncio.create_task(
@@ -547,9 +552,13 @@ class MercurySyncBaseServer(Generic[T]):
 
             try:
                 self._tcp_server_socket.bind((self._host, self._tcp_port))
-
-            except Exception:
-                pass
+            except OSError as bind_error:
+                self._tcp_server_socket.close()
+                self._tcp_server_socket = None
+                raise OSError(
+                    "Unable to bind TCP server to "
+                    f"{self._host}:{self._tcp_port}"
+                ) from bind_error
 
             self._tcp_server_socket.setblocking(False)
 
@@ -582,6 +591,33 @@ class MercurySyncBaseServer(Generic[T]):
 
             self._tcp_server = server
             self._tcp_connected = True
+            if self._tcp_server.sockets:
+                host, port = self._tcp_server.sockets[0].getsockname()[:2]
+                self._host = host
+                self._tcp_port = port
+
+    def _close_startup_transports(self) -> None:
+        """Close partially-started listeners after startup failure."""
+        if self._udp_transport is not None:
+            self._udp_transport.close()
+            self._udp_transport = None
+            self._udp_connected = False
+        if self._udp_server_socket is not None:
+            try:
+                self._udp_server_socket.close()
+            except OSError:
+                pass
+            self._udp_server_socket = None
+        if self._tcp_server is not None:
+            self._tcp_server.close()
+            self._tcp_server = None
+            self._tcp_connected = False
+        if self._tcp_server_socket is not None:
+            try:
+                self._tcp_server_socket.close()
+            except OSError:
+                pass
+            self._tcp_server_socket = None
 
     def _create_udp_ssl_context(self) -> ssl.SSLContext:
         ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS)

@@ -446,6 +446,8 @@ class WorkerServer(HealthAwareServer):
             rejoin_base_backoff_seconds=(
                 self._env.WORKER_CLUSTER_REJOIN_BASE_BACKOFF
             ),
+            rejoin_jitter_min_seconds=self._config.recovery_jitter_min_seconds,
+            rejoin_jitter_max_seconds=self._config.recovery_jitter_max_seconds,
         )
         # Wire the registry's healthy-set-changed signal so every
         # mark_healthy / mark_unhealthy / remove_manager_state path

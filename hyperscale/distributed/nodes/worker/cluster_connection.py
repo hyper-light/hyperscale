@@ -49,6 +49,7 @@ rejoin task is fire-and-forget bounded by state.
 """
 
 import asyncio
+import random
 import time
 from enum import Enum
 from typing import TYPE_CHECKING, Awaitable, Callable
@@ -100,6 +101,8 @@ class WorkerClusterConnection:
         liveness_check_interval_seconds: float,
         heartbeat_staleness_threshold_seconds: float,
         rejoin_base_backoff_seconds: float,
+        rejoin_jitter_min_seconds: float = 0.0,
+        rejoin_jitter_max_seconds: float = 0.0,
     ) -> None:
         self._seed_manager_tcp_addrs: list[tuple[str, int]] = list(
             seed_manager_tcp_addrs
@@ -122,6 +125,11 @@ class WorkerClusterConnection:
             heartbeat_staleness_threshold_seconds
         )
         self._rejoin_base_backoff_seconds: float = rejoin_base_backoff_seconds
+        self._rejoin_jitter_min_seconds: float = rejoin_jitter_min_seconds
+        self._rejoin_jitter_max_seconds: float = max(
+            rejoin_jitter_min_seconds,
+            rejoin_jitter_max_seconds,
+        )
         self._task_runner: "TaskRunner" = task_runner
         self._logger: "Logger" = logger
         self._node_host: str = node_host
@@ -167,6 +175,8 @@ class WorkerClusterConnection:
             self._liveness_watchdog,
             alias="worker_cluster_liveness_watchdog",
         )
+        if len(self._get_healthy_manager_ids()) == 0 and self._seed_manager_tcp_addrs:
+            self._transition_to(ClusterConnectionState.RECONNECTING)
 
     def record_heartbeat(self, manager_id: str) -> None:
         """Record that we received evidence of a live manager.
@@ -443,6 +453,11 @@ class WorkerClusterConnection:
                 backoff = self._rejoin_base_backoff_seconds * max(
                     1.0, self._get_lhm_multiplier()
                 )
+                if self._rejoin_jitter_max_seconds > 0.0:
+                    backoff += random.uniform(
+                        self._rejoin_jitter_min_seconds,
+                        self._rejoin_jitter_max_seconds,
+                    )
                 await asyncio.sleep(backoff)
         except asyncio.CancelledError:
             return
