@@ -3192,18 +3192,24 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         self,
         self_addr: tuple[str, int],
     ) -> None:
-        """Start global SUSPECT for every alive member with no recent probe success.
+        """Declare every silent member globally DEAD when burst-failure fires.
 
         AD-53. The probe-walk is serial; at large ``N`` it cannot
         individually visit every dead peer within Phase-3 reap budgets.
         When the burst-failure signal indicates a cluster-wide failure
-        event the prober is already observing, this method extends the
-        observation to the rest of the membership: each scheduler entry
-        that the SWIM layer has *not* recently confirmed is moved into
-        SUSPECT, and its Lifeguard timer begins ticking immediately in
-        the timing wheel. Suspicions for actually-alive peers are
-        cleanly refuted via the standard SWIM path
-        (peer-incarnation-bump on receipt of the suspect gossip).
+        event the prober is already observing, this method drives the
+        rest of the membership through the standard DEAD pipeline
+        directly: ``incarnation_tracker.update_node(DEAD, …)`` followed
+        by ``notify_node_dead(…)`` so the existing
+        ``_on_node_dead_callbacks`` chain (registry unregister, gossip
+        update, scheduler refresh, peer-reliability cleanup) runs
+        identically to a probe-driven DEAD transition. The SUSPECT
+        grace window is *deliberately* skipped: Lifeguard suspicion
+        exists so peers can refute a wrong call, and in the
+        burst-failure regime by definition there are no peers alive
+        to refute. Waiting the full bracket (which under LHM-saturated
+        composition can stretch to ~40 s) only delays the inevitable
+        and starves the Phase-3 reap budgets.
 
         Gates:
 
@@ -3211,21 +3217,28 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
           ``2 × SWIM_UDP_POLL_INTERVAL`` — those are exactly the peers
           burst-failure must *not* speculatively kill.
         * Skip targets already in a terminal state (SUSPECT/DEAD/UNCONFIRMED).
-        * Skip ``self_addr`` (cannot suspect the prober).
-        * Skip targets that ``start_suspicion`` would itself reject
-          (e.g. ``can_suspect_node`` returns False per AD-29).
+        * Skip ``self_addr`` (cannot declare the prober dead).
 
-        The broadcast step that normally accompanies probe-driven
-        SUSPECT (``broadcast_suspicion``) is **omitted** here: in the
-        bulk-failure regime peers are by definition not reachable, so
-        broadcasting would burn ``O(N²)`` UDP sends to silent
-        destinations and would not change the outcome. The local SWIM
-        timing wheel does the work.
+        Refutation for false positives: if a speculatively-DEAD member
+        was actually alive, its next register/JOIN handshake (with a
+        bumped incarnation per ``reset_peer_for_rejoin``) clears the
+        DEAD record and re-seats the entry, identical to the
+        canonical SWIM rejoin path.
         """
-        recent_success_window = 2.0 * float(
-            await self._context.read("udp_poll_interval", 1.0)
-        )
+        # The recent-success gate must cover at minimum the burst-failure
+        # observation window — a peer SWIM-confirmed within the same
+        # window that the burst was assembled from is by construction
+        # *not* part of the burst, and speculatively killing it would
+        # be a self-inflicted false positive. At small N a peer is
+        # probed every protocol_period; at N=50 it can take a full
+        # round through the scheduler (~N · protocol_period) before
+        # the prober returns to a given peer, so a 2 × protocol_period
+        # gate is too tight to protect a survivor. Use the
+        # burst-failure window so the protection scales with the same
+        # operator knob that defines "burst".
+        recent_success_window = self._burst_failure_window_seconds
         members = list(self._probe_scheduler.members)
+        now = time.monotonic()
         for member in members:
             if member == self_addr:
                 continue
@@ -3237,7 +3250,18 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                 continue
             node_state = self._incarnation_tracker.get_node_state(member)
             incarnation = node_state.incarnation if node_state else 0
-            await self.start_suspicion(member, incarnation, self_addr)
+            applied = await self._incarnation_tracker.update_node(
+                member,
+                b"DEAD",
+                incarnation,
+                now,
+            )
+            if applied:
+                self.notify_node_dead(
+                    member,
+                    incarnation,
+                    "ad53_burst_failure_speculative_dead",
+                )
 
     def _compute_direct_probe_budget(
         self,
@@ -4716,10 +4740,27 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         # never learns it's being suspected and the bracket fires on
         # an alive peer. Direct delivery is also strictly cheaper than
         # waiting for the SUSPECT to propagate via random gossip.
-        node_addresses = list(self._incarnation_tracker.node_states.keys())
-        for node in node_addresses:
-            if node != self_addr:
-                success = await self._send_broadcast_message(node, msg, timeout)
+        #
+        # Sends are gathered concurrently so a wave of dead destinations
+        # cannot serialize the probe loop behind ``N × per_send_timeout``
+        # of pure timeout — at N≈50 with the default 1-3 s timeout that
+        # serial form blocked the probe loop for ~100 s per round,
+        # starving the burst-failure observation window of the failures
+        # needed to trip its threshold.
+        node_addresses = [
+            node
+            for node in list(self._incarnation_tracker.node_states.keys())
+            if node != self_addr
+        ]
+        if node_addresses:
+            results = await asyncio.gather(
+                *(
+                    self._send_broadcast_message(node, msg, timeout)
+                    for node in node_addresses
+                ),
+                return_exceptions=False,
+            )
+            for success in results:
                 if success:
                     successful += 1
                 else:

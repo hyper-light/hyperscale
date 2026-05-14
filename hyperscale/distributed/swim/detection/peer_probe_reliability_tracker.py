@@ -187,18 +187,28 @@ class PeerProbeReliabilityTracker:
         within_seconds: float,
         now: float | None = None,
     ) -> bool:
-        """Return True iff a probe to ``peer`` succeeded within the window.
+        """Return True iff the **most recent** in-window probe for ``peer`` succeeded.
 
-        AD-53 escalation gate: distinguishes "SWIM just confirmed this peer
-        is alive" (defer to the global layer; job silence is workflow-side)
-        from "no probe has touched this peer recently, or recent probes
-        failed" (job-layer evidence is the freshest signal and may
-        escalate). Unlike :meth:`get_reliability` — which smooths an
-        empty window toward 1.0 because the SWIM default posture is
-        "healthy unless proven otherwise" — this predicate returns
-        ``False`` for an unknown peer because the question is
-        specifically about *evidence of success*, not the absence of
-        evidence of failure.
+        AD-53 escalation gate. Two competing readings are possible for
+        "had recent success":
+
+        * "Any sample within the window is success" — too lenient for
+          escalation gating. A peer that succeeded at ``t=−25 s`` and
+          has failed every probe since (e.g. a gracefully-leaving
+          worker whose LEAVE has not yet been processed) would still
+          satisfy this predicate, so the burst-failure speculative
+          DEAD path would refuse to kill it and registry cleanup
+          stalls until the LEAVE handler runs.
+
+        * "Most recent in-window sample is success" — the intended
+          semantics. The most recent outcome is the only one that
+          reflects the peer's *current* SWIM reachability. A peer
+          whose latest probe failed is part of the burst by
+          construction; one whose latest probe succeeded is not.
+
+        This implementation uses the latter. ``False`` for an unknown
+        peer (no samples) is preserved — the predicate asks for
+        evidence of success, not absence of evidence of failure.
         """
         window = self._windows.get(peer)
         if not window:
@@ -206,12 +216,10 @@ class PeerProbeReliabilityTracker:
         if now is None:
             now = time.monotonic()
         cutoff = now - within_seconds
-        for sample_time, success in reversed(window):
-            if sample_time < cutoff:
-                return False
-            if success:
-                return True
-        return False
+        latest_time, latest_success = window[-1]
+        if latest_time < cutoff:
+            return False
+        return latest_success
 
     def remove_peer(self, peer: NodeAddress) -> None:
         """Drop tracking state for ``peer`` (e.g. on declared death)."""
