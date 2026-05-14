@@ -640,12 +640,20 @@ class WorkerServer(HealthAwareServer):
     ) -> None:
         """Stop the worker server gracefully.
 
-        Background loops are cancelled FIRST so that even if a later step
-        raises (or the parent supervisor's `wait_for` cancels mid-stop),
-        the worker's named bg tasks are already done. Otherwise they
-        survive past shutdown and surface as leaked asyncio tasks.
+        Voluntary leave is announced before workflow cancellation and local
+        pool teardown. Those steps can take seconds for long-running
+        workloads, while manager membership must converge immediately so the
+        control plane can stop routing work to this worker and reassign any
+        in-flight sub-workflows.
+
+        After the leave is sent, background loops are cancelled before
+        teardown that can raise or be externally cancelled. That keeps the
+        worker's named background tasks from surviving past shutdown.
         """
         self._running = False
+
+        if broadcast_leave:
+            await self._broadcast_leave()
 
         # Tear down the cluster-connection state machine first so any
         # in-flight rejoin task is cancelled before the rest of the
@@ -669,6 +677,14 @@ class WorkerServer(HealthAwareServer):
                 node_id=self._node_id.short,
             )
         )
+
+    def _get_additional_leave_targets(self) -> list[tuple[str, int]]:
+        """Return known manager UDP addresses that must receive worker leave."""
+        return [
+            (manager.udp_host, manager.udp_port)
+            for manager in self._registry.get_known_manager_values()
+            if manager.udp_host and manager.udp_port
+        ]
 
     async def _log_worker_stopping(self) -> None:
         if self._event_logger is None:

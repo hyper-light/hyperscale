@@ -82,6 +82,10 @@ class WorkerRegistry:
         """Get manager info by ID."""
         return self._known_managers.get(manager_id)
 
+    def get_known_manager_values(self) -> list[ManagerInfo]:
+        """Return a snapshot of all known managers."""
+        return list(self._known_managers.values())
+
     def get_manager_by_addr(self, addr: tuple[str, int]) -> ManagerInfo | None:
         """Get manager info by TCP address."""
         for manager in self._known_managers.values():

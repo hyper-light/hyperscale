@@ -1138,9 +1138,7 @@ class ManagerServer(HealthAwareServer):
         """Handle node death detected by SWIM."""
         worker_id = self._manager_state.get_worker_id_from_addr(node_addr)
         if worker_id:
-            self._manager_state.setdefault_worker_unhealthy_since(
-                worker_id, time.monotonic()
-            )
+            self._detach_worker_membership(worker_id)
             self._task_runner.run(self._handle_worker_failure, worker_id)
             return
 
@@ -1585,7 +1583,12 @@ class ManagerServer(HealthAwareServer):
     # =========================================================================
 
     async def _handle_worker_failure(self, worker_id: str) -> None:
-        await self._worker_health_monitor.handle_worker_failure(worker_id)
+        if self._manager_state.has_worker(worker_id):
+            await self._worker_health_monitor.handle_worker_failure(worker_id)
+
+        self._detach_worker_membership(worker_id)
+        if await self._worker_pool.deregister_worker(worker_id):
+            await self._worker_pool.notify_cores_available()
 
         if self._workflow_dispatcher and self._job_manager:
             reassignable_sub_workflows = (
@@ -1608,24 +1611,16 @@ class ManagerServer(HealthAwareServer):
                     reassignments=reassignable_sub_workflows,
                 )
 
-        # Fully unregister the worker on DEAD detection. The previous
-        # ``remove_worker_state`` call cleaned up auxiliary tracking
-        # (latency samples, circuit breaker, deadlines, etc.) but left
-        # the worker in ``_workers`` until ``_reap_dead_workers`` ran
-        # 60 s later — far too coarse for any liveness check that
-        # needs sub-minute reaction (SWIM marks DEAD instantly, the
-        # registry should reflect that). ``unregister_worker`` removes
-        # the registration plus all the auxiliary tracking; the LHM
-        # scores cleanup that ``remove_worker_state`` covered is
-        # mirrored explicitly here so we keep the same surface.
-        self._registry.unregister_worker(worker_id)
-        self._manager_state._worker_lhm_scores.pop(worker_id, None)
-
         if (
             self._job_manager
             and self._manager_state.get_worker_count() == 0
         ):
             await self._fail_unfinished_workflows_with_no_workers()
+
+    def _detach_worker_membership(self, worker_id: str) -> None:
+        """Remove a dead worker from membership indexes immediately."""
+        self._registry.unregister_worker(worker_id)
+        self._manager_state._worker_lhm_scores.pop(worker_id, None)
 
     async def _handle_manager_peer_failure(
         self,

@@ -3344,39 +3344,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         # 2. Broadcast leave message to cluster
         if broadcast_leave:
             try:
-                incarnation = self._incarnation_tracker.get_self_incarnation()
-                leave_msg = (
-                    f"leave:{incarnation}>{self_addr[0]}:{self_addr[1]}".encode()
-                )
-                timeout = self.get_lhm_adjusted_timeout(1.0)
-
-                send_failures = 0
-                node_addresses = list(self._incarnation_tracker.node_states.keys())
-                for node in node_addresses:
-                    if node != self_addr:
-                        try:
-                            await self.send(node, leave_msg, timeout=timeout)
-                        except Exception as e:
-                            # Best effort - log but don't fail shutdown for send errors
-                            send_failures += 1
-                            await self._udp_logger.log(
-                                ServerDebug(
-                                    message=f"Leave broadcast to {node[0]}:{node[1]} failed: {type(e).__name__}",
-                                    node_host=self._host,
-                                    node_port=self._port,
-                                    node_id=self._node_id.numeric_id,
-                                )
-                            )
-
-                if send_failures > 0:
-                    await self._udp_logger.log(
-                        ServerDebug(
-                            message=f"Leave broadcast: {send_failures}/{len(node_addresses) - 1} sends failed",
-                            node_host=self._host,
-                            node_port=self._port,
-                            node_id=self._node_id.numeric_id,
-                        )
-                    )
+                await self._broadcast_leave()
             except Exception as e:
                 if self._error_handler:
                     await self.handle_exception(e, "shutdown_broadcast_leave")
@@ -3433,6 +3401,78 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             node=self_addr,
             reason="graceful_shutdown",
         )
+
+    def _get_additional_leave_targets(self) -> list[tuple[str, int]]:
+        """Return role-specific UDP targets that must receive graceful leave."""
+        return []
+
+    def _get_leave_targets(self) -> list[tuple[str, int]]:
+        """Return a deduplicated snapshot of UDP peers to notify on leave."""
+        self_addr = self._get_self_udp_addr()
+        targets: dict[tuple[str, int], None] = {}
+
+        for node in self._incarnation_tracker.node_states.keys():
+            if node != self_addr:
+                targets[node] = None
+
+        for node in self._get_additional_leave_targets():
+            if node != self_addr and node[0] and node[1]:
+                targets[node] = None
+
+        return list(targets.keys())
+
+    async def _broadcast_leave(self) -> None:
+        """Best-effort broadcast of this node's SWIM leave message."""
+        self_addr = self._get_self_udp_addr()
+        incarnation = self._incarnation_tracker.get_self_incarnation()
+        leave_msg = f"leave:{incarnation}>{self_addr[0]}:{self_addr[1]}".encode()
+        timeout = self.get_lhm_adjusted_timeout(1.0)
+
+        node_addresses = self._get_leave_targets()
+        if not node_addresses:
+            return
+
+        concurrency = min(64, len(node_addresses))
+        send_semaphore = asyncio.Semaphore(concurrency)
+
+        async def send_leave(node: tuple[str, int]) -> bool:
+            async with send_semaphore:
+                try:
+                    await self.send(node, leave_msg, timeout=timeout)
+                    return True
+                except Exception as e:
+                    # Best effort - log but don't fail shutdown for send errors
+                    await self._udp_logger.log(
+                        ServerDebug(
+                            message=(
+                                f"Leave broadcast to {node[0]}:{node[1]} failed: "
+                                f"{type(e).__name__}"
+                            ),
+                            node_host=self._host,
+                            node_port=self._port,
+                            node_id=self._node_id.numeric_id,
+                        )
+                    )
+                    return False
+
+        results = await asyncio.gather(
+            *(send_leave(node) for node in node_addresses),
+            return_exceptions=False,
+        )
+        send_failures = sum(1 for result in results if not result)
+
+        if send_failures > 0:
+            await self._udp_logger.log(
+                ServerDebug(
+                    message=(
+                        f"Leave broadcast: {send_failures}/{len(node_addresses)} "
+                        "sends failed"
+                    ),
+                    node_host=self._host,
+                    node_port=self._port,
+                    node_id=self._node_id.numeric_id,
+                )
+            )
 
     async def stop(
         self, drain_timeout: float = 5, broadcast_leave: bool = True
