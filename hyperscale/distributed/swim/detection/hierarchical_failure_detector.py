@@ -149,6 +149,12 @@ class HierarchicalFailureDetector:
             config = HierarchicalConfig()
 
         self._config = config
+        # Public read-only alias for callers that need to derive timing
+        # constants from the same config (e.g. AD-30 cross-layer
+        # escalation in the manager's responsiveness loop). Reading
+        # ``self._config`` from outside is allowed by convention here
+        # since ``HierarchicalConfig`` is frozen at init.
+        self.config = config
         self._on_global_death = on_global_death
         # ``on_global_death_sync`` runs synchronously inside the wheel
         # expiration handler before the async ``on_global_death`` is

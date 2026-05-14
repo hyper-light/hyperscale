@@ -546,6 +546,37 @@ class ManagerHealthMonitor:
 
         return expired
 
+    def find_silent_worker_jobs(
+        self,
+        threshold_seconds: float,
+    ) -> list[tuple[str, str]]:
+        """Return ``(job_id, worker_id)`` pairs whose last progress is past threshold.
+
+        AD-30 extension: this surfaces the job-layer's silence signal so the
+        responsiveness loop can promote it into a job-suspicion. The current
+        progress timestamps (kept by :meth:`record_job_progress`) are the
+        canonical "worker is talking about job X" signal; AD-30 designed the
+        two-layer detector around exactly this kind of cross-layer evidence
+        but the wiring was incomplete — :meth:`suspect_job` had no caller in
+        the manager. This method closes that gap by exposing the silent
+        pairs to the manager loop in a single lookup.
+
+        Excludes pairs that are already suspected or already declared
+        job-dead so the loop is idempotent across ticks.
+        """
+        now = time.monotonic()
+        silent: list[tuple[str, str]] = []
+        for key, last_progress in self._state._worker_job_last_progress.items():
+            if key in self._job_suspicions:
+                continue
+            job_id, worker_id = key
+            job_dead = self._job_dead_workers.get(job_id)
+            if job_dead and worker_id in job_dead:
+                continue
+            if now - last_progress >= threshold_seconds:
+                silent.append(key)
+        return silent
+
     def is_worker_alive_for_job(self, job_id: str, worker_id: str) -> bool:
         """
         Check if worker is alive for a specific job (AD-30).

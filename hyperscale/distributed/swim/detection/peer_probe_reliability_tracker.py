@@ -181,6 +181,38 @@ class PeerProbeReliabilityTracker:
             return float(self._config.window_size + 1)
         return 1.0 / reliability
 
+    def had_recent_success(
+        self,
+        peer: NodeAddress,
+        within_seconds: float,
+        now: float | None = None,
+    ) -> bool:
+        """Return True iff a probe to ``peer`` succeeded within the window.
+
+        AD-53 escalation gate: distinguishes "SWIM just confirmed this peer
+        is alive" (defer to the global layer; job silence is workflow-side)
+        from "no probe has touched this peer recently, or recent probes
+        failed" (job-layer evidence is the freshest signal and may
+        escalate). Unlike :meth:`get_reliability` — which smooths an
+        empty window toward 1.0 because the SWIM default posture is
+        "healthy unless proven otherwise" — this predicate returns
+        ``False`` for an unknown peer because the question is
+        specifically about *evidence of success*, not the absence of
+        evidence of failure.
+        """
+        window = self._windows.get(peer)
+        if not window:
+            return False
+        if now is None:
+            now = time.monotonic()
+        cutoff = now - within_seconds
+        for sample_time, success in reversed(window):
+            if sample_time < cutoff:
+                return False
+            if success:
+                return True
+        return False
+
     def remove_peer(self, peer: NodeAddress) -> None:
         """Drop tracking state for ``peer`` (e.g. on declared death)."""
         self._windows.pop(peer, None)

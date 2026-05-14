@@ -2265,17 +2265,52 @@ class ManagerServer(HealthAwareServer):
                 )
 
     async def _job_responsiveness_loop(self) -> None:
-        """Check job responsiveness (AD-30)."""
+        """Check job responsiveness (AD-30 + cross-layer escalation).
+
+        AD-30 designed two independent failure-detection layers (global SWIM
+        probing and per-job responsiveness) explicitly so that *either*
+        layer can drive death detection. The job-layer wiring was incomplete:
+        :meth:`ManagerHealthMonitor.suspect_job` had no caller in the
+        manager, so the per-job timestamps maintained by
+        :meth:`record_job_progress` never escalated into anything.
+
+        This loop now closes the wiring in two steps:
+
+        1. Promote silent ``(job_id, worker_id)`` pairs into a
+           :class:`JobSuspicion` with a tight ``job_min_timeout`` budget
+           (separate from the long stale-progress threshold, which only
+           gates the *start* of suspicion). Stale-progress means "we already
+           waited a full responsiveness threshold for any signal"; further
+           silence past the tight suspicion timer is strong evidence.
+
+        2. When a job-suspicion expires, run the existing per-job
+           reassignment path AND escalate the worker to global DEAD via
+           :meth:`_escalate_job_death_to_global` — a second-layer signal
+           that bypasses the serial SWIM probe walk when the cluster is
+           in a burst-failure regime. The escalation is gated so it never
+           contradicts a recent successful SWIM probe.
+        """
         while self._running:
             try:
                 await asyncio.sleep(
                     self._config.job_responsiveness_check_interval_seconds
                 )
 
+                silent_pairs = self._worker_health_monitor.find_silent_worker_jobs(
+                    self._config.job_responsiveness_threshold_seconds,
+                )
+                for job_id, worker_id in silent_pairs:
+                    await self._worker_health_monitor.suspect_job(
+                        job_id,
+                        worker_id,
+                        timeout_seconds=self._hierarchical_detector.config.job_min_timeout,
+                    )
+
                 expired = await self._worker_health_monitor.check_job_suspicion_expiry()
 
                 for job_id, worker_id in expired:
                     self._on_worker_dead_for_job(job_id, worker_id)
+                    await self._escalate_job_death_to_global(worker_id)
 
             except asyncio.CancelledError:
                 break
@@ -2288,6 +2323,85 @@ class ManagerServer(HealthAwareServer):
                         node_id=self._node_id.short,
                     )
                 )
+
+    async def _escalate_job_death_to_global(self, worker_id: str) -> None:
+        """Promote a job-layer-confirmed death into a global DEAD declaration.
+
+        AD-30 cross-layer escalation. The job layer has *independently*
+        observed the worker miss progress past both the stale-threshold and
+        the tight job-suspicion timer. Without this escalation the worker
+        sits as ``ALIVE`` in the global incarnation tracker until the SWIM
+        probe walk reaches it — at large ``N`` that walk is the limiting
+        factor on dead-detection latency. With this escalation the global
+        layer treats the job-layer expiry as a peer-equivalent confirmation
+        and runs the standard ``update_node_state(DEAD) → notify_node_dead
+        → _on_node_dead`` chain so registry cleanup, reassignment, and the
+        SWIM ``dead`` gossip update fire identically to a probe-driven
+        death.
+
+        Two gates protect against false positives:
+
+        * **Recent probe-success**: if the per-peer probe reliability tracks
+          a healthy success rate, the worker is still SWIM-responsive and
+          the job silence is more likely workflow-internal (e.g. busy CPU)
+          than node death. Defer to the SWIM layer in that case.
+
+        * **Already-terminal**: if the incarnation tracker already records
+          DEAD (or has no record at all), no action is needed.
+        """
+        worker = self._registry.get_worker(worker_id)
+        if worker is None or worker.node is None:
+            return
+
+        if not worker.node.udp_port:
+            return
+
+        udp_addr = (worker.node.host, worker.node.udp_port)
+
+        # Defer to the SWIM layer when it has independently confirmed
+        # the worker as alive within the past two probe cycles. Sized
+        # against the configured protocol period so the gate scales
+        # with operator tuning.
+        recent_success_window = 2.0 * float(
+            self.env.SWIM_UDP_POLL_INTERVAL
+        )
+        if self._peer_probe_reliability.had_recent_success(
+            udp_addr, within_seconds=recent_success_window
+        ):
+            return
+
+        node_state = self._incarnation_tracker.get_node_state(udp_addr)
+        if node_state is None or node_state.status == b"DEAD":
+            return
+
+        incarnation = node_state.incarnation
+        updated = await self.update_node_state(
+            udp_addr,
+            b"DEAD",
+            incarnation,
+            time.monotonic(),
+        )
+        if not updated:
+            return
+
+        self.notify_node_dead(
+            udp_addr,
+            incarnation,
+            "ad30_job_layer_escalation",
+        )
+
+        await self._udp_logger.log(
+            ServerWarning(
+                message=(
+                    f"AD-30 job-layer escalation: worker {worker_id[:8]}... "
+                    f"declared globally DEAD (no recent successful probe; "
+                    f"job-suspicion expired)"
+                ),
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
 
     async def _stats_push_loop(self) -> None:
         """Periodically push stats to gates/clients."""

@@ -2955,16 +2955,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             return False
 
     async def start_probe_cycle(self) -> None:
-        """Start the SWIM randomized round-robin probe cycle.
-
-        At ``SWIM_PROBE_FANOUT > 1`` we spawn ``K`` cooperating probe-loop
-        workers that share a single ``ProbeScheduler``. The scheduler's
-        ``_probe_index`` is incremented atomically per call so the workers
-        naturally pick distinct targets each protocol period — effective
-        cycle through ``N`` members becomes ``ceil(N / K)`` periods instead
-        of ``N``. This keeps dead-node reap time bounded as the cluster
-        scales, without losing SWIM's randomized-round-robin guarantee.
-        """
+        """Start the SWIM randomized round-robin probe cycle."""
         # Ensure error handler is set up first
         if self._error_handler is None:
             self._setup_error_handler()
@@ -2991,28 +2982,6 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         protocol_period = await self._context.read("udp_poll_interval", 1.0)
         self._probe_scheduler.protocol_period = protocol_period
 
-        probe_fanout = max(1, int(getattr(self.env, "SWIM_PROBE_FANOUT", 1)))
-
-        if probe_fanout == 1:
-            await self._probe_loop_worker(protocol_period)
-            return
-
-        await asyncio.gather(
-            *[
-                self._probe_loop_worker(protocol_period)
-                for _ in range(probe_fanout)
-            ],
-            return_exceptions=True,
-        )
-
-    async def _probe_loop_worker(self, protocol_period: float) -> None:
-        """Single probe-loop worker.
-
-        Multiple workers can run this concurrently; the shared
-        ``ProbeScheduler`` guarantees each call to ``get_next_target``
-        returns a distinct member while the cycle has unprobed slots.
-        Cancellation propagates so shutdown drains all workers cleanly.
-        """
         while self._running and self._probe_scheduler._running:
             try:
                 await self._run_probe_round()
