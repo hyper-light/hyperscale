@@ -729,18 +729,20 @@ and can be added opportunistically.
   client is treated as outside the harness.
 
 - `FaultMatrix` extensions: `partition`, `heal_partition`,
-  `delay(ms, *, src, dst, jitter_ms)`, `drop_rate(probability, *,
-  src, dst)`, `clear_network_faults`. Wildcards on `src`/`dst`
-  supported (`None` = any). Most-specific-rule wins; ties broken by
-  insertion order so scenarios can install a wildcard baseline and
-  override for named pairs.
+  `delay(ms, *, src, dst, jitter_ms)`, `latency_drift(...)`,
+  `drop_rate(probability, *, src, dst)`, `drop_burst(...)`,
+  `bandwidth_cap(...)`, `reorder(...)`, `duplicate(...)`,
+  `tcp_reset(...)`, and `clear_network_faults`. Wildcards on
+  `src`/`dst` supported (`None` = any). Most-specific-rule wins;
+  ties broken by insertion order so scenarios can install a wildcard
+  baseline and override for named pairs.
 
 - `ClusterHarness.address_to_node_id(address, kind)` — TCP/UDP
   port-table lookup. `_install_one` runs after `_start_servers`;
   `FaultMatrix.restart` re-installs on rebuild so partition rules
   survive kill / restart cycles.
 
-- 8 scenarios under `tests/simulation/scenarios/phase4_network/`:
+- 17 scenarios under `tests/simulation/scenarios/phase4_network/`:
 
   *Plumbing (test_partitions.py):*
 
@@ -765,13 +767,36 @@ and can be added opportunistically.
   | `high_loss_rate_triggers_lhm_growth`              | L2 (3M)  | drop_rate=0.7 grows LHM but doesn't escalate     |
   |                                                   |          | to DEAD — Phase B/C/D adaptive-timeout coverage  |
 
+  *Gap closure (test_network_condition_gaps.py):*
+
+  | Scenario                                          | Topology | What it validates                                 |
+  |---------------------------------------------------|----------|--------------------------------------------------|
+  | `latency_drift_link_delay_increases_and_clears`   | L2 (3M)  | Delay drifts over time without background tasks   |
+  | `uniform_packet_drop_*pct`                        | L2 (3M)  | 1%, 5%, 20% loss preserve SWIM peer convergence  |
+  | `drop_burst_expires_without_false_dead`           | L2 (3M)  | 200ms full-loss burst expires without DEAD       |
+  | `bandwidth_cap_throttles_without_breaking_quorum` | L2 (3M)  | Token-bucket throttling remains bounded          |
+  | `udp_reordering_and_duplication_keep_swim_converged` | L2 (3M) | Reorder/duplicate datagrams don't break SWIM     |
+  | `tcp_mid_stream_reset_during_dispatch_recovers`   | L2 (3M)  | workflow_dispatch reset is retried, not hung     |
+
+  *Gap closure (test_partition_gap_scenarios.py):*
+
+  | Scenario                                          | Topology | What it validates                                 |
+  |---------------------------------------------------|----------|--------------------------------------------------|
+  | `three_way_manager_partition_then_heal`           | L2 (3M)  | True multi-way split heals to full convergence   |
+  | `gate_tier_partition_then_heal`                   | L3 gates | Gate cluster survives split and reconverges      |
+  | `quorum_isolating_partition_rejects_submits`      | L2 (3M)  | Minority-side writes reject per AD-3             |
+
 **Exit criteria — met.** SWIM partition-correlation paths exercised
-at L3 with symmetric, asymmetric, and flapping faults; LHM growth
-under partition (the upstream signal that drives cross-DC correlation
-detection) verified end-to-end against the production
-``LocalHealthMultiplier``; the FaultMatrix primitives compose with
-the Phase 3 lifecycle faults so any future scenario can mix
-kill/restart with partition/delay/drop without new harness code.
+at L3 with symmetric, asymmetric, flapping, gate-tier, and healing
+faults; LHM growth under partition (the upstream signal that drives
+cross-DC correlation detection) verified end-to-end against the
+production ``LocalHealthMultiplier``; Phase-4 network conditions now
+cover drift, bounded bursts, bandwidth caps, UDP reordering,
+duplicate delivery, and TCP reset; quorum-isolating partitions reject
+writes per AD-3 instead of silently queuing minority-side work. The
+FaultMatrix primitives compose with the Phase 3 lifecycle faults so
+future scenarios can mix kill/restart with transport faults without
+new harness code.
 
 ### Phase 5 — Clock / Random / Transport interface refactor
 

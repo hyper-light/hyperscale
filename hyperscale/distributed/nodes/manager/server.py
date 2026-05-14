@@ -6584,6 +6584,21 @@ class ManagerServer(HealthAwareServer):
                     protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
                 ).dump()
 
+            # AD-3: leadership is not enough to accept writes. A node
+            # isolated from configured quorum may still have a locally
+            # valid leader lease for a short window, but accepting a
+            # new job in that state creates a partition-side write that
+            # cannot be safely replicated or fenced.
+            if not self._has_quorum_available():
+                return JobAck(
+                    job_id=submission.job_id,
+                    accepted=False,
+                    error="No quorum available; rejecting job submission",
+                    leader_addr=None,
+                    protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+                    protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+                ).dump()
+
             if idempotency_key is not None and self._idempotency_ledger is not None:
                 found, entry = await self._idempotency_ledger.check_or_reserve(
                     idempotency_key,

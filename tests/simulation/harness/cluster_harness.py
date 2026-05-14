@@ -187,6 +187,10 @@ class ClusterHarness:
             client_port=client_port,
         )
 
+    def reserve_client_port(self) -> int:
+        """Reserve a TCP port for a scenario-owned external client."""
+        return self._ports.reserve_pair()[0]
+
     async def _on_invariant_violation(self, reason: str) -> None:
         await self._diagnostics.dump(reason=f"invariant: {reason}")
 
