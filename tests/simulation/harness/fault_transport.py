@@ -214,8 +214,10 @@ async def _send_with_faults(
             dst_node_id,
             rng,
         )
+        result = await original(address, action, data, timeout=timeout)
         for _duplicate_index in range(duplicate_count):
             await original(address, action, data, timeout=0.05)
+        return result
 
     return await original(address, action, data, timeout=timeout)
 
