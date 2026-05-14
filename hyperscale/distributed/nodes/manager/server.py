@@ -2560,28 +2560,15 @@ class ManagerServer(HealthAwareServer):
                         if timed_out:
                             await self._udp_logger.log(
                                 ServerWarning(
-                                    message=f"Job {job_id[:8]}... timed out: {reason}",
+                                    message=(
+                                        f"Job {job_id[:8]}... timeout strategy "
+                                        f"reported: {reason}"
+                                    ),
                                     node_host=self._host,
                                     node_port=self._tcp_port,
                                     node_id=self._node_id.short,
                                 )
                             )
-                            job = self._job_manager.get_job(job_id)
-                            if job and job.status not in (
-                                JobStatus.COMPLETED.value,
-                                JobStatus.FAILED.value,
-                                JobStatus.CANCELLED.value,
-                            ):
-                                job.status = JobStatus.FAILED.value
-                                job.completed_at = time.time()
-                                await self._manager_state.increment_state_version()
-                                # Phase F3: emit TIMED_OUT outcomes
-                                # for every still-in-flight workflow
-                                # on this job. Closes the H8
-                                # feedback loop on hard timeouts.
-                                self._emit_outcomes_for_terminal_job(
-                                    job_id, ExtensionOutcomeKind.TIMED_OUT
-                                )
                     except Exception as check_error:
                         await self._udp_logger.log(
                             ServerError(
@@ -3922,6 +3909,224 @@ class ManagerServer(HealthAwareServer):
             return GateCoordinatedTimeout(self)
         else:
             return LocalAuthorityTimeout(self)
+
+    async def _timeout_job(self, job_id: str, reason: str) -> bool:
+        """Mark ``job_id`` timed out and publish terminal notifications."""
+        job = self._job_manager.get_job_by_id(job_id)
+        if job is None:
+            self._manager_state.remove_job_timeout_strategy(job_id)
+            await self._udp_logger.log(
+                ServerWarning(
+                    message=f"Timeout ignored for unknown job {job_id[:8]}...",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            return False
+
+        timeout_reason = reason or "Job timed out"
+        timestamp = time.monotonic()
+        pending_cancelled = await self._cancel_pending_workflows(
+            job_id,
+            timestamp,
+            timeout_reason,
+        )
+        workflows_to_cancel = self._get_running_workflows_to_cancel(
+            job,
+            pending_cancelled,
+        )
+        timeout_summary = await self._mark_job_timed_out(job, timeout_reason)
+        if timeout_summary is None:
+            self._manager_state.remove_job_timeout_strategy(job_id)
+            return False
+
+        (
+            workflow_pushes,
+            workflow_results,
+            errors,
+            total_completed,
+            total_failed,
+            elapsed_seconds,
+        ) = timeout_summary
+
+        await self._manager_state.increment_state_version()
+        self._emit_outcomes_for_terminal_job(job_id, ExtensionOutcomeKind.TIMED_OUT)
+        await self._push_timeout_workflow_results(workflow_pushes)
+        await self._push_job_status_to_client(
+            job_id,
+            JobStatus.TIMEOUT.value,
+            timeout_reason,
+            is_final=True,
+        )
+
+        _running_cancelled, workflow_errors = await self._cancel_running_workflows(
+            job,
+            pending_cancelled,
+            self._node_id.full,
+            timestamp,
+            timeout_reason,
+            workflows_to_cancel=workflows_to_cancel,
+        )
+        if workflow_errors:
+            await self._udp_logger.log(
+                ServerWarning(
+                    message=(
+                        f"Timeout cancellation issues for job {job_id[:8]}...: "
+                        f"{workflow_errors}"
+                    ),
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+
+        await self._send_job_completion_to_gate(
+            job_id,
+            JobStatus.TIMEOUT.value,
+            workflow_results,
+            errors,
+            total_completed,
+            total_failed,
+            elapsed_seconds,
+        )
+        return True
+
+    async def _mark_job_timed_out(
+        self,
+        job: JobInfo,
+        reason: str,
+    ) -> tuple[
+        list[WorkflowResultPush],
+        list[WorkflowResult],
+        list[str],
+        int,
+        int,
+        float,
+    ] | None:
+        """Transition a non-terminal job to TIMEOUT under its job lock."""
+        terminal_job_statuses = {
+            JobStatus.COMPLETED.value,
+            JobStatus.FAILED.value,
+            JobStatus.CANCELLED.value,
+            JobStatus.TIMEOUT.value,
+        }
+        terminal_workflow_statuses = {
+            WorkflowStatus.COMPLETED,
+            WorkflowStatus.FAILED,
+            WorkflowStatus.AGGREGATED,
+            WorkflowStatus.AGGREGATION_FAILED,
+            WorkflowStatus.CANCELLED,
+        }
+        workflow_pushes: list[WorkflowResultPush] = []
+
+        async with job.lock:
+            if job.status in terminal_job_statuses:
+                return None
+
+            job.status = JobStatus.TIMEOUT.value
+            job.completed_at = time.time()
+            job.timestamp = job.completed_at
+            elapsed_seconds = job.elapsed_seconds()
+
+            for workflow in job.workflows.values():
+                if workflow.status in terminal_workflow_statuses:
+                    continue
+                workflow.status = WorkflowStatus.FAILED
+                workflow.error = reason
+                workflow.terminal_pushed = True
+                workflow.terminal_status = WorkflowStatus.FAILED.value
+                workflow.completion_event.set()
+                workflow_pushes.append(
+                    self._build_timeout_workflow_push(job, workflow, reason)
+                )
+
+            completed_count = sum(
+                1
+                for workflow in job.workflows.values()
+                if workflow.status in {
+                    WorkflowStatus.COMPLETED,
+                    WorkflowStatus.AGGREGATED,
+                }
+            )
+            failed_count = sum(
+                1
+                for workflow in job.workflows.values()
+                if workflow.status in {
+                    WorkflowStatus.FAILED,
+                    WorkflowStatus.AGGREGATION_FAILED,
+                    WorkflowStatus.CANCELLED,
+                }
+            )
+            job.workflows_completed = completed_count
+            job.workflows_failed = failed_count
+            workflow_results, errors, total_completed, total_failed = (
+                self._aggregate_workflow_results(job)
+            )
+            total_completed = max(total_completed, completed_count)
+            total_failed = max(total_failed, failed_count)
+            if reason and reason not in errors:
+                errors.append(reason)
+
+        return (
+            workflow_pushes,
+            workflow_results,
+            errors,
+            total_completed,
+            total_failed,
+            elapsed_seconds,
+        )
+
+    def _build_timeout_workflow_push(
+        self,
+        job: JobInfo,
+        workflow: WorkflowInfo,
+        reason: str,
+    ) -> WorkflowResultPush:
+        """Build a terminal workflow push for a job timeout."""
+        return WorkflowResultPush(
+            job_id=job.job_id,
+            workflow_id=workflow.token.workflow_id or workflow.token_str,
+            workflow_name=workflow.name,
+            datacenter=self._node_id.datacenter,
+            status=WorkflowStatus.FAILED.value,
+            fence_token=self._leases.get_fence_token(job.job_id),
+            results=[],
+            error=reason,
+            elapsed_seconds=job.elapsed_seconds(),
+            completed_at=time.time(),
+        )
+
+    async def _push_timeout_workflow_results(
+        self,
+        workflow_pushes: list[WorkflowResultPush],
+    ) -> None:
+        """Push workflow timeout results to the registered callback."""
+        for push in workflow_pushes:
+            callback_addr = self._manager_state.get_job_callback(push.job_id)
+            if not callback_addr:
+                continue
+            if isinstance(callback_addr, list):
+                callback_addr = tuple(callback_addr)
+            try:
+                await self._send_to_client(
+                    callback_addr,
+                    "workflow_result_push",
+                    push.dump(),
+                    timeout=5.0,
+                )
+            except Exception as send_error:
+                await self._udp_logger.log(
+                    ServerWarning(
+                        message=(
+                            "Failed to push timeout workflow result for "
+                            f"{push.job_id}/{push.workflow_name}: {send_error}"
+                        ),
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
 
     async def _suspect_worker_deadline_expired(self, worker_id: str) -> None:
         """
