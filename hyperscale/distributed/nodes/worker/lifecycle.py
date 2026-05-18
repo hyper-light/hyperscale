@@ -73,8 +73,16 @@ class WorkerLifecycleManager:
         # Logging configuration
         self._logging_config: LoggingConfig | None = None
 
-        # Connection timeout
+        # Network connection timeout (UDP/TCP setup for existing peers —
+        # short by design, measured in milliseconds-to-seconds).
         self._connect_timeout: float = TimeParser(env.MERCURY_SYNC_CONNECT_SECONDS).time
+
+        # Subprocess-pool startup budget (Python interpreter spawn + the
+        # hyperscale import are an order of magnitude slower than UDP
+        # connect; see WORKER_POOL_STARTUP_TIMEOUT_SECONDS in Env).
+        self._pool_startup_timeout: float = float(
+            getattr(env, "WORKER_POOL_STARTUP_TIMEOUT_SECONDS", 60.0)
+        )
 
         # Local env for worker processes
         self._local_env: LocalEnv = LocalEnv(
@@ -186,19 +194,22 @@ class WorkerLifecycleManager:
         self,
         timeout: float | None = None,
     ) -> None:
-        """
-        Connect to local worker processes.
+        """Wait for the worker's local subprocess pool to spawn and ack.
 
-        Args:
-            timeout: Connection timeout (uses default if None)
+        ``timeout`` overrides the configured budget when provided. The
+        default budget — ``WORKER_POOL_STARTUP_TIMEOUT_SECONDS`` — is
+        scoped to *this* operation rather than reusing
+        ``MERCURY_SYNC_CONNECT_SECONDS`` (which is a network-connect
+        timeout for already-running peers, an entirely different
+        scale).
 
-        Raises:
-            RuntimeError: If connection times out
+        Raises ``RuntimeError`` if the budget expires before the
+        subprocess pool acknowledges readiness.
         """
         if not self._remote_manager:
             raise RuntimeError("RemoteGraphManager not initialized")
 
-        effective_timeout = timeout or self._connect_timeout
+        effective_timeout = timeout if timeout is not None else self._pool_startup_timeout
         worker_ips = self.get_worker_ips()
 
         try:
@@ -211,8 +222,9 @@ class WorkerLifecycleManager:
             )
         except asyncio.TimeoutError:
             raise RuntimeError(
-                f"Worker process pool failed to start within {effective_timeout + 10.0}s. "
-                "Check logs for process spawn errors."
+                f"Worker process pool failed to start within "
+                f"{effective_timeout + 10.0}s. Check logs for process "
+                "spawn errors."
             )
 
     def set_on_cores_available(self, callback: callable) -> None:

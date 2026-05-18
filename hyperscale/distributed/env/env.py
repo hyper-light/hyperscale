@@ -189,6 +189,24 @@ class Env(BaseModel):
     WORKER_REGISTRATION_BASE_DELAY: StrictFloat = 0.25
     WORKER_INITIAL_REGISTRATION_JITTER_MAX: StrictFloat = 0.25
 
+    # Time budget for the worker's local subprocess pool to spawn and
+    # acknowledge readiness. *Distinct* from
+    # ``MERCURY_SYNC_CONNECT_SECONDS``: that knob is the network
+    # connect timeout for an *existing* peer (UDP/TCP socket setup,
+    # measured in milliseconds), while this one covers a full
+    # ``spawn`` of a fresh Python interpreter plus importing the
+    # hyperscale package — which on macOS/Linux is on the order of
+    # 1-2 seconds per subprocess in isolation and substantially more
+    # under concurrent startup (cold disk cache, fork lock contention,
+    # interpreter init serialization). The previous code reused
+    # ``MERCURY_SYNC_CONNECT_SECONDS + 10s`` here, which works in
+    # production where each worker is in its own container but is
+    # too tight whenever many workers are launched on the same host
+    # at the same time (simulation harnesses, dev VMs, k8s pods
+    # scheduled densely onto one node). Default is generous enough
+    # to absorb that load without operator tuning.
+    WORKER_POOL_STARTUP_TIMEOUT_SECONDS: StrictFloat = 60.0
+
     # Worker Orphan Grace Period Settings (Section 2.7)
     # Grace period before cancelling workflows when job leader manager fails
     # Should be longer than expected election + takeover time
@@ -802,6 +820,8 @@ class Env(BaseModel):
             # Worker TCP timeout settings
             "WORKER_TCP_TIMEOUT_SHORT": float,
             "WORKER_TCP_TIMEOUT_STANDARD": float,
+            # Worker process pool startup budget
+            "WORKER_POOL_STARTUP_TIMEOUT_SECONDS": float,
             # Worker orphan grace period settings
             "WORKER_ORPHAN_GRACE_PERIOD": float,
             "WORKER_ORPHAN_CHECK_INTERVAL": float,
