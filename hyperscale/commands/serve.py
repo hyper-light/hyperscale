@@ -32,12 +32,12 @@ NodeRoleName = Literal["gate", "manager", "worker"]
 # Locator parsing (AD-52 §2).
 #
 # The full seed-locator package lives at hyperscale/distributed/cluster/
-# seed_locators/ per AD-52 §19 and ships with AD-52 Phase 1. Until then,
-# this command supports the two schemes that cover every K8s deployment
-# topology and >90% of cloud deployments: tcp:// (literal) and dns:// (OS
-# name resolution). The remaining schemes (dns-srv://, file://, exec://)
-# are parsed and rejected with a clear pointer at AD-52 §2 — never
-# silently accepted.
+# seed_locators/ and supports all five AD-52 §2 schemes (tcp, dns,
+# dns-srv, file, exec). The serve command parses URIs into the AD-52
+# locator package for the cluster-module path; for the legacy adapter
+# path (until the cluster module is fully wired through the transport
+# layer) it still resolves tcp:// + dns:// to (host, port) tuples
+# in-process.
 # ---------------------------------------------------------------------------
 
 _WIRED_SCHEMES = ("tcp://", "dns://")
