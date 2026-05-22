@@ -275,10 +275,69 @@ class FaultMatrix:
         """Abruptly kill every handle concurrently."""
         await asyncio.gather(*(self.kill(handle) for handle in handles))
 
+    async def prepare_graceful_drain(
+        self,
+        handles: list[ServerHandle],
+        reason: str = "simulation_graceful_stop",
+    ) -> None:
+        """Tell managers that workers are draining before local stop begins."""
+        worker_ids_by_dc: dict[str, set[str]] = {}
+
+        for handle in handles:
+            self._require_known(handle)
+            if handle.kind != ServerKind.WORKER:
+                continue
+            if handle.node_id in self._killed or not handle.started:
+                continue
+
+            node_id = getattr(handle.instance, "_node_id", None)
+            worker_id = getattr(node_id, "full", handle.node_id)
+            worker_ids_by_dc.setdefault(handle.dc_id, set()).add(worker_id)
+
+        drain_tasks = []
+        for dc_id, worker_ids in worker_ids_by_dc.items():
+            for manager in self.harness.managers(dc_id):
+                if not manager.started:
+                    continue
+                prepare = getattr(manager.instance, "prepare_workers_for_drain", None)
+                if prepare is None:
+                    continue
+                drain_tasks.append(prepare(worker_ids, reason))
+
+        if drain_tasks:
+            await asyncio.gather(*drain_tasks)
+
+    async def graceful_stop_many(
+        self,
+        handles: list[ServerHandle],
+        drain_timeout: float = 5.0,
+        window_seconds: float = 0.0,
+    ) -> None:
+        """Gracefully stop handles after batch-publishing drain intent."""
+        await self.prepare_graceful_drain(handles)
+
+        async def stop_after_delay(handle: ServerHandle, delay_seconds: float) -> None:
+            if delay_seconds > 0:
+                await asyncio.sleep(delay_seconds)
+            await self.graceful_stop(
+                handle,
+                drain_timeout=drain_timeout,
+                prepare_drain=False,
+            )
+
+        handle_count = len(handles)
+        async with asyncio.TaskGroup() as task_group:
+            for handle_index, handle in enumerate(handles):
+                delay_seconds = 0.0
+                if window_seconds > 0.0 and handle_count > 0:
+                    delay_seconds = handle_index * window_seconds / handle_count
+                task_group.create_task(stop_after_delay(handle, delay_seconds))
+
     async def graceful_stop(
         self,
         handle: ServerHandle,
         drain_timeout: float = 5.0,
+        prepare_drain: bool = True,
     ) -> None:
         """Gracefully stop ``handle`` while broadcasting a leave event."""
         self._require_known(handle)
@@ -288,6 +347,8 @@ class FaultMatrix:
             raise FaultError(
                 f"graceful_stop({handle.node_id}): node has not been started"
             )
+        if prepare_drain:
+            await self.prepare_graceful_drain([handle])
         await handle.instance.stop(
             drain_timeout=drain_timeout,
             broadcast_leave=True,

@@ -1138,6 +1138,10 @@ class ManagerServer(HealthAwareServer):
         """Handle node death detected by SWIM."""
         worker_id = self._manager_state.get_worker_id_from_addr(node_addr)
         if worker_id:
+            self._worker_pool.mark_worker_draining_immediate(
+                worker_id,
+                "swim_node_dead",
+            )
             self._detach_worker_membership(worker_id)
             self._task_runner.run(self._handle_worker_failure, worker_id)
             return
@@ -1427,7 +1431,8 @@ class ManagerServer(HealthAwareServer):
                     )
                 else:
                     requeued = await self._workflow_dispatcher.requeue_workflow(
-                        sub_workflow_token
+                        sub_workflow_token,
+                        excluded_worker_id=failed_worker_id,
                     )
                     dispatch_state_updated = requeued
 
@@ -4388,6 +4393,30 @@ class ManagerServer(HealthAwareServer):
         if hasattr(self, "_stats") and self._stats is not None:
             return await self._stats.import_stats_checkpoint(checkpoint)
         return 0
+
+    async def prepare_workers_for_drain(
+        self,
+        worker_ids: set[str],
+        reason: str = "planned_drain",
+    ) -> set[str]:
+        """Mark workers as draining before voluntary leave begins."""
+        marked_worker_ids = await self._worker_pool.mark_workers_draining(
+            worker_ids,
+            reason,
+        )
+        if not marked_worker_ids:
+            return set()
+
+        if self._worker_disseminator:
+            await self._worker_disseminator.broadcast_workers_draining(
+                marked_worker_ids,
+                reason,
+            )
+
+        if self._workflow_dispatcher:
+            self._workflow_dispatcher.signal_cores_available()
+
+        return marked_worker_ids
 
     async def _record_worker_dispatch_success(self, worker_id: str) -> None:
         """Record successful workflow dispatch routing without mutating SWIM health."""

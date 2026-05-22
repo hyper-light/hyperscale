@@ -6,7 +6,7 @@ import asyncio
 import time
 from typing import TYPE_CHECKING, Any, Callable, Coroutine
 
-from hyperscale.distributed.models import WorkerRegistration
+from hyperscale.distributed.models import WorkerRegistration, WorkerState
 from hyperscale.distributed.models.worker_state import (
     WorkerStateUpdate,
     WorkerListResponse,
@@ -174,6 +174,62 @@ class WorkerDisseminator:
             ),
         )
 
+    async def broadcast_workers_draining(
+        self,
+        worker_ids: set[str],
+        reason: str,
+    ) -> None:
+        """Broadcast planned worker drain intent to peer managers."""
+        updates: list[WorkerStateUpdate] = []
+
+        for worker_id in worker_ids:
+            worker = self._worker_pool.get_worker(worker_id)
+            if worker is None or worker.registration is None:
+                continue
+
+            incarnation = await self._get_next_incarnation(worker_id)
+            node = worker.registration.node
+            updates.append(
+                WorkerStateUpdate(
+                    worker_id=worker_id,
+                    owner_manager_id=self._node_id,
+                    host=node.host,
+                    tcp_port=node.port,
+                    udp_port=node.udp_port or node.port,
+                    state="draining",
+                    incarnation=incarnation,
+                    total_cores=worker.total_cores,
+                    available_cores=0,
+                    timestamp=time.monotonic(),
+                    datacenter=self._datacenter,
+                )
+            )
+
+        for update in updates:
+            self._gossip_buffer.add_update(
+                update,
+                number_of_managers=len(self._state._active_manager_peers) + 1,
+            )
+
+        if updates:
+            await asyncio.gather(
+                *(self._broadcast_to_peers(update) for update in updates),
+                return_exceptions=True,
+            )
+
+            self._task_runner.run(
+                self._logger.log,
+                ServerDebug(
+                    message=(
+                        f"Broadcast worker drain intent for {len(updates)} workers "
+                        f"({reason})"
+                    ),
+                    node_host=self._config.host,
+                    node_port=self._config.tcp_port,
+                    node_id=self._node_id,
+                ),
+            )
+
     async def _broadcast_to_peers(self, update: WorkerStateUpdate) -> None:
         peers = list(self._state._active_manager_peers)
         if not peers:
@@ -247,7 +303,10 @@ class WorkerDisseminator:
             self._task_runner.run(
                 self._logger.log,
                 ServerInfo(
-                    message=f"Registered remote worker {update.worker_id[:8]}... from manager {update.owner_manager_id[:8]}...",
+                    message=(
+                        f"Registered remote worker {update.worker_id[:8]}... "
+                        f"from manager {update.owner_manager_id[:8]}..."
+                    ),
                     node_host=self._config.host,
                     node_port=self._config.tcp_port,
                     node_id=self._node_id,
@@ -476,7 +535,11 @@ class WorkerDisseminator:
                     if worker.registration
                     else 0
                 ),
-                state="registered",
+                state=(
+                    "draining"
+                    if worker.health == WorkerState.DRAINING
+                    else "registered"
+                ),
                 incarnation=self.get_worker_incarnation(worker.worker_id),
                 total_cores=worker.total_cores,
                 available_cores=worker.available_cores,
@@ -556,7 +619,10 @@ class WorkerDisseminator:
         self._task_runner.run(
             self._logger.log,
             ServerDebug(
-                message=f"Broadcast {len(reassignments)} workflow reassignments from failed worker {failed_worker_id[:8]}...",
+                message=(
+                    f"Broadcast {len(reassignments)} workflow reassignments "
+                    f"from failed worker {failed_worker_id[:8]}..."
+                ),
                 node_host=self._config.host,
                 node_port=self._config.tcp_port,
                 node_id=self._node_id,

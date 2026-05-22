@@ -31,6 +31,7 @@ from hyperscale.distributed.health import (
 from hyperscale.distributed.jobs.worker_dispatch_routing_state import (
     WorkerDispatchRoutingState,
 )
+from hyperscale.distributed.jobs.worker_drain_intent import WorkerDrainIntent
 from hyperscale.distributed.jobs.logging_models import (
     WorkerPoolTrace,
     WorkerPoolDebug,
@@ -103,6 +104,8 @@ class WorkerPool:
         self._worker_health: dict[str, WorkerHealthState] = {}
         self._health_config = WorkerHealthConfig()
         self._dispatch_routing: dict[str, WorkerDispatchRoutingState] = {}
+        self._drain_intents: dict[str, WorkerDrainIntent] = {}
+        self._drain_epoch: int = 0
 
         # Quick lookup by address
         self._addr_to_worker: dict[tuple[str, int], str] = {}
@@ -139,6 +142,7 @@ class WorkerPool:
             # Check if already registered
             if node_id in self._workers:
                 worker = self._workers[node_id]
+                drain_intended = self.is_worker_drain_intended(node_id)
                 if worker.registration:
                     old_addr = (
                         worker.registration.node.host,
@@ -151,14 +155,20 @@ class WorkerPool:
                 worker.total_cores = registration.total_cores or 0
                 worker.available_cores = registration.available_cores or 0
                 worker.reserved_cores = 0
-                worker.health = WorkerState.HEALTHY
+                worker.health = (
+                    WorkerState.DRAINING if drain_intended else WorkerState.HEALTHY
+                )
 
                 health_state = self._worker_health.get(node_id)
                 if health_state:
                     health_state.update_liveness(success=True)
                     health_state.update_readiness(
-                        accepting=True,
-                        capacity=registration.available_cores or 0,
+                        accepting=not drain_intended,
+                        capacity=(
+                            0
+                            if drain_intended
+                            else registration.available_cores or 0
+                        ),
                     )
 
                 self._get_or_create_dispatch_routing_state(node_id).record_success()
@@ -167,10 +177,16 @@ class WorkerPool:
                 self._addr_to_worker[addr] = node_id
 
             else:
+                drain_intended = self.is_worker_drain_intended(node_id)
+
                 # Create new worker status
                 worker = WorkerStatus(
                     worker_id=node_id,
-                    state=WorkerState.HEALTHY.value,
+                    state=(
+                        WorkerState.DRAINING.value
+                        if drain_intended
+                        else WorkerState.HEALTHY.value
+                    ),
                     registration=registration,
                     last_seen=time.monotonic(),
                     total_cores=registration.total_cores or 0,
@@ -186,8 +202,12 @@ class WorkerPool:
                 )
                 health_state.update_liveness(success=True)
                 health_state.update_readiness(
-                    accepting=True,
-                    capacity=registration.available_cores or 0,
+                    accepting=not drain_intended,
+                    capacity=(
+                        0
+                        if drain_intended
+                        else registration.available_cores or 0
+                    ),
                 )
                 self._worker_health[node_id] = health_state
                 self._get_or_create_dispatch_routing_state(node_id).record_success()
@@ -217,6 +237,7 @@ class WorkerPool:
             # Remove health state tracking
             self._worker_health.pop(node_id, None)
             self._dispatch_routing.pop(node_id, None)
+            self._drain_intents.pop(node_id, None)
 
             # Remove address lookup
             if worker.registration:
@@ -258,6 +279,63 @@ class WorkerPool:
             self._dispatch_routing[node_id] = routing_state
 
         return routing_state
+
+    def mark_worker_draining_immediate(self, node_id: str, reason: str) -> bool:
+        """Synchronously mark a worker as non-routable."""
+        worker = self._workers.get(node_id)
+        if worker is None:
+            return False
+
+        self._drain_epoch += 1
+        self._drain_intents[node_id] = WorkerDrainIntent(
+            worker_id=node_id,
+            epoch=self._drain_epoch,
+            reason=reason,
+        )
+        worker.health = WorkerState.DRAINING
+
+        if health_state := self._worker_health.get(node_id):
+            health_state.update_readiness(accepting=False, capacity=0)
+
+        return True
+
+    async def mark_workers_draining(
+        self,
+        worker_ids: set[str],
+        reason: str,
+    ) -> set[str]:
+        """Mark workers as draining and wake dispatch waiters."""
+        marked_worker_ids: set[str] = set()
+
+        async with self._cores_condition:
+            self._drain_epoch += 1
+            drain_epoch = self._drain_epoch
+
+            for node_id in worker_ids:
+                worker = self._workers.get(node_id)
+                if worker is None:
+                    continue
+
+                self._drain_intents[node_id] = WorkerDrainIntent(
+                    worker_id=node_id,
+                    epoch=drain_epoch,
+                    reason=reason,
+                )
+                worker.health = WorkerState.DRAINING
+
+                if health_state := self._worker_health.get(node_id):
+                    health_state.update_readiness(accepting=False, capacity=0)
+
+                marked_worker_ids.add(node_id)
+
+            if marked_worker_ids:
+                self._cores_condition.notify_all()
+
+        return marked_worker_ids
+
+    def is_worker_drain_intended(self, node_id: str) -> bool:
+        """Return whether the manager has explicit drain intent for a worker."""
+        return node_id in self._drain_intents
 
     def record_dispatch_success(self, node_id: str) -> bool:
         """
@@ -385,6 +463,9 @@ class WorkerPool:
         """
         worker = self._workers.get(node_id)
         if not worker:
+            return False
+
+        if self.is_worker_drain_intended(node_id):
             return False
 
         if not self.is_worker_dispatch_routable(node_id):
@@ -620,12 +701,16 @@ class WorkerPool:
                 return True
 
             was_healthy = self.is_worker_healthy(node_id)
+            drain_intended = self.is_worker_drain_intended(node_id)
             worker.heartbeat = heartbeat
             worker.last_seen = time.monotonic()
-            try:
-                worker.health = WorkerState(heartbeat.state)
-            except ValueError:
-                worker.health = WorkerState.DEGRADED
+            if drain_intended:
+                worker.health = WorkerState.DRAINING
+            else:
+                try:
+                    worker.health = WorkerState(heartbeat.state)
+                except ValueError:
+                    worker.health = WorkerState.DEGRADED
 
             old_available = worker.available_cores
             worker.available_cores = heartbeat.available_cores
@@ -648,10 +733,11 @@ class WorkerPool:
 
                 health_state.update_readiness(
                     accepting=(
-                        heartbeat.health_accepting_work
+                        not drain_intended
+                        and heartbeat.health_accepting_work
                         and worker.available_cores > 0
                     ),
-                    capacity=worker.available_cores,
+                    capacity=0 if drain_intended else worker.available_cores,
                 )
 
             if not was_healthy and self.is_worker_healthy(node_id):
@@ -677,6 +763,7 @@ class WorkerPool:
         self,
         cores_needed: int,
         timeout: float = 30.0,
+        excluded_worker_ids: set[str] | None = None,
     ) -> list[tuple[str, int]] | None:
         """
         Allocate cores from the worker pool.
@@ -702,7 +789,10 @@ class WorkerPool:
                 return None
 
             async with self._cores_condition:
-                allocations = self._select_workers_for_allocation(cores_needed)
+                allocations = self._select_workers_for_allocation(
+                    cores_needed,
+                    excluded_worker_ids=excluded_worker_ids,
+                )
                 total_allocated = sum(cores for _, cores in allocations)
 
                 if total_allocated >= cores_needed:
@@ -754,9 +844,11 @@ class WorkerPool:
     def _select_workers_for_allocation(
         self,
         cores_needed: int,
+        excluded_worker_ids: set[str] | None = None,
     ) -> list[tuple[str, int]]:
         allocations: list[tuple[str, int]] = []
         remaining = cores_needed
+        excluded = excluded_worker_ids or set()
 
         bucket_priority = ["HEALTHY", "BUSY", "DEGRADED"]
 
@@ -765,6 +857,9 @@ class WorkerPool:
         }
 
         for node_id, worker in self._workers.items():
+            if node_id in excluded:
+                continue
+
             bucket = self.get_worker_health_bucket(node_id)
             if bucket in workers_by_bucket:
                 workers_by_bucket[bucket].append((node_id, worker))
@@ -962,6 +1057,11 @@ class WorkerPool:
                 existing = self._remote_workers[worker_id]
                 existing.total_cores = update.total_cores
                 existing.available_cores = update.available_cores
+                existing.health = (
+                    WorkerState.DRAINING
+                    if update.state == "draining"
+                    else WorkerState.HEALTHY
+                )
                 existing.last_seen = time.monotonic()
                 return True
 
@@ -985,7 +1085,11 @@ class WorkerPool:
 
             worker = WorkerStatus(
                 worker_id=worker_id,
-                state=WorkerState.HEALTHY.value,
+                state=(
+                    WorkerState.DRAINING.value
+                    if update.state == "draining"
+                    else WorkerState.HEALTHY.value
+                ),
                 registration=registration,
                 last_seen=time.monotonic(),
                 total_cores=update.total_cores,

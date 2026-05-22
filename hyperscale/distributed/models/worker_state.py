@@ -22,6 +22,7 @@ if TYPE_CHECKING:
 # Pre-encode state bytes for fast lookup
 _STATE_BYTES_CACHE: dict[str, bytes] = {
     "registered": b"registered",
+    "draining": b"draining",
     "dead": b"dead",
     "evicted": b"evicted",
     "left": b"left",
@@ -55,7 +56,7 @@ class WorkerStateUpdate(Message):
     udp_port: int
 
     # State info
-    state: str  # "registered", "dead", "evicted", "left"
+    state: str  # "registered", "draining", "dead", "evicted", "left"
     incarnation: int  # Monotonic, reject lower incarnation
 
     # Capacity (for scheduling decisions)
@@ -70,7 +71,9 @@ class WorkerStateUpdate(Message):
         """
         Serialize for piggyback transmission.
 
-        Format: worker_id:owner_manager_id:host:tcp_port:udp_port:state:incarnation:total_cores:available_cores:timestamp:datacenter
+        Format:
+            worker_id:owner_manager_id:host:tcp_port:udp_port:state:
+            incarnation:total_cores:available_cores:timestamp:datacenter
 
         Uses caching for frequently-encoded values.
         """
@@ -135,7 +138,7 @@ class WorkerStateUpdate(Message):
 
     def is_alive_state(self) -> bool:
         """Check if this update represents a live worker."""
-        return self.state == "registered"
+        return self.state in ("registered", "draining")
 
     def is_dead_state(self) -> bool:
         """Check if this update represents a dead/removed worker."""

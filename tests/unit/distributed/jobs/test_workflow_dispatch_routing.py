@@ -173,6 +173,50 @@ async def test_equal_version_heartbeat_refreshes_lifecycle_state() -> None:
 
 
 @pytest.mark.asyncio
+async def test_manager_drain_intent_survives_healthy_heartbeat() -> None:
+    worker_pool = WorkerPool(get_swim_status=lambda _addr: "OK")
+    await worker_pool.register_worker(_registration())
+
+    marked = await worker_pool.mark_workers_draining(
+        {"worker-1"},
+        reason="planned_scale_down",
+    )
+
+    assert marked == {"worker-1"}
+    assert not worker_pool.is_worker_healthy("worker-1")
+
+    await worker_pool.process_heartbeat(
+        "worker-1",
+        _heartbeat(
+            state=WorkerState.HEALTHY,
+            available_cores=2,
+            version=1,
+            accepting_work=True,
+        ),
+    )
+
+    worker = worker_pool.get_worker("worker-1")
+    assert worker is not None
+    assert worker.health == WorkerState.DRAINING
+    assert not worker_pool.is_worker_healthy("worker-1")
+
+
+@pytest.mark.asyncio
+async def test_allocation_excludes_reassignment_workers() -> None:
+    worker_pool = WorkerPool(get_swim_status=lambda _addr: "OK")
+    await worker_pool.register_worker(_registration("worker-1", port=10_001))
+    await worker_pool.register_worker(_registration("worker-2", port=10_011))
+
+    allocations = await worker_pool.allocate_cores(
+        1,
+        timeout=0.1,
+        excluded_worker_ids={"worker-1"},
+    )
+
+    assert allocations == [("worker-2", 1)]
+
+
+@pytest.mark.asyncio
 async def test_dispatch_plan_fanout_is_bounded() -> None:
     active_dispatches = 0
     max_active_dispatches = 0

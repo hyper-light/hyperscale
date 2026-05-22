@@ -620,6 +620,7 @@ class WorkflowDispatcher:
             allocations = await self._worker_pool.allocate_cores(
                 cores_needed,
                 timeout=allocator_budget,
+                excluded_worker_ids=pending.excluded_worker_ids,
             )
 
             if not allocations:
@@ -1323,19 +1324,30 @@ class WorkflowDispatcher:
 
         self.signal_dispatch()
 
-    async def requeue_workflow(self, sub_workflow_token: str) -> bool:
-        token_parts = sub_workflow_token.split(":")
-        if len(token_parts) < 4:
+    async def requeue_workflow(
+        self,
+        sub_workflow_token: str,
+        excluded_worker_id: str | None = None,
+    ) -> bool:
+        try:
+            token = TrackingToken.parse(sub_workflow_token)
+        except ValueError:
             return False
 
-        job_id = token_parts[2]
-        workflow_id = token_parts[3]
+        if token.workflow_id is None:
+            return False
+
+        job_id = token.job_id
+        workflow_id = token.workflow_id
         key = f"{job_id}:{workflow_id}"
 
         async with self._pending_lock:
             pending = self._pending.get(key)
             if pending is None:
                 return False
+            worker_id_to_exclude = excluded_worker_id or token.worker_id
+            if worker_id_to_exclude:
+                pending.excluded_worker_ids.add(worker_id_to_exclude)
             pending.dispatched = False
             pending.dispatch_in_progress = False
             pending.dispatched_at = 0.0

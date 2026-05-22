@@ -31,7 +31,6 @@ from tests.simulation.harness import (
     HarnessTimeouts,
     Submission,
     SubmissionPattern,
-    ServerHandle,
     WorkloadSpec,
     manager_has_n_swim_confirmed_workers,
     manager_has_n_workers,
@@ -168,17 +167,6 @@ def _fake_worker_registration(
     )
 
 
-async def _graceful_stop_after_delay(
-    cluster: ClusterHarness,
-    worker: ServerHandle,
-    delay_seconds: float,
-) -> None:
-    """Start a graceful worker stop at a scheduled offset."""
-    if delay_seconds > 0:
-        await asyncio.sleep(delay_seconds)
-    await cluster.faults.graceful_stop(worker, drain_timeout=1.0)
-
-
 @pytest.mark.asyncio
 @pytest.mark.simulation
 async def test_registration_storm_50_workers() -> None:
@@ -256,20 +244,11 @@ async def test_graceful_scale_down_50_workers_reassigns_orphans() -> None:
             )
 
             cluster.set_expected_worker_count("local", 1)
-            async with asyncio.TaskGroup() as task_group:
-                for victim_index, victim in enumerate(victims):
-                    delay_seconds = (
-                        victim_index
-                        * _SCALE_DOWN_WINDOW_SECONDS
-                        / _LARGE_WORKER_COUNT
-                    )
-                    task_group.create_task(
-                        _graceful_stop_after_delay(
-                            cluster,
-                            victim,
-                            delay_seconds,
-                        )
-                    )
+            await cluster.faults.graceful_stop_many(
+                victims,
+                drain_timeout=1.0,
+                window_seconds=_SCALE_DOWN_WINDOW_SECONDS,
+            )
 
             await wait_until(
                 lambda: manager.instance._manager_state.get_worker_count() == 1,

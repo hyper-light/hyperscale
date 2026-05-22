@@ -489,6 +489,7 @@ class PendingWorkflow:
     last_dispatch_attempt: float = 0.0  # time.monotonic() of last attempt
     next_retry_delay: float = 1.0  # Seconds until next retry allowed
     max_dispatch_attempts: int = 5  # Max retries before marking failed
+    excluded_worker_ids: set[str] = field(default_factory=set)
 
     def check_and_signal_ready(self) -> bool:
         """
