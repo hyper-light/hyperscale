@@ -21,6 +21,7 @@ import time
 from base64 import b64decode, b64encode
 from typing import Callable
 
+from hyperscale.distributed.env import Env
 from hyperscale.distributed.server import udp
 from hyperscale.distributed.server.server.mercury_sync_base_server import (
     MercurySyncBaseServer,
@@ -244,16 +245,25 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         # through the normal direct probe -> indirect probe -> SUSPECT
         # pipeline; burst mode changes scheduling pressure, not SWIM's
         # membership state machine. See ``docs/architecture/AD_53.md``.
-        _burst_env = kwargs.get("env")
+        _burst_default_env = Env()
+        _burst_env = kwargs.get("env") or _burst_default_env
         self._burst_failure_threshold: int = (
-            int(getattr(_burst_env, "BURST_FAILURE_THRESHOLD", 3))
-            if _burst_env is not None
-            else 3
+            int(
+                getattr(
+                    _burst_env,
+                    "BURST_FAILURE_THRESHOLD",
+                    _burst_default_env.BURST_FAILURE_THRESHOLD,
+                )
+            )
         )
         self._burst_failure_window_seconds: float = (
-            float(getattr(_burst_env, "BURST_FAILURE_WINDOW_SECONDS", 10.0))
-            if _burst_env is not None
-            else 10.0
+            float(
+                getattr(
+                    _burst_env,
+                    "BURST_FAILURE_WINDOW_SECONDS",
+                    _burst_default_env.BURST_FAILURE_WINDOW_SECONDS,
+                )
+            )
         )
         self._burst_failure_observations: collections.deque[
             tuple[float, tuple[str, int]]
@@ -3154,12 +3164,9 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
     def _reset_burst_failure_state(self) -> None:
         """Clear the burst-failure observation window on any probe success.
 
-        A single successful probe is evidence the cluster has not fully
-        collapsed; the accelerated confirmation path is only meant to fire
-        during a true bulk failure where no peer is reachable. Resetting
-        on success ensures the trigger requires ``K`` *consecutive*
-        failures (within the window) rather than ``K`` failures
-        interleaved with successes.
+        An ordinary probe-cycle success ends the current consecutive
+        full-failure run. Accelerated candidate successes do not call
+        this for the whole batch; they refute only their own target.
         """
         if self._burst_failure_observations:
             self._burst_failure_observations.clear()
@@ -3175,10 +3182,11 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         AD-53. Appends ``(now, failed_target)`` to the observation
         window, evicts entries older than
         ``BURST_FAILURE_WINDOW_SECONDS``, and if the distinct failed
-        target count crosses ``BURST_FAILURE_THRESHOLD`` while the
-        prober is not already in burst mode, triggers bounded
-        parallel confirmation for other silent members. The flag is
-        one-shot per burst; a later probe success clears it.
+        target count crosses ``BURST_FAILURE_THRESHOLD`` while no
+        confirmation batch is already running, triggers bounded
+        parallel confirmation for other registered members. A later
+        ordinary probe success clears the observation window; candidate
+        successes refute only their own candidate.
         """
         now = time.monotonic()
         observations = self._burst_failure_observations
@@ -3195,66 +3203,54 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             return
 
         self._burst_failure_active = True
-        burst_started_at = observations[0][0]
-        await self._accelerate_burst_failure_confirmation(
-            self_addr,
-            burst_started_at,
-        )
+        try:
+            await self._accelerate_burst_failure_confirmation(self_addr)
+        finally:
+            self._burst_failure_active = False
 
     async def _accelerate_burst_failure_confirmation(
         self,
         self_addr: tuple[str, int],
-        burst_started_at: float,
     ) -> None:
         """Probe silent members concurrently while preserving SWIM semantics.
 
         AD-53. The probe-walk is serial; at large ``N`` it cannot
         individually visit every dead peer within Phase-3 reap budgets.
-        Burst mode temporarily widens confirmation work for members
-        that have no successful probe evidence after the burst began.
-        Each target still uses the normal direct probe -> indirect
-        probe -> SUSPECT flow, so DEAD remains owned by the
-        hierarchical suspicion timer and the canonical
-        ``_on_suspicion_expired`` callback.
+        Burst mode temporarily widens confirmation work for registered
+        members that are not already terminal. Each target still uses
+        the normal direct probe -> indirect probe -> SUSPECT flow, so
+        DEAD remains owned by the hierarchical suspicion timer and the
+        canonical ``_on_suspicion_expired`` callback.
 
         Gates:
 
-        * Skip targets with probe success after ``burst_started_at``.
         * Skip targets already in a terminal state (SUSPECT/DEAD/UNCONFIRMED).
         * Skip targets that did not complete an explicit registration
           handshake; ``start_suspicion`` would reject them anyway.
         * Skip ``self_addr`` (cannot declare the prober dead).
+
+        Prior successes do not skip a candidate. In rolling scale-down a
+        worker can be reachable at the first burst failure and gone a few
+        seconds later; only this candidate's fresh confirmation attempt can
+        refute suspicion for this candidate.
         """
-        candidates = self._get_burst_confirmation_candidates(
-            self_addr,
-            burst_started_at,
-        )
+        candidates = self._get_burst_confirmation_candidates(self_addr)
         if not candidates:
             return
 
-        success_seen = asyncio.Event()
         semaphore = asyncio.Semaphore(
             min(self._burst_failure_probe_concurrency, len(candidates))
         )
 
-        async def confirm_candidate(candidate: tuple[str, int]) -> None:
+        async def confirm_candidate(candidate: tuple[str, int]) -> bool:
             async with semaphore:
                 try:
-                    if success_seen.is_set() or not self._running:
-                        return
-                    if self._peer_probe_reliability.had_success_since(
-                        candidate,
-                        burst_started_at,
-                    ):
-                        success_seen.set()
-                        return
-                    confirmed_alive = await self._confirm_burst_failure_candidate(
+                    if not self._running:
+                        return True
+                    return await self._confirm_burst_failure_candidate(
                         candidate,
                         self_addr,
-                        burst_started_at,
                     )
-                    if confirmed_alive:
-                        success_seen.set()
                 except asyncio.CancelledError:
                     raise
                 except Exception as error:
@@ -3262,18 +3258,18 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                         error,
                         f"ad53_burst_confirmation_{candidate[0]}_{candidate[1]}",
                     )
-                    return
+                    return False
 
-        await asyncio.gather(
+        confirmation_results = await asyncio.gather(
             *(confirm_candidate(candidate) for candidate in candidates)
         )
-        if success_seen.is_set():
+
+        if all(confirmation_results):
             self._reset_burst_failure_state()
 
     def _get_burst_confirmation_candidates(
         self,
         self_addr: tuple[str, int],
-        burst_started_at: float,
     ) -> list[tuple[str, int]]:
         """Return members eligible for AD-53 accelerated confirmation."""
         candidates: list[tuple[str, int]] = []
@@ -3284,11 +3280,6 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                 continue
             if self._is_target_already_suspect_or_dead(member):
                 continue
-            if self._peer_probe_reliability.had_success_since(
-                member,
-                burst_started_at,
-            ):
-                continue
             candidates.append(member)
         return candidates
 
@@ -3296,7 +3287,6 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         self,
         target: tuple[str, int],
         self_addr: tuple[str, int],
-        burst_started_at: float,
     ) -> bool:
         """Run one normal SWIM confirmation for an AD-53 burst candidate."""
         if not self._running or self._is_target_already_suspect_or_dead(target):
@@ -3304,6 +3294,43 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
 
         node_state = self._incarnation_tracker.get_node_state(target)
         incarnation = node_state.incarnation if node_state else 0
+        confirmation_started_at = time.monotonic()
+
+        confirmed_alive = await self._confirm_peer_reachable_by_swim(
+            target,
+            incarnation,
+        )
+        if confirmed_alive:
+            return True
+
+        if self._peer_probe_reliability.had_success_since(
+            target,
+            confirmation_started_at,
+        ):
+            return True
+
+        if not self._running or self._is_target_already_suspect_or_dead(target):
+            return False
+
+        await self.start_suspicion(target, incarnation, self_addr)
+        await self.broadcast_suspicion(target, incarnation)
+        return False
+
+    async def _confirm_peer_reachable_by_swim(
+        self,
+        target: tuple[str, int],
+        incarnation: int,
+    ) -> bool:
+        """Run direct and indirect SWIM confirmation for ``target``.
+
+        This helper intentionally stops before suspicion. Callers that
+        need a membership transition must decide how to interpret the
+        failed confirmation in their own layer, while positive results
+        consistently update probe reliability and LHM just like the
+        ordinary probe loop.
+        """
+        if not self._running:
+            return False
 
         base_timeout = await self._context.read("current_timeout")
         timeout = self.get_lhm_adjusted_timeout(base_timeout)
@@ -3323,8 +3350,6 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             return True
 
         self._peer_probe_reliability.record_probe_outcome(target, success=False)
-        if self._peer_probe_reliability.had_success_since(target, burst_started_at):
-            return True
 
         indirect_sent = await self.initiate_indirect_probe(target, incarnation)
         if indirect_sent:
@@ -3341,13 +3366,6 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                 )
                 return True
 
-        if not self._running or self._is_target_already_suspect_or_dead(target):
-            return False
-        if self._peer_probe_reliability.had_success_since(target, burst_started_at):
-            return True
-
-        await self.start_suspicion(target, incarnation, self_addr)
-        await self.broadcast_suspicion(target, incarnation)
         return False
 
     def _compute_direct_probe_budget(
