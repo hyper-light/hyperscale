@@ -187,7 +187,18 @@ class Env(BaseModel):
     )
     WORKER_REGISTRATION_MAX_RETRIES: StrictInt = 5
     WORKER_REGISTRATION_BASE_DELAY: StrictFloat = 0.25
-    WORKER_INITIAL_REGISTRATION_JITTER_MAX: StrictFloat = 0.25
+    # Wait a random jittered delay before this worker's *first* register
+    # attempt to spread the cold-start register storm. The default has
+    # to absorb large clusters: with N workers and jitter ``J`` the
+    # effective per-second register rate seen by the manager is ``N/J``;
+    # at the previous default of 0.25s an N=50 cluster generates ~200
+    # connects/second, which exceeds the macOS/Linux per-socket accept
+    # drain rate and causes ECONNREFUSED + per-worker circuit-breaker
+    # open + permanent registration failure. 5s keeps the rate under
+    # ~10/sec for N≤50 and degrades gracefully past that. Single-digit
+    # cold-start latency is acceptable because workers retry with their
+    # own backoff after the initial attempt.
+    WORKER_INITIAL_REGISTRATION_JITTER_MAX: StrictFloat = 5.0
 
     # Time budget for the worker's local subprocess pool to spawn and
     # acknowledge readiness. *Distinct* from
