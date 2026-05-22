@@ -4602,6 +4602,35 @@ class ManagerServer(HealthAwareServer):
     # TCP Handlers
     # =========================================================================
 
+    def _build_worker_registration_response(
+        self,
+        *,
+        accepted: bool,
+        error: str | None = None,
+    ) -> RegistrationResponse:
+        """Build a worker registration response with the current manager view."""
+        healthy_managers = self._manager_state.get_active_known_manager_peers()
+        healthy_managers.append(
+            ManagerInfo(
+                node_id=self._node_id.full,
+                tcp_host=self._host,
+                tcp_port=self._tcp_port,
+                udp_host=self._host,
+                udp_port=self._udp_port,
+                datacenter=self._node_id.datacenter,
+                is_leader=self.is_leader(),
+            )
+        )
+
+        return RegistrationResponse(
+            accepted=accepted,
+            manager_id=self._node_id.full,
+            healthy_managers=healthy_managers,
+            error=error,
+            protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+            protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+        )
+
     @tcp.receive()
     async def worker_register(
         self,
@@ -4664,8 +4693,39 @@ class ManagerServer(HealthAwareServer):
                     protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
                 ).dump()
 
+            existing_worker = self._registry.get_worker(registration.node.node_id)
+            worker_udp_addr = (registration.node.host, registration.node.udp_port)
+            existing_worker_udp_addr: tuple[str, int] | None = None
+            if existing_worker is not None and existing_worker.node is not None:
+                existing_worker_udp_addr = (
+                    existing_worker.node.host,
+                    existing_worker.node.udp_port,
+                )
+
+            is_new_worker = existing_worker is None
+            is_same_worker_registration = existing_worker_udp_addr == worker_udp_addr
+            node_state = self._incarnation_tracker.get_node_state(worker_udp_addr)
+            needs_fresh_liveness = (
+                is_same_worker_registration
+                and node_state is not None
+                and node_state.status in (b"SUSPECT", b"DEAD")
+            )
+            if needs_fresh_liveness:
+                confirmed_alive = await self._confirm_peer_reachable_by_swim(
+                    worker_udp_addr,
+                    node_state.incarnation,
+                )
+                if not confirmed_alive:
+                    return self._build_worker_registration_response(
+                        accepted=False,
+                        error=(
+                            "Worker registration rejected: "
+                            "stale duplicate registration could not be "
+                            "confirmed over SWIM"
+                        ),
+                    ).dump()
+
             max_workers = self._config.max_workers_per_manager
-            is_new_worker = self._registry.get_worker(registration.node.node_id) is None
             if (
                 max_workers is not None
                 and max_workers >= 0
@@ -4691,23 +4751,23 @@ class ManagerServer(HealthAwareServer):
             await self._worker_pool.register_worker(registration)
 
             # Add to SWIM
-            worker_udp_addr = (registration.node.host, registration.node.udp_port)
-            # TCP registration is the authoritative "fresh start" signal
-            # for this address: it tells the manager that the worker
-            # process at ``worker_udp_addr`` is brand-new (a different
-            # ``node_id`` from any predecessor that may have died there).
-            # ``reset_peer_for_rejoin`` wipes leftover SWIM state and
-            # re-seats the tracker entry at a *bumped* incarnation so
-            # stale DEAD gossip about the predecessor (still in flight
-            # at this point) is rejected by the freshness check rather
-            # than regressing the new instance back to DEAD. Without
-            # this reset every path that needs to engage on the new
-            # instance short-circuits: ``confirm_peer`` no-ops because
-            # the address looks already-confirmed, ``can_suspect_node``
-            # blocks SUSPECT because the tracker still says DEAD, and
-            # the only remaining path back to unregister is the coarse
-            # deadline-enforcement fallback.
-            await self.reset_peer_for_rejoin(worker_udp_addr)
+            if is_same_worker_registration and not needs_fresh_liveness:
+                self.register_peer(worker_udp_addr)
+            else:
+                # TCP registration is the authoritative "fresh start" signal
+                # for this address: it tells the manager that the worker
+                # process at ``worker_udp_addr`` is brand-new (a different
+                # ``node_id`` from any predecessor that may have died there).
+                # ``reset_peer_for_rejoin`` wipes leftover SWIM state and
+                # re-seats the tracker entry at a *bumped* incarnation so
+                # stale DEAD gossip about the predecessor (still in flight
+                # at this point) is rejected by the freshness check rather
+                # than regressing the new instance back to DEAD. Duplicate
+                # registration from the same worker is intentionally
+                # idempotent: it refreshes registry/pool metadata but does not
+                # manufacture a new incarnation or disseminate ALIVE gossip.
+                await self.reset_peer_for_rejoin(worker_udp_addr)
+
             self._manager_state.set_worker_addr_mapping(
                 worker_udp_addr, registration.node.node_id
             )
@@ -4718,27 +4778,7 @@ class ManagerServer(HealthAwareServer):
                     registration
                 )
 
-            # Build response with known managers
-            healthy_managers = self._manager_state.get_active_known_manager_peers()
-            healthy_managers.append(
-                ManagerInfo(
-                    node_id=self._node_id.full,
-                    tcp_host=self._host,
-                    tcp_port=self._tcp_port,
-                    udp_host=self._host,
-                    udp_port=self._udp_port,
-                    datacenter=self._node_id.datacenter,
-                    is_leader=self.is_leader(),
-                )
-            )
-
-            response = RegistrationResponse(
-                accepted=True,
-                manager_id=self._node_id.full,
-                healthy_managers=healthy_managers,
-                protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
-                protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
-            )
+            response = self._build_worker_registration_response(accepted=True)
 
             return response.dump()
 
@@ -4759,22 +4799,8 @@ class ManagerServer(HealthAwareServer):
                     node_id=self._node_id.short,
                 )
             )
-            healthy_managers = self._manager_state.get_active_known_manager_peers()
-            healthy_managers.append(
-                ManagerInfo(
-                    node_id=self._node_id.full,
-                    tcp_host=self._host,
-                    tcp_port=self._tcp_port,
-                    udp_host=self._host,
-                    udp_port=self._udp_port,
-                    datacenter=self._node_id.datacenter,
-                    is_leader=self.is_leader(),
-                )
-            )
-            return RegistrationResponse(
+            return self._build_worker_registration_response(
                 accepted=False,
-                manager_id=self._node_id.full,
-                healthy_managers=healthy_managers,
                 error=str(error),
             ).dump()
 

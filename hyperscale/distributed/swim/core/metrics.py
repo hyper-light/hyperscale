@@ -70,6 +70,7 @@ class Metrics:
     gossip_updates_sent: int = 0
     gossip_updates_received: int = 0
     gossip_buffer_overflows: int = 0
+    gossip_alive_refutations_suppressed: int = 0
     
     # Rate limiting and dedup
     messages_rate_limited: int = 0
@@ -224,4 +225,3 @@ class Metrics:
                 setattr(self, name, 0)
         self._start_time = time.monotonic()
         self._saturated_counters.clear()
-

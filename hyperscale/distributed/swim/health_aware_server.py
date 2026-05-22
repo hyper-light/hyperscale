@@ -90,6 +90,7 @@ from .detection.peer_probe_reliability_tracker import (
 
 # Gossip
 from .gossip.gossip_buffer import GossipBuffer, MAX_UDP_PAYLOAD
+from .gossip.piggyback_update import PiggybackUpdate
 from .gossip.health_gossip_buffer import HealthGossipBuffer, HealthGossipBufferConfig
 
 # Leadership
@@ -1832,7 +1833,11 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                     health_piggyback
                 )
             if membership_piggyback:
-                self._task_runner.run(self.process_piggyback_data, membership_piggyback)
+                self._task_runner.run(
+                    self.process_piggyback_data,
+                    membership_piggyback,
+                    source_addr,
+                )
             return message[:msg_end] if msg_end < len(message) else message
 
         state_sep_idx = message.find(self._STATE_SEPARATOR, addr_sep_idx, msg_end)
@@ -1860,7 +1865,11 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         if health_piggyback:
             self._health_gossip_buffer.decode_and_process_piggyback(health_piggyback)
         if membership_piggyback:
-            self._task_runner.run(self.process_piggyback_data, membership_piggyback)
+            self._task_runner.run(
+                self.process_piggyback_data,
+                membership_piggyback,
+                source_addr,
+            )
 
         # No state separator - return clean message
         if state_sep_idx < 0:
@@ -2659,7 +2668,31 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         """Get piggybacked membership updates to append to a message."""
         return self._gossip_buffer.encode_piggyback(max_updates)
 
-    async def process_piggyback_data(self, data: bytes) -> None:
+    def _should_apply_alive_piggyback(
+        self,
+        update: PiggybackUpdate,
+        source_addr: tuple[str, int] | None,
+    ) -> bool:
+        """Return whether an ALIVE piggyback is strong enough to apply.
+
+        Third-party ALIVE gossip is a useful dissemination mechanism when
+        no local suspicion is open. Once this node has opened a SUSPECT
+        bracket for the target, however, stale indirect ALIVE gossip is
+        not a refutation: only a message sent by the target itself (or a
+        fresh explicit probe confirmation elsewhere in the call stack) can
+        prove the target survived after the suspicion began.
+        """
+        if update.update_type != "alive":
+            return True
+        if not self.is_node_suspected(update.node):
+            return True
+        return source_addr == update.node
+
+    async def process_piggyback_data(
+        self,
+        data: bytes,
+        source_addr: tuple[str, int] | None = None,
+    ) -> None:
         """Process piggybacked membership updates received in a message."""
         updates = GossipBuffer.decode_piggyback(data)
         self._metrics.increment("gossip_updates_received", len(updates))
@@ -2682,6 +2715,10 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                 "leave": b"DEAD",
             }
             status = status_map.get(update.update_type, b"OK")
+
+            if not self._should_apply_alive_piggyback(update, source_addr):
+                self._metrics.increment("gossip_alive_refutations_suppressed")
+                continue
 
             if self.is_message_fresh(update.node, update.incarnation, status):
                 self_addr = self._get_self_udp_addr()
