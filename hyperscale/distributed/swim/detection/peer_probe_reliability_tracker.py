@@ -221,6 +221,33 @@ class PeerProbeReliabilityTracker:
             return False
         return latest_success
 
+    def had_success_since(
+        self,
+        peer: NodeAddress,
+        since: float,
+        now: float | None = None,
+    ) -> bool:
+        """Return True iff the latest live probe sample since ``since`` succeeded.
+
+        This is the burst-failure refutation predicate. A sample before
+        the burst began is not useful evidence that the peer survived
+        the burst, and a later failure must override an earlier success.
+        Unknown peers return ``False`` because this asks for concrete
+        positive liveness evidence.
+        """
+        window = self._windows.get(peer)
+        if not window:
+            return False
+
+        if now is None:
+            now = time.monotonic()
+
+        cutoff = max(since, now - self._config.sample_ttl_s)
+        latest_time, latest_success = window[-1]
+        if latest_time < cutoff:
+            return False
+        return latest_success
+
     def remove_peer(self, peer: NodeAddress) -> None:
         """Drop tracking state for ``peer`` (e.g. on declared death)."""
         self._windows.pop(peer, None)

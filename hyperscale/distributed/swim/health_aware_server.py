@@ -238,13 +238,12 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         )
 
         # AD-53 burst-failure cluster-degradation signal.
-        # When K direct+indirect probe failures occur within W seconds
-        # the prober speculatively starts global SUSPECT for every
-        # alive member of the probe scheduler that has no recent
-        # successful probe. This composes a new "cluster is degraded"
-        # signal into the hierarchical detector's global layer instead
-        # of waiting for the serial probe walk to reach each target.
-        # See ``docs/architecture/AD_53.md`` for the design.
+        # When K distinct direct+indirect probe failures occur within
+        # W seconds, the prober temporarily widens confirmation work
+        # for other silent peers. Each accelerated target still goes
+        # through the normal direct probe -> indirect probe -> SUSPECT
+        # pipeline; burst mode changes scheduling pressure, not SWIM's
+        # membership state machine. See ``docs/architecture/AD_53.md``.
         _burst_env = kwargs.get("env")
         self._burst_failure_threshold: int = (
             int(getattr(_burst_env, "BURST_FAILURE_THRESHOLD", 3))
@@ -256,8 +255,17 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             if _burst_env is not None
             else 10.0
         )
-        self._burst_failure_observations: collections.deque[float] = (
-            collections.deque()
+        self._burst_failure_observations: collections.deque[
+            tuple[float, tuple[str, int]]
+        ] = collections.deque()
+        self._burst_failure_probe_concurrency: int = max(
+            1,
+            min(
+                16,
+                self._burst_failure_threshold
+                * max(1, self._indirect_probe_manager.k_proxies)
+                * 2,
+            ),
         )
         self._burst_failure_active: bool = False
 
@@ -3141,13 +3149,13 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             # AD-53 burst-failure detection (after start_suspicion for the
             # confirmed-dead target, so the failure window only counts
             # *actual* full direct+indirect failures, not partial ones).
-            await self._record_probe_failure_and_check_burst(self_addr)
+            await self._record_probe_failure_and_check_burst(self_addr, target)
 
     def _reset_burst_failure_state(self) -> None:
         """Clear the burst-failure observation window on any probe success.
 
         A single successful probe is evidence the cluster has not fully
-        collapsed; the speculative-SUSPECT path is only meant to fire
+        collapsed; the accelerated confirmation path is only meant to fire
         during a true bulk failure where no peer is reachable. Resetting
         on success ensures the trigger requires ``K`` *consecutive*
         failures (within the window) rather than ``K`` failures
@@ -3160,108 +3168,187 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
     async def _record_probe_failure_and_check_burst(
         self,
         self_addr: tuple[str, int],
+        failed_target: tuple[str, int],
     ) -> None:
-        """Record a probe failure and, on threshold, trigger speculative SUSPECT.
+        """Record a probe failure and, on threshold, accelerate confirmation.
 
-        AD-53. Appends ``now`` to the observation window, evicts entries
-        older than ``BURST_FAILURE_WINDOW_SECONDS``, and if the active
-        observation count crosses ``BURST_FAILURE_THRESHOLD`` while the
-        prober is not already in burst mode, triggers
-        :meth:`_speculatively_suspect_all_silent`. The flag is one-shot
-        per burst — repeated invocations within the same window do not
-        re-fire the speculative scan (already-SUSPECT targets are skipped
-        by the inner loop, but the bookkeeping is cheaper to gate at
-        the entry point).
+        AD-53. Appends ``(now, failed_target)`` to the observation
+        window, evicts entries older than
+        ``BURST_FAILURE_WINDOW_SECONDS``, and if the distinct failed
+        target count crosses ``BURST_FAILURE_THRESHOLD`` while the
+        prober is not already in burst mode, triggers bounded
+        parallel confirmation for other silent members. The flag is
+        one-shot per burst; a later probe success clears it.
         """
         now = time.monotonic()
         observations = self._burst_failure_observations
-        observations.append(now)
+        observations.append((now, failed_target))
         cutoff = now - self._burst_failure_window_seconds
-        while observations and observations[0] < cutoff:
+        while observations and observations[0][0] < cutoff:
             observations.popleft()
 
         if self._burst_failure_active:
             return
-        if len(observations) < self._burst_failure_threshold:
+
+        distinct_failed_targets = {target for _, target in observations}
+        if len(distinct_failed_targets) < self._burst_failure_threshold:
             return
 
         self._burst_failure_active = True
-        await self._speculatively_suspect_all_silent(self_addr)
+        burst_started_at = observations[0][0]
+        await self._accelerate_burst_failure_confirmation(
+            self_addr,
+            burst_started_at,
+        )
 
-    async def _speculatively_suspect_all_silent(
+    async def _accelerate_burst_failure_confirmation(
         self,
         self_addr: tuple[str, int],
+        burst_started_at: float,
     ) -> None:
-        """Declare every silent member globally DEAD when burst-failure fires.
+        """Probe silent members concurrently while preserving SWIM semantics.
 
         AD-53. The probe-walk is serial; at large ``N`` it cannot
         individually visit every dead peer within Phase-3 reap budgets.
-        When the burst-failure signal indicates a cluster-wide failure
-        event the prober is already observing, this method drives the
-        rest of the membership through the standard DEAD pipeline
-        directly: ``incarnation_tracker.update_node(DEAD, …)`` followed
-        by ``notify_node_dead(…)`` so the existing
-        ``_on_node_dead_callbacks`` chain (registry unregister, gossip
-        update, scheduler refresh, peer-reliability cleanup) runs
-        identically to a probe-driven DEAD transition. The SUSPECT
-        grace window is *deliberately* skipped: Lifeguard suspicion
-        exists so peers can refute a wrong call, and in the
-        burst-failure regime by definition there are no peers alive
-        to refute. Waiting the full bracket (which under LHM-saturated
-        composition can stretch to ~40 s) only delays the inevitable
-        and starves the Phase-3 reap budgets.
+        Burst mode temporarily widens confirmation work for members
+        that have no successful probe evidence after the burst began.
+        Each target still uses the normal direct probe -> indirect
+        probe -> SUSPECT flow, so DEAD remains owned by the
+        hierarchical suspicion timer and the canonical
+        ``_on_suspicion_expired`` callback.
 
         Gates:
 
-        * Skip targets that have been SWIM-confirmed alive within
-          ``2 × SWIM_UDP_POLL_INTERVAL`` — those are exactly the peers
-          burst-failure must *not* speculatively kill.
+        * Skip targets with probe success after ``burst_started_at``.
         * Skip targets already in a terminal state (SUSPECT/DEAD/UNCONFIRMED).
+        * Skip targets that did not complete an explicit registration
+          handshake; ``start_suspicion`` would reject them anyway.
         * Skip ``self_addr`` (cannot declare the prober dead).
-
-        Refutation for false positives: if a speculatively-DEAD member
-        was actually alive, its next register/JOIN handshake (with a
-        bumped incarnation per ``reset_peer_for_rejoin``) clears the
-        DEAD record and re-seats the entry, identical to the
-        canonical SWIM rejoin path.
         """
-        # The recent-success gate must cover at minimum the burst-failure
-        # observation window — a peer SWIM-confirmed within the same
-        # window that the burst was assembled from is by construction
-        # *not* part of the burst, and speculatively killing it would
-        # be a self-inflicted false positive. At small N a peer is
-        # probed every protocol_period; at N=50 it can take a full
-        # round through the scheduler (~N · protocol_period) before
-        # the prober returns to a given peer, so a 2 × protocol_period
-        # gate is too tight to protect a survivor. Use the
-        # burst-failure window so the protection scales with the same
-        # operator knob that defines "burst".
-        recent_success_window = self._burst_failure_window_seconds
-        members = list(self._probe_scheduler.members)
-        now = time.monotonic()
-        for member in members:
+        candidates = self._get_burst_confirmation_candidates(
+            self_addr,
+            burst_started_at,
+        )
+        if not candidates:
+            return
+
+        success_seen = asyncio.Event()
+        semaphore = asyncio.Semaphore(
+            min(self._burst_failure_probe_concurrency, len(candidates))
+        )
+
+        async def confirm_candidate(candidate: tuple[str, int]) -> None:
+            async with semaphore:
+                try:
+                    if success_seen.is_set() or not self._running:
+                        return
+                    if self._peer_probe_reliability.had_success_since(
+                        candidate,
+                        burst_started_at,
+                    ):
+                        success_seen.set()
+                        return
+                    confirmed_alive = await self._confirm_burst_failure_candidate(
+                        candidate,
+                        self_addr,
+                        burst_started_at,
+                    )
+                    if confirmed_alive:
+                        success_seen.set()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    await self.handle_exception(
+                        error,
+                        f"ad53_burst_confirmation_{candidate[0]}_{candidate[1]}",
+                    )
+                    return
+
+        await asyncio.gather(
+            *(confirm_candidate(candidate) for candidate in candidates)
+        )
+        if success_seen.is_set():
+            self._reset_burst_failure_state()
+
+    def _get_burst_confirmation_candidates(
+        self,
+        self_addr: tuple[str, int],
+        burst_started_at: float,
+    ) -> list[tuple[str, int]]:
+        """Return members eligible for AD-53 accelerated confirmation."""
+        candidates: list[tuple[str, int]] = []
+        for member in list(self._probe_scheduler.members):
             if member == self_addr:
                 continue
-            if self._peer_probe_reliability.had_recent_success(
-                member, within_seconds=recent_success_window
-            ):
+            if not self.is_peer_registered(member):
                 continue
             if self._is_target_already_suspect_or_dead(member):
                 continue
-            node_state = self._incarnation_tracker.get_node_state(member)
-            incarnation = node_state.incarnation if node_state else 0
-            applied = await self._incarnation_tracker.update_node(
+            if self._peer_probe_reliability.had_success_since(
                 member,
-                b"DEAD",
-                incarnation,
-                now,
+                burst_started_at,
+            ):
+                continue
+            candidates.append(member)
+        return candidates
+
+    async def _confirm_burst_failure_candidate(
+        self,
+        target: tuple[str, int],
+        self_addr: tuple[str, int],
+        burst_started_at: float,
+    ) -> bool:
+        """Run one normal SWIM confirmation for an AD-53 burst candidate."""
+        if not self._running or self._is_target_already_suspect_or_dead(target):
+            return False
+
+        node_state = self._incarnation_tracker.get_node_state(target)
+        incarnation = node_state.incarnation if node_state else 0
+
+        base_timeout = await self._context.read("current_timeout")
+        timeout = self.get_lhm_adjusted_timeout(base_timeout)
+        target_addr = f"{target[0]}:{target[1]}".encode()
+
+        response_received = await self._probe_with_timeout(
+            target,
+            b"probe>" + target_addr,
+            timeout,
+        )
+        if response_received:
+            await self.decrease_failure_detector("successful_probe")
+            self._peer_probe_reliability.record_probe_outcome(
+                target,
+                success=True,
             )
-            if applied:
-                self.notify_node_dead(
-                    member,
-                    incarnation,
-                    "ad53_burst_failure_speculative_dead",
+            return True
+
+        self._peer_probe_reliability.record_probe_outcome(target, success=False)
+        if self._peer_probe_reliability.had_success_since(target, burst_started_at):
+            return True
+
+        indirect_sent = await self.initiate_indirect_probe(target, incarnation)
+        if indirect_sent:
+            await asyncio.sleep(timeout)
+            if not self._running:
+                return False
+
+            probe = self._indirect_probe_manager.get_pending_probe(target)
+            if probe and probe.is_completed():
+                await self.decrease_failure_detector("successful_probe")
+                self._peer_probe_reliability.record_probe_outcome(
+                    target,
+                    success=True,
                 )
+                return True
+
+        if not self._running or self._is_target_already_suspect_or_dead(target):
+            return False
+        if self._peer_probe_reliability.had_success_since(target, burst_started_at):
+            return True
+
+        await self.start_suspicion(target, incarnation, self_addr)
+        await self.broadcast_suspicion(target, incarnation)
+        return False
 
     def _compute_direct_probe_budget(
         self,

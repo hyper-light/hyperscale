@@ -61,18 +61,16 @@ class Env(BaseModel):
         8.0  # Reduced from 15.0 - faster failure declaration
     )
     # AD-53 burst-failure cluster-degradation signal.
-    # When the prober observes ``BURST_FAILURE_THRESHOLD`` direct+indirect
-    # probe failures within ``BURST_FAILURE_WINDOW_SECONDS``, it
-    # speculatively starts global SUSPECT for every alive member of the
-    # probe scheduler that has no recent successful probe. This feeds a
-    # cluster-wide degradation signal into the AD-30 hierarchical
-    # detector's global layer so the serial SWIM probe walk is not the
-    # only path to dead-node detection at large N. The window has to
-    # be wide enough to absorb LHM-stretched probe rounds (which can run
-    # at base_timeout × lhm_max ≈ 9 s per direct probe, plus indirect)
-    # under a bulk-failure burst — at threshold ``K`` with rounds of
-    # ``R`` seconds each, the window must clear ``K × R`` for the
-    # detector to fire before the budget runs out. See AD-53.
+    # When the prober observes ``BURST_FAILURE_THRESHOLD`` distinct
+    # direct+indirect probe failures within
+    # ``BURST_FAILURE_WINDOW_SECONDS``, it temporarily widens SWIM
+    # confirmation work for other silent members. Each accelerated
+    # target still runs direct probe -> indirect probe -> SUSPECT; the
+    # burst signal changes probe scheduling pressure, not membership
+    # state semantics. The window has to be wide enough to absorb
+    # LHM-stretched probe rounds (which can run at base_timeout ×
+    # lhm_max ≈ 9 s per direct probe, plus indirect) under a
+    # bulk-failure burst. See AD-53.
     BURST_FAILURE_THRESHOLD: StrictInt = 2
     BURST_FAILURE_WINDOW_SECONDS: StrictFloat = 30.0
     # Refutation rate limiting - prevents incarnation exhaustion attacks

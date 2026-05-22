@@ -1298,12 +1298,13 @@ class UDPProtocol(Generic[T, K]):
         # Stop accepting new work first
         self._running = False
 
-        # Cancel pending response tasks
+        # _pending_responses stores asyncio.Task objects, which cannot
+        # be completed with set_result(). Cancellation is the correct
+        # shutdown signal for pending tasks.
         pending_tasks = list(self._pending_responses)
         for task in pending_tasks:
             if not task.done():
-                task.set_result(None)
-
+                task.cancel()
 
         # Signal run_forever() to exit
         if self._run_future:
