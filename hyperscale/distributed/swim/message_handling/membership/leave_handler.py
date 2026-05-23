@@ -31,6 +31,11 @@ class LeaveHandler(BaseHandler):
 
     async def handle(self, context: MessageContext) -> HandlerResult:
         """Handle a leave message."""
+        import sys as _sys
+        import time as _time
+        _t_in = _time.monotonic()
+        _sys.stderr.write(f"[LEAVE] in t={_t_in:.2f} source={context.source_addr}\n")
+        _sys.stderr.flush()
         source_addr = context.source_addr
         target = context.target
         target_addr_bytes = context.target_addr_bytes
@@ -65,10 +70,7 @@ class LeaveHandler(BaseHandler):
                     incarnation,
                     "direct_leave_handler",
                 )
-                message = self._build_authorized_leave_message(
-                    incarnation,
-                    direct_leave_node_id,
-                )
+                message = f"leave:{incarnation}:{direct_leave_node_id}".encode()
                 self._queue_leave_propagation(
                     target,
                     incarnation,
@@ -156,14 +158,6 @@ class LeaveHandler(BaseHandler):
         if target != source_addr or node_id is None:
             return False
         return self._server.get_registered_node_id_for_addr(target) == node_id
-
-    def _build_authorized_leave_message(
-        self,
-        incarnation: int,
-        node_id: str,
-    ) -> bytes:
-        """Build canonical direct-LEAVE metadata after incarnation reconciliation."""
-        return f"leave:{incarnation}:{node_id}".encode()
 
     def _parse_leave_metadata(self, message: bytes) -> tuple[int, str | None]:
         """Parse ``leave:{incarnation}:{node_id}`` with legacy fallback."""
