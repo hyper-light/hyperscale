@@ -48,27 +48,36 @@ class LeaveHandler(BaseHandler):
                 embed_state=False,
             )
 
+        direct_leave_node_id = (
+            node_id
+            if self._is_authorized_direct_leave(target, source_addr, node_id)
+            else None
+        )
+
         # Process leave within context
         async with await self._server.context_with_value(target):
             nodes = self._server.read_nodes()
 
-            if target not in nodes:
-                if self._is_authorized_direct_leave(target, source_addr, node_id):
-                    updated = await self._apply_authorized_leave(
-                        target,
-                        source_addr,
-                        incarnation,
-                        "direct_leave_handler",
-                    )
-                    if updated:
-                        self._queue_leave_propagation(
-                            target,
-                            incarnation,
-                            target_addr_bytes,
-                            message,
-                        )
-                    return self._ack()
+            if direct_leave_node_id is not None:
+                incarnation = await self._apply_authorized_leave(
+                    target,
+                    source_addr,
+                    incarnation,
+                    "direct_leave_handler",
+                )
+                message = self._build_authorized_leave_message(
+                    incarnation,
+                    direct_leave_node_id,
+                )
+                self._queue_leave_propagation(
+                    target,
+                    incarnation,
+                    target_addr_bytes,
+                    message,
+                )
+                return self._ack()
 
+            if target not in nodes:
                 await self._server.increase_failure_detector("missed_nack")
                 return self._nack()
 
@@ -82,19 +91,6 @@ class LeaveHandler(BaseHandler):
                 incarnation,
                 time.monotonic(),
             )
-            if (
-                not updated
-                and not was_dead
-                and previous_state is not None
-                and self._is_authorized_direct_leave(target, source_addr, node_id)
-            ):
-                incarnation = max(incarnation, previous_state.incarnation)
-                updated = await self._server.update_node_state(
-                    target,
-                    b"DEAD",
-                    incarnation,
-                    time.monotonic(),
-                )
             self._server.update_probe_scheduler_membership()
 
             if updated:
@@ -124,17 +120,19 @@ class LeaveHandler(BaseHandler):
         source_addr: tuple[str, int],
         incarnation: int,
         notification_source: str,
-    ) -> bool:
+    ) -> int:
         """Apply a self-originated leave already authorized by node identity."""
-        updated = await self._server.update_node_state(
+        previous_state = self._server.incarnation_tracker.get_node_state(target)
+        if previous_state is not None:
+            incarnation = max(incarnation, previous_state.incarnation)
+
+        await self._server.update_node_state(
             target,
             b"DEAD",
             incarnation,
             time.monotonic(),
         )
         self._server.update_probe_scheduler_membership()
-        if not updated:
-            return False
 
         self._server.audit_log.record(
             AuditEventType.NODE_LEFT,
@@ -146,7 +144,7 @@ class LeaveHandler(BaseHandler):
             incarnation,
             notification_source,
         )
-        return True
+        return incarnation
 
     def _is_authorized_direct_leave(
         self,
@@ -158,6 +156,14 @@ class LeaveHandler(BaseHandler):
         if target != source_addr or node_id is None:
             return False
         return self._server.get_registered_node_id_for_addr(target) == node_id
+
+    def _build_authorized_leave_message(
+        self,
+        incarnation: int,
+        node_id: str,
+    ) -> bytes:
+        """Build canonical direct-LEAVE metadata after incarnation reconciliation."""
+        return f"leave:{incarnation}:{node_id}".encode()
 
     def _parse_leave_metadata(self, message: bytes) -> tuple[int, str | None]:
         """Parse ``leave:{incarnation}:{node_id}`` with legacy fallback."""

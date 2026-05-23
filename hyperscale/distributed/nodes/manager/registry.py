@@ -54,6 +54,17 @@ class ManagerRegistry:
             registration: Worker registration details
         """
         worker_id = registration.node.node_id
+        import sys as _sys
+        import traceback as _tb
+        already = worker_id in self._state._workers
+        if already:
+            _sys.stderr.write(
+                f"[RE-REGISTER] worker_id={worker_id[:24]} count_before="
+                f"{len(self._state._workers)}\n"
+            )
+            for frame in _tb.extract_stack(limit=6)[:-1]:
+                _sys.stderr.write(f"  {frame.filename}:{frame.lineno} {frame.name}\n")
+            _sys.stderr.flush()
         self._state._workers[worker_id] = registration
 
         tcp_addr = (registration.node.host, registration.node.port)

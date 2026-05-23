@@ -720,23 +720,11 @@ class WorkerServer(HealthAwareServer):
 
     def _get_leave_targets(self) -> list[tuple[str, int]]:
         """Return manager UDP targets for worker voluntary leave."""
-        targets: dict[tuple[str, int], None] = {}
-        for manager in self._registry.get_known_manager_values():
-            if manager.udp_host and manager.udp_port:
-                targets[(manager.udp_host, manager.udp_port)] = None
-
-        if targets:
-            return list(targets.keys())
-
-        return super()._get_leave_targets()
+        return self._registry.get_manager_leave_udp_addrs()
 
     def _get_additional_leave_targets(self) -> list[tuple[str, int]]:
         """Return known manager UDP addresses that must receive worker leave."""
-        return [
-            (manager.udp_host, manager.udp_port)
-            for manager in self._registry.get_known_manager_values()
-            if manager.udp_host and manager.udp_port
-        ]
+        return self._registry.get_manager_leave_udp_addrs()
 
     def _get_registered_node_id_for_addr(self, addr: tuple[str, int]) -> str | None:
         """Return the manager identity currently registered at ``addr``."""

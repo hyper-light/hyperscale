@@ -56,6 +56,7 @@ class WorkerRegistry:
 
         # Manager tracking
         self._known_managers: dict[str, ManagerInfo] = {}
+        self._manager_leave_udp_addrs: dict[tuple[str, int], None] = {}
         self._healthy_manager_ids: set[str] = set()
         self._primary_manager_id: str | None = None
         self._manager_unhealthy_since: dict[str, float] = {}
@@ -77,6 +78,17 @@ class WorkerRegistry:
     def add_manager(self, manager_id: str, manager_info: ManagerInfo) -> None:
         """Add or update a known manager."""
         self._known_managers[manager_id] = manager_info
+        self._record_manager_leave_udp_addr(manager_info)
+
+    def _record_manager_leave_udp_addr(
+        self,
+        manager_info: ManagerInfo,
+    ) -> None:
+        """Remember a manager UDP address for future voluntary worker LEAVE."""
+        udp_host = manager_info.udp_host
+        udp_port = manager_info.udp_port
+        if udp_host and udp_port:
+            self._manager_leave_udp_addrs[(udp_host, udp_port)] = None
 
     def get_manager(self, manager_id: str) -> ManagerInfo | None:
         """Get manager info by ID."""
@@ -85,6 +97,20 @@ class WorkerRegistry:
     def get_known_manager_values(self) -> list[ManagerInfo]:
         """Return a snapshot of all known managers."""
         return list(self._known_managers.values())
+
+    def get_manager_leave_udp_addrs(self) -> list[tuple[str, int]]:
+        """Return durable manager UDP targets for worker voluntary LEAVE.
+
+        Voluntary worker shutdown is manager-authoritative: workers notify
+        managers, and managers drive local registry detach plus SWIM gossip.
+        This cache intentionally survives health downgrades and manager-state
+        reaping so shutdown does not fall back to broadcasting LEAVE at every
+        SWIM peer when the live-manager set is temporarily empty.
+        """
+        for manager_info in self._known_managers.values():
+            self._record_manager_leave_udp_addr(manager_info)
+
+        return list(self._manager_leave_udp_addrs.keys())
 
     def get_manager_by_addr(self, addr: tuple[str, int]) -> ManagerInfo | None:
         """Get manager info by TCP address."""

@@ -511,12 +511,45 @@ class TestLeaveHandlerNegativePath:
 
         assert result.response.startswith(b"ack>")
         assert mock_server._dead_notifications == [
-            (node_addr, 20, "leave_handler")
+            (node_addr, 20, "direct_leave_handler")
         ]
         assert mock_server._queued_gossip_updates == [
             ("leave", node_addr, 20)
         ]
         assert len(mock_server.task_runner._tasks) == 1
+        assert mock_server.task_runner._tasks[0][1][2] == b"leave:20:worker-50"
+
+    @pytest.mark.asyncio
+    async def test_handle_already_dead_authorized_direct_leave(
+        self, mock_server: MockServerInterface
+    ) -> None:
+        """Direct leave detaches registry state even when SWIM is already DEAD."""
+        node_addr = ("192.168.1.51", 9001)
+        mock_server.add_node(node_addr)
+        mock_server._registered_node_ids_by_addr[node_addr] = "worker-51"
+        await mock_server.update_node_state(node_addr, b"DEAD", 30, 0.0)
+
+        handler = LeaveHandler(mock_server)
+        context = MessageContext(
+            source_addr=node_addr,
+            target=node_addr,
+            target_addr_bytes=b"192.168.1.51:9001",
+            message_type=b"leave",
+            message=b"leave:12:worker-51",
+            clock_time=12345,
+        )
+
+        result = await handler.handle(context)
+
+        assert result.response.startswith(b"ack>")
+        assert mock_server._dead_notifications == [
+            (node_addr, 30, "direct_leave_handler")
+        ]
+        assert mock_server._queued_gossip_updates == [
+            ("leave", node_addr, 30)
+        ]
+        assert len(mock_server.task_runner._tasks) == 1
+        assert mock_server.task_runner._tasks[0][1][2] == b"leave:30:worker-51"
 
 
 class TestLeaveHandlerEdgeCases:

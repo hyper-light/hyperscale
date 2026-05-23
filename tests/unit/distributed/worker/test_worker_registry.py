@@ -32,6 +32,7 @@ class TestWorkerRegistryInitialization:
 
         assert registry._logger == logger
         assert isinstance(registry._known_managers, dict)
+        assert isinstance(registry._manager_leave_udp_addrs, dict)
         assert isinstance(registry._healthy_manager_ids, set)
         assert registry._primary_manager_id is None
 
@@ -68,6 +69,7 @@ class TestWorkerRegistryManagerOperations:
 
         assert "mgr-1" in registry._known_managers
         assert registry._known_managers["mgr-1"] == manager_info
+        assert registry.get_manager_leave_udp_addrs() == [("192.168.1.1", 8001)]
 
     def test_get_manager(self):
         """Test getting a manager by ID."""
@@ -108,6 +110,28 @@ class TestWorkerRegistryManagerOperations:
 
         result = registry.get_manager_by_addr(("192.168.1.1", 8000))
         assert result is None
+
+    @pytest.mark.asyncio
+    async def test_leave_udp_addrs_survive_unhealthy_reap(self):
+        """Manager LEAVE targets survive health downgrade and state reaping."""
+        logger = MagicMock()
+        registry = WorkerRegistry(logger)
+
+        manager_info = ManagerInfo(
+            node_id="mgr-1",
+            tcp_host="192.168.1.1",
+            tcp_port=8000,
+            udp_host="192.168.1.1",
+            udp_port=8001,
+            datacenter="dc-1",
+        )
+
+        registry.add_manager("mgr-1", manager_info)
+        await registry.mark_manager_healthy("mgr-1")
+        await registry.mark_manager_unhealthy("mgr-1")
+        registry.remove_manager_state("mgr-1", ("192.168.1.1", 8000))
+
+        assert registry.get_manager_leave_udp_addrs() == [("192.168.1.1", 8001)]
 
 
 class TestWorkerRegistryHealthTracking:
