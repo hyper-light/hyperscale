@@ -233,6 +233,7 @@ class MockServerInterface:
         self._errors: list[Exception] = []
         self._dead_notifications: list[tuple[tuple[str, int], int, str]] = []
         self._registered_node_ids_by_addr: dict[tuple[str, int], str] = {}
+        self._queued_gossip_updates: list[tuple[str, tuple[str, int], int]] = []
 
         # Configurable behaviors
         self._validate_target_result = True
@@ -532,6 +533,14 @@ class MockServerInterface:
 
     async def clear_stale_state(self, node: tuple[str, int]) -> None:
         pass
+
+    def queue_gossip_update(
+        self,
+        update_type: str,
+        node: tuple[str, int],
+        incarnation: int,
+    ) -> None:
+        self._queued_gossip_updates.append((update_type, node, incarnation))
 
     def update_probe_scheduler_membership(self) -> None:
         pass

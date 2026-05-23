@@ -54,12 +54,19 @@ class LeaveHandler(BaseHandler):
 
             if target not in nodes:
                 if self._is_authorized_direct_leave(target, source_addr, node_id):
-                    await self._apply_authorized_leave(
+                    updated = await self._apply_authorized_leave(
                         target,
                         source_addr,
                         incarnation,
                         "direct_leave_handler",
                     )
+                    if updated:
+                        self._queue_leave_propagation(
+                            target,
+                            incarnation,
+                            target_addr_bytes,
+                            message,
+                        )
                     return self._ack()
 
                 await self._server.increase_failure_detector("missed_nack")
@@ -102,7 +109,12 @@ class LeaveHandler(BaseHandler):
                         incarnation,
                         "leave_handler",
                     )
-                await self._propagate_leave(target, target_addr_bytes, message)
+                self._queue_leave_propagation(
+                    target,
+                    incarnation,
+                    target_addr_bytes,
+                    message,
+                )
 
             return self._ack()
 
@@ -112,7 +124,7 @@ class LeaveHandler(BaseHandler):
         source_addr: tuple[str, int],
         incarnation: int,
         notification_source: str,
-    ) -> None:
+    ) -> bool:
         """Apply a self-originated leave already authorized by node identity."""
         updated = await self._server.update_node_state(
             target,
@@ -122,7 +134,7 @@ class LeaveHandler(BaseHandler):
         )
         self._server.update_probe_scheduler_membership()
         if not updated:
-            return
+            return False
 
         self._server.audit_log.record(
             AuditEventType.NODE_LEFT,
@@ -134,6 +146,7 @@ class LeaveHandler(BaseHandler):
             incarnation,
             notification_source,
         )
+        return True
 
     def _is_authorized_direct_leave(
         self,
@@ -165,6 +178,26 @@ class LeaveHandler(BaseHandler):
                 node_id = None
 
         return incarnation, node_id
+
+    def _queue_leave_propagation(
+        self,
+        target: tuple[str, int],
+        incarnation: int,
+        target_addr_bytes: bytes | None,
+        message: bytes,
+    ) -> None:
+        """Queue LEAVE dissemination without delaying local reap/ACK."""
+        self._server.queue_gossip_update("leave", target, incarnation)
+        if target_addr_bytes is None:
+            return
+
+        self._server.task_runner.run(
+            self._propagate_leave,
+            target,
+            target_addr_bytes,
+            message,
+            alias="leave_propagation",
+        )
 
     async def _propagate_leave(
         self,

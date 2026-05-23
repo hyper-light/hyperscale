@@ -7,6 +7,8 @@ enabling testability and decoupling.
 
 from typing import Protocol, runtime_checkable, Any
 
+from hyperscale.distributed.swim.core.types import UpdateType
+
 
 @runtime_checkable
 class ServerInterface(Protocol):
@@ -299,6 +301,15 @@ class ServerInterface(Protocol):
 
     async def clear_stale_state(self, node: tuple[str, int]) -> None:
         """Clear stale state for a node."""
+        ...
+
+    def queue_gossip_update(
+        self,
+        update_type: UpdateType,
+        node: tuple[str, int],
+        incarnation: int,
+    ) -> None:
+        """Queue a membership update for piggyback dissemination."""
         ...
 
     def update_probe_scheduler_membership(self) -> None:

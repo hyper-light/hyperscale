@@ -410,6 +410,11 @@ class TestLeaveHandlerHappyPath:
         assert mock_server._dead_notifications == [
             (("192.168.1.2", 9001), 7, "leave_handler")
         ]
+        assert mock_server._queued_gossip_updates == [
+            ("leave", ("192.168.1.2", 9001), 7)
+        ]
+        assert len(mock_server.task_runner._tasks) == 1
+        assert mock_server._sent_messages == []
 
 
 class TestLeaveHandlerNegativePath:
@@ -477,6 +482,10 @@ class TestLeaveHandlerNegativePath:
         assert mock_server._dead_notifications == [
             (("192.168.1.99", 9001), 11, "direct_leave_handler")
         ]
+        assert mock_server._queued_gossip_updates == [
+            ("leave", ("192.168.1.99", 9001), 11)
+        ]
+        assert len(mock_server.task_runner._tasks) == 1
 
     @pytest.mark.asyncio
     async def test_handle_stale_authorized_direct_leave(
@@ -504,6 +513,10 @@ class TestLeaveHandlerNegativePath:
         assert mock_server._dead_notifications == [
             (node_addr, 20, "leave_handler")
         ]
+        assert mock_server._queued_gossip_updates == [
+            ("leave", node_addr, 20)
+        ]
+        assert len(mock_server.task_runner._tasks) == 1
 
 
 class TestLeaveHandlerEdgeCases:

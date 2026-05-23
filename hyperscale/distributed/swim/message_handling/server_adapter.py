@@ -7,6 +7,8 @@ handlers and the actual HealthAwareServer implementation.
 
 from typing import TYPE_CHECKING, Any
 
+from hyperscale.distributed.swim.core.types import UpdateType
+
 if TYPE_CHECKING:
     from hyperscale.distributed.swim.health_aware_server import (
         HealthAwareServer,
@@ -306,6 +308,15 @@ class ServerAdapter:
     async def clear_stale_state(self, node: tuple[str, int]) -> None:
         """Clear stale state for a node."""
         await self._server._clear_stale_state(node)
+
+    def queue_gossip_update(
+        self,
+        update_type: UpdateType,
+        node: tuple[str, int],
+        incarnation: int,
+    ) -> None:
+        """Queue a membership update for piggyback dissemination."""
+        self._server.queue_gossip_update(update_type, node, incarnation)
 
     def update_probe_scheduler_membership(self) -> None:
         """Update probe scheduler with current membership."""
