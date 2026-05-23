@@ -16,6 +16,7 @@ from unittest.mock import patch, MagicMock
 
 import pytest
 
+from hyperscale.distributed.env import Env
 from hyperscale.distributed.nodes.worker.config import (
     WorkerConfig,
     create_worker_config_from_env,
@@ -164,8 +165,14 @@ class TestWorkerConfig:
             udp_port=7001,
         )
 
-        assert config.registration_max_retries == 3
-        assert config.registration_base_delay_seconds == 0.5
+        env = Env()
+
+        assert config.registration_max_retries == env.WORKER_REGISTRATION_MAX_RETRIES
+        assert config.registration_base_delay_seconds == env.WORKER_REGISTRATION_BASE_DELAY
+        assert (
+            config.initial_registration_jitter_max_seconds
+            == env.WORKER_INITIAL_REGISTRATION_JITTER_MAX
+        )
 
     def test_progress_update_interval_property(self):
         """Test progress_update_interval property alias."""
@@ -252,6 +259,9 @@ class TestWorkerConfigFromEnv:
         mock_env.RECOVERY_JITTER_MIN = 0.1
         mock_env.RECOVERY_JITTER_MAX = 2.0
         mock_env.RECOVERY_SEMAPHORE_SIZE = 10
+        mock_env.WORKER_REGISTRATION_MAX_RETRIES = 7
+        mock_env.WORKER_REGISTRATION_BASE_DELAY = 0.4
+        mock_env.WORKER_INITIAL_REGISTRATION_JITTER_MAX = 6.0
 
         config = WorkerConfig.from_env(
             env=mock_env,
@@ -268,6 +278,9 @@ class TestWorkerConfigFromEnv:
         assert config.total_cores == 8
         assert config.tcp_timeout_short_seconds == 1.5
         assert config.orphan_grace_period_seconds == 180.0
+        assert config.registration_max_retries == 7
+        assert config.registration_base_delay_seconds == 0.4
+        assert config.initial_registration_jitter_max_seconds == 6.0
 
     def test_from_env_with_missing_attrs(self):
         """Test from_env with missing Env attributes uses defaults."""
@@ -283,6 +296,39 @@ class TestWorkerConfigFromEnv:
         # Should fall back to defaults for missing attributes
         assert config.tcp_timeout_short_seconds == 2.0
         assert config.tcp_timeout_standard_seconds == 5.0
+        assert (
+            config.initial_registration_jitter_max_seconds
+            == Env().WORKER_INITIAL_REGISTRATION_JITTER_MAX
+        )
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_registration_defaults_converge_across_factories(self):
+        """Worker registration defaults must come from Env in every path."""
+        env = Env()
+        direct = WorkerConfig(
+            host="localhost",
+            tcp_port=8000,
+            udp_port=8001,
+        )
+        from_env = WorkerConfig.from_env(
+            env=env,
+            host="localhost",
+            tcp_port=8000,
+            udp_port=8001,
+        )
+        from_os_env = create_worker_config_from_env(
+            host="localhost",
+            tcp_port=8000,
+            udp_port=8001,
+        )
+
+        for config in (direct, from_env, from_os_env):
+            assert config.registration_max_retries == env.WORKER_REGISTRATION_MAX_RETRIES
+            assert config.registration_base_delay_seconds == env.WORKER_REGISTRATION_BASE_DELAY
+            assert (
+                config.initial_registration_jitter_max_seconds
+                == env.WORKER_INITIAL_REGISTRATION_JITTER_MAX
+            )
 
     def test_from_env_default_datacenter(self):
         """Test from_env with default datacenter."""

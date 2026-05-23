@@ -22,10 +22,3 @@ dev.yaml
 *.xml
 .ruff_cache/
 *.lock
-
-# Reproducible image and chart builds need these tracked despite the
-# broad globs above. Add narrow exceptions only — never weaken the
-# globs themselves, which protect against accidental commits of
-# generated artifacts (workflow logs, CSV result dumps, secret-y JSON).
-!uv.lock
-!helm/**/templates/NOTES.txt

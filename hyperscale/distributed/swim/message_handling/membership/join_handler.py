@@ -119,6 +119,40 @@ class JoinHandler(BaseHandler):
                 )
                 return self._nack(b"zombie_rejected")
 
+            # SWIM canonical refutation contract: incarnations are owned
+            # by the node they identify. The receiver MUST NOT synthesize
+            # an incarnation increase on behalf of the joiner — doing so
+            # turns the incarnation into a shared mutable counter and
+            # lets stale UDP replays (e.g. a worker's pre-kill startup
+            # JOIN delivered after the worker dies) refute live SUSPECT
+            # state in the tracker.
+            #
+            # The joiner is therefore required to carry its current
+            # ``self_incarnation`` in the ``|i:{inc}`` trailer
+            # (``join_cluster`` already does this and bumps
+            # ``self_incarnation`` by ``minimum_rejoin_incarnation_bump
+            # + 1`` per call so the claim strictly exceeds any prior
+            # tracker view). Without the trailer we have no live claim
+            # to compare against — the only sound action is to reject.
+            #
+            # Once the trailer is present we trust the joiner's claim
+            # as authoritative. ``NodeState.update``'s freshness check
+            # then naturally handles every case:
+            #
+            #   * claim > current  → OK transition wins (genuine join /
+            #     rejoin / refutation after a real self_incarnation bump)
+            #   * claim == current → status priority decides; SUSPECT
+            #     and DEAD both outrank OK at equal incarnation, so
+            #     stale replays during SUSPECT and zombie replays
+            #     post-DEAD are silently dropped (the matching
+            #     piggyback-ALIVE gate in
+            #     ``health_aware_server._should_apply_alive_piggyback``
+            #     closes the gossip side of the same invariant)
+            #   * claim < current → freshness check drops it as stale
+            if sent_incarnation is None:
+                self._server.increment_metric("joins_rejected_no_incarnation")
+                return self._nack(b"incarnation_required")
+
             await self._server.clear_stale_state(target)
 
             event_type = (
@@ -132,7 +166,9 @@ class JoinHandler(BaseHandler):
 
             await self._server.write_context(target, b"OK")
 
-            await self._propagate_join(target, role, target_addr_bytes)
+            await self._propagate_join(
+                target, role, target_addr_bytes, sent_incarnation
+            )
 
             self._server.probe_scheduler.add_member(target)
 
@@ -146,33 +182,18 @@ class JoinHandler(BaseHandler):
             self._server.register_peer(target)
             self._server.register_peer(source_addr)
 
-            rejoin_incarnation = incarnation_tracker.get_required_rejoin_incarnation(
-                target
-            )
-            # Ensure the new incarnation strictly exceeds the prior
-            # tracked value. ``NodeState.update`` ignores updates whose
-            # incarnation is < the current one (and only same-or-higher
-            # status priorities under equal incarnation), so reusing 0
-            # — or any value <= the DEAD-marking incarnation — silently
-            # drops the rejoin and leaves the node DEAD in the tracker.
-            current_incarnation = incarnation_tracker.get_node_incarnation(target)
-            new_incarnation = (
-                rejoin_incarnation
-                if rejoin_incarnation > current_incarnation
-                else current_incarnation + 1
-            )
-            # Route through the server's ``update_node_state`` rather
-            # than the incarnation tracker directly so the DEAD→OK
-            # transition fires ``_on_node_join_callbacks``. The
-            # tracker-only path left those callbacks dormant on rejoin,
-            # which meant that downstream observers (manager
-            # peer-recovery handler, gate peer-recovery handler) never
-            # re-added the rejoiner to their active-peer indices — the
-            # cluster looked permanently under-converged from those
-            # nodes' perspective even though SWIM membership had
-            # recovered.
+            # Apply the joiner's authoritative incarnation directly.
+            # No receiver-side ``current + 1`` synthesis: see the
+            # SWIM-canonical-refutation block above. The zombie check
+            # (lines 103-120) has already verified the claim is high
+            # enough above any prior DEAD record, and
+            # ``NodeState.update``'s freshness check handles the
+            # SUSPECT/OK priority ordering at equal incarnation. Route
+            # through the server's ``update_node_state`` rather than
+            # the incarnation tracker directly so the DEAD→OK
+            # transition fires ``_on_node_join_callbacks``.
             await self._server.update_node_state(
-                target, b"OK", new_incarnation, time.monotonic()
+                target, b"OK", sent_incarnation, time.monotonic()
             )
 
             incarnation_tracker.clear_death_record(target)
@@ -279,13 +300,18 @@ class JoinHandler(BaseHandler):
         target: tuple[str, int],
         role: str | None,
         target_addr_bytes: bytes | None,
+        claimed_incarnation: int,
     ) -> None:
         """Propagate join to other cluster members.
 
-        Re-encodes the message in the current 3-field
-        ``v{ver}|{role}|host:port`` shape (or 2-field legacy when role
-        is unknown) so peers downstream can parse role even if the
-        original sender used the legacy format.
+        Re-encodes the message in the current 4-field
+        ``v{ver}|{role}|host:port|i:{inc}`` shape (or 3-field
+        ``v{ver}|host:port|i:{inc}`` when role is unknown) so peers
+        downstream can both parse role and apply the joiner's
+        authoritative incarnation. The ``|i:{inc}`` trailer is
+        mandatory: receivers reject JOINs without it (see
+        ``handle``) because there is no sound way to refute a
+        SUSPECT bracket without a fresh joiner-owned incarnation.
         """
         if target_addr_bytes is None:
             return
@@ -294,6 +320,7 @@ class JoinHandler(BaseHandler):
         base_timeout = await self._server.get_current_timeout()
         gather_timeout = self._server.get_lhm_adjusted_timeout(base_timeout) * 2
 
+        incarnation_trailer = b"|i:" + str(claimed_incarnation).encode()
         if role:
             propagate_msg = (
                 b"join>"
@@ -302,10 +329,15 @@ class JoinHandler(BaseHandler):
                 + role.encode()
                 + b"|"
                 + target_addr_bytes
+                + incarnation_trailer
             )
         else:
             propagate_msg = (
-                b"join>" + SWIM_VERSION_PREFIX + b"|" + target_addr_bytes
+                b"join>"
+                + SWIM_VERSION_PREFIX
+                + b"|"
+                + target_addr_bytes
+                + incarnation_trailer
             )
 
         coros = [self._server.send_if_ok(node, propagate_msg) for node in others]

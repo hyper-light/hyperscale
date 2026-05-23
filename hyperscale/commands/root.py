@@ -14,7 +14,6 @@ from .cli import (
 from .new import new
 from .ping import ping
 from .run import run
-from .serve import serve
 
 
 async def create_header():
@@ -70,7 +69,6 @@ async def create_header():
     new,
     ping,
     run,
-    serve,
     global_styles=CLIStyle(
         header=create_header,
         flag_description_color="white",

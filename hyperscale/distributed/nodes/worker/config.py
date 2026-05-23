@@ -10,10 +10,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from hyperscale.distributed.env import Env
+from hyperscale.distributed.env import Env, load_env
 
 
 def _get_os_cpus() -> int:
@@ -24,6 +21,11 @@ def _get_os_cpus() -> int:
         return psutil.cpu_count(logical=False) or os.cpu_count() or 1
     except ImportError:
         return os.cpu_count() or 1
+
+
+def _default_env_value(name: str):
+    """Return the canonical distributed Env default for ``name``."""
+    return getattr(Env(), name)
 
 
 @dataclass(slots=True)
@@ -84,9 +86,17 @@ class WorkerConfig:
     recovery_semaphore_size: int = 5
 
     # Registration
-    registration_max_retries: int = 5
-    registration_base_delay_seconds: float = 0.25
-    initial_registration_jitter_max_seconds: float = 0.25
+    registration_max_retries: int = field(
+        default_factory=lambda: _default_env_value("WORKER_REGISTRATION_MAX_RETRIES")
+    )
+    registration_base_delay_seconds: float = field(
+        default_factory=lambda: _default_env_value("WORKER_REGISTRATION_BASE_DELAY")
+    )
+    initial_registration_jitter_max_seconds: float = field(
+        default_factory=lambda: _default_env_value(
+            "WORKER_INITIAL_REGISTRATION_JITTER_MAX"
+        )
+    )
 
     # Event log configuration (AD-47)
     event_log_dir: Path | None = None
@@ -126,6 +136,8 @@ class WorkerConfig:
         total_cores = getattr(env, "WORKER_MAX_CORES", None)
         if not total_cores:
             total_cores = _get_os_cpus()
+
+        default_env = Env()
 
         return cls(
             host=host,
@@ -171,13 +183,19 @@ class WorkerConfig:
             recovery_jitter_max_seconds=getattr(env, "RECOVERY_JITTER_MAX", 1.0),
             recovery_semaphore_size=getattr(env, "RECOVERY_SEMAPHORE_SIZE", 5),
             registration_max_retries=getattr(
-                env, "WORKER_REGISTRATION_MAX_RETRIES", 5
+                env,
+                "WORKER_REGISTRATION_MAX_RETRIES",
+                default_env.WORKER_REGISTRATION_MAX_RETRIES,
             ),
             registration_base_delay_seconds=getattr(
-                env, "WORKER_REGISTRATION_BASE_DELAY", 0.25
+                env,
+                "WORKER_REGISTRATION_BASE_DELAY",
+                default_env.WORKER_REGISTRATION_BASE_DELAY,
             ),
             initial_registration_jitter_max_seconds=getattr(
-                env, "WORKER_INITIAL_REGISTRATION_JITTER_MAX", 0.25
+                env,
+                "WORKER_INITIAL_REGISTRATION_JITTER_MAX",
+                default_env.WORKER_INITIAL_REGISTRATION_JITTER_MAX,
             ),
         )
 
@@ -204,57 +222,12 @@ def create_worker_config_from_env(
     Returns:
         WorkerConfig instance
     """
-    total_cores = int(os.getenv("WORKER_MAX_CORES", "0"))
-    if not total_cores:
-        total_cores = _get_os_cpus()
-
-    return WorkerConfig(
+    env = load_env(Env, env_file="")
+    config = WorkerConfig.from_env(
+        env,
         host=host,
         tcp_port=tcp_port,
         udp_port=udp_port,
         datacenter_id=datacenter_id,
-        total_cores=total_cores,
-        tcp_timeout_short_seconds=float(os.getenv("WORKER_TCP_TIMEOUT_SHORT", "2.0")),
-        tcp_timeout_standard_seconds=float(
-            os.getenv("WORKER_TCP_TIMEOUT_STANDARD", "5.0")
-        ),
-        dead_manager_reap_interval_seconds=float(
-            os.getenv("WORKER_DEAD_MANAGER_REAP_INTERVAL", "60.0")
-        ),
-        dead_manager_check_interval_seconds=float(
-            os.getenv("WORKER_DEAD_MANAGER_CHECK_INTERVAL", "10.0")
-        ),
-        progress_update_interval_seconds=float(
-            os.getenv("WORKER_PROGRESS_UPDATE_INTERVAL", "1.0")
-        ),
-        progress_flush_interval_seconds=float(
-            os.getenv("WORKER_PROGRESS_FLUSH_INTERVAL", "0.5")
-        ),
-        cancellation_poll_interval_seconds=float(
-            os.getenv("WORKER_CANCELLATION_POLL_INTERVAL", "5.0")
-        ),
-        orphan_grace_period_seconds=float(
-            os.getenv("WORKER_ORPHAN_GRACE_PERIOD", "120.0")
-        ),
-        orphan_check_interval_seconds=float(
-            os.getenv("WORKER_ORPHAN_CHECK_INTERVAL", "10.0")
-        ),
-        pending_transfer_ttl_seconds=float(
-            os.getenv("WORKER_PENDING_TRANSFER_TTL", "60.0")
-        ),
-        overload_poll_interval_seconds=float(
-            os.getenv("WORKER_OVERLOAD_POLL_INTERVAL", "0.25")
-        ),
-        throughput_interval_seconds=float(
-            os.getenv("WORKER_THROUGHPUT_INTERVAL_SECONDS", "10.0")
-        ),
-        registration_max_retries=int(
-            os.getenv("WORKER_REGISTRATION_MAX_RETRIES", "5")
-        ),
-        registration_base_delay_seconds=float(
-            os.getenv("WORKER_REGISTRATION_BASE_DELAY", "0.25")
-        ),
-        initial_registration_jitter_max_seconds=float(
-            os.getenv("WORKER_INITIAL_REGISTRATION_JITTER_MAX", "0.25")
-        ),
     )
+    return config

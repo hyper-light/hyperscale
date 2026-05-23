@@ -848,7 +848,10 @@ class WorkerProgressReporter:
             target_addrs.append((manager_id, manager_addr))
             seen_addrs.add(manager_addr)
 
-        leader_addr = final_result.job_leader_addr
+        leader_addr = (
+            self._state.get_workflow_job_leader(final_result.workflow_id)
+            or final_result.job_leader_addr
+        )
         if isinstance(leader_addr, list):
             leader_addr = tuple(leader_addr)
         leader_manager = (
@@ -857,6 +860,10 @@ class WorkerProgressReporter:
             else None
         )
         add_target(leader_manager.node_id if leader_manager else None, leader_addr)
+
+        if primary_id := self._registry._primary_manager_id:
+            if manager := self._registry.get_manager(primary_id):
+                add_target(primary_id, (manager.tcp_host, manager.tcp_port))
 
         for manager_id in sorted(self._registry._healthy_manager_ids):
             if manager := self._registry.get_manager(manager_id):
