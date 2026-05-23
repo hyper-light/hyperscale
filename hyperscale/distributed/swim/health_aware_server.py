@@ -351,7 +351,11 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         )
         self._rate_limit_tokens: int = rate_limit_tokens
         self._rate_limit_refill: float = rate_limit_refill
-        self._rate_limit_stats = {"accepted": 0, "rejected": 0}
+        self._rate_limit_stats = {
+            "accepted": 0,
+            "rejected": 0,
+            "protected_direct_leave": 0,
+        }
 
         # Refutation rate limiting - prevent incarnation exhaustion attacks
         # Configurable via init params or Env settings
@@ -1550,6 +1554,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
     _MEMBERSHIP_SEPARATOR = b"#|m"
     _HEALTH_SEPARATOR = b"#|h"
     _WORKER_STATE_SEPARATOR = b"#|w"
+    _VIVALDI_SEPARATOR = b"#|v"
     # AD-26 H7b: extension decision dissemination. Sits between
     # worker-state (#|w) and vivaldi (#|v) on the wire — added
     # second-to-last when encoding, stripped second when decoding.
@@ -1558,6 +1563,16 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
     # decision (#|x) and vivaldi (#|v); appended after #|x and
     # stripped right after #|v on the receive path.
     _EXTENSION_OUTCOME_SEPARATOR = b"#|o"
+
+    _UDP_PAYLOAD_EXTENSION_SEPARATORS = (
+        _STATE_SEPARATOR,
+        _MEMBERSHIP_SEPARATOR,
+        _HEALTH_SEPARATOR,
+        _WORKER_STATE_SEPARATOR,
+        _EXTENSION_DECISION_SEPARATOR,
+        _EXTENSION_OUTCOME_SEPARATOR,
+        _VIVALDI_SEPARATOR,
+    )
 
     def set_state_embedder(self, embedder: StateEmbedder) -> None:
         """
@@ -2144,8 +2159,13 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         if (
             self._rate_limit_stats["accepted"] > MAX_COUNTER
             or self._rate_limit_stats["rejected"] > MAX_COUNTER
+            or self._rate_limit_stats["protected_direct_leave"] > MAX_COUNTER
         ):
-            self._rate_limit_stats = {"accepted": 0, "rejected": 0}
+            self._rate_limit_stats = {
+                "accepted": 0,
+                "rejected": 0,
+                "protected_direct_leave": 0,
+            }
 
     async def _check_stale_unconfirmed_peers(self) -> None:
         """
@@ -3828,26 +3848,46 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
 
         concurrency = min(64, len(node_addresses))
         send_semaphore = asyncio.Semaphore(concurrency)
+        max_attempts = 2
 
         async def send_leave(node: tuple[str, int]) -> bool:
             async with send_semaphore:
-                try:
-                    await self.send(node, leave_msg, timeout=timeout)
-                    return True
-                except Exception as e:
-                    # Best effort - log but don't fail shutdown for send errors
-                    await self._udp_logger.log(
-                        ServerDebug(
-                            message=(
-                                f"Leave broadcast to {node[0]}:{node[1]} failed: "
-                                f"{type(e).__name__}"
-                            ),
-                            node_host=self._host,
-                            node_port=self._port,
-                            node_id=self._node_id.numeric_id,
+                last_failure: object = None
+                for _attempt_number in range(1, max_attempts + 1):
+                    try:
+                        send_result = await self.send(
+                            node,
+                            leave_msg,
+                            timeout=timeout,
                         )
+                    except Exception as error:
+                        last_failure = error
+                        continue
+
+                    response = (
+                        send_result[0]
+                        if isinstance(send_result, tuple)
+                        else send_result
                     )
-                    return False
+                    if isinstance(response, bytes) and response.startswith(
+                        (b"ack", b"leave")
+                    ):
+                        return True
+                    last_failure = response
+
+                await self._udp_logger.log(
+                    ServerDebug(
+                        message=(
+                            f"Leave broadcast to {node[0]}:{node[1]} failed "
+                            f"after {max_attempts} attempts: "
+                            f"{type(last_failure).__name__}"
+                        ),
+                        node_host=self._host,
+                        node_port=self._port,
+                        node_id=self._node_id.numeric_id,
+                    )
+                )
+                return False
 
         results = await asyncio.gather(
             *(send_leave(node) for node in node_addresses),
@@ -4377,6 +4417,57 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             "window_seconds": self._dedup_window,
         }
 
+    def _is_authorized_direct_leave_payload(
+        self,
+        source_addr: tuple[str, int],
+        data: bytes,
+    ) -> bool:
+        """Return whether raw UDP data is a registered node's direct LEAVE."""
+        parsed = data.split(b">", maxsplit=1)
+        if len(parsed) != 2:
+            return False
+
+        message, target_addr_bytes = parsed
+        leave_parts = message.split(b":", maxsplit=2)
+        if len(leave_parts) != 3 or leave_parts[0] != b"leave":
+            return False
+
+        try:
+            incarnation = int(leave_parts[1].decode())
+            node_id = leave_parts[2].decode()
+        except (UnicodeDecodeError, ValueError):
+            return False
+
+        if incarnation < 0 or not node_id:
+            return False
+
+        target = self._parse_udp_payload_target(target_addr_bytes)
+        if target != source_addr:
+            return False
+
+        return self._get_registered_node_id_for_addr(target) == node_id
+
+    def _parse_udp_payload_target(
+        self,
+        target_addr_bytes: bytes,
+    ) -> tuple[str, int] | None:
+        """Parse a UDP target address without processing piggyback state."""
+        clean_target_addr = self._strip_udp_payload_extensions(target_addr_bytes)
+        try:
+            host, port = clean_target_addr.decode().split(":", maxsplit=1)
+            return (host, int(port))
+        except (UnicodeDecodeError, ValueError):
+            return None
+
+    def _strip_udp_payload_extensions(self, payload: bytes) -> bytes:
+        """Strip piggyback suffixes from raw UDP payload address bytes."""
+        payload_end = len(payload)
+        for separator in self._UDP_PAYLOAD_EXTENSION_SEPARATORS:
+            separator_index = payload.find(separator)
+            if separator_index >= 0:
+                payload_end = min(payload_end, separator_index)
+        return payload[:payload_end]
+
     async def _check_rate_limit(self, addr: tuple[str, int]) -> bool:
         """
         Check if a sender is within rate limits using token bucket.
@@ -4430,6 +4521,9 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         return {
             "accepted": self._rate_limit_stats["accepted"],
             "rejected": self._rate_limit_stats["rejected"],
+            "protected_direct_leave": self._rate_limit_stats[
+                "protected_direct_leave"
+            ],
             "tracked_senders": len(self._rate_limits),
             "tokens_per_sender": self._rate_limit_tokens,
             "refill_rate": self._rate_limit_refill,
@@ -5232,9 +5326,19 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                 )
                 return b"nack>" + self._udp_addr_slug
 
-            # Check rate limit - drop if sender is flooding
-            if not await self._check_rate_limit(addr):
+            direct_leave_protected = self._is_authorized_direct_leave_payload(
+                addr,
+                data,
+            )
+
+            # Check rate limit - drop if sender is flooding. A registered
+            # node's self-originated LEAVE is a lifecycle message: it still
+            # goes through normal handler authorization, but it cannot be
+            # lost behind the generic SWIM token bucket.
+            if not direct_leave_protected and not await self._check_rate_limit(addr):
                 return b"nack>" + self._udp_addr_slug
+            if direct_leave_protected:
+                self._rate_limit_stats["protected_direct_leave"] += 1
 
             # Check for duplicate messages
             if self._is_duplicate_message(addr, data):
