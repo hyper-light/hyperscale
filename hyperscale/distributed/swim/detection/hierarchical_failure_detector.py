@@ -65,6 +65,7 @@ class HierarchicalConfig:
     # Global layer config
     global_min_timeout: float = 5.0
     global_max_timeout: float = 30.0
+    global_required_confirmations: int = 2
 
     # Job layer config
     job_min_timeout: float = 1.0
@@ -466,9 +467,10 @@ class HierarchicalFailureDetector:
             # any cluster scale. AD-30's three signals are preserved
             # in full; only the operator changed.
             #
-            # The Lifeguard confirmation/cluster term ``log(C+1)/log(N+1)``
-            # remains intact via ``SuspicionState.calculate_timeout``
-            # on top of this bracket.
+            # The Lifeguard confirmation term remains intact via
+            # ``SuspicionState.calculate_timeout`` on top of this
+            # bracket, using a bounded global confirmation target
+            # instead of total cluster size.
             self_lhm = (
                 self._get_lhm_multiplier() if self._get_lhm_multiplier else 1.0
             )
@@ -500,11 +502,30 @@ class HierarchicalFailureDetector:
                 min_timeout=base_min,
                 max_timeout=adjusted_max,
                 n_members=self._get_current_n_members(),
+                required_confirmations=self._get_required_global_confirmations(),
             )
             state.add_confirmation(from_node)
 
             expiration = time.monotonic() + state.calculate_timeout()
             return await self._global_wheel.add(node, state, expiration)
+
+    def _get_required_global_confirmations(self) -> int:
+        """Return the bounded confirmation target for global suspicion.
+
+        SWIM's confirmation acceleration should not use total cluster
+        size as its denominator: at large ``N`` that makes independent
+        confirmations almost powerless. Memberlist derives a small
+        target from the suspicion multiplier and clamps it by available
+        peers. ``global_required_confirmations`` is the configured
+        target; the live member count caps it so tiny clusters do not
+        wait for impossible confirmations.
+        """
+        n_members = self._get_current_n_members()
+        available_confirmers = max(0, n_members - 2)
+        configured_target = max(0, self._config.global_required_confirmations)
+        if available_confirmers <= 0:
+            return 0
+        return min(configured_target, available_confirmers)
 
     async def confirm_global(
         self,

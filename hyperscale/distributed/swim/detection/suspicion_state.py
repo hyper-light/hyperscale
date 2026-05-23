@@ -17,12 +17,14 @@ class SuspicionState:
     """
     Tracks the suspicion state for a single node.
     
-    Per Lifeguard paper, the suspicion timeout is dynamically calculated as:
-    timeout = max(min_timeout, (max_timeout - min_timeout) * log(C+1) / log(N+1))
-    
+    Per Lifeguard/memberlist, the suspicion timeout is dynamically
+    calculated as:
+    timeout = max_timeout - (max_timeout - min_timeout) * log(C + 1) / log(K + 1)
+
     Where:
     - C is the number of independent confirmations
-    - N is the total number of members in the group
+    - K is the configured confirmation target. If unset, K falls back
+      to the total member count for compatibility with older callers.
     
     The timeout decreases as more confirmations are received, but never
     goes below min_timeout.
@@ -41,6 +43,7 @@ class SuspicionState:
     min_timeout: float = 1.0
     max_timeout: float = 10.0
     n_members: int = 1
+    required_confirmations: int | None = None
     # Lifeguard re-gossip factor K: number of times to re-gossip suspicion
     regossip_factor: int = 3
     regossip_count: int = 0
@@ -89,19 +92,28 @@ class SuspicionState:
         """
         Calculate the current suspicion timeout based on confirmations.
         
-        Uses the Lifeguard formula:
-        timeout = max(min, (max - min) * log(C+1) / log(N+1))
-        
+        Uses the Lifeguard/memberlist formula:
+        timeout = max - (max - min) * log(C + 1) / log(K + 1)
+
         More confirmations = lower timeout (faster declaration of failure)
+        once the configured confirmation target ``K`` is reached. If
+        ``required_confirmations`` is omitted, the historical member-count
+        denominator is retained for callers that have not opted into the
+        bounded confirmation target.
         """
         c = self.confirmation_count
-        n = max(1, self.n_members)
-        
-        if n <= 1:
+        confirmation_target = self.required_confirmations
+        if confirmation_target is None:
+            confirmation_target = self.n_members
+        k = max(0, confirmation_target)
+
+        if k <= 0:
+            return self.min_timeout
+        if c <= 0:
             return self.max_timeout
-        
-        # Lifeguard formula from the paper
-        log_factor = math.log(c + 1) / math.log(n + 1)
+
+        bounded_confirmations = min(c, k)
+        log_factor = math.log(bounded_confirmations + 1) / math.log(k + 1)
         timeout = self.max_timeout - (self.max_timeout - self.min_timeout) * log_factor
         
         return max(self.min_timeout, timeout)
@@ -144,4 +156,3 @@ class SuspicionState:
             'confirmations_dropped': self._confirmations_dropped,
             'max_confirmers': self.max_confirmers,
         }
-

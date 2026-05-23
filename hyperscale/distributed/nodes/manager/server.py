@@ -656,6 +656,8 @@ class ManagerServer(HealthAwareServer):
         # an HFD-level override.
         self.init_hierarchical_detector(
             config=HierarchicalConfig(
+                global_min_timeout=float(self._env.SWIM_SUSPICION_MIN_TIMEOUT),
+                global_max_timeout=float(self._env.SWIM_SUSPICION_MAX_TIMEOUT),
                 job_min_timeout=2.0,
                 job_max_timeout=15.0,
             ),

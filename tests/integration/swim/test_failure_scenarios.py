@@ -23,8 +23,11 @@ sys.path.insert(
 )
 
 from hyperscale.distributed.swim.detection import (
+    HierarchicalConfig,
+    HierarchicalFailureDetector,
     IncarnationTracker,
     IncarnationStore,
+    SuspicionState,
 )
 from hyperscale.distributed.datacenters.cross_dc_correlation import (
     CrossDCCorrelationDetector,
@@ -361,6 +364,143 @@ async def scenario_death_record_cleanup() -> bool:
     return passed
 
 
+async def scenario_suspicion_timeout_uses_bounded_confirmations() -> bool:
+    """
+    Test that global suspicion can use a bounded confirmation target.
+
+    A large cluster should not require confirmations proportional to
+    total membership before the suspicion timer approaches its minimum.
+    """
+    print(f"\n{'=' * 70}")
+    print("TEST: Suspicion Timeout - Bounded Confirmations")
+    print(f"{'=' * 70}")
+
+    bounded_state = SuspicionState(
+        node=("127.0.0.1", 9200),
+        incarnation=1,
+        start_time=0.0,
+        min_timeout=5.0,
+        max_timeout=30.0,
+        n_members=50,
+        required_confirmations=2,
+    )
+    legacy_state = SuspicionState(
+        node=("127.0.0.1", 9201),
+        incarnation=1,
+        start_time=0.0,
+        min_timeout=5.0,
+        max_timeout=30.0,
+        n_members=50,
+    )
+
+    confirmer = ("127.0.0.1", 9300)
+    bounded_state.add_confirmation(confirmer)
+    legacy_state.add_confirmation(confirmer)
+
+    bounded_timeout = bounded_state.calculate_timeout()
+    legacy_timeout = legacy_state.calculate_timeout()
+
+    print(f"  Bounded timeout: {bounded_timeout:.3f}s")
+    print(f"  Legacy timeout: {legacy_timeout:.3f}s")
+
+    passed = bounded_timeout < legacy_timeout and bounded_timeout < 20.0
+
+    print(f"\n{'=' * 70}")
+    result = "PASSED" if passed else "FAILED"
+    print(f"TEST RESULT: {result}")
+    print(f"{'=' * 70}")
+
+    return passed
+
+
+async def scenario_global_detector_sets_confirmation_target() -> bool:
+    """
+    Test that global HFD suspicions receive the configured confirmation target.
+    """
+    print(f"\n{'=' * 70}")
+    print("TEST: Global Detector - Confirmation Target")
+    print(f"{'=' * 70}")
+
+    detector = HierarchicalFailureDetector(
+        config=HierarchicalConfig(
+            global_min_timeout=5.0,
+            global_max_timeout=30.0,
+            global_required_confirmations=2,
+        ),
+        get_n_members=lambda: 50,
+    )
+
+    target = ("127.0.0.1", 9400)
+    from_node = ("127.0.0.1", 9401)
+    created = await detector.suspect_global(target, 1, from_node)
+    state = await detector.get_global_suspicion_state(target)
+
+    timeout = state.calculate_timeout() if state else 0.0
+    print(f"  Suspicion created: {created}")
+    print(f"  Required confirmations: {state.required_confirmations if state else None}")
+    print(f"  Initial timeout: {timeout:.3f}s")
+
+    passed = bool(
+        created
+        and state is not None
+        and state.required_confirmations == 2
+        and timeout < 20.0
+    )
+
+    await detector.stop()
+
+    print(f"\n{'=' * 70}")
+    result = "PASSED" if passed else "FAILED"
+    print(f"TEST RESULT: {result}")
+    print(f"{'=' * 70}")
+
+    return passed
+
+
+async def scenario_global_detector_clamps_impossible_confirmations() -> bool:
+    """
+    Test that tiny clusters do not wait for impossible confirmation counts.
+    """
+    print(f"\n{'=' * 70}")
+    print("TEST: Global Detector - Confirmation Clamp")
+    print(f"{'=' * 70}")
+
+    detector = HierarchicalFailureDetector(
+        config=HierarchicalConfig(
+            global_min_timeout=5.0,
+            global_max_timeout=30.0,
+            global_required_confirmations=2,
+        ),
+        get_n_members=lambda: 2,
+    )
+
+    target = ("127.0.0.1", 9500)
+    from_node = ("127.0.0.1", 9501)
+    created = await detector.suspect_global(target, 1, from_node)
+    state = await detector.get_global_suspicion_state(target)
+
+    timeout = state.calculate_timeout() if state else 0.0
+    print(f"  Suspicion created: {created}")
+    print(f"  Required confirmations: {state.required_confirmations if state else None}")
+    print(f"  Initial timeout: {timeout:.3f}s")
+
+    passed = bool(
+        created
+        and state is not None
+        and state.required_confirmations == 0
+        and timeout == state.min_timeout
+    )
+
+    await detector.stop()
+
+    print(f"\n{'=' * 70}")
+    result = "PASSED" if passed else "FAILED"
+    print(f"TEST RESULT: {result}")
+    print(f"{'=' * 70}")
+
+    return passed
+
+
 async def run_all_scenarios() -> dict[str, bool]:
     results = {}
 
@@ -377,6 +517,18 @@ async def run_all_scenarios() -> dict[str, bool]:
             scenario_partition_detection_delays_eviction,
         ),
         ("death_record_cleanup", scenario_death_record_cleanup),
+        (
+            "suspicion_timeout_uses_bounded_confirmations",
+            scenario_suspicion_timeout_uses_bounded_confirmations,
+        ),
+        (
+            "global_detector_sets_confirmation_target",
+            scenario_global_detector_sets_confirmation_target,
+        ),
+        (
+            "global_detector_clamps_impossible_confirmations",
+            scenario_global_detector_clamps_impossible_confirmations,
+        ),
     ]
 
     for name, scenario_func in scenarios:

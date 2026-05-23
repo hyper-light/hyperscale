@@ -26,6 +26,7 @@ from hyperscale.distributed.server import udp
 from hyperscale.distributed.server.server.mercury_sync_base_server import (
     MercurySyncBaseServer,
 )
+from hyperscale.distributed.taskex.run import Run
 from hyperscale.distributed.swim.coordinates import CoordinateTracker
 from hyperscale.distributed.models.coordinates import NetworkCoordinate, VivaldiConfig
 from hyperscale.logging.hyperscale_logging_models import (
@@ -279,6 +280,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             ),
         )
         self._burst_failure_active: bool = False
+        self._burst_failure_run: Run | None = None
 
         # Hierarchical failure detector for multi-layer detection (AD-30)
         # - Global layer: Machine-level liveness (via timing wheel)
@@ -2526,6 +2528,26 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             return False
         return node_state.status in (b"SUSPECT", b"DEAD", b"UNCONFIRMED")
 
+    def _should_increment_lhm_for_failed_confirmation(
+        self,
+        target: tuple[str, int],
+    ) -> bool:
+        """Return True when a failed probe should count against self-health.
+
+        A confirmed miss to a registered peer is ambiguous in isolation
+        but becomes target-failure evidence during a burst. Feeding
+        every miss into local LHM during a burst makes peer death
+        stretch probe and suspicion timers cluster-wide. Keep LHM for
+        genuinely local signals (event-loop lag, missed nack,
+        refutation pressure) and the first isolated confirmed miss
+        before a burst is established.
+        """
+        if self._is_target_already_suspect_or_dead(target):
+            return False
+        if self._burst_failure_active or self._burst_failure_observations:
+            return False
+        return True
+
     def _get_election_member_count(self) -> int:
         """Members that participate in *this node's* leader election.
 
@@ -2663,6 +2685,47 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         if node == self._get_self_udp_addr():
             role = self._node_role
         self._gossip_buffer.add_update(update_type, node, incarnation, n_members, role)
+
+    def queue_suspicion_update(
+        self,
+        target: tuple[str, int],
+        incarnation: int,
+    ) -> None:
+        """Queue SUSPECT dissemination without blocking failure detection.
+
+        Membership convergence belongs to the piggyback gossip queue.
+        The only direct send we keep on the hot path's behalf is a
+        managed best-effort notice to the suspected target so an alive
+        peer can refute promptly.
+        """
+        self.queue_gossip_update("suspect", target, incarnation)
+        if self._task_runner is None:
+            return
+        self._task_runner.run(
+            self._send_direct_suspicion_notice,
+            target,
+            incarnation,
+            alias=f"swim_suspect_notice_{target[0]}_{target[1]}_{incarnation}",
+            keep=100,
+            max_age="5m",
+            keep_policy="COUNT_AND_AGE",
+        )
+
+    async def _send_direct_suspicion_notice(
+        self,
+        target: tuple[str, int],
+        incarnation: int,
+    ) -> None:
+        """Best-effort direct SUSPECT notification to the target."""
+        if not self._running or target == self._get_self_udp_addr():
+            return
+
+        target_addr_bytes = f"{target[0]}:{target[1]}".encode()
+        msg = b"suspect:" + str(incarnation).encode() + b">" + target_addr_bytes
+
+        base_timeout = await self._context.read("current_timeout")
+        timeout = self.get_lhm_adjusted_timeout(base_timeout)
+        await self._send_broadcast_message(target, msg, timeout)
 
     def get_piggyback_data(self, max_updates: int = 5) -> bytes:
         """Get piggybacked membership updates to append to a message."""
@@ -3147,21 +3210,6 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                 target, success=False
             )
 
-            # Phase C signal hygiene — only pump self-LHM when the
-            # probe failure is evidence of *our* slowness. If the
-            # target is already SUSPECT, DEAD, or UNCONFIRMED, further
-            # probe-timeouts to it are evidence of *peer* deadness or
-            # peer-not-yet-ready, not local slowness, and must not
-            # feed back into our self-health signal.
-            #
-            # Per Lifeguard §4: missed pings/ping-reqs *do* bump LHM —
-            # the protocol relies on it to let probes self-pace under
-            # local overload. The signal-hygiene gate is the AD-30
-            # extension that keeps the bump from feeding back through
-            # ``_is_target_already_suspect_or_dead`` (or UNCONFIRMED
-            # per AD-29).
-            if not self._is_target_already_suspect_or_dead(target):
-                await self.increase_failure_detector("probe_timeout")
             indirect_sent = await self.initiate_indirect_probe(target, incarnation)
 
             # Exit early if shutting down
@@ -3189,9 +3237,12 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             if not self._running:
                 return
 
+            if self._should_increment_lhm_for_failed_confirmation(target):
+                await self.increase_failure_detector("probe_timeout")
+
             self_addr = self._get_self_udp_addr()
             await self.start_suspicion(target, incarnation, self_addr)
-            await self.broadcast_suspicion(target, incarnation)
+            self.queue_suspicion_update(target, incarnation)
 
             # AD-53 burst-failure detection (after start_suspicion for the
             # confirmed-dead target, so the failure window only counts
@@ -3207,7 +3258,8 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         """
         if self._burst_failure_observations:
             self._burst_failure_observations.clear()
-        self._burst_failure_active = False
+        if self._burst_failure_run is None or not self._burst_failure_run.task_running:
+            self._burst_failure_active = False
 
     async def _record_probe_failure_and_check_burst(
         self,
@@ -3240,10 +3292,41 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             return
 
         self._burst_failure_active = True
+        if self._task_runner is None:
+            await self._run_burst_failure_confirmation(self_addr)
+            return
+
+        run = self._task_runner.run(
+            self._run_burst_failure_confirmation,
+            self_addr,
+            alias="ad53_burst_failure_confirmation",
+            keep=10,
+            max_age="5m",
+            keep_policy="COUNT_AND_AGE",
+        )
+        if run is None:
+            self._burst_failure_active = False
+            return
+        self._burst_failure_run = run
+
+    async def _run_burst_failure_confirmation(
+        self,
+        self_addr: tuple[str, int],
+    ) -> None:
+        """Run one managed AD-53 burst-confirmation batch."""
         try:
             await self._accelerate_burst_failure_confirmation(self_addr)
         finally:
             self._burst_failure_active = False
+            self._burst_failure_run = None
+
+    async def _cancel_burst_failure_run(self) -> None:
+        """Cancel the in-flight managed burst-confirmation batch, if any."""
+        run = self._burst_failure_run
+        self._burst_failure_run = None
+        self._burst_failure_active = False
+        if run is not None and run.task_running:
+            await run.cancel()
 
     async def _accelerate_burst_failure_confirmation(
         self,
@@ -3313,7 +3396,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         for member in list(self._probe_scheduler.members):
             if member == self_addr:
                 continue
-            if not self.is_peer_registered(member):
+            if not self.is_peer_registered(member) or not self.is_peer_confirmed(member):
                 continue
             if self._is_target_already_suspect_or_dead(member):
                 continue
@@ -3350,7 +3433,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             return False
 
         await self.start_suspicion(target, incarnation, self_addr)
-        await self.broadcast_suspicion(target, incarnation)
+        self.queue_suspicion_update(target, incarnation)
         return False
 
     async def _confirm_peer_reachable_by_swim(
@@ -3666,6 +3749,8 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         except Exception as e:
             if self._error_handler:
                 await self.handle_exception(e, "shutdown_stop_probe_cycle")
+
+        await self._cancel_burst_failure_run()
 
         # Cancel all pending probe ACK futures
         for future in self._pending_probe_acks.values():
@@ -4582,7 +4667,11 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         all_candidates = [
             node
             for node in self._incarnation_tracker.node_states.keys()
-            if node != target and node != self_addr
+            if (
+                node != target
+                and node != self_addr
+                and self._is_valid_indirect_probe_proxy(node)
+            )
         ]
 
         if not all_candidates:
@@ -4623,6 +4712,16 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             # No healthy candidates, use stressed
             return random.sample(stressed_candidates, min(k, len(stressed_candidates)))
 
+    def _is_valid_indirect_probe_proxy(self, node: tuple[str, int]) -> bool:
+        """Return True when ``node`` can add useful indirect-probe evidence."""
+        if not self.is_peer_registered(node) or not self.is_peer_confirmed(node):
+            return False
+
+        node_state = self._incarnation_tracker.get_node_state(node)
+        if node_state is None:
+            return False
+        return node_state.status in (b"OK", b"JOIN")
+
     def _get_self_udp_addr(self) -> tuple[str, int]:
         """Get this server's UDP address as a tuple."""
         host, port = self._udp_addr_slug.decode().split(":")
@@ -4653,6 +4752,8 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             requester=self._get_self_udp_addr(),
             timeout=timeout,
         )
+        if probe is None:
+            return False
         self._metrics.increment("indirect_probes_sent")
 
         target_addr = f"{target[0]}:{target[1]}".encode()
