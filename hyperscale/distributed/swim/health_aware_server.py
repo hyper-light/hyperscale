@@ -19,13 +19,14 @@ import math
 import random
 import time
 from base64 import b64decode, b64encode
-from typing import Callable
+from typing import Callable, Literal
 
 from hyperscale.distributed.env import Env
 from hyperscale.distributed.server import udp
 from hyperscale.distributed.server.server.mercury_sync_base_server import (
     MercurySyncBaseServer,
 )
+from hyperscale.distributed.server.protocol import MessagePriority
 from hyperscale.distributed.taskex.run import Run
 from hyperscale.distributed.swim.coordinates import CoordinateTracker
 from hyperscale.distributed.models.coordinates import NetworkCoordinate, VivaldiConfig
@@ -54,6 +55,11 @@ from .core.errors import (
     ResourceError,
     TaskOverloadError,
     NotEligibleError,
+)
+from .admission import (
+    SwimAdmissionClass,
+    classify_swim_payload,
+    has_auxiliary_piggyback,
 )
 from .core.error_handler import ErrorHandler, ErrorContext
 from .core.resource_limits import BoundedDict
@@ -345,16 +351,46 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         self._dedup_stats = {"duplicates": 0, "unique": 0}
 
         # Rate limiting - per-sender token bucket to prevent resource exhaustion
-        self._rate_limits: BoundedDict[tuple[str, int], dict] = BoundedDict(
-            max_size=rate_limit_cache_size,
+        self._rate_limits: BoundedDict[tuple[str, int, str], dict] = BoundedDict(
+            max_size=rate_limit_cache_size * 8,
             eviction_policy="LRA",
         )
         self._rate_limit_tokens: int = rate_limit_tokens
         self._rate_limit_refill: float = rate_limit_refill
+        self._swim_rate_limit_profiles: dict[str, tuple[int, float]] = {
+            "probe_response": (
+                max(rate_limit_tokens * 4, 256),
+                max(rate_limit_refill * 10.0, 100.0),
+            ),
+            "probe_request": (
+                max(rate_limit_tokens * 2, 128),
+                max(rate_limit_refill * 5.0, 50.0),
+            ),
+            "lifecycle_direct": (
+                max(rate_limit_tokens, 100),
+                max(rate_limit_refill * 2.0, 20.0),
+            ),
+            "membership_gossip": (rate_limit_tokens, rate_limit_refill),
+            "leadership": (
+                max(rate_limit_tokens, 100),
+                max(rate_limit_refill * 2.0, 20.0),
+            ),
+            "auxiliary": (
+                max(rate_limit_tokens // 2, 50),
+                max(rate_limit_refill, 10.0),
+            ),
+            "unknown": (
+                max(rate_limit_tokens // 2, 50),
+                max(rate_limit_refill, 10.0),
+            ),
+        }
+        self._swim_rate_limit_stats: dict[str, dict[str, int]] = {
+            admission_class: {"accepted": 0, "rejected": 0}
+            for admission_class in self._swim_rate_limit_profiles
+        }
         self._rate_limit_stats = {
             "accepted": 0,
             "rejected": 0,
-            "protected_direct_leave": 0,
         }
 
         # Refutation rate limiting - prevent incarnation exhaustion attacks
@@ -395,6 +431,11 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         # Called when a node's status changes (e.g., becomes DEAD or rejoins)
         self._on_node_dead_callbacks: list[Callable[[tuple[str, int]], None]] = []
         self._on_node_join_callbacks: list[Callable[[tuple[str, int]], None]] = []
+        self._leave_dissemination_queue: dict[
+            tuple[str, int],
+            tuple[int, bytes, bytes],
+        ] = {}
+        self._leave_dissemination_drain_scheduled: bool = False
 
         # Peer confirmation tracking (AD-29: Protocol-Level Peer Confirmation)
         # Failure detection only applies to peers we've successfully communicated with.
@@ -1497,8 +1538,8 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                     ServerInfoLog(
                         message=f"Degradation {direction}: {old_level.name} -> {new_level.name} ({policy.description})",
                         node_host=self._host,
-                        node_port=self._port,
-                        node_id=self._node_id.numeric_id
+                        node_port=self._udp_port,
+                        node_id=self._node_id.short
                         if hasattr(self, "_node_id")
                         else 0,
                     ),
@@ -1563,16 +1604,6 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
     # decision (#|x) and vivaldi (#|v); appended after #|x and
     # stripped right after #|v on the receive path.
     _EXTENSION_OUTCOME_SEPARATOR = b"#|o"
-
-    _UDP_PAYLOAD_EXTENSION_SEPARATORS = (
-        _STATE_SEPARATOR,
-        _MEMBERSHIP_SEPARATOR,
-        _HEALTH_SEPARATOR,
-        _WORKER_STATE_SEPARATOR,
-        _EXTENSION_DECISION_SEPARATOR,
-        _EXTENSION_OUTCOME_SEPARATOR,
-        _VIVALDI_SEPARATOR,
-    )
 
     def set_state_embedder(self, embedder: StateEmbedder) -> None:
         """
@@ -1753,6 +1784,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         self,
         message: bytes,
         source_addr: tuple[str, int],
+        process_piggybacks: bool = True,
     ) -> bytes:
         """
         Extract and process embedded state from an incoming message.
@@ -1771,6 +1803,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         Args:
             message: Raw message that may contain embedded state and piggyback.
             source_addr: The (host, port) of the sender.
+            process_piggybacks: Whether to process auxiliary piggyback data.
 
         Returns:
             The message with embedded state and piggyback removed.
@@ -1825,6 +1858,42 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
 
         addr_sep_idx = message.find(b">", 0, msg_end)
         if addr_sep_idx < 0:
+            if process_piggybacks:
+                if vivaldi_piggyback:
+                    self._process_vivaldi_piggyback(vivaldi_piggyback, source_addr)
+                if extension_outcome_piggyback:
+                    self._task_runner.run(
+                        self._process_extension_outcome_piggyback,
+                        extension_outcome_piggyback,
+                        source_addr,
+                    )
+                if extension_decision_piggyback:
+                    self._task_runner.run(
+                        self._process_extension_decision_piggyback,
+                        extension_decision_piggyback,
+                        source_addr,
+                    )
+                if worker_state_piggyback:
+                    self._task_runner.run(
+                        self._process_worker_state_piggyback,
+                        worker_state_piggyback,
+                        source_addr,
+                    )
+                if health_piggyback:
+                    self._health_gossip_buffer.decode_and_process_piggyback(
+                        health_piggyback
+                    )
+                if membership_piggyback:
+                    self._task_runner.run(
+                        self.process_piggyback_data,
+                        membership_piggyback,
+                        source_addr,
+                    )
+            return message[:msg_end] if msg_end < len(message) else message
+
+        state_sep_idx = message.find(self._STATE_SEPARATOR, addr_sep_idx, msg_end)
+
+        if process_piggybacks:
             if vivaldi_piggyback:
                 self._process_vivaldi_piggyback(vivaldi_piggyback, source_addr)
             if extension_outcome_piggyback:
@@ -1846,51 +1915,20 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                     source_addr,
                 )
             if health_piggyback:
-                self._health_gossip_buffer.decode_and_process_piggyback(
-                    health_piggyback
-                )
+                self._health_gossip_buffer.decode_and_process_piggyback(health_piggyback)
             if membership_piggyback:
                 self._task_runner.run(
                     self.process_piggyback_data,
                     membership_piggyback,
                     source_addr,
                 )
-            return message[:msg_end] if msg_end < len(message) else message
-
-        state_sep_idx = message.find(self._STATE_SEPARATOR, addr_sep_idx, msg_end)
-
-        if vivaldi_piggyback:
-            self._process_vivaldi_piggyback(vivaldi_piggyback, source_addr)
-        if extension_outcome_piggyback:
-            self._task_runner.run(
-                self._process_extension_outcome_piggyback,
-                extension_outcome_piggyback,
-                source_addr,
-            )
-        if extension_decision_piggyback:
-            self._task_runner.run(
-                self._process_extension_decision_piggyback,
-                extension_decision_piggyback,
-                source_addr,
-            )
-        if worker_state_piggyback:
-            self._task_runner.run(
-                self._process_worker_state_piggyback,
-                worker_state_piggyback,
-                source_addr,
-            )
-        if health_piggyback:
-            self._health_gossip_buffer.decode_and_process_piggyback(health_piggyback)
-        if membership_piggyback:
-            self._task_runner.run(
-                self.process_piggyback_data,
-                membership_piggyback,
-                source_addr,
-            )
 
         # No state separator - return clean message
         if state_sep_idx < 0:
             return message[:msg_end] if msg_end < len(message) else message
+
+        if not process_piggybacks:
+            return message[:state_sep_idx]
 
         # Extract and decode state
         # Slice once: encoded_state is between state_sep and msg_end
@@ -2159,12 +2197,19 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         if (
             self._rate_limit_stats["accepted"] > MAX_COUNTER
             or self._rate_limit_stats["rejected"] > MAX_COUNTER
-            or self._rate_limit_stats["protected_direct_leave"] > MAX_COUNTER
+            or any(
+                class_stats["accepted"] > MAX_COUNTER
+                or class_stats["rejected"] > MAX_COUNTER
+                for class_stats in self._swim_rate_limit_stats.values()
+            )
         ):
             self._rate_limit_stats = {
                 "accepted": 0,
                 "rejected": 0,
-                "protected_direct_leave": 0,
+            }
+            self._swim_rate_limit_stats = {
+                admission_class: {"accepted": 0, "rejected": 0}
+                for admission_class in self._swim_rate_limit_profiles
             }
 
     async def _check_stale_unconfirmed_peers(self) -> None:
@@ -2674,8 +2719,8 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                 ServerWarning(
                     message=f"Hierarchical failure detector error: {error_message} - {error}",
                     node_host=self._host,
-                    node_port=self._port,
-                    node_id=self._node_id.numeric_id
+                    node_port=self._udp_port,
+                    node_id=self._node_id.short
                     if hasattr(self, "_node_id")
                     else 0,
                 ),
@@ -2705,6 +2750,99 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         if node == self._get_self_udp_addr():
             role = self._node_role
         self._gossip_buffer.add_update(update_type, node, incarnation, n_members, role)
+
+    def queue_leave_dissemination(
+        self,
+        target: tuple[str, int],
+        incarnation: int,
+        target_addr_bytes: bytes | None,
+        message: bytes,
+    ) -> None:
+        """Queue explicit LEAVE dissemination with per-target coalescing."""
+        if target_addr_bytes is None:
+            return
+
+        existing = self._leave_dissemination_queue.get(target)
+        if existing is not None and existing[0] > incarnation:
+            return
+
+        self._leave_dissemination_queue[target] = (
+            incarnation,
+            target_addr_bytes,
+            message,
+        )
+
+        if self._leave_dissemination_drain_scheduled:
+            return
+
+        self._leave_dissemination_drain_scheduled = True
+        self._task_runner.run(
+            self._drain_leave_dissemination_queue,
+            alias="leave_dissemination_drain",
+            keep=20,
+            max_age="5m",
+            keep_policy="COUNT_AND_AGE",
+        )
+
+    async def _drain_leave_dissemination_queue(self) -> None:
+        """Drain coalesced LEAVE dissemination work through bounded sends."""
+        try:
+            while self._leave_dissemination_queue:
+                pending_items = list(self._leave_dissemination_queue.items())
+                self._leave_dissemination_queue.clear()
+                await self._send_coalesced_leave_dissemination(pending_items)
+        finally:
+            self._leave_dissemination_drain_scheduled = False
+            if self._leave_dissemination_queue:
+                self._schedule_leave_dissemination_drain()
+
+    def _schedule_leave_dissemination_drain(self) -> None:
+        """Schedule a drain task for queued LEAVE dissemination."""
+        if self._leave_dissemination_drain_scheduled:
+            return
+
+        self._leave_dissemination_drain_scheduled = True
+        self._task_runner.run(
+            self._drain_leave_dissemination_queue,
+            alias="leave_dissemination_drain",
+            keep=20,
+            max_age="5m",
+            keep_policy="COUNT_AND_AGE",
+        )
+
+    async def _send_coalesced_leave_dissemination(
+        self,
+        pending_items: list[tuple[tuple[str, int], tuple[int, bytes, bytes]]],
+    ) -> None:
+        """Send a bounded batch of explicit LEAVE propagation messages."""
+        if not pending_items:
+            return
+
+        base_timeout = await self._context.read("current_timeout")
+        gather_timeout = self.get_lhm_adjusted_timeout(base_timeout) * 2
+        send_coros = []
+        send_semaphore = asyncio.Semaphore(16)
+
+        async def send_one(
+            node: tuple[str, int],
+            propagate_msg: bytes,
+        ) -> None:
+            async with send_semaphore:
+                await self.send_if_ok(node, propagate_msg)
+
+        for target, (_incarnation, target_addr_bytes, message) in pending_items:
+            propagate_msg = message + b">" + target_addr_bytes
+            send_coros.extend(
+                send_one(node, propagate_msg)
+                for node in self.get_other_nodes(target)
+            )
+
+        if send_coros:
+            await self.gather_with_errors(
+                send_coros,
+                operation="leave_dissemination",
+                timeout=gather_timeout,
+            )
 
     def queue_suspicion_update(
         self,
@@ -3843,6 +3981,18 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         timeout = self.get_lhm_adjusted_timeout(1.0)
 
         node_addresses = self._get_leave_targets()
+        await self._udp_logger.log(
+            ServerError(
+                message=(
+                    f"[BCAST-ENTER] self={self_addr} "
+                    f"targets={node_addresses} "
+                    f"node_id={self._node_id.short}"
+                ),
+                node_host=self._host,
+                node_port=self._udp_port,
+                node_id=self._node_id.short,
+            )
+        )
         if not node_addresses:
             return
 
@@ -3862,12 +4012,36 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                         )
                     except Exception as error:
                         last_failure = error
+                        await self._udp_logger.log(
+                            ServerError(
+                                message=(
+                                    f"[BCAST-SEND-EXC] self={self_addr} "
+                                    f"-> node={node} attempt={_attempt_number} "
+                                    f"err={type(error).__name__}:{error}"
+                                ),
+                                node_host=self._host,
+                                node_port=self._udp_port,
+                                node_id=self._node_id.short,
+                            )
+                        )
                         continue
 
                     response = (
                         send_result[0]
                         if isinstance(send_result, tuple)
                         else send_result
+                    )
+                    await self._udp_logger.log(
+                        ServerError(
+                            message=(
+                                f"[BCAST-SEND-RSP] self={self_addr} "
+                                f"-> node={node} attempt={_attempt_number} "
+                                f"response={response!r:.80}"
+                            ),
+                            node_host=self._host,
+                            node_port=self._udp_port,
+                            node_id=self._node_id.short,
+                        )
                     )
                     if isinstance(response, bytes) and response.startswith(
                         (b"ack", b"leave")
@@ -3883,8 +4057,8 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                             f"{type(last_failure).__name__}"
                         ),
                         node_host=self._host,
-                        node_port=self._port,
-                        node_id=self._node_id.numeric_id,
+                        node_port=self._udp_port,
+                        node_id=self._node_id.short,
                     )
                 )
                 return False
@@ -3903,8 +4077,8 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                         "sends failed"
                     ),
                     node_host=self._host,
-                    node_port=self._port,
-                    node_id=self._node_id.numeric_id,
+                    node_port=self._udp_port,
+                    node_id=self._node_id.short,
                 )
             )
 
@@ -3986,9 +4160,9 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                             f"belongs in metrics."
                         ),
                         node_host=self._host,
-                        node_port=self._port,
+                        node_port=self._udp_port,
                         node_id=(
-                            self._node_id.numeric_id
+                            self._node_id.short
                             if hasattr(self, "_node_id")
                             else 0
                         ),
@@ -4020,9 +4194,9 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                             f"See ``increase_failure_detector`` docstring."
                         ),
                         node_host=self._host,
-                        node_port=self._port,
+                        node_port=self._udp_port,
                         node_id=(
-                            self._node_id.numeric_id
+                            self._node_id.short
                             if hasattr(self, "_node_id")
                             else 0
                         ),
@@ -4417,84 +4591,48 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             "window_seconds": self._dedup_window,
         }
 
-    def _is_authorized_direct_leave_payload(
+    async def _check_rate_limit(
         self,
-        source_addr: tuple[str, int],
-        data: bytes,
+        addr: tuple[str, int],
+        admission_class: SwimAdmissionClass | Literal["auxiliary"] = "unknown",
+        *,
+        log_rejection: bool = True,
     ) -> bool:
-        """Return whether raw UDP data is a registered node's direct LEAVE."""
-        parsed = data.split(b">", maxsplit=1)
-        if len(parsed) != 2:
-            return False
-
-        message, target_addr_bytes = parsed
-        leave_parts = message.split(b":", maxsplit=2)
-        if len(leave_parts) != 3 or leave_parts[0] != b"leave":
-            return False
-
-        try:
-            incarnation = int(leave_parts[1].decode())
-            node_id = leave_parts[2].decode()
-        except (UnicodeDecodeError, ValueError):
-            return False
-
-        if incarnation < 0 or not node_id:
-            return False
-
-        target = self._parse_udp_payload_target(target_addr_bytes)
-        if target != source_addr:
-            return False
-
-        return self._get_registered_node_id_for_addr(target) == node_id
-
-    def _parse_udp_payload_target(
-        self,
-        target_addr_bytes: bytes,
-    ) -> tuple[str, int] | None:
-        """Parse a UDP target address without processing piggyback state."""
-        clean_target_addr = self._strip_udp_payload_extensions(target_addr_bytes)
-        try:
-            host, port = clean_target_addr.decode().split(":", maxsplit=1)
-            return (host, int(port))
-        except (UnicodeDecodeError, ValueError):
-            return None
-
-    def _strip_udp_payload_extensions(self, payload: bytes) -> bytes:
-        """Strip piggyback suffixes from raw UDP payload address bytes."""
-        payload_end = len(payload)
-        for separator in self._UDP_PAYLOAD_EXTENSION_SEPARATORS:
-            separator_index = payload.find(separator)
-            if separator_index >= 0:
-                payload_end = min(payload_end, separator_index)
-        return payload[:payload_end]
-
-    async def _check_rate_limit(self, addr: tuple[str, int]) -> bool:
         """
-        Check if a sender is within rate limits using token bucket.
+        Check if a sender is within the class-aware SWIM token bucket.
 
-        Each sender has a token bucket that refills over time.
+        Each sender and SWIM admission class has a token bucket that refills over time.
         If bucket is empty, message is rejected.
 
         Returns True if allowed, False if rate limited.
         """
         now = time.monotonic()
+        bucket_key = (addr[0], addr[1], admission_class)
+        bucket_capacity, refill_rate = self._swim_rate_limit_profiles.get(
+            admission_class,
+            self._swim_rate_limit_profiles["unknown"],
+        )
+        class_stats = self._swim_rate_limit_stats.setdefault(
+            admission_class,
+            {"accepted": 0, "rejected": 0},
+        )
 
-        if addr not in self._rate_limits:
+        if bucket_key not in self._rate_limits:
             # New sender - initialize bucket
-            self._rate_limits[addr] = {
-                "tokens": self._rate_limit_tokens,
+            self._rate_limits[bucket_key] = {
+                "tokens": bucket_capacity,
                 "last_refill": now,
             }
 
-        bucket = self._rate_limits[addr]
+        bucket = self._rate_limits[bucket_key]
 
         # Refill tokens based on elapsed time
         elapsed = now - bucket["last_refill"]
-        refill = int(elapsed * self._rate_limit_refill)
+        refill = int(elapsed * refill_rate)
         if refill > 0:
             bucket["tokens"] = min(
                 bucket["tokens"] + refill,
-                self._rate_limit_tokens,
+                bucket_capacity,
             )
             bucket["last_refill"] = now
 
@@ -4502,18 +4640,22 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         if bucket["tokens"] > 0:
             bucket["tokens"] -= 1
             self._rate_limit_stats["accepted"] += 1
+            class_stats["accepted"] += 1
             return True
         else:
             self._rate_limit_stats["rejected"] += 1
+            class_stats["rejected"] += 1
             self._metrics.increment("messages_rate_limited")
             # Log rate limit violation
-            await self.handle_error(
-                ResourceError(
-                    f"Rate limit exceeded for {addr[0]}:{addr[1]}",
-                    source=addr,
-                    tokens=bucket["tokens"],
+            if log_rejection:
+                await self.handle_error(
+                    ResourceError(
+                        f"SWIM {admission_class} rate limit exceeded for "
+                        f"{addr[0]}:{addr[1]}",
+                        source=addr,
+                        tokens=bucket["tokens"],
+                    )
                 )
-            )
             return False
 
     def get_rate_limit_stats(self) -> dict:
@@ -4521,17 +4663,46 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         return {
             "accepted": self._rate_limit_stats["accepted"],
             "rejected": self._rate_limit_stats["rejected"],
-            "protected_direct_leave": self._rate_limit_stats[
-                "protected_direct_leave"
-            ],
-            "tracked_senders": len(self._rate_limits),
+            "tracked_buckets": len(self._rate_limits),
             "tokens_per_sender": self._rate_limit_tokens,
             "refill_rate": self._rate_limit_refill,
+            "classes": {
+                admission_class: dict(class_stats)
+                for admission_class, class_stats in self._swim_rate_limit_stats.items()
+            },
         }
 
     def get_metrics(self) -> dict:
         """Get all protocol metrics for monitoring."""
         return self._metrics.to_dict()
+
+    def _classify_swim_admission(
+        self,
+        source_addr: tuple[str, int],
+        data: bytes,
+    ) -> SwimAdmissionClass:
+        """Classify an inbound SWIM payload for class-aware rate limiting."""
+        registered_node_id = self._get_registered_node_id_for_addr(source_addr)
+        return classify_swim_payload(
+            source_addr,
+            data,
+            registered_node_id=registered_node_id,
+        )
+
+    async def _should_process_auxiliary_piggyback(
+        self,
+        source_addr: tuple[str, int],
+        data: bytes,
+    ) -> bool:
+        """Return whether auxiliary piggyback work is admitted for this packet."""
+        if not has_auxiliary_piggyback(data):
+            return True
+
+        return await self._check_rate_limit(
+            source_addr,
+            "auxiliary",
+            log_rejection=False,
+        )
 
     def get_audit_log(self) -> list[dict]:
         """Get recent audit events for debugging and compliance."""
@@ -5292,10 +5463,18 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             # clean message. Skipping is safe: piggyback is auxiliary
             # to the request/response.
             return data
-        clean_data = await self._extract_embedded_state(data, addr_tuple)
+        process_piggybacks = await self._should_process_auxiliary_piggyback(
+            addr_tuple,
+            data,
+        )
+        clean_data = await self._extract_embedded_state(
+            data,
+            addr_tuple,
+            process_piggybacks=process_piggybacks,
+        )
         return clean_data
 
-    @udp.receive()
+    @udp.receive(priority=MessagePriority.CRITICAL, admission_group="swim")
     async def receive(
         self,
         addr: tuple[str, int],
@@ -5326,19 +5505,41 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                 )
                 return b"nack>" + self._udp_addr_slug
 
-            direct_leave_protected = self._is_authorized_direct_leave_payload(
+            if data.startswith(b"leave"):
+                await self._udp_logger.log(
+                    ServerError(
+                        message=(
+                            f"[RECV-LEAVE] src={addr} self_udp={self._udp_port} "
+                            f"data_prefix={data[:96]!r}"
+                        ),
+                        node_host=self._host,
+                        node_port=self._udp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+
+            admission_class = self._classify_swim_admission(addr, data)
+
+            # Check SWIM class-aware rate limit - drop if sender is flooding
+            if not await self._check_rate_limit(addr, admission_class):
+                if data.startswith(b"leave"):
+                    await self._udp_logger.log(
+                        ServerError(
+                            message=(
+                                f"[RATELIMIT-DROP] src={addr} "
+                                f"class={admission_class}"
+                            ),
+                            node_host=self._host,
+                            node_port=self._udp_port,
+                            node_id=self._node_id.short,
+                        )
+                )
+                return b"nack>" + self._udp_addr_slug
+
+            process_piggybacks = await self._should_process_auxiliary_piggyback(
                 addr,
                 data,
             )
-
-            # Check rate limit - drop if sender is flooding. A registered
-            # node's self-originated LEAVE is a lifecycle message: it still
-            # goes through normal handler authorization, but it cannot be
-            # lost behind the generic SWIM token bucket.
-            if not direct_leave_protected and not await self._check_rate_limit(addr):
-                return b"nack>" + self._udp_addr_slug
-            if direct_leave_protected:
-                self._rate_limit_stats["protected_direct_leave"] += 1
 
             # Check for duplicate messages
             if self._is_duplicate_message(addr, data):
@@ -5353,7 +5554,11 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             # The parser then decoded `host:port#|v{...}` as the address,
             # int() failed on the port, target became None, and every
             # probe was rejected as `Missing target address`.
-            data = await self._extract_embedded_state(data, addr)
+            data = await self._extract_embedded_state(
+                data,
+                addr,
+                process_piggybacks=process_piggybacks,
+            )
 
             if data.startswith((b"pre-vote", b"leader-claim", b"leader-elected",
                                 b"leader-heartbeat", b"leader-stepdown",

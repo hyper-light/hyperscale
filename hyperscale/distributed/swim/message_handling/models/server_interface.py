@@ -312,6 +312,16 @@ class ServerInterface(Protocol):
         """Queue a membership update for piggyback dissemination."""
         ...
 
+    def queue_leave_dissemination(
+        self,
+        target: tuple[str, int],
+        incarnation: int,
+        target_addr_bytes: bytes | None,
+        message: bytes,
+    ) -> None:
+        """Queue explicit LEAVE dissemination without blocking the handler."""
+        ...
+
     def update_probe_scheduler_membership(self) -> None:
         """Update probe scheduler with current membership."""
         ...

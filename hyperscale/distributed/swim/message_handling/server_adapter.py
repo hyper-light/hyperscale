@@ -318,6 +318,21 @@ class ServerAdapter:
         """Queue a membership update for piggyback dissemination."""
         self._server.queue_gossip_update(update_type, node, incarnation)
 
+    def queue_leave_dissemination(
+        self,
+        target: tuple[str, int],
+        incarnation: int,
+        target_addr_bytes: bytes | None,
+        message: bytes,
+    ) -> None:
+        """Queue explicit LEAVE dissemination without blocking the handler."""
+        self._server.queue_leave_dissemination(
+            target,
+            incarnation,
+            target_addr_bytes,
+            message,
+        )
+
     def update_probe_scheduler_membership(self) -> None:
         """Update probe scheduler with current membership."""
         self._server.update_probe_scheduler_membership()

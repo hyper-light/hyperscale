@@ -2,18 +2,21 @@
 Priority-Aware In-Flight Task Tracker (AD-32, AD-37).
 
 Provides bounded immediate execution with priority-based load shedding for
-server-side incoming request handling. Ensures SWIM protocol messages
-(CRITICAL priority) are never delayed or dropped.
+server-side incoming request handling. Ungrouped CRITICAL traffic keeps the
+legacy unlimited behavior; grouped CRITICAL traffic, such as SWIM, gets a
+dedicated reserve that is isolated from DATA/NORMAL overload but still bounded.
 
 Key Design Points:
 - All operations are sync-safe (GIL-protected integer operations)
 - Called from sync protocol callbacks (datagram_received, etc.)
-- CRITICAL priority ALWAYS succeeds (SWIM probes/acks)
+- Ungrouped CRITICAL priority ALWAYS succeeds; grouped CRITICAL traffic can
+  have its own hard cap (for example SWIM's dedicated admission reserve)
 - Lower priorities shed first under load (LOW → NORMAL → HIGH)
 
 AD-37 Integration:
 - MessagePriority maps directly to AD-37 MessageClass via MESSAGE_CLASS_TO_PRIORITY
-- CONTROL (MessageClass) → CRITICAL (MessagePriority) - never shed
+- CONTROL (MessageClass) → CRITICAL (MessagePriority) - never shed unless
+  the hook opts into a bounded admission group
 - DISPATCH → HIGH - shed under overload
 - DATA → NORMAL - explicit backpressure
 - TELEMETRY → LOW - shed first
@@ -159,7 +162,7 @@ class MessagePriority(IntEnum):
     - LOW ← TELEMETRY (metrics, debug)
     """
 
-    CRITICAL = 0  # SWIM probes/acks, leadership, failure detection - NEVER shed
+    CRITICAL = 0  # Control-plane traffic; ungrouped CRITICAL is never shed.
     HIGH = 1  # Job dispatch, workflow commands, state sync
     NORMAL = 2  # Status updates, heartbeats (non-SWIM)
     LOW = 3  # Metrics, stats, telemetry, logs
@@ -199,7 +202,9 @@ class PriorityLimits:
     priorities that can be in flight simultaneously.
     """
 
-    critical: int = 0  # 0 = unlimited (SWIM must never be limited)
+    critical: int = 0  # 0 = unlimited for ungrouped CRITICAL traffic
+    swim: int = 1000
+    """Dedicated SWIM/control admission cap independent of DATA/NORMAL."""
     high: int = 500
     normal: int = 300
     low: int = 200
@@ -244,6 +249,9 @@ class ProtocolInFlightTracker:
 
     # Metrics - total shed per priority
     _shed_total: dict[MessagePriority, int] = field(init=False)
+    _group_counts: dict[str, int] = field(init=False)
+    _group_acquired_total: dict[str, int] = field(init=False)
+    _group_shed_total: dict[str, int] = field(init=False)
 
     def __post_init__(self) -> None:
         """Initialize counter dictionaries."""
@@ -265,17 +273,24 @@ class ProtocolInFlightTracker:
             MessagePriority.NORMAL: 0,
             MessagePriority.LOW: 0,
         }
+        self._group_counts = {}
+        self._group_acquired_total = {}
+        self._group_shed_total = {}
 
-    def try_acquire(self, priority: MessagePriority) -> bool:
+    def try_acquire(
+        self,
+        priority: MessagePriority,
+        admission_group: str | None = None,
+    ) -> bool:
         """
         Try to acquire a slot for the given priority.
 
         Returns True if acquired (caller should execute immediately).
         Returns False if rejected (caller should apply load shedding).
 
-        CRITICAL priority ALWAYS succeeds - this is essential for SWIM
-        protocol accuracy. If CRITICAL were ever dropped, failure detection
-        would become unreliable.
+        CRITICAL priority without an admission group keeps the historical
+        unlimited behavior. CRITICAL traffic with a group is isolated from
+        DATA/NORMAL global shedding but still bounded by the group's hard cap.
 
         Args:
             priority: The priority level of the incoming message.
@@ -283,30 +298,39 @@ class ProtocolInFlightTracker:
         Returns:
             True if slot acquired, False if request should be shed.
         """
-        # CRITICAL never shed - SWIM protocol accuracy depends on this
+        group_limit = self._get_group_limit(admission_group)
+        if group_limit > 0 and admission_group is not None:
+            group_count = self._group_counts.get(admission_group, 0)
+            if group_count >= group_limit:
+                self._record_shed(priority, admission_group)
+                return False
+
+        # Ungrouped CRITICAL never shed - legacy control-plane behavior.
         if priority == MessagePriority.CRITICAL:
-            self._counts[priority] += 1
-            self._acquired_total[priority] += 1
+            self._record_acquired(priority, admission_group)
             return True
 
         # Check global limit first
         total_in_flight = sum(self._counts.values())
         if total_in_flight >= self.limits.global_limit:
-            self._shed_total[priority] += 1
+            self._record_shed(priority, admission_group)
             return False
 
         # Check per-priority limit
         limit = self._get_limit(priority)
         if limit > 0 and self._counts[priority] >= limit:
-            self._shed_total[priority] += 1
+            self._record_shed(priority, admission_group)
             return False
 
         # Slot acquired
-        self._counts[priority] += 1
-        self._acquired_total[priority] += 1
+        self._record_acquired(priority, admission_group)
         return True
 
-    def release(self, priority: MessagePriority) -> None:
+    def release(
+        self,
+        priority: MessagePriority,
+        admission_group: str | None = None,
+    ) -> None:
         """
         Release a slot for the given priority.
 
@@ -317,6 +341,12 @@ class ProtocolInFlightTracker:
         """
         if self._counts[priority] > 0:
             self._counts[priority] -= 1
+        if admission_group is None:
+            return
+
+        group_count = self._group_counts.get(admission_group, 0)
+        if group_count > 0:
+            self._group_counts[admission_group] -= 1
 
     def try_acquire_for_handler(self, handler_name: str) -> bool:
         """
@@ -346,6 +376,34 @@ class ProtocolInFlightTracker:
         priority = _classify_handler_to_priority(handler_name)
         self.release(priority)
 
+    def _record_acquired(
+        self,
+        priority: MessagePriority,
+        admission_group: str | None,
+    ) -> None:
+        """Record an admitted request by priority and optional admission group."""
+        self._counts[priority] += 1
+        self._acquired_total[priority] += 1
+        if admission_group is not None:
+            self._group_counts[admission_group] = (
+                self._group_counts.get(admission_group, 0) + 1
+            )
+            self._group_acquired_total[admission_group] = (
+                self._group_acquired_total.get(admission_group, 0) + 1
+            )
+
+    def _record_shed(
+        self,
+        priority: MessagePriority,
+        admission_group: str | None,
+    ) -> None:
+        """Record a shed request by priority and optional admission group."""
+        self._shed_total[priority] += 1
+        if admission_group is not None:
+            self._group_shed_total[admission_group] = (
+                self._group_shed_total.get(admission_group, 0) + 1
+            )
+
     def _get_limit(self, priority: MessagePriority) -> int:
         """
         Get the limit for a given priority.
@@ -366,6 +424,12 @@ class ProtocolInFlightTracker:
             return self.limits.normal
         else:  # LOW
             return self.limits.low
+
+    def _get_group_limit(self, admission_group: str | None) -> int:
+        """Return an admission group's hard cap, or 0 for unbounded groups."""
+        if admission_group == "swim":
+            return self.limits.swim
+        return 0
 
     @property
     def total_in_flight(self) -> int:
@@ -439,10 +503,16 @@ class ProtocolInFlightTracker:
             },
             "limits": {
                 "critical": self.limits.critical,
+                "swim": self.limits.swim,
                 "high": self.limits.high,
                 "normal": self.limits.normal,
                 "low": self.limits.low,
                 "global": self.limits.global_limit,
+            },
+            "admission_groups": {
+                "in_flight": dict(self._group_counts),
+                "acquired_total": dict(self._group_acquired_total),
+                "shed_total": dict(self._group_shed_total),
             },
         }
 
@@ -451,6 +521,8 @@ class ProtocolInFlightTracker:
         for priority in MessagePriority:
             self._acquired_total[priority] = 0
             self._shed_total[priority] = 0
+        self._group_acquired_total.clear()
+        self._group_shed_total.clear()
 
     def __repr__(self) -> str:
         return (

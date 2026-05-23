@@ -732,9 +732,12 @@ class Env(BaseModel):
     # Bounded Pending Response Queues Settings (AD-32)
     # ==========================================================================
     # Priority-aware bounded execution with load shedding
-    # CRITICAL (SWIM) never shed, LOW shed first under load
+    # CRITICAL defaults to unshed; SWIM uses its own bounded reserve.
     PENDING_RESPONSE_MAX_CONCURRENT: StrictInt = (
         1000  # Global limit across all priorities
+    )
+    PENDING_RESPONSE_SWIM_LIMIT: StrictInt = (
+        1000  # Dedicated SWIM/control in-flight cap independent of NORMAL
     )
     PENDING_RESPONSE_HIGH_LIMIT: StrictInt = 500  # HIGH priority limit
     PENDING_RESPONSE_NORMAL_LIMIT: StrictInt = 300  # NORMAL priority limit
@@ -1012,6 +1015,7 @@ class Env(BaseModel):
             "MESSAGE_QUEUE_WARN_SIZE": int,
             # Bounded pending response queues settings (AD-32)
             "PENDING_RESPONSE_MAX_CONCURRENT": int,
+            "PENDING_RESPONSE_SWIM_LIMIT": int,
             "PENDING_RESPONSE_HIGH_LIMIT": int,
             "PENDING_RESPONSE_NORMAL_LIMIT": int,
             "PENDING_RESPONSE_LOW_LIMIT": int,
@@ -1389,18 +1393,20 @@ class Env(BaseModel):
         Get bounded pending response configuration (AD-32).
 
         Returns configuration for the priority-aware bounded execution system:
-        - Per-priority limits (CRITICAL unlimited, HIGH/NORMAL/LOW bounded)
+        - Per-priority limits (CRITICAL unlimited unless a hook sets a
+          bounded admission group; HIGH/NORMAL/LOW bounded)
         - Global limit across all priorities
         - Load shedding: LOW shed first, then NORMAL, then HIGH
-        - CRITICAL (SWIM probes/acks) NEVER shed
+        - SWIM uses a dedicated bounded reserve instead of NORMAL capacity
 
         This prevents memory exhaustion under high load while:
-        - Ensuring SWIM protocol accuracy (CRITICAL never delayed)
+        - Keeping SWIM protocol work isolated from DATA/NORMAL load shedding
         - Providing graceful degradation (shed stats before job commands)
         - Enabling immediate execution (no queue latency for most messages)
         """
         return {
             "global_limit": self.PENDING_RESPONSE_MAX_CONCURRENT,
+            "swim_limit": self.PENDING_RESPONSE_SWIM_LIMIT,
             "high_limit": self.PENDING_RESPONSE_HIGH_LIMIT,
             "normal_limit": self.PENDING_RESPONSE_NORMAL_LIMIT,
             "low_limit": self.PENDING_RESPONSE_LOW_LIMIT,

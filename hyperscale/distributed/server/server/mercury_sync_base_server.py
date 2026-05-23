@@ -203,7 +203,8 @@ class MercurySyncBaseServer(Generic[T]):
         # AD-32: Priority-aware bounded execution trackers
         pending_config = env.get_pending_response_config()
         priority_limits = PriorityLimits(
-            critical=0,  # CRITICAL (SWIM) unlimited
+            critical=0,  # Ungrouped CRITICAL remains unlimited.
+            swim=pending_config["swim_limit"],
             high=pending_config["high_limit"],
             normal=pending_config["normal_limit"],
             low=pending_config["low_limit"],
@@ -271,6 +272,8 @@ class MercurySyncBaseServer(Generic[T]):
             bytes,
             Handler,
         ] = {}
+        self._udp_handler_priorities: dict[bytes, MessagePriority] = {}
+        self._udp_handler_admission_groups: dict[bytes, str] = {}
 
         self.udp_client_handlers: dict[
             bytes,
@@ -487,6 +490,24 @@ class MercurySyncBaseServer(Generic[T]):
                 socket.SOL_SOCKET,
                 socket.SO_RCVBUF,
                 self.env.MERCURY_SYNC_UDP_SERVER_RCVBUF,
+            )
+            actual_rcvbuf = self._udp_server_socket.getsockopt(
+                socket.SOL_SOCKET, socket.SO_RCVBUF
+            )
+            self._udp_actual_rcvbuf = actual_rcvbuf
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerError(
+                    message=(
+                        f"[UDP-RCVBUF] requested="
+                        f"{self.env.MERCURY_SYNC_UDP_SERVER_RCVBUF} "
+                        f"actual={actual_rcvbuf} host={self._udp_host} "
+                        f"port={self._udp_port}"
+                    ),
+                    node_host=self._udp_host,
+                    node_port=self._udp_port,
+                    node_id=str(self._udp_port),
+                ),
             )
             self._udp_server_socket.bind((self._udp_host, self._udp_port))
 
@@ -725,6 +746,7 @@ class MercurySyncBaseServer(Generic[T]):
         }
 
         for hook in hooks.values():
+            hook_metadata = hook.__func__
             hook = hook.__get__(self, self.__class__)
             setattr(self, hook.name, hook)
 
@@ -755,6 +777,12 @@ class MercurySyncBaseServer(Generic[T]):
 
             if hook.action == "receive":
                 self.udp_handlers[encoded_hook_name] = hook
+                if hook_priority := hook_metadata.priority:
+                    self._udp_handler_priorities[encoded_hook_name] = hook_priority
+                if admission_group := hook_metadata.admission_group:
+                    self._udp_handler_admission_groups[encoded_hook_name] = (
+                        admission_group
+                    )
 
             elif hook.action == "handle":
                 self.udp_client_handlers[hook.target] = hook
@@ -1172,6 +1200,7 @@ class MercurySyncBaseServer(Generic[T]):
         self,
         coro: Coroutine,
         priority: MessagePriority = MessagePriority.NORMAL,
+        admission_group: str | None = None,
     ) -> bool:
         """
         Spawn a UDP response task with priority-aware bounded execution (AD-32).
@@ -1199,9 +1228,27 @@ class MercurySyncBaseServer(Generic[T]):
         Returns:
             True if task was spawned, False if request was shed.
         """
-        if not self._udp_in_flight_tracker.try_acquire(priority):
+        if not self._udp_in_flight_tracker.try_acquire(
+            priority,
+            admission_group=admission_group,
+        ):
             # Load shedding - increment drop counter
             self._udp_drop_counter.increment_load_shed()
+            if self._udp_drop_counter.load_shed % 10 == 0:
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerError(
+                        message=(
+                            f"[UDP-LOAD-SHED] priority={priority.name} "
+                            f"total_shed={self._udp_drop_counter.load_shed} "
+                            f"in_flight_counts="
+                            f"{self._udp_in_flight_tracker._counts}"
+                        ),
+                        node_host=self._udp_host,
+                        node_port=self._udp_port,
+                        node_id=str(self._udp_port),
+                    ),
+                )
             return False
 
         if priority == MessagePriority.CRITICAL:
@@ -1209,12 +1256,21 @@ class MercurySyncBaseServer(Generic[T]):
             # responses don't get stuck behind a deep synchronous
             # ``read_udp`` chain processing a backlog.
             asyncio.get_event_loop().call_soon(
-                self._spawn_udp_response_deferred, coro, priority
+                self._spawn_udp_response_deferred,
+                coro,
+                priority,
+                admission_group,
             )
             return True
 
         task = asyncio.ensure_future(coro)
-        task.add_done_callback(lambda t: self._on_udp_task_done(t, priority))
+        task.add_done_callback(
+            lambda task: self._on_udp_task_done(
+                task,
+                priority,
+                admission_group,
+            )
+        )
         self._pending_udp_server_responses.append(task)
         return True
 
@@ -1222,6 +1278,7 @@ class MercurySyncBaseServer(Generic[T]):
         self,
         coro: Coroutine,
         priority: MessagePriority,
+        admission_group: str | None,
     ) -> None:
         """``call_soon`` callback that completes a deferred CRITICAL spawn.
 
@@ -1233,16 +1290,26 @@ class MercurySyncBaseServer(Generic[T]):
             # Server stopped between schedule and execution; release
             # the priority slot we acquired in ``_spawn_udp_response``
             # so the in-flight tracker doesn't leak it.
-            self._udp_in_flight_tracker.release(priority)
+            self._udp_in_flight_tracker.release(
+                priority,
+                admission_group=admission_group,
+            )
             return
         task = asyncio.ensure_future(coro)
-        task.add_done_callback(lambda t: self._on_udp_task_done(t, priority))
+        task.add_done_callback(
+            lambda completed_task: self._on_udp_task_done(
+                completed_task,
+                priority,
+                admission_group,
+            )
+        )
         self._pending_udp_server_responses.append(task)
 
     def _on_udp_task_done(
         self,
         task: asyncio.Task,
         priority: MessagePriority,
+        admission_group: str | None = None,
     ) -> None:
         """Done callback for UDP response tasks - release slot and cleanup."""
         # Retrieve exception to prevent memory leak
@@ -1254,7 +1321,10 @@ class MercurySyncBaseServer(Generic[T]):
             pass  # Logged elsewhere
 
         # Release the priority slot
-        self._udp_in_flight_tracker.release(priority)
+        self._udp_in_flight_tracker.release(
+            priority,
+            admission_group=admission_group,
+        )
 
     def read_client_tcp(
         self,
@@ -1306,6 +1376,21 @@ class MercurySyncBaseServer(Generic[T]):
             if sender_addr is not None:
                 if not self._rate_limiter.check_sync(sender_addr):
                     self._udp_drop_counter.increment_rate_limited()
+                    if self._udp_drop_counter.rate_limited % 10 == 0:
+                        self._task_runner.run(
+                            self._udp_logger.log,
+                            ServerError(
+                                message=(
+                                    f"[FRAMEWORK-RL-DROP] from={sender_addr} "
+                                    f"total_rate_limited="
+                                    f"{self._udp_drop_counter.rate_limited} "
+                                    f"data_len={len(data)}"
+                                ),
+                                node_host=self._udp_host,
+                                node_port=self._udp_port,
+                                node_id=str(self._udp_port),
+                            ),
+                        )
                     return
 
             # Message size validation (before decompression)
@@ -1341,22 +1426,21 @@ class MercurySyncBaseServer(Generic[T]):
             # Extract payload (remaining bytes)
             payload = rest[68 : 68 + data_len]
 
-            # Classify priority from the handler name (AD-37). SWIM
-            # control messages (probe/ack/suspect/alive/leadership-*)
-            # MUST be CRITICAL — they're the failure-detection layer
-            # that everything else depends on, and load-shedding them
-            # produces cross-suspicion cascades because nodes stop
-            # acking each other under any backlog. The previous code
-            # hardcoded NORMAL with a comment that subclasses would
-            # override to CRITICAL — but no subclass actually did,
-            # so SWIM messages were running at the same priority as
-            # ordinary data traffic.
-            try:
-                handler_priority = _classify_handler_to_priority(
-                    handler_name.decode("utf-8")
-                )
-            except UnicodeDecodeError:
-                handler_priority = MessagePriority.NORMAL
+            # Classify priority from explicit hook metadata first, then
+            # fall back to AD-37 handler-name classification. SWIM uses
+            # an umbrella hook name (`receive`) and stores its admission
+            # policy on the hook so framework admission does not need to
+            # parse SWIM's embedded message type.
+            handler_priority = self._udp_handler_priorities.get(handler_name)
+            admission_group = self._udp_handler_admission_groups.get(handler_name)
+
+            if handler_priority is None:
+                try:
+                    handler_priority = _classify_handler_to_priority(
+                        handler_name.decode("utf-8")
+                    )
+                except UnicodeDecodeError:
+                    handler_priority = MessagePriority.NORMAL
 
             match request_type:
                 case b"c":
@@ -1369,6 +1453,7 @@ class MercurySyncBaseServer(Generic[T]):
                             transport,
                         ),
                         priority=handler_priority,
+                        admission_group=admission_group,
                     )
 
                 case b"s":
@@ -1381,10 +1466,25 @@ class MercurySyncBaseServer(Generic[T]):
                             transport,
                         ),
                         priority=handler_priority,
+                        admission_group=admission_group,
                     )
 
         except Exception as err:
             self._udp_drop_counter.increment_malformed_message()
+            if self._udp_drop_counter.malformed_message % 10 == 0:
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerError(
+                        message=(
+                            f"[UDP-MALFORMED] err={type(err).__name__}:{err} "
+                            f"total={self._udp_drop_counter.malformed_message} "
+                            f"data_len={len(data) if data else 0}"
+                        ),
+                        node_host=self._udp_host,
+                        node_port=self._udp_port,
+                        node_id=str(self._udp_port),
+                    ),
+                )
 
     async def process_tcp_client_response(
         self,
@@ -1622,6 +1722,23 @@ class MercurySyncBaseServer(Generic[T]):
         clock_time: int,
         transport: asyncio.DatagramTransport,
     ):
+        if handler_name == b"receive":
+            self._udp_recv_arrived_count = (
+                getattr(self, "_udp_recv_arrived_count", 0) + 1
+            )
+            if self._udp_recv_arrived_count % 100 == 0:
+                await self._udp_logger.log(
+                    ServerError(
+                        message=(
+                            f"[UDP-PROCESS-ARRIVED] handler=receive "
+                            f"total={self._udp_recv_arrived_count}"
+                        ),
+                        node_host=self._udp_host,
+                        node_port=self._udp_port,
+                        node_id=str(self._udp_port),
+                    )
+                )
+
         next_time = await self._udp_clock.update(clock_time)
 
         try:

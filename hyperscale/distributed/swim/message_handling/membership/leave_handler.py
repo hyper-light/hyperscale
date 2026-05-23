@@ -31,16 +31,14 @@ class LeaveHandler(BaseHandler):
 
     async def handle(self, context: MessageContext) -> HandlerResult:
         """Handle a leave message."""
-        import sys as _sys
-        import time as _time
-        _t_in = _time.monotonic()
-        _sys.stderr.write(f"[LEAVE] in t={_t_in:.2f} source={context.source_addr}\n")
-        _sys.stderr.flush()
         source_addr = context.source_addr
         target = context.target
         target_addr_bytes = context.target_addr_bytes
         message = context.message
         incarnation, node_id = self._parse_leave_metadata(message)
+
+        if incarnation is None or node_id is None:
+            return self._nack(b"metadata_required")
 
         # Validate target
         if not await self._server.validate_target(target, b"leave", source_addr):
@@ -58,6 +56,17 @@ class LeaveHandler(BaseHandler):
             if self._is_authorized_direct_leave(target, source_addr, node_id)
             else None
         )
+        if target == source_addr and direct_leave_node_id is None:
+            return self._nack(b"unauthorized")
+
+        registered_target_node_id = self._server.get_registered_node_id_for_addr(
+            target
+        )
+        if (
+            registered_target_node_id is not None
+            and registered_target_node_id != node_id
+        ):
+            return self._nack(b"node_mismatch")
 
         # Process leave within context
         async with await self._server.context_with_value(target):
@@ -159,23 +168,27 @@ class LeaveHandler(BaseHandler):
             return False
         return self._server.get_registered_node_id_for_addr(target) == node_id
 
-    def _parse_leave_metadata(self, message: bytes) -> tuple[int, str | None]:
-        """Parse ``leave:{incarnation}:{node_id}`` with legacy fallback."""
+    def _parse_leave_metadata(self, message: bytes) -> tuple[int | None, str | None]:
+        """Parse required ``leave:{incarnation}:{node_id}`` metadata."""
         parts = message.split(b":", maxsplit=2)
-        incarnation = 0
-        node_id: str | None = None
+        if len(parts) != 3 or parts[0] != b"leave":
+            return None, None
 
-        if len(parts) > 1:
-            try:
-                incarnation = int(parts[1].decode())
-            except ValueError:
-                incarnation = 0
+        try:
+            incarnation = int(parts[1].decode())
+        except (UnicodeDecodeError, ValueError):
+            return None, None
 
-        if len(parts) > 2:
-            try:
-                node_id = parts[2].decode()
-            except UnicodeDecodeError:
-                node_id = None
+        if incarnation < 0:
+            return None, None
+
+        try:
+            node_id = parts[2].decode()
+        except UnicodeDecodeError:
+            return None, None
+
+        if not node_id:
+            return None, None
 
         return incarnation, node_id
 
@@ -188,34 +201,9 @@ class LeaveHandler(BaseHandler):
     ) -> None:
         """Queue LEAVE dissemination without delaying local reap/ACK."""
         self._server.queue_gossip_update("leave", target, incarnation)
-        if target_addr_bytes is None:
-            return
-
-        self._server.task_runner.run(
-            self._propagate_leave,
+        self._server.queue_leave_dissemination(
             target,
+            incarnation,
             target_addr_bytes,
             message,
-            alias="leave_propagation",
-        )
-
-    async def _propagate_leave(
-        self,
-        target: tuple[str, int],
-        target_addr_bytes: bytes | None,
-        message: bytes,
-    ) -> None:
-        """Propagate leave to other cluster members."""
-        if target_addr_bytes is None:
-            return
-
-        others = self._server.get_other_nodes(target)
-        base_timeout = await self._server.get_current_timeout()
-        gather_timeout = self._server.get_lhm_adjusted_timeout(base_timeout) * 2
-
-        propagate_msg = message + b">" + target_addr_bytes
-
-        coros = [self._server.send_if_ok(node, propagate_msg) for node in others]
-        await self._server.gather_with_errors(
-            coros, operation="leave_propagation", timeout=gather_timeout
         )
