@@ -710,6 +710,7 @@ class MercurySyncBaseServer(Generic[T]):
         }
 
         for hook in hooks.values():
+            hook_metadata = hook.__func__
             hook = hook.__get__(self, self.__class__)
             setattr(self, hook.name, hook)
 
@@ -749,6 +750,7 @@ class MercurySyncBaseServer(Generic[T]):
             hook_metadata = hook.__func__
             hook = hook.__get__(self, self.__class__)
             setattr(self, hook.name, hook)
+            hook_metadata = getattr(hook, "__func__", hook)
 
             signature = inspect.signature(hook)
 
