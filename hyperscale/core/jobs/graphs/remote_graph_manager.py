@@ -1096,6 +1096,8 @@ class RemoteGraphManager:
                 )
                 _sys.stderr.flush()
 
+                execution_result: WorkflowStats = {}
+
                 if is_test_workflow and len(results) > 1:
                     await ctx.log_prepared(
                         message=f"Merging {len(results)} test results sets for Workflow {workflow.name} run {run_id}",

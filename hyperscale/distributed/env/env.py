@@ -390,6 +390,20 @@ class Env(BaseModel):
     GATE_DEAD_PEER_CHECK_INTERVAL: StrictFloat = 10.0
     GATE_QUORUM_STEPDOWN_CONSECUTIVE_FAILURES: StrictInt = 3
 
+    # Gate SWIM hierarchical-detector bracket (AD-30).
+    # Gates deliberately use a more conservative bracket than managers
+    # (``SWIM_SUSPICION_*`` defaults to 1.5/8.0): a single gate
+    # orchestrates hundreds-to-thousands of concurrent jobs, and a
+    # false-positive gate death triggers leadership takeover for every
+    # job it owned — fence-token bumps, hash-ring re-evaluation,
+    # callback re-routing, and peer gates absorbing the load. The cost
+    # of a false positive at gate fan-out dwarfs the cost of slower
+    # true-positive detection. Tune with care.
+    GATE_SWIM_GLOBAL_MIN_TIMEOUT: StrictFloat = 30.0
+    GATE_SWIM_GLOBAL_MAX_TIMEOUT: StrictFloat = 120.0
+    GATE_SWIM_JOB_MIN_TIMEOUT: StrictFloat = 5.0
+    GATE_SWIM_JOB_MAX_TIMEOUT: StrictFloat = 30.0
+
     SPILLOVER_MAX_WAIT_SECONDS: StrictFloat = 60.0
     SPILLOVER_MAX_LATENCY_PENALTY_MS: StrictFloat = 100.0
     SPILLOVER_MIN_IMPROVEMENT_RATIO: StrictFloat = 0.5
@@ -899,6 +913,11 @@ class Env(BaseModel):
             "GATE_DEAD_PEER_REAP_INTERVAL": float,
             "GATE_DEAD_PEER_CHECK_INTERVAL": float,
             "GATE_QUORUM_STEPDOWN_CONSECUTIVE_FAILURES": int,
+            # Gate SWIM hierarchical-detector bracket (AD-30)
+            "GATE_SWIM_GLOBAL_MIN_TIMEOUT": float,
+            "GATE_SWIM_GLOBAL_MAX_TIMEOUT": float,
+            "GATE_SWIM_JOB_MIN_TIMEOUT": float,
+            "GATE_SWIM_JOB_MAX_TIMEOUT": float,
             # Overload detection settings (AD-18)
             "OVERLOAD_EMA_ALPHA": float,
             "OVERLOAD_CURRENT_WINDOW": int,

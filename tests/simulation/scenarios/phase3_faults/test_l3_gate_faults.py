@@ -95,7 +95,20 @@ def _l3_spec(base_port: int) -> ClusterSpec:
         datacenters={
             _DC_ID: DCSpec(managers=2, workers=1, cores_per_worker=2),
         },
-        env=EnvOverrides(request_timeout="5s", log_level="error"),
+        # Compress the gate's SWIM bracket for deterministic in-budget
+        # leadership takeover. Production gates use 30s/120s for the
+        # global bracket because false-positive gate death at scale is
+        # catastrophic (fan-out across hundreds-to-thousands of owned
+        # jobs); a single-process simulation kills a gate
+        # unambiguously via ``faults.kill``, so there is no
+        # false-positive concern and the conservative bracket only
+        # delays detection past the test budget.
+        env=EnvOverrides(
+            request_timeout="5s",
+            log_level="error",
+            gate_swim_global_min_timeout=5.0,
+            gate_swim_global_max_timeout=15.0,
+        ),
         base_port=base_port,
         timeouts=HarnessTimeouts(stabilization_default=_L3_STABILIZATION_SECONDS),
     )

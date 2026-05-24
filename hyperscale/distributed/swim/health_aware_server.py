@@ -2758,13 +2758,25 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         effect on that result so the new instance is not
         re-unregistered by a stale fire.
         """
+        import sys as _sys
+        _sys.stderr.write(
+            f"[SUSPECT-EXPIRED self=({self._host}, {self._udp_port})] "
+            f"target={node} incarnation={incarnation}\n"
+        )
+        _sys.stderr.flush()
         now = time.monotonic()
         suspicion_started_at = self._global_suspicion_started_at.get(node, now)
-        if not await self._should_apply_unwitnessed_dead_transition(
+        gate_allows = await self._should_apply_unwitnessed_dead_transition(
             node,
             incarnation,
             suspicion_started_at,
-        ):
+        )
+        _sys.stderr.write(
+            f"[SUSPECT-EXPIRED-GATE self=({self._host}, {self._udp_port})] "
+            f"target={node} gate_allows={gate_allows}\n"
+        )
+        _sys.stderr.flush()
+        if not gate_allows:
             return
 
         applied = await self._incarnation_tracker.update_node(

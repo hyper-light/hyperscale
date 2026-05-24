@@ -209,6 +209,13 @@ class GateOrphanJobCoordinator:
             failed_gate_addr
         )
 
+        import sys as _sys
+        _sys.stderr.write(
+            f"[ORPHAN-MARK gate={failed_gate_addr} self={self._get_node_addr()}] "
+            f"orphan_count={len(orphaned_job_ids)} job_ids={[j[:10] for j in orphaned_job_ids]}\n"
+        )
+        _sys.stderr.flush()
+
         now = time.monotonic()
         for job_id in orphaned_job_ids:
             self._state.mark_job_orphaned(job_id, now)
@@ -337,6 +344,14 @@ class GateOrphanJobCoordinator:
                     )
                 )
 
+                import sys as _sys
+                _sys.stderr.write(
+                    f"[ORPHAN-LOOP self={self._get_node_addr()}] "
+                    f"orphaned_total={len(orphaned_jobs)} past_grace={len(jobs_to_evaluate)} "
+                    f"job_ids={[j[0][:10] for j in jobs_to_evaluate]}\n"
+                )
+                _sys.stderr.flush()
+
                 for job_id, orphaned_at in jobs_to_evaluate:
                     await self._evaluate_orphan_takeover(job_id, orphaned_at)
 
@@ -352,6 +367,25 @@ class GateOrphanJobCoordinator:
                         node_id=self._get_node_id().short,
                     ),
                 )
+
+    async def _evaluate_orphan_takeover_with_trace(
+        self,
+        job_id: str,
+        orphaned_at: float,
+    ) -> None:
+        import sys as _sys
+        _sys.stderr.write(
+            f"[ORPHAN-EVAL self={self._get_node_addr()} job={job_id[:10]}] starting evaluation\n"
+        )
+        _sys.stderr.flush()
+        try:
+            await self._evaluate_orphan_takeover(job_id, orphaned_at)
+        except Exception as e:
+            _sys.stderr.write(
+                f"[ORPHAN-EVAL-EXC job={job_id[:10]}] {type(e).__name__}: {e}\n"
+            )
+            _sys.stderr.flush()
+            raise
 
     async def _evaluate_orphan_takeover(
         self,
@@ -369,6 +403,12 @@ class GateOrphanJobCoordinator:
             orphaned_at: Timestamp when job was marked orphaned
         """
         job = self._job_manager.get_job(job_id)
+        import sys as _sys
+        _sys.stderr.write(
+            f"[ORPHAN-EVAL-STATE self={self._get_node_addr()} job={job_id[:10]}] "
+            f"job_found={job is not None} status={job.status if job else 'n/a'}\n"
+        )
+        _sys.stderr.flush()
         if not job:
             self._state.clear_orphaned_job(job_id)
             return
@@ -379,6 +419,13 @@ class GateOrphanJobCoordinator:
 
         time_orphaned = time.monotonic() - orphaned_at
         new_owner = await self._job_hash_ring.get_node(job_id)
+        _sys.stderr.write(
+            f"[ORPHAN-EVAL-OWNER self={self._get_node_addr()} job={job_id[:10]}] "
+            f"new_owner={new_owner.node_id[:30] if new_owner else 'None'} "
+            f"my_id={self._get_node_id().full[:30]} "
+            f"time_orphaned={time_orphaned:.1f}\n"
+        )
+        _sys.stderr.flush()
         if not new_owner:
             if time_orphaned >= self._orphan_timeout_seconds:
                 job.status = JobStatus.FAILED.value

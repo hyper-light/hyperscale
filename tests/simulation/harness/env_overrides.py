@@ -24,3 +24,7 @@ class EnvOverrides:
     max_workers_per_manager: int | None = None
     recovery_jitter_min: float | None = None
     recovery_jitter_max: float | None = None
+    gate_swim_global_min_timeout: float | None = None
+    gate_swim_global_max_timeout: float | None = None
+    gate_swim_job_min_timeout: float | None = None
+    gate_swim_job_max_timeout: float | None = None

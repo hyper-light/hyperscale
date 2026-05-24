@@ -949,6 +949,13 @@ class HierarchicalFailureDetector:
 
         This is called synchronously by the timing wheel.
         """
+        import sys as _sys
+        _sys.stderr.write(
+            f"[HFD-GLOBAL-EXPIRE target={node} incarnation={state.incarnation} "
+            f"on_death={self._on_global_death is not None} "
+            f"on_death_sync={self._on_global_death_sync is not None}]\n"
+        )
+        _sys.stderr.flush()
         actual_age_seconds = time.monotonic() - state.start_time
         expected_timeout = state.calculate_timeout()
         if self._on_expiration_diagnostic is not None:
@@ -1016,6 +1023,11 @@ class HierarchicalFailureDetector:
         # lifecycle tracking and cleanup; the fallback path tracks the
         # task in ``_pending_clear_tasks`` so HFD.stop can drain it.
         if self._on_global_death:
+            import sys as _sys
+            _sys.stderr.write(
+                f"[HFD-DISPATCH-DEATH target={node} callback={self._on_global_death!r}]\n"
+            )
+            _sys.stderr.flush()
             try:
                 self._dispatch_callback(
                     self._on_global_death,
@@ -1144,6 +1156,11 @@ class HierarchicalFailureDetector:
         # the supported replacement and behaves identically for our
         # use case (detecting native ``async def`` callbacks).
         if inspect.iscoroutinefunction(callback):
+            import sys as _sys
+            _sys.stderr.write(
+                f"[HFD-DISPATCH-ASYNC callback={callback!r} has_task_runner={self._task_runner is not None}]\n"
+            )
+            _sys.stderr.flush()
             self._dispatch_async_work(callback, *args)
             return
 

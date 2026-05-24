@@ -559,13 +559,16 @@ class GateServer(HealthAwareServer):
         self.register_on_lose_leadership(self._on_gate_lose_leadership)
         self.register_on_peer_confirmed(self._on_peer_confirmed)
 
-        # Initialize hierarchical failure detector (AD-30)
+        # Initialize hierarchical failure detector (AD-30).
+        # Gate bracket is deliberately wider than the manager's
+        # ``SWIM_SUSPICION_*`` defaults — see ``GATE_SWIM_*`` rationale
+        # in ``env.py``.
         self.init_hierarchical_detector(
             config=HierarchicalConfig(
-                global_min_timeout=30.0,
-                global_max_timeout=120.0,
-                job_min_timeout=5.0,
-                job_max_timeout=30.0,
+                global_min_timeout=float(env.GATE_SWIM_GLOBAL_MIN_TIMEOUT),
+                global_max_timeout=float(env.GATE_SWIM_GLOBAL_MAX_TIMEOUT),
+                job_min_timeout=float(env.GATE_SWIM_JOB_MIN_TIMEOUT),
+                job_max_timeout=float(env.GATE_SWIM_JOB_MAX_TIMEOUT),
             ),
             on_global_death=self._on_manager_globally_dead,
             on_job_death=self._on_manager_dead_for_dc,
@@ -2906,6 +2909,12 @@ class GateServer(HealthAwareServer):
     def _on_node_dead(self, node_addr: tuple[str, int]) -> None:
         """Handle node death via SWIM."""
         gate_tcp_addr = self._modular_state.get_tcp_addr_for_udp(node_addr)
+        import sys as _sys
+        _sys.stderr.write(
+            f"[GATE-NODE-DEAD self=({self._host}, {self._tcp_port})] "
+            f"dead_udp={node_addr} resolved_tcp={gate_tcp_addr}\n"
+        )
+        _sys.stderr.flush()
         if gate_tcp_addr:
             self._dead_gate_addrs.add(gate_tcp_addr)
             if self._raft is not None:
@@ -2984,6 +2993,12 @@ class GateServer(HealthAwareServer):
             await self._modular_state.add_active_peer(tcp_addr)
 
     async def _handle_job_leader_failure(self, tcp_addr: tuple[str, int]) -> None:
+        import sys as _sys
+        _sys.stderr.write(
+            f"[ORPHAN-TRIGGER self=({self._host}, {self._tcp_port}) failed_gate={tcp_addr}] "
+            f"has_coordinator={self._orphan_job_coordinator is not None}\n"
+        )
+        _sys.stderr.flush()
         if self._orphan_job_coordinator:
             orphaned_job_ids = self._orphan_job_coordinator.mark_jobs_orphaned_by_gate(
                 tcp_addr

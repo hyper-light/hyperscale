@@ -228,18 +228,32 @@ class TimingWheel:
         expiration_time: float,
     ) -> bool:
         """Register a suspicion. Returns False if already tracked."""
+        import sys as _sys
         if node in self._entries:
+            _sys.stderr.write(
+                f"[WHEEL-ADD-SKIP target={node}] already tracked\n"
+            )
+            _sys.stderr.flush()
             return False
 
         entry = _Entry(state=state, expiration_time=expiration_time)
+        delay = max(0.0, expiration_time - time.monotonic())
+        _sys.stderr.write(
+            f"[WHEEL-ADD target={node}] delay={delay:.2f} running={self._running}\n"
+        )
+        _sys.stderr.flush()
         if self._running:
-            delay = max(0.0, expiration_time - time.monotonic())
             entry.timer_handle = asyncio.get_event_loop().call_later(
                 delay, self._fire_expiration, node
             )
         self._entries[node] = entry
         self._entries_added += 1
         return True
+
+    async def _trace_fire(self, node: NodeAddress) -> None:
+        import sys as _sys
+        _sys.stderr.write(f"[WHEEL-FIRE target={node}]\n")
+        _sys.stderr.flush()
 
     async def remove(self, node: NodeAddress) -> SuspicionState | None:
         """Cancel and drop a suspicion. Returns the prior state if found."""
@@ -288,13 +302,20 @@ class TimingWheel:
         that state, not a still-tracked-in-the-wheel state, when it
         runs.
         """
+        import sys as _sys
+        _sys.stderr.write(f"[WHEEL-FIRE target={node}]\n")
+        _sys.stderr.flush()
         entry = self._entries.pop(node, None)
         if entry is None:
             # Cancelled or replaced between scheduling and firing.
+            _sys.stderr.write(f"[WHEEL-FIRE-MISS target={node}]\n")
+            _sys.stderr.flush()
             return
         entry.timer_handle = None
         self._entries_expired += 1
         if self._on_expired is None:
+            _sys.stderr.write(f"[WHEEL-FIRE-NO-CALLBACK target={node}]\n")
+            _sys.stderr.flush()
             return
         try:
             self._on_expired(node, entry.state)

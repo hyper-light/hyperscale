@@ -693,6 +693,14 @@ class ClusterHarness:
             kwargs["WORKER_MAX_CORES"] = layered.worker_max_cores or worker_cores
         if layered.max_workers_per_manager is not None:
             kwargs["MAX_WORKERS_PER_MANAGER"] = layered.max_workers_per_manager
+        if layered.gate_swim_global_min_timeout is not None:
+            kwargs["GATE_SWIM_GLOBAL_MIN_TIMEOUT"] = layered.gate_swim_global_min_timeout
+        if layered.gate_swim_global_max_timeout is not None:
+            kwargs["GATE_SWIM_GLOBAL_MAX_TIMEOUT"] = layered.gate_swim_global_max_timeout
+        if layered.gate_swim_job_min_timeout is not None:
+            kwargs["GATE_SWIM_JOB_MIN_TIMEOUT"] = layered.gate_swim_job_min_timeout
+        if layered.gate_swim_job_max_timeout is not None:
+            kwargs["GATE_SWIM_JOB_MAX_TIMEOUT"] = layered.gate_swim_job_max_timeout
         return Env(**kwargs)
 
     def _layered_overrides(
@@ -732,4 +740,16 @@ def _merge(base: EnvOverrides, overlay: EnvOverrides) -> EnvOverrides:
         recovery_jitter_max=overlay.recovery_jitter_max
         if overlay.recovery_jitter_max is not None
         else base.recovery_jitter_max,
+        gate_swim_global_min_timeout=overlay.gate_swim_global_min_timeout
+        if overlay.gate_swim_global_min_timeout is not None
+        else base.gate_swim_global_min_timeout,
+        gate_swim_global_max_timeout=overlay.gate_swim_global_max_timeout
+        if overlay.gate_swim_global_max_timeout is not None
+        else base.gate_swim_global_max_timeout,
+        gate_swim_job_min_timeout=overlay.gate_swim_job_min_timeout
+        if overlay.gate_swim_job_min_timeout is not None
+        else base.gate_swim_job_min_timeout,
+        gate_swim_job_max_timeout=overlay.gate_swim_job_max_timeout
+        if overlay.gate_swim_job_max_timeout is not None
+        else base.gate_swim_job_max_timeout,
     )
