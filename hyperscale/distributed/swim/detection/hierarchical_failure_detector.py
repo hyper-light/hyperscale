@@ -65,6 +65,7 @@ class HierarchicalConfig:
     # Global layer config
     global_min_timeout: float = 5.0
     global_max_timeout: float = 30.0
+    global_no_witness_timeout: float | None = None
     global_required_confirmations: int = 2
 
     # Job layer config
@@ -139,6 +140,9 @@ class HierarchicalFailureDetector:
         on_job_death: Callable[[JobId, NodeAddress, int], None] | None = None,
         on_error: Callable[[str, Exception], None] | None = None,
         get_n_members: Callable[[], int] | None = None,
+        get_global_indirect_witness_count: (
+            Callable[[NodeAddress], int] | None
+        ) = None,
         get_job_n_members: Callable[[JobId], int] | None = None,
         get_lhm_multiplier: Callable[[], float] | None = None,
         task_runner: "TaskRunner | None" = None,
@@ -168,6 +172,7 @@ class HierarchicalFailureDetector:
         self._on_job_death = on_job_death
         self._on_error = on_error
         self._get_n_members = get_n_members
+        self._get_global_indirect_witness_count = get_global_indirect_witness_count
         self._get_job_n_members = get_job_n_members
         self._get_lhm_multiplier = get_lhm_multiplier
         # CLAUDE.md: never create asyncio orphaned tasks; route async work
@@ -494,22 +499,48 @@ class HierarchicalFailureDetector:
             base_max = self._config.global_max_timeout
             base_min = self._config.global_min_timeout
             adjusted_max = base_max + (base_max - base_min) * combined_unreliability
+            required_confirmations = self._get_required_global_confirmations(node)
+
+            if required_confirmations <= 0:
+                no_witness_timeout = self._get_no_witness_global_timeout(
+                    adjusted_max,
+                )
+                state_min_timeout = no_witness_timeout
+                state_max_timeout = no_witness_timeout
+            else:
+                state_min_timeout = base_min
+                state_max_timeout = adjusted_max
 
             state = SuspicionState(
                 node=node,
                 incarnation=incarnation,
                 start_time=time.monotonic(),
-                min_timeout=base_min,
-                max_timeout=adjusted_max,
+                min_timeout=state_min_timeout,
+                max_timeout=state_max_timeout,
                 n_members=self._get_current_n_members(),
-                required_confirmations=self._get_required_global_confirmations(),
+                required_confirmations=required_confirmations,
             )
             state.add_confirmation(from_node)
 
             expiration = time.monotonic() + state.calculate_timeout()
             return await self._global_wheel.add(node, state, expiration)
 
-    def _get_required_global_confirmations(self) -> int:
+    def _get_no_witness_global_timeout(self, adjusted_max_timeout: float) -> float:
+        """Return the finite direct-probe bracket for no-witness suspicions."""
+        configured_timeout = self._config.global_no_witness_timeout
+        if configured_timeout is None:
+            return adjusted_max_timeout
+        return max(adjusted_max_timeout, configured_timeout)
+
+    def _get_available_global_confirmers(self, node: NodeAddress) -> int:
+        """Return currently usable independent global confirmers for ``node``."""
+        if self._get_global_indirect_witness_count is not None:
+            return max(0, self._get_global_indirect_witness_count(node))
+
+        n_members = self._get_current_n_members()
+        return max(0, n_members - 2)
+
+    def _get_required_global_confirmations(self, node: NodeAddress) -> int:
         """Return the bounded confirmation target for global suspicion.
 
         SWIM's confirmation acceleration should not use total cluster
@@ -517,11 +548,13 @@ class HierarchicalFailureDetector:
         confirmations almost powerless. Memberlist derives a small
         target from the suspicion multiplier and clamps it by available
         peers. ``global_required_confirmations`` is the configured
-        target; the live member count caps it so tiny clusters do not
-        wait for impossible confirmations.
+        target; the valid indirect-witness count caps it so tiny
+        clusters do not wait for impossible confirmations. When no
+        independent confirmer exists, ``suspect_global`` uses the
+        no-witness direct-probe bracket instead of accelerating to the
+        minimum.
         """
-        n_members = self._get_current_n_members()
-        available_confirmers = max(0, n_members - 2)
+        available_confirmers = self._get_available_global_confirmers(node)
         configured_target = max(0, self._config.global_required_confirmations)
         if available_confirmers <= 0:
             return 0

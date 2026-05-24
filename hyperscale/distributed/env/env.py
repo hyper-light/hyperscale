@@ -60,6 +60,7 @@ class Env(BaseModel):
     SWIM_SUSPICION_MAX_TIMEOUT: StrictFloat = (
         8.0  # Reduced from 15.0 - faster failure declaration
     )
+    SWIM_NO_WITNESS_SUSPICION_TIMEOUT: StrictFloat = 30.0
     # AD-53 burst-failure cluster-degradation signal.
     # When the prober observes ``BURST_FAILURE_THRESHOLD`` distinct
     # direct+indirect probe failures within
@@ -788,6 +789,7 @@ class Env(BaseModel):
             "SWIM_UDP_POLL_INTERVAL": int,
             "SWIM_SUSPICION_MIN_TIMEOUT": float,
             "SWIM_SUSPICION_MAX_TIMEOUT": float,
+            "SWIM_NO_WITNESS_SUSPICION_TIMEOUT": float,
             "BURST_FAILURE_THRESHOLD": int,
             "BURST_FAILURE_WINDOW_SECONDS": float,
             "SWIM_REFUTATION_RATE_LIMIT_TOKENS": int,
@@ -1041,6 +1043,7 @@ class Env(BaseModel):
             "udp_poll_interval": self.SWIM_UDP_POLL_INTERVAL,
             "suspicion_min_timeout": self.SWIM_SUSPICION_MIN_TIMEOUT,
             "suspicion_max_timeout": self.SWIM_SUSPICION_MAX_TIMEOUT,
+            "no_witness_suspicion_timeout": self.SWIM_NO_WITNESS_SUSPICION_TIMEOUT,
             "refutation_rate_limit_tokens": self.SWIM_REFUTATION_RATE_LIMIT_TOKENS,
             "refutation_rate_limit_window": self.SWIM_REFUTATION_RATE_LIMIT_WINDOW,
         }

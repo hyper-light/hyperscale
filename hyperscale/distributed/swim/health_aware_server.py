@@ -308,6 +308,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             on_global_death_sync=self._record_global_death_sync,
             on_error=self._on_hierarchical_detector_error,
             get_n_members=self._get_member_count,
+            get_global_indirect_witness_count=self._get_indirect_probe_witness_count,
             get_lhm_multiplier=self._get_lhm_multiplier,
             task_runner=self._task_runner,
             peer_health_awareness=self._peer_health_awareness,
@@ -1199,6 +1200,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             on_job_death=on_job_death,
             on_error=self._on_hierarchical_detector_error,
             get_n_members=self._get_member_count,
+            get_global_indirect_witness_count=self._get_indirect_probe_witness_count,
             get_job_n_members=get_job_n_members,
             get_lhm_multiplier=self._get_lhm_multiplier,
             task_runner=self._task_runner,
@@ -2623,7 +2625,12 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
 
     def _has_indirect_probe_witnesses(self, target: tuple[str, int]) -> bool:
         """Return whether any registered healthy peer can verify ``target``."""
-        return bool(self.get_random_proxy_nodes(target, 1))
+        return self._get_indirect_probe_witness_count(target) > 0
+
+    def _get_indirect_probe_witness_count(self, target: tuple[str, int]) -> int:
+        """Return the number of usable indirect-probe witnesses for ``target``."""
+        k = self._indirect_probe_manager.k_proxies
+        return len(self.get_random_proxy_nodes(target, k))
 
     def _requires_unwitnessed_dead_confirmation(
         self,

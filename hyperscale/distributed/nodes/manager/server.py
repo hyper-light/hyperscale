@@ -658,6 +658,9 @@ class ManagerServer(HealthAwareServer):
             config=HierarchicalConfig(
                 global_min_timeout=float(self._env.SWIM_SUSPICION_MIN_TIMEOUT),
                 global_max_timeout=float(self._env.SWIM_SUSPICION_MAX_TIMEOUT),
+                global_no_witness_timeout=float(
+                    self._env.SWIM_NO_WITNESS_SUSPICION_TIMEOUT
+                ),
                 job_min_timeout=2.0,
                 job_max_timeout=15.0,
             ),

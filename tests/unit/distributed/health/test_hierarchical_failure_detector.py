@@ -185,6 +185,58 @@ class TestHierarchicalHappyPath:
             await detector.stop()
 
     @pytest.mark.asyncio
+    async def test_no_witness_global_suspicion_uses_extended_timeout(self) -> None:
+        """Zero independent confirmers should use the no-witness bracket."""
+        detector = HierarchicalFailureDetector(
+            config=HierarchicalConfig(
+                global_min_timeout=1.0,
+                global_max_timeout=5.0,
+                global_no_witness_timeout=20.0,
+            ),
+            get_n_members=lambda: 50,
+            get_global_indirect_witness_count=lambda _node: 0,
+        )
+        await detector.start()
+
+        try:
+            node = make_node(1)
+            await detector.suspect_global(node, 1, make_node(2))
+
+            state = await detector.get_global_suspicion_state(node)
+
+            assert state is not None
+            assert state.required_confirmations == 0
+            assert state.calculate_timeout() == pytest.approx(20.0)
+        finally:
+            await detector.stop()
+
+    @pytest.mark.asyncio
+    async def test_witnessed_global_suspicion_keeps_lifeguard_acceleration(self) -> None:
+        """Independent confirmers keep the normal Lifeguard bracket."""
+        detector = HierarchicalFailureDetector(
+            config=HierarchicalConfig(
+                global_min_timeout=1.0,
+                global_max_timeout=5.0,
+                global_no_witness_timeout=20.0,
+            ),
+            get_n_members=lambda: 3,
+            get_global_indirect_witness_count=lambda _node: 1,
+        )
+        await detector.start()
+
+        try:
+            node = make_node(1)
+            await detector.suspect_global(node, 1, make_node(2))
+
+            state = await detector.get_global_suspicion_state(node)
+
+            assert state is not None
+            assert state.required_confirmations == 1
+            assert state.calculate_timeout() == pytest.approx(1.0)
+        finally:
+            await detector.stop()
+
+    @pytest.mark.asyncio
     async def test_confirm_job_adds_confirmation(self, default_config: HierarchicalConfig):
         """Confirming job suspicion should add confirmation."""
         detector = HierarchicalFailureDetector(config=default_config)
