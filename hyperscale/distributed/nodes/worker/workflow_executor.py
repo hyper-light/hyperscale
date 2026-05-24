@@ -370,12 +370,22 @@ class WorkerWorkflowExecutor:
                     name="worker_events",
                 )
 
+        import sys as _sys
+        _sys.stderr.write(
+            f"[WORKER-FINAL job_id={dispatch.job_id[:10]} wf={dispatch.workflow_id[:20]}] "
+            f"status={progress.status} "
+            f"workflow_results_type={type(workflow_results).__name__} "
+            f"workflow_results_len={len(workflow_results) if hasattr(workflow_results, '__len__') else 'n/a'} "
+            f"truthy={bool(workflow_results)}\n"
+        )
+        _sys.stderr.flush()
+
         final_result = WorkflowFinalResult(
             job_id=dispatch.job_id,
             workflow_id=dispatch.workflow_id,
             workflow_name=progress.workflow_name,
             status=progress.status,
-            results=workflow_results if workflow_results else b"",
+            results=workflow_results if workflow_results else [],
             context_updates=context_updates if context_updates else b"",
             error=workflow_error,
             worker_id=node_id_full,

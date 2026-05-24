@@ -929,11 +929,27 @@ class JobManager:
             any_failed = False
             first_failed_error: str | None = None
 
+            import sys as _sys
             for sid in parent.sub_workflow_tokens:
                 sub = job.sub_workflows.get(sid)
                 if sub is None or sub.superseded or sub.result is None:
+                    _sys.stderr.write(
+                        f"[MGR-AGG-SUB sid={sid[:30]}] "
+                        f"sub_none={sub is None} "
+                        f"superseded={sub.superseded if sub else 'n/a'} "
+                        f"result_none={sub.result is None if sub else 'n/a'}\n"
+                    )
+                    _sys.stderr.flush()
                     continue
                 sub_status = sub.result.status
+                _sys.stderr.write(
+                    f"[MGR-AGG-SUB sid={sid[:30]}] "
+                    f"status={sub_status} "
+                    f"results_type={type(sub.result.results).__name__} "
+                    f"results_repr={sub.result.results!r:.80} "
+                    f"truthy={bool(sub.result.results)}\n"
+                )
+                _sys.stderr.flush()
                 if sub_status == WorkflowStatus.COMPLETED.value:
                     any_completed = True
                 elif sub_status == WorkflowStatus.FAILED.value:

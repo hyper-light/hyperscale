@@ -16,9 +16,12 @@ CancellingWorkflow, PanickingWorkflow, LeakyWorkflow).
 from hyperscale.distributed.testing.workflows.long_running_workflow import (
     LongRunningWorkflow,
 )
+from hyperscale.distributed.testing.workflows.long_running_workflow_test import (
+    LongRunningTestWorkflow,
+)
 from hyperscale.distributed.testing.workflows.simple_workflow import (
     SimpleWorkflow,
 )
 
 
-__all__ = ["LongRunningWorkflow", "SimpleWorkflow"]
+__all__ = ["LongRunningTestWorkflow", "LongRunningWorkflow", "SimpleWorkflow"]

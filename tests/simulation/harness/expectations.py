@@ -27,6 +27,12 @@ class WorkloadObservations:
     workflow_results: dict[str, str] = field(default_factory=dict)
     """workflow_name -> final status (e.g. "completed", "failed")."""
 
+    workflow_result_stats_counts: dict[str, int] = field(default_factory=dict)
+    """workflow_name -> count of top-level ``WorkflowStats`` in final result."""
+
+    workflow_result_per_dc_stats_counts: dict[str, int] = field(default_factory=dict)
+    """workflow_name -> count of per-DC stats envelopes in final result."""
+
     status_update_count: int = 0
     """Total ``JobStatusPush`` callbacks received."""
 
@@ -127,6 +133,45 @@ class ExpectWorkflowTerminal:
             parts.append(
                 f"wrong_status={[(name, actual[name]) for name in wrong_status]}"
             )
+        return ExpectationResult(
+            name=self.name,
+            holds=False,
+            detail="; ".join(parts),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class ExpectWorkflowStatsPresent:
+    """Every named workflow must deliver at least one final stats payload."""
+
+    expected_workflow_names: list[str]
+    require_per_dc_stats: bool = False
+    name: str = "ExpectWorkflowStatsPresent"
+
+    def evaluate(self, observations: WorkloadObservations) -> ExpectationResult:
+        expected = set(self.expected_workflow_names)
+        missing = sorted(
+            workflow_name
+            for workflow_name in expected
+            if observations.workflow_result_stats_counts.get(workflow_name, 0) <= 0
+        )
+        missing_per_dc = sorted(
+            workflow_name
+            for workflow_name in expected
+            if self.require_per_dc_stats
+            and observations.workflow_result_per_dc_stats_counts.get(workflow_name, 0)
+            <= 0
+        )
+
+        if not missing and not missing_per_dc:
+            return ExpectationResult(name=self.name, holds=True)
+
+        parts: list[str] = []
+        if missing:
+            parts.append(f"missing_stats={missing}")
+        if missing_per_dc:
+            parts.append(f"missing_per_dc_stats={missing_per_dc}")
+
         return ExpectationResult(
             name=self.name,
             holds=False,

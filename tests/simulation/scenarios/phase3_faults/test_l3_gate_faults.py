@@ -30,7 +30,10 @@ import asyncio
 
 import pytest
 
-from hyperscale.distributed.testing.workflows import LongRunningWorkflow
+from hyperscale.distributed.testing.workflows import (
+    LongRunningTestWorkflow,
+    LongRunningWorkflow,
+)
 from tests.simulation.harness import (
     ClusterHarness,
     ClusterSpec,
@@ -39,6 +42,7 @@ from tests.simulation.harness import (
     ExecutionMode,
     ExpectAllWorkflowsComplete,
     ExpectCompletionWithin,
+    ExpectWorkflowStatsPresent,
     HarnessTimeouts,
     Submission,
     SubmissionPattern,
@@ -111,6 +115,29 @@ def _long_workload(timeout_seconds: float) -> WorkloadSpec:
         pattern=SubmissionPattern.SINGLE,
         expectations=[
             ExpectAllWorkflowsComplete(expected_workflow_names=[workflow_name]),
+            ExpectCompletionWithin(seconds=timeout_seconds),
+        ],
+    )
+
+
+def _long_test_workload(timeout_seconds: float) -> WorkloadSpec:
+    workflow_name = LongRunningTestWorkflow.__name__
+    return WorkloadSpec(
+        submissions=[
+            Submission(
+                workflows=[([], LongRunningTestWorkflow)],
+                dc_count=1,
+                timeout_seconds=timeout_seconds,
+                vus=1,
+            ),
+        ],
+        pattern=SubmissionPattern.SINGLE,
+        expectations=[
+            ExpectAllWorkflowsComplete(expected_workflow_names=[workflow_name]),
+            ExpectWorkflowStatsPresent(
+                expected_workflow_names=[workflow_name],
+                require_per_dc_stats=True,
+            ),
             ExpectCompletionWithin(seconds=timeout_seconds),
         ],
     )
@@ -200,6 +227,33 @@ async def test_l3_gate_dies_dc_routing_fails_over() -> None:
             # Killing the first gate is sufficient: the client target
             # list rotates on each retry, so whichever gate is
             # ``cluster.gates[0]`` becoming unreachable forces failover.
+            await cluster.faults.kill(cluster.gates[0])
+
+            await driver.wait_for_completion()
+
+
+@pytest.mark.asyncio
+@pytest.mark.simulation
+async def test_l3_gate_dies_dc_routing_fails_over_with_test_stats() -> None:
+    """Kill one gate while a test workflow is in flight; the surviving
+    L3 route must deliver terminal status with aggregated stats intact.
+    """
+    spec = _l3_spec(base_port=22900)
+    async with ClusterHarness(
+        spec,
+        mode=ExecutionMode.REAL,
+        scenario_name="l3_gate_dies_dc_routing_fails_over_with_test_stats",
+    ) as cluster:
+        await _wait_for_gate_cluster(cluster)
+
+        async with cluster.workload(
+            _long_test_workload(_GATE_FAULT_WORKLOAD_BUDGET)
+        ) as driver:
+            await driver.submit()
+            await driver.wait_until_running(
+                timeout=_L3_RUNNING_TIMEOUT_SECONDS
+            )
+
             await cluster.faults.kill(cluster.gates[0])
 
             await driver.wait_for_completion()

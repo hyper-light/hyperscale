@@ -1535,6 +1535,17 @@ class GateServer(HealthAwareServer):
         try:
             push = WorkflowResultPush.load(data)
             callback = self._resolve_job_callback(push.job_id, push.callback_addr)
+            import sys as _sys
+            _sys.stderr.write(
+                f"[GATE-RESULT-RECV job_id={push.job_id[:10]} wf={push.workflow_id[:10]}] "
+                f"from={addr} dc={push.datacenter} status={push.status} "
+                f"has_job={self._job_manager.has_job(push.job_id)} "
+                f"push_cb={push.callback_addr} resolved_cb={callback} "
+                f"is_client_ready={push.is_client_ready} "
+                f"results_len={len(push.results)} target_dcs={push.target_dcs} "
+                f"tdc_count={push.target_dc_count}\n"
+            )
+            _sys.stderr.flush()
             if callback is not None:
                 push.callback_addr = callback
                 self._record_job_callback(push.job_id, callback)
@@ -1671,6 +1682,12 @@ class GateServer(HealthAwareServer):
             return b"stored"
 
         except Exception as error:
+            import sys as _sys, traceback as _tb
+            _sys.stderr.write(
+                f"[GATE-RESULT-EXC] error={type(error).__name__}: {error}\n"
+                f"{_tb.format_exc()}\n"
+            )
+            _sys.stderr.flush()
             await self.handle_exception(error, "workflow_result_push")
             return b"error"
 
@@ -2248,12 +2265,23 @@ class GateServer(HealthAwareServer):
         last_error: Exception | None = None
         for attempt in range(GateStatsCoordinator.CALLBACK_PUSH_MAX_RETRIES):
             try:
+                import sys as _sys
+                _sys.stderr.write(
+                    f"[GATE-CLIENT-SEND job_id={job_id[:10]} method={message_type}] "
+                    f"callback={callback} attempt={attempt}\n"
+                )
+                _sys.stderr.flush()
                 response, _ = await self._send_tcp(
                     callback,
                     message_type,
                     payload,
                     timeout=timeout,
                 )
+                _sys.stderr.write(
+                    f"[GATE-CLIENT-RESP job_id={job_id[:10]} method={message_type}] "
+                    f"callback={callback} response={response!r}\n"
+                )
+                _sys.stderr.flush()
                 if isinstance(response, Exception):
                     raise response
                 if response not in (b"ok", None):
@@ -4595,13 +4623,14 @@ class GateServer(HealthAwareServer):
         datacenter: str,
         dc_push: WorkflowResultPush,
         is_test_workflow: bool,
+        workflow_stats: list[WorkflowStats],
     ) -> WorkflowDCResult:
         if is_test_workflow:
             dc_aggregated_stats: WorkflowStats | None = None
-            if len(dc_push.results) > 1:
-                dc_aggregated_stats = Results().merge_results(dc_push.results)
-            elif dc_push.results:
-                dc_aggregated_stats = dc_push.results[0]
+            if len(workflow_stats) > 1:
+                dc_aggregated_stats = Results().merge_results(workflow_stats)
+            elif workflow_stats:
+                dc_aggregated_stats = workflow_stats[0]
 
             return WorkflowDCResult(
                 datacenter=datacenter,
@@ -4617,8 +4646,25 @@ class GateServer(HealthAwareServer):
             stats=None,
             error=dc_push.error,
             elapsed_seconds=dc_push.elapsed_seconds,
-            raw_results=dc_push.results,
+            raw_results=workflow_stats,
         )
+
+    def _normalize_workflow_result_stats(self, results: object) -> list[WorkflowStats]:
+        if isinstance(results, bytes):
+            if not results:
+                return []
+            raise ValueError(
+                "WorkflowResultPush.results must be list[WorkflowStats], "
+                "got non-empty bytes"
+            )
+
+        if not isinstance(results, list):
+            raise TypeError(
+                "WorkflowResultPush.results must be list[WorkflowStats], "
+                f"got {type(results).__name__}"
+            )
+
+        return results
 
     def _aggregate_workflow_results(
         self,
@@ -4645,10 +4691,16 @@ class GateServer(HealthAwareServer):
 
         for datacenter, dc_push in workflow_results.items():
             workflow_name = dc_push.workflow_name
-            all_workflow_stats.extend(dc_push.results)
+            dc_workflow_stats = self._normalize_workflow_result_stats(dc_push.results)
+            all_workflow_stats.extend(dc_workflow_stats)
 
             per_dc_results.append(
-                self._build_per_dc_result(datacenter, dc_push, is_test_workflow)
+                self._build_per_dc_result(
+                    datacenter,
+                    dc_push,
+                    is_test_workflow,
+                    dc_workflow_stats,
+                )
             )
 
             status_value = dc_push.status.upper()
@@ -4677,6 +4729,9 @@ class GateServer(HealthAwareServer):
     def _prepare_final_results(
         self, all_workflow_stats: list[WorkflowStats], is_test_workflow: bool
     ) -> list[WorkflowStats]:
+        if not all_workflow_stats:
+            return []
+
         if is_test_workflow:
             aggregator = Results()
             if len(all_workflow_stats) > 1:
@@ -5001,17 +5056,14 @@ class GateServer(HealthAwareServer):
             failed_datacenters,
         ) = self._aggregate_workflow_results(workflow_results, is_test_workflow)
 
-        if not all_workflow_stats:
-            return False
-
-        status = "FAILED" if has_failure else "COMPLETED"
+        status = JobStatus.FAILED.value if has_failure else JobStatus.COMPLETED.value
         if (
             self._allow_partial_workflow_results
             and has_failure
             and completed_datacenters > 0
             and failed_datacenters > 0
         ):
-            status = "PARTIAL"
+            status = "partial"
         error = "; ".join(error_messages) if error_messages else None
         results_to_send = self._prepare_final_results(
             all_workflow_stats, is_test_workflow
@@ -5038,6 +5090,12 @@ class GateServer(HealthAwareServer):
         if callback:
             self._record_job_callback(job_id, callback)
             payload = client_push.dump()
+            import sys as _sys
+            _sys.stderr.write(
+                f"[GATE-AGG-DELIVER job_id={job_id[:10]} wf={workflow_id[:10]}] "
+                f"callback={callback} status={status} payload_bytes={len(payload)}\n"
+            )
+            _sys.stderr.flush()
             delivered = await self._record_and_send_client_update(
                 job_id,
                 callback,
@@ -5046,6 +5104,10 @@ class GateServer(HealthAwareServer):
                 timeout=5.0,
                 log_failure=False,
             )
+            _sys.stderr.write(
+                f"[GATE-AGG-DONE job_id={job_id[:10]} wf={workflow_id[:10]}] delivered={delivered}\n"
+            )
+            _sys.stderr.flush()
             if not delivered:
                 self._task_runner.run(
                     self._udp_logger.log,

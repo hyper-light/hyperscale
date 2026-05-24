@@ -4050,6 +4050,12 @@ class ManagerServer(HealthAwareServer):
         no origin gate was ever recorded — preserves L1/L2 semantics.
         """
         origin_gate_addr = self._manager_state.get_job_origin_gate(job_id)
+        import sys as _sys
+        _sys.stderr.write(
+            f"[MGR-PUSH-ENTRY job_id={job_id[:10]} method={gate_method}] "
+            f"origin={origin_gate_addr} callback={callback_addr}\n"
+        )
+        _sys.stderr.flush()
         if origin_gate_addr is not None:
             origin_tuple = tuple(origin_gate_addr)
             tried: list[tuple[str, int]] = []
@@ -4062,6 +4068,13 @@ class ManagerServer(HealthAwareServer):
                 timeout=timeout,
                 tried=tried,
             )
+
+            _sys.stderr.write(
+                f"[MGR-PUSH-RESULT job_id={job_id[:10]} method={gate_method}] "
+                f"destination={destination} tried={tried} "
+                f"last_error={type(last_error).__name__ if last_error else None}:{last_error}\n"
+            )
+            _sys.stderr.flush()
 
             if destination is None:
                 # Every gate attempt failed; surface the most recent
@@ -5324,6 +5337,15 @@ class ManagerServer(HealthAwareServer):
         aggregate = await self._job_manager.aggregate_parent_workflow_outcome(
             result.workflow_id
         )
+        import sys as _sys
+        _sys.stderr.write(
+            f"[MGR-AGG-OUTCOME job_id={result.job_id[:10]} wf={result.workflow_id[:20]}] "
+            f"result.results_type={type(result.results).__name__} "
+            f"result.results_len={len(result.results) if isinstance(result.results, list) else 'n/a'} "
+            f"result.status={result.status} "
+            f"aggregate={'None' if aggregate is None else f'(status={aggregate[0]}, error={aggregate[1]}, results_len={len(aggregate[2])})'}\n"
+        )
+        _sys.stderr.flush()
         if aggregate is None:
             return
         aggregate_status, aggregate_error, aggregated_results = aggregate
@@ -5587,6 +5609,12 @@ class ManagerServer(HealthAwareServer):
         try:
             result = WorkflowFinalResult.load(data)
             is_leader = self._leases.is_job_leader(result.job_id)
+            import sys as _sys
+            _sys.stderr.write(
+                f"[MGR-FINAL-RECV job_id={result.job_id[:10]} wf={result.workflow_id[:10]}] "
+                f"from={addr} status={result.status} is_leader={is_leader}\n"
+            )
+            _sys.stderr.flush()
 
             if not is_leader:
                 return await self._forward_workflow_final_result_to_leader(

@@ -466,6 +466,22 @@ class WorkloadDriver:
         status = getattr(push, "status", None)
         if not workflow_name or status is None:
             return
+        results = getattr(push, "results", [])
+        if isinstance(results, list):
+            self._observations.workflow_result_stats_counts[workflow_name] = len(
+                results
+            )
+        else:
+            self._observations.workflow_result_stats_counts[workflow_name] = 0
+
+        per_dc_results = getattr(push, "per_dc_results", [])
+        if isinstance(per_dc_results, list):
+            self._observations.workflow_result_per_dc_stats_counts[workflow_name] = sum(
+                1
+                for dc_result in per_dc_results
+                if getattr(dc_result, "stats", None) is not None
+            )
+
         # A final result implies the workflow ran to terminal state.
         self._mark_running_if_dispatched()
         self._observations.workflow_results[workflow_name] = status
