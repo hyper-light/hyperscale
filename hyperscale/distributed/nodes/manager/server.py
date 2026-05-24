@@ -1570,6 +1570,7 @@ class ManagerServer(HealthAwareServer):
             elapsed_seconds=elapsed_seconds,
             is_final=False,
             fence_token=self._leases.get_fence_token(job_id),
+            callback_addr=self._get_job_callback_addr(job_id),
         )
 
         try:
@@ -1581,7 +1582,7 @@ class ManagerServer(HealthAwareServer):
             )
             if isinstance(response, Exception):
                 raise response
-            if response not in (b"ok", b"forwarded", None):
+            if response not in (b"ok", b"stored", None):
                 raise RuntimeError(
                     f"job_status_push_forward rejected with {response!r}"
                 )
@@ -4033,12 +4034,13 @@ class ManagerServer(HealthAwareServer):
 
         Gate-tier failover: when ``origin_gate_addr`` is set but the send
         fails (gate killed, partitioned, dead transport), iterate every
-        healthy peer gate in deterministic order and try each. Any gate
-        that doesn't own the job forwards via
-        ``_forward_workflow_result_to_peers`` (hash-ring + fallback), so
-        delivering to any live gate is sufficient. On peer success the
-        origin is updated to the gate that accepted, so subsequent pushes
-        route directly to the new owner instead of paying the dead-origin
+        healthy peer gate in deterministic order and try each. Push
+        payloads carry the client callback and target-DC metadata, so a
+        surviving gate can deliver client-ready updates or durably accept
+        raw workflow results for aggregation without relying on callback
+        state from the original accepting gate. On peer success the origin
+        is updated to the gate that accepted, so subsequent pushes route
+        directly to the new owner instead of paying the dead-origin
         timeout per send. The ``JobLeadershipAnnouncement`` handler will
         independently rewrite the origin when an orphan-coordinator
         takeover lands; failover here is the in-flight bridge between the
@@ -4048,12 +4050,6 @@ class ManagerServer(HealthAwareServer):
         no origin gate was ever recorded — preserves L1/L2 semantics.
         """
         origin_gate_addr = self._manager_state.get_job_origin_gate(job_id)
-        import sys as _sys
-        _sys.stderr.write(
-            f"[MGR-PUSH-ENTRY job_id={job_id[:10]} method={gate_method}] "
-            f"origin={origin_gate_addr} callback={callback_addr}\n"
-        )
-        _sys.stderr.flush()
         if origin_gate_addr is not None:
             origin_tuple = tuple(origin_gate_addr)
             tried: list[tuple[str, int]] = []
@@ -4066,13 +4062,6 @@ class ManagerServer(HealthAwareServer):
                 timeout=timeout,
                 tried=tried,
             )
-
-            _sys.stderr.write(
-                f"[MGR-PUSH-RESULT job_id={job_id[:10]} method={gate_method}] "
-                f"destination={destination} tried={tried} "
-                f"last_error={type(last_error).__name__ if last_error else None}:{last_error}\n"
-            )
-            _sys.stderr.flush()
 
             if destination is None:
                 # Every gate attempt failed; surface the most recent
@@ -4087,11 +4076,6 @@ class ManagerServer(HealthAwareServer):
 
             method = gate_method
             if destination != origin_tuple:
-                _sys.stderr.write(
-                    f"[MGR-PUSH-REROUTE job_id={job_id[:10]}] "
-                    f"old_origin={origin_tuple} new_origin={destination}\n"
-                )
-                _sys.stderr.flush()
                 self._manager_state.set_job_origin_gate(job_id, destination)
         else:
             if callback_addr is None:
@@ -4181,11 +4165,38 @@ class ManagerServer(HealthAwareServer):
 
         if isinstance(response, Exception):
             return None, None, response
-        if response not in (b"ok", b"forwarded", None):
+        if response not in (b"ok", b"stored", None):
             return None, None, RuntimeError(
                 f"{gate_method} rejected by {addr} with {response!r}"
             )
         return addr, response, None
+
+    def _get_job_callback_addr(self, job_id: str) -> tuple[str, int] | None:
+        """Resolve the client callback address for a job update."""
+        callback_addr = self._manager_state.get_job_callback(job_id)
+        if not callback_addr:
+            callback_addr = self._manager_state.get_client_callback(job_id)
+        if isinstance(callback_addr, list):
+            return tuple(callback_addr)
+        return callback_addr
+
+    def _get_job_target_dcs_for_push(self, job_id: str) -> list[str]:
+        """Return the target datacenters known to this manager for push routing."""
+        submission = self._manager_state.get_job_submission(job_id)
+        if submission is None:
+            return []
+        return list(submission.datacenters)
+
+    def _get_job_target_dc_count_for_push(
+        self,
+        job_id: str,
+        target_dcs: list[str],
+    ) -> int:
+        """Return expected DC count for a workflow-result push."""
+        submission = self._manager_state.get_job_submission(job_id)
+        if submission is None:
+            return len(target_dcs)
+        return max(submission.datacenter_count, len(target_dcs))
 
     async def _push_job_status_to_client(
         self,
@@ -4204,13 +4215,9 @@ class ManagerServer(HealthAwareServer):
         when no callback is registered (e.g. fire-and-forget
         submissions).
         """
-        callback_addr = self._manager_state.get_job_callback(job_id)
-        if not callback_addr:
-            callback_addr = self._manager_state.get_client_callback(job_id)
+        callback_addr = self._get_job_callback_addr(job_id)
         if not callback_addr and not self._manager_state.get_job_origin_gate(job_id):
             return
-        if isinstance(callback_addr, list):
-            callback_addr = tuple(callback_addr)
 
         job = self._job_manager.get_job_by_id(job_id)
         elapsed = job.elapsed_seconds() if job else 0.0
@@ -4228,6 +4235,7 @@ class ManagerServer(HealthAwareServer):
             elapsed_seconds=elapsed,
             is_final=is_final,
             fence_token=self._leases.get_fence_token(job_id),
+            callback_addr=callback_addr,
         )
         try:
             await self._send_job_update_to_origin(
@@ -4500,6 +4508,8 @@ class ManagerServer(HealthAwareServer):
         reason: str,
     ) -> WorkflowResultPush:
         """Build a terminal workflow push for a job timeout."""
+        callback_addr = self._get_job_callback_addr(job.job_id)
+        target_dcs = self._get_job_target_dcs_for_push(job.job_id)
         return WorkflowResultPush(
             job_id=job.job_id,
             workflow_id=workflow.token.workflow_id or workflow.token_str,
@@ -4511,6 +4521,12 @@ class ManagerServer(HealthAwareServer):
             error=reason,
             elapsed_seconds=job.elapsed_seconds(),
             completed_at=time.time(),
+            callback_addr=callback_addr,
+            target_dcs=target_dcs,
+            target_dc_count=self._get_job_target_dc_count_for_push(
+                job.job_id,
+                target_dcs,
+            ),
         )
 
     async def _push_timeout_workflow_results(
@@ -4519,14 +4535,18 @@ class ManagerServer(HealthAwareServer):
     ) -> None:
         """Push workflow timeout results to the registered callback."""
         for push in workflow_pushes:
-            callback_addr = self._manager_state.get_job_callback(push.job_id)
-            if not callback_addr:
-                callback_addr = self._manager_state.get_client_callback(push.job_id)
+            callback_addr = self._get_job_callback_addr(push.job_id)
             if not callback_addr:
                 if not self._manager_state.get_job_origin_gate(push.job_id):
                     continue
-            if isinstance(callback_addr, list):
-                callback_addr = tuple(callback_addr)
+            push.callback_addr = callback_addr
+            if not push.target_dcs:
+                push.target_dcs = self._get_job_target_dcs_for_push(push.job_id)
+            if push.target_dc_count <= 0:
+                push.target_dc_count = self._get_job_target_dc_count_for_push(
+                    push.job_id,
+                    push.target_dcs,
+                )
             try:
                 await self._send_job_update_to_origin(
                     push.job_id,
@@ -5338,14 +5358,10 @@ class ManagerServer(HealthAwareServer):
         aggregate_error: str | None = None,
         aggregated_results: list[dict] | None = None,
     ) -> None:
-        callback_addr = self._manager_state.get_job_callback(result.job_id)
-        if not callback_addr:
-            callback_addr = self._manager_state.get_client_callback(result.job_id)
+        callback_addr = self._get_job_callback_addr(result.job_id)
         if not callback_addr:
             if not self._manager_state.get_job_origin_gate(result.job_id):
                 return
-        if isinstance(callback_addr, list):
-            callback_addr = tuple(callback_addr)
         # The aggregate computed across every sub-workflow is the
         # authoritative terminal state for the parent. Falling back to
         # ``result.*`` keeps callers without an aggregate (legacy paths)
@@ -5358,6 +5374,7 @@ class ManagerServer(HealthAwareServer):
             push_results = aggregated_results
         else:
             push_results = list(result.results) if result.results else []
+        target_dcs = self._get_job_target_dcs_for_push(result.job_id)
         push = WorkflowResultPush(
             job_id=result.job_id,
             workflow_id=sub_token.workflow_id or result.workflow_id,
@@ -5369,6 +5386,15 @@ class ManagerServer(HealthAwareServer):
             error=push_error,
             elapsed_seconds=0.0,
             completed_at=time.time(),
+            callback_addr=callback_addr,
+            target_dcs=target_dcs,
+            target_dc_count=self._get_job_target_dc_count_for_push(
+                result.job_id,
+                target_dcs,
+            ),
+            is_client_ready=not bool(
+                self._manager_state.get_job_origin_gate(result.job_id)
+            ),
         )
         try:
             await self._send_job_update_to_origin(
@@ -5417,13 +5443,9 @@ class ManagerServer(HealthAwareServer):
         completed_job_ids: set[str] = set()
 
         for job_id, workflow_id, workflow_name, error in failed_workflows:
-            callback_addr = self._manager_state.get_job_callback(job_id)
-            if not callback_addr:
-                callback_addr = self._manager_state.get_client_callback(job_id)
+            callback_addr = self._get_job_callback_addr(job_id)
             if callback_addr or self._manager_state.get_job_origin_gate(job_id):
-                normalized_callback_addr = (
-                    tuple(callback_addr) if callback_addr is not None else None
-                )
+                target_dcs = self._get_job_target_dcs_for_push(job_id)
                 push = WorkflowResultPush(
                     job_id=job_id,
                     workflow_id=workflow_id,
@@ -5435,11 +5457,20 @@ class ManagerServer(HealthAwareServer):
                     error=error,
                     elapsed_seconds=0.0,
                     completed_at=time.time(),
+                    callback_addr=callback_addr,
+                    target_dcs=target_dcs,
+                    target_dc_count=self._get_job_target_dc_count_for_push(
+                        job_id,
+                        target_dcs,
+                    ),
+                    is_client_ready=not bool(
+                        self._manager_state.get_job_origin_gate(job_id)
+                    ),
                 )
                 try:
                     await self._send_job_update_to_origin(
                         job_id,
-                        normalized_callback_addr,
+                        callback_addr,
                         "workflow_result_push",
                         "workflow_result_push",
                         push.dump(),
@@ -5555,13 +5586,7 @@ class ManagerServer(HealthAwareServer):
     ) -> bytes:
         try:
             result = WorkflowFinalResult.load(data)
-            import sys as _sys
             is_leader = self._leases.is_job_leader(result.job_id)
-            _sys.stderr.write(
-                f"[MGR-FINAL-RECV job_id={result.job_id[:10]} wf={result.workflow_id[:10]}] "
-                f"from={addr} status={result.status} is_leader={is_leader}\n"
-            )
-            _sys.stderr.flush()
 
             if not is_leader:
                 return await self._forward_workflow_final_result_to_leader(

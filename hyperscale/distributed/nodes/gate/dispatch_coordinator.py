@@ -234,6 +234,7 @@ class GateDispatchCoordinator:
             elapsed_seconds=elapsed_seconds,
             is_final=is_final,
             fence_token=self._job_manager.get_fence_token(job_id),
+            callback_addr=callback,
         )
         payload = push.dump()
         sequence = await self._state.record_client_update(

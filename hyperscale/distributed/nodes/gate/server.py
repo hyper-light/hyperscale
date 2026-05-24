@@ -357,6 +357,7 @@ class GateServer(HealthAwareServer):
             env, "GATE_ALLOW_PARTIAL_WORKFLOW_RESULTS", False
         )
         self._workflow_result_timeout_tokens: dict[str, dict[str, str]] = {}
+        self._workflow_result_expected_dc_counts: dict[str, dict[str, int]] = {}
         self._job_workflow_ids: dict[str, set[str]] = {}
 
         # Per-job leadership tracking
@@ -1533,13 +1534,10 @@ class GateServer(HealthAwareServer):
         """Handle workflow result push from manager."""
         try:
             push = WorkflowResultPush.load(data)
-            import sys as _sys
-            _sys.stderr.write(
-                f"[GATE-RESULT-RECV job_id={push.job_id[:10]} wf={push.workflow_id[:10]}] "
-                f"from={addr} dc={push.datacenter} status={push.status} "
-                f"has_job={self._job_manager.has_job(push.job_id)}\n"
-            )
-            _sys.stderr.flush()
+            callback = self._resolve_job_callback(push.job_id, push.callback_addr)
+            if callback is not None:
+                push.callback_addr = callback
+                self._record_job_callback(push.job_id, callback)
 
             current_fence = self._job_manager.get_fence_token(push.job_id)
             if push.fence_token < current_fence:
@@ -1558,9 +1556,34 @@ class GateServer(HealthAwareServer):
             if push.fence_token > current_fence:
                 self._job_manager.set_fence_token(push.job_id, push.fence_token)
 
+            if push.is_client_ready:
+                if callback is None:
+                    return b"no_callback"
+                delivered = await self._record_and_send_client_update(
+                    push.job_id,
+                    callback,
+                    "workflow_result_push",
+                    push.dump(),
+                    timeout=5.0,
+                )
+                return b"ok" if delivered else b"error"
+
             if not self._job_manager.has_job(push.job_id):
-                await self._forward_workflow_result_to_peers(push)
-                return b"ok"
+                if callback is None:
+                    self._task_runner.run(
+                        self._udp_logger.log,
+                        ServerWarning(
+                            message=(
+                                "Rejecting workflow result for unknown job "
+                                f"{push.job_id}: no callback metadata"
+                            ),
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        ),
+                    )
+                    return b"no_callback"
+                self._recover_job_from_workflow_push(push, callback)
 
             self._task_runner.run(
                 self._udp_logger.log,
@@ -1576,8 +1599,24 @@ class GateServer(HealthAwareServer):
             timeout_token: str | None = None
             should_schedule_timeout = False
             state_updated = False
+            target_dcs_from_push = self._get_workflow_push_target_dcs(push)
+            expected_dc_count = self._get_workflow_push_expected_dc_count(
+                push,
+                target_dcs_from_push,
+            )
 
             async with self._workflow_dc_results_lock:
+                if target_dcs_from_push:
+                    self._job_manager.set_target_dcs(push.job_id, target_dcs_from_push)
+                if expected_dc_count > 0:
+                    expected_counts = self._workflow_result_expected_dc_counts.setdefault(
+                        push.job_id,
+                        {},
+                    )
+                    previous_expected_count = expected_counts.get(push.workflow_id, 0)
+                    if expected_dc_count > previous_expected_count:
+                        expected_counts[push.workflow_id] = expected_dc_count
+
                 if push.job_id not in self._workflow_dc_results:
                     self._workflow_dc_results[push.job_id] = {}
                 if push.workflow_id not in self._workflow_dc_results[push.job_id]:
@@ -1595,7 +1634,10 @@ class GateServer(HealthAwareServer):
                 received_dcs = set(
                     self._workflow_dc_results[push.job_id][push.workflow_id].keys()
                 )
-                should_aggregate = target_dcs and received_dcs >= target_dcs
+                should_aggregate = bool(target_dcs and received_dcs >= target_dcs)
+                if not should_aggregate and not target_dcs and expected_dc_count > 0:
+                    should_aggregate = len(received_dcs) >= expected_dc_count
+
                 has_timeout = (
                     push.job_id in self._workflow_result_timeout_tokens
                     and push.workflow_id
@@ -1606,7 +1648,7 @@ class GateServer(HealthAwareServer):
                     workflow_results, timeout_token = self._pop_workflow_results_locked(
                         push.job_id, push.workflow_id
                     )
-                elif target_dcs and not has_timeout:
+                elif (target_dcs or expected_dc_count > 1) and not has_timeout:
                     should_schedule_timeout = True
 
             if state_updated:
@@ -1621,11 +1663,12 @@ class GateServer(HealthAwareServer):
                 await self._cancel_workflow_result_timeout(timeout_token)
 
             if workflow_results:
-                await self._forward_aggregated_workflow_result(
+                delivered = await self._forward_aggregated_workflow_result(
                     push.job_id, push.workflow_id, workflow_results
                 )
+                return b"ok" if delivered else b"error"
 
-            return b"ok"
+            return b"stored"
 
         except Exception as error:
             await self.handle_exception(error, "workflow_result_push")
@@ -1662,11 +1705,7 @@ class GateServer(HealthAwareServer):
                 )
                 return response.dump()
 
-            existing_callback = self._progress_callbacks.get(job_id)
-            self._job_manager.set_callback(job_id, request.callback_addr)
-            self._progress_callbacks[job_id] = request.callback_addr
-            if existing_callback != request.callback_addr:
-                self._increment_version()
+            self._record_job_callback(job_id, request.callback_addr)
 
             last_sequence = request.last_sequence
             if last_sequence <= 0:
@@ -1826,11 +1865,15 @@ class GateServer(HealthAwareServer):
                 job_id=announcement.job_id,
                 claimer_id=announcement.leader_id,
                 claimer_addr=(announcement.leader_host, announcement.leader_tcp_port),
-                fencing_token=announcement.term,
-                metadata=announcement.workflow_count,
+                fencing_token=announcement.fence_token or announcement.term,
+                metadata=announcement.target_dc_count or announcement.workflow_count,
             )
 
             if accepted:
+                callback = self._normalize_callback_addr(announcement.callback_addr)
+                if callback is not None:
+                    self._record_job_callback(announcement.job_id, callback)
+
                 self._task_runner.run(
                     self._udp_logger.log,
                     ServerDebug(
@@ -2130,61 +2173,21 @@ class GateServer(HealthAwareServer):
             push = JobStatusPush.load(data)
             job_id = push.job_id
 
-            callback = self._job_manager.get_callback(job_id)
+            callback = self._resolve_job_callback(job_id, push.callback_addr)
             if not callback:
                 return b"no_callback"
+            push.callback_addr = callback
+            self._record_job_callback(job_id, callback)
+            data = push.dump()
 
-            sequence = await self._modular_state.record_client_update(
+            delivered = await self._record_and_send_client_update(
                 job_id,
+                callback,
                 "job_status_push",
                 data,
+                timeout=5.0,
             )
-
-            max_retries = GateStatsCoordinator.CALLBACK_PUSH_MAX_RETRIES
-            base_delay = GateStatsCoordinator.CALLBACK_PUSH_BASE_DELAY_SECONDS
-            max_delay = GateStatsCoordinator.CALLBACK_PUSH_MAX_DELAY_SECONDS
-            last_error: Exception | None = None
-
-            for attempt in range(max_retries):
-                try:
-                    response, _ = await self._send_tcp(
-                        callback,
-                        "job_status_push",
-                        data,
-                    )
-                    if isinstance(response, Exception):
-                        raise response
-                    if response not in (b"ok", None):
-                        raise RuntimeError(
-                            f"job_status_push rejected with {response!r}"
-                        )
-                    await self._modular_state.set_client_update_position(
-                        job_id,
-                        callback,
-                        sequence,
-                    )
-                    return b"ok"
-                except Exception as send_error:
-                    last_error = send_error
-                    if attempt < max_retries - 1:
-                        delay = min(base_delay * (2**attempt), max_delay)
-                        await asyncio.sleep(delay)
-
-            if await self._forward_job_status_push_to_peers(job_id, data):
-                return b"forwarded"
-
-            await self._udp_logger.log(
-                ServerWarning(
-                    message=(
-                        f"Failed to deliver forwarded status push for job {job_id} "
-                        f"after {max_retries} retries: {last_error}"
-                    ),
-                    node_host=self._host,
-                    node_port=self._tcp_port,
-                    node_id=self._node_id.short,
-                )
-            )
-            return b"error"
+            return b"ok" if delivered else b"error"
 
         except Exception as error:
             await self.handle_exception(error, "job_status_push_forward")
@@ -3474,6 +3477,85 @@ class GateServer(HealthAwareServer):
             callback = self._modular_state._progress_callbacks.get(job_id)
         return callback
 
+    def _normalize_callback_addr(
+        self,
+        callback_addr: tuple[str, int] | list[str | int] | None,
+    ) -> tuple[str, int] | None:
+        """Normalize serialized callback addresses into TCP address tuples."""
+        if callback_addr is None:
+            return None
+        if len(callback_addr) != 2:
+            return None
+        return (str(callback_addr[0]), int(callback_addr[1]))
+
+    def _record_job_callback(self, job_id: str, callback: tuple[str, int]) -> None:
+        """Record a client callback in every gate-local callback store."""
+        previous_callback = self._job_manager.get_callback(job_id)
+        self._job_manager.set_callback(job_id, callback)
+        self._progress_callbacks[job_id] = callback
+        self._modular_state._progress_callbacks[job_id] = callback
+        if previous_callback != callback:
+            self._increment_version()
+
+    def _resolve_job_callback(
+        self,
+        job_id: str,
+        callback_addr: tuple[str, int] | list[str | int] | None,
+    ) -> tuple[str, int] | None:
+        """Resolve callback metadata from a push payload or local gate state."""
+        callback = self._normalize_callback_addr(callback_addr)
+        if callback is not None:
+            return callback
+
+        callback = self._job_manager.get_callback(job_id)
+        if callback is not None:
+            return callback
+
+        callback = self._progress_callbacks.get(job_id)
+        if callback is not None:
+            return callback
+
+        return self._modular_state._progress_callbacks.get(job_id)
+
+    def _get_workflow_push_target_dcs(self, push: WorkflowResultPush) -> set[str]:
+        """Return the explicit target DCs carried by a workflow-result push."""
+        return {datacenter for datacenter in push.target_dcs if datacenter}
+
+    def _get_workflow_push_expected_dc_count(
+        self,
+        push: WorkflowResultPush,
+        target_dcs: set[str],
+    ) -> int:
+        """Return the expected DC count represented by a workflow-result push."""
+        expected_dc_count = max(push.target_dc_count, len(target_dcs))
+        if expected_dc_count <= 0 and push.datacenter:
+            return 1
+        return expected_dc_count
+
+    def _recover_job_from_workflow_push(
+        self,
+        push: WorkflowResultPush,
+        callback: tuple[str, int],
+    ) -> None:
+        """Create enough job state for a survivor gate to own pushed results."""
+        job = GlobalJobStatus(
+            job_id=push.job_id,
+            status=JobStatus.RUNNING.value,
+            datacenters=[],
+            timestamp=time.monotonic(),
+            fence_token=push.fence_token,
+        )
+        self._job_manager.set_job(push.job_id, job)
+        self._job_manager.set_fence_token(push.job_id, push.fence_token)
+        self._record_job_callback(push.job_id, callback)
+
+        target_dcs = self._get_workflow_push_target_dcs(push)
+        expected_dc_count = self._get_workflow_push_expected_dc_count(push, target_dcs)
+        if not target_dcs and expected_dc_count <= 1 and push.datacenter:
+            target_dcs = {push.datacenter}
+        if target_dcs:
+            self._job_manager.set_target_dcs(push.job_id, target_dcs)
+
     async def _broadcast_job_leadership(
         self,
         job_id: str,
@@ -3851,15 +3933,9 @@ class GateServer(HealthAwareServer):
                             workflow_entries[dc_id] = result
 
         for job_id, callback_addr in snapshot.progress_callbacks.items():
-            callback_tuple = (
-                tuple(callback_addr)
-                if isinstance(callback_addr, list)
-                else callback_addr
-            )
-            if job_id not in self._modular_state._progress_callbacks:
-                self._modular_state._progress_callbacks[job_id] = callback_tuple
-            if job_id not in self._progress_callbacks:
-                self._progress_callbacks[job_id] = callback_tuple
+            callback_tuple = self._normalize_callback_addr(callback_addr)
+            if callback_tuple is not None:
+                self._record_job_callback(job_id, callback_tuple)
 
         self._job_leadership_tracker.merge_from_snapshot(
             job_leaders=snapshot.job_leaders,
@@ -4146,12 +4222,16 @@ class GateServer(HealthAwareServer):
 
             circuit = await self._peer_gate_circuit_breaker.get_circuit(gate_addr)
             try:
-                await self.send_tcp(
+                response, _ = await self.send_tcp(
                     gate_addr,
                     "workflow_result_push",
                     push.dump(),
                     timeout=3.0,
                 )
+                if response not in (b"ok", b"stored", None):
+                    raise RuntimeError(
+                        f"workflow_result_push rejected with {response!r}"
+                    )
                 circuit.record_success()
                 return True
             except Exception as push_error:
@@ -4176,12 +4256,16 @@ class GateServer(HealthAwareServer):
 
             circuit = await self._peer_gate_circuit_breaker.get_circuit(gate_addr)
             try:
-                await self.send_tcp(
+                response, _ = await self.send_tcp(
                     gate_addr,
                     "workflow_result_push",
                     push.dump(),
                     timeout=3.0,
                 )
+                if response not in (b"ok", b"stored", None):
+                    raise RuntimeError(
+                        f"workflow_result_push rejected with {response!r}"
+                    )
                 circuit.record_success()
                 return True
             except Exception as fallback_push_error:
@@ -4301,7 +4385,7 @@ class GateServer(HealthAwareServer):
                     push_data,
                     timeout=3.0,
                 )
-                if response in (b"ok", b"forwarded"):
+                if response in (b"ok", None):
                     circuit.record_success()
                     return True
             except Exception as forward_error:
@@ -4429,13 +4513,27 @@ class GateServer(HealthAwareServer):
         job_id: str,
         workflow_id: str,
     ) -> None:
-        workflow_results, _ = await self._pop_workflow_results(job_id, workflow_id)
+        async with self._workflow_dc_results_lock:
+            expected_dc_count = self._workflow_result_expected_dc_counts.get(
+                job_id,
+                {},
+            ).get(workflow_id, 0)
+            workflow_results, _ = self._pop_workflow_results_locked(
+                job_id,
+                workflow_id,
+            )
         if not workflow_results:
             return
 
         target_dcs = self._job_manager.get_target_dcs(job_id)
         missing_dcs = set(target_dcs) if target_dcs else set()
         missing_dcs -= set(workflow_results.keys())
+        if not missing_dcs and expected_dc_count > len(workflow_results):
+            missing_count = expected_dc_count - len(workflow_results)
+            missing_dcs = {
+                f"unknown-dc-{ordinal}"
+                for ordinal in range(1, missing_count + 1)
+            }
 
         if missing_dcs:
             await self._udp_logger.log(
@@ -4477,6 +4575,11 @@ class GateServer(HealthAwareServer):
         workflow_results = job_results.pop(workflow_id, {})
         if not job_results and job_id in self._workflow_dc_results:
             del self._workflow_dc_results[job_id]
+
+        expected_counts = self._workflow_result_expected_dc_counts.get(job_id, {})
+        expected_counts.pop(workflow_id, None)
+        if not expected_counts and job_id in self._workflow_result_expected_dc_counts:
+            del self._workflow_result_expected_dc_counts[job_id]
 
         timeout_token = self._pop_workflow_timeout_token_locked(job_id, workflow_id)
         return workflow_results, timeout_token
@@ -4882,7 +4985,7 @@ class GateServer(HealthAwareServer):
         job_id: str,
         workflow_id: str,
         workflow_results: dict[str, WorkflowResultPush],
-    ) -> None:
+    ) -> bool:
         first_dc_push = next(iter(workflow_results.values()))
         is_test_workflow = first_dc_push.is_test
         fence_token = max(dc_push.fence_token for dc_push in workflow_results.values())
@@ -4899,7 +5002,7 @@ class GateServer(HealthAwareServer):
         ) = self._aggregate_workflow_results(workflow_results, is_test_workflow)
 
         if not all_workflow_stats:
-            return
+            return False
 
         status = "FAILED" if has_failure else "COMPLETED"
         if (
@@ -4913,6 +5016,7 @@ class GateServer(HealthAwareServer):
         results_to_send = self._prepare_final_results(
             all_workflow_stats, is_test_workflow
         )
+        callback = self._resolve_job_callback(job_id, first_dc_push.callback_addr)
 
         client_push = WorkflowResultPush(
             job_id=job_id,
@@ -4927,10 +5031,12 @@ class GateServer(HealthAwareServer):
             per_dc_results=per_dc_results,
             completed_at=time.time(),
             is_test=is_test_workflow,
+            callback_addr=callback,
+            is_client_ready=True,
         )
 
-        callback = self._job_manager.get_callback(job_id)
         if callback:
+            self._record_job_callback(job_id, callback)
             payload = client_push.dump()
             delivered = await self._record_and_send_client_update(
                 job_id,
@@ -4950,6 +5056,17 @@ class GateServer(HealthAwareServer):
                         node_id=self._node_id.short,
                     ),
                 )
+            return delivered
+
+        await self._udp_logger.log(
+            ServerWarning(
+                message=f"Failed to send workflow result for {job_id}: no callback",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+        return False
 
     async def _query_all_datacenters(
         self,
@@ -5236,6 +5353,7 @@ class GateServer(HealthAwareServer):
         workflow_timeout_tokens: dict[str, str] | None = None
         async with self._workflow_dc_results_lock:
             self._workflow_dc_results.pop(job_id, None)
+            self._workflow_result_expected_dc_counts.pop(job_id, None)
             workflow_timeout_tokens = self._workflow_result_timeout_tokens.pop(
                 job_id, None
             )

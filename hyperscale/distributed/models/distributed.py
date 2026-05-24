@@ -1504,6 +1504,18 @@ class WorkflowResultPush(Message):
     # True: aggregate results using merge_results()
     # False: return raw list of WorkflowStats per DC
     is_test: bool = True
+    # Client callback for gate-owned L3 delivery. Managers include this so any
+    # surviving gate can deliver or aggregate the result without relying on
+    # callback state replicated from the original accepting gate.
+    callback_addr: tuple[str, int] | None = None
+    # Expected datacenters for cross-DC aggregation. ``target_dcs`` is preferred
+    # when known; ``target_dc_count`` is a fallback when only cardinality is
+    # known by the sender.
+    target_dcs: list[str] = field(default_factory=list)
+    target_dc_count: int = 0
+    # True when this payload is already client-ready and should not be treated
+    # as raw per-DC input for gate aggregation.
+    is_client_ready: bool = False
 
 
 @dataclass(slots=True)
@@ -2021,6 +2033,10 @@ class JobStatusPush(Message):
     # Per-datacenter breakdown (for clients that want granular visibility)
     per_dc_stats: list["DCStats"] = field(default_factory=list)
     fence_token: int = 0  # Fencing token for at-most-once semantics
+    # Client callback for gate-owned L3 delivery. This lets any surviving gate
+    # deliver forwarded status updates without depending on local callback
+    # replication from the original accepting gate.
+    callback_addr: tuple[str, int] | None = None
 
 
 @dataclass(slots=True)

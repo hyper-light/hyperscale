@@ -106,8 +106,12 @@ class GateLeadershipCoordinator:
             job_id=job_id,
             leader_id=node_id.full,
             leader_addr=node_addr,
+            term=fence_token,
+            workflow_count=target_dc_count,
             fence_token=fence_token,
             target_dc_count=target_dc_count,
+            callback_addr=callback_addr,
+            origin_gate_addr=node_addr,
         )
 
         # Send to all active peers

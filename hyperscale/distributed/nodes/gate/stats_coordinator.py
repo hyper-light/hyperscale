@@ -150,6 +150,7 @@ class GateStatsCoordinator:
             overall_rate=getattr(job, "overall_rate", 0.0),
             elapsed_seconds=getattr(job, "elapsed_seconds", 0.0),
             is_final=is_final,
+            callback_addr=callback,
         )
 
         push_data = push.dump()

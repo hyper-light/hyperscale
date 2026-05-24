@@ -409,6 +409,7 @@ class GateOrphanJobCoordinator:
                         overall_rate=getattr(job, "overall_rate", 0.0),
                         elapsed_seconds=getattr(job, "elapsed_seconds", 0.0),
                         is_final=True,
+                        callback_addr=callback,
                     )
                     await self._send_job_status_push_with_retry(
                         job_id,
