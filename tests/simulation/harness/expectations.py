@@ -33,6 +33,14 @@ class WorkloadObservations:
     workflow_result_per_dc_stats_counts: dict[str, int] = field(default_factory=dict)
     """workflow_name -> count of per-DC stats envelopes in final result."""
 
+    workflow_result_executed_counts: dict[str, int] = field(default_factory=dict)
+    """workflow_name -> summed top-level ``WorkflowStats.stats.executed`` count."""
+
+    workflow_result_per_dc_executed_counts: dict[str, int] = field(
+        default_factory=dict
+    )
+    """workflow_name -> summed per-DC ``WorkflowStats.stats.executed`` count."""
+
     status_update_count: int = 0
     """Total ``JobStatusPush`` callbacks received."""
 
@@ -142,10 +150,11 @@ class ExpectWorkflowTerminal:
 
 @dataclass(slots=True, frozen=True)
 class ExpectWorkflowStatsPresent:
-    """Every named workflow must deliver at least one final stats payload."""
+    """Every named workflow must deliver final stats with executed work."""
 
     expected_workflow_names: list[str]
     require_per_dc_stats: bool = False
+    minimum_executed: int = 1
     name: str = "ExpectWorkflowStatsPresent"
 
     def evaluate(self, observations: WorkloadObservations) -> ExpectationResult:
@@ -162,8 +171,28 @@ class ExpectWorkflowStatsPresent:
             and observations.workflow_result_per_dc_stats_counts.get(workflow_name, 0)
             <= 0
         )
+        missing_executed = sorted(
+            workflow_name
+            for workflow_name in expected
+            if observations.workflow_result_executed_counts.get(workflow_name, 0)
+            < self.minimum_executed
+        )
+        missing_per_dc_executed = sorted(
+            workflow_name
+            for workflow_name in expected
+            if self.require_per_dc_stats
+            and observations.workflow_result_per_dc_executed_counts.get(
+                workflow_name, 0
+            )
+            < self.minimum_executed
+        )
 
-        if not missing and not missing_per_dc:
+        if (
+            not missing
+            and not missing_per_dc
+            and not missing_executed
+            and not missing_per_dc_executed
+        ):
             return ExpectationResult(name=self.name, holds=True)
 
         parts: list[str] = []
@@ -171,6 +200,10 @@ class ExpectWorkflowStatsPresent:
             parts.append(f"missing_stats={missing}")
         if missing_per_dc:
             parts.append(f"missing_per_dc_stats={missing_per_dc}")
+        if missing_executed:
+            parts.append(f"missing_executed={missing_executed}")
+        if missing_per_dc_executed:
+            parts.append(f"missing_per_dc_executed={missing_per_dc_executed}")
 
         return ExpectationResult(
             name=self.name,

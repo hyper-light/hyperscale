@@ -461,6 +461,19 @@ class WorkloadDriver:
         # while execution runs.
         self._mark_running_if_dispatched()
 
+    def _workflow_stats_executed_count(self, workflow_stats: object) -> int:
+        if not isinstance(workflow_stats, dict):
+            return 0
+
+        stats_counts = workflow_stats.get("stats")
+        if not isinstance(stats_counts, dict):
+            return 0
+
+        executed_count = stats_counts.get("executed")
+        if isinstance(executed_count, int) and not isinstance(executed_count, bool):
+            return max(executed_count, 0)
+        return 0
+
     def _on_workflow_result(self, push: object) -> None:
         workflow_name = getattr(push, "workflow_name", None)
         status = getattr(push, "status", None)
@@ -471,8 +484,13 @@ class WorkloadDriver:
             self._observations.workflow_result_stats_counts[workflow_name] = len(
                 results
             )
+            self._observations.workflow_result_executed_counts[workflow_name] = sum(
+                self._workflow_stats_executed_count(result)
+                for result in results
+            )
         else:
             self._observations.workflow_result_stats_counts[workflow_name] = 0
+            self._observations.workflow_result_executed_counts[workflow_name] = 0
 
         per_dc_results = getattr(push, "per_dc_results", [])
         if isinstance(per_dc_results, list):
@@ -481,6 +499,19 @@ class WorkloadDriver:
                 for dc_result in per_dc_results
                 if getattr(dc_result, "stats", None) is not None
             )
+            self._observations.workflow_result_per_dc_executed_counts[
+                workflow_name
+            ] = sum(
+                self._workflow_stats_executed_count(
+                    getattr(dc_result, "stats", None)
+                )
+                for dc_result in per_dc_results
+            )
+        else:
+            self._observations.workflow_result_per_dc_stats_counts[workflow_name] = 0
+            self._observations.workflow_result_per_dc_executed_counts[
+                workflow_name
+            ] = 0
 
         # A final result implies the workflow ran to terminal state.
         self._mark_running_if_dispatched()

@@ -1037,6 +1037,22 @@ class RemoteGraphManager:
                     workflow.name,
                 )
 
+                import sys as _sys
+                _sys.stderr.write(
+                    f"[REMOTE-RUN wf_name={workflow.name} run_id={run_id}] "
+                    f"results_type={type(results).__name__} "
+                    f"results_len={len(results) if hasattr(results, '__len__') else 'n/a'} "
+                    f"results_keys={list(results.keys()) if hasattr(results, 'keys') else 'n/a'} "
+                    f"timeout_error={timeout_error!r}\n"
+                )
+                if hasattr(results, 'items'):
+                    for key, val in list(results.items())[:5]:
+                        _sys.stderr.write(
+                            f"[REMOTE-RUN-ITEM key={key!r}] val_type={type(val).__name__} "
+                            f"val_repr={repr(val)[:120]}\n"
+                        )
+                _sys.stderr.flush()
+
                 # Cleanup completion state
                 self._controller.cleanup_workflow_completion(run_id, workflow.name)
 
@@ -1065,7 +1081,20 @@ class RemoteGraphManager:
                     name="debug",
                 )
 
-                results = [result_set for _, result_set in results.values() if result_set is not None]
+                results = [
+                    result_set
+                    for _, result_set in results.values()
+                    if result_set is not None
+                ]
+                distributed_results = results if is_test_workflow else []
+                import sys as _sys
+                _sys.stderr.write(
+                    f"[REMOTE-RUN-FILTERED wf_name={workflow.name}] "
+                    f"results_type={type(results).__name__} "
+                    f"results_len={len(results)} "
+                    f"first_repr={repr(results[0])[:200] if results else 'empty'}\n"
+                )
+                _sys.stderr.flush()
 
                 if is_test_workflow and len(results) > 1:
                     await ctx.log_prepared(
@@ -1089,7 +1118,7 @@ class RemoteGraphManager:
                     ).pop()
 
                 elif len(results) > 0:
-                    execution_result = results.pop()
+                    execution_result = results[-1]
 
                 else:
                     await ctx.log_prepared(
@@ -1119,7 +1148,7 @@ class RemoteGraphManager:
                 if skip_reporting:
                     return (
                         workflow.name,
-                        results,
+                        distributed_results,
                         updated_context,
                         timeout_error,
                     )

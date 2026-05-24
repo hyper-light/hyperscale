@@ -299,6 +299,16 @@ class WorkerWorkflowExecutor:
                 max(allocated_cores, 1),
             )
 
+            import sys as _sys
+            _sys.stderr.write(
+                f"[WORKER-EXECUTE wf_name={workflow.name} wf_id={dispatch.workflow_id[:20]}] "
+                f"results_type={type(workflow_results).__name__} "
+                f"results_len={len(workflow_results) if hasattr(workflow_results, '__len__') else 'n/a'} "
+                f"results_repr={repr(workflow_results)[:200]} "
+                f"status={status} error={error!r}\n"
+            )
+            _sys.stderr.flush()
+
             progress.cores_completed = len(progress.assigned_cores)
 
             # Phase 3: Determine final status
