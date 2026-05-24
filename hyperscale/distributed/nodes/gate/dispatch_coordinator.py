@@ -16,6 +16,7 @@ from hyperscale.distributed.models import (
     JobSubmission,
     JobAck,
     JobStatus,
+    JobStatusPush,
     GlobalJobStatus,
 )
 from hyperscale.distributed.capacity import (
@@ -193,6 +194,74 @@ class GateDispatchCoordinator:
         else:
             self._pop_lease_renewal_token(job_id)
         await self._job_lease_manager.release(job_id)
+
+    async def _push_job_status_to_client(
+        self,
+        job_id: str,
+        status: str,
+        message: str,
+        *,
+        is_final: bool = False,
+    ) -> None:
+        """Push a gate-owned job status update to the client callback."""
+        callback = self._job_manager.get_callback(job_id)
+        if callback is None:
+            return
+
+        job = self._job_manager.get_job(job_id)
+        elapsed_seconds = 0.0
+        total_completed = 0
+        total_failed = 0
+        overall_rate = 0.0
+        if job is not None:
+            if job.timestamp > 0:
+                elapsed_seconds = max(0.0, time.monotonic() - job.timestamp)
+            total_completed = job.total_completed
+            total_failed = job.total_failed
+            overall_rate = job.overall_rate
+
+        push = JobStatusPush(
+            job_id=job_id,
+            status=status,
+            message=message,
+            total_completed=total_completed,
+            total_failed=total_failed,
+            overall_rate=overall_rate,
+            elapsed_seconds=elapsed_seconds,
+            is_final=is_final,
+            fence_token=self._job_manager.get_fence_token(job_id),
+        )
+        payload = push.dump()
+        sequence = await self._state.record_client_update(
+            job_id,
+            "job_status_push",
+            payload,
+        )
+
+        try:
+            response, _ = await self._send_tcp(
+                callback,
+                "job_status_push",
+                payload,
+                timeout=5.0,
+            )
+            if isinstance(response, Exception):
+                raise response
+            if response not in (b"ok", None):
+                raise RuntimeError(f"status push rejected: {response!r}")
+            await self._state.set_client_update_position(job_id, callback, sequence)
+        except Exception as error:
+            await self._logger.log(
+                ServerWarning(
+                    message=(
+                        f"Failed to push gate status {status} for "
+                        f"{job_id[:8]}... to client {callback}: {error}"
+                    ),
+                    node_host=self._get_node_host(),
+                    node_port=self._get_node_port(),
+                    node_id=self._get_node_id_short(),
+                )
+            )
 
     async def _renew_job_lease(self, job_id: str, lease_duration: float) -> None:
         renewal_interval = max(1.0, lease_duration * 0.5)
@@ -501,6 +570,11 @@ class GateDispatchCoordinator:
         job.status = JobStatus.DISPATCHING.value
         self._job_manager.set_job(submission.job_id, job)
         self._increment_version()
+        await self._push_job_status_to_client(
+            submission.job_id,
+            JobStatus.DISPATCHING.value,
+            "Job dispatching",
+        )
 
         primary_dcs, fallback_dcs, worst_health = self._select_datacenters(
             len(target_dcs),
@@ -510,6 +584,7 @@ class GateDispatchCoordinator:
 
         if worst_health == "initializing":
             job.status = JobStatus.PENDING.value
+            self._job_manager.set_job(submission.job_id, job)
             self._task_runner.run(
                 self._logger.log,
                 ServerWarning(
@@ -519,11 +594,18 @@ class GateDispatchCoordinator:
                     node_id=self._get_node_id_short(),
                 ),
             )
+            self._increment_version()
+            await self._push_job_status_to_client(
+                submission.job_id,
+                JobStatus.PENDING.value,
+                "Datacenters initializing",
+            )
             return
 
         if worst_health == "unhealthy":
             job.status = JobStatus.FAILED.value
             job.failed_datacenters = len(target_dcs)
+            self._job_manager.set_job(submission.job_id, job)
             self._quorum_circuit.record_error()
 
             if self._record_dispatch_failure:
@@ -540,6 +622,12 @@ class GateDispatchCoordinator:
                 ),
             )
             self._increment_version()
+            await self._push_job_status_to_client(
+                submission.job_id,
+                JobStatus.FAILED.value,
+                "All datacenters are unhealthy",
+                is_final=True,
+            )
             return
 
         if worst_health == "degraded":
@@ -573,6 +661,7 @@ class GateDispatchCoordinator:
             self._quorum_circuit.record_error()
             job.status = JobStatus.FAILED.value
             job.failed_datacenters = len(failed_dcs)
+            self._job_manager.set_job(submission.job_id, job)
             self._task_runner.run(
                 self._logger.log,
                 ServerError(
@@ -587,6 +676,7 @@ class GateDispatchCoordinator:
             job.status = JobStatus.RUNNING.value
             job.completed_datacenters = 0
             job.failed_datacenters = len(failed_dcs)
+            self._job_manager.set_job(submission.job_id, job)
 
             if failed_dcs:
                 self._task_runner.run(
@@ -606,6 +696,19 @@ class GateDispatchCoordinator:
             )
 
         self._increment_version()
+        if successful_dcs:
+            await self._push_job_status_to_client(
+                submission.job_id,
+                JobStatus.RUNNING.value,
+                "Job started",
+            )
+        else:
+            await self._push_job_status_to_client(
+                submission.job_id,
+                JobStatus.FAILED.value,
+                "Failed to dispatch to any datacenter",
+                is_final=True,
+            )
 
     def _evaluate_spillover(
         self,

@@ -765,10 +765,12 @@ class GateServer(HealthAwareServer):
             versioned_clock=self._versioned_clock,
             manager_dispatcher=self._manager_dispatcher,
             manager_health_config=self._manager_health_config,
+            datacenter_managers=self._datacenter_managers,
             get_node_id=lambda: self._node_id,
             get_host=lambda: self._host,
             get_tcp_port=lambda: self._tcp_port,
             confirm_manager_for_dc=self._confirm_manager_for_dc,
+            record_manager_heartbeat=self._record_manager_heartbeat,
             capacity_aggregator=self._capacity_aggregator,
             on_partition_healed=self._on_partition_healed,
             on_partition_detected=self._on_partition_detected,
@@ -879,6 +881,7 @@ class GateServer(HealthAwareServer):
             broadcast_manager_discovery=self._broadcast_manager_discovery,
             send_tcp=self._send_tcp,
             get_progress_callback=self._get_progress_callback_for_job,
+            ingest_manager_heartbeat=self._ingest_manager_heartbeat,
         )
 
         self._cancellation_handler = GateCancellationHandler(
@@ -1223,10 +1226,36 @@ class GateServer(HealthAwareServer):
         clock_time: int,
     ):
         """Handle job submission from client."""
+        from hyperscale.logging.hyperscale_logging_models import ServerError
+        await self._udp_logger.log(
+            ServerError(
+                message=(
+                    f"[L3-HOP1 gate.job_submission] client_addr={addr} "
+                    f"has_job_handler={self._job_handler is not None} "
+                    f"active_peer_count="
+                    f"{self._modular_state.get_active_peer_count()}"
+                ),
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
         if self._job_handler:
-            return await self._job_handler.handle_submission(
+            result = await self._job_handler.handle_submission(
                 addr, data, self._modular_state.get_active_peer_count()
             )
+            await self._udp_logger.log(
+                ServerError(
+                    message=(
+                        f"[L3-HOP1-DONE gate.job_submission] client_addr={addr} "
+                        f"result_len={len(result) if result else 0}"
+                    ),
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            return result
         return b"error"
 
     @tcp.receive()
@@ -2135,7 +2164,17 @@ class GateServer(HealthAwareServer):
 
             for attempt in range(max_retries):
                 try:
-                    await self._send_tcp(callback, "job_status_push", data)
+                    response, _ = await self._send_tcp(
+                        callback,
+                        "job_status_push",
+                        data,
+                    )
+                    if isinstance(response, Exception):
+                        raise response
+                    if response not in (b"ok", None):
+                        raise RuntimeError(
+                            f"job_status_push rejected with {response!r}"
+                        )
                     await self._modular_state.set_client_update_position(
                         job_id,
                         callback,
@@ -2223,12 +2262,18 @@ class GateServer(HealthAwareServer):
         last_error: Exception | None = None
         for attempt in range(GateStatsCoordinator.CALLBACK_PUSH_MAX_RETRIES):
             try:
-                await self._send_tcp(
+                response, _ = await self._send_tcp(
                     callback,
                     message_type,
                     payload,
                     timeout=timeout,
                 )
+                if isinstance(response, Exception):
+                    raise response
+                if response not in (b"ok", None):
+                    raise RuntimeError(
+                        f"{message_type} rejected with {response!r}"
+                    )
                 await self._modular_state.set_client_update_position(
                     job_id,
                     callback,
@@ -3132,13 +3177,28 @@ class GateServer(HealthAwareServer):
         heartbeat: ManagerHeartbeat,
         source_addr: tuple[str, int],
     ) -> None:
-        self._capacity_aggregator.record_heartbeat(heartbeat)
-
         if self._health_coordinator:
             await self._health_coordinator.handle_embedded_manager_heartbeat(
                 heartbeat,
                 source_addr,
             )
+
+    async def _ingest_manager_heartbeat(
+        self,
+        heartbeat: ManagerHeartbeat,
+        source_addr: tuple[str, int],
+        manager_addr: tuple[str, int] | None = None,
+        *,
+        use_version_clock: bool = True,
+    ) -> tuple[str, tuple[str, int]] | None:
+        if self._health_coordinator is None:
+            return None
+        return await self._health_coordinator.ingest_manager_heartbeat(
+            heartbeat,
+            source_addr,
+            manager_addr,
+            use_version_clock=use_version_clock,
+        )
 
     async def _handle_gate_peer_heartbeat(
         self,

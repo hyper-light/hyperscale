@@ -75,6 +75,9 @@ class GateManagerHandler:
         broadcast_manager_discovery: Callable,
         send_tcp: Callable | None = None,
         get_progress_callback: Callable[[str], tuple[str, int] | None] | None = None,
+        ingest_manager_heartbeat: Callable[
+            ..., Awaitable[tuple[str, tuple[str, int]] | None]
+        ] | None = None,
     ) -> None:
         """
         Initialize the manager handler.
@@ -98,6 +101,7 @@ class GateManagerHandler:
             broadcast_manager_discovery: Callback to broadcast discovery
             send_tcp: Callback to send TCP messages
             get_progress_callback: Callback to get client callback for a job
+            ingest_manager_heartbeat: Canonical manager heartbeat ingestion callback
         """
         self._state: GateRuntimeState = state
         self._logger: Logger = logger
@@ -129,6 +133,9 @@ class GateManagerHandler:
         self._get_progress_callback: Callable[
             [str], tuple[str, int] | None
         ] | None = get_progress_callback
+        self._ingest_manager_heartbeat: Callable[
+            ..., Awaitable[tuple[str, tuple[str, int]] | None]
+        ] | None = ingest_manager_heartbeat
 
     async def handle_status_update(
         self,
@@ -156,13 +163,7 @@ class GateManagerHandler:
             datacenter_id = status.datacenter
             manager_addr = (status.tcp_host, status.tcp_port)
 
-            await self._state.update_manager_status(
-                datacenter_id, manager_addr, status, time.monotonic()
-            )
-
-            self._record_manager_heartbeat(
-                datacenter_id, manager_addr, status.node_id, status.version
-            )
+            await self._record_heartbeat_canonically(status, addr, manager_addr)
 
             if status.backpressure_level > 0 or status.backpressure_delay_ms > 0:
                 backpressure_signal = BackpressureSignal(
@@ -180,6 +181,40 @@ class GateManagerHandler:
         except Exception as error:
             await handle_exception(error, "manager_status_update")
             return b"error"
+
+    async def _record_heartbeat_canonically(
+        self,
+        heartbeat: ManagerHeartbeat,
+        source_addr: tuple[str, int],
+        manager_addr: tuple[str, int],
+        *,
+        use_version_clock: bool = True,
+    ) -> None:
+        if self._ingest_manager_heartbeat is not None:
+            await self._ingest_manager_heartbeat(
+                heartbeat,
+                source_addr,
+                manager_addr,
+                use_version_clock=use_version_clock,
+            )
+            return
+
+        datacenter_id = heartbeat.datacenter
+        await self._state.update_manager_status(
+            datacenter_id,
+            manager_addr,
+            heartbeat,
+            time.monotonic(),
+        )
+        self._record_manager_heartbeat(
+            datacenter_id,
+            manager_addr,
+            heartbeat.node_id,
+            heartbeat.version,
+        )
+        managers = self._datacenter_managers.setdefault(datacenter_id, [])
+        if manager_addr not in managers:
+            managers.append(manager_addr)
 
     async def handle_register(
         self,
@@ -366,21 +401,7 @@ class GateManagerHandler:
 
             self._state._manager_negotiated_caps[manager_addr] = negotiated
 
-            if datacenter_id not in self._state._datacenter_manager_status:
-                self._state._datacenter_manager_status[datacenter_id] = {}
-            self._state._datacenter_manager_status[datacenter_id][manager_addr] = (
-                heartbeat
-            )
-            self._state._manager_last_status[manager_addr] = time.monotonic()
-
-            if datacenter_id not in self._datacenter_managers:
-                self._datacenter_managers[datacenter_id] = []
-            if manager_addr not in self._datacenter_managers[datacenter_id]:
-                self._datacenter_managers[datacenter_id].append(manager_addr)
-
-            self._record_manager_heartbeat(
-                datacenter_id, manager_addr, heartbeat.node_id, heartbeat.version
-            )
+            await self._record_heartbeat_canonically(heartbeat, addr, manager_addr)
 
             if heartbeat.backpressure_level > 0 or heartbeat.backpressure_delay_ms > 0:
                 backpressure_signal = BackpressureSignal(
@@ -463,20 +484,14 @@ class GateManagerHandler:
             datacenter_id = broadcast.datacenter
             manager_addr = tuple(broadcast.manager_tcp_addr)
 
+            if broadcast.manager_udp_addr:
+                dc_udp = datacenter_manager_udp.setdefault(datacenter_id, [])
+                udp_addr = tuple(broadcast.manager_udp_addr)
+                if udp_addr not in dc_udp:
+                    dc_udp.append(udp_addr)
+
             dc_managers = self._datacenter_managers.setdefault(datacenter_id, [])
-            dc_manager_status = self._state._datacenter_manager_status.setdefault(
-                datacenter_id, {}
-            )
-
             if manager_addr not in dc_managers:
-                dc_managers.append(manager_addr)
-
-                if broadcast.manager_udp_addr:
-                    dc_udp = datacenter_manager_udp.setdefault(datacenter_id, [])
-                    udp_addr = tuple(broadcast.manager_udp_addr)
-                    if udp_addr not in dc_udp:
-                        dc_udp.append(udp_addr)
-
                 self._task_runner.run(
                     self._logger.log,
                     ServerInfo(
@@ -499,10 +514,16 @@ class GateManagerHandler:
                 healthy_worker_count=broadcast.healthy_worker_count,
                 available_cores=broadcast.available_cores,
                 total_cores=broadcast.total_cores,
+                tcp_host=manager_addr[0],
+                tcp_port=manager_addr[1],
                 state="active",
             )
-            dc_manager_status[manager_addr] = synthetic_heartbeat
-            self._state._manager_last_status[manager_addr] = time.monotonic()
+            await self._record_heartbeat_canonically(
+                synthetic_heartbeat,
+                addr,
+                manager_addr,
+                use_version_clock=False,
+            )
 
             return b"ok"
 

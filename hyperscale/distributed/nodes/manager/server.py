@@ -1572,12 +1572,18 @@ class ManagerServer(HealthAwareServer):
         )
 
         try:
-            await self._send_to_peer(
+            response = await self._send_to_peer(
                 origin_gate_addr,
                 "job_status_push_forward",
                 push.dump(),
                 timeout=2.0,
             )
+            if isinstance(response, Exception):
+                raise response
+            if response not in (b"ok", b"forwarded", None):
+                raise RuntimeError(
+                    f"job_status_push_forward rejected with {response!r}"
+                )
         except Exception as error:
             await self._udp_logger.log(
                 ServerWarning(
@@ -2491,12 +2497,16 @@ class ManagerServer(HealthAwareServer):
         stats_push.datacenter = self._node_id.datacenter
 
         try:
-            await self._send_to_peer(
+            response = await self._send_to_peer(
                 origin_gate_addr,
                 "windowed_stats_push",
                 stats_push.dump(),
                 timeout=self._config.tcp_timeout_short_seconds,
             )
+            if isinstance(response, Exception):
+                raise response
+            if response not in (b"ok", b"discarded", None):
+                raise RuntimeError(f"windowed_stats_push rejected with {response!r}")
         except Exception as error:
             await self._udp_logger.log(
                 ServerWarning(
@@ -3910,6 +3920,44 @@ class ManagerServer(HealthAwareServer):
 
         return None
 
+    async def _send_job_update_to_origin(
+        self,
+        job_id: str,
+        callback_addr: tuple[str, int] | None,
+        gate_method: str,
+        client_method: str,
+        payload: bytes,
+        timeout: float = 5.0,
+    ) -> tuple[str, tuple[str, int]] | None:
+        """Send a job update through the origin gate when one owns the job."""
+        origin_gate_addr = self._manager_state.get_job_origin_gate(job_id)
+        if origin_gate_addr is not None:
+            destination = tuple(origin_gate_addr)
+            response = await self._send_to_peer(
+                destination,
+                gate_method,
+                payload,
+                timeout=timeout,
+            )
+            method = gate_method
+        else:
+            if callback_addr is None:
+                return None
+            destination = tuple(callback_addr)
+            response = await self._send_to_client(
+                destination,
+                client_method,
+                payload,
+                timeout=timeout,
+            )
+            method = client_method
+
+        if isinstance(response, Exception):
+            raise response
+        if response not in (b"ok", b"forwarded", None):
+            raise RuntimeError(f"{method} rejected update with {response!r}")
+        return method, destination
+
     async def _push_job_status_to_client(
         self,
         job_id: str,
@@ -3930,7 +3978,7 @@ class ManagerServer(HealthAwareServer):
         callback_addr = self._manager_state.get_job_callback(job_id)
         if not callback_addr:
             callback_addr = self._manager_state.get_client_callback(job_id)
-        if not callback_addr:
+        if not callback_addr and not self._manager_state.get_job_origin_gate(job_id):
             return
         if isinstance(callback_addr, list):
             callback_addr = tuple(callback_addr)
@@ -3953,8 +4001,10 @@ class ManagerServer(HealthAwareServer):
             fence_token=self._leases.get_fence_token(job_id),
         )
         try:
-            await self._send_to_client(
+            await self._send_job_update_to_origin(
+                job_id,
                 callback_addr,
+                "job_status_push_forward",
                 "job_status_push",
                 push.dump(),
                 timeout=5.0,
@@ -4242,12 +4292,17 @@ class ManagerServer(HealthAwareServer):
         for push in workflow_pushes:
             callback_addr = self._manager_state.get_job_callback(push.job_id)
             if not callback_addr:
-                continue
+                callback_addr = self._manager_state.get_client_callback(push.job_id)
+            if not callback_addr:
+                if not self._manager_state.get_job_origin_gate(push.job_id):
+                    continue
             if isinstance(callback_addr, list):
                 callback_addr = tuple(callback_addr)
             try:
-                await self._send_to_client(
+                await self._send_job_update_to_origin(
+                    push.job_id,
                     callback_addr,
+                    "workflow_result_push",
                     "workflow_result_push",
                     push.dump(),
                     timeout=5.0,
@@ -5056,7 +5111,10 @@ class ManagerServer(HealthAwareServer):
     ) -> None:
         callback_addr = self._manager_state.get_job_callback(result.job_id)
         if not callback_addr:
-            return
+            callback_addr = self._manager_state.get_client_callback(result.job_id)
+        if not callback_addr:
+            if not self._manager_state.get_job_origin_gate(result.job_id):
+                return
         if isinstance(callback_addr, list):
             callback_addr = tuple(callback_addr)
         # The aggregate computed across every sub-workflow is the
@@ -5084,8 +5142,10 @@ class ManagerServer(HealthAwareServer):
             completed_at=time.time(),
         )
         try:
-            await self._send_to_client(
+            await self._send_job_update_to_origin(
+                result.job_id,
                 callback_addr,
+                "workflow_result_push",
                 "workflow_result_push",
                 push.dump(),
                 timeout=5.0,
@@ -5129,9 +5189,12 @@ class ManagerServer(HealthAwareServer):
 
         for job_id, workflow_id, workflow_name, error in failed_workflows:
             callback_addr = self._manager_state.get_job_callback(job_id)
-            if callback_addr:
-                if isinstance(callback_addr, list):
-                    callback_addr = tuple(callback_addr)
+            if not callback_addr:
+                callback_addr = self._manager_state.get_client_callback(job_id)
+            if callback_addr or self._manager_state.get_job_origin_gate(job_id):
+                normalized_callback_addr = (
+                    tuple(callback_addr) if callback_addr is not None else None
+                )
                 push = WorkflowResultPush(
                     job_id=job_id,
                     workflow_id=workflow_id,
@@ -5145,8 +5208,10 @@ class ManagerServer(HealthAwareServer):
                     completed_at=time.time(),
                 )
                 try:
-                    await self._send_to_client(
-                        callback_addr,
+                    await self._send_job_update_to_origin(
+                        job_id,
+                        normalized_callback_addr,
+                        "workflow_result_push",
                         "workflow_result_push",
                         push.dump(),
                         timeout=5.0,
@@ -5155,7 +5220,7 @@ class ManagerServer(HealthAwareServer):
                     await self._udp_logger.log(
                         ServerWarning(
                             message=(
-                                "Failed to push no-worker workflow failure to client: "
+                                "Failed to push no-worker workflow failure to origin: "
                                 f"{send_error}"
                             ),
                             node_host=self._host,
@@ -7898,9 +7963,13 @@ class ManagerServer(HealthAwareServer):
         )
 
         try:
-            await self._send_to_peer(
+            response = await self._send_to_peer(
                 origin_gate_addr, "job_final_result", final_result.dump(), timeout=5.0
             )
+            if isinstance(response, Exception):
+                raise response
+            if response not in (b"ok", b"duplicate", b"forwarded", None):
+                raise RuntimeError(f"job_final_result rejected with {response!r}")
         except Exception as send_error:
             await self._udp_logger.log(
                 ServerWarning(

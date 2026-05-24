@@ -116,6 +116,7 @@ class WorkloadDriver:
                     reason=f"workload waited for DC {dc} leader; never arrived"
                 ),
             )
+        await self._wait_for_l3_routing_ready()
         self._client = HyperscaleClient(
             host=self.harness.spec.host,
             port=self.client_port,
@@ -178,6 +179,7 @@ class WorkloadDriver:
             raise HarnessError(
                 f"SubmissionPattern {self.spec.pattern} not yet supported in Phase 2"
             )
+        await self._raise_submit_errors_if_any()
 
     async def wait_until_running(self, timeout: float = 30.0) -> None:
         """Block until at least one submitted job reaches a dispatched
@@ -201,6 +203,19 @@ class WorkloadDriver:
         try:
             await asyncio.wait_for(self._running_event.wait(), timeout=timeout)
         except asyncio.TimeoutError:
+            # Print state directly so pytest captures it even when its
+            # diagnostic-dump pipeline elides the substituted f-string.
+            # Critical for L3 path debugging where the submission may
+            # have succeeded (job_id captured) but the reverse status
+            # push never reached the client.
+            print(
+                f"[WAIT-RUNNING-TIMEOUT] "
+                f"submitted_jobs={self._observations.submitted_job_ids} "
+                f"submit_errors={self._observations.submit_errors} "
+                f"status_update_count={self._observations.status_update_count} "
+                f"progress_update_count={self._observations.progress_update_count}",
+                flush=True,
+            )
             await self.harness.dump_diagnostics(
                 reason=(
                     f"workload waited {timeout:.1f}s for first workflow "
@@ -320,6 +335,79 @@ class WorkloadDriver:
             self._observations.submit_errors.append(
                 f"{type(submit_error).__name__}: {submit_error}"
             )
+
+    async def _raise_submit_errors_if_any(self) -> None:
+        if self._observations.submit_errors:
+            await self.harness.dump_diagnostics(
+                reason=(
+                    "workload submission failed: "
+                    f"{self._observations.submit_errors}"
+                )
+            )
+            raise HarnessError(
+                "workload submission failed: "
+                f"{self._observations.submit_errors}"
+            )
+
+        if not self._observations.submitted_job_ids:
+            await self.harness.dump_diagnostics(
+                reason="workload submission produced no job ids"
+            )
+            raise HarnessError("workload submission produced no job ids")
+
+    async def _wait_for_l3_routing_ready(self) -> None:
+        gates = self.harness.gates
+        if not gates:
+            return
+
+        await wait_until(
+            self._l3_routing_ready,
+            timeout=30.0,
+            poll=0.5,
+            description="L3 gate routing ready",
+            on_fail=lambda: self.harness.dump_diagnostics(
+                reason="workload waited for L3 gate routing readiness"
+            ),
+            failure_detail=self._l3_routing_snapshot,
+        )
+
+    def _l3_routing_ready(self) -> bool:
+        for gate in self.harness.gates:
+            if not gate.started:
+                return False
+            if not self._gate_has_usable_datacenter(gate):
+                return False
+        return True
+
+    def _gate_has_usable_datacenter(self, gate: "ServerHandle") -> bool:
+        candidates = gate.instance._get_datacenter_candidates_for_router()
+        return any(
+            candidate.health_bucket in {"HEALTHY", "BUSY"}
+            and candidate.total_managers > 0
+            and candidate.healthy_managers > 0
+            for candidate in candidates
+        )
+
+    def _l3_routing_snapshot(self) -> str:
+        snapshots: list[str] = []
+        for gate in self.harness.gates:
+            try:
+                candidates = gate.instance._get_datacenter_candidates_for_router()
+                candidate_summary = [
+                    {
+                        "dc": candidate.datacenter_id,
+                        "health": candidate.health_bucket,
+                        "total_mgrs": candidate.total_managers,
+                        "healthy_mgrs": candidate.healthy_managers,
+                        "cores": candidate.available_cores,
+                        "total_cores": candidate.total_cores,
+                    }
+                    for candidate in candidates
+                ]
+            except Exception as error:
+                candidate_summary = [{"error": f"{type(error).__name__}: {error}"}]
+            snapshots.append(f"{gate.node_id}={candidate_summary}")
+        return "L3 routing candidates: " + "; ".join(snapshots)
 
     async def _wait_for_completion(self) -> None:
         budget = max(s.timeout_seconds for s in self.spec.submissions)

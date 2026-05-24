@@ -69,10 +69,12 @@ class GateHealthCoordinator:
         versioned_clock: "VersionedStateClock",
         manager_dispatcher: "ManagerDispatcher",
         manager_health_config: "ManagerHealthConfig",
+        datacenter_managers: dict[str, list[tuple[str, int]]],
         get_node_id: Callable[[], "NodeId"],
         get_host: Callable[[], str],
         get_tcp_port: Callable[[], int],
         confirm_manager_for_dc: Callable[[str, tuple[str, int]], "asyncio.Task"],
+        record_manager_heartbeat: Callable[[str, tuple[str, int], str, int], None],
         capacity_aggregator: DatacenterCapacityAggregator | None = None,
         on_partition_healed: Callable[[list[str]], None] | None = None,
         on_partition_detected: Callable[[list[str]], None] | None = None,
@@ -87,12 +89,18 @@ class GateHealthCoordinator:
         self._versioned_clock: "VersionedStateClock" = versioned_clock
         self._manager_dispatcher: "ManagerDispatcher" = manager_dispatcher
         self._manager_health_config: "ManagerHealthConfig" = manager_health_config
+        self._datacenter_managers: dict[str, list[tuple[str, int]]] = (
+            datacenter_managers
+        )
         self._get_node_id: Callable[[], "NodeId"] = get_node_id
         self._get_host: Callable[[], str] = get_host
         self._get_tcp_port: Callable[[], int] = get_tcp_port
         self._confirm_manager_for_dc: Callable[
             [str, tuple[str, int]], "asyncio.Task"
         ] = confirm_manager_for_dc
+        self._record_manager_heartbeat: Callable[
+            [str, tuple[str, int], str, int], None
+        ] = record_manager_heartbeat
         self._capacity_aggregator: DatacenterCapacityAggregator | None = (
             capacity_aggregator
         )
@@ -125,37 +133,145 @@ class GateHealthCoordinator:
             heartbeat: Received manager heartbeat
             source_addr: UDP source address of the heartbeat
         """
-        dc_key = f"dc:{heartbeat.datacenter}"
-        if await self._versioned_clock.is_entity_stale(dc_key, heartbeat.version):
-            return
+        await self.ingest_manager_heartbeat(heartbeat, source_addr)
 
+    async def ingest_manager_heartbeat(
+        self,
+        heartbeat: ManagerHeartbeat,
+        source_addr: tuple[str, int],
+        manager_addr: tuple[str, int] | None = None,
+        *,
+        use_version_clock: bool = True,
+    ) -> tuple[str, tuple[str, int]] | None:
+        """Ingest a manager heartbeat into every gate-side health store.
+
+        Manager heartbeats arrive through TCP status updates, TCP
+        registration, peer-gate discovery, and SWIM piggyback data. All
+        paths must update the same canonical stores or routing sees
+        contradictory state: capacity can look available while the
+        datacenter health manager still has zero managers.
+        """
         datacenter_id = heartbeat.datacenter
-        manager_addr = (
-            (heartbeat.tcp_host, heartbeat.tcp_port)
-            if heartbeat.tcp_host
-            else source_addr
+        resolved_manager_addr = manager_addr or self._resolve_manager_addr(
+            heartbeat, source_addr
+        )
+        version_key = self._manager_version_key(heartbeat, resolved_manager_addr)
+
+        if use_version_clock and await self._is_older_manager_version(
+            version_key, heartbeat.version
+        ):
+            return None
+
+        self._ensure_manager_known(datacenter_id, resolved_manager_addr)
+        await self._state.update_manager_status(
+            datacenter_id,
+            resolved_manager_addr,
+            heartbeat,
+            time.monotonic(),
         )
 
-        if datacenter_id not in self._state._datacenter_manager_status:
-            self._state._datacenter_manager_status[datacenter_id] = {}
-        self._state._datacenter_manager_status[datacenter_id][manager_addr] = heartbeat
-        self._state._manager_last_status[manager_addr] = time.monotonic()
+        if self._capacity_aggregator is not None:
+            self._capacity_aggregator.record_heartbeat(heartbeat)
 
-        if datacenter_id in self._dc_manager_discovery:
-            discovery = self._dc_manager_discovery[datacenter_id]
-            peer_id = (
-                heartbeat.node_id
-                if heartbeat.node_id
-                else f"{manager_addr[0]}:{manager_addr[1]}"
-            )
-            discovery.add_peer(
-                peer_id=peer_id,
-                host=manager_addr[0],
-                port=manager_addr[1],
-                role="manager",
-                datacenter_id=datacenter_id,
+        self._record_manager_heartbeat(
+            datacenter_id,
+            resolved_manager_addr,
+            heartbeat.node_id,
+            heartbeat.version,
+        )
+        self._add_manager_to_discovery(
+            datacenter_id,
+            resolved_manager_addr,
+            heartbeat.node_id,
+        )
+        await self._update_manager_health_state(
+            datacenter_id,
+            resolved_manager_addr,
+            heartbeat,
+        )
+
+        self._task_runner.run(
+            self._confirm_manager_for_dc,
+            datacenter_id,
+            resolved_manager_addr,
+        )
+        self._dc_health_manager.update_manager(
+            datacenter_id,
+            resolved_manager_addr,
+            heartbeat,
+        )
+
+        if heartbeat.is_leader:
+            self._manager_dispatcher.set_leader(
+                datacenter_id,
+                resolved_manager_addr,
             )
 
+        self._record_cross_dc_signals(datacenter_id, heartbeat)
+        if use_version_clock:
+            await self._versioned_clock.update_entity(version_key, heartbeat.version)
+
+        return datacenter_id, resolved_manager_addr
+
+    def _resolve_manager_addr(
+        self,
+        heartbeat: ManagerHeartbeat,
+        source_addr: tuple[str, int],
+    ) -> tuple[str, int]:
+        if heartbeat.tcp_host and heartbeat.tcp_port > 0:
+            return (heartbeat.tcp_host, heartbeat.tcp_port)
+        return source_addr
+
+    def _manager_version_key(
+        self,
+        heartbeat: ManagerHeartbeat,
+        manager_addr: tuple[str, int],
+    ) -> str:
+        if heartbeat.node_id and not heartbeat.node_id.startswith("discovered-via-"):
+            return f"mgr:{heartbeat.node_id}"
+        return f"mgr:{manager_addr[0]}:{manager_addr[1]}"
+
+    async def _is_older_manager_version(
+        self,
+        version_key: str,
+        incoming_version: int,
+    ) -> bool:
+        current_version = await self._versioned_clock.get_entity_version(version_key)
+        return current_version is not None and incoming_version < current_version
+
+    def _ensure_manager_known(
+        self,
+        datacenter_id: str,
+        manager_addr: tuple[str, int],
+    ) -> None:
+        managers = self._datacenter_managers.setdefault(datacenter_id, [])
+        if manager_addr not in managers:
+            managers.append(manager_addr)
+
+    def _add_manager_to_discovery(
+        self,
+        datacenter_id: str,
+        manager_addr: tuple[str, int],
+        node_id: str,
+    ) -> None:
+        discovery = self._dc_manager_discovery.get(datacenter_id)
+        if discovery is None:
+            return
+        peer_id = node_id or f"{manager_addr[0]}:{manager_addr[1]}"
+        discovery.add_peer(
+            peer_id=peer_id,
+            host=manager_addr[0],
+            port=manager_addr[1],
+            role="manager",
+            datacenter_id=datacenter_id,
+        )
+
+    async def _update_manager_health_state(
+        self,
+        datacenter_id: str,
+        manager_addr: tuple[str, int],
+        heartbeat: ManagerHeartbeat,
+    ) -> None:
         manager_key = (datacenter_id, manager_addr)
         health_state = self._state._manager_health.get(manager_key)
         if not health_state:
@@ -166,20 +282,29 @@ class GateHealthCoordinator:
             )
             self._state._manager_health[manager_key] = health_state
 
+        has_quorum = getattr(
+            heartbeat,
+            "health_has_quorum",
+            getattr(heartbeat, "has_quorum", True),
+        )
+        accepting_jobs = getattr(
+            heartbeat,
+            "health_accepting_jobs",
+            getattr(heartbeat, "accepting_jobs", True),
+        )
+
         await health_state.update_liveness_async(success=True)
         await health_state.update_readiness_async(
-            has_quorum=heartbeat.has_quorum,
-            accepting=heartbeat.accepting_jobs,
+            has_quorum=has_quorum,
+            accepting=accepting_jobs,
             worker_count=heartbeat.healthy_worker_count,
         )
 
-        self._task_runner.run(self._confirm_manager_for_dc, datacenter_id, manager_addr)
-
-        self._dc_health_manager.update_manager(datacenter_id, manager_addr, heartbeat)
-
-        if heartbeat.is_leader:
-            self._manager_dispatcher.set_leader(datacenter_id, manager_addr)
-
+    def _record_cross_dc_signals(
+        self,
+        datacenter_id: str,
+        heartbeat: ManagerHeartbeat,
+    ) -> None:
         if heartbeat.workers_with_extensions > 0:
             self._cross_dc_correlation.record_extension(
                 datacenter_id=datacenter_id,
@@ -193,22 +318,13 @@ class GateHealthCoordinator:
                 lhm_score=heartbeat.lhm_score,
                 node_type="manager",
             )
-        # AD-19 addendum (Phase D): worker-tier LHM aggregated by the
-        # manager and gossiped through ManagerHeartbeat. Feed it into
-        # cross_dc_correlation so a saturated worker fleet shows up
-        # as DC stress alongside the manager-tier signal.
-        if (
-            getattr(heartbeat, "worker_max_lhm_score", 0) > 0
-        ):
+        worker_lhm_score = getattr(heartbeat, "worker_max_lhm_score", 0)
+        if worker_lhm_score > 0:
             self._cross_dc_correlation.record_lhm_score(
                 datacenter_id=datacenter_id,
-                lhm_score=heartbeat.worker_max_lhm_score,
+                lhm_score=worker_lhm_score,
                 node_type="worker",
             )
-
-        self._task_runner.run(
-            self._versioned_clock.update_entity, dc_key, heartbeat.version
-        )
 
     def record_peer_lhm_score(
         self,

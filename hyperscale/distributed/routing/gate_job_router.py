@@ -178,6 +178,42 @@ class GateJobRouter:
         # Step 2: Filter candidates
         eligible, excluded = self._candidate_filter.filter_datacenters(candidates)
 
+        # Diagnostic: report what we saw at the gate's job-routing
+        # entry. Useful when the gate rejects submission with
+        # "all unhealthy" — tells us exactly which DCs were
+        # considered and why each was excluded.
+        import sys as _sys
+        _candidate_summary = [
+            {
+                "dc": c.datacenter_id,
+                "health": c.health_bucket,
+                "total_mgrs": c.total_managers,
+                "healthy_mgrs": c.healthy_managers,
+                "cores": c.available_cores,
+                "total_cores": c.total_cores,
+            }
+            for c in candidates
+        ]
+        _exclusion_summary = [
+            {
+                "dc": c.datacenter_id,
+                "reason": (
+                    c.exclusion_reason.name
+                    if c.exclusion_reason is not None
+                    else None
+                ),
+                "health": c.health_bucket,
+            }
+            for c in excluded
+        ]
+        _sys.stderr.write(
+            f"[L3-ROUTE job_id={job_id[:12]}] "
+            f"candidates={_candidate_summary} "
+            f"excluded={_exclusion_summary} "
+            f"eligible_count={len(eligible)}\n"
+        )
+        _sys.stderr.flush()
+
         if not eligible:
             return self._empty_decision(job_id, job_state)
 

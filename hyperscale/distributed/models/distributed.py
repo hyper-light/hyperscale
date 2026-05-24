@@ -828,6 +828,16 @@ class ManagerHeartbeat(Message):
     # DC-wide signal. Zero when no workers are currently registered
     # or none are reporting.
     worker_max_lhm_score: int = 0
+    # Datacenter capacity inputs consumed by ``DataCenterCapacity.from_heartbeats``.
+    # Without these, the gate's submission path raises
+    # ``'ManagerHeartbeat' object has no attribute 'pending_workflow_count'``
+    # when computing DC capacity, which surfaces as
+    # ``Job rejected: '...'`` at the client and the workflow never
+    # reaches RUNNING. Neutral defaults preserve back-compat with
+    # peers running an older heartbeat schema.
+    pending_workflow_count: int = 0
+    pending_duration_seconds: float = 0.0
+    active_remaining_seconds: float = 0.0
     # AD-37: Backpressure fields for gate throttling
     # Gates use these to throttle forwarded updates when managers are under load
     backpressure_level: int = (

@@ -110,6 +110,25 @@ class ClientTargetSelector:
             return leader_info.gate_addr
         return None
 
+    def get_gate_for_job(self, job_id: str) -> tuple[str, int] | None:
+        """
+        Get the best known gate address for a job.
+
+        Args:
+            job_id: Job identifier
+
+        Returns:
+            Gate (host, port) if a leader or sticky gate target is known, else None
+        """
+        preferred_gate = self.get_preferred_gate_for_job(job_id)
+        if preferred_gate is not None:
+            return preferred_gate
+
+        job_target = self._state.get_job_target(job_id)
+        if job_target in self._config.gates:
+            return job_target
+        return None
+
     def get_preferred_manager_for_job(
         self, job_id: str, datacenter_id: str
     ) -> tuple[str, int] | None:

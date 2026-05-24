@@ -180,7 +180,17 @@ class GateStatsCoordinator:
 
         for attempt in range(self.CALLBACK_PUSH_MAX_RETRIES):
             try:
-                await self._send_tcp(callback, "job_status_push", push_data)
+                response, _ = await self._send_tcp(
+                    callback,
+                    "job_status_push",
+                    push_data,
+                )
+                if isinstance(response, Exception):
+                    raise response
+                if response not in (b"ok", None):
+                    raise RuntimeError(
+                        f"job_status_push rejected with {response!r}"
+                    )
                 return True
             except Exception as send_error:
                 last_error = send_error
