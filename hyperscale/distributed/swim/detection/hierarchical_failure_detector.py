@@ -149,7 +149,15 @@ class HierarchicalFailureDetector:
         peer_health_awareness: "PeerHealthAwareness | None" = None,
         get_peer_load_multiplier: Callable[[NodeAddress], float] | None = None,
         get_vivaldi_quality_multiplier: Callable[[NodeAddress], float] | None = None,
+        on_expiration_diagnostic: (
+            Callable[
+                [NodeAddress, float, float, int, int, float, float],
+                None,
+            ]
+            | None
+        ) = None,
     ) -> None:
+        self._on_expiration_diagnostic = on_expiration_diagnostic
         if config is None:
             config = HierarchicalConfig()
 
@@ -941,6 +949,22 @@ class HierarchicalFailureDetector:
 
         This is called synchronously by the timing wheel.
         """
+        actual_age_seconds = time.monotonic() - state.start_time
+        expected_timeout = state.calculate_timeout()
+        if self._on_expiration_diagnostic is not None:
+            try:
+                self._on_expiration_diagnostic(
+                    node,
+                    actual_age_seconds,
+                    expected_timeout,
+                    state.incarnation,
+                    state.required_confirmations,
+                    state.min_timeout,
+                    state.max_timeout,
+                )
+            except Exception:
+                pass
+
         # Mark as globally dead
         self._globally_dead.add(node)
         self._global_deaths += 1

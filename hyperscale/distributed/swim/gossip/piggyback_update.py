@@ -50,6 +50,9 @@ class PiggybackUpdate:
     max_broadcasts: int = 10
     # AD-35 Task 12.4.3: Optional node role (gate/manager/worker)
     role: str | None = None
+    # Stable identity bound to ``node`` when known. Address reuse means
+    # address+incarnation alone cannot fence stale predecessor gossip.
+    node_id: str | None = None
     
     def should_broadcast(self) -> bool:
         """Check if this update should still be piggybacked."""
@@ -64,7 +67,9 @@ class PiggybackUpdate:
         Serialize update for transmission.
 
         Uses pre-allocated constants and caching for performance.
-        Format: type:incarnation:host:port[:role] (role is optional, AD-35 Task 12.4.3)
+        Format: type:incarnation:host:port[:role[:node_id]]
+        Role and node_id are optional. If node_id is present without
+        role, the role field is emitted empty to preserve field order.
         """
         # Use cached update type bytes
         type_bytes = _UPDATE_TYPE_CACHE.get(self.update_type)
@@ -88,9 +93,13 @@ class PiggybackUpdate:
             encode_int(self.node[1])
         )
 
-        # AD-35 Task 12.4.3: Append role if present (backward compatible)
-        if self.role:
-            result += DELIM_COLON + self.role.encode()
+        # AD-35 Task 12.4.3: Append role if present (backward compatible).
+        # Node identity is a trailing optional field so older 5-field
+        # role-bearing gossip remains parseable.
+        if self.role or self.node_id:
+            result += DELIM_COLON + (self.role.encode() if self.role else b"")
+        if self.node_id:
+            result += DELIM_COLON + self.node_id.encode()
 
         return result
     
@@ -103,11 +112,13 @@ class PiggybackUpdate:
         the same hosts appear in many updates.
 
         AD-35 Task 12.4.3: Parses optional 5th field (role) if present.
-        Backward compatible - defaults role to None if not present.
+        A 6th field carries stable node identity for address-reuse
+        fencing. Backward compatible - defaults optional fields to None.
         """
         try:
-            # Split into parts - maxsplit=4 to get up to 5 parts (type:inc:host:port:role)
-            parts = data.decode().split(':', maxsplit=4)
+            # Split into parts - maxsplit=5 to get up to 6 parts:
+            # type:inc:host:port:role:node_id.
+            parts = data.decode().split(':', maxsplit=5)
             if len(parts) < 4:
                 return None
             update_type = parts[0]
@@ -116,19 +127,21 @@ class PiggybackUpdate:
             host = sys.intern(parts[2])
             port = int(parts[3])
             # AD-35 Task 12.4.3: Parse role if present (backward compatible)
-            role = parts[4] if len(parts) >= 5 else None
+            role = parts[4] if len(parts) >= 5 and parts[4] else None
+            node_id = parts[5] if len(parts) >= 6 and parts[5] else None
             return cls(
                 update_type=update_type,
                 node=(host, port),
                 incarnation=incarnation,
                 timestamp=time.monotonic(),
                 role=role,
+                node_id=node_id,
             )
         except (ValueError, UnicodeDecodeError):
             return None
     
     def __hash__(self) -> int:
-        return hash((self.update_type, self.node, self.incarnation))
+        return hash((self.update_type, self.node, self.incarnation, self.node_id))
     
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, PiggybackUpdate):
@@ -136,6 +149,6 @@ class PiggybackUpdate:
         return (
             self.update_type == other.update_type and
             self.node == other.node and
-            self.incarnation == other.incarnation
+            self.incarnation == other.incarnation and
+            self.node_id == other.node_id
         )
-

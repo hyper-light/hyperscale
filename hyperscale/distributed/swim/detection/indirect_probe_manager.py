@@ -66,6 +66,7 @@ class IndirectProbeManager:
         self,
         target: tuple[str, int],
         requester: tuple[str, int],
+        request_id: str,
         timeout: float,
     ) -> PendingIndirectProbe | None:
         """
@@ -84,6 +85,7 @@ class IndirectProbeManager:
         probe = PendingIndirectProbe(
             target=target,
             requester=requester,
+            request_id=request_id,
             start_time=time.monotonic(),
             timeout=timeout,
         )
@@ -95,13 +97,13 @@ class IndirectProbeManager:
         """Get the pending probe for a target, if any."""
         return self.pending_probes.get(target)
     
-    def record_ack(self, target: tuple[str, int]) -> bool:
+    def record_ack(self, target: tuple[str, int], request_id: str | None) -> bool:
         """
         Record that the target responded to an indirect probe.
         Returns True if the probe was pending and this is the first ack.
         """
         probe = self.pending_probes.get(target)
-        if probe and probe.record_ack():
+        if probe and probe.record_ack(request_id):
             del self.pending_probes[target]
             self._completed_count += 1
             return True
@@ -212,4 +214,3 @@ class IndirectProbeManager:
             return True
         except Exception:
             return False
-

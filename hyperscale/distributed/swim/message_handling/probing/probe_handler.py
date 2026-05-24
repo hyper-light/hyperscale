@@ -92,6 +92,8 @@ class ProbeHandler(BaseHandler):
         base = (
             b"alive:"
             + str(new_incarnation).encode()
+            + b":"
+            + self._server.get_self_node_id().encode()
             + b">"
             + self._server.udp_addr_slug
         )

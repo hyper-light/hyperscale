@@ -71,6 +71,7 @@ class GossipBuffer:
         incarnation: int,
         n_members: int = 1,
         role: str | None = None,
+        node_id: str | None = None,
     ) -> bool:
         """
         Add or update a membership update in the buffer.
@@ -85,6 +86,7 @@ class GossipBuffer:
             incarnation: Incarnation number
             n_members: Number of members (for broadcast count calculation)
             role: Optional node role (AD-35 Task 12.4.3)
+            node_id: Stable identity currently bound to ``node`` when known.
 
         Returns:
             True if update was added, False if rejected due to limits.
@@ -115,6 +117,7 @@ class GossipBuffer:
                 timestamp=time.monotonic(),
                 max_broadcasts=max_broadcasts,
                 role=role,
+                node_id=node_id,
             )
             return True
         elif incarnation > existing.incarnation:
@@ -126,6 +129,7 @@ class GossipBuffer:
                 timestamp=time.monotonic(),
                 max_broadcasts=max_broadcasts,
                 role=role,
+                node_id=node_id,
             )
             return True
         elif incarnation == existing.incarnation:
@@ -138,6 +142,8 @@ class GossipBuffer:
                     incarnation=incarnation,
                     timestamp=time.monotonic(),
                     max_broadcasts=max_broadcasts,
+                    role=role,
+                    node_id=node_id,
                 )
                 return True
         
@@ -415,4 +421,3 @@ class GossipBuffer:
             'max_piggyback_size': self.max_piggyback_size,
             'max_updates': self.max_updates,
         }
-

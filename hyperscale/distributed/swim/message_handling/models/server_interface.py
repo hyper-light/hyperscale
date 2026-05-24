@@ -30,6 +30,10 @@ class ServerInterface(Protocol):
         """Get this server's UDP address as tuple."""
         ...
 
+    def get_self_node_id(self) -> str:
+        """Get this server's stable node identity."""
+        ...
+
     def udp_target_is_self(self, target: tuple[str, int]) -> bool:
         """Check if target address is this server."""
         ...
@@ -82,6 +86,10 @@ class ServerInterface(Protocol):
         ("manager", "gate", "worker"); unrecognised values are
         ignored.
         """
+        ...
+
+    def get_registered_node_id_for_addr(self, addr: tuple[str, int]) -> str | None:
+        """Return the registered node identity currently bound to ``addr``."""
         ...
 
     # === Node State ===
@@ -138,6 +146,15 @@ class ServerInterface(Protocol):
         incarnation: int,
     ) -> bool:
         """Refute suspicion with higher incarnation."""
+        ...
+
+    def is_authoritative_liveness_evidence(
+        self,
+        source_addr: tuple[str, int],
+        target: tuple[str, int] | None,
+        node_id: str | None,
+    ) -> bool:
+        """Return whether first-party liveness evidence can clear suspicion."""
         ...
 
     async def broadcast_refutation(self) -> int:
@@ -258,6 +275,10 @@ class ServerInterface(Protocol):
         """Parse incarnation number from message safely."""
         ...
 
+    def parse_node_id_from_message(self, message: bytes) -> str | None:
+        """Parse optional stable node identity from a SWIM message."""
+        ...
+
     async def parse_term_safe(
         self, message: bytes, source_addr: tuple[str, int]
     ) -> int:
@@ -279,7 +300,10 @@ class ServerInterface(Protocol):
     # === Indirect Probing ===
 
     async def handle_indirect_probe_response(
-        self, target: tuple[str, int], is_alive: bool
+        self,
+        target: tuple[str, int],
+        is_alive: bool,
+        request_id: str | None = None,
     ) -> None:
         """Handle response from indirect probe."""
         ...

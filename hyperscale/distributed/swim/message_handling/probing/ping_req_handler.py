@@ -2,7 +2,6 @@
 Handler for PING-REQ messages (indirect probing).
 """
 
-import asyncio
 from base64 import b64encode
 from typing import ClassVar
 
@@ -34,6 +33,7 @@ class PingReqHandler(BaseHandler):
         """Handle a ping-req message."""
         target = context.target
         target_addr_bytes = context.target_addr_bytes
+        request_id = self._parse_request_id(context.message)
 
         # Process within context
         async with await self._server.context_with_value(target):
@@ -45,21 +45,29 @@ class PingReqHandler(BaseHandler):
 
             # If target is self, respond with alive
             if self._server.udp_target_is_self(target):
-                return self._build_alive_response()
+                return self._build_alive_response(request_id)
 
             # Unknown target
             if target not in nodes:
                 return HandlerResult(
-                    response=b"ping-req-ack:unknown>" + self._server.udp_addr_slug,
+                    response=self._build_ping_req_ack(
+                        b"unknown",
+                        target_addr_bytes,
+                        request_id,
+                    ),
                     embed_state=False,
                 )
 
             # Probe the target and return result
-            return await self._probe_target(target, target_addr_bytes)
+            return await self._probe_target(target, target_addr_bytes, request_id)
 
-    def _build_alive_response(self) -> HandlerResult:
+    def _build_alive_response(self, request_id: str | None) -> HandlerResult:
         """Build alive response for self-targeted ping-req."""
-        base = b"ping-req-ack:alive>" + self._server.udp_addr_slug
+        base = self._build_ping_req_ack(
+            b"alive",
+            self._server.udp_addr_slug,
+            request_id,
+        )
 
         state = self._server.get_embedded_state()
         if state:
@@ -73,24 +81,40 @@ class PingReqHandler(BaseHandler):
         self,
         target: tuple[str, int],
         target_addr_bytes: bytes | None,
+        request_id: str | None,
     ) -> HandlerResult:
         """Probe target and return appropriate response."""
-        base_timeout = await self._server.get_current_timeout()
-        timeout = self._server.get_lhm_adjusted_timeout(base_timeout)
+        result = await self._server.send_probe_and_wait(target)
+        status = b"alive" if result else b"dead"
+        response = self._build_ping_req_ack(status, target_addr_bytes, request_id)
+        return HandlerResult(response=response, embed_state=False)
 
-        try:
-            result = await asyncio.wait_for(
-                self._server.send_probe_and_wait(target),
-                timeout=timeout,
+    def _build_ping_req_ack(
+        self,
+        status: bytes,
+        target_addr_bytes: bytes | None,
+        request_id: str | None,
+    ) -> bytes:
+        """Build a request-fenced indirect probe response."""
+        if request_id:
+            return (
+                b"ping-req-ack:"
+                + status
+                + b":"
+                + request_id.encode()
+                + b">"
+                + (target_addr_bytes or b"")
             )
+        return b"ping-req-ack:" + status + b">" + (target_addr_bytes or b"")
 
-            if result:
-                response = b"ping-req-ack:alive>" + (target_addr_bytes or b"")
-            else:
-                response = b"ping-req-ack:dead>" + (target_addr_bytes or b"")
-
-            return HandlerResult(response=response, embed_state=False)
-
-        except asyncio.TimeoutError:
-            response = b"ping-req-ack:timeout>" + (target_addr_bytes or b"")
-            return HandlerResult(response=response, embed_state=False)
+    def _parse_request_id(self, message: bytes) -> str | None:
+        """Parse optional ``ping-req:{incarnation}:{request_id}`` token."""
+        msg_part = message.split(b">", maxsplit=1)[0]
+        parts = msg_part.split(b":", maxsplit=2)
+        if len(parts) < 3:
+            return None
+        try:
+            request_id = parts[2].decode()
+        except UnicodeDecodeError:
+            return None
+        return request_id or None

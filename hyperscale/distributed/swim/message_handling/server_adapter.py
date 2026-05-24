@@ -43,6 +43,10 @@ class ServerAdapter:
         """Get this server's UDP address as tuple."""
         return self._server._get_self_udp_addr()
 
+    def get_self_node_id(self) -> str:
+        """Get this server's stable node identity."""
+        return self._server._node_id.full
+
     def udp_target_is_self(self, target: tuple[str, int]) -> bool:
         """Check if target address is this server."""
         return self._server.udp_target_is_self(target)
@@ -145,6 +149,19 @@ class ServerAdapter:
     ) -> bool:
         """Refute suspicion with higher incarnation."""
         return await self._server.refute_suspicion(node, incarnation)
+
+    def is_authoritative_liveness_evidence(
+        self,
+        source_addr: tuple[str, int],
+        target: tuple[str, int] | None,
+        node_id: str | None,
+    ) -> bool:
+        """Return whether first-party liveness evidence can clear suspicion."""
+        return self._server.is_authoritative_liveness_evidence(
+            source_addr,
+            target,
+            node_id,
+        )
 
     async def broadcast_refutation(self) -> int:
         """Broadcast alive message with incremented incarnation."""
@@ -264,6 +281,10 @@ class ServerAdapter:
         """Parse incarnation number from message safely."""
         return await self._server._parse_incarnation_safe(message, source_addr)
 
+    def parse_node_id_from_message(self, message: bytes) -> str | None:
+        """Parse optional stable node identity from a SWIM message."""
+        return self._server._parse_node_id_from_message(message)
+
     async def parse_term_safe(
         self, message: bytes, source_addr: tuple[str, int]
     ) -> int:
@@ -285,10 +306,17 @@ class ServerAdapter:
     # === Indirect Probing ===
 
     async def handle_indirect_probe_response(
-        self, target: tuple[str, int], is_alive: bool
+        self,
+        target: tuple[str, int],
+        is_alive: bool,
+        request_id: str | None = None,
     ) -> None:
         """Handle response from indirect probe."""
-        await self._server.handle_indirect_probe_response(target, is_alive)
+        await self._server.handle_indirect_probe_response(
+            target,
+            is_alive,
+            request_id,
+        )
 
     async def send_probe_and_wait(self, target: tuple[str, int]) -> bool:
         """Send probe and wait for ack."""

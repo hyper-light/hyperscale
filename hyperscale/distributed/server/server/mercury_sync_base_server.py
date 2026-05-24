@@ -1798,6 +1798,15 @@ class MercurySyncBaseServer(Generic[T]):
                     )
                 )
 
+        # Terminal-abort barrier: a UDP response task that was spawned
+        # before ``abort()`` fired must not continue to run handlers or
+        # emit ``sendto`` after abort. Otherwise a hard-killed instance
+        # keeps responding to in-flight probes/suspicions long enough to
+        # refute its own death via the captured transport reference (see
+        # ``abort()``'s docstring on the kill→restart race).
+        if not self._running:
+            return
+
         next_time = await self._udp_clock.update(clock_time)
 
         try:
@@ -1846,6 +1855,16 @@ class MercurySyncBaseServer(Generic[T]):
             if isinstance(response, Message):
                 response = response.dump()
 
+            # Final terminal-abort barrier: even if the handler completed
+            # right before ``abort()`` flipped ``_running``, do not emit
+            # any wire bytes from a stopping instance. The captured
+            # ``transport`` argument is still alive (closed but the
+            # ``sendto`` call doesn't error synchronously), so without
+            # this check a half-killed worker can still send ALIVE /
+            # refutation responses that the manager treats as authoritative.
+            if not self._running:
+                return
+
             # UDP response with clock before length-prefixed data
             # Format: type<address<handler<clock(64 bytes)data_len(4 bytes)data(N bytes)
             response_len = len(response).to_bytes(4, "big")
@@ -1870,6 +1889,9 @@ class MercurySyncBaseServer(Generic[T]):
                 f"UDP server request failed: {type(e).__name__}",
                 protocol="udp",
             )
+
+            if not self._running:
+                return
 
             # Sanitized error response
             error_msg = b"Request processing failed"
@@ -1897,6 +1919,8 @@ class MercurySyncBaseServer(Generic[T]):
         clock_time: int,
         _: asyncio.DatagramTransport,
     ):
+        if not self._running:
+            return
         try:
             await self._udp_clock.ack(clock_time)
 
@@ -2201,3 +2225,55 @@ class MercurySyncBaseServer(Generic[T]):
         cancel_and_release_task(self._tcp_server_cleanup_task)
         cancel_and_release_task(self._udp_server_sleep_task)
         cancel_and_release_task(self._udp_server_cleanup_task)
+
+        # Pre-cancel pending UDP/TCP response tasks here in the sync
+        # path. ``cancel`` only schedules cancellation; the corresponding
+        # await happens in ``abort_and_wait``. Doing the schedule in the
+        # sync ``abort()`` keeps the behavior layered: tests/code calling
+        # the historical sync entry point still get the same effect on
+        # the event loop's next tick.
+        for pending in list(self._pending_udp_server_responses):
+            if not pending.done():
+                pending.cancel()
+        for pending in list(self._pending_tcp_server_responses):
+            if not pending.done():
+                pending.cancel()
+
+    async def abort_and_wait(self) -> None:
+        """Awaitable terminal abort — guarantees a dark instance on return.
+
+        Calls the synchronous ``abort()`` (which flips ``_running``,
+        closes transports, cancels named loops, and schedules
+        cancellation of pending response tasks) then *awaits* the
+        cancellations so no in-flight UDP/TCP handler can still emit
+        wire bytes after this returns. Two yields to the loop ensure
+        any handler currently in its ``except`` branch reaches the
+        post-cancel ``_running`` guard rather than racing through a
+        late ``transport.sendto``.
+
+        Use this in place of ``abort()`` + ``asyncio.sleep(0.05)`` from
+        any test harness that simulates a hard kill — without it, the
+        killed instance can still respond to SWIM probes/suspicions for
+        seconds after the test thinks it is dead, which lets the dying
+        node refute its own death via captured transport references.
+        """
+        self.abort()
+
+        pending = (
+            list(self._pending_udp_server_responses)
+            + list(self._pending_tcp_server_responses)
+        )
+        if pending:
+            await asyncio.gather(
+                *(cancel(task) for task in pending),
+                return_exceptions=True,
+            )
+        self._pending_udp_server_responses.clear()
+        self._pending_tcp_server_responses.clear()
+
+        # Two loop yields: first lets any cancelled task's ``except
+        # CancelledError`` branch run; second lets the cancellation
+        # propagate into nested awaits inside SWIM handlers (refutation
+        # broadcasts, etc.).
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)

@@ -25,6 +25,7 @@ class PendingIndirectProbe:
     """
     target: tuple[str, int]
     requester: tuple[str, int]
+    request_id: str
     start_time: float
     timeout: float
     proxies: set[tuple[str, int]] = field(default_factory=set)
@@ -45,11 +46,17 @@ class PendingIndirectProbe:
         self.proxies.add(proxy)
         return True
     
-    def record_ack(self) -> bool:
+    def matches_request(self, request_id: str | None) -> bool:
+        """Return whether a response belongs to this indirect probe attempt."""
+        return request_id == self.request_id
+
+    def record_ack(self, request_id: str | None) -> bool:
         """
         Record that we received an ack from one of the proxies.
         Returns True if this is the first ack (target is alive).
         """
+        if not self.matches_request(request_id):
+            return False
         if self._completed:
             return False
         self.received_acks += 1
@@ -65,4 +72,3 @@ class PendingIndirectProbe:
     def is_completed(self) -> bool:
         """Check if we've received an ack (probe succeeded)."""
         return self._completed
-

@@ -437,6 +437,39 @@ async def test_slow_worker_churn_one_worker_every_10_seconds() -> None:
         manager = cluster.managers("local")[0]
         victim = cluster.workers("local")[0]
 
+        def _dump_swim_state(label: str) -> None:
+            mgr = manager.instance
+            workers = list(mgr._manager_state._workers.keys())
+            tracker = mgr._incarnation_tracker
+            node_states = {
+                str(addr): {
+                    "status": (
+                        state.status.decode(errors="replace")
+                        if state.status
+                        else None
+                    ),
+                    "incarnation": state.incarnation,
+                }
+                for addr, state in tracker.node_states.items()
+            }
+            hfd = mgr._hierarchical_detector
+            print(
+                f"[SLOW-CHURN-DUMP {label}] "
+                f"worker_count={mgr._manager_state.get_worker_count()} "
+                f"workers={workers} "
+                f"node_states={node_states} "
+                f"registered_peers={sorted(str(p) for p in mgr._registered_peers)} "
+                f"confirmed_peers={sorted(str(p) for p in mgr._confirmed_peers)} "
+                f"probe_members={[str(n) for n in mgr._probe_scheduler.members]} "
+                f"global_suspicion_started_at="
+                f"{ {str(k): v for k, v in mgr._global_suspicion_started_at.items()} } "
+                f"lhm_score={mgr._local_health.score} "
+                f"lhm_mult={mgr._local_health.get_multiplier():.2f} "
+                f"degradation={mgr._degradation.current_level.name} "
+                f"hfd_globally_dead={[str(n) for n in hfd._globally_dead]}",
+                flush=True,
+            )
+
         for churn_index in range(_SLOW_CHURN_CYCLES):
             await cluster.faults.kill(victim)
             await wait_until(
@@ -444,6 +477,9 @@ async def test_slow_worker_churn_one_worker_every_10_seconds() -> None:
                 timeout=60.0,
                 poll=0.5,
                 description=f"slow churn {churn_index}: worker removed",
+                on_fail=lambda i=churn_index: _dump_swim_state(
+                    f"iter_{i}_remove_timeout"
+                ),
             )
             await asyncio.sleep(_SLOW_CHURN_INTERVAL_SECONDS)
             await cluster.faults.restart(victim)
@@ -452,6 +488,9 @@ async def test_slow_worker_churn_one_worker_every_10_seconds() -> None:
                 timeout=60.0,
                 poll=0.5,
                 description=f"slow churn {churn_index}: worker restored",
+                on_fail=lambda i=churn_index: _dump_swim_state(
+                    f"iter_{i}_restore_timeout"
+                ),
             )
 
 

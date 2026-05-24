@@ -65,10 +65,25 @@ class ManagerRegistry:
             for frame in _tb.extract_stack(limit=6)[:-1]:
                 _sys.stderr.write(f"  {frame.filename}:{frame.lineno} {frame.name}\n")
             _sys.stderr.flush()
-        self._state._workers[worker_id] = registration
 
         tcp_addr = (registration.node.host, registration.node.port)
         udp_addr = (registration.node.host, registration.node.udp_port)
+
+        # Evict any stale worker_id currently sharing either address. SWIM
+        # death detection can lag a hard kill + restart, so the previous
+        # process's node_id may still be in ``_workers`` when the rebuilt
+        # worker re-registers at the same TCP/UDP ports. Without this,
+        # the registry accumulates one entry per restart cycle even though
+        # only one live process exists at the address — the kill/restart
+        # churn test eventually pushes ``get_worker_count()`` above the
+        # actual cluster size and ``wait_until(count <= 1)`` never fires
+        # because the count never drops back down.
+        for addr in (tcp_addr, udp_addr):
+            existing_worker_id = self._state._worker_addr_to_id.get(addr)
+            if existing_worker_id is not None and existing_worker_id != worker_id:
+                self.unregister_worker(existing_worker_id)
+
+        self._state._workers[worker_id] = registration
         self._state._worker_addr_to_id[tcp_addr] = worker_id
         self._state._worker_addr_to_id[udp_addr] = worker_id
 

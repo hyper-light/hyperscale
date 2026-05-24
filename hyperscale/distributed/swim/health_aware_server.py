@@ -315,6 +315,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             get_vivaldi_quality_multiplier=(
                 self._compute_vivaldi_quality_multiplier_for_node
             ),
+            on_expiration_diagnostic=self._log_suspicion_expiration_diagnostic,
         )
 
         # Initialize leader election with configurable parameters from Env
@@ -2853,7 +2854,17 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         # If this is our own node, use our role
         if node == self._get_self_udp_addr():
             role = self._node_role
-        self._gossip_buffer.add_update(update_type, node, incarnation, n_members, role)
+        node_id = self._node_id.full if node == self._get_self_udp_addr() else (
+            self._get_registered_node_id_for_addr(node)
+        )
+        self._gossip_buffer.add_update(
+            update_type,
+            node,
+            incarnation,
+            n_members,
+            role,
+            node_id,
+        )
 
     def queue_leave_dissemination(
         self,
@@ -3100,25 +3111,57 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         """Get piggybacked membership updates to append to a message."""
         return self._gossip_buffer.encode_piggyback(max_updates)
 
-    def _should_apply_alive_piggyback(
+    def _liveness_identity_matches(
+        self,
+        node: tuple[str, int],
+        node_id: str | None,
+    ) -> bool:
+        """Return whether liveness evidence matches the current node binding."""
+        registered_node_id = self._get_registered_node_id_for_addr(node)
+        if registered_node_id is None:
+            return True
+        return node_id == registered_node_id
+
+    def _is_locally_suspect_or_dead(self, node: tuple[str, int]) -> bool:
+        """Return True when local state must not be cleared by third-party gossip."""
+        node_state = self._incarnation_tracker.get_node_state(node)
+        if node_state is not None and node_state.status in (b"SUSPECT", b"DEAD"):
+            return True
+        return self.is_node_suspected(node)
+
+    def _should_apply_liveness_piggyback(
         self,
         update: PiggybackUpdate,
         source_addr: tuple[str, int] | None,
     ) -> bool:
-        """Return whether an ALIVE piggyback is strong enough to apply.
+        """Return whether piggybacked OK/JOIN evidence is authoritative enough.
 
-        Third-party ALIVE gossip is a useful dissemination mechanism when
-        no local suspicion is open. Once this node has opened a SUSPECT
-        bracket for the target, however, stale indirect ALIVE gossip is
-        not a refutation: only a message sent by the target itself (or a
-        fresh explicit probe confirmation elsewhere in the call stack) can
-        prove the target survived after the suspicion began.
+        Third-party liveness gossip is convergence data only. Once this
+        node has local SUSPECT/DEAD evidence for an address, clearing it
+        requires first-party ALIVE from that address, or an explicit
+        direct/rejoin path elsewhere. JOIN piggyback from another peer is
+        never allowed to refute local suspicion; direct JOIN handling is
+        the authoritative rejoin path.
         """
+        if update.update_type not in ("alive", "join"):
+            return True
+
+        if not self._liveness_identity_matches(update.node, update.node_id):
+            self._metrics.increment("gossip_liveness_identity_suppressed")
+            return False
+
+        if not self._is_locally_suspect_or_dead(update.node):
+            return True
+
         if update.update_type != "alive":
-            return True
-        if not self.is_node_suspected(update.node):
-            return True
-        return source_addr == update.node
+            self._metrics.increment("gossip_liveness_refutations_suppressed")
+            return False
+
+        if source_addr != update.node:
+            self._metrics.increment("gossip_liveness_refutations_suppressed")
+            return False
+
+        return True
 
     def _should_defer_unwitnessed_dead_piggyback(
         self,
@@ -3176,9 +3219,12 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                 "dead": b"DEAD",
                 "leave": b"DEAD",
             }
-            status = status_map.get(update.update_type, b"OK")
+            status = status_map.get(update.update_type)
+            if status is None:
+                self._metrics.increment("gossip_unknown_updates_suppressed")
+                continue
 
-            if not self._should_apply_alive_piggyback(update, source_addr):
+            if not self._should_apply_liveness_piggyback(update, source_addr):
                 self._metrics.increment("gossip_alive_refutations_suppressed")
                 continue
 
@@ -4590,11 +4636,23 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             host, port = target_str.split(":", maxsplit=1)
             target = (host, int(port))
 
-        msg_parts = msg_part.split(b":", maxsplit=1)
+        msg_parts = msg_part.split(b":", maxsplit=2)
         msg_type = msg_parts[0]
         incarnation = int(msg_parts[1].decode()) if len(msg_parts) > 1 else 0
 
         return msg_type, incarnation, target
+
+    def _parse_node_id_from_message(self, message: bytes) -> str | None:
+        """Parse optional stable node identity from ``type:incarnation:node_id``."""
+        msg_part = message.split(b">", maxsplit=1)[0]
+        msg_parts = msg_part.split(b":", maxsplit=2)
+        if len(msg_parts) < 3:
+            return None
+        try:
+            node_id = msg_parts[2].decode()
+        except UnicodeDecodeError:
+            return None
+        return node_id or None
 
     async def _parse_incarnation_safe(
         self,
@@ -4606,7 +4664,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
 
         Returns 0 on parse failure but logs the error for monitoring.
         """
-        msg_parts = message.split(b":", maxsplit=1)
+        msg_parts = message.split(b">", maxsplit=1)[0].split(b":", maxsplit=2)
         if len(msg_parts) > 1:
             try:
                 return int(msg_parts[1].decode())
@@ -4619,6 +4677,76 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                     )
                 )
         return 0
+
+    def is_authoritative_liveness_evidence(
+        self,
+        source_addr: tuple[str, int],
+        target: tuple[str, int] | None,
+        node_id: str | None,
+    ) -> bool:
+        """Return whether an ALIVE message can refute local suspicion.
+
+        ALIVE is first-party evidence: the source address must be the
+        subject address. When this receiver has a registered identity for
+        that address, the message must carry the same identity so stale
+        predecessor traffic cannot clear suspicion for a fresh process.
+        """
+        if target is None or source_addr != target:
+            return False
+        return self._liveness_identity_matches(target, node_id)
+
+    async def _process_direct_alive_response(
+        self,
+        source_addr: tuple[str, int],
+        data: bytes,
+    ) -> None:
+        """Apply a direct ``alive:`` probe response after identity fencing."""
+        try:
+            message_type, incarnation, target = self.decode_message_with_incarnation(
+                data
+            )
+        except (ValueError, UnicodeDecodeError):
+            return
+
+        if message_type != b"alive":
+            return
+
+        node_id = self._parse_node_id_from_message(data)
+        if not self.is_authoritative_liveness_evidence(
+            source_addr,
+            target,
+            node_id,
+        ):
+            self._metrics.increment("non_authoritative_alive_suppressed")
+            return
+
+        pending_future = self._pending_probe_acks.get(source_addr)
+        if pending_future and not pending_future.done():
+            pending_future.set_result(True)
+
+        if not target:
+            return
+
+        node_state = self._incarnation_tracker.get_node_state(target)
+        if (
+            node_state is not None
+            and node_state.status == b"SUSPECT"
+            and incarnation >= node_state.incarnation
+        ):
+            await self._clear_unwitnessed_suspicion_after_confirmation(
+                target,
+                incarnation,
+            )
+            return
+
+        if self.is_message_fresh(target, incarnation, b"OK"):
+            await self.refute_suspicion(target, incarnation)
+            await self.update_node_state(
+                target,
+                b"OK",
+                incarnation,
+                time.monotonic(),
+            )
 
     async def _parse_term_safe(
         self,
@@ -5135,6 +5263,43 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         )
         if result:
             self._global_suspicion_started_at.setdefault(node, now)
+            witness_count, rejection_reasons = self._proxy_eligibility_breakdown(
+                node
+            )
+            suspicion_state = (
+                await self._hierarchical_detector._global_wheel.get_state(node)
+                if self._hierarchical_detector is not None
+                else None
+            )
+            min_timeout = (
+                suspicion_state.min_timeout if suspicion_state is not None else None
+            )
+            max_timeout = (
+                suspicion_state.max_timeout if suspicion_state is not None else None
+            )
+            mapped_worker_id = self._get_registered_node_id_for_addr(node)
+            degradation_level = (
+                self._degradation.current_level.name
+                if self._degradation is not None
+                else None
+            )
+            await self._udp_logger.log(
+                ServerError(
+                    message=(
+                        f"[SUSPICION-START] target={node} "
+                        f"worker_id={mapped_worker_id} incarnation={incarnation} "
+                        f"witnesses={witness_count} "
+                        f"rejected={rejection_reasons} "
+                        f"lhm_score={self._local_health.score} "
+                        f"lhm_multiplier={self._local_health.get_multiplier():.2f} "
+                        f"degradation={degradation_level} "
+                        f"min_timeout={min_timeout} max_timeout={max_timeout}"
+                    ),
+                    node_host=self._host,
+                    node_port=self._udp_port,
+                    node_id=self._node_id.short,
+                )
+            )
         return result
 
     async def confirm_suspicion(
@@ -5255,6 +5420,80 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             return False
         return node_state.status in (b"OK", b"JOIN")
 
+    def _log_suspicion_expiration_diagnostic(
+        self,
+        node: tuple[str, int],
+        actual_age_seconds: float,
+        expected_timeout: float,
+        incarnation: int,
+        required_confirmations: int,
+        min_timeout: float,
+        max_timeout: float,
+    ) -> None:
+        """Sync callback from HFD wheel; route logging via TaskRunner."""
+        started_at = self._global_suspicion_started_at.get(node)
+        wall_age = (
+            time.monotonic() - started_at if started_at is not None else None
+        )
+        target_state = self._incarnation_tracker.get_node_state(node)
+        target_status = target_state.status if target_state is not None else None
+        self._task_runner.run(
+            self._udp_logger.log,
+            ServerError(
+                message=(
+                    f"[SUSPICION-EXPIRY] target={node} incarnation={incarnation} "
+                    f"actual_age_s={actual_age_seconds:.2f} "
+                    f"expected_timeout_s={expected_timeout:.2f} "
+                    f"min_timeout_s={min_timeout:.2f} max_timeout_s={max_timeout:.2f} "
+                    f"required_confirmations={required_confirmations} "
+                    f"wall_age_since_setdefault_s={wall_age} "
+                    f"target_status={target_status} "
+                    f"lhm_score={self._local_health.score} "
+                    f"degradation={self._degradation.current_level.name}"
+                ),
+                node_host=self._host,
+                node_port=self._udp_port,
+                node_id=self._node_id.short,
+            ),
+            alias="suspicion_expiry_diag",
+        )
+
+    def _proxy_eligibility_breakdown(
+        self,
+        target: tuple[str, int],
+    ) -> tuple[int, dict[str, int]]:
+        """Return (witness_count, {rejection_reason: count}) for ``target``.
+
+        Iterates every non-self, non-target node in the incarnation tracker
+        and records exactly why each one is or isn't a valid indirect-probe
+        proxy. Used by the suspicion-start diagnostic so we can see whether
+        the cluster entered no-witness mode because witnesses *don't exist*
+        or because they were transiently disqualified.
+        """
+        self_addr = self._get_self_udp_addr()
+        eligible: list[tuple[str, int]] = []
+        reasons: dict[str, int] = {}
+        for node in self._incarnation_tracker.node_states.keys():
+            if node == target or node == self_addr:
+                continue
+            if not self.is_peer_registered(node):
+                reasons["unregistered"] = reasons.get("unregistered", 0) + 1
+                continue
+            if not self.is_peer_confirmed(node):
+                reasons["unconfirmed"] = reasons.get("unconfirmed", 0) + 1
+                continue
+            node_state = self._incarnation_tracker.get_node_state(node)
+            if node_state is None:
+                reasons["no_state"] = reasons.get("no_state", 0) + 1
+                continue
+            status = node_state.status
+            if status not in (b"OK", b"JOIN"):
+                key = f"status={status.decode(errors='replace')}"
+                reasons[key] = reasons.get(key, 0) + 1
+                continue
+            eligible.append(node)
+        return len(eligible), reasons
+
     def _get_self_udp_addr(self) -> tuple[str, int]:
         """Get this server's UDP address as a tuple."""
         host, port = self._udp_addr_slug.decode().split(":")
@@ -5279,10 +5518,12 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
 
         base_timeout = await self._context.read("current_timeout")
         timeout = self.get_lhm_adjusted_timeout(base_timeout)
+        request_id = self._build_indirect_probe_request_id()
 
         probe = self._indirect_probe_manager.start_indirect_probe(
             target=target,
             requester=self._get_self_udp_addr(),
+            request_id=request_id,
             timeout=timeout,
         )
         if probe is None:
@@ -5290,7 +5531,14 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         self._metrics.increment("indirect_probes_sent")
 
         target_addr = f"{target[0]}:{target[1]}".encode()
-        msg = b"ping-req:" + str(incarnation).encode() + b">" + target_addr
+        msg = (
+            b"ping-req:"
+            + str(incarnation).encode()
+            + b":"
+            + request_id.encode()
+            + b">"
+            + target_addr
+        )
 
         successful_sends = 0
         failed_proxies: list[tuple[str, int]] = []
@@ -5355,14 +5603,22 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         self,
         target: tuple[str, int],
         is_alive: bool,
+        request_id: str | None = None,
     ) -> None:
         """Handle response from an indirect probe."""
         if is_alive:
-            if self._indirect_probe_manager.record_ack(target):
+            if self._indirect_probe_manager.record_ack(target, request_id):
                 await self.decrease_failure_detector("successful_probe")
                 self._peer_probe_reliability.record_probe_outcome(
                     target, success=True
                 )
+
+    def _build_indirect_probe_request_id(self) -> str:
+        """Build a request token for fencing indirect-probe responses."""
+        return (
+            f"{self._node_id.short}-{time.monotonic_ns()}-"
+            f"{random.getrandbits(32):08x}"
+        )
 
     async def broadcast_refutation(self) -> int:
         """
@@ -5374,7 +5630,16 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         Rate limited to prevent incarnation exhaustion attacks - if an attacker
         sends many probes/suspects about us, we don't want to burn through
         all possible incarnation numbers.
+
+        Terminal-abort barrier: a stopping instance must never emit a
+        refutation. The harness's hard kill closes the listener but
+        previously-spawned SUSPECT handlers can reach this code path
+        with a captured transport; without this check they refute their
+        own death and the manager treats the killed node as still alive.
         """
+        if not self._running:
+            return self._incarnation_tracker.get_self_incarnation()
+
         # Rate limiting check
         now = time.monotonic()
         window_elapsed = now - self._last_refutation_time
@@ -5391,10 +5656,26 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
 
         new_incarnation = await self.increment_incarnation()
 
+        # Post-await terminal barrier: ``abort()`` may have flipped
+        # ``_running`` while we were inside ``increment_incarnation``.
+        # Without this check, an in-flight self-suspicion handler
+        # continues into the per-peer send loop after the instance is
+        # supposed to be dark, re-emerging on the wire with a fresh
+        # incarnation that the manager treats as authoritative liveness.
+        if not self._running:
+            return new_incarnation
+
         self_addr = self._get_self_udp_addr()
 
         self_addr_bytes = f"{self_addr[0]}:{self_addr[1]}".encode()
-        msg = b"alive:" + str(new_incarnation).encode() + b">" + self_addr_bytes
+        msg = (
+            b"alive:"
+            + str(new_incarnation).encode()
+            + b":"
+            + self._node_id.full.encode()
+            + b">"
+            + self_addr_bytes
+        )
 
         base_timeout = await self._context.read("current_timeout")
         timeout = self.get_lhm_adjusted_timeout(base_timeout)
@@ -5404,6 +5685,8 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
 
         node_addresses = list(self._incarnation_tracker.node_states.keys())
         for node in node_addresses:
+            if not self._running:
+                break
             if node != self_addr:
                 success = await self._send_with_retry(node, msg, timeout)
                 if success:
@@ -5610,11 +5893,11 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
 
     async def _send_probe_and_wait(self, target: tuple[str, int]) -> bool:
         """
-        Send a probe to target and wait for response indication.
+        Send a probe to target and wait for a fresh response.
 
-        Since UDP is connectionless, we can't directly receive a response.
-        Instead, we send the probe and wait a short time for the node's
-        state to update (indicating an ack was processed).
+        Indirect-probe proxies must never answer from cached membership
+        state. A proxy may report ``alive`` only when the target responds
+        to this probe attempt and completes the per-target ACK future.
 
         Returns True if target appears alive, False otherwise.
         """
@@ -5624,28 +5907,18 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         target_addr = f"{target[0]}:{target[1]}".encode()
         msg = b"probe>" + target_addr
 
-        # Get current node state before probe
-        state_before = self._incarnation_tracker.get_node_state(target)
-        last_seen_before = state_before.last_update_time if state_before else 0
-
         try:
-            # Send probe with error handling
+            existing_future = self._pending_probe_acks.pop(target, None)
+            if existing_future and not existing_future.done():
+                existing_future.cancel()
+
+            ack_future: asyncio.Future[bool] = asyncio.get_event_loop().create_future()
+            self._pending_probe_acks[target] = ack_future
+            self._pending_probe_start[target] = time.monotonic()
+
             await self.send(target, msg, timeout=timeout)
-
-            # Wait for potential response to arrive
-            await asyncio.sleep(min(timeout * 0.7, 0.5))
-
-            # Check if node state was updated (indicates response received)
-            state_after = self._incarnation_tracker.get_node_state(target)
-            if state_after:
-                # Node was updated more recently than before our probe
-                if state_after.last_update_time > last_seen_before:
-                    return state_after.status == b"OK"
-                # Node status is OK
-                if state_after.status == b"OK":
-                    return True
-
-            return False
+            await asyncio.wait_for(ack_future, timeout=timeout)
+            return True
 
         except asyncio.TimeoutError:
             await self.handle_error(ProbeTimeoutError(target, timeout))
@@ -5656,6 +5929,9 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         except Exception as e:
             await self.handle_exception(e, f"probe_and_wait_{target[0]}_{target[1]}")
             return False
+        finally:
+            self._pending_probe_acks.pop(target, None)
+            self._pending_probe_start.pop(target, None)
 
     @udp.send("receive")
     async def send(
@@ -5669,7 +5945,19 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
 
         This hook adds piggybacked gossip data (membership + health) to
         outgoing messages for O(log n) dissemination.
+
+        Terminal-abort barrier: after ``abort()`` flips ``_running``, no
+        outbound SWIM message may leave this instance — including ALIVE
+        refutations, probes, suspect broadcasts, and gossip piggyback.
+        Without this guard, an in-flight handler that captured a
+        reference to this server before abort can still reach the
+        framework's wire-level ``sendto`` and look alive to peers.
+        ``ConnectionResetError`` mimics the OS-level signal a real
+        SIGKILL'd process would surface to outbound senders.
         """
+        if not self._running:
+            raise ConnectionResetError("instance stopped; outbound SWIM send blocked")
+
         # Add piggyback data (membership + health gossip) to outgoing messages
         message_with_piggyback = self._add_piggyback_safe(message)
 
@@ -5740,6 +6028,12 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             addr_tuple,
             process_piggybacks=process_piggybacks,
         )
+        clean_msg_type = clean_data.split(b">", maxsplit=1)[0].split(
+            b":",
+            maxsplit=1,
+        )[0]
+        if clean_msg_type == b"alive":
+            await self._process_direct_alive_response(addr_tuple, clean_data)
         return clean_data
 
     @udp.receive(priority=MessagePriority.CRITICAL, admission_group="swim")

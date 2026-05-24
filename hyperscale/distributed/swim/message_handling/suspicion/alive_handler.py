@@ -34,6 +34,15 @@ class AliveHandler(BaseHandler):
         msg_incarnation = await self._server.parse_incarnation_safe(
             message, source_addr
         )
+        node_id = self._server.parse_node_id_from_message(message)
+        is_authoritative = self._server.is_authoritative_liveness_evidence(
+            source_addr,
+            target,
+            node_id,
+        )
+        if not is_authoritative:
+            self._server.increment_metric("non_authoritative_alive_suppressed")
+            return self._ack()
 
         await self._server.confirm_peer(source_addr)
 
@@ -45,15 +54,14 @@ class AliveHandler(BaseHandler):
         if pending_future and not pending_future.done():
             pending_future.set_result(True)
 
-        if target:
-            if self._server.is_message_fresh(target, msg_incarnation, b"OK"):
-                await self._server.refute_suspicion(target, msg_incarnation)
-                await self._server.update_node_state(
-                    target,
-                    b"OK",
-                    msg_incarnation,
-                    time.monotonic(),
-                )
-                await self._server.decrease_failure_detector("successful_probe")
+        if target and self._server.is_message_fresh(target, msg_incarnation, b"OK"):
+            await self._server.refute_suspicion(target, msg_incarnation)
+            await self._server.update_node_state(
+                target,
+                b"OK",
+                msg_incarnation,
+                time.monotonic(),
+            )
+            await self._server.decrease_failure_detector("successful_probe")
 
         return self._ack()
