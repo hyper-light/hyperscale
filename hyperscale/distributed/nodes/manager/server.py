@@ -4029,17 +4029,70 @@ class ManagerServer(HealthAwareServer):
         payload: bytes,
         timeout: float = 5.0,
     ) -> tuple[str, tuple[str, int]] | None:
-        """Send a job update through the origin gate when one owns the job."""
+        """Send a job update through the origin gate when one owns the job.
+
+        Gate-tier failover: when ``origin_gate_addr`` is set but the send
+        fails (gate killed, partitioned, dead transport), iterate every
+        healthy peer gate in deterministic order and try each. Any gate
+        that doesn't own the job forwards via
+        ``_forward_workflow_result_to_peers`` (hash-ring + fallback), so
+        delivering to any live gate is sufficient. On peer success the
+        origin is updated to the gate that accepted, so subsequent pushes
+        route directly to the new owner instead of paying the dead-origin
+        timeout per send. The ``JobLeadershipAnnouncement`` handler will
+        independently rewrite the origin when an orphan-coordinator
+        takeover lands; failover here is the in-flight bridge between the
+        origin dying and the announcement arriving.
+
+        Falls through to ``callback_addr`` (direct-to-client) only when
+        no origin gate was ever recorded — preserves L1/L2 semantics.
+        """
         origin_gate_addr = self._manager_state.get_job_origin_gate(job_id)
+        import sys as _sys
+        _sys.stderr.write(
+            f"[MGR-PUSH-ENTRY job_id={job_id[:10]} method={gate_method}] "
+            f"origin={origin_gate_addr} callback={callback_addr}\n"
+        )
+        _sys.stderr.flush()
         if origin_gate_addr is not None:
-            destination = tuple(origin_gate_addr)
-            response = await self._send_to_peer(
-                destination,
-                gate_method,
-                payload,
+            origin_tuple = tuple(origin_gate_addr)
+            tried: list[tuple[str, int]] = []
+
+            destination, response, last_error = await self._send_to_gate_with_failover(
+                job_id=job_id,
+                primary_addr=origin_tuple,
+                gate_method=gate_method,
+                payload=payload,
                 timeout=timeout,
+                tried=tried,
             )
+
+            _sys.stderr.write(
+                f"[MGR-PUSH-RESULT job_id={job_id[:10]} method={gate_method}] "
+                f"destination={destination} tried={tried} "
+                f"last_error={type(last_error).__name__ if last_error else None}:{last_error}\n"
+            )
+            _sys.stderr.flush()
+
+            if destination is None:
+                # Every gate attempt failed; surface the most recent
+                # error so the caller's exception handler can log
+                # something actionable rather than a silent drop.
+                if last_error is not None:
+                    raise last_error
+                raise RuntimeError(
+                    f"{gate_method} failed against every healthy gate "
+                    f"(tried={tried})"
+                )
+
             method = gate_method
+            if destination != origin_tuple:
+                _sys.stderr.write(
+                    f"[MGR-PUSH-REROUTE job_id={job_id[:10]}] "
+                    f"old_origin={origin_tuple} new_origin={destination}\n"
+                )
+                _sys.stderr.flush()
+                self._manager_state.set_job_origin_gate(job_id, destination)
         else:
             if callback_addr is None:
                 return None
@@ -4052,11 +4105,87 @@ class ManagerServer(HealthAwareServer):
             )
             method = client_method
 
-        if isinstance(response, Exception):
-            raise response
-        if response not in (b"ok", b"forwarded", None):
-            raise RuntimeError(f"{method} rejected update with {response!r}")
+            if isinstance(response, Exception):
+                raise response
+            if response not in (b"ok", b"forwarded", None):
+                raise RuntimeError(f"{method} rejected update with {response!r}")
+
         return method, destination
+
+    async def _send_to_gate_with_failover(
+        self,
+        job_id: str,
+        primary_addr: tuple[str, int],
+        gate_method: str,
+        payload: bytes,
+        timeout: float,
+        tried: list[tuple[str, int]],
+    ) -> tuple[tuple[str, int] | None, bytes | None, Exception | None]:
+        """Try ``primary_addr`` then healthy peer gates in deterministic order.
+
+        Returns ``(destination_that_succeeded, response_bytes, last_error)``.
+        ``destination`` is ``None`` when every attempt failed. Healthy peer
+        gates are drawn from the heartbeat-freshness-driven healthy set;
+        gates whose heartbeats have aged past the registry's reap
+        threshold are already excluded by ``get_healthy_gate_ids``. The
+        deterministic sort by ``(host, port)`` keeps failover ordering
+        stable across managers so the same surviving gate accumulates
+        pushes for a given job rather than scattering.
+        """
+        # Try the recorded origin first — happy-path is unchanged.
+        destination, response, last_error = await self._attempt_send_to_gate(
+            primary_addr, gate_method, payload, timeout, tried,
+        )
+        if destination is not None:
+            return destination, response, None
+
+        # Failover: rank peers deterministically and walk them.
+        healthy_addrs = sorted(self._get_healthy_gate_tcp_addrs())
+        for peer_addr in healthy_addrs:
+            if peer_addr == primary_addr or peer_addr in tried:
+                continue
+            destination, response, send_error = await self._attempt_send_to_gate(
+                peer_addr, gate_method, payload, timeout, tried,
+            )
+            if destination is not None:
+                return destination, response, None
+            if send_error is not None:
+                last_error = send_error
+
+        return None, None, last_error
+
+    async def _attempt_send_to_gate(
+        self,
+        addr: tuple[str, int],
+        gate_method: str,
+        payload: bytes,
+        timeout: float,
+        tried: list[tuple[str, int]],
+    ) -> tuple[tuple[str, int] | None, bytes | None, Exception | None]:
+        """Single send attempt; classify outcome without raising.
+
+        Returns ``(addr, response, None)`` on accept,
+        ``(None, None, exception_or_runtime_error)`` on any failure.
+        Appends ``addr`` to ``tried`` so the outer loop skips it.
+        """
+        tried.append(addr)
+        try:
+            response = await self._send_to_peer(
+                addr,
+                gate_method,
+                payload,
+                timeout=timeout,
+            )
+        except Exception as send_error:
+            return None, None, send_error
+
+        if isinstance(response, Exception):
+            return None, None, response
+        if response not in (b"ok", b"forwarded", None):
+            return None, None, RuntimeError(
+                f"{gate_method} rejected by {addr} with {response!r}"
+            )
+        return addr, response, None
 
     async def _push_job_status_to_client(
         self,
@@ -5426,8 +5555,15 @@ class ManagerServer(HealthAwareServer):
     ) -> bytes:
         try:
             result = WorkflowFinalResult.load(data)
+            import sys as _sys
+            is_leader = self._leases.is_job_leader(result.job_id)
+            _sys.stderr.write(
+                f"[MGR-FINAL-RECV job_id={result.job_id[:10]} wf={result.workflow_id[:10]}] "
+                f"from={addr} status={result.status} is_leader={is_leader}\n"
+            )
+            _sys.stderr.flush()
 
-            if not self._leases.is_job_leader(result.job_id):
+            if not is_leader:
                 return await self._forward_workflow_final_result_to_leader(
                     result,
                     data,

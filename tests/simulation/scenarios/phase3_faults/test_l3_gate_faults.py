@@ -52,8 +52,13 @@ _GATE_COUNT = 3
 _DC_ID = "main"
 _WORKFLOW_DURATION_SECONDS = 30.0
 # GATE_ORPHAN_GRACE_PERIOD (10) + GATE_ORPHAN_CHECK_INTERVAL (2) +
-# takeover_jitter_max (2) + 1 SWIM detection cycle (~5).
-_GATE_TAKEOVER_BUDGET_SECONDS = 20.0
+# SWIM death detection of the killed gate (~5-10s under default
+# Lifeguard bracket) + GATE_ORPHAN_GRACE_PERIOD (10s) +
+# GATE_ORPHAN_CHECK_INTERVAL (2s max wait until next scan tick) +
+# takeover_jitter_max (2s). Underestimating any of these forces
+# the test to fail before the orphan coordinator's takeover scan
+# has a chance to fire even on a healthy cluster.
+_GATE_TAKEOVER_BUDGET_SECONDS = 30.0
 # Dispatch overhead headroom — the same shape we use for the worker-
 # death-timing tests: one workflow run, plus reassignment overhead.
 _DISPATCH_OVERHEAD_SECONDS = 15.0

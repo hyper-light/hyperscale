@@ -732,7 +732,7 @@ class GateCoordinatedTimeout(TimeoutStrategy):
 
         report = JobProgressReport(
             job_id=job_id,
-            datacenter=self._manager._datacenter,
+            datacenter=self._manager._node_id.datacenter,
             manager_id=self._manager._node_id.short,
             manager_host=self._manager._host,
             manager_port=self._manager._tcp_port,
@@ -775,7 +775,7 @@ class GateCoordinatedTimeout(TimeoutStrategy):
 
         report = JobTimeoutReport(
             job_id=job_id,
-            datacenter=self._manager._datacenter,
+            datacenter=self._manager._node_id.datacenter,
             manager_id=self._manager._node_id.short,
             manager_host=self._manager._host,
             manager_port=self._manager._tcp_port,
@@ -819,7 +819,7 @@ class GateCoordinatedTimeout(TimeoutStrategy):
 
         report = JobLeaderTransfer(
             job_id=job_id,
-            datacenter=self._manager._datacenter,
+            datacenter=self._manager._node_id.datacenter,
             new_leader_id=self._manager._node_id.short,
             new_leader_host=self._manager._host,
             new_leader_port=self._manager._tcp_port,
@@ -857,7 +857,7 @@ class GateCoordinatedTimeout(TimeoutStrategy):
 
         final_report = JobFinalStatus(
             job_id=job_id,
-            datacenter=self._manager._datacenter,
+            datacenter=self._manager._node_id.datacenter,
             manager_id=self._manager._node_id.short,
             status=status,
             timestamp=time.monotonic(),
@@ -887,7 +887,7 @@ class GateCoordinatedTimeout(TimeoutStrategy):
 
         correction = JobFinalStatus(
             job_id=job_id,
-            datacenter=self._manager._datacenter,
+            datacenter=self._manager._node_id.datacenter,
             manager_id=self._manager._node_id.short,
             status=status,
             timestamp=time.monotonic(),

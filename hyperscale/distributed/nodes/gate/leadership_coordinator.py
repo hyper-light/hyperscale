@@ -100,7 +100,7 @@ class GateLeadershipCoordinator:
         """
         node_id = self._get_node_id()
         node_addr = self._get_node_addr()
-        fence_token = self._leadership_tracker.get_fence_token(job_id)
+        fence_token = self._leadership_tracker.get_fencing_token(job_id)
 
         announcement = JobLeadershipAnnouncement(
             job_id=job_id,
@@ -196,7 +196,7 @@ class GateLeadershipCoordinator:
             Acknowledgment
         """
         # Check if we already have leadership with higher fence token
-        current_token = self._leadership_tracker.get_fence_token(job_id)
+        current_token = self._leadership_tracker.get_fencing_token(job_id)
         node_id = self._get_node_id()
         if current_token and current_token >= fence_token:
             return JobLeadershipAck(
@@ -242,7 +242,7 @@ class GateLeadershipCoordinator:
         if not self.is_job_leader(job_id):
             return False
 
-        fence_token = self._leadership_tracker.get_fence_token(job_id)
+        fence_token = self._leadership_tracker.get_fencing_token(job_id)
         new_token = fence_token + 1
 
         transfer = JobLeaderGateTransfer(

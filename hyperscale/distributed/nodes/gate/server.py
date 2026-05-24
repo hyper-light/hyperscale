@@ -729,6 +729,7 @@ class GateServer(HealthAwareServer):
                 job_id,
                 datacenter_id,
             ),
+            manager_dispatch_timeout_seconds=self.env.GATE_TCP_TIMEOUT_STANDARD,
         )
 
         self._peer_coordinator = GatePeerCoordinator(
@@ -1227,36 +1228,10 @@ class GateServer(HealthAwareServer):
         clock_time: int,
     ):
         """Handle job submission from client."""
-        from hyperscale.logging.hyperscale_logging_models import ServerError
-        await self._udp_logger.log(
-            ServerError(
-                message=(
-                    f"[L3-HOP1 gate.job_submission] client_addr={addr} "
-                    f"has_job_handler={self._job_handler is not None} "
-                    f"active_peer_count="
-                    f"{self._modular_state.get_active_peer_count()}"
-                ),
-                node_host=self._host,
-                node_port=self._tcp_port,
-                node_id=self._node_id.short,
-            )
-        )
         if self._job_handler:
-            result = await self._job_handler.handle_submission(
+            return await self._job_handler.handle_submission(
                 addr, data, self._modular_state.get_active_peer_count()
             )
-            await self._udp_logger.log(
-                ServerError(
-                    message=(
-                        f"[L3-HOP1-DONE gate.job_submission] client_addr={addr} "
-                        f"result_len={len(result) if result else 0}"
-                    ),
-                    node_host=self._host,
-                    node_port=self._tcp_port,
-                    node_id=self._node_id.short,
-                )
-            )
-            return result
         return b"error"
 
     @tcp.receive()
@@ -1558,6 +1533,13 @@ class GateServer(HealthAwareServer):
         """Handle workflow result push from manager."""
         try:
             push = WorkflowResultPush.load(data)
+            import sys as _sys
+            _sys.stderr.write(
+                f"[GATE-RESULT-RECV job_id={push.job_id[:10]} wf={push.workflow_id[:10]}] "
+                f"from={addr} dc={push.datacenter} status={push.status} "
+                f"has_job={self._job_manager.has_job(push.job_id)}\n"
+            )
+            _sys.stderr.flush()
 
             current_fence = self._job_manager.get_fence_token(push.job_id)
             if push.fence_token < current_fence:

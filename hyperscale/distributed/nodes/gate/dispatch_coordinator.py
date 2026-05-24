@@ -97,7 +97,11 @@ class GateDispatchCoordinator:
         spillover_evaluator: SpilloverEvaluator | None = None,
         observed_latency_tracker: "ObservedLatencyTracker | None" = None,
         record_dispatch_failure: Callable[[str, str], None] | None = None,
+        manager_dispatch_timeout_seconds: float = 5.0,
     ) -> None:
+        self._manager_dispatch_timeout_seconds: float = (
+            manager_dispatch_timeout_seconds
+        )
         self._state: "GateRuntimeState" = state
         self._logger: "Logger" = logger
         self._task_runner: "TaskRunner" = task_runner
@@ -887,10 +891,10 @@ class GateDispatchCoordinator:
         base_delay: float = 0.3,
     ) -> tuple[bool, str | None]:
         """Try to dispatch job to a single manager with retries and circuit breaker."""
-        if self._circuit_breaker_manager.is_open(manager_addr):
+        if await self._circuit_breaker_manager.is_circuit_open(manager_addr):
             return (False, "Circuit breaker is OPEN")
 
-        circuit = self._circuit_breaker_manager.get_or_create(manager_addr)
+        circuit = await self._circuit_breaker_manager.get_circuit(manager_addr)
         retry_config = RetryConfig(
             max_attempts=max_retries + 1,
             base_delay=base_delay,
@@ -900,11 +904,16 @@ class GateDispatchCoordinator:
         executor = RetryExecutor(retry_config)
 
         async def dispatch_operation() -> tuple[bool, str | None]:
-            response = await self._send_tcp(
+            # ``_send_tcp`` returns ``(response_bytes | None, clock_time)`` —
+            # unpack the tuple rather than testing isinstance(response, bytes)
+            # against the raw tuple, which would always fail and force the
+            # retry path to ``raise ConnectionError("No valid response from
+            # manager")`` even when the manager handler responded correctly.
+            response, _clock = await self._send_tcp(
                 manager_addr,
                 "job_submission",
                 submission.dump(),
-                timeout=5.0,
+                timeout=self._manager_dispatch_timeout_seconds,
             )
 
             if isinstance(response, bytes):
@@ -914,11 +923,25 @@ class GateDispatchCoordinator:
             raise ConnectionError("No valid response from manager")
 
         try:
-            return await executor.execute(
+            result = await executor.execute(
                 dispatch_operation,
                 operation_name=f"dispatch_to_manager_{manager_addr}",
             )
+            import sys as _sys
+            _sys.stderr.write(
+                f"[L3-HOP2-EXIT gate->mgr] mgr={manager_addr} "
+                f"job_id={submission.job_id} result={result}\n"
+            )
+            _sys.stderr.flush()
+            return result
         except Exception as exception:
+            import sys as _sys
+            _sys.stderr.write(
+                f"[L3-HOP2-EXIT-EXC gate->mgr] mgr={manager_addr} "
+                f"job_id={submission.job_id} "
+                f"err={type(exception).__name__}:{exception}\n"
+            )
+            _sys.stderr.flush()
             circuit.record_failure()
             return (False, str(exception))
 
