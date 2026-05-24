@@ -1143,7 +1143,6 @@ class GateServer(HealthAwareServer):
         """
         try:
             ack = CrossClusterAck.load(ack_data)
-            self._dc_health_monitor.handle_ack(ack)
 
             if ack.is_leader and isinstance(source_addr, tuple):
                 self._dc_health_monitor.update_leader(
@@ -1152,6 +1151,8 @@ class GateServer(HealthAwareServer):
                     leader_node_id=ack.node_id,
                     leader_term=ack.leader_term,
                 )
+
+            self._dc_health_monitor.handle_ack(ack)
 
         except Exception as error:
             await self.handle_exception(error, "_handle_xack_response")
@@ -3894,7 +3895,17 @@ class GateServer(HealthAwareServer):
     async def _send_xprobe(self, target: tuple[str, int], data: bytes) -> bool:
         """Send cross-cluster probe."""
         try:
-            await self.send(target, data, timeout=5)
+            response = await self.send(target, data, timeout=5)
+            if not isinstance(response, bytes):
+                return True
+
+            if response.startswith(b"xack>"):
+                await self._handle_xack_response(target, response.split(b">", 1)[1])
+                return True
+
+            if response.startswith(b"xnack>"):
+                return False
+
             return True
         except Exception as probe_error:
             await self._udp_logger.log(

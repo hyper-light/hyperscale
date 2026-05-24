@@ -27,6 +27,7 @@ from hyperscale.distributed.datacenters import (
 from hyperscale.distributed.capacity import DatacenterCapacityAggregator
 from hyperscale.distributed.swim.health import (
     FederatedHealthMonitor,
+    DCHealthState,
     DCReachability,
 )
 from hyperscale.distributed.reliability import (
@@ -206,12 +207,37 @@ class GateHealthCoordinator:
                 datacenter_id,
                 resolved_manager_addr,
             )
+            self._update_federated_leader(
+                datacenter_id,
+                resolved_manager_addr,
+                heartbeat,
+            )
 
         self._record_cross_dc_signals(datacenter_id, heartbeat)
         if use_version_clock:
             await self._versioned_clock.update_entity(version_key, heartbeat.version)
 
         return datacenter_id, resolved_manager_addr
+
+    def _update_federated_leader(
+        self,
+        datacenter_id: str,
+        manager_addr: tuple[str, int],
+        heartbeat: ManagerHeartbeat,
+    ) -> None:
+        """Refresh the federated probe target from the current manager leader."""
+        if not heartbeat.udp_host or heartbeat.udp_port <= 0:
+            return
+
+        tcp_host = heartbeat.tcp_host or manager_addr[0]
+        tcp_port = heartbeat.tcp_port or manager_addr[1]
+        self._dc_health_monitor.update_leader(
+            datacenter=datacenter_id,
+            leader_udp_addr=(heartbeat.udp_host, heartbeat.udp_port),
+            leader_tcp_addr=(tcp_host, tcp_port),
+            leader_node_id=heartbeat.node_id,
+            leader_term=heartbeat.term,
+        )
 
     def _resolve_manager_addr(
         self,
@@ -370,15 +396,14 @@ class GateHealthCoordinator:
         if federated_health is None:
             return tcp_status
 
+        if federated_health.reachability == DCReachability.UNKNOWN:
+            return tcp_status
+
         if federated_health.reachability == DCReachability.UNREACHABLE:
-            return DatacenterStatus(
-                dc_id=datacenter_id,
-                health=DatacenterHealth.UNHEALTHY.value,
-                available_capacity=0,
-                queue_depth=tcp_status.queue_depth,
-                manager_count=tcp_status.manager_count,
-                worker_count=0,
-                last_update=tcp_status.last_update,
+            return self._merge_unreachable_federated_health(
+                datacenter_id,
+                tcp_status,
+                federated_health,
             )
 
         if federated_health.reachability == DCReachability.SUSPECTED:
@@ -438,6 +463,40 @@ class GateHealthCoordinator:
                 )
 
         return tcp_status
+
+    def _merge_unreachable_federated_health(
+        self,
+        datacenter_id: str,
+        tcp_status: DatacenterStatus,
+        federated_health: DCHealthState,
+    ) -> DatacenterStatus:
+        """Apply a confirmed federated reachability failure to TCP health."""
+        if not federated_health.has_successful_probe:
+            return tcp_status
+
+        if tcp_status.health in (
+            DatacenterHealth.HEALTHY.value,
+            DatacenterHealth.BUSY.value,
+        ):
+            return DatacenterStatus(
+                dc_id=datacenter_id,
+                health=DatacenterHealth.DEGRADED.value,
+                available_capacity=tcp_status.available_capacity,
+                queue_depth=tcp_status.queue_depth,
+                manager_count=tcp_status.manager_count,
+                worker_count=tcp_status.worker_count,
+                last_update=tcp_status.last_update,
+            )
+
+        return DatacenterStatus(
+            dc_id=datacenter_id,
+            health=DatacenterHealth.UNHEALTHY.value,
+            available_capacity=0,
+            queue_depth=tcp_status.queue_depth,
+            manager_count=tcp_status.manager_count,
+            worker_count=0,
+            last_update=tcp_status.last_update,
+        )
 
     def get_all_datacenter_health(
         self,

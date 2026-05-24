@@ -24,6 +24,7 @@ from hyperscale.distributed.swim.core.protocols import LoggerProtocol
 class DCReachability(Enum):
     """Network reachability state for a datacenter."""
 
+    UNKNOWN = "unknown"
     REACHABLE = "reachable"
     SUSPECTED = "suspected"
     UNREACHABLE = "unreachable"
@@ -112,7 +113,7 @@ class DCHealthState:
     leader_term: int = 0
 
     # Probe state
-    reachability: DCReachability = DCReachability.UNREACHABLE
+    reachability: DCReachability = DCReachability.UNKNOWN
     last_probe_sent: float = 0.0
     last_ack_received: float = 0.0
     consecutive_failures: int = 0
@@ -129,6 +130,8 @@ class DCHealthState:
     @property
     def effective_health(self) -> str:
         """Combine reachability and reported health."""
+        if self.reachability == DCReachability.UNKNOWN:
+            return "UNKNOWN"
         if self.reachability == DCReachability.UNREACHABLE:
             return "UNREACHABLE"
         if self.reachability == DCReachability.SUSPECTED:
@@ -140,11 +143,16 @@ class DCHealthState:
     @property
     def is_healthy_for_jobs(self) -> bool:
         """Can this DC accept new jobs?"""
-        if self.reachability == DCReachability.UNREACHABLE:
+        if self.reachability in (DCReachability.UNKNOWN, DCReachability.UNREACHABLE):
             return False
         if not self.last_ack:
             return False
         return self.last_ack.dc_health in ("HEALTHY", "DEGRADED", "BUSY")
+
+    @property
+    def has_successful_probe(self) -> bool:
+        """Return whether this DC has ever answered a federated probe."""
+        return self.last_ack is not None and self.last_ack_received > 0.0
 
 
 @dataclass(slots=True)
@@ -316,6 +324,9 @@ class FederatedHealthMonitor:
         if leader_term < state.leader_term:
             return False
 
+        previous_leader_node_id = state.leader_node_id
+        previous_leader_udp_addr = state.leader_udp_addr
+
         # Check if this is an actual leader change (term increased or node changed)
         leader_changed = (
             leader_term > state.leader_term or leader_node_id != state.leader_node_id
@@ -327,10 +338,12 @@ class FederatedHealthMonitor:
         state.leader_node_id = leader_node_id
         state.leader_term = leader_term
 
-        # Reset suspicion on leader change
-        if state.reachability == DCReachability.SUSPECTED:
-            state.reachability = DCReachability.UNREACHABLE
-            state.consecutive_failures = 0
+        if leader_changed or previous_leader_udp_addr != leader_udp_addr:
+            self._reset_probe_state_for_leader_change(
+                state,
+                previous_leader_node_id,
+                previous_leader_udp_addr,
+            )
 
         # Fire callback if leader actually changed
         if leader_changed and self._on_dc_leader_change and leader_tcp_addr:
@@ -343,6 +356,27 @@ class FederatedHealthMonitor:
             )
 
         return leader_changed
+
+    def _reset_probe_state_for_leader_change(
+        self,
+        state: DCHealthState,
+        previous_leader_node_id: str,
+        previous_leader_udp_addr: tuple[str, int] | None,
+    ) -> None:
+        """Clear negative probe state when probing moves to a different leader."""
+        if (
+            state.leader_node_id == previous_leader_node_id
+            and state.leader_udp_addr == previous_leader_udp_addr
+        ):
+            return
+
+        state.reachability = DCReachability.UNKNOWN
+        state.last_probe_sent = 0.0
+        state.last_ack_received = 0.0
+        state.consecutive_failures = 0
+        state.incarnation = 0
+        state.last_ack = None
+        state.suspected_at = 0.0
 
     def get_dc_health(self, datacenter: str) -> DCHealthState | None:
         """Get current health state for a datacenter."""
@@ -463,23 +497,22 @@ class FederatedHealthMonitor:
         """
         Check all DCs for ack timeout and transition to SUSPECTED/UNREACHABLE.
 
-        This handles the case where probes are sent successfully but no ack arrives.
-        Without this, a DC could remain REACHABLE indefinitely after its last ack.
+        This handles loss after a DC has already returned at least one ack. A
+        never-acked DC remains UNKNOWN so "not yet established" is not treated
+        as confirmed reachability failure.
         """
         now = time.monotonic()
         ack_grace_period = self.probe_timeout * self.max_consecutive_failures
 
         for state in self._dc_health.values():
-            if state.reachability == DCReachability.UNREACHABLE:
+            if state.reachability in (
+                DCReachability.UNKNOWN,
+                DCReachability.UNREACHABLE,
+            ):
                 continue
 
             if state.last_ack_received == 0.0:
-                if state.last_probe_sent == 0.0:
-                    continue
-                time_since_first_probe = now - state.last_probe_sent
-                if time_since_first_probe <= ack_grace_period:
-                    continue
-                reference_time = state.last_probe_sent
+                continue
             else:
                 reference_time = state.last_ack_received
 
@@ -503,6 +536,12 @@ class FederatedHealthMonitor:
 
         old_reachability = state.reachability
 
+        if (
+            state.reachability == DCReachability.UNKNOWN
+            and not state.has_successful_probe
+        ):
+            return
+
         if state.consecutive_failures >= self.max_consecutive_failures:
             if state.reachability == DCReachability.REACHABLE:
                 state.reachability = DCReachability.SUSPECTED
@@ -518,6 +557,12 @@ class FederatedHealthMonitor:
         """Handle an xack response from a DC leader."""
         state = self._dc_health.get(ack.datacenter)
         if not state:
+            return
+
+        if not ack.is_leader:
+            return
+
+        if ack.leader_term < state.leader_term:
             return
 
         # Check incarnation for staleness

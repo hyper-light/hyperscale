@@ -16,7 +16,7 @@ from hyperscale.core.graph.workflow import Workflow
 from hyperscale.distributed.swim import HealthAwareServer, ManagerStateEmbedder
 from hyperscale.distributed.swim.core import ErrorStats, CircuitState
 from hyperscale.distributed.swim.detection import HierarchicalConfig
-from hyperscale.distributed.swim.health import FederatedHealthMonitor
+from hyperscale.distributed.swim.health import CrossClusterAck, FederatedHealthMonitor
 from hyperscale.distributed.env import Env
 from hyperscale.distributed.server import tcp
 from hyperscale.distributed.idempotency import (
@@ -103,6 +103,7 @@ from hyperscale.distributed.models import (
     RegisterCallbackResponse,
     RateLimitResponse,
     TrackingToken,
+    DatacenterHealth,
     restricted_loads,
     JobInfo,
     WorkflowInfo,
@@ -3428,6 +3429,105 @@ class ManagerServer(HealthAwareServer):
             slo_routing_factor=slo_summary.routing_factor,
             slo_updated_at=slo_summary.updated_at,
         )
+
+    async def _build_xprobe_response(
+        self,
+        source_addr: tuple[str, int] | bytes,
+        probe_data: bytes,
+    ) -> bytes | None:
+        """Build a federated health acknowledgment for gate xprobes."""
+        if not self.is_leader():
+            return None
+
+        heartbeat = self._build_manager_heartbeat()
+        healthy_managers = self._manager_state.get_active_peer_count()
+        cluster_size = max(
+            healthy_managers,
+            self._manager_state.get_known_manager_peer_count() + 1,
+            len(self._manager_udp_peers) + 1,
+        )
+        incarnation = await self._manager_state.increment_external_incarnation()
+        datacenter_health = self._classify_xprobe_datacenter_health(
+            heartbeat,
+            healthy_managers,
+            cluster_size,
+        )
+
+        return CrossClusterAck(
+            datacenter=heartbeat.datacenter,
+            node_id=heartbeat.node_id,
+            incarnation=incarnation,
+            is_leader=heartbeat.is_leader,
+            leader_term=heartbeat.term,
+            cluster_size=cluster_size,
+            healthy_managers=healthy_managers,
+            worker_count=heartbeat.worker_count,
+            healthy_workers=heartbeat.healthy_worker_count,
+            total_cores=heartbeat.total_cores,
+            available_cores=heartbeat.available_cores,
+            active_jobs=heartbeat.active_jobs,
+            active_workflows=heartbeat.active_workflows,
+            dc_health=datacenter_health.value.upper(),
+            health_reason=self._get_xprobe_health_reason(
+                heartbeat,
+                healthy_managers,
+                cluster_size,
+                datacenter_health,
+            ),
+        ).dump()
+
+    def _classify_xprobe_datacenter_health(
+        self,
+        heartbeat: ManagerHeartbeat,
+        healthy_managers: int,
+        cluster_size: int,
+    ) -> DatacenterHealth:
+        """Classify this DC for a federated xprobe ack."""
+        if heartbeat.worker_count == 0 or healthy_managers == 0:
+            return DatacenterHealth.UNHEALTHY
+
+        quorum_size = cluster_size // 2 + 1
+        worker_quorum = heartbeat.worker_count // 2 + 1
+        if (
+            healthy_managers < quorum_size
+            or heartbeat.healthy_worker_count < worker_quorum
+            or not self._has_quorum_available()
+        ):
+            return DatacenterHealth.DEGRADED
+
+        if self._manager_health_state_snapshot == "overloaded":
+            return DatacenterHealth.DEGRADED
+
+        if heartbeat.available_cores <= 0:
+            return DatacenterHealth.BUSY
+
+        return DatacenterHealth.HEALTHY
+
+    def _get_xprobe_health_reason(
+        self,
+        heartbeat: ManagerHeartbeat,
+        healthy_managers: int,
+        cluster_size: int,
+        datacenter_health: DatacenterHealth,
+    ) -> str:
+        """Return a compact reason string for non-healthy xprobe acks."""
+        if datacenter_health == DatacenterHealth.HEALTHY:
+            return ""
+        if heartbeat.worker_count == 0:
+            return "no workers registered"
+        if healthy_managers == 0:
+            return "no managers reachable"
+        if healthy_managers < cluster_size // 2 + 1:
+            return "manager quorum unavailable"
+        if heartbeat.healthy_worker_count < heartbeat.worker_count // 2 + 1:
+            return "worker quorum unavailable"
+        if not self._has_quorum_available():
+            return "manager leadership quorum unavailable"
+        if self._manager_health_state_snapshot == "overloaded":
+            return "manager overloaded"
+        if heartbeat.available_cores <= 0:
+            return "all cores busy"
+        return datacenter_health.value
 
     def _get_healthy_gate_tcp_addrs(self) -> list[tuple[str, int]]:
         """Get TCP addresses of healthy gates."""

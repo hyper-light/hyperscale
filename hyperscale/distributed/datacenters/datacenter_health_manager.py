@@ -376,6 +376,46 @@ class DatacenterHealthManager:
         if leader_heartbeat is not None:
             best_heartbeat = leader_heartbeat
 
+        # Diagnostic: log every cached heartbeat with the freshness +
+        # is_leader + worker_count signals the classifier consumes.
+        # Reveals whether the "UNHEALTHY despite full inputs" failure
+        # is (a) leader's heartbeat not arriving / not is_leader-tagged,
+        # (b) follower being picked because no leader heartbeat is fresh,
+        # or (c) leader's most recent cached heartbeat carrying stale
+        # pre-worker-registration counts.
+        import sys as _sys
+        _cached = [
+            {
+                "mgr": f"{addr[0]}:{addr[1]}",
+                "node_id": (info.heartbeat.node_id[:16] if info.heartbeat.node_id else None),
+                "is_leader": info.heartbeat.is_leader,
+                "worker_count": info.heartbeat.worker_count,
+                "healthy_worker_count": info.heartbeat.healthy_worker_count,
+                "available_cores": info.heartbeat.available_cores,
+                "version": info.heartbeat.version,
+                "age_s": round(now - info.last_seen, 2),
+                "fresh": (now - info.last_seen) < self._heartbeat_timeout,
+                "is_alive": info.is_alive,
+            }
+            for addr, info in dc_managers.items()
+        ]
+        _picked = None
+        if best_heartbeat is not None:
+            _picked = {
+                "node_id": (best_heartbeat.node_id[:16] if best_heartbeat.node_id else None),
+                "is_leader": best_heartbeat.is_leader,
+                "worker_count": best_heartbeat.worker_count,
+                "available_cores": best_heartbeat.available_cores,
+                "version": best_heartbeat.version,
+            }
+        _sys.stderr.write(
+            f"[BEST-HEARTBEAT dc={dc_id}] cached={_cached} "
+            f"alive_count={alive_count} total={len(dc_managers)} "
+            f"picked={_picked} "
+            f"heartbeat_timeout={self._heartbeat_timeout}\n"
+        )
+        _sys.stderr.flush()
+
         return best_heartbeat, alive_count, len(dc_managers)
 
     def get_leader_address(self, dc_id: str) -> tuple[str, int] | None:
