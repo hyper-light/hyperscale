@@ -47,6 +47,8 @@ class Metrics:
     suspicions_confirmed: int = 0
     suspicions_refuted: int = 0
     suspicions_expired: int = 0
+    suspicions_expired_refuted_direct: int = 0
+    dead_gossip_deferred_unwitnessed: int = 0
     
     # Election metrics
     elections_started: int = 0

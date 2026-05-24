@@ -155,6 +155,72 @@ async def test_worker_dies_post_ack_before_workload_finishes() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.simulation
+async def test_worker_dies_mid_execute() -> None:
+    """Worker is actively executing the workflow (post-ack, before result)
+    when it dies; cancellation propagation must surface or redispatch.
+
+    Distinct from ``test_worker_dies_post_ack_before_workload_finishes``
+    (which intercepts the workflow task before execute starts) and
+    ``test_worker_dies_post_execute_before_result_push`` (which lets
+    execute complete and intercepts the result push). Here the workflow
+    is genuinely in flight — the ``LongRunningWorkflow`` step is part-
+    way through its ``asyncio.sleep(30)`` when the kill lands.
+
+    Targets the same worker the dispatch landed on (captured via the
+    ``_send_dispatch`` hook used by the post-ack timing test) so the
+    fault is deterministic rather than relying on a 2-worker 50/50
+    roll. The peer worker must pick the workflow up; ``LongRunningWorkflow``
+    is restart-from-scratch (per SCENARIOS.md §2 contract), so the
+    completion budget covers one full re-execution plus dispatch.
+    """
+    spec = _l1_spec(base_port=38250)
+    async with ClusterHarness(
+        spec,
+        mode=ExecutionMode.REAL,
+        scenario_name="worker_dies_mid_execute",
+    ) as cluster:
+        manager = cluster.managers("local")[0]
+        dispatcher = manager.instance._workflow_dispatcher
+        original_send_dispatch = dispatcher._send_dispatch
+        dispatched_worker_id: str | None = None
+        dispatch_ack_event = asyncio.Event()
+
+        async def capture_dispatch_target(
+            worker_id: str,
+            dispatch: WorkflowDispatch,
+        ) -> bool:
+            nonlocal dispatched_worker_id
+            accepted = await original_send_dispatch(worker_id, dispatch)
+            if accepted and dispatched_worker_id is None:
+                dispatched_worker_id = worker_id
+                dispatch_ack_event.set()
+            return accepted
+
+        dispatcher._send_dispatch = capture_dispatch_target
+
+        async with cluster.workload(_workload(LongRunningWorkflow, 90.0)) as driver:
+            await driver.submit()
+            await driver.wait_until_running(timeout=30.0)
+            await asyncio.wait_for(dispatch_ack_event.wait(), timeout=10.0)
+
+            # Wait long enough that execute() is genuinely mid-sleep,
+            # not still spinning up. LongRunningWorkflow.duration is
+            # 30s, so 5s is ~16% through the execute window — well
+            # past startup, well before completion.
+            await asyncio.sleep(5.0)
+
+            victim = next(
+                worker
+                for worker in cluster.workers("local")
+                if worker.instance._node_id.full == dispatched_worker_id
+            )
+            await cluster.faults.kill(victim)
+
+            await driver.wait_for_completion()
+
+
+@pytest.mark.asyncio
+@pytest.mark.simulation
 async def test_worker_dies_post_execute_before_result_push() -> None:
     """Worker finishes execution but dies before pushing its final result."""
     spec = _l1_spec(base_port=39000)

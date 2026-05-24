@@ -1590,6 +1590,19 @@ class ManagerServer(HealthAwareServer):
     # =========================================================================
 
     async def _handle_worker_failure(self, worker_id: str) -> None:
+        await self._udp_logger.log(
+            ServerError(
+                message=(
+                    f"[WORKER-FAIL] worker_id={worker_id} "
+                    f"worker_count_before={self._manager_state.get_worker_count()} "
+                    f"has_worker={self._manager_state.has_worker(worker_id)} "
+                    f"all_worker_ids={list(self._manager_state._workers.keys())}"
+                ),
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
         if self._manager_state.has_worker(worker_id):
             await self._worker_health_monitor.handle_worker_failure(worker_id)
 
@@ -5092,6 +5105,20 @@ class ManagerServer(HealthAwareServer):
         """Fail and notify unfinished workflows when no worker remains."""
         if not self._job_manager:
             return
+
+        import traceback as _tb
+        await self._udp_logger.log(
+            ServerError(
+                message=(
+                    f"[FAIL-UNFINISHED] worker_count="
+                    f"{self._manager_state.get_worker_count()} "
+                    f"stack={'/'.join(f.name for f in _tb.extract_stack()[-6:-1])}"
+                ),
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
 
         reason = "all workers unavailable"
         failed_workflows = await self._job_manager.fail_unfinished_workflows(reason)

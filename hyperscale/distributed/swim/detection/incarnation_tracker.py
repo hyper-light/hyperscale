@@ -566,6 +566,42 @@ class IncarnationTracker:
 
             return False
 
+    async def clear_suspicion_after_confirmation(
+        self,
+        node: tuple[str, int],
+        incarnation: int,
+        timestamp: float | None = None,
+    ) -> bool:
+        """
+        Clear a local SUSPECT state after fresh bidirectional confirmation.
+
+        Gossip must preserve SWIM's same-incarnation status priority
+        (DEAD > SUSPECT > OK). This method is intentionally separate
+        from gossip freshness: callers may use it only after they have
+        direct liveness evidence from the target, such as a probe ACK
+        observed after the suspicion began.
+        """
+        if timestamp is None:
+            timestamp = time.monotonic()
+
+        async with self._lock:
+            existing = self.node_states.get(node)
+            if existing is None:
+                return False
+
+            if existing.status != b"SUSPECT":
+                return False
+
+            if incarnation < existing.incarnation:
+                return False
+
+            existing.status = b"OK"
+            existing.incarnation = max(existing.incarnation, incarnation)
+            existing.last_update_time = timestamp
+            self._death_timestamps.pop(node, None)
+            self._death_incarnations.pop(node, None)
+            return True
+
     def is_node_confirmed(self, node: tuple[str, int]) -> bool:
         """
         Check if a node is confirmed (not UNCONFIRMED) (AD-29).

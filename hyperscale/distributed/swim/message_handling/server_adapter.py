@@ -333,6 +333,21 @@ class ServerAdapter:
             message,
         )
 
+    def queue_join_dissemination(
+        self,
+        target: tuple[str, int],
+        incarnation: int,
+        target_addr_bytes: bytes | None,
+        message: bytes,
+    ) -> None:
+        """Queue explicit JOIN dissemination without blocking the handler."""
+        self._server.queue_join_dissemination(
+            target,
+            incarnation,
+            target_addr_bytes,
+            message,
+        )
+
     def update_probe_scheduler_membership(self) -> None:
         """Update probe scheduler with current membership."""
         self._server.update_probe_scheduler_membership()

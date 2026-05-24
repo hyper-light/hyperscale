@@ -689,7 +689,10 @@ verifies continuously.
   timeout)` wraps the client's cancellation + await round-trip with
   diagnostic-dump-on-timeout.
 
-- 11 scenarios under `tests/simulation/scenarios/phase3_faults/`:
+- 39 scenarios under `tests/simulation/scenarios/phase3_faults/`, organised by
+  the SCENARIOS.md subsystem each one exercises:
+
+  *Original Phase-3 manifest (lifecycle + cancellation + mid-workload faults):*
 
   | File                              | Scenarios                                                                        |
   |-----------------------------------|----------------------------------------------------------------------------------|
@@ -699,14 +702,63 @@ verifies continuously.
   | `test_faults_with_workload.py`    | worker_kill_mid_workload, leader_kill_mid_workload                               |
   | `test_cancellation_under_fault.py`| cancel_running_workflow, cancel_during_leader_failover                           |
 
+  *Leadership gap closure (SCENARIOS.md §1):*
+
+  | File                              | Scenarios                                                                        |
+  |-----------------------------------|----------------------------------------------------------------------------------|
+  | `test_phase3_advanced.py`         | leader_graceful_stepdown, lhm_driven_leader_stepdown, concurrent_candidates      |
+  | `test_phase3_leadership_gaps.py`  | pre_vote_rejected_during_stable_lease, flapping_detector_backs_off_after_election_failures, term_exhaustion_bails_cleanly, swim_leader_and_raft_job_leader_can_diverge_safely |
+
+  *Worker death timing (SCENARIOS.md §2 boundaries):*
+
+  | File                              | Scenarios                                                                        |
+  |-----------------------------------|----------------------------------------------------------------------------------|
+  | `test_worker_death_timing.py`     | worker_dies_mid_dispatch_before_ack, worker_dies_post_ack_before_workload_finishes, worker_dies_mid_execute, worker_dies_post_execute_before_result_push, worker_rejoins_same_process_refutes_stale_incarnation, worker_rejoins_new_incarnation_after_restart |
+  | `test_phase3_advanced.py`         | worker_permanent_failure, all_managers_die_then_quorum_returns                   |
+
+  *Membership churn (SCENARIOS.md §6):*
+
+  | File                              | Scenarios                                                                        |
+  |-----------------------------------|----------------------------------------------------------------------------------|
+  | `test_membership_churn_gaps.py`   | registration_storm_50_workers, graceful_scale_down_50_workers_membership_reaps, graceful_scale_down_50_workers_orphaned_workflow_completes, mass_crash_50_workers, slow_worker_churn_one_worker_every_10_seconds, beyond_max_workers_per_manager_cap_rejected_cleanly |
+
+  *Resource pressure / pool fidelity (SCENARIOS.md §8):*
+
+  | File                              | Scenarios                                                                        |
+  |-----------------------------------|----------------------------------------------------------------------------------|
+  | `test_resource_pool_gaps.py`      | cpu_saturation_marks_worker_overloaded, memory_pressure_marks_worker_overloaded, worker_subprocess_crash_is_reaped, worker_subprocess_hang_can_be_resumed, event_loop_lag_injection_raises_lhm_and_steps_down_leader |
+
+  *L3 gate-tier faults (SCENARIOS.md §1 + §2, both L3-tagged items):*
+
+  | File                              | Scenarios                                                                        |
+  |-----------------------------------|----------------------------------------------------------------------------------|
+  | `test_l3_gate_faults.py`          | l3_gate_dies_dc_routing_fails_over, l3_job_leadership_transfer_at_gate_tier      |
+
+**Coverage status against SCENARIOS.md Phase-3 items.**
+
+- §1 Leadership — all Phase-3-tagged items and supporting items covered.
+  ``Job-leadership transfer (gate tier, L3)`` exercised on the L3 spec
+  (3 gates + 2 DCs); peer takeover verified via
+  ``JobLeadershipTracker.is_leader`` polling after the owning gate is killed.
+- §2 Node failure / rejoin — all 13 items covered. The four worker-death-
+  timing boundaries (mid-dispatch, post-ack/pre-execute, mid-execute,
+  post-execute/pre-result-push) each have a dedicated deterministic test;
+  ``Gate dies (L3)`` covered by the L3 routing-failover test.
+- §6 Membership churn — all five items covered. Graceful scale-down is split
+  into two tests so the SWIM membership-reap contract and the workflow-
+  reassignment contract assert independently against derived budgets.
+- §8 Resource pressure — all five items covered.
+
 **Exit criteria — met.** The cancellation-failover and election
 scenarios from `tests/integration/raft/test_cancellation_failover.py`
 and `test_raft_leadership_failover.py` have equivalent simulation
 coverage: leader takeover (single + cascade), cancellation through
 the push chain (stable + during failover), worker reaping, and
-quorum loss / recovery. Subtle variants in the integration suite
-(SwimLeaderPlusJobLeaderFails, GateOrphanJobHandling, etc.) are
-mechanical compositions of the harness primitives now available
+quorum loss / recovery. The two L3 gate-tier scenarios that were
+previously deferred now ride on the same L3 spec the smoke test
+uses. Subtle variants in the integration suite
+(SwimLeaderPlusJobLeaderFails, GateOrphanJobHandling, etc.) remain
+mechanical compositions of the harness primitives available today
 and can be added opportunistically.
 
 ### Phase 4 — Transport injection (REAL mode partition / delay / drop) — *landed*

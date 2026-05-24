@@ -780,11 +780,13 @@ class MercurySyncBaseServer(Generic[T]):
 
             if hook.action == "receive":
                 self.udp_handlers[encoded_hook_name] = hook
-                if hook_priority := hook_metadata.priority:
+                hook_priority = hook_metadata.priority
+                if hook_priority is not None:
                     self._udp_handler_priorities[encoded_hook_name] = hook_priority
-                if admission_group := hook_metadata.admission_group:
+                hook_admission_group = hook_metadata.admission_group
+                if hook_admission_group is not None:
                     self._udp_handler_admission_groups[encoded_hook_name] = (
-                        admission_group
+                        hook_admission_group
                     )
 
             elif hook.action == "handle":
@@ -1238,14 +1240,19 @@ class MercurySyncBaseServer(Generic[T]):
             # Load shedding - increment drop counter
             self._udp_drop_counter.increment_load_shed()
             if self._udp_drop_counter.load_shed % 10 == 0:
+                tracker = self._udp_in_flight_tracker
                 self._task_runner.run(
                     self._udp_logger.log,
                     ServerError(
                         message=(
                             f"[UDP-LOAD-SHED] priority={priority.name} "
+                            f"group={admission_group} "
                             f"total_shed={self._udp_drop_counter.load_shed} "
-                            f"in_flight_counts="
-                            f"{self._udp_in_flight_tracker._counts}"
+                            f"in_flight={tracker._counts} "
+                            f"group_in_flight={tracker._group_counts} "
+                            f"acquired_total={tracker._acquired_total} "
+                            f"group_acquired_total="
+                            f"{tracker._group_acquired_total}"
                         ),
                         node_host=self._udp_host,
                         node_port=self._udp_port,
@@ -1399,12 +1406,40 @@ class MercurySyncBaseServer(Generic[T]):
             # Message size validation (before decompression)
             if len(data) > MAX_MESSAGE_SIZE:
                 self._udp_drop_counter.increment_message_too_large()
+                if self._udp_drop_counter.message_too_large % 10 == 0:
+                    self._task_runner.run(
+                        self._udp_logger.log,
+                        ServerError(
+                            message=(
+                                f"[UDP-SIZE-DROP] from={sender_addr} "
+                                f"len={len(data)} "
+                                f"total={self._udp_drop_counter.message_too_large}"
+                            ),
+                            node_host=self._udp_host,
+                            node_port=self._udp_port,
+                            node_id=str(self._udp_port),
+                        ),
+                    )
                 return
 
             try:
                 decrypted_data = self._encryptor.decrypt(data)
-            except Exception:
+            except Exception as decrypt_error:
                 self._udp_drop_counter.increment_decryption_failed()
+                if self._udp_drop_counter.decryption_failed % 10 == 0:
+                    self._task_runner.run(
+                        self._udp_logger.log,
+                        ServerError(
+                            message=(
+                                f"[UDP-DECRYPT-DROP] from={sender_addr} "
+                                f"err={type(decrypt_error).__name__} "
+                                f"total={self._udp_drop_counter.decryption_failed}"
+                            ),
+                            node_host=self._udp_host,
+                            node_port=self._udp_port,
+                            node_id=str(self._udp_port),
+                        ),
+                    )
                 return
 
             decrypted = self._decompressor.decompress(
@@ -1417,6 +1452,20 @@ class MercurySyncBaseServer(Generic[T]):
                 validate_message_size(len(decrypted_data), len(decrypted))
             except MessageSizeError:
                 self._udp_drop_counter.increment_decompression_too_large()
+                if self._udp_drop_counter.decompression_too_large % 10 == 0:
+                    self._task_runner.run(
+                        self._udp_logger.log,
+                        ServerError(
+                            message=(
+                                f"[UDP-DECOMPRESS-DROP] from={sender_addr} "
+                                f"total="
+                                f"{self._udp_drop_counter.decompression_too_large}"
+                            ),
+                            node_host=self._udp_host,
+                            node_port=self._udp_port,
+                            node_id=str(self._udp_port),
+                        ),
+                    )
                 return
 
             # Parse length-prefixed UDP message format:
@@ -1730,11 +1779,18 @@ class MercurySyncBaseServer(Generic[T]):
                 getattr(self, "_udp_recv_arrived_count", 0) + 1
             )
             if self._udp_recv_arrived_count % 100 == 0:
+                tracker = self._udp_in_flight_tracker
                 await self._udp_logger.log(
                     ServerError(
                         message=(
                             f"[UDP-PROCESS-ARRIVED] handler=receive "
-                            f"total={self._udp_recv_arrived_count}"
+                            f"total={self._udp_recv_arrived_count} "
+                            f"in_flight={dict(tracker._counts)} "
+                            f"group_in_flight={dict(tracker._group_counts)} "
+                            f"acquired_total={dict(tracker._acquired_total)} "
+                            f"group_acquired_total="
+                            f"{dict(tracker._group_acquired_total)} "
+                            f"group_shed_total={dict(tracker._group_shed_total)}"
                         ),
                         node_host=self._udp_host,
                         node_port=self._udp_port,
@@ -1766,6 +1822,18 @@ class MercurySyncBaseServer(Generic[T]):
                         )
                     except ReplayError:
                         self._udp_drop_counter.increment_replay_detected()
+                        if self._udp_drop_counter.replay_detected % 10 == 0:
+                            await self._udp_logger.log(
+                                ServerError(
+                                    message=(
+                                        f"[UDP-REPLAY-DROP] handler={handler_name!r} "
+                                        f"total={self._udp_drop_counter.replay_detected}"
+                                    ),
+                                    node_host=self._udp_host,
+                                    node_port=self._udp_port,
+                                    node_id=str(self._udp_port),
+                                )
+                            )
                         return
 
             handler = self.udp_handlers[handler_name]

@@ -1077,6 +1077,18 @@ class JobManager:
         Notifies on_workflow_completed callback for event-driven dispatch.
         """
         token_str = str(workflow_token)
+        if self._logger is not None:
+            import traceback as _tb
+            await self._logger.log(
+                JobManagerError(
+                    message=(
+                        f"[MARK-FAILED] token={token_str} error={error!r} "
+                        f"stack={'/'.join(f.name for f in _tb.extract_stack()[-6:-1])}"
+                    ),
+                    manager_id=self._manager_id,
+                    datacenter=self._datacenter,
+                )
+            )
         job = self.get_job_for_workflow(token_str)
         if not job:
             return False

@@ -322,6 +322,16 @@ class ServerInterface(Protocol):
         """Queue explicit LEAVE dissemination without blocking the handler."""
         ...
 
+    def queue_join_dissemination(
+        self,
+        target: tuple[str, int],
+        incarnation: int,
+        target_addr_bytes: bytes | None,
+        message: bytes,
+    ) -> None:
+        """Queue explicit JOIN dissemination without blocking the handler."""
+        ...
+
     def update_probe_scheduler_membership(self) -> None:
         """Update probe scheduler with current membership."""
         ...

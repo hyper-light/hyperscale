@@ -166,7 +166,7 @@ class JoinHandler(BaseHandler):
 
             await self._server.write_context(target, b"OK")
 
-            await self._propagate_join(
+            self._queue_join_propagation(
                 target, role, target_addr_bytes, sent_incarnation
             )
 
@@ -295,30 +295,33 @@ class JoinHandler(BaseHandler):
         except (ValueError, UnicodeDecodeError):
             return None
 
-    async def _propagate_join(
+    def _queue_join_propagation(
         self,
         target: tuple[str, int],
         role: str | None,
         target_addr_bytes: bytes | None,
         claimed_incarnation: int,
     ) -> None:
-        """Propagate join to other cluster members.
+        """Queue JOIN dissemination without blocking the handler.
 
-        Re-encodes the message in the current 4-field
+        Builds the propagate payload in the current 4-field
         ``v{ver}|{role}|host:port|i:{inc}`` shape (or 3-field
-        ``v{ver}|host:port|i:{inc}`` when role is unknown) so peers
-        downstream can both parse role and apply the joiner's
-        authoritative incarnation. The ``|i:{inc}`` trailer is
-        mandatory: receivers reject JOINs without it (see
-        ``handle``) because there is no sound way to refute a
+        ``v{ver}|host:port|i:{inc}`` when role is unknown) and hands
+        it to the server-level dissemination queue. The ``|i:{inc}``
+        trailer is mandatory: receivers reject JOINs without it
+        (see ``handle``) because there is no sound way to refute a
         SUSPECT bracket without a fresh joiner-owned incarnation.
+
+        Previously this method (then ``_propagate_join``) awaited
+        ``gather_with_errors`` over every peer in-line, holding the
+        SWIM in-flight admission slot for ~2s of LHM-adjusted
+        timeout per join. With N=50 nodes and re-registration storms
+        the SWIM cap saturated and load-shed unrelated SWIM traffic
+        (LEAVE/probe/ack). Mirrors the LEAVE-side fix in
+        ``LeaveHandler._queue_leave_propagation``.
         """
         if target_addr_bytes is None:
             return
-
-        others = self._server.get_other_nodes(target)
-        base_timeout = await self._server.get_current_timeout()
-        gather_timeout = self._server.get_lhm_adjusted_timeout(base_timeout) * 2
 
         incarnation_trailer = b"|i:" + str(claimed_incarnation).encode()
         if role:
@@ -340,7 +343,9 @@ class JoinHandler(BaseHandler):
                 + incarnation_trailer
             )
 
-        coros = [self._server.send_if_ok(node, propagate_msg) for node in others]
-        await self._server.gather_with_errors(
-            coros, operation="join_propagation", timeout=gather_timeout
+        self._server.queue_join_dissemination(
+            target,
+            claimed_incarnation,
+            target_addr_bytes,
+            propagate_msg,
         )
