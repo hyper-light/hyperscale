@@ -45,13 +45,22 @@ class AliveHandler(BaseHandler):
             return self._ack()
 
         await self._server.confirm_peer(source_addr)
+        request_id = self._server.parse_probe_request_id_from_message(message)
+        request_matches_pending_probe = self._server.probe_request_matches_pending(
+            source_addr,
+            request_id,
+        )
 
         # Complete any pending probe Future for this address
         # 'alive' is sent as a response when a node is probed about itself
         # This is equivalent to an ACK for probe purposes
         pending_acks = self._server.pending_probe_acks
         pending_future = pending_acks.get(source_addr)
-        if pending_future and not pending_future.done():
+        if (
+            pending_future
+            and not pending_future.done()
+            and request_matches_pending_probe
+        ):
             pending_future.set_result(True)
 
         if target and self._server.is_message_fresh(target, msg_incarnation, b"OK"):

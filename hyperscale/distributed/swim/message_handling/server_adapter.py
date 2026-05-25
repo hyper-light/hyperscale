@@ -294,6 +294,18 @@ class ServerAdapter:
         """Parse optional stable node identity from a SWIM message."""
         return self._server._parse_node_id_from_message(message)
 
+    def parse_probe_request_id_from_message(self, message: bytes) -> str | None:
+        """Parse optional direct-probe request fencing token."""
+        return self._server._parse_probe_request_id_from_message(message)
+
+    def probe_request_matches_pending(
+        self,
+        source_addr: tuple[str, int],
+        request_id: str | None,
+    ) -> bool:
+        """Return whether a direct-probe response token matches."""
+        return self._server._probe_request_matches_pending(source_addr, request_id)
+
     async def parse_term_safe(
         self, message: bytes, source_addr: tuple[str, int]
     ) -> int:

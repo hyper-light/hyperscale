@@ -288,6 +288,18 @@ class ServerInterface(Protocol):
         """Parse optional stable node identity from a SWIM message."""
         ...
 
+    def parse_probe_request_id_from_message(self, message: bytes) -> str | None:
+        """Parse optional direct-probe request fencing token."""
+        ...
+
+    def probe_request_matches_pending(
+        self,
+        source_addr: tuple[str, int],
+        request_id: str | None,
+    ) -> bool:
+        """Return whether a direct-probe response token matches."""
+        ...
+
     async def parse_term_safe(
         self, message: bytes, source_addr: tuple[str, int]
     ) -> int:

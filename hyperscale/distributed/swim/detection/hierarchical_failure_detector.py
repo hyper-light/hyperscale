@@ -169,13 +169,11 @@ class HierarchicalFailureDetector:
         # since ``HierarchicalConfig`` is frozen at init.
         self.config = config
         self._on_global_death = on_global_death
-        # ``on_global_death_sync`` runs synchronously inside the wheel
-        # expiration handler before the async ``on_global_death`` is
-        # dispatched. It exists so observers that need the death-
-        # event recorded *before* any later task can read it (e.g. a
-        # concurrent ``reset_peer_for_rejoin`` reading
-        # ``get_required_rejoin_incarnation``) get the data they need
-        # without racing the TaskRunner queue.
+        # ``on_global_death_sync`` runs when the owner commits a DEAD
+        # transition via ``commit_global_death``. The timing wheel may
+        # expire a suspicion whose incarnation is stale by the time the
+        # owning SWIM state machine validates it, so HFD must not publish
+        # global-dead side effects until that owner accepts the transition.
         self._on_global_death_sync = on_global_death_sync
         self._on_job_death = on_job_death
         self._on_error = on_error
@@ -621,6 +619,76 @@ class HierarchicalFailureDetector:
                 return True
             return False
 
+    async def clear_global_suspicion(
+        self,
+        node: NodeAddress,
+        incarnation: int | None = None,
+    ) -> bool:
+        """Clear a global suspicion that failed owner-side validation.
+
+        ``suspect_global`` owns the timing-wheel entry, but the caller owns
+        the authoritative incarnation tracker. If that tracker rejects the
+        corresponding SUSPECT transition, keeping the HFD timer would create
+        an orphaned future DEAD event. The optional incarnation fence prevents
+        a late cleanup from removing a newer suspicion for the same address.
+        """
+        async with self._lock:
+            state = await self._global_wheel.get_state(node)
+            if state is None:
+                return False
+            if incarnation is not None and state.incarnation != incarnation:
+                return False
+            await self._global_wheel.remove(node)
+            self.reset_extension_tracker(node)
+            return True
+
+    async def commit_global_death(
+        self,
+        node: NodeAddress,
+        incarnation: int,
+    ) -> bool:
+        """Commit a globally-dead transition after owner validation.
+
+        HFD computes and schedules suspicion expiry, but the owner of the
+        concrete membership state decides whether the expired incarnation is
+        still current. This method records HFD-side global-death state only
+        after that owner has accepted ``DEAD`` in its incarnation tracker.
+        """
+        async with self._lock:
+            if node in self._globally_dead:
+                return False
+            self._globally_dead.add(node)
+            self._global_deaths += 1
+
+        if self._on_global_death_sync is not None:
+            try:
+                self._on_global_death_sync(node, incarnation)
+            except Exception as sync_error:
+                if self._on_error is not None:
+                    try:
+                        self._on_error(
+                            f"on_global_death_sync failed for {node}",
+                            sync_error,
+                        )
+                    except Exception:
+                        pass
+
+        self.remove_extension_tracker(node)
+
+        event = FailureEvent(
+            node=node,
+            source=FailureSource.GLOBAL,
+            job_id=None,
+            incarnation=incarnation,
+        )
+        self._record_event(event)
+
+        self._dispatch_async_work(
+            self._clear_job_suspicions_for_node,
+            node,
+        )
+        return True
+
     # =========================================================================
     # AD-26: Adaptive Healthcheck Extensions
     # =========================================================================
@@ -972,56 +1040,13 @@ class HierarchicalFailureDetector:
             except Exception:
                 pass
 
-        # Mark as globally dead
-        self._globally_dead.add(node)
-        self._global_deaths += 1
-
-        # Synchronous death-event hook. Runs *before* the async
-        # ``on_global_death`` dispatch so any task scheduled after the
-        # wheel fired but before the async callback drains (e.g. a
-        # concurrent ``reset_peer_for_rejoin``) can observe the death
-        # record without racing the TaskRunner queue.
-        if self._on_global_death_sync is not None:
-            try:
-                self._on_global_death_sync(node, state.incarnation)
-            except Exception as sync_error:
-                if self._on_error is not None:
-                    try:
-                        self._on_error(
-                            f"on_global_death_sync failed for {node}",
-                            sync_error,
-                        )
-                    except Exception:
-                        pass
-
-        # Clean up extension tracker for this node (AD-26)
-        self.remove_extension_tracker(node)
-
-        # Record event
-        event = FailureEvent(
-            node=node,
-            source=FailureSource.GLOBAL,
-            job_id=None,
-            incarnation=state.incarnation,
-        )
-        self._record_event(event)
-
-        # Dispatch the per-node job-suspicion cleanup. CLAUDE.md forbids
-        # orphaned asyncio tasks; route through TaskRunner when available.
-        # Fallback to tracked ``asyncio.create_task`` keeps the standalone
-        # unit-test path working — production HealthAwareServer always
-        # provides a TaskRunner.
-        self._dispatch_async_work(
-            self._clear_job_suspicions_for_node,
-            node,
-        )
-
-        # Invoke ``on_global_death`` callback. If the callback is async,
-        # the returned coroutine must be scheduled — otherwise the DEAD
-        # transition never executes (the coroutine is silently dropped
-        # at GC time). Routing through TaskRunner gives us proper
-        # lifecycle tracking and cleanup; the fallback path tracks the
-        # task in ``_pending_clear_tasks`` so HFD.stop can drain it.
+        # Invoke ``on_global_death`` callback. The callback is a candidate
+        # expiry notification, not the commit point: the owning SWIM state
+        # machine must first accept the DEAD write. Once it does, it calls
+        # ``commit_global_death`` to publish HFD-side global-death state.
+        # Routing through TaskRunner gives us proper lifecycle tracking and
+        # cleanup; the fallback path tracks the task in
+        # ``_pending_clear_tasks`` so HFD.stop can drain it.
         if self._on_global_death:
             import sys as _sys
             _sys.stderr.write(
@@ -1044,6 +1069,12 @@ class HierarchicalFailureDetector:
                         )
                     except Exception:
                         pass
+        else:
+            self._dispatch_async_work(
+                self.commit_global_death,
+                node,
+                state.incarnation,
+            )
 
     def _handle_job_expiration(
         self,

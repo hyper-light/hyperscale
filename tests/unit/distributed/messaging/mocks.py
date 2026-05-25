@@ -229,6 +229,7 @@ class MockServerInterface:
         # Tracking
         self._confirmed_peers: set[tuple[str, int]] = set()
         self._pending_probe_acks: dict[tuple[str, int], asyncio.Future] = {}
+        self._pending_probe_request_ids: dict[tuple[str, int], str] = {}
         self._sent_messages: list[tuple[tuple[str, int], bytes]] = []
         self._errors: list[Exception] = []
         self._dead_notifications: list[tuple[tuple[str, int], int, str]] = []
@@ -334,6 +335,14 @@ class MockServerInterface:
         incarnation: int,
     ) -> bool:
         return True
+
+    def is_authoritative_liveness_evidence(
+        self,
+        source_addr: tuple[str, int],
+        target: tuple[str, int] | None,
+        node_id: str | None,
+    ) -> bool:
+        return target is None or source_addr == target
 
     async def broadcast_refutation(self) -> int:
         return self._broadcast_refutation_incarnation
@@ -458,13 +467,52 @@ class MockServerInterface:
     ) -> int:
         # Parse incarnation from message like "alive:5>addr"
         try:
-            parts = message.split(b":", maxsplit=1)
+            msg_part = message.split(b">", maxsplit=1)[0]
+            parts = msg_part.split(b":", maxsplit=2)
             if len(parts) > 1:
-                inc_part = parts[1].split(b">")[0]
-                return int(inc_part.decode())
+                return int(parts[1].decode())
         except (ValueError, IndexError):
             pass
         return 0
+
+    def parse_node_id_from_message(self, message: bytes) -> str | None:
+        msg_part = message.split(b">", maxsplit=1)[0]
+        msg_parts = msg_part.split(b":", maxsplit=3)
+        if len(msg_parts) < 3:
+            return None
+        try:
+            node_id = msg_parts[2].decode()
+        except UnicodeDecodeError:
+            return None
+        return node_id or None
+
+    def parse_probe_request_id_from_message(self, message: bytes) -> str | None:
+        msg_part = message.split(b">", maxsplit=1)[0]
+        if msg_part.startswith(b"probe:"):
+            try:
+                request_id = msg_part.split(b":", maxsplit=1)[1].decode()
+            except (IndexError, UnicodeDecodeError):
+                return None
+            return request_id or None
+
+        msg_parts = msg_part.split(b":", maxsplit=3)
+        if len(msg_parts) < 4:
+            return None
+        try:
+            request_id = msg_parts[3].decode()
+        except UnicodeDecodeError:
+            return None
+        return request_id or None
+
+    def probe_request_matches_pending(
+        self,
+        source_addr: tuple[str, int],
+        request_id: str | None,
+    ) -> bool:
+        pending_request_id = self._pending_probe_request_ids.get(source_addr)
+        if pending_request_id is None:
+            return request_id is None
+        return request_id == pending_request_id
 
     async def parse_term_safe(
         self, message: bytes, source_addr: tuple[str, int]

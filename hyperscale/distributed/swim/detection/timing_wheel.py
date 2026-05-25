@@ -297,10 +297,9 @@ class TimingWheel:
 
         Pops the entry from tracking BEFORE invoking the user callback,
         symmetric with the previous wheel's ordering: the callback
-        (e.g. ``HFD._handle_global_expiration``) marks the node as
-        globally dead and any concurrent ``suspect_global`` must see
-        that state, not a still-tracked-in-the-wheel state, when it
-        runs.
+        (e.g. ``HFD._handle_global_expiration``) dispatches owner-side
+        validation, and any concurrent ``suspect_global`` must see that
+        the timer has fired, not a still-tracked-in-the-wheel state.
         """
         import sys as _sys
         _sys.stderr.write(f"[WHEEL-FIRE target={node}]\n")

@@ -194,6 +194,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         # Direct probe ACK tracking - key is target addr, value is Future set when ACK received
         self._pending_probe_acks: dict[tuple[str, int], asyncio.Future[bool]] = {}
         self._pending_probe_start: dict[tuple[str, int], float] = {}
+        self._pending_probe_request_ids: dict[tuple[str, int], str] = {}
 
         # AD-35 Task 12.7: Initialize CoordinateTracker with config
         self._coordinate_tracker = CoordinateTracker(config=self._vivaldi_config)
@@ -1212,10 +1213,11 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         self._hierarchical_detector = HierarchicalFailureDetector(
             config=config,
             on_global_death=self._on_suspicion_expired,
-            # Synchronous death record happens BEFORE the async DEAD
-            # callback drains, so a concurrent ``reset_peer_for_rejoin``
-            # can read the right rejoin threshold rather than defaulting
-            # to ``1`` and getting overwritten by the queued async fire.
+            # Synchronous death recording happens when
+            # ``_on_suspicion_expired`` commits the tracker-accepted DEAD
+            # transition into HFD. The wheel expiry itself is only a
+            # candidate because its incarnation may be stale by the time the
+            # async callback drains.
             on_global_death_sync=self._record_global_death_sync,
             on_job_death=on_job_death,
             on_error=self._on_hierarchical_detector_error,
@@ -1236,15 +1238,12 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
     ) -> None:
         """Synchronous death-event hook for HFD wheel expirations.
 
-        Records the death in the incarnation tracker the moment the
-        wheel fires, before the async ``_on_suspicion_expired``
-        callback drains. The recording is what
-        ``get_required_rejoin_incarnation`` reads, so any concurrent
-        rejoin (e.g. TCP worker_register handler running while the
-        async fire is queued) sees the correct ``death_incarnation +
-        minimum_rejoin_incarnation_bump`` threshold rather than the
-        default-zero fallback that lets a stale async fire overwrite
-        the freshly-installed OK entry.
+        Records the death in the incarnation tracker only after the
+        canonical ``_on_suspicion_expired`` path has accepted the DEAD
+        transition. The recording is what
+        ``get_required_rejoin_incarnation`` reads, so fresh rejoin state is
+        fenced against stale DEAD gossip without letting a stale HFD wheel
+        expiry poison the death history.
         """
         self._incarnation_tracker.record_node_death(
             node, incarnation, time.monotonic()
@@ -2807,9 +2806,15 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         if not applied:
             # Stale wheel-expiration: the tracker has already moved
             # past this incarnation (e.g. via rejoin). Discard the
-            # entire post-DEAD pipeline.
+            # entire post-DEAD pipeline and make sure HFD does not retain
+            # a global-dead marker for an uncommitted DEAD transition.
             self._metrics.increment("suspicions_expired_stale")
             self._global_suspicion_started_at.pop(node, None)
+            if self._hierarchical_detector is not None:
+                await self._hierarchical_detector.clear_global_suspicion(
+                    node,
+                    incarnation,
+                )
             return
 
         self._metrics.increment("suspicions_expired")
@@ -2819,30 +2824,15 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             node=node,
             incarnation=incarnation,
         )
-        # ``record_node_death`` already ran synchronously from HFD's
-        # ``_handle_global_expiration`` via ``on_global_death_sync``;
-        # no need to repeat it here.
+
+        if self._hierarchical_detector is not None:
+            await self._hierarchical_detector.commit_global_death(
+                node,
+                incarnation,
+            )
+
         self.queue_gossip_update("dead", node, incarnation)
-
-        self.update_probe_scheduler_membership()
-
-        # Drop the dead peer's probe-reliability history. CLAUDE.md
-        # requires explicit cleanup of long-running per-peer state to
-        # prevent leaks across the kill/restart lifecycle. If the peer
-        # rejoins it starts with a fresh, empty window (defaulting to
-        # reliability=1.0 — the SWIM "assume healthy" baseline).
-        self._peer_probe_reliability.remove_peer(node)
-        # The peer is dead; their registration is no longer valid. The
-        # rejoin path (TCP register or SWIM JOIN) will re-add them to
-        # ``_registered_peers`` when the new instance arrives.
-        self._registered_peers.discard(node)
-
-        # Invoke registered callbacks (composition pattern)
-        for callback in self._on_node_dead_callbacks:
-            try:
-                callback(node)
-            except Exception as e:
-                self._task_runner.run(self.handle_exception, e, "on_node_dead_callback")
+        self.notify_node_dead(node, incarnation, "suspicion_expired")
 
     def _on_hierarchical_detector_error(
         self,
@@ -3700,12 +3690,9 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             base_timeout = await self._context.read("current_timeout")
             timeout = self.get_lhm_adjusted_timeout(base_timeout)
 
-            target_addr = f"{target[0]}:{target[1]}".encode()
-            # Note: Piggyback is added centrally in send() hook via _add_piggyback_safe()
-            probe_msg = b"probe>" + target_addr
-
             response_received = await self._probe_with_timeout(
-                target, probe_msg, timeout
+                target,
+                timeout,
             )
 
             # Exit early if shutting down
@@ -3981,11 +3968,9 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
 
         base_timeout = await self._context.read("current_timeout")
         timeout = self.get_lhm_adjusted_timeout(base_timeout)
-        target_addr = f"{target[0]}:{target[1]}".encode()
 
         response_received = await self._probe_with_timeout(
             target,
-            b"probe>" + target_addr,
             timeout,
         )
         if response_received:
@@ -4106,7 +4091,6 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
     async def _probe_with_timeout(
         self,
         target: tuple[str, int],
-        message: bytes,
         timeout: float,
     ) -> bool:
         """Direct-probe phase under a continuous adaptive deadline.
@@ -4154,6 +4138,9 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                 )
                 self._pending_probe_acks[target] = ack_future
                 self._pending_probe_start[target] = time.monotonic()
+                request_id = self._build_direct_probe_request_id()
+                self._pending_probe_request_ids[target] = request_id
+                message = self._build_direct_probe_message(target, request_id)
 
                 await self.send(target, message, timeout=timeout)
 
@@ -4170,14 +4157,17 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                 finally:
                     self._pending_probe_acks.pop(target, None)
                     self._pending_probe_start.pop(target, None)
+                    self._pending_probe_request_ids.pop(target, None)
 
             except asyncio.CancelledError:
                 self._pending_probe_acks.pop(target, None)
                 self._pending_probe_start.pop(target, None)
+                self._pending_probe_request_ids.pop(target, None)
                 raise
             except OSError as e:
                 self._pending_probe_acks.pop(target, None)
                 self._pending_probe_start.pop(target, None)
+                self._pending_probe_request_ids.pop(target, None)
                 self._metrics.increment("probes_failed")
                 await self.handle_error(
                     self._make_network_error(e, target, "Probe")
@@ -4186,6 +4176,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             except Exception as e:
                 self._pending_probe_acks.pop(target, None)
                 self._pending_probe_start.pop(target, None)
+                self._pending_probe_request_ids.pop(target, None)
                 self._metrics.increment("probes_failed")
                 await self.handle_exception(e, f"probe_{target[0]}_{target[1]}")
                 return False
@@ -4284,6 +4275,8 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             if not future.done():
                 future.cancel()
         self._pending_probe_acks.clear()
+        self._pending_probe_start.clear()
+        self._pending_probe_request_ids.clear()
 
         # Stop leader election (stops sending heartbeats)
         try:
@@ -4720,7 +4713,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
     def _parse_node_id_from_message(self, message: bytes) -> str | None:
         """Parse optional stable node identity from ``type:incarnation:node_id``."""
         msg_part = message.split(b">", maxsplit=1)[0]
-        msg_parts = msg_part.split(b":", maxsplit=2)
+        msg_parts = msg_part.split(b":", maxsplit=3)
         if len(msg_parts) < 3:
             return None
         try:
@@ -4728,6 +4721,38 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         except UnicodeDecodeError:
             return None
         return node_id or None
+
+    def _parse_probe_request_id_from_message(self, message: bytes) -> str | None:
+        """Parse an optional direct-probe response/request fencing token."""
+        msg_part = message.split(b">", maxsplit=1)[0]
+        if msg_part.startswith(b"probe:"):
+            try:
+                request_id = msg_part.split(b":", maxsplit=1)[1].decode()
+            except (IndexError, UnicodeDecodeError):
+                return None
+            return request_id or None
+
+        msg_parts = msg_part.split(b":", maxsplit=3)
+        if len(msg_parts) < 4:
+            return None
+        try:
+            request_id = msg_parts[3].decode()
+        except UnicodeDecodeError:
+            return None
+        return request_id or None
+
+    def _probe_request_matches_pending(
+        self,
+        source_addr: tuple[str, int],
+        request_id: str | None,
+    ) -> bool:
+        """Return whether ``request_id`` matches the active direct probe."""
+        pending_request_id = self._pending_probe_request_ids.get(source_addr)
+        return (
+            pending_request_id is not None
+            and request_id is not None
+            and request_id == pending_request_id
+        )
 
     async def _parse_incarnation_safe(
         self,
@@ -4795,8 +4820,17 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             self._metrics.increment("non_authoritative_alive_suppressed")
             return
 
+        request_id = self._parse_probe_request_id_from_message(data)
         pending_future = self._pending_probe_acks.get(source_addr)
-        if pending_future and not pending_future.done():
+        request_matches_pending_probe = self._probe_request_matches_pending(
+            source_addr,
+            request_id,
+        )
+        if (
+            pending_future
+            and not pending_future.done()
+            and request_matches_pending_probe
+        ):
             pending_future.set_result(True)
 
         if not target:
@@ -4808,6 +4842,9 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             and node_state.status == b"SUSPECT"
             and incarnation >= node_state.incarnation
         ):
+            if not request_matches_pending_probe:
+                self._metrics.increment("stale_alive_refutations_suppressed")
+                return
             await self._clear_unwitnessed_suspicion_after_confirmation(
                 target,
                 incarnation,
@@ -5319,22 +5356,39 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             self._metrics.increment("suspicions_skipped_unconfirmed")
             return None
 
+        previous_state = self._incarnation_tracker.get_node_state(node)
+        already_suspect = (
+            previous_state is not None
+            and previous_state.status == b"SUSPECT"
+            and previous_state.incarnation >= incarnation
+        )
         now = time.monotonic()
+        result = await self._hierarchical_detector.suspect_global(
+            node, incarnation, from_node
+        )
+        if not result:
+            return result
+
+        applied = await self._incarnation_tracker.update_node(
+            node,
+            b"SUSPECT",
+            incarnation,
+            now,
+        )
+        if not applied and not already_suspect:
+            await self._hierarchical_detector.clear_global_suspicion(
+                node,
+                incarnation,
+            )
+            self._metrics.increment("suspicions_skipped_stale_tracker")
+            return None
+
         self._metrics.increment("suspicions_started")
         self._audit_log.record(
             AuditEventType.NODE_SUSPECTED,
             node=node,
             from_node=from_node,
             incarnation=incarnation,
-        )
-        await self._incarnation_tracker.update_node(
-            node,
-            b"SUSPECT",
-            incarnation,
-            now,
-        )
-        result = await self._hierarchical_detector.suspect_global(
-            node, incarnation, from_node
         )
         if result:
             self._global_suspicion_started_at.setdefault(node, now)
@@ -5695,6 +5749,19 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             f"{random.getrandbits(32):08x}"
         )
 
+    def _build_direct_probe_request_id(self) -> str:
+        """Build a request token for fencing direct-probe ALIVE responses."""
+        return self._build_indirect_probe_request_id()
+
+    def _build_direct_probe_message(
+        self,
+        target: tuple[str, int],
+        request_id: str,
+    ) -> bytes:
+        """Build a direct probe message carrying a response-fencing token."""
+        target_addr = f"{target[0]}:{target[1]}".encode()
+        return b"probe:" + request_id.encode() + b">" + target_addr
+
     async def broadcast_refutation(self) -> int:
         """
         Broadcast an alive message to refute any suspicions about this node.
@@ -5979,9 +6046,6 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         base_timeout = await self._context.read("current_timeout")
         timeout = self.get_lhm_adjusted_timeout(base_timeout)
 
-        target_addr = f"{target[0]}:{target[1]}".encode()
-        msg = b"probe>" + target_addr
-
         try:
             existing_future = self._pending_probe_acks.pop(target, None)
             if existing_future and not existing_future.done():
@@ -5990,6 +6054,9 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             ack_future: asyncio.Future[bool] = asyncio.get_event_loop().create_future()
             self._pending_probe_acks[target] = ack_future
             self._pending_probe_start[target] = time.monotonic()
+            request_id = self._build_direct_probe_request_id()
+            self._pending_probe_request_ids[target] = request_id
+            msg = self._build_direct_probe_message(target, request_id)
 
             await self.send(target, msg, timeout=timeout)
             await asyncio.wait_for(ack_future, timeout=timeout)
@@ -6007,6 +6074,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         finally:
             self._pending_probe_acks.pop(target, None)
             self._pending_probe_start.pop(target, None)
+            self._pending_probe_request_ids.pop(target, None)
 
     @udp.send("receive")
     async def send(

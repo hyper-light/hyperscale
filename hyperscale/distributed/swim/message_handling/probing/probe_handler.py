@@ -51,7 +51,7 @@ class ProbeHandler(BaseHandler):
 
             # If probe is about self, send refutation
             if self._server.udp_target_is_self(target):
-                return await self._handle_self_probe()
+                return await self._handle_self_probe(message)
 
             # Unknown target
             if target not in nodes:
@@ -65,7 +65,7 @@ class ProbeHandler(BaseHandler):
 
             return self._ack()
 
-    async def _handle_self_probe(self) -> HandlerResult:
+    async def _handle_self_probe(self, message: bytes) -> HandlerResult:
         """Handle probe about self — respond ALIVE.
 
         A SWIM probe-about-self is a routine health check, not a
@@ -89,14 +89,16 @@ class ProbeHandler(BaseHandler):
         Reply with the current incarnation and embedded state.
         """
         new_incarnation = self._server.incarnation_tracker.get_self_incarnation()
+        request_id = self._server.parse_probe_request_id_from_message(message)
         base = (
             b"alive:"
             + str(new_incarnation).encode()
             + b":"
             + self._server.get_self_node_id().encode()
-            + b">"
-            + self._server.udp_addr_slug
         )
+        if request_id:
+            base += b":" + request_id.encode()
+        base += b">" + self._server.udp_addr_slug
 
         state = self._server.get_embedded_state()
         if state:
