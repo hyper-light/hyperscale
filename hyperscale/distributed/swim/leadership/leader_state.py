@@ -187,7 +187,7 @@ class LeaderState:
 
         # Clear vote sets to free memory - we're done with the election
         self.votes_received.clear()
-        self.pre_votes_received.clear()
+        self.abort_pre_vote()
 
         if not was_leader and self._on_become_leader:
             self._on_become_leader()
@@ -207,6 +207,7 @@ class LeaderState:
             self.current_leader = leader
             self.leader_term = term
             self.leader_lease_start = time.monotonic()
+            self.abort_pre_vote()
         
         if was_leader and self._on_lose_leadership:
             self._on_lose_leadership()
@@ -221,6 +222,7 @@ class LeaderState:
             self.leader_term = term
             self.leader_lease_start = time.monotonic()
             self.last_heartbeat_time = time.monotonic()
+            self.abort_pre_vote()
             
             if self.role != 'follower':
                 self.become_follower(term, leader)
@@ -399,4 +401,3 @@ class LeaderState:
             'votes_dropped': self._votes_dropped,
             'max_votes': self.max_votes,
         }
-
