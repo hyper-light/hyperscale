@@ -38,6 +38,11 @@ from hyperscale.logging.hyperscale_logging_models import (
 
 from ..state import GateRuntimeState
 
+RecordManagerHeartbeat = Callable[
+    [str, tuple[str, int], str, int, int, bool],
+    None,
+]
+
 if TYPE_CHECKING:
     from hyperscale.distributed.swim.core import NodeId
     from hyperscale.distributed.env import Env
@@ -64,7 +69,7 @@ class GateManagerHandler:
         get_host: Callable[[], str],
         get_tcp_port: Callable[[], int],
         get_healthy_gates: Callable[[], list[GateInfo]],
-        record_manager_heartbeat: Callable[[str, tuple[str, int], str, int], None],
+        record_manager_heartbeat: RecordManagerHeartbeat,
         handle_manager_backpressure_signal: Callable[
             [tuple[str, int], str, BackpressureSignal], Awaitable[None]
         ],
@@ -211,6 +216,8 @@ class GateManagerHandler:
             manager_addr,
             heartbeat.node_id,
             heartbeat.version,
+            heartbeat.term,
+            heartbeat.is_leader,
         )
         managers = self._datacenter_managers.setdefault(datacenter_id, [])
         if manager_addr not in managers:

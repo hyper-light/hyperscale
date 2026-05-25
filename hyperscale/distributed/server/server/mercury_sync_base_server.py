@@ -1688,7 +1688,7 @@ class MercurySyncBaseServer(Generic[T]):
                     protocol="tcp",
                 )
                 return
-            
+
             self._tcp_server_request_transports[addr] = transport
 
             if request_model := self.tcp_server_request_models.get(handler_name):

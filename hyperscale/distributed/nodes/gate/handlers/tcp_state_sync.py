@@ -68,6 +68,7 @@ class GateStateSyncHandler:
         get_term: Callable[[], int],
         get_state_snapshot: Callable[[], GateStateSnapshot],
         apply_state_snapshot: Callable[[GateStateSnapshot], None],
+        get_known_leader_manager_term: Callable[[str], int] | None = None,
     ) -> None:
         """
         Initialize the state sync handler.
@@ -88,6 +89,12 @@ class GateStateSyncHandler:
             get_term: Callback to get current leadership term
             get_state_snapshot: Callback to get full state snapshot
             apply_state_snapshot: Callback to apply state snapshot
+            get_known_leader_manager_term: Lookup the highest
+                leader ``ManagerHeartbeat.term`` observed for a DC. Used in
+                ``handle_job_final_result`` to validate the producing
+                manager against per-DC manager leadership independently
+                of any gate-leader fence. ``None`` disables the check
+                (test scaffolds that don't wire heartbeat ingest).
         """
         self._state: GateRuntimeState = state
         self._logger: Logger = logger
@@ -106,6 +113,9 @@ class GateStateSyncHandler:
         self._apply_state_snapshot: Callable[[GateStateSnapshot], None] = (
             apply_state_snapshot
         )
+        self._get_known_leader_manager_term: (
+            Callable[[str], int] | None
+        ) = get_known_leader_manager_term
 
     async def handle_state_sync_request(
         self,
@@ -344,6 +354,38 @@ class GateStateSyncHandler:
                 ),
             )
 
+            # ``result.fence_token`` is the manager-side fence at the
+            # moment the worker delivered the final result, not a
+            # gate-leadership claim. Comparing it to the gate's
+            # per-job fence (which orphan-takeover bumps) would drop
+            # completed work whenever a gate takeover landed before
+            # the manager learned the new fence. Gate-leader fencing
+            # protects gate-claim messages; manager-originated terminal
+            # data is validated at the manager-leadership layer here,
+            # before any forwarding or local completion side effects.
+            if (
+                self._get_known_leader_manager_term is not None
+                and result.producer_role == "manager"
+                and result.manager_fence_token > 0
+            ):
+                known_term = self._get_known_leader_manager_term(result.datacenter)
+                if known_term > 0 and result.manager_fence_token < known_term:
+                    self._task_runner.run(
+                        self._logger.log,
+                        ServerDebug(
+                            message=(
+                                f"Rejecting final result for {result.job_id}: "
+                                f"producer {result.producer_id[:8]}... term "
+                                f"{result.manager_fence_token} < DC manager "
+                                f"term {known_term}"
+                            ),
+                            node_host=self._get_host(),
+                            node_port=self._get_tcp_port(),
+                            node_id=self._get_node_id().short,
+                        ),
+                    )
+                    return b"stale_producer"
+
             leader_id = self._job_leadership_tracker.get_leader(result.job_id)
             is_job_leader = self._job_leadership_tracker.is_leader(result.job_id)
             if leader_id and not is_job_leader:
@@ -407,20 +449,6 @@ class GateStateSyncHandler:
                         )
                     )
                 return b"unknown_job"
-
-            current_fence = self._job_manager.get_fence_token(result.job_id)
-            if result.fence_token < current_fence:
-                self._task_runner.run(
-                    self._logger.log,
-                    ServerDebug(
-                        message=f"Rejecting stale final result for {result.job_id}: "
-                        f"fence_token {result.fence_token} < {current_fence}",
-                        node_host=self._get_host(),
-                        node_port=self._get_tcp_port(),
-                        node_id=self._get_node_id().short,
-                    ),
-                )
-                return b"ok"
 
             completed = await complete_job(result.job_id, result)
             if not completed:

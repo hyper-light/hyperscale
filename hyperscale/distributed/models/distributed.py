@@ -1499,6 +1499,13 @@ class WorkflowResultPush(Message):
     workflow_name: str  # Workflow class name
     datacenter: str  # Source datacenter (or "aggregated" for cross-DC)
     status: str  # COMPLETED | FAILED
+    # Legacy field kept for wire-compat with older nodes. New code uses
+    # ``manager_fence_token`` / ``gate_fence_token`` (the two distinct
+    # fence domains) and ``result_sequence`` (data-plane ordering).
+    # Receivers must NOT apply this to gate-leader fencing — gate-leader
+    # claims live on dedicated messages (``GateJobReplica``,
+    # ``JobLeaderGateTransfer``). See ``WorkflowResultPush`` header for
+    # the producer/fence split rationale.
     fence_token: int = 0
     results: list[WorkflowStats] = field(default_factory=list)
     error: str | None = None  # Error message if failed
@@ -1523,6 +1530,34 @@ class WorkflowResultPush(Message):
     # True when this payload is already client-ready and should not be treated
     # as raw per-DC input for gate aggregation.
     is_client_ready: bool = False
+    # ----- Producer identity (data-plane provenance) -----
+    # Stamped by the originating node. The receiver gates on the
+    # producer's leadership domain — manager pushes are gated against
+    # per-DC manager leadership; gate pushes (cross-gate aggregation
+    # forwards) are gated against per-job gate leadership.
+    producer_id: str = ""
+    producer_addr: tuple[str, int] | None = None
+    producer_role: str = ""  # "manager" | "gate" | "" (legacy/unset)
+    # ----- Split-fence domains -----
+    # ``manager_fence_token`` is the manager's per-DC leadership
+    # generation at the moment the push was built. The receiver
+    # rejects only when this is strictly older than the per-DC
+    # manager-leadership generation it has on record (i.e. the
+    # producing manager is no longer the DC leader). Default 0 is
+    # treated as "unknown / wire-compat fallback" and is accepted.
+    manager_fence_token: int = 0
+    # ``gate_fence_token`` is the gate's per-job leadership fence as
+    # known to the producer. Managers set this to 0 (they don't claim
+    # gate leadership). Cross-gate forwards stamp the producing
+    # gate's current fence. The receiver only applies this to other
+    # gate's pushes, not to manager pushes.
+    gate_fence_token: int = 0
+    # ----- Data-plane idempotency -----
+    # Per-``(job_id, workflow_id, datacenter)`` monotonic sequence
+    # number stamped by the producer. The receiver uses this for
+    # last-writer-wins dedup independently of either fence domain.
+    # See ``_finalized_workflow_result_sequences`` on the gate.
+    result_sequence: int = 0
 
 
 @dataclass(slots=True)
@@ -1542,7 +1577,20 @@ class JobFinalResult(Message):
     total_failed: int = 0  # Total failed actions
     errors: list[str] = field(default_factory=list)  # All error messages
     elapsed_seconds: float = 0.0  # Max elapsed across workflows
-    fence_token: int = 0  # Fencing token for at-most-once semantics
+    # Legacy wire field — see ``WorkflowResultPush.fence_token`` for the
+    # split-domain rationale. Receivers must use
+    # ``manager_fence_token`` for manager-leadership gating and never
+    # apply the legacy ``fence_token`` to gate-leadership checks.
+    fence_token: int = 0
+    # Producer identity / split-fence domains / data-plane sequence.
+    # See ``WorkflowResultPush`` for full semantics; the contract is
+    # identical for terminal per-DC final results.
+    producer_id: str = ""
+    producer_addr: tuple[str, int] | None = None
+    producer_role: str = ""
+    manager_fence_token: int = 0
+    gate_fence_token: int = 0
+    result_sequence: int = 0
 
 
 @dataclass(slots=True)
@@ -3035,6 +3083,16 @@ class ManagerRegistrationState:
     node_id: str | None = None  # Manager's node_id (from first heartbeat)
     generation: int = 0  # Increments on manager restart (from heartbeat)
 
+    # Manager-leadership term carried in the heartbeat
+    # (``ManagerHeartbeat.term``). Monotonically non-decreasing within
+    # a manager generation; reset when a fresh generation is observed.
+    # Used by the gate to validate manager-originated data-plane
+    # results against the latest known leader manager in this DC.
+    latest_term: int = 0
+    # ``True`` on the most recent heartbeat. Surfaces "is this
+    # manager the DC leader right now" without re-grepping heartbeats.
+    is_leader: bool = False
+
     # Timing
     first_seen_at: float = 0.0  # monotonic time of first heartbeat
     last_heartbeat_at: float = 0.0  # monotonic time of most recent heartbeat
@@ -3062,9 +3120,23 @@ class ManagerRegistrationState:
             staleness_multiplier * expected_interval
         )
 
-    def record_heartbeat(self, now: float, node_id: str, generation: int) -> bool:
+    def record_heartbeat(
+        self,
+        now: float,
+        node_id: str,
+        generation: int,
+        term: int = 0,
+        is_leader: bool = False,
+    ) -> bool:
         """
         Record a heartbeat from this manager.
+
+        ``term`` is the manager's current leadership term
+        (``ManagerHeartbeat.term``). It is stored monotonically within
+        one process generation, and reset on a new generation so a
+        restarted manager is not fenced by stale term state from its
+        previous incarnation. ``is_leader`` is updated only for a
+        heartbeat at least as fresh as ``latest_term``.
 
         Returns True if this is a new generation (manager restarted).
         """
@@ -3077,6 +3149,8 @@ class ManagerRegistrationState:
             self.first_seen_at = now
             self.heartbeat_count = 1
             self.avg_heartbeat_interval = 5.0  # Reset to default
+            self.latest_term = term
+            self.is_leader = is_leader
         else:
             # Update running average of heartbeat interval
             if self.last_heartbeat_at > 0:
@@ -3086,6 +3160,12 @@ class ManagerRegistrationState:
                     0.8 * self.avg_heartbeat_interval + 0.2 * interval
                 )
             self.heartbeat_count += 1
+
+            if term > self.latest_term:
+                self.latest_term = term
+                self.is_leader = is_leader
+            elif term == self.latest_term:
+                self.is_leader = is_leader
 
         self.last_heartbeat_at = now
         return is_new_generation
@@ -3174,6 +3254,8 @@ class DatacenterRegistrationState:
         node_id: str,
         generation: int,
         now: float,
+        term: int = 0,
+        is_leader: bool = False,
     ) -> bool:
         """
         Record a heartbeat from a manager in this datacenter.
@@ -3186,7 +3268,7 @@ class DatacenterRegistrationState:
             )
 
         is_new = self.manager_states[manager_addr].record_heartbeat(
-            now, node_id, generation
+            now, node_id, generation, term=term, is_leader=is_leader
         )
 
         # Update DC-level timing
@@ -3195,3 +3277,21 @@ class DatacenterRegistrationState:
         self.last_heartbeat_at = now
 
         return is_new
+
+    def get_known_leader_manager_term(self) -> int:
+        """Highest term observed from a manager advertising leadership.
+
+        Used by the gate to validate ``WorkflowResultPush.manager_fence_token``
+        on manager-originated data-plane results. Follower/candidate
+        heartbeats can carry newer terms before a stable leader is
+        known; those must not fence valid data-plane results. Therefore
+        only current leader heartbeats contribute to this value.
+        """
+        return max(
+            (
+                state.latest_term
+                for state in self.manager_states.values()
+                if state.is_leader
+            ),
+            default=0,
+        )

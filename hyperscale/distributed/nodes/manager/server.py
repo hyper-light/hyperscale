@@ -4536,6 +4536,67 @@ class ManagerServer(HealthAwareServer):
             return len(target_dcs)
         return max(submission.datacenter_count, len(target_dcs))
 
+    def _manager_leadership_fence(self) -> int:
+        """Return the manager's current per-DC leadership generation.
+
+        Split-fence rule (see ``state.py`` and
+        ``WorkflowResultPush.manager_fence_token``): stamped onto
+        every data-plane result push so gate receivers can validate
+        the *producing manager* against per-DC manager leadership,
+        independently of any gate-tier leadership fence.
+
+        Backed by ``LocalLeaderElection.state.current_term``: that
+        value advances on each DC manager election, which is the
+        correct epoch for "the manager that produced this push was
+        leader at term T".
+        """
+        if self._leader_election is None:
+            return 0
+        return int(self._leader_election.state.current_term or 0)
+
+    def _data_plane_provenance(
+        self, job_id: str
+    ) -> dict[str, str | int | tuple[str, int]]:
+        """Producer identity + both fence-domain stamps for a job.
+
+        Shared between ``WorkflowResultPush`` and ``JobFinalResult``
+        builders — these fields are identical for both message types
+        because the split-fence semantics apply to every
+        manager-originated data-plane result. The per-workflow
+        result-sequence is intentionally NOT here; it belongs only to
+        ``WorkflowResultPush`` and is allocated by
+        ``_data_plane_push_fields``.
+        """
+        return {
+            "producer_id": self._node_id.full,
+            "producer_addr": (self._host, self._tcp_port),
+            "producer_role": "manager",
+            "manager_fence_token": self._manager_leadership_fence(),
+            "gate_fence_token": (
+                self._manager_state.get_job_gate_routing_fence(job_id)
+            ),
+        }
+
+    def _data_plane_push_fields(
+        self,
+        job_id: str,
+        workflow_id: str,
+        datacenter: str,
+    ) -> dict[str, str | int | tuple[str, int]]:
+        """Provenance + per-``(job, workflow, dc)`` result-sequence.
+
+        Use for ``WorkflowResultPush`` only. The sequence allocation
+        is monotonic per-triple and powers the gate's late-arrival
+        dedup independently of either fence domain.
+        """
+        fields = self._data_plane_provenance(job_id)
+        fields["result_sequence"] = (
+            self._manager_state.next_workflow_result_sequence(
+                job_id, workflow_id, datacenter
+            )
+        )
+        return fields
+
     async def _push_job_status_to_client(
         self,
         job_id: str,
@@ -4848,9 +4909,10 @@ class ManagerServer(HealthAwareServer):
         """Build a terminal workflow push for a job timeout."""
         callback_addr = self._get_job_callback_addr(job.job_id)
         target_dcs = self._get_job_target_dcs_for_push(job.job_id)
+        workflow_id = workflow.token.workflow_id or workflow.token_str
         return WorkflowResultPush(
             job_id=job.job_id,
-            workflow_id=workflow.token.workflow_id or workflow.token_str,
+            workflow_id=workflow_id,
             workflow_name=workflow.name,
             datacenter=self._node_id.datacenter,
             status=WorkflowStatus.FAILED.value,
@@ -4864,6 +4926,9 @@ class ManagerServer(HealthAwareServer):
             target_dc_count=self._get_job_target_dc_count_for_push(
                 job.job_id,
                 target_dcs,
+            ),
+            **self._data_plane_push_fields(
+                job.job_id, workflow_id, self._node_id.datacenter
             ),
         )
 
@@ -5716,9 +5781,10 @@ class ManagerServer(HealthAwareServer):
         else:
             push_results = list(result.results) if result.results else []
         target_dcs = self._get_job_target_dcs_for_push(result.job_id)
+        workflow_id = sub_token.workflow_id or result.workflow_id
         push = WorkflowResultPush(
             job_id=result.job_id,
-            workflow_id=sub_token.workflow_id or result.workflow_id,
+            workflow_id=workflow_id,
             workflow_name=result.workflow_name,
             datacenter=self._node_id.datacenter,
             status=push_status,
@@ -5735,6 +5801,9 @@ class ManagerServer(HealthAwareServer):
             ),
             is_client_ready=not bool(
                 self._manager_state.get_job_origin_gate(result.job_id)
+            ),
+            **self._data_plane_push_fields(
+                result.job_id, workflow_id, self._node_id.datacenter
             ),
         )
         try:
@@ -5806,6 +5875,9 @@ class ManagerServer(HealthAwareServer):
                     ),
                     is_client_ready=not bool(
                         self._manager_state.get_job_origin_gate(job_id)
+                    ),
+                    **self._data_plane_push_fields(
+                        job_id, workflow_id, self._node_id.datacenter
                     ),
                 )
                 try:
@@ -8082,12 +8154,26 @@ class ManagerServer(HealthAwareServer):
         data: bytes,
         clock_time: int,
     ) -> bytes:
-        """Handle job leader gate transfer notification from gate."""
+        """Handle job leader gate transfer notification from gate.
+
+        ``transfer.fence_token`` is a *gate-leadership* fence — it
+        advances when an orphan-takeover at the gate tier elects a
+        new job-leader gate. It must NOT mutate ``_leases``
+        (manager-leadership fence). Mixing those two epochs causes
+        in-flight manager-originated results to be rejected by the
+        gate as "stale" after every takeover; the gate's
+        ``workflow_result_push`` handler used to gate on
+        ``manager_push.fence < gate_current_fence`` and silently
+        dropped legitimate completed work. The two domains are now
+        tracked in separate storage and never cross-pollinate.
+        """
         try:
             transfer = JobLeaderGateTransfer.load(data)
 
-            current_fence = self._leases.get_fence_token(transfer.job_id)
-            if transfer.fence_token < current_fence:
+            current_routing_fence = (
+                self._manager_state.get_job_gate_routing_fence(transfer.job_id)
+            )
+            if transfer.fence_token < current_routing_fence:
                 return JobLeaderGateTransferAck(
                     job_id=transfer.job_id,
                     manager_id=self._node_id.full,
@@ -8097,8 +8183,7 @@ class ManagerServer(HealthAwareServer):
             self._manager_state.set_job_origin_gate(
                 transfer.job_id, transfer.new_gate_addr
             )
-
-            self._leases.update_fence_token_if_higher(
+            self._manager_state.update_job_gate_routing_fence_if_higher(
                 transfer.job_id, transfer.fence_token
             )
 
@@ -8604,6 +8689,12 @@ class ManagerServer(HealthAwareServer):
             errors=errors,
             elapsed_seconds=elapsed_seconds,
             fence_token=self._leases.get_fence_token(job_id),
+            # JobFinalResult is per-``(job, datacenter)`` — the gate's
+            # existing ``set_dc_result`` / ``get_all_dc_results``
+            # mapping already dedupes by ``(job_id, datacenter)``, so
+            # ``result_sequence`` stays at its default 0. Producer +
+            # fence stamps come from ``_data_plane_provenance``.
+            **self._data_plane_provenance(job_id),
         )
 
         try:

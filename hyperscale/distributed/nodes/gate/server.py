@@ -365,6 +365,20 @@ class GateServer(HealthAwareServer):
         self._workflow_result_expected_dc_counts: dict[str, dict[str, int]] = {}
         self._job_workflow_ids: dict[str, set[str]] = {}
 
+        # Data-plane idempotency: highest finalized result_sequence per
+        # ``(job_id, workflow_id, datacenter)``. Populated when an
+        # incoming ``WorkflowResultPush`` for that triple is accepted
+        # for aggregation; consulted on every subsequent inbound push
+        # so a late-arriving duplicate (after aggregation has popped
+        # ``_workflow_dc_results``) is acked idempotently without
+        # re-aggregating or re-delivering. Cleaned up alongside other
+        # per-job state in the cancellation / completion cleanup
+        # paths. Bounded by the number of in-flight job-workflow-dc
+        # triples — same scaling envelope as ``_workflow_dc_results``.
+        self._finalized_workflow_result_sequences: dict[
+            tuple[str, str, str], int
+        ] = {}
+
         # Per-job leadership tracking
         self._job_leadership_tracker: JobLeadershipTracker[int] = JobLeadershipTracker(
             node_id="",
@@ -948,6 +962,7 @@ class GateServer(HealthAwareServer):
             get_term=lambda: self._leader_election.state.current_term,
             get_state_snapshot=self._get_state_snapshot,
             apply_state_snapshot=self._apply_gate_state_snapshot,
+            get_known_leader_manager_term=self._get_known_leader_manager_term_for_dc,
         )
 
     # =========================================================================
@@ -1578,26 +1593,45 @@ class GateServer(HealthAwareServer):
                 f"tdc_count={push.target_dc_count}\n"
             )
             _sys.stderr.flush()
+
+            stale_response = self._validate_workflow_result_producer(push)
+            if stale_response is not None:
+                return stale_response
+
             if callback is not None:
                 push.callback_addr = callback
                 self._record_job_callback(push.job_id, callback)
 
-            current_fence = self._job_manager.get_fence_token(push.job_id)
-            if push.fence_token < current_fence:
-                self._task_runner.run(
-                    self._udp_logger.log,
-                    ServerDebug(
-                        message=f"Rejecting stale workflow result for {push.job_id}: "
-                        f"fence_token {push.fence_token} < {current_fence}",
-                        node_host=self._host,
-                        node_port=self._tcp_port,
-                        node_id=self._node_id.short,
-                    ),
-                )
-                return b"ok"
+            # Note: ``push.fence_token`` is the manager-side fence at
+            # dispatch time, not a gate-leadership claim. Applying the
+            # gate's per-job fence (which is bumped by orphan takeover —
+            # see ``_commit_gate_job_leadership_takeover``) to reject
+            # this push would silently drop legitimate completed work
+            # whenever a takeover landed mid-flight before the manager
+            # learned the new fence via ``job_leader_gate_transfer``.
+            # Gate-leadership fencing belongs on gate-leader claims
+            # (``GateJobReplica``, ``JobLeaderGateTransfer``), not on
+            # manager-originated data-plane results.
 
-            if push.fence_token > current_fence:
-                self._job_manager.set_fence_token(push.job_id, push.fence_token)
+            # Data-plane idempotency: if this exact ``(job_id,
+            # workflow_id, datacenter)`` triple has already been
+            # aggregated and delivered (we recorded the sequence on
+            # successful ``_forward_aggregated_workflow_result``),
+            # ack a late duplicate without re-running the aggregation
+            # or re-delivering. Uses ``result_sequence`` only — fence
+            # tokens never enter dedup. ``result_sequence == 0`` is
+            # the wire-compat fallback for pushes from older nodes
+            # that don't stamp the field; we accept those into the
+            # aggregator path so behavior matches pre-split.
+            finalized_key = (push.job_id, push.workflow_id, push.datacenter)
+            finalized_sequence = (
+                self._finalized_workflow_result_sequences.get(finalized_key, 0)
+            )
+            if (
+                push.result_sequence > 0
+                and push.result_sequence <= finalized_sequence
+            ):
+                return b"ok"
 
             if push.is_client_ready:
                 if callback is None:
@@ -1709,6 +1743,27 @@ class GateServer(HealthAwareServer):
                 delivered = await self._forward_aggregated_workflow_result(
                     push.job_id, push.workflow_id, workflow_results
                 )
+                if delivered:
+                    # Record the highest result_sequence we observed
+                    # for each (job_id, workflow_id, datacenter) we
+                    # just aggregated. Late duplicates of any of
+                    # these triples will be acked idempotently at
+                    # the dedup check above without re-aggregating.
+                    for dc_push in workflow_results.values():
+                        triple = (
+                            dc_push.job_id,
+                            dc_push.workflow_id,
+                            dc_push.datacenter,
+                        )
+                        existing = (
+                            self._finalized_workflow_result_sequences.get(
+                                triple, 0
+                            )
+                        )
+                        if dc_push.result_sequence > existing:
+                            self._finalized_workflow_result_sequences[triple] = (
+                                dc_push.result_sequence
+                            )
                 return b"ok" if delivered else b"error"
 
             return b"stored"
@@ -2334,7 +2389,7 @@ class GateServer(HealthAwareServer):
             delivered = await self._record_and_send_client_update(
                 result.job_id,
                 callback,
-                "job_final_result",
+                "receive_job_final_result",
                 data,
                 log_failure=True,
             )
@@ -2833,6 +2888,7 @@ class GateServer(HealthAwareServer):
                     errors=[timeout_reason],
                     elapsed_seconds=elapsed_seconds,
                     fence_token=fence_token,
+                    **self._data_plane_provenance(job_id),
                 )
             )
 
@@ -4075,6 +4131,134 @@ class GateServer(HealthAwareServer):
         if previous_callback != callback:
             self._increment_version()
 
+    def _data_plane_provenance(
+        self, job_id: str
+    ) -> dict[str, str | int | tuple[str, int]]:
+        """Producer identity + fence stamps for a gate-originated result.
+
+        Mirrors the manager-side helper for the split-fence semantics:
+        gates stamp ``producer_role='gate'`` and ``manager_fence_token=0``
+        (gates never claim manager leadership); ``gate_fence_token`` is
+        the gate's current per-job leadership fence — used by *peer*
+        gate receivers to validate gate-originated forwards. The
+        per-workflow result-sequence is not allocated here; gate-
+        originated pushes are one-shot per workflow result, and any
+        dedup at the receiving gate is keyed on
+        ``(job_id, workflow_id, datacenter)``.
+        """
+        return {
+            "producer_id": self._node_id.full,
+            "producer_addr": (self._host, self._tcp_port),
+            "producer_role": "gate",
+            "manager_fence_token": 0,
+            "gate_fence_token": self._job_manager.get_fence_token(job_id),
+        }
+
+    def _get_known_dc_manager_for_job(
+        self,
+        job_id: str,
+        datacenter: str,
+    ) -> tuple[str, int] | None:
+        """Return the known manager leader for ``job_id`` in ``datacenter``."""
+        manager_addr = self._job_leadership_tracker.get_dc_manager(
+            job_id,
+            datacenter,
+        )
+        if manager_addr is not None:
+            return manager_addr
+
+        return self._job_dc_managers.get(job_id, {}).get(datacenter)
+
+    def _validate_manager_result_producer(
+        self,
+        push: WorkflowResultPush,
+    ) -> bytes | None:
+        """Validate manager-originated workflow result provenance."""
+        if push.producer_addr is not None:
+            expected_manager_addr = self._get_known_dc_manager_for_job(
+                push.job_id,
+                push.datacenter,
+            )
+            producer_addr = tuple(push.producer_addr)
+            if (
+                expected_manager_addr is not None
+                and producer_addr != expected_manager_addr
+            ):
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerDebug(
+                        message=(
+                            f"Rejecting workflow result for {push.job_id}: "
+                            f"producer {producer_addr} is not DC manager "
+                            f"{expected_manager_addr}"
+                        ),
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    ),
+                )
+                return b"stale_producer"
+
+        if push.manager_fence_token <= 0:
+            return None
+
+        known_term = self._get_known_leader_manager_term_for_dc(push.datacenter)
+        if known_term <= 0 or push.manager_fence_token >= known_term:
+            return None
+
+        self._task_runner.run(
+            self._udp_logger.log,
+            ServerDebug(
+                message=(
+                    f"Rejecting workflow result for {push.job_id}: producer "
+                    f"{push.producer_id[:8]}... term {push.manager_fence_token} "
+                    f"< DC leader manager term {known_term}"
+                ),
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            ),
+        )
+        return b"stale_producer"
+
+    def _validate_gate_result_producer(
+        self,
+        push: WorkflowResultPush,
+    ) -> bytes | None:
+        """Validate gate-originated workflow result provenance."""
+        if push.gate_fence_token <= 0:
+            return None
+
+        current_fence = self._job_manager.get_fence_token(push.job_id)
+        if push.gate_fence_token >= current_fence:
+            return None
+
+        self._task_runner.run(
+            self._udp_logger.log,
+            ServerDebug(
+                message=(
+                    f"Rejecting workflow result for {push.job_id}: gate "
+                    f"producer {push.producer_id[:8]}... fence "
+                    f"{push.gate_fence_token} < current gate fence {current_fence}"
+                ),
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            ),
+        )
+        return b"stale_producer"
+
+    def _validate_workflow_result_producer(
+        self,
+        push: WorkflowResultPush,
+    ) -> bytes | None:
+        """Validate producer provenance for a workflow result push."""
+        if push.producer_role == "manager":
+            return self._validate_manager_result_producer(push)
+        if push.producer_role == "gate":
+            return self._validate_gate_result_producer(push)
+        return None
+
     def _resolve_job_callback(
         self,
         job_id: str,
@@ -4356,14 +4540,37 @@ class GateServer(HealthAwareServer):
                 job_id, event_type, payload
             )
 
+    def _get_known_leader_manager_term_for_dc(self, dc_id: str) -> int:
+        """Return the highest known leader-manager term for ``dc_id``.
+
+        Looked up by ``GateStateSyncHandler.handle_job_final_result``
+        (and the equivalent inline guard in ``workflow_result_push``)
+        to validate ``manager_fence_token`` on manager-originated
+        data-plane results against per-DC manager leadership.
+        Returns 0 when no leader heartbeat exists for the DC — the
+        caller treats 0 as "permissive: unknown" and accepts.
+        """
+        dc_state = self._dc_registration_states.get(dc_id)
+        if dc_state is None:
+            return 0
+        return dc_state.get_known_leader_manager_term()
+
     def _record_manager_heartbeat(
         self,
         dc_id: str,
         manager_addr: tuple[str, int],
         node_id: str,
         generation: int,
+        term: int = 0,
+        is_leader: bool = False,
     ) -> None:
-        """Record manager heartbeat."""
+        """Record manager heartbeat.
+
+        ``term`` and ``is_leader`` are threaded from
+        ``ManagerHeartbeat`` so the gate can later validate
+        manager-originated data-plane results against per-DC
+        manager-leadership term.
+        """
         now = time.monotonic()
 
         self._circuit_breaker_manager.record_success(manager_addr)
@@ -4378,7 +4585,14 @@ class GateServer(HealthAwareServer):
         if manager_addr not in dc_state.configured_managers:
             dc_state.configured_managers.append(manager_addr)
 
-        dc_state.record_heartbeat(manager_addr, node_id, generation, now)
+        dc_state.record_heartbeat(
+            manager_addr,
+            node_id,
+            generation,
+            now,
+            term=term,
+            is_leader=is_leader,
+        )
 
     async def _handle_manager_backpressure_signal(
         self,
@@ -5084,6 +5298,7 @@ class GateServer(HealthAwareServer):
             elapsed_seconds=0.0,
             completed_at=time.time(),
             is_test=is_test_workflow,
+            **self._data_plane_provenance(job_id),
         )
 
     async def _handle_workflow_result_timeout(
@@ -5425,6 +5640,7 @@ class GateServer(HealthAwareServer):
             errors=[f"Missing final result from DC {datacenter}"],
             elapsed_seconds=0.0,
             fence_token=fence_token,
+            **self._data_plane_provenance(job_id),
         )
 
     def _build_global_job_result(
@@ -5512,11 +5728,12 @@ class GateServer(HealthAwareServer):
             if not self._job_manager.has_job(result.job_id):
                 return None
 
-            current_fence = self._job_manager.get_fence_token(result.job_id)
-            if result.fence_token < current_fence:
-                return None
-            if result.fence_token > current_fence:
-                self._job_manager.set_fence_token(result.job_id, result.fence_token)
+            # Gate-leader fence does NOT apply to manager-originated
+            # final results. The takeover bump exists to fence stale
+            # gate-leader claims; data-plane terminal results from the
+            # manager are validated separately. Mixing the two drops
+            # legitimate completed work whenever a gate takeover
+            # landed before the manager learned the new fence.
 
             self._job_manager.set_dc_result(result.job_id, result.datacenter, result)
 
@@ -5635,6 +5852,7 @@ class GateServer(HealthAwareServer):
             is_test=is_test_workflow,
             callback_addr=callback,
             is_client_ready=True,
+            **self._data_plane_provenance(job_id),
         )
 
         if callback:
@@ -5970,6 +6188,16 @@ class GateServer(HealthAwareServer):
             workflow_timeout_tokens = self._workflow_result_timeout_tokens.pop(
                 job_id, None
             )
+            # Drop any finalized result-sequence rows for this job.
+            # Bounded by the number of in-flight triples for the job;
+            # in practice O(workflows × DCs).
+            finalized_keys = [
+                key
+                for key in self._finalized_workflow_result_sequences
+                if key[0] == job_id
+            ]
+            for key in finalized_keys:
+                self._finalized_workflow_result_sequences.pop(key, None)
         if workflow_timeout_tokens:
             await self._cancel_workflow_result_timeouts(workflow_timeout_tokens)
         if self._job_final_statuses:

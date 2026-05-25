@@ -149,6 +149,26 @@ class ManagerState:
         self._job_origin_gates: dict[str, tuple[str, int]] = {}
         self._progress_callbacks: dict[str, tuple[str, int]] = {}
 
+        # Per-job gate-routing fence. Distinct from
+        # ``_job_fencing_tokens`` (the manager's per-job leadership
+        # fence). This field tracks the most recently advertised
+        # gate-leader fence for the job, as learned via
+        # ``JobLeaderGateTransfer`` notifications from gates. It is a
+        # routing hint only — gate-leader takeover bumps it; manager
+        # leadership transitions do not touch it. Used to stamp
+        # ``gate_fence_token`` on data-plane result pushes so receiving
+        # gates can apply gate-leader fencing only to gate-originated
+        # forwards, never to manager-originated terminal data.
+        self._job_gate_routing_fences: dict[str, int] = {}
+
+        # Per-``(job_id, workflow_id, datacenter)`` monotonic
+        # result-sequence counter. Stamped onto each
+        # ``WorkflowResultPush`` / ``JobFinalResult`` as
+        # ``result_sequence`` so the gate can deduplicate late
+        # arrivals after aggregation without mixing data-plane
+        # ordering into either fence domain.
+        self._workflow_result_sequences: dict[tuple[str, str, str], int] = {}
+
         # Cancellation tracking (AD-20)
         self._cancellation_pending_workflows: dict[str, set[str]] = defaultdict(set)
         self._cancellation_errors: dict[str, list[str]] = defaultdict(list)
@@ -333,6 +353,12 @@ class ManagerState:
         self._job_origin_gates.pop(job_id, None)
         self._progress_callbacks.pop(job_id, None)
         self._job_submissions.pop(job_id, None)
+        self._job_gate_routing_fences.pop(job_id, None)
+        prefix_keys = [
+            key for key in self._workflow_result_sequences if key[0] == job_id
+        ]
+        for key in prefix_keys:
+            self._workflow_result_sequences.pop(key, None)
         reporter_tasks = self._job_reporter_tasks.pop(job_id, None)
         if reporter_tasks:
             for task in reporter_tasks.values():
@@ -854,6 +880,49 @@ class ManagerState:
 
     def set_job_origin_gate(self, job_id: str, addr: tuple[str, int]) -> None:
         self._job_origin_gates[job_id] = addr
+
+    # =========================================================================
+    # Gate-routing fence accessors (split-fence-domain — see __init__).
+    # Manager leadership fence lives in ``_job_fencing_tokens``
+    # (read via ``Leases.get_fence_token``); the gate-routing fence is
+    # tracked here so ``JobLeaderGateTransfer`` notifications never
+    # mutate the manager-leadership fence.
+    # =========================================================================
+
+    def get_job_gate_routing_fence(self, job_id: str) -> int:
+        return self._job_gate_routing_fences.get(job_id, 0)
+
+    def update_job_gate_routing_fence_if_higher(
+        self, job_id: str, new_value: int
+    ) -> bool:
+        """Update the routing fence only when monotonically newer.
+
+        Returns True iff the stored fence advanced. Stale gate-transfer
+        notifications (lower-than-known fence) are no-ops.
+        """
+        current = self._job_gate_routing_fences.get(job_id, 0)
+        if new_value > current:
+            self._job_gate_routing_fences[job_id] = new_value
+            return True
+        return False
+
+    # =========================================================================
+    # Per-(job, workflow, datacenter) data-plane result-sequence accessors.
+    # The result_sequence is monotonic per-triple and used by gate
+    # receivers for last-writer-wins dedup, independent of either
+    # leadership fence. See ``_workflow_result_sequences`` in
+    # __init__ for the full rationale.
+    # =========================================================================
+
+    def next_workflow_result_sequence(
+        self, job_id: str, workflow_id: str, datacenter: str
+    ) -> int:
+        """Allocate the next monotonic result-sequence for the triple."""
+        key = (job_id, workflow_id, datacenter)
+        current = self._workflow_result_sequences.get(key, 0)
+        new_value = current + 1
+        self._workflow_result_sequences[key] = new_value
+        return new_value
 
     # =========================================================================
     # Job Layer Version Accessors (4 direct accesses)

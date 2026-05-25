@@ -40,6 +40,13 @@ from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerWarni
 
 from .state import GateRuntimeState
 
+
+RecordManagerHeartbeat = Callable[
+    [str, tuple[str, int], str, int, int, bool],
+    None,
+]
+
+
 if TYPE_CHECKING:
     from hyperscale.distributed.swim.core import NodeId
     from hyperscale.distributed.server.events.lamport_clock import VersionedStateClock
@@ -75,7 +82,7 @@ class GateHealthCoordinator:
         get_host: Callable[[], str],
         get_tcp_port: Callable[[], int],
         confirm_manager_for_dc: Callable[[str, tuple[str, int]], "asyncio.Task"],
-        record_manager_heartbeat: Callable[[str, tuple[str, int], str, int], None],
+        record_manager_heartbeat: RecordManagerHeartbeat,
         capacity_aggregator: DatacenterCapacityAggregator | None = None,
         on_partition_healed: Callable[[list[str]], None] | None = None,
         on_partition_detected: Callable[[list[str]], None] | None = None,
@@ -99,9 +106,9 @@ class GateHealthCoordinator:
         self._confirm_manager_for_dc: Callable[
             [str, tuple[str, int]], "asyncio.Task"
         ] = confirm_manager_for_dc
-        self._record_manager_heartbeat: Callable[
-            [str, tuple[str, int], str, int], None
-        ] = record_manager_heartbeat
+        self._record_manager_heartbeat: RecordManagerHeartbeat = (
+            record_manager_heartbeat
+        )
         self._capacity_aggregator: DatacenterCapacityAggregator | None = (
             capacity_aggregator
         )
@@ -179,6 +186,8 @@ class GateHealthCoordinator:
             resolved_manager_addr,
             heartbeat.node_id,
             heartbeat.version,
+            heartbeat.term,
+            heartbeat.is_leader,
         )
         self._add_manager_to_discovery(
             datacenter_id,
