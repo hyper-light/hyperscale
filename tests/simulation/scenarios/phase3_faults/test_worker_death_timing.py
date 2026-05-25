@@ -136,49 +136,67 @@ async def test_worker_dies_post_ack_before_workload_finishes() -> None:
         scenario_name="worker_dies_post_ack_before_workload_finishes",
     ) as cluster:
         manager = cluster.managers("local")[0]
-        victim = cluster.workers("local")[0]
-        victim_id = victim.instance._node_id.full
         dispatcher = manager.instance._workflow_dispatcher
         original_send_dispatch = dispatcher._send_dispatch
-        original_task_runner_run = victim.instance._task_runner.run
         fault_landed = False
         execution_deferred = False
-
-        def defer_workflow_execution(
-            call: object,
-            *args: object,
-            alias: str | None = None,
-            **kwargs: object,
-        ) -> object:
-            nonlocal execution_deferred
-            if alias is not None and alias.startswith("workflow:") and not execution_deferred:
-                execution_deferred = True
-                return SimpleNamespace(token=f"harness-deferred:{alias}")
-
-            return original_task_runner_run(call, *args, alias=alias, **kwargs)
 
         async def send_dispatch_then_kill(
             worker_id: str,
             dispatch: WorkflowDispatch,
         ) -> bool:
-            nonlocal fault_landed
-            accepted = await original_send_dispatch(worker_id, dispatch)
-            if (
-                worker_id == victim_id
-                and accepted
-                and execution_deferred
-                and not fault_landed
-            ):
+            nonlocal execution_deferred, fault_landed
+            selected_worker = _worker_handle_by_node_id(
+                cluster,
+                "local",
+                worker_id,
+            )
+            if selected_worker is None or fault_landed:
+                return await original_send_dispatch(worker_id, dispatch)
+
+            original_task_runner_run = selected_worker.instance._task_runner.run
+            selected_dispatch_deferred = False
+
+            def defer_workflow_execution(
+                call: object,
+                *args: object,
+                alias: str | None = None,
+                **kwargs: object,
+            ) -> object:
+                nonlocal execution_deferred, selected_dispatch_deferred
+                if alias is not None and alias.startswith("workflow:"):
+                    execution_deferred = True
+                    selected_dispatch_deferred = True
+                    return SimpleNamespace(token=f"harness-deferred:{alias}")
+
+                return original_task_runner_run(call, *args, alias=alias, **kwargs)
+
+            selected_worker.instance._task_runner.run = defer_workflow_execution
+            try:
+                accepted = await original_send_dispatch(worker_id, dispatch)
+            finally:
+                if (
+                    selected_worker.instance._task_runner.run
+                    is defer_workflow_execution
+                ):
+                    selected_worker.instance._task_runner.run = (
+                        original_task_runner_run
+                    )
+
+            if accepted and selected_dispatch_deferred and not fault_landed:
                 fault_landed = True
-                await cluster.faults.kill(victim)
+                await cluster.faults.kill(selected_worker)
+
             return accepted
 
-        victim.instance._task_runner.run = defer_workflow_execution
         dispatcher._send_dispatch = send_dispatch_then_kill
-        async with cluster.workload(_workload(LongRunningWorkflow, 75.0)) as driver:
-            await driver.submit()
-            await driver.wait_until_running(timeout=30.0)
-            await driver.wait_for_completion()
+        try:
+            async with cluster.workload(_workload(LongRunningWorkflow, 75.0)) as driver:
+                await driver.submit()
+                await driver.wait_until_running(timeout=30.0)
+                await driver.wait_for_completion()
+        finally:
+            dispatcher._send_dispatch = original_send_dispatch
 
         assert fault_landed is True
         assert execution_deferred is True
