@@ -96,13 +96,13 @@ class GateJobReplica(Message):
       ``_progress_callbacks[job_id]``.
     * ``fence_token`` → ``_job_fence_tokens[job_id]`` and the
       leadership-tracker fencing token via
-      ``record_external_leader``.
+      ``apply_leadership``.
     * ``workflow_ids`` → ``_job_workflow_ids[job_id]``.
     * ``submission_payload`` → ``_job_submissions[job_id]`` (raw
       serialized ``JobSubmission`` so peers do not need to deserialize
       the submission unless they actually take over and dispatch).
     * ``leader_id`` + ``leader_addr`` →
-      ``_job_leadership_tracker.record_external_leader``.
+      ``_job_leadership_tracker.apply_leadership``.
     * ``origin_gate_addr`` is the gate that accepted the client
       submission (== ``leader_addr`` at submission time, but tracked
       separately so it survives later leader changes).

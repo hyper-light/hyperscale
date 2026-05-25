@@ -1675,11 +1675,11 @@ class JobLeadershipAnnouncement(Message):
     target_dc_count: int = 0
     fence_token: int = 0
     # Push-notification destinations replicated to peers so a manager
-    # that takes over job leadership (Raft takeover after the original
-    # leader dies) can push completion / cancellation notifications to
-    # the originating client and origin gate. Without this, only the
-    # original leader knows the callback addresses, and any post-
-    # takeover completion silently drops on the floor.
+    # that takes over job leadership after the original leader dies can
+    # push completion / cancellation notifications to the originating
+    # client and origin gate. Without this, only the original leader knows
+    # the callback addresses, and any post-takeover completion silently
+    # drops on the floor.
     callback_addr: tuple[str, int] | None = None
     origin_gate_addr: tuple[str, int] | None = None
 
@@ -1769,7 +1769,7 @@ class JobLeaderGateTransfer(Message):
 
     This is part of Direct DC-to-Job-Leader Routing:
     - Gate-A fails while owning job-123
-    - Gate-B takes over via consistent hashing
+    - The SWIM cluster leader gate takes over with a higher fence token
     - Gate-B sends JobLeaderGateTransfer to managers
     - Managers update _job_origin_gates[job-123] = Gate-B address
     """

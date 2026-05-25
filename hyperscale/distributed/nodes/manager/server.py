@@ -87,6 +87,8 @@ from hyperscale.distributed.models import (
     JobStateSyncAck,
     JobLeaderGateTransfer,
     JobLeaderGateTransferAck,
+    JobLeaderManagerTransfer,
+    JobLeaderManagerTransferAck,
     JobLeaderWorkerTransfer,
     JobLeaderWorkerTransferAck,
     ProvisionRequest,
@@ -1497,12 +1499,19 @@ class ManagerServer(HealthAwareServer):
     # =========================================================================
 
     def _on_job_raft_leader(self, job_id: str) -> None:
-        """Called when this node becomes the per-job Raft leader.
-
-        Schedules an async check for whether the current job leader
-        is dead and needs to be taken over.
-        """
-        self._task_runner.run(self._check_raft_leader_takeover, job_id)
+        """Called when this node becomes the per-job Raft leader."""
+        self._task_runner.run(
+            self._udp_logger.log,
+            ServerDebug(
+                message=(
+                    f"Ignoring per-job Raft leadership for {job_id[:8]}... "
+                    "as a failover authority; SWIM leadership coordinates takeover"
+                ),
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            ),
+        )
 
     def _on_job_raft_lose_leader(self, job_id: str) -> None:
         """Called when this node loses per-job Raft leadership."""
@@ -1517,48 +1526,12 @@ class ManagerServer(HealthAwareServer):
         )
 
     async def _check_raft_leader_takeover(self, job_id: str) -> None:
-        """Check if job leadership takeover is needed after becoming Raft leader.
+        """Deprecated per-job Raft takeover hook.
 
-        When this node becomes the per-job Raft leader, it checks if
-        the current job leader is dead. If so, it proposes a leadership
-        takeover through Raft consensus and notifies workers.
+        Job leadership is independent of SWIM cluster leadership during steady
+        state, but failover is coordinated only by the SWIM cluster leader.
         """
-        leader_addr = self._manager_state.get_job_leader_addr(job_id)
-        if leader_addr is None:
-            return
-
-        dead_managers = self._manager_state.get_dead_managers()
-        if leader_addr not in dead_managers:
-            return
-
-        old_leader_id = self._manager_state.get_job_leader(job_id)
-
-        next_fencing_token = max(2, self._leases.get_fence_token(job_id) + 1)
-        accepted = await self._raft.raft_job_manager.takeover_job_leadership(
-            job_id,
-            fencing_token=next_fencing_token,
-        )
-        if not accepted:
-            return
-
-        if not self._is_job_leader(job_id):
-            return
-
-        await self._notify_workers_job_leader_transfer(job_id, old_leader_id)
-        # Phase F4: inherit AD-26 H7/H8 state from the previous
-        # leader's persisted TimeoutTrackingState.
-        self._replay_extension_state_for_job(job_id)
-        await self._udp_logger.log(
-            ServerInfo(
-                message=(
-                    f"Raft leader takeover: assumed job leadership for {job_id[:8]}... "
-                    f"(previous leader {old_leader_id or 'unknown'} is dead)"
-                ),
-                node_host=self._host,
-                node_port=self._tcp_port,
-                node_id=self._node_id.short,
-            )
-        )
+        return
 
     def _on_worker_dead_for_job(self, job_id: str, worker_id: str) -> None:
         if not self._workflow_dispatcher or not self._job_manager:
@@ -2144,12 +2117,13 @@ class ManagerServer(HealthAwareServer):
     async def _handle_job_leader_failure(self, failed_addr: tuple[str, int]) -> None:
         """Handle job leader manager failure.
 
-        Every manager that observes the failure may try the Raft proposal;
-        only the current per-job Raft leader can commit it. This keeps SWIM
-        cluster leadership out of the job-leadership safety path and avoids
-        missing takeover when the per-job Raft leader was already elected
-        before the failed manager was declared dead.
+        Job leadership is per-job during normal operation. When a job leader
+        dies, the SWIM cluster leader is the only node allowed to advance the
+        fenced leadership epoch and publish the takeover.
         """
+        if not self.is_leader():
+            return
+
         jobs_to_takeover = [
             job_id
             for job_id, leader_addr in self._manager_state.iter_job_leader_addrs()
@@ -2158,38 +2132,132 @@ class ManagerServer(HealthAwareServer):
 
         for job_id in jobs_to_takeover:
             old_leader_id = self._manager_state.get_job_leader(job_id)
-
-            await self._raft.consensus.create_job_raft(job_id)
-
-            next_fencing_token = max(2, self._leases.get_fence_token(job_id) + 1)
-            accepted = await self._raft.raft_job_manager.takeover_job_leadership(
+            taken_over = await self._take_over_job_leadership_as_cluster_leader(
                 job_id,
-                fencing_token=next_fencing_token,
+                old_leader_id,
             )
-            if not accepted:
-                await self._udp_logger.log(
-                    ServerWarning(
-                        message=(
-                            f"Raft takeover proposal rejected for job {job_id[:8]}... "
-                            "(not Raft leader for this job; per-job Raft leader will handle)"
-                        ),
-                        node_host=self._host,
-                        node_port=self._tcp_port,
-                        node_id=self._node_id.short,
-                    )
-                )
+            if not taken_over:
                 continue
 
-            if not self._is_job_leader(job_id):
-                continue
-
-            await self._notify_workers_job_leader_transfer(job_id, old_leader_id)
-            # Phase F4: inherit AD-26 H7/H8 state from the previous
-            # leader's persisted TimeoutTrackingState.
-            self._replay_extension_state_for_job(job_id)
             await self._udp_logger.log(
                 ServerInfo(
-                    message=f"Took over leadership for job {job_id[:8]}... via Raft consensus",
+                    message=f"Took over leadership for job {job_id[:8]}... as SWIM cluster leader",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+
+    async def _take_over_job_leadership_as_cluster_leader(
+        self,
+        job_id: str,
+        old_leader_id: str | None,
+    ) -> bool:
+        """Advance a job's fenced leadership epoch as the SWIM cluster leader."""
+        if not self.is_leader():
+            return False
+        if not self._leadership.has_quorum():
+            await self._udp_logger.log(
+                ServerWarning(
+                    message=(
+                        f"Cannot take over job {job_id[:8]}... without manager quorum"
+                    ),
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            return False
+
+        next_fencing_token = max(2, self._leases.get_fence_token(job_id) + 1)
+        accepted = self._leases.apply_job_leadership(
+            job_id=job_id,
+            leader_id=self._node_id.full,
+            leader_addr=(self._host, self._tcp_port),
+            fencing_token=next_fencing_token,
+        )
+        if not accepted:
+            return False
+
+        job = self._job_manager.get_job_by_id(job_id)
+        workflow_names: list[str] = []
+        if job is not None:
+            job.leader_node_id = self._node_id.full
+            job.leader_addr = (self._host, self._tcp_port)
+            job.fencing_token = next_fencing_token
+            workflow_names = [
+                workflow.name for workflow in job.workflows.values()
+            ]
+
+        await self._manager_state.increment_state_version()
+        await self._broadcast_job_leadership(
+            job_id,
+            len(workflow_names),
+            workflow_names,
+            callback_addr=self._manager_state.get_job_callback(job_id),
+            origin_gate_addr=self._manager_state.get_job_origin_gate(job_id),
+        )
+        await self._notify_origin_gate_job_leader_transfer(
+            job_id,
+            old_leader_id,
+            next_fencing_token,
+        )
+        await self._notify_workers_job_leader_transfer(job_id, old_leader_id)
+        # Phase F4: inherit AD-26 H7/H8 state from the previous
+        # leader's persisted TimeoutTrackingState.
+        self._replay_extension_state_for_job(job_id)
+        return True
+
+    async def _notify_origin_gate_job_leader_transfer(
+        self,
+        job_id: str,
+        old_leader_id: str | None,
+        fencing_token: int,
+    ) -> None:
+        """Notify the origin gate that this manager now leads the job."""
+        origin_gate_addr = self._manager_state.get_job_origin_gate(job_id)
+        if origin_gate_addr is None:
+            return
+
+        transfer = JobLeaderManagerTransfer(
+            job_id=job_id,
+            datacenter_id=self._node_id.datacenter,
+            new_manager_id=self._node_id.full,
+            new_manager_addr=(self._host, self._tcp_port),
+            fence_token=fencing_token,
+            old_manager_id=old_leader_id,
+        )
+        try:
+            response, _clock_time = await self.send_tcp(
+                origin_gate_addr,
+                "job_leader_manager_transfer",
+                transfer.dump(),
+                timeout=self._config.tcp_timeout_standard_seconds,
+            )
+            if not response:
+                return
+            ack = JobLeaderManagerTransferAck.load(response)
+            if ack.accepted:
+                return
+
+            await self._udp_logger.log(
+                ServerWarning(
+                    message=(
+                        f"Origin gate {origin_gate_addr} rejected manager leader "
+                        f"transfer for job {job_id[:8]}..."
+                    ),
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+        except Exception as transfer_error:
+            await self._udp_logger.log(
+                ServerWarning(
+                    message=(
+                        f"Failed to notify origin gate {origin_gate_addr} about manager "
+                        f"leader transfer for job {job_id[:8]}...: {transfer_error}"
+                    ),
                     node_host=self._host,
                     node_port=self._tcp_port,
                     node_id=self._node_id.short,
@@ -3329,8 +3397,8 @@ class ManagerServer(HealthAwareServer):
         """Scan for orphaned jobs from dead managers.
 
         Called when this node becomes the SWIM cluster leader.
-        Proposes leadership takeover through Raft consensus for
-        any jobs whose leader is in the dead managers set.
+        Advances fenced leadership for jobs whose leader is in the dead
+        managers set.
         """
         dead_managers_snapshot = self._manager_state.get_dead_managers()
         job_leader_addrs_snapshot = self._manager_state.iter_job_leader_addrs()
@@ -3344,22 +3412,9 @@ class ManagerServer(HealthAwareServer):
 
             for job_id in jobs_to_takeover:
                 old_leader_id = self._manager_state.get_job_leader(job_id)
-
-                await self._raft.consensus.create_job_raft(job_id)
-
-                next_fencing_token = max(2, self._leases.get_fence_token(job_id) + 1)
-                accepted = await self._raft.raft_job_manager.takeover_job_leadership(
+                await self._take_over_job_leadership_as_cluster_leader(
                     job_id,
-                    fencing_token=next_fencing_token,
-                )
-                if not accepted:
-                    continue
-
-                if not self._is_job_leader(job_id):
-                    continue
-
-                await self._notify_workers_job_leader_transfer(
-                    job_id, old_leader_id
+                    old_leader_id,
                 )
 
     async def _resume_timeout_tracking_for_all_jobs(self) -> None:
@@ -4081,9 +4136,8 @@ class ManagerServer(HealthAwareServer):
         """Phase F4: replay persisted AD-26 H7/H8 state into the
         local ``WorkerHealthManager`` on leader takeover.
 
-        Called from both takeover paths (per-job Raft takeover and
-        bulk takeover after a manager dies) so the new leader
-        immediately sees the previous leader's:
+        Called after SWIM-leader takeover so the new leader immediately sees
+        the previous leader's:
 
         - Most-recent decision per workflow (H7 ledger entries)
         - In-flight outcome events not yet disseminated (H8)
@@ -8249,8 +8303,8 @@ class ManagerServer(HealthAwareServer):
         """Broadcast job leadership to peer managers.
 
         ``callback_addr`` / ``origin_gate_addr`` are replicated so a
-        peer that subsequently takes over job leadership (Raft
-        takeover after the original leader dies) has the destinations
+        peer that subsequently takes over job leadership after the original
+        leader dies has the destinations
         needed to push job-completion / cancellation-completion
         notifications back to the originating client and origin
         gate. Without replication, only the original leader knows

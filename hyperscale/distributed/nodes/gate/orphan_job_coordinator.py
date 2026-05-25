@@ -2,13 +2,12 @@
 Gate orphan job coordinator for handling job takeover when gate peers fail.
 
 This module implements the detection and takeover of orphaned jobs when a gate
-peer becomes unavailable. It uses the consistent hash ring to determine new
-ownership and fencing tokens to prevent split-brain scenarios.
+peer becomes unavailable. The SWIM cluster leader is the only failover
+authority; fencing tokens prevent stale leaders from reappearing.
 
 Key responsibilities:
 - Detect jobs orphaned by gate peer failures
-- Determine new job ownership via consistent hash ring
-- Execute takeover with proper fencing token increment
+- Execute SWIM-leader takeover with proper fencing token increment
 - Broadcast leadership changes to peer gates and managers
 - Prevent thundering herd via jitter and grace periods
 """
@@ -51,11 +50,11 @@ class GateOrphanJobCoordinator:
     1. Identifies all jobs that were led by the failed gate
     2. Marks those jobs as orphaned with timestamps
     3. Periodically scans orphaned jobs after a grace period
-    4. Takes over jobs where this gate is the new owner (via hash ring)
+    4. Lets only the SWIM cluster leader commit takeover
     5. Broadcasts leadership changes to maintain cluster consistency
 
     The grace period prevents premature takeover during transient network issues
-    and allows the consistent hash ring to stabilize after node removal.
+    and allows membership to stabilize after node removal.
 
     Asyncio Safety:
     - Uses internal lock for orphan state modifications
@@ -80,6 +79,8 @@ class GateOrphanJobCoordinator:
         "_get_active_peers",
         "_forward_status_push_to_peers",
         "_state_repair_callback",
+        "_commit_takeover_callback",
+        "_is_cluster_leader",
         "_orphan_check_interval_seconds",
         "_orphan_grace_period_seconds",
         "_orphan_timeout_seconds",
@@ -106,6 +107,8 @@ class GateOrphanJobCoordinator:
         forward_status_push_to_peers: Callable[[str, bytes], Awaitable[bool]]
         | None = None,
         state_repair_callback: Callable[[str], Awaitable[bool]] | None = None,
+        commit_takeover_callback: Callable[[str], Awaitable[int | None]] | None = None,
+        is_cluster_leader: Callable[[], bool] | None = None,
         orphan_check_interval_seconds: float = 15.0,
         orphan_grace_period_seconds: float = 30.0,
         orphan_timeout_seconds: float = 300.0,
@@ -119,7 +122,7 @@ class GateOrphanJobCoordinator:
             state: Runtime state container with orphan tracking
             logger: Async logger instance
             task_runner: Background task executor
-            job_hash_ring: Consistent hash ring for determining job ownership
+            job_hash_ring: Existing job hash ring retained for coordinator compatibility
             job_leadership_tracker: Tracks per-job leadership with fencing tokens
             job_manager: Manages job state and target datacenters
             get_node_id: Callback to get this gate's node ID
@@ -127,6 +130,9 @@ class GateOrphanJobCoordinator:
             send_tcp: Callback to send TCP messages to peers
             get_active_peers: Callback to get active peer gate addresses
             forward_status_push_to_peers: Callback to forward status pushes to peer gates
+            state_repair_callback: Callback to hydrate missing committed job state
+            commit_takeover_callback: Callback that quorum-commits a takeover
+            is_cluster_leader: Callback returning whether this gate is SWIM leader
             orphan_check_interval_seconds: How often to scan for orphaned jobs
             orphan_grace_period_seconds: Time to wait before attempting takeover
             orphan_timeout_seconds: Max time before orphaned jobs fail
@@ -145,6 +151,8 @@ class GateOrphanJobCoordinator:
         self._get_active_peers = get_active_peers
         self._forward_status_push_to_peers = forward_status_push_to_peers
         self._state_repair_callback = state_repair_callback
+        self._commit_takeover_callback = commit_takeover_callback
+        self._is_cluster_leader = is_cluster_leader
         self._orphan_check_interval_seconds = orphan_check_interval_seconds
         self._orphan_grace_period_seconds = orphan_grace_period_seconds
         self._orphan_timeout_seconds = orphan_timeout_seconds
@@ -403,8 +411,8 @@ class GateOrphanJobCoordinator:
         """
         Evaluate whether to take over an orphaned job.
 
-        Checks if this gate is the new owner via consistent hash ring,
-        and if so, executes the takeover with proper fencing.
+        Checks if this gate is the SWIM cluster leader, and if so, executes
+        the takeover with proper fencing.
 
         Args:
             job_id: The orphaned job ID
@@ -431,74 +439,25 @@ class GateOrphanJobCoordinator:
             return
 
         time_orphaned = time.monotonic() - orphaned_at
-        new_owner = await self._job_hash_ring.get_node(job_id)
         _sys.stderr.write(
             f"[ORPHAN-EVAL-OWNER self={self._get_node_addr()} job={job_id[:10]}] "
-            f"new_owner={new_owner.node_id[:30] if new_owner else 'None'} "
+            f"is_cluster_leader={self._is_current_cluster_leader()} "
             f"my_id={self._get_node_id().full[:30]} "
             f"time_orphaned={time_orphaned:.1f}\n"
         )
         _sys.stderr.flush()
-        if not new_owner:
-            if time_orphaned >= self._orphan_timeout_seconds:
-                job.status = JobStatus.FAILED.value
-                if getattr(job, "timestamp", 0) > 0:
-                    job.elapsed_seconds = time.monotonic() - job.timestamp
-                self._job_manager.set_job(job_id, job)
-                self._state.clear_orphaned_job(job_id)
-
-                await self._logger.log(
-                    ServerWarning(
-                        message=(
-                            f"Orphaned job {job_id[:8]}... failed after {time_orphaned:.1f}s without new owner"
-                        ),
-                        node_host=self._get_node_addr()[0],
-                        node_port=self._get_node_addr()[1],
-                        node_id=self._get_node_id().short,
-                    )
-                )
-
-                callback = self._job_manager.get_callback(job_id)
-                if callback:
-                    push = JobStatusPush(
-                        job_id=job_id,
-                        status=job.status,
-                        message=f"Job {job_id} failed (orphan timeout)",
-                        total_completed=getattr(job, "total_completed", 0),
-                        total_failed=getattr(job, "total_failed", 0),
-                        overall_rate=getattr(job, "overall_rate", 0.0),
-                        elapsed_seconds=getattr(job, "elapsed_seconds", 0.0),
-                        is_final=True,
-                        callback_addr=callback,
-                    )
-                    await self._send_job_status_push_with_retry(
-                        job_id,
-                        callback,
-                        push.dump(),
-                        allow_peer_forwarding=True,
-                    )
-                return
-
-            await self._logger.log(
-                ServerWarning(
-                    message=(
-                        f"No owner found in hash ring for orphaned job {job_id[:8]}... "
-                        f"({time_orphaned:.1f}s orphaned)"
-                    ),
-                    node_host=self._get_node_addr()[0],
-                    node_port=self._get_node_addr()[1],
-                    node_id=self._get_node_id().short,
-                )
-            )
+        if time_orphaned >= self._orphan_timeout_seconds:
+            await self._fail_orphaned_job(job_id, job, time_orphaned)
             return
 
-        my_node_id = self._get_node_id().full
-
-        if new_owner.node_id != my_node_id:
+        if not self._is_current_cluster_leader():
             self._task_runner.run(
                 self._logger.log,
                 ServerDebug(
-                    message=f"Job {job_id[:8]}... should be owned by {new_owner.node_id[:8]}..., not us",
+                    message=(
+                        f"Job {job_id[:8]}... orphan takeover deferred to the "
+                        "SWIM cluster leader"
+                    ),
                     node_host=self._get_node_addr()[0],
                     node_port=self._get_node_addr()[1],
                     node_id=self._get_node_id().short,
@@ -507,6 +466,56 @@ class GateOrphanJobCoordinator:
             return
 
         await self._execute_takeover(job_id)
+
+    def _is_current_cluster_leader(self) -> bool:
+        """Return whether this gate is currently the SWIM cluster leader."""
+        if self._is_cluster_leader is None:
+            return False
+        return self._is_cluster_leader()
+
+    async def _fail_orphaned_job(
+        self,
+        job_id: str,
+        job: GlobalJobStatus,
+        time_orphaned: float,
+    ) -> None:
+        """Fail an orphaned job that exceeded the takeover timeout."""
+        job.status = JobStatus.FAILED.value
+        if job.timestamp > 0:
+            job.elapsed_seconds = time.monotonic() - job.timestamp
+        self._job_manager.set_job(job_id, job)
+        self._state.clear_orphaned_job(job_id)
+
+        await self._logger.log(
+            ServerWarning(
+                message=f"Orphaned job {job_id[:8]}... failed after {time_orphaned:.1f}s without takeover",
+                node_host=self._get_node_addr()[0],
+                node_port=self._get_node_addr()[1],
+                node_id=self._get_node_id().short,
+            )
+        )
+
+        callback = self._job_manager.get_callback(job_id)
+        if callback is None:
+            return
+
+        push = JobStatusPush(
+            job_id=job_id,
+            status=job.status,
+            message=f"Job {job_id} failed (orphan timeout)",
+            total_completed=job.total_completed,
+            total_failed=job.total_failed,
+            overall_rate=job.overall_rate,
+            elapsed_seconds=job.elapsed_seconds,
+            is_final=True,
+            callback_addr=callback,
+        )
+        await self._send_job_status_push_with_retry(
+            job_id,
+            callback,
+            push.dump(),
+            allow_peer_forwarding=True,
+        )
 
     async def _get_or_repair_job(self, job_id: str) -> GlobalJobStatus | None:
         """Return local job state, fetching committed replica state if needed."""
@@ -543,11 +552,11 @@ class GateOrphanJobCoordinator:
         """
         Execute takeover of an orphaned job.
 
-        Takes over leadership with an incremented fencing token and broadcasts
-        the change. Once the consistent hash ring elects a single owner, this
-        path intentionally does not sleep; delaying after owner selection lets
-        unrelated state cleanup clear the orphan before the elected owner can
-        fence the old leader.
+        The SWIM cluster leader quorum-commits leadership with an incremented
+        fencing token, then broadcasts the committed value. This path
+        intentionally does not sleep after leader selection; delaying lets
+        unrelated state cleanup clear the orphan before the leader can fence
+        the old owner.
 
         Args:
             job_id: The job ID to take over
@@ -580,24 +589,47 @@ class GateOrphanJobCoordinator:
                 _sys.stderr.flush()
                 return
 
-            new_owner = await self._job_hash_ring.get_node(job_id)
-            my_node_id = self._get_node_id().full
-            if new_owner is None or new_owner.node_id != my_node_id:
+            if not self._is_current_cluster_leader():
                 _sys.stderr.write(
                     f"[ORPHAN-TAKEOVER-SKIP self={self._get_node_addr()} job={job_id[:10]}] "
-                    f"reason=owner_changed new_owner={new_owner.node_id[:30] if new_owner else 'None'} "
-                    f"my_id={my_node_id[:30]}\n"
+                    "reason=not_cluster_leader\n"
                 )
                 _sys.stderr.flush()
                 return
 
             target_dc_count = len(self._job_manager.get_target_dcs(job_id))
 
-            new_token = await self._job_leadership_tracker.takeover_leadership_async(
-                job_id,
-                metadata=target_dc_count,
+        if self._commit_takeover_callback is None:
+            await self._logger.log(
+                ServerWarning(
+                    message=f"No commit callback available for orphaned job {job_id[:8]}... takeover",
+                    node_host=self._get_node_addr()[0],
+                    node_port=self._get_node_addr()[1],
+                    node_id=self._get_node_id().short,
+                )
             )
+            return
 
+        new_token = await self._commit_takeover_callback(job_id)
+        if new_token is None:
+            await self._logger.log(
+                ServerWarning(
+                    message=f"Quorum commit failed for orphaned job {job_id[:8]}... takeover",
+                    node_host=self._get_node_addr()[0],
+                    node_port=self._get_node_addr()[1],
+                    node_id=self._get_node_id().short,
+                )
+            )
+            return
+
+        async with self._lock:
+            if not self._state.is_job_orphaned(job_id):
+                _sys.stderr.write(
+                    f"[ORPHAN-TAKEOVER-SKIP self={self._get_node_addr()} job={job_id[:10]}] "
+                    "reason=committed_but_already_cleared\n"
+                )
+                _sys.stderr.flush()
+                return
             self._state.clear_orphaned_job(job_id)
             _sys.stderr.write(
                 f"[ORPHAN-TAKEOVER-COMMIT self={self._get_node_addr()} job={job_id[:10]}] "

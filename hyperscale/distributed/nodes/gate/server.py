@@ -96,6 +96,7 @@ from hyperscale.distributed.models import (
     WorkflowResultPush,
     WorkflowDCResult,
     restricted_loads,
+    GateJobReplica,
     JobLeadershipAnnouncement,
     JobLeadershipAck,
     JobLeaderGateTransferAck,
@@ -704,6 +705,7 @@ class GateServer(HealthAwareServer):
             get_node_addr=lambda: (self._host, self._tcp_port),
             send_tcp=self._send_tcp,
             get_active_peers=lambda: self._modular_state.get_active_peers_list(),
+            configured_gate_count=self._configured_gate_count(),
         )
 
         self._dispatch_coordinator = GateDispatchCoordinator(
@@ -819,6 +821,8 @@ class GateServer(HealthAwareServer):
             get_active_peers=lambda: self._modular_state.get_active_peers(),
             forward_status_push_to_peers=self._forward_job_status_push_to_peers,
             state_repair_callback=self._repair_orphan_job_state,
+            commit_takeover_callback=self._commit_gate_job_leadership_takeover,
+            is_cluster_leader=self.is_leader,
             orphan_check_interval_seconds=self._orphan_check_interval,
             orphan_grace_period_seconds=self._orphan_grace_period,
         )
@@ -3262,18 +3266,24 @@ class GateServer(HealthAwareServer):
 
         Called by the replication coordinator at commit time on both
         leader and peers. Idempotent — repeated commits at the same
-        sequence overwrite identical values. On the leader the
-        ``leader_id`` matches our own node id and we ``assume_leadership``;
-        on peers ``leader_id`` is the accepting gate and we record the
-        external leadership claim with the replica's fencing token.
+        sequence overwrite identical values. Leadership is applied as the
+        committed fenced value regardless of whether this gate is the leader
+        or a peer, keeping local identity out of the commit path.
         """
-        job = GlobalJobStatus(
-            job_id=replica.job_id,
-            status=replica.status_seed,
-            datacenters=[],
-            timestamp=replica.submitted_at,
-            fence_token=replica.fence_token,
-        )
+        job = self._job_manager.get_job(replica.job_id)
+        if job is None:
+            job = GlobalJobStatus(
+                job_id=replica.job_id,
+                status=replica.status_seed,
+                datacenters=[],
+                timestamp=replica.submitted_at,
+                fence_token=replica.fence_token,
+            )
+        else:
+            job.status = replica.status_seed
+            job.fence_token = replica.fence_token
+            if job.timestamp <= 0:
+                job.timestamp = replica.submitted_at
         self._job_manager.set_job(replica.job_id, job)
         self._job_manager.set_target_dcs(
             replica.job_id, set(replica.target_dcs)
@@ -3293,23 +3303,26 @@ class GateServer(HealthAwareServer):
             try:
                 submission = JobSubmission.load(replica.submission_payload)
                 self._modular_state._job_submissions[replica.job_id] = submission
-            except Exception:
-                pass
+            except Exception as load_error:
+                await self._udp_logger.log(
+                    ServerWarning(
+                        message=(
+                            f"Committed gate replica for job {replica.job_id[:8]}... "
+                            f"has invalid submission payload: {load_error}"
+                        ),
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
 
-        if replica.leader_id == self._node_id.full:
-            self._job_leadership_tracker.assume_leadership(
-                job_id=replica.job_id,
-                metadata=replica.target_dc_count,
-                initial_token=replica.fence_token,
-            )
-        else:
-            self._job_leadership_tracker.process_leadership_claim(
-                job_id=replica.job_id,
-                claimer_id=replica.leader_id,
-                claimer_addr=tuple(replica.leader_addr),
-                fencing_token=replica.fence_token,
-                metadata=replica.target_dc_count,
-            )
+        self._job_leadership_tracker.apply_leadership(
+            job_id=replica.job_id,
+            leader_id=replica.leader_id,
+            leader_addr=tuple(replica.leader_addr),
+            fencing_token=replica.fence_token,
+            metadata=replica.target_dc_count,
+        )
 
         await self._modular_state.increment_state_version()
 
@@ -3345,6 +3358,147 @@ class GateServer(HealthAwareServer):
             return False
         await self._apply_committed_replica(replica)
         return True
+
+    async def _commit_gate_job_leadership_takeover(self, job_id: str) -> int | None:
+        """Quorum-commit a gate job leadership takeover by the SWIM leader."""
+        if self._replication_coordinator is None:
+            return None
+        if not self.is_leader():
+            return None
+
+        job = self._job_manager.get_job(job_id)
+        if job is None:
+            return None
+
+        target_dcs = sorted(self._job_manager.get_target_dcs(job_id))
+        current_fence_token = max(
+            self._job_manager.get_fence_token(job_id),
+            self._job_leadership_tracker.get_fencing_token(job_id),
+        )
+        next_fence_token = max(2, current_fence_token + 1)
+        callback_addr = self._job_manager.get_callback(job_id)
+        node_addr = (self._host, self._tcp_port)
+        old_leader_id = self._job_leadership_tracker.get_leader(job_id)
+        workflow_ids = sorted(self._modular_state._job_workflow_ids.get(job_id, set()))
+        submission = self._modular_state._job_submissions.get(job_id)
+        submission_payload = submission.dump() if submission is not None else b""
+
+        replica = GateJobReplica(
+            job_id=job_id,
+            sequence=next_fence_token,
+            fence_token=next_fence_token,
+            leader_id=self._node_id.full,
+            leader_addr=node_addr,
+            origin_gate_addr=node_addr,
+            callback_addr=callback_addr,
+            target_dcs=target_dcs,
+            target_dc_count=len(target_dcs),
+            status_seed=job.status,
+            submitted_at=job.timestamp,
+            workflow_ids=workflow_ids,
+            submission_payload=submission_payload,
+        )
+        committed = await self._replication_coordinator.replicate_with_quorum(
+            replica=replica,
+            peer_addrs=list(self._modular_state.get_active_peers_list()),
+            quorum_size=self._quorum_size(),
+        )
+        if not committed:
+            return None
+
+        self._task_runner.run(
+            self._notify_managers_gate_job_leader_transfer,
+            job_id,
+            old_leader_id,
+            next_fence_token,
+            target_dcs,
+        )
+        return next_fence_token
+
+    async def _notify_managers_gate_job_leader_transfer(
+        self,
+        job_id: str,
+        old_gate_id: str | None,
+        fence_token: int,
+        target_dcs: list[str],
+    ) -> None:
+        """Notify relevant managers that this gate is the new job leader."""
+        manager_addrs: list[tuple[str, int]] = []
+        seen_manager_addrs: set[tuple[str, int]] = set()
+        job_dc_managers = self._job_dc_managers.get(job_id, {})
+
+        for manager_addr in job_dc_managers.values():
+            if manager_addr in seen_manager_addrs:
+                continue
+            manager_addrs.append(manager_addr)
+            seen_manager_addrs.add(manager_addr)
+
+        for datacenter_id in target_dcs:
+            for manager_addr in self._datacenter_managers.get(datacenter_id, []):
+                if manager_addr in seen_manager_addrs:
+                    continue
+                manager_addrs.append(manager_addr)
+                seen_manager_addrs.add(manager_addr)
+
+        if not manager_addrs:
+            return
+
+        transfer = JobLeaderGateTransfer(
+            job_id=job_id,
+            new_gate_id=self._node_id.full,
+            new_gate_addr=(self._host, self._tcp_port),
+            fence_token=fence_token,
+            old_gate_id=old_gate_id,
+        )
+        await asyncio.gather(
+            *[
+                self._send_gate_job_leader_transfer_to_manager(manager_addr, transfer)
+                for manager_addr in manager_addrs
+            ]
+        )
+
+    async def _send_gate_job_leader_transfer_to_manager(
+        self,
+        manager_addr: tuple[str, int],
+        transfer: JobLeaderGateTransfer,
+    ) -> None:
+        """Send one gate-leader-transfer notification to a manager."""
+        try:
+            response, _clock_time = await self._send_tcp(
+                manager_addr,
+                "job_leader_gate_transfer",
+                transfer.dump(),
+                timeout=self.env.GATE_TCP_TIMEOUT_STANDARD,
+            )
+            if not response:
+                return
+            ack = JobLeaderGateTransferAck.load(response)
+            if ack.accepted:
+                return
+
+            await self._udp_logger.log(
+                ServerWarning(
+                    message=(
+                        f"Manager {manager_addr} rejected gate leader transfer "
+                        f"for job {transfer.job_id[:8]}..."
+                    ),
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+        except Exception as transfer_error:
+            await self._udp_logger.log(
+                ServerWarning(
+                    message=(
+                        f"Failed to notify manager {manager_addr} about gate leader "
+                        f"transfer for job {transfer.job_id[:8]}...: {transfer_error}"
+                    ),
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
 
     async def _handle_job_leader_failure(self, tcp_addr: tuple[str, int]) -> None:
         import sys as _sys
@@ -3398,12 +3552,19 @@ class GateServer(HealthAwareServer):
     # =========================================================================
 
     def _on_job_raft_leader(self, job_id: str) -> None:
-        """Called when this gate becomes the per-job Raft leader.
-
-        Schedules an async check for whether the current gate job
-        leader is dead and needs to be taken over.
-        """
-        self._task_runner.run(self._check_gate_raft_leader_takeover, job_id)
+        """Called when this gate becomes the per-job Raft leader."""
+        self._task_runner.run(
+            self._udp_logger.log,
+            ServerDebug(
+                message=(
+                    f"Ignoring per-job Raft leadership for gate job {job_id[:8]}... "
+                    "as a failover authority; SWIM leadership coordinates takeover"
+                ),
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            ),
+        )
 
     def _on_job_raft_lose_leader(self, job_id: str) -> None:
         """Called when this gate loses per-job Raft leadership."""
@@ -3418,72 +3579,32 @@ class GateServer(HealthAwareServer):
         )
 
     async def _check_gate_raft_leader_takeover(self, job_id: str) -> None:
-        """Check if gate job leadership takeover is needed after becoming Raft leader.
+        """Deprecated per-job Raft takeover hook.
 
-        When this gate becomes the per-job Raft leader, it checks if
-        the current gate job leader is dead. If so, it proposes a
-        leadership takeover through Raft consensus.
+        Gate job leadership is independent of SWIM cluster leadership during
+        steady state, but failover is coordinated only by the SWIM cluster
+        leader through the gate replica quorum-commit path.
         """
-        if self._raft is None:
-            return
-
-        leader_addr = self._job_leadership_tracker.get_leader_addr(job_id)
-        if leader_addr is None:
-            return
-
-        if leader_addr not in self._dead_gate_addrs:
-            return
-
-        old_leader_id = self._job_leadership_tracker.get_leader(job_id)
-
-        accepted = await self._raft.raft_job_manager.takeover_gate_leadership(job_id)
-        if not accepted:
-            return
-
-        await self._udp_logger.log(
-            ServerInfo(
-                message=(
-                    f"Raft leader takeover: assumed gate job leadership for {job_id[:8]}... "
-                    f"(previous gate leader {old_leader_id or 'unknown'} is dead)"
-                ),
-                node_host=self._host,
-                node_port=self._tcp_port,
-                node_id=self._node_id.short,
-            )
-        )
+        return
 
     async def _scan_for_orphaned_gate_jobs(self) -> None:
         """Scan for orphaned gate jobs from dead gate peers.
 
         Called when this gate becomes the SWIM cluster leader.
-        Proposes leadership takeover through Raft consensus for any
-        gate jobs whose leader is in the dead gate addresses set.
+        Marks jobs whose leader is in the dead gate-address set so the orphan
+        coordinator can quorum-commit the SWIM-leader takeover.
         """
-        if self._raft is None:
+        if self._orphan_job_coordinator is None:
             return
-
         all_leaderships = self._job_leadership_tracker.get_all_leaderships()
-        for job_id, leader_id, leader_addr, _fencing_token in all_leaderships:
+        dead_leader_addrs: set[tuple[str, int]] = set()
+        for _job_id, _leader_id, leader_addr, _fencing_token in all_leaderships:
             if leader_addr not in self._dead_gate_addrs:
                 continue
+            dead_leader_addrs.add(leader_addr)
 
-            await self._raft.consensus.create_job_raft(job_id)
-
-            accepted = await self._raft.raft_job_manager.takeover_gate_leadership(job_id)
-            if not accepted:
-                continue
-
-            await self._udp_logger.log(
-                ServerInfo(
-                    message=(
-                        f"Orphan scan: took over gate job leadership for {job_id[:8]}... "
-                        f"(previous leader {leader_id} is dead)"
-                    ),
-                    node_host=self._host,
-                    node_port=self._tcp_port,
-                    node_id=self._node_id.short,
-                )
-            )
+        for leader_addr in dead_leader_addrs:
+            self._orphan_job_coordinator.mark_jobs_orphaned_by_gate(leader_addr)
 
     def _on_manager_dead_for_dc(
         self,
@@ -3857,8 +3978,16 @@ class GateServer(HealthAwareServer):
     def _quorum_size(self) -> int:
         if self._leadership_coordinator:
             return self._leadership_coordinator.get_quorum_size()
-        total_gates = self._modular_state.get_active_peer_count() + 1
+        total_gates = self._configured_gate_count()
         return (total_gates // 2) + 1
+
+    def _configured_gate_count(self) -> int:
+        """Return the static gate cluster size used for quorum decisions."""
+        return max(
+            1,
+            self._modular_state.get_known_gate_count() + 1,
+            len(self._gate_peers) + 1,
+        )
 
     def _get_healthy_gates(self) -> list[GateInfo]:
         if self._peer_coordinator:
@@ -6097,10 +6226,7 @@ class GateServer(HealthAwareServer):
 
     async def _check_quorum_status(self) -> None:
         active_peer_count = self._modular_state.get_active_peer_count() + 1
-        known_gate_count = max(
-            self._modular_state.get_known_gate_count() + 1,
-            len(self._gate_peers) + 1,
-        )
+        known_gate_count = self._configured_gate_count()
         quorum_size = known_gate_count // 2 + 1
 
         if active_peer_count < quorum_size:
