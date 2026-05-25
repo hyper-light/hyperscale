@@ -3,7 +3,9 @@ Phase 3 leadership scenarios from ``docs/SCENARIOS.md`` §1.
 
 These cover leadership edges not exercised by the baseline kill/restart
 faults: stable-lease pre-vote rejection, flapping backoff, synthetic term
-exhaustion, and SWIM DC-leader vs per-job Raft-leader divergence.
+exhaustion, SWIM DC-leader vs per-job Raft-leader divergence, and the
+death-recovery rule that only the SWIM leader may take over a dead job
+leader.
 """
 
 import time
@@ -57,6 +59,25 @@ def _find_followers(managers: list[ServerHandle]) -> list[ServerHandle]:
     if not followers:
         raise AssertionError("no followers available")
     return followers
+
+
+def _manager_tcp_addr(manager: ServerHandle) -> tuple[str, int]:
+    return manager.host, manager.tcp_port
+
+
+def _manager_node_id(manager: ServerHandle) -> str:
+    return manager.instance._node_id.full
+
+
+def _all_managers_observe_job_leader(
+    managers: list[ServerHandle],
+    job_id: str,
+    leader_id: str,
+) -> bool:
+    return all(
+        manager.instance._manager_state.get_job_leader(job_id) == leader_id
+        for manager in managers
+    )
 
 
 def _followers_observe_stable_leader(managers: list[ServerHandle]) -> bool:
@@ -264,3 +285,92 @@ async def test_swim_leader_and_raft_job_leader_can_diverge_safely() -> None:
         assert heartbeat_time <= time.monotonic()
         assert swim_leader.instance._leader_election.state.is_lease_valid()
         assert dc_has_leader(managers)() is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.simulation
+async def test_dead_job_leader_failover_uses_swim_leader() -> None:
+    """A dead job leader transfers to the SWIM leader, not the per-job Raft leader.
+
+    Steady-state job leadership may diverge from SWIM leadership, but death
+    recovery is intentionally centralized through the SWIM cluster leader so a
+    busy manager tier does not split-brain job ownership under failover load.
+    """
+    spec = _l2_spec(base_port=34700)
+    async with ClusterHarness(
+        spec,
+        mode=ExecutionMode.REAL,
+        scenario_name="dead_job_leader_failover_uses_swim_leader",
+    ) as cluster:
+        managers = cluster.managers("main")
+        await wait_until(
+            dc_has_leader(managers),
+            timeout=60.0,
+            poll=0.5,
+            description="initial SWIM leader elected",
+        )
+
+        swim_leader = _find_leader(managers)
+        followers = _find_followers(managers)
+        failed_job_leader = followers[0]
+        raft_job_leader = followers[-1]
+        job_id = "synthetic-dead-job-leader"
+        failed_job_leader_id = _manager_node_id(failed_job_leader)
+        failed_job_leader_addr = _manager_tcp_addr(failed_job_leader)
+        swim_leader_id = _manager_node_id(swim_leader)
+        swim_leader_addr = _manager_tcp_addr(swim_leader)
+        original_fence_token = 7
+
+        for manager in managers:
+            manager.instance._leases.apply_job_leadership(
+                job_id=job_id,
+                leader_id=failed_job_leader_id,
+                leader_addr=failed_job_leader_addr,
+                fencing_token=original_fence_token,
+            )
+            manager.instance._manager_state.add_dead_manager(
+                failed_job_leader_addr,
+                time.monotonic(),
+            )
+
+        raft_token = await raft_job_leader.instance._raft_leadership_tracker.assume_leadership_async(
+            job_id,
+            metadata=1,
+            initial_token=original_fence_token + 10,
+        )
+        assert raft_token > original_fence_token
+
+        await raft_job_leader.instance._check_raft_leader_takeover(job_id)
+        await raft_job_leader.instance._handle_job_leader_failure(
+            failed_job_leader_addr
+        )
+
+        assert _all_managers_observe_job_leader(
+            managers,
+            job_id,
+            failed_job_leader_id,
+        )
+
+        await swim_leader.instance._handle_job_leader_failure(failed_job_leader_addr)
+
+        await wait_until(
+            lambda: _all_managers_observe_job_leader(
+                managers,
+                job_id,
+                swim_leader_id,
+            ),
+            timeout=10.0,
+            poll=0.2,
+            description="all managers observe SWIM-leader job takeover",
+            on_fail=lambda: cluster.dump_diagnostics(
+                reason="dead job leader did not transfer to SWIM leader"
+            ),
+        )
+
+        assert swim_leader.instance._manager_state.get_job_leader_addr(
+            job_id
+        ) == swim_leader_addr
+        assert (
+            swim_leader.instance._leases.get_fence_token(job_id)
+            > original_fence_token
+        )

@@ -10,9 +10,9 @@ manifest:
 
   * §1 ``Job-leadership transfer (gate tier, L3)`` — the gate that
     holds job leadership for an in-flight job dies; a peer gate takes
-    over via the ``GateOrphanJobCoordinator`` consistent-hash-ring
-    path, callback addresses are preserved, and the fence token
-    continuity invariant holds.
+    over via the SWIM cluster leader's quorum-committed
+    ``GateOrphanJobCoordinator`` path, callback addresses are
+    preserved, and the fence token continuity invariant holds.
 
 L3 spec mirrors ``tests/simulation/scenarios/l3_multi_dc/test_smoke.py``
 (3 gates + 2 DCs × (2 managers + 1 worker × 2 cores)). The longer
@@ -58,10 +58,10 @@ _WORKFLOW_DURATION_SECONDS = 30.0
 # GATE_ORPHAN_GRACE_PERIOD (10) + GATE_ORPHAN_CHECK_INTERVAL (2) +
 # SWIM death detection of the killed gate (~5-10s under default
 # Lifeguard bracket) + GATE_ORPHAN_GRACE_PERIOD (10s) +
-# GATE_ORPHAN_CHECK_INTERVAL (2s max wait until next scan tick) +
-# takeover_jitter_max (2s). Underestimating any of these forces
-# the test to fail before the orphan coordinator's takeover scan
-# has a chance to fire even on a healthy cluster.
+# GATE_ORPHAN_CHECK_INTERVAL (2s max wait until next scan tick) and
+# quorum-replication round trips. Underestimating any of these forces
+# the test to fail before the orphan coordinator's takeover scan has
+# a chance to fire even on a healthy cluster.
 _GATE_TAKEOVER_BUDGET_SECONDS = 30.0
 # Dispatch overhead headroom — the same shape we use for the worker-
 # death-timing tests: one workflow run, plus reassignment overhead.
@@ -195,6 +195,21 @@ def _find_owning_gate(
     return None
 
 
+def _find_gate_cluster_leader(
+    cluster: ClusterHarness,
+    exclude_node_id: str | None = None,
+):
+    """Return the live gate currently holding SWIM cluster leadership."""
+    for gate in cluster.gates:
+        if not gate.started:
+            continue
+        if exclude_node_id is not None and gate.node_id == exclude_node_id:
+            continue
+        if gate.instance.is_leader():
+            return gate
+    return None
+
+
 async def _wait_for_known_job_id(driver, timeout: float) -> str:
     """Block until the workload driver has registered a submitted job_id."""
     deadline = asyncio.get_event_loop().time() + timeout
@@ -276,8 +291,9 @@ async def test_l3_gate_dies_dc_routing_fails_over_with_test_stats() -> None:
 @pytest.mark.simulation
 async def test_l3_job_leadership_transfer_at_gate_tier() -> None:
     """Kill the gate that holds job leadership for an in-flight job;
-    a peer gate must take over via the orphan-job coordinator without
-    losing the callback address or fence-token continuity.
+    the surviving SWIM cluster leader must take over via the
+    orphan-job coordinator without losing the callback address or
+    fence-token continuity.
 
     SCENARIOS.md §1 ``Job-leadership transfer (gate tier, L3)``.
 
@@ -291,7 +307,7 @@ async def test_l3_job_leadership_transfer_at_gate_tier() -> None:
       4. Poll for a peer gate to assume leadership for the same
          ``job_id``. The orphan coordinator path runs:
          SWIM dead → orphan grace (10 s) → check interval (2 s) →
-         consistent-hash takeover with new fence token.
+         SWIM-leader quorum commit with a new fence token.
       5. ``wait_for_completion`` — completion callback must still
          route back to the original client through the new leader.
     """
@@ -329,22 +345,44 @@ async def test_l3_job_leadership_transfer_at_gate_tier() -> None:
             old_leader = owning_gate.instance._job_leadership_tracker.get_leader(
                 job_id
             )
+            old_fence_token = (
+                owning_gate.instance._job_leadership_tracker.get_fencing_token(
+                    job_id
+                )
+            )
 
             await cluster.faults.kill(owning_gate)
 
             await wait_until(
-                lambda: _find_owning_gate(
-                    cluster, job_id, exclude_node_id=old_owner_node_id
-                )
-                is not None,
+                lambda: (
+                    (
+                        new_owner := _find_owning_gate(
+                            cluster,
+                            job_id,
+                            exclude_node_id=old_owner_node_id,
+                        )
+                    )
+                    is not None
+                    and (
+                        cluster_leader := _find_gate_cluster_leader(
+                            cluster,
+                            exclude_node_id=old_owner_node_id,
+                        )
+                    )
+                    is not None
+                    and new_owner.node_id == cluster_leader.node_id
+                ),
                 timeout=_GATE_TAKEOVER_BUDGET_SECONDS,
                 poll=0.5,
                 description=(
-                    f"peer gate takes over leadership for job {job_id} "
-                    f"(old leader {old_leader})"
+                    f"SWIM leader gate takes over leadership for job {job_id} "
+                    f"(old job leader {old_leader})"
                 ),
                 on_fail=lambda: cluster.dump_diagnostics(
-                    reason="gate-tier job leadership never transferred"
+                    reason=(
+                        "gate-tier job leadership never transferred to "
+                        "the surviving SWIM leader"
+                    )
                 ),
             )
 
@@ -355,5 +393,18 @@ async def test_l3_job_leadership_transfer_at_gate_tier() -> None:
             assert new_owner.node_id != old_owner_node_id, (
                 "new owner has the same node_id as the killed gate"
             )
+            cluster_leader = _find_gate_cluster_leader(
+                cluster, exclude_node_id=old_owner_node_id
+            )
+            assert cluster_leader is not None, "no surviving gate SWIM leader"
+            assert new_owner.node_id == cluster_leader.node_id, (
+                "gate job leadership did not transfer to the SWIM cluster leader"
+            )
+            new_fence_token = (
+                new_owner.instance._job_leadership_tracker.get_fencing_token(
+                    job_id
+                )
+            )
+            assert new_fence_token > old_fence_token
 
             await driver.wait_for_completion()
