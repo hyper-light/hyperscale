@@ -27,9 +27,9 @@ Protocol summary:
      from the committed ``GateJobManager`` state) and returns
      ``GateJobReplicaAck(status=PREPARED)``.
   3. The leader waits for prepare-acks summing (with self) to >=
-     cluster quorum. On success it commits locally, then fires
-     ``GateJobReplicaCommit`` at acked peers (fire-and-forget after
-     quorum — the protocol invariant is already satisfied).
+     cluster quorum. On success it sends ``GateJobReplicaCommit`` to
+     prepared peers and waits for committed acks summing (with self)
+     to >= cluster quorum before the job can be accepted.
   4. On commit, a peer promotes the prepared replica into its
      ``GateJobManager`` (jobs, target_dcs, callbacks, fence tokens,
      workflow ids, submission, leadership tracker).
@@ -174,24 +174,31 @@ class GateJobReplicaAck(Message):
 
 @dataclass(slots=True)
 class GateJobReplicaFetchRequest(Message):
-    """Peer → peer: request a cached committed replica for ``job_id``.
+    """Peer → peer: request cached committed replicas.
 
     Used by the orphan coordinator's state-repair path: when a peer
     sees a job in its leadership tracker (from an earlier
     announcement) but the local ``GateJobManager`` has no state for
     it, the peer queries other gates for the committed replica before
     declaring the job unrecoverable.
+
+    ``leader_addr`` uses the same fetch path for the SWIM-leader repair
+    case where the leader knows a gate died but does not yet know every
+    job led by that gate locally.
     """
 
-    job_id: str
+    job_id: str | None = None
+    leader_addr: tuple[str, int] | None = None
 
 
 @dataclass(slots=True)
 class GateJobReplicaFetchResponse(Message):
-    """Peer → peer: cached committed replica or ``None``."""
+    """Peer → peer: cached committed replica payload."""
 
-    job_id: str
+    job_id: str | None = None
+    leader_addr: tuple[str, int] | None = None
     replica: GateJobReplica | None = None
+    replicas: list[GateJobReplica] = field(default_factory=list)
     found: bool = False
 
 

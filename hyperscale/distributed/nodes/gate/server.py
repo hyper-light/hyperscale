@@ -3353,15 +3353,52 @@ class GateServer(HealthAwareServer):
         if self._replication_coordinator is None:
             return False
         peer_addrs = list(self._modular_state.get_active_peers_list())
-        if not peer_addrs:
-            return False
-        replica = await self._replication_coordinator.fetch_committed_replica_from_peers(
-            job_id, peer_addrs
+        return await self._replication_coordinator.repair_committed_replica_from_peers(
+            job_id,
+            peer_addrs,
         )
-        if replica is None:
-            return False
-        await self._apply_committed_replica(replica)
-        return True
+
+    async def _repair_orphan_jobs_for_dead_gate(
+        self,
+        leader_addr: tuple[str, int],
+    ) -> list[str]:
+        """Fetch committed replicas for jobs led by a SWIM-dead gate."""
+        if self._replication_coordinator is None:
+            return []
+
+        peer_addrs = list(self._modular_state.get_active_peers_list())
+        return (
+            await self._replication_coordinator.repair_committed_replicas_for_leader_from_peers(
+                leader_addr,
+                peer_addrs,
+            )
+        )
+
+    async def _mark_confirmed_orphans_for_dead_gate(
+        self,
+        leader_addr: tuple[str, int],
+    ) -> list[str]:
+        """Mark and repair SWIM-confirmed orphans for a dead gate leader."""
+        if self._orphan_job_coordinator is None:
+            return []
+
+        orphaned_job_ids = (
+            self._orphan_job_coordinator.mark_jobs_confirmed_orphaned_by_gate(
+                leader_addr
+            )
+        )
+        if self.is_leader():
+            repaired_job_ids = await self._repair_orphan_jobs_for_dead_gate(
+                leader_addr
+            )
+            if repaired_job_ids:
+                orphaned_job_ids = (
+                    self._orphan_job_coordinator.mark_jobs_confirmed_orphaned_by_gate(
+                        leader_addr
+                    )
+                )
+
+        return orphaned_job_ids
 
     async def _commit_gate_job_leadership_takeover(self, job_id: str) -> int | None:
         """Quorum-commit a gate job leadership takeover by the SWIM leader."""
@@ -3511,22 +3548,17 @@ class GateServer(HealthAwareServer):
             f"has_coordinator={self._orphan_job_coordinator is not None}\n"
         )
         _sys.stderr.flush()
-        if self._orphan_job_coordinator:
-            orphaned_job_ids = (
-                self._orphan_job_coordinator.mark_jobs_confirmed_orphaned_by_gate(
-                    tcp_addr
-                )
+        orphaned_job_ids = await self._mark_confirmed_orphans_for_dead_gate(tcp_addr)
+        if orphaned_job_ids:
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerInfo(
+                    message=f"Marked {len(orphaned_job_ids)} jobs as orphaned from failed gate {tcp_addr}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                ),
             )
-            if orphaned_job_ids:
-                self._task_runner.run(
-                    self._udp_logger.log,
-                    ServerInfo(
-                        message=f"Marked {len(orphaned_job_ids)} jobs as orphaned from failed gate {tcp_addr}",
-                        node_host=self._host,
-                        node_port=self._tcp_port,
-                        node_id=self._node_id.short,
-                    ),
-                )
 
     def _on_gate_become_leader(self) -> None:
         """Called when this gate becomes the SWIM cluster leader."""
@@ -3614,9 +3646,7 @@ class GateServer(HealthAwareServer):
             dead_leader_addrs.add(leader_addr)
 
         for leader_addr in dead_leader_addrs:
-            self._orphan_job_coordinator.mark_jobs_confirmed_orphaned_by_gate(
-                leader_addr
-            )
+            await self._mark_confirmed_orphans_for_dead_gate(leader_addr)
 
     def _on_manager_dead_for_dc(
         self,
@@ -5970,6 +6000,8 @@ class GateServer(HealthAwareServer):
         self._modular_state.cleanup_job_progress_tracking(job_id)
         await self._modular_state.cleanup_job_update_state(job_id)
         self._modular_state.cleanup_cancellation(job_id)
+        if self._replication_coordinator is not None:
+            self._replication_coordinator.clear_for_job(job_id)
 
     async def _job_cleanup_loop(self) -> None:
         while self._running:
