@@ -76,7 +76,7 @@ async def test_worker_dies_mid_dispatch_before_ack() -> None:
         original_send_dispatch = dispatcher._send_dispatch
         fault_landed = False
 
-        async def kill_selected_worker_before_ack(
+        async def install_cancel_before_ack_on_selected_worker(
             worker_id: str,
             dispatch: WorkflowDispatch,
         ) -> bool:
@@ -91,12 +91,39 @@ async def test_worker_dies_mid_dispatch_before_ack() -> None:
                     None,
                 )
                 if selected_worker is not None:
-                    fault_landed = True
-                    await cluster.faults.kill(selected_worker)
+                    original_dispatch_handle = (
+                        selected_worker.instance._dispatch_handler.handle
+                    )
+
+                    async def cancel_before_ack(
+                        addr: tuple[str, int],
+                        data: bytes,
+                        clock_time: int,
+                    ) -> bytes:
+                        nonlocal fault_landed
+                        if not fault_landed:
+                            fault_landed = True
+                            if (
+                                selected_worker.instance._dispatch_handler.handle
+                                is cancel_before_ack
+                            ):
+                                selected_worker.instance._dispatch_handler.handle = (
+                                    original_dispatch_handle
+                                )
+                            await cluster.faults.kill(selected_worker)
+                            raise asyncio.CancelledError(
+                                "harness cancelled dispatch before ack"
+                            )
+
+                        return await original_dispatch_handle(addr, data, clock_time)
+
+                    selected_worker.instance._dispatch_handler.handle = (
+                        cancel_before_ack
+                    )
 
             return await original_send_dispatch(worker_id, dispatch)
 
-        dispatcher._send_dispatch = kill_selected_worker_before_ack
+        dispatcher._send_dispatch = install_cancel_before_ack_on_selected_worker
         async with cluster.workload(_workload(SimpleWorkflow, 45.0)) as driver:
             await driver.submit_and_wait()
 
@@ -238,19 +265,51 @@ async def test_worker_dies_post_execute_before_result_push() -> None:
         mode=ExecutionMode.REAL,
         scenario_name="worker_dies_post_execute_before_result_push",
     ) as cluster:
-        victim = cluster.workers("local")[0]
-        original_send_final = victim.instance._progress_reporter.send_final_result
+        manager = cluster.managers("local")[0]
+        dispatcher = manager.instance._workflow_dispatcher
+        original_send_dispatch = dispatcher._send_dispatch
         fault_landed = False
+        patched_worker_id: str | None = None
 
-        async def lose_result_before_send(**kwargs) -> None:
-            nonlocal fault_landed
-            if not fault_landed:
-                fault_landed = True
-                await cluster.faults.kill(victim)
-                return
-            await original_send_final(**kwargs)
+        async def install_result_drop_on_selected_worker(
+            worker_id: str,
+            dispatch: WorkflowDispatch,
+        ) -> bool:
+            nonlocal patched_worker_id, fault_landed
+            if patched_worker_id is None:
+                selected_worker = next(
+                    (
+                        worker
+                        for worker in cluster.workers("local")
+                        if worker.instance._node_id.full == worker_id
+                    ),
+                    None,
+                )
+                if selected_worker is not None:
+                    patched_worker_id = worker_id
+                    original_send_final = (
+                        selected_worker.instance._progress_reporter.send_final_result
+                    )
 
-        victim.instance._progress_reporter.send_final_result = lose_result_before_send
+                    async def lose_result_before_send(**kwargs) -> None:
+                        nonlocal fault_landed
+                        if not fault_landed:
+                            fault_landed = True
+                            selected_worker.instance._progress_reporter.send_final_result = (
+                                original_send_final
+                            )
+                            await cluster.faults.kill(selected_worker)
+                            return
+
+                        await original_send_final(**kwargs)
+
+                    selected_worker.instance._progress_reporter.send_final_result = (
+                        lose_result_before_send
+                    )
+
+            return await original_send_dispatch(worker_id, dispatch)
+
+        dispatcher._send_dispatch = install_result_drop_on_selected_worker
         async with cluster.workload(_workload(SimpleWorkflow, 60.0)) as driver:
             await driver.submit_and_wait()
 
