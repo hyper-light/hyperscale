@@ -1986,6 +1986,10 @@ class GateServer(HealthAwareServer):
                 callback = self._normalize_callback_addr(announcement.callback_addr)
                 if callback is not None:
                     self._record_job_callback(announcement.job_id, callback)
+                if self._orphan_job_coordinator is not None:
+                    self._orphan_job_coordinator.clear_orphaned_job(
+                        announcement.job_id
+                    )
 
                 self._task_runner.run(
                     self._udp_logger.log,
@@ -3508,8 +3512,10 @@ class GateServer(HealthAwareServer):
         )
         _sys.stderr.flush()
         if self._orphan_job_coordinator:
-            orphaned_job_ids = self._orphan_job_coordinator.mark_jobs_orphaned_by_gate(
-                tcp_addr
+            orphaned_job_ids = (
+                self._orphan_job_coordinator.mark_jobs_confirmed_orphaned_by_gate(
+                    tcp_addr
+                )
             )
             if orphaned_job_ids:
                 self._task_runner.run(
@@ -3534,6 +3540,10 @@ class GateServer(HealthAwareServer):
             ),
         )
         self._task_runner.run(self._scan_for_orphaned_gate_jobs)
+        if self._orphan_job_coordinator is not None:
+            self._task_runner.run(
+                self._orphan_job_coordinator.evaluate_confirmed_orphans
+            )
 
     def _on_gate_lose_leadership(self) -> None:
         """Called when this gate loses cluster leadership."""
@@ -3604,7 +3614,9 @@ class GateServer(HealthAwareServer):
             dead_leader_addrs.add(leader_addr)
 
         for leader_addr in dead_leader_addrs:
-            self._orphan_job_coordinator.mark_jobs_orphaned_by_gate(leader_addr)
+            self._orphan_job_coordinator.mark_jobs_confirmed_orphaned_by_gate(
+                leader_addr
+            )
 
     def _on_manager_dead_for_dc(
         self,

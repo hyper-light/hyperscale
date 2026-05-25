@@ -86,6 +86,7 @@ class GateOrphanJobCoordinator:
         "_orphan_timeout_seconds",
         "_takeover_jitter_min_seconds",
         "_takeover_jitter_max_seconds",
+        "_confirmed_orphaned_jobs",
         "_running",
         "_check_loop_task",
         "_lock",
@@ -158,6 +159,7 @@ class GateOrphanJobCoordinator:
         self._orphan_timeout_seconds = orphan_timeout_seconds
         self._takeover_jitter_min_seconds = takeover_jitter_min_seconds
         self._takeover_jitter_max_seconds = takeover_jitter_max_seconds
+        self._confirmed_orphaned_jobs: set[str] = set()
         self._running = False
         self._check_loop_task: asyncio.Task | None = None
         self._lock = asyncio.Lock()
@@ -234,6 +236,54 @@ class GateOrphanJobCoordinator:
         self._state.mark_leader_dead(failed_gate_addr)
 
         return orphaned_job_ids
+
+    def mark_jobs_confirmed_orphaned_by_gate(
+        self,
+        failed_gate_addr: tuple[str, int],
+    ) -> list[str]:
+        """Mark jobs orphaned by a SWIM-confirmed dead gate.
+
+        Confirmed SWIM death has already paid the failure-detection
+        bracket. These jobs are eligible for immediate evaluation by the
+        current SWIM leader; the periodic loop remains a reconciliation
+        fallback for non-leaders and leadership changes.
+        """
+        orphaned_job_ids = self.mark_jobs_orphaned_by_gate(failed_gate_addr)
+        for job_id in orphaned_job_ids:
+            self._confirmed_orphaned_jobs.add(job_id)
+
+        if orphaned_job_ids and self._is_current_cluster_leader():
+            self._task_runner.run(
+                self.evaluate_confirmed_orphans,
+                orphaned_job_ids,
+            )
+
+        return orphaned_job_ids
+
+    async def evaluate_confirmed_orphans(
+        self,
+        job_ids: list[str] | None = None,
+    ) -> None:
+        """Immediately evaluate SWIM-confirmed orphaned jobs."""
+        if not self._is_current_cluster_leader():
+            return
+
+        orphaned_jobs = self._state.get_orphaned_jobs()
+        candidate_job_ids = (
+            list(job_ids)
+            if job_ids is not None
+            else list(self._confirmed_orphaned_jobs)
+        )
+        for job_id in candidate_job_ids:
+            orphaned_at = orphaned_jobs.get(job_id)
+            if orphaned_at is None:
+                self._confirmed_orphaned_jobs.discard(job_id)
+                continue
+            await self._evaluate_orphan_takeover_with_trace(job_id, orphaned_at)
+
+    def clear_orphaned_job(self, job_id: str) -> None:
+        """Clear orphan tracking for a job after leadership is resolved."""
+        self._clear_orphaned_job(job_id)
 
     def on_lease_expired(self, lease: "JobLease") -> None:
         """
@@ -340,7 +390,10 @@ class GateOrphanJobCoordinator:
 
                 for job_id, orphaned_at in orphaned_jobs.items():
                     time_orphaned = now - orphaned_at
-                    if time_orphaned >= self._orphan_grace_period_seconds:
+                    if (
+                        job_id in self._confirmed_orphaned_jobs
+                        or time_orphaned >= self._orphan_grace_period_seconds
+                    ):
                         jobs_to_evaluate.append((job_id, orphaned_at))
 
                 if not jobs_to_evaluate:
@@ -431,11 +484,11 @@ class GateOrphanJobCoordinator:
             if not job:
                 time_orphaned = time.monotonic() - orphaned_at
                 if time_orphaned >= self._orphan_timeout_seconds:
-                    self._state.clear_orphaned_job(job_id)
+                    self._clear_orphaned_job(job_id)
                 return
 
         if job.status in self._terminal_statuses:
-            self._state.clear_orphaned_job(job_id)
+            self._clear_orphaned_job(job_id)
             return
 
         time_orphaned = time.monotonic() - orphaned_at
@@ -473,6 +526,11 @@ class GateOrphanJobCoordinator:
             return False
         return self._is_cluster_leader()
 
+    def _clear_orphaned_job(self, job_id: str) -> None:
+        """Clear all orphan evidence for ``job_id``."""
+        self._state.clear_orphaned_job(job_id)
+        self._confirmed_orphaned_jobs.discard(job_id)
+
     async def _fail_orphaned_job(
         self,
         job_id: str,
@@ -484,7 +542,7 @@ class GateOrphanJobCoordinator:
         if job.timestamp > 0:
             job.elapsed_seconds = time.monotonic() - job.timestamp
         self._job_manager.set_job(job_id, job)
-        self._state.clear_orphaned_job(job_id)
+        self._clear_orphaned_job(job_id)
 
         await self._logger.log(
             ServerWarning(
@@ -581,7 +639,7 @@ class GateOrphanJobCoordinator:
                 return
 
             if job.status in self._terminal_statuses:
-                self._state.clear_orphaned_job(job_id)
+                self._clear_orphaned_job(job_id)
                 _sys.stderr.write(
                     f"[ORPHAN-TAKEOVER-SKIP self={self._get_node_addr()} job={job_id[:10]}] "
                     f"reason=terminal status={job.status}\n"
@@ -630,7 +688,7 @@ class GateOrphanJobCoordinator:
                 )
                 _sys.stderr.flush()
                 return
-            self._state.clear_orphaned_job(job_id)
+            self._clear_orphaned_job(job_id)
             _sys.stderr.write(
                 f"[ORPHAN-TAKEOVER-COMMIT self={self._get_node_addr()} job={job_id[:10]}] "
                 f"fence_token={new_token} target_dcs={target_dc_count}\n"
@@ -742,6 +800,7 @@ class GateOrphanJobCoordinator:
 
         return {
             "total_orphaned": len(orphaned_jobs),
+            "confirmed_orphaned": len(self._confirmed_orphaned_jobs),
             "past_grace_period": past_grace_period,
             "grace_period_seconds": self._orphan_grace_period_seconds,
             "check_interval_seconds": self._orphan_check_interval_seconds,
