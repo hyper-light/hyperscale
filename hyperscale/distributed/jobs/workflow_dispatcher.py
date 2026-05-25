@@ -393,28 +393,6 @@ class WorkflowDispatcher:
         """
         async with self._dispatch_lock:
             ready = self._get_ready_workflows(job_id)
-            import sys as _sys
-            pendings_snapshot = [
-                p for p in self._pending.values() if p.job_id == job_id
-            ]
-            _sys.stderr.write(
-                f"[TRY-DISPATCH job={job_id[:10]}] "
-                f"ready={len(ready)} "
-                f"pending_total={len(pendings_snapshot)} "
-                f"pending_states=[\n"
-            )
-            for p in pendings_snapshot:
-                _sys.stderr.write(
-                    f"  wf={p.workflow_id[:10]} "
-                    f"attempts={p.dispatch_attempts}/{p.max_dispatch_attempts} "
-                    f"dispatched={p.dispatched} "
-                    f"dispatch_in_progress={p.dispatch_in_progress} "
-                    f"next_retry={p.next_retry_delay:.2f} "
-                    f"last_attempt={time.monotonic() - p.last_dispatch_attempt:.2f}s ago "
-                    f"ready_event_set={p.ready_event.is_set()}\n"
-                )
-            _sys.stderr.write("]\n")
-            _sys.stderr.flush()
             if not ready:
                 return 0
 
@@ -467,14 +445,6 @@ class WorkflowDispatcher:
 
             # Check if we've exceeded max retries
             if pending.dispatch_attempts >= pending.max_dispatch_attempts:
-                import sys as _sys
-                _sys.stderr.write(
-                    f"[DISPATCH-MAX-ATTEMPTS job={pending.job_id[:10]} "
-                    f"wf={pending.workflow_id[:10]}] "
-                    f"attempts={pending.dispatch_attempts} "
-                    f"max={pending.max_dispatch_attempts} skipping\n"
-                )
-                _sys.stderr.flush()
                 continue  # Will be cleaned up by check_timeouts or explicit failure handling
 
             # Check retry backoff - if we failed before, wait for backoff period
@@ -636,19 +606,6 @@ class WorkflowDispatcher:
             pending.dispatch_attempts += 1
             pending.last_dispatch_attempt = time.monotonic()
 
-            import sys as _sys
-            buckets = self._worker_pool.get_workers_by_health_bucket()
-            _sys.stderr.write(
-                f"[DISPATCH-ATTEMPT job={pending.job_id[:10]} "
-                f"wf={pending.workflow_id[:10]}] "
-                f"attempts={pending.dispatch_attempts}/"
-                f"{pending.max_dispatch_attempts} "
-                f"excluded={list(pending.excluded_worker_ids)} "
-                f"buckets={ {k: len(v) for k, v in buckets.items()} } "
-                f"healthy_ids={[w[:24] for w in buckets.get('HEALTHY', [])]}\n"
-            )
-            _sys.stderr.flush()
-
             # Allocate cores from worker pool. The allocation budget is
             # capped at 30s regardless of per-job timeout — this is a
             # backpressure cap, not the workflow execution deadline.
@@ -665,13 +622,6 @@ class WorkflowDispatcher:
                 timeout=allocator_budget,
                 excluded_worker_ids=pending.excluded_worker_ids,
             )
-
-            _sys.stderr.write(
-                f"[DISPATCH-ALLOC job={pending.job_id[:10]} "
-                f"wf={pending.workflow_id[:10]}] "
-                f"allocations={[(w[:24], c) for w, c in (allocations or [])]}\n"
-            )
-            _sys.stderr.flush()
 
             if not allocations:
                 self._apply_backoff(pending)
@@ -779,14 +729,6 @@ class WorkflowDispatcher:
                 pending,
                 dispatch_plans,
             )
-
-            import sys as _sys
-            _sys.stderr.write(
-                f"[DISPATCH-SEND-RESULT job={pending.job_id[:10]} "
-                f"wf={pending.workflow_id[:10]}] "
-                f"results={[(w[:24], success) for w, _c, _t, success in dispatch_results]}\n"
-            )
-            _sys.stderr.flush()
 
             for worker_id, worker_cores, sub_token, success in dispatch_results:
                 if success:
@@ -956,17 +898,8 @@ class WorkflowDispatcher:
         - Job cancelled/completed
         - Shutdown signaled
         """
-        import sys as _sys
-        _sys.stderr.write(f"[LOOP-ENTRY job={job_id[:10]}]\n")
-        _sys.stderr.flush()
-        iteration = 0
         try:
             while not self._shutting_down:
-                iteration += 1
-                _sys.stderr.write(
-                    f"[LOOP-ITER job={job_id[:10]}] iter={iteration}\n"
-                )
-                _sys.stderr.flush()
                 # Get all workflows still owned by this dispatch queue. A
                 # workflow with dispatch_in_progress=True is still active
                 # queue state even though it is not currently eligible for
@@ -1041,24 +974,12 @@ class WorkflowDispatcher:
                     asyncio.create_task(coro)
                     for coro in wait_coroutines
                 ]
-                import sys as _sys
-                _sys.stderr.write(
-                    f"[LOOP-WAIT job={job_id[:10]}] "
-                    f"ready_events={len(ready_events)} task_count={len(tasks)} "
-                    f"pending_total={len(job_pending)}\n"
-                )
-                _sys.stderr.flush()
                 try:
                     done, pending = await asyncio.wait(
                         tasks,
                         timeout=wait_timeout,
                         return_when=asyncio.FIRST_COMPLETED,
                     )
-                    _sys.stderr.write(
-                        f"[LOOP-WAKE job={job_id[:10]}] "
-                        f"done={len(done)} pending={len(pending)}\n"
-                    )
-                    _sys.stderr.flush()
 
                     # Cancel pending tasks and suppress CancelledError
                     for task in pending:
@@ -1087,25 +1008,13 @@ class WorkflowDispatcher:
                 await self.try_dispatch(job_id, submission)
 
         except asyncio.CancelledError:
-            import sys as _sys
-            _sys.stderr.write(f"[LOOP-EXIT-CANCELLED job={job_id[:10]}]\n")
-            _sys.stderr.flush()
             pass
         except Exception as e:
-            import sys as _sys, traceback as _tb
-            _sys.stderr.write(
-                f"[LOOP-EXIT-EXC job={job_id[:10]}] {type(e).__name__}: {e}\n"
-                f"{_tb.format_exc()}\n"
-            )
-            _sys.stderr.flush()
             await self._log_error(
                 f"Dispatch loop error for job {job_id}: {e}",
                 job_id=job_id,
             )
         finally:
-            import sys as _sys
-            _sys.stderr.write(f"[LOOP-EXIT job={job_id[:10]}]\n")
-            _sys.stderr.flush()
             # Clean up
             self._job_dispatch_tasks.pop(job_id, None)
 

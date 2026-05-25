@@ -2968,12 +2968,25 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                 for node in self.get_other_nodes(target)
             )
 
+        # Same orphan-coroutine guard as the join-dissemination path:
+        # cancellation arriving at ``await self.gather_with_errors``
+        # before the gather wraps the input coros into Tasks leaves
+        # the raw ``send_one`` coros unawaited when the frame unwinds.
+        # Close them explicitly on any exception so CLAUDE.md's
+        # no-orphan rule holds.
         if send_coros:
-            await self.gather_with_errors(
-                send_coros,
-                operation="leave_dissemination",
-                timeout=gather_timeout,
-            )
+            pending_coros = send_coros
+            try:
+                await self.gather_with_errors(
+                    pending_coros,
+                    operation="leave_dissemination",
+                    timeout=gather_timeout,
+                )
+            except BaseException:
+                for unwrapped in pending_coros:
+                    if asyncio.iscoroutine(unwrapped):
+                        unwrapped.close()
+                raise
 
     def queue_join_dissemination(
         self,
