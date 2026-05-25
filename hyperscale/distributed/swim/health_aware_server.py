@@ -3075,12 +3075,29 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                 for node in self.get_other_nodes(target)
             )
 
+        # asyncio delivers cancellation at await points. If the
+        # enclosing TaskRunner-managed task is cancelled at the
+        # ``await self.gather_with_errors(...)`` below — which happens
+        # during cluster teardown when the TaskRunner drains — the
+        # ``CancelledError`` is raised *before* ``gather_with_errors``
+        # enters and wraps the coros into Tasks. The raw ``send_one``
+        # coros in ``send_coros`` then unwind with the frame and get
+        # GC'd unawaited, surfacing the ``coroutine 'send_one' was
+        # never awaited`` warning per CLAUDE.md's no-orphan rule.
+        # Close any coros that the gather did not consume.
         if send_coros:
-            await self.gather_with_errors(
-                send_coros,
-                operation="join_dissemination",
-                timeout=gather_timeout,
-            )
+            pending_coros = send_coros
+            try:
+                await self.gather_with_errors(
+                    pending_coros,
+                    operation="join_dissemination",
+                    timeout=gather_timeout,
+                )
+            except BaseException:
+                for unwrapped in pending_coros:
+                    if asyncio.iscoroutine(unwrapped):
+                        unwrapped.close()
+                raise
 
     def queue_suspicion_update(
         self,
