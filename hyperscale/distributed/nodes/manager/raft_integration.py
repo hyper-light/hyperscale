@@ -44,6 +44,7 @@ class ManagerRaftIntegration:
         "_raft_job_manager",
         "_send_tcp",
         "_node_id",
+        "_node_addr",
         "_logger",
     )
 
@@ -55,12 +56,16 @@ class ManagerRaftIntegration:
         logger: "Logger",
         task_runner: "TaskRunner",
         send_tcp: Callable[..., Awaitable[bytes | Exception | None]],
+        node_addr: tuple[str, int] | None = None,
+        configured_cluster_size: int = 1,
+        proposal_timeout_seconds: float = 5.0,
         on_job_raft_leader: Callable[[str], None] | None = None,
         on_job_raft_lose_leader: Callable[[str], None] | None = None,
         manager_state: "ManagerState | None" = None,
         clock: "HybridLamportClock | None" = None,
     ) -> None:
         self._node_id = node_id
+        self._node_addr = node_addr if node_addr is not None else ("", 0)
         self._logger = logger
         self._send_tcp = send_tcp
 
@@ -71,6 +76,8 @@ class ManagerRaftIntegration:
             logger=logger,
             task_runner=task_runner,
             send_message=self._send_raft_message,
+            configured_cluster_size=configured_cluster_size,
+            proposal_timeout_seconds=proposal_timeout_seconds,
             on_become_leader=on_job_raft_leader,
             on_lose_leadership=on_job_raft_lose_leader,
             manager_state=manager_state,
@@ -81,6 +88,7 @@ class ManagerRaftIntegration:
             consensus=self._consensus,
             logger=logger,
             node_id=node_id,
+            node_addr=self._node_addr,
         )
 
     @property

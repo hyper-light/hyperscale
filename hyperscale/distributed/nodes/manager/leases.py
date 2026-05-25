@@ -103,20 +103,23 @@ class ManagerLeaseCoordinator:
         )
 
         if can_claim:
-            self._state._job_leaders[job_id] = self._node_id
-            self._state._job_leader_addrs[job_id] = tcp_addr
-
-            if job_id not in self._state._job_fencing_tokens:
-                self._state._job_fencing_tokens[job_id] = 1
-                self._state._job_layer_version[job_id] = 0
-            elif force_takeover:
-                self._state._job_fencing_tokens[job_id] += 1
+            current_token = self._state._job_fencing_tokens.get(job_id, 0)
+            next_token = current_token + 1 if force_takeover else max(1, current_token)
+            self._state.apply_job_leadership(
+                job_id=job_id,
+                leader_id=self._node_id,
+                leader_addr=tcp_addr,
+                fencing_token=next_token,
+            )
 
             action = "Took over" if force_takeover else "Claimed"
             self._task_runner.run(
                 self._logger.log,
                 ServerDebug(
-                    message=f"{action} leadership for job {job_id[:8]}... (fence={self._state._job_fencing_tokens.get(job_id, 0)})",
+                    message=(
+                        f"{action} leadership for job {job_id[:8]}... "
+                        f"(fence={self._state._job_fencing_tokens.get(job_id, 0)})"
+                    ),
                     node_host=self._config.host,
                     node_port=self._config.tcp_port,
                     node_id=self._node_id,
@@ -126,6 +129,29 @@ class ManagerLeaseCoordinator:
 
         return False
 
+    def apply_job_leadership(
+        self,
+        job_id: str,
+        leader_id: str,
+        leader_addr: tuple[str, int],
+        fencing_token: int,
+        layer_version: int | None = None,
+    ) -> bool:
+        """
+        Apply a leadership claim that already passed its authoritative protocol.
+
+        This is the common ingress for Raft apply, state sync, and leadership
+        announcements. It keeps ``ManagerState`` as the manager-visible source
+        of truth while preserving fencing-token ordering.
+        """
+        return self._state.apply_job_leadership(
+            job_id=job_id,
+            leader_id=leader_id,
+            leader_addr=leader_addr,
+            fencing_token=fencing_token,
+            layer_version=layer_version,
+        )
+
     def release_job_leadership(self, job_id: str) -> None:
         """
         Release leadership for a job.
@@ -133,9 +159,7 @@ class ManagerLeaseCoordinator:
         Args:
             job_id: Job ID to release
         """
-        if self._state._job_leaders.get(job_id) == self._node_id:
-            self._state._job_leaders.pop(job_id, None)
-            self._state._job_leader_addrs.pop(job_id, None)
+        if self._state.release_job_leadership_if_owner(job_id, self._node_id):
 
             self._task_runner.run(
                 self._logger.log,

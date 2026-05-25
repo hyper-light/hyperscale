@@ -252,23 +252,62 @@ class RaftStateMachine:
     # =========================================================================
 
     async def _apply_assume_leadership(self, command: RaftCommand, entry: RaftLogEntry) -> None:
-        """Apply ASSUME_JOB_LEADERSHIP: this node assumes leadership."""
-        self._leadership_tracker.assume_leadership(
+        """Apply ASSUME_JOB_LEADERSHIP as a deterministic leader value."""
+        if command.job_id is None:
+            return
+        if command.leader_node_id is None or command.leader_addr is None:
+            return
+
+        fencing_token = command.fencing_token or command.initial_token
+        self._leadership_tracker.apply_leadership(
             job_id=command.job_id,
+            leader_id=command.leader_node_id,
+            leader_addr=command.leader_addr,
+            fencing_token=fencing_token,
             metadata=command.metadata,
-            initial_token=command.initial_token,
         )
+        if self._manager_state is not None:
+            self._manager_state.apply_job_leadership(
+                job_id=command.job_id,
+                leader_id=command.leader_node_id,
+                leader_addr=command.leader_addr,
+                fencing_token=fencing_token,
+            )
 
     async def _apply_takeover_leadership(self, command: RaftCommand, entry: RaftLogEntry) -> None:
-        """Apply TAKEOVER_JOB_LEADERSHIP: this node takes over leadership."""
-        self._leadership_tracker.takeover_leadership(
+        """Apply TAKEOVER_JOB_LEADERSHIP as a deterministic leader value."""
+        if command.job_id is None:
+            return
+        if command.leader_node_id is None or command.leader_addr is None:
+            return
+        if command.fencing_token <= 0:
+            return
+
+        self._leadership_tracker.apply_leadership(
             job_id=command.job_id,
+            leader_id=command.leader_node_id,
+            leader_addr=command.leader_addr,
+            fencing_token=command.fencing_token,
             metadata=command.metadata,
         )
+        if self._manager_state is not None:
+            self._manager_state.apply_job_leadership(
+                job_id=command.job_id,
+                leader_id=command.leader_node_id,
+                leader_addr=command.leader_addr,
+                fencing_token=command.fencing_token,
+            )
 
     async def _apply_release_leadership(self, command: RaftCommand, entry: RaftLogEntry) -> None:
         """Apply RELEASE_JOB_LEADERSHIP: release leadership of a job."""
+        if command.job_id is None:
+            return
         self._leadership_tracker.release_leadership(job_id=command.job_id)
+        if self._manager_state is not None and command.leader_node_id is not None:
+            self._manager_state.release_job_leadership_if_owner(
+                command.job_id,
+                command.leader_node_id,
+            )
 
     # =========================================================================
     # Cancellation Handlers

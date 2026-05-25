@@ -704,6 +704,48 @@ class ManagerState:
     def iter_job_leader_addrs(self) -> list[tuple[str, tuple[str, int]]]:
         return list(self._job_leader_addrs.items())
 
+    def apply_job_leadership(
+        self,
+        job_id: str,
+        leader_id: str,
+        leader_addr: tuple[str, int],
+        fencing_token: int,
+        layer_version: int | None = None,
+    ) -> bool:
+        """Apply a fenced job-leadership claim to manager-visible state."""
+        current_token = self._job_fencing_tokens.get(job_id)
+        current_leader = self._job_leaders.get(job_id)
+        accepts_newer_token = current_token is None or fencing_token > current_token
+        accepts_idempotent_claim = (
+            current_token == fencing_token
+            and (current_leader is None or current_leader == leader_id)
+        )
+
+        if not accepts_newer_token and not accepts_idempotent_claim:
+            return False
+
+        self._job_leaders[job_id] = leader_id
+        self._job_leader_addrs[job_id] = leader_addr
+        self._job_fencing_tokens[job_id] = fencing_token
+
+        if layer_version is not None:
+            current_layer_version = self._job_layer_version.get(job_id, 0)
+            if layer_version > current_layer_version:
+                self._job_layer_version[job_id] = layer_version
+        else:
+            self._job_layer_version.setdefault(job_id, 0)
+
+        return True
+
+    def release_job_leadership_if_owner(self, job_id: str, leader_id: str) -> bool:
+        """Release job leadership only when ``leader_id`` still owns it."""
+        if self._job_leaders.get(job_id) != leader_id:
+            return False
+
+        self._job_leaders.pop(job_id, None)
+        self._job_leader_addrs.pop(job_id, None)
+        return True
+
     # =========================================================================
     # Worker Health Accessors (5 direct accesses each)
     # =========================================================================

@@ -257,9 +257,9 @@ def at_most_one_job_leader_per_job() -> SafetyInvariant:
         for handle in harness.all_handles():
             if handle.kind is not ServerKind.MANAGER:
                 continue
-            state = getattr(handle.instance, "_manager_state", None)
-            if state is None:
+            if not handle.started or harness.faults.is_killed(handle):
                 continue
+            state = handle.instance._manager_state
             for job_id, leader_id in state.iter_job_leaders():
                 existing_leader = leader_to_job.get(job_id)
                 if existing_leader is not None and existing_leader != leader_id:

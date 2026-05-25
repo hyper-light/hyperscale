@@ -469,6 +469,34 @@ class JobLeadershipTracker(Generic[T]):
 
         return False
 
+    def apply_leadership(
+        self,
+        job_id: str,
+        leader_id: str,
+        leader_addr: tuple[str, int],
+        fencing_token: int,
+        metadata: T | None = None,
+    ) -> bool:
+        """Apply a deterministic fenced leadership value."""
+        current = self._leaderships.get(job_id)
+        accepts_newer_token = current is None or fencing_token > current.fencing_token
+        accepts_idempotent_claim = (
+            current is not None
+            and fencing_token == current.fencing_token
+            and current.leader_id == leader_id
+        )
+        if not accepts_newer_token and not accepts_idempotent_claim:
+            return False
+
+        self._leaderships[job_id] = JobLeadership(
+            leader_id=leader_id,
+            leader_addr=leader_addr,
+            fencing_token=fencing_token,
+        )
+        if metadata is not None:
+            self._metadata[job_id] = metadata
+        return True
+
     def is_leader(self, job_id: str) -> bool:
         """Check if this node is the leader for the given job."""
         leadership = self._leaderships.get(job_id)

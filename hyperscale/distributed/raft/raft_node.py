@@ -65,9 +65,12 @@ class RaftNode:
         "_next_index",
         "_match_index",
         "_votes_received",
+        "_proposal_waiters",
+        "_proposal_timeout_seconds",
         "_election_deadline",
         "_last_heartbeat_sent",
         "_destroyed",
+        "_configured_cluster_size",
     )
 
     def __init__(
@@ -82,6 +85,8 @@ class RaftNode:
         on_lose_leadership: Callable[[], None] | None,
         logger: "Logger",
         clock: "HybridLamportClock | None" = None,
+        configured_cluster_size: int | None = None,
+        proposal_timeout_seconds: float = 5.0,
     ) -> None:
         self._job_id = job_id
         self._node_id = node_id
@@ -107,10 +112,18 @@ class RaftNode:
         self._next_index: dict[str, int] = {}
         self._match_index: dict[str, int] = {}
         self._votes_received: set[str] = set()
+        self._proposal_waiters: dict[int, asyncio.Future[bool]] = {}
+        self._proposal_timeout_seconds = proposal_timeout_seconds
 
         self._election_deadline = self._new_election_deadline()
         self._last_heartbeat_sent: float = 0.0
         self._destroyed = False
+        self._configured_cluster_size = max(
+            1,
+            configured_cluster_size
+            if configured_cluster_size is not None
+            else len(self._members) + 1,
+        )
 
     # =========================================================================
     # Properties
@@ -322,6 +335,12 @@ class RaftNode:
             if request.term < self._current_term:
                 return self._append_response(success=False, match_index=0)
 
+            # A same-term leader claim means this node's local leadership view
+            # is stale. Step down before applying the heartbeat so only one
+            # writer remains active for the term.
+            if self._role == "leader" and request.leader_id != self._node_id:
+                self._step_down(request.term)
+
             # Valid leader heartbeat -- reset election timer
             self._current_leader = request.leader_id
             self._election_deadline = self._new_election_deadline()
@@ -480,7 +499,24 @@ class RaftNode:
                 timestamp=entry_timestamp,
             )
             index = self._log.append(entry)
-            return True, index
+            waiter = asyncio.get_running_loop().create_future()
+            self._proposal_waiters[index] = waiter
+            self._advance_commit_index()
+
+        try:
+            committed = await asyncio.wait_for(
+                waiter,
+                timeout=self._proposal_timeout_seconds,
+            )
+            return committed, index
+        except asyncio.TimeoutError:
+            async with self._lock:
+                self._proposal_waiters.pop(index, None)
+            return False, index
+        except asyncio.CancelledError:
+            async with self._lock:
+                self._proposal_waiters.pop(index, None)
+            raise
 
     async def apply_committed_entries(self) -> int:
         """
@@ -498,6 +534,9 @@ class RaftNode:
                 self._last_applied += 1
                 if entry := self._log.get(self._last_applied):
                     await self._apply_command(entry)
+                    waiter = self._proposal_waiters.pop(self._last_applied, None)
+                    if waiter is not None and not waiter.done():
+                        waiter.set_result(True)
                     applied_count += 1
 
             return applied_count
@@ -545,6 +584,7 @@ class RaftNode:
         self._next_index.clear()
         self._match_index.clear()
         self._votes_received.clear()
+        self._fail_pending_proposals()
         self._members.clear()
         self._member_addrs.clear()
 
@@ -553,19 +593,27 @@ class RaftNode:
     # =========================================================================
 
     def _step_down(self, new_term: int) -> None:
-        """Step down to follower for a higher term."""
+        """Step down to follower for a newer or conflicting term."""
         was_leader = self._role == "leader"
         self._current_term = new_term
         self._role = "follower"
         self._voted_for = None
         self._election_deadline = self._new_election_deadline()
+        self._fail_pending_proposals()
 
         if was_leader and self._on_lose_leadership:
             self._on_lose_leadership()
 
     def _quorum_size(self) -> int:
-        """Majority quorum: (cluster_size // 2) + 1."""
-        return len(self._members) // 2 + 1
+        """Majority quorum from configured cluster size."""
+        return self._configured_cluster_size // 2 + 1
+
+    def _fail_pending_proposals(self) -> None:
+        """Fail all local proposals that have not reached committed apply."""
+        for waiter in self._proposal_waiters.values():
+            if not waiter.done():
+                waiter.set_result(False)
+        self._proposal_waiters.clear()
 
     @staticmethod
     def _new_election_deadline() -> float:

@@ -445,16 +445,19 @@ class ManagerServer(HealthAwareServer):
 
         # Raft consensus integration
         self._raft_leadership_tracker: JobLeadershipTracker[int] = JobLeadershipTracker(
-            node_id=self._node_id.short,
+            node_id=self._node_id.full,
             node_addr=(self._host, self._tcp_port),
         )
         self._raft = ManagerRaftIntegration(
-            node_id=self._node_id.short,
+            node_id=self._node_id.full,
             job_manager=self._job_manager,
             leadership_tracker=self._raft_leadership_tracker,
             logger=self._udp_logger,
             task_runner=self._task_runner,
             send_tcp=self._send_to_peer,
+            node_addr=(self._host, self._tcp_port),
+            configured_cluster_size=len(self._config.manager_udp_peers) + 1,
+            proposal_timeout_seconds=self._config.quorum_timeout_seconds,
             on_job_raft_leader=self._on_job_raft_leader,
             on_job_raft_lose_leader=self._on_job_raft_lose_leader,
             manager_state=self._manager_state,
@@ -1530,15 +1533,16 @@ class ManagerServer(HealthAwareServer):
 
         old_leader_id = self._manager_state.get_job_leader(job_id)
 
-        accepted = await self._raft.raft_job_manager.takeover_job_leadership(job_id)
+        next_fencing_token = max(2, self._leases.get_fence_token(job_id) + 1)
+        accepted = await self._raft.raft_job_manager.takeover_job_leadership(
+            job_id,
+            fencing_token=next_fencing_token,
+        )
         if not accepted:
             return
 
-        self._leases.claim_job_leadership(
-            job_id,
-            (self._host, self._tcp_port),
-            force_takeover=True,
-        )
+        if not self._is_job_leader(job_id):
+            return
 
         await self._notify_workers_job_leader_transfer(job_id, old_leader_id)
         # Phase F4: inherit AD-26 H7/H8 state from the previous
@@ -2140,15 +2144,12 @@ class ManagerServer(HealthAwareServer):
     async def _handle_job_leader_failure(self, failed_addr: tuple[str, int]) -> None:
         """Handle job leader manager failure.
 
-        The SWIM leader coordinates takeover by proposing leadership
-        changes through Raft consensus. If this node is also the
-        per-job Raft leader, the proposal succeeds immediately.
-        Otherwise, the per-job Raft leader handles it via the
-        on_become_leader callback.
+        Every manager that observes the failure may try the Raft proposal;
+        only the current per-job Raft leader can commit it. This keeps SWIM
+        cluster leadership out of the job-leadership safety path and avoids
+        missing takeover when the per-job Raft leader was already elected
+        before the failed manager was declared dead.
         """
-        if not self.is_leader():
-            return
-
         jobs_to_takeover = [
             job_id
             for job_id, leader_addr in self._manager_state.iter_job_leader_addrs()
@@ -2160,7 +2161,11 @@ class ManagerServer(HealthAwareServer):
 
             await self._raft.consensus.create_job_raft(job_id)
 
-            accepted = await self._raft.raft_job_manager.takeover_job_leadership(job_id)
+            next_fencing_token = max(2, self._leases.get_fence_token(job_id) + 1)
+            accepted = await self._raft.raft_job_manager.takeover_job_leadership(
+                job_id,
+                fencing_token=next_fencing_token,
+            )
             if not accepted:
                 await self._udp_logger.log(
                     ServerWarning(
@@ -2175,11 +2180,8 @@ class ManagerServer(HealthAwareServer):
                 )
                 continue
 
-            self._leases.claim_job_leadership(
-                job_id,
-                (self._host, self._tcp_port),
-                force_takeover=True,
-            )
+            if not self._is_job_leader(job_id):
+                continue
 
             await self._notify_workers_job_leader_transfer(job_id, old_leader_id)
             # Phase F4: inherit AD-26 H7/H8 state from the previous
@@ -3300,12 +3302,18 @@ class ManagerServer(HealthAwareServer):
                     sync_response = StateSyncResponse.load(response)
                     if sync_response.manager_state and sync_response.responder_ready:
                         peer_snapshot = sync_response.manager_state
-                        self._manager_state.update_job_leaders(
-                            peer_snapshot.job_leaders
-                        )
-                        self._manager_state.update_job_leader_addrs(
-                            peer_snapshot.job_leader_addrs
-                        )
+                        for job_id, fence_token in peer_snapshot.job_fence_tokens.items():
+                            leader_id = peer_snapshot.job_leaders.get(job_id)
+                            leader_addr = peer_snapshot.job_leader_addrs.get(job_id)
+                            if leader_id is None or leader_addr is None:
+                                continue
+                            self._leases.apply_job_leadership(
+                                job_id=job_id,
+                                leader_id=leader_id,
+                                leader_addr=tuple(leader_addr),
+                                fencing_token=fence_token,
+                                layer_version=peer_snapshot.job_layer_versions.get(job_id),
+                            )
 
             except Exception as error:
                 await self._udp_logger.log(
@@ -3339,15 +3347,16 @@ class ManagerServer(HealthAwareServer):
 
                 await self._raft.consensus.create_job_raft(job_id)
 
-                accepted = await self._raft.raft_job_manager.takeover_job_leadership(job_id)
+                next_fencing_token = max(2, self._leases.get_fence_token(job_id) + 1)
+                accepted = await self._raft.raft_job_manager.takeover_job_leadership(
+                    job_id,
+                    fencing_token=next_fencing_token,
+                )
                 if not accepted:
                     continue
 
-                self._leases.claim_job_leadership(
-                    job_id,
-                    (self._host, self._tcp_port),
-                    force_takeover=True,
-                )
+                if not self._is_job_leader(job_id):
+                    continue
 
                 await self._notify_workers_job_leader_transfer(
                     job_id, old_leader_id
@@ -7515,6 +7524,7 @@ class ManagerServer(HealthAwareServer):
                 tcp_addr=(self._host, self._tcp_port),
             )
             self._leases.initialize_job_context(submission.job_id)
+            await self._raft.consensus.create_job_raft(submission.job_id)
 
             # Store callbacks
             if submission.callback_addr:
@@ -7885,23 +7895,21 @@ class ManagerServer(HealthAwareServer):
         """Handle job leadership announcement from another manager."""
         try:
             announcement = JobLeadershipAnnouncement.load(data)
+            leader_addr = (announcement.leader_host, announcement.leader_tcp_port)
+            fencing_token = announcement.fence_token or 1
 
-            # Don't accept if we're already the leader
-            if self._is_job_leader(announcement.job_id):
+            accepted = self._leases.apply_job_leadership(
+                job_id=announcement.job_id,
+                leader_id=announcement.leader_id,
+                leader_addr=leader_addr,
+                fencing_token=fencing_token,
+            )
+            if not accepted:
                 return JobLeadershipAck(
                     job_id=announcement.job_id,
                     accepted=False,
                     responder_id=self._node_id.full,
                 ).dump()
-
-            # Record job leadership
-            self._manager_state.set_job_leader(
-                announcement.job_id, announcement.leader_id
-            )
-            self._manager_state.set_job_leader_addr(
-                announcement.job_id,
-                (announcement.leader_host, announcement.leader_tcp_port),
-            )
 
             # Replicate push-notification destinations from the
             # announcement so any subsequent leadership takeover on
@@ -7925,12 +7933,13 @@ class ManagerServer(HealthAwareServer):
             self._manager_state.get_or_create_job_context(announcement.job_id)
 
             self._manager_state.setdefault_job_layer_version(announcement.job_id, 0)
+            await self._raft.consensus.create_job_raft(announcement.job_id)
 
             # Track remote job
             await self._job_manager.track_remote_job(
                 job_id=announcement.job_id,
                 leader_node_id=announcement.leader_id,
-                leader_addr=(announcement.leader_host, announcement.leader_tcp_port),
+                leader_addr=leader_addr,
             )
 
             return JobLeadershipAck(
@@ -8255,6 +8264,7 @@ class ManagerServer(HealthAwareServer):
             leader_tcp_port=self._tcp_port,
             workflow_count=workflow_count,
             workflow_names=workflow_names,
+            fence_token=self._leases.get_fence_token(job_id),
             callback_addr=callback_addr,
             origin_gate_addr=origin_gate_addr,
         )

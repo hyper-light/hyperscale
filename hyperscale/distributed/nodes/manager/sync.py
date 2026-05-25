@@ -673,27 +673,22 @@ class ManagerStateSync:
 
         for job_id, fence_token in snapshot.job_fence_tokens.items():
             current_token = self._state._job_fencing_tokens.get(job_id, -1)
-            if fence_token > current_token:
-                previous_leader = self._state._job_leaders.get(job_id)
-                previous_addr = self._state._job_leader_addrs.get(job_id)
-                self._state._job_fencing_tokens[job_id] = fence_token
+            previous_leader = self._state._job_leaders.get(job_id)
+            previous_addr = self._state._job_leader_addrs.get(job_id)
+            leader_id = snapshot.job_leaders.get(job_id)
+            leader_addr = snapshot.job_leader_addrs.get(job_id)
+            leader_addr_tuple = self._normalize_job_leader_addr(leader_addr)
+            if leader_id is None or leader_addr_tuple is None:
+                continue
 
-                leader_id = snapshot.job_leaders.get(job_id)
-                if leader_id:
-                    self._state._job_leaders[job_id] = leader_id
-
-                leader_addr = snapshot.job_leader_addrs.get(job_id)
-                leader_addr_tuple = self._normalize_job_leader_addr(leader_addr)
-                if leader_addr_tuple is not None:
-                    self._state._job_leader_addrs[job_id] = leader_addr_tuple
-
-                incoming_layer_version = snapshot.job_layer_versions.get(job_id)
-                if incoming_layer_version is not None:
-                    current_layer_version = self._state._job_layer_version.get(
-                        job_id, 0
-                    )
-                    if incoming_layer_version > current_layer_version:
-                        self._state._job_layer_version[job_id] = incoming_layer_version
+            accepted = self._state.apply_job_leadership(
+                job_id=job_id,
+                leader_id=leader_id,
+                leader_addr=leader_addr_tuple,
+                fencing_token=fence_token,
+                layer_version=snapshot.job_layer_versions.get(job_id),
+            )
+            if accepted:
 
                 self._task_runner.run(
                     self._logger.log,

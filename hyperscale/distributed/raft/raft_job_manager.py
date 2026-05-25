@@ -39,6 +39,7 @@ class RaftJobManager:
         "_consensus",
         "_logger",
         "_node_id",
+        "_node_addr",
     )
 
     def __init__(
@@ -46,10 +47,12 @@ class RaftJobManager:
         consensus: "RaftConsensus",
         logger: "Logger",
         node_id: str,
+        node_addr: tuple[str, int],
     ) -> None:
         self._consensus = consensus
         self._logger = logger
         self._node_id = node_id
+        self._node_addr = node_addr
 
     # =========================================================================
     # Internal Helper
@@ -289,20 +292,27 @@ class RaftJobManager:
         return await self._propose(job_id, RaftCommand(
             command_type=RaftCommandType.ASSUME_JOB_LEADERSHIP,
             job_id=job_id,
+            leader_node_id=self._node_id,
+            leader_addr=self._node_addr,
             metadata=metadata,
             initial_token=initial_token,
+            fencing_token=initial_token,
         ))
 
     async def takeover_job_leadership(
         self,
         job_id: str,
         metadata: Any = None,
+        fencing_token: int = 0,
     ) -> bool:
         """Propose TAKEOVER_JOB_LEADERSHIP through Raft."""
         return await self._propose(job_id, RaftCommand(
             command_type=RaftCommandType.TAKEOVER_JOB_LEADERSHIP,
             job_id=job_id,
+            leader_node_id=self._node_id,
+            leader_addr=self._node_addr,
             metadata=metadata,
+            fencing_token=fencing_token,
         ))
 
     async def release_job_leadership(self, job_id: str) -> bool:
@@ -310,6 +320,7 @@ class RaftJobManager:
         return await self._propose(job_id, RaftCommand(
             command_type=RaftCommandType.RELEASE_JOB_LEADERSHIP,
             job_id=job_id,
+            leader_node_id=self._node_id,
         ))
 
     # =========================================================================
