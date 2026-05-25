@@ -253,6 +253,20 @@ class ManagerRegistry:
         Args:
             gate_info: Gate information
         """
+        tcp_addr = (gate_info.tcp_host, gate_info.tcp_port)
+        udp_addr = (gate_info.udp_host, gate_info.udp_port)
+        stale_gate_ids = [
+            gate_id
+            for gate_id, known_gate in self._state._known_gates.items()
+            if gate_id != gate_info.node_id
+            and (
+                (known_gate.tcp_host, known_gate.tcp_port) == tcp_addr
+                or (known_gate.udp_host, known_gate.udp_port) == udp_addr
+            )
+        ]
+        for stale_gate_id in stale_gate_ids:
+            self.unregister_gate(stale_gate_id)
+
         self._state._known_gates[gate_info.node_id] = gate_info
         self._state._healthy_gate_ids.add(gate_info.node_id)
 

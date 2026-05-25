@@ -544,6 +544,7 @@ class GateRegistrationRequest(Message):
     is_leader: bool  # Whether this gate is the leader
     term: int  # Current leadership term
     state: str  # GateState value
+    datacenter: str = "global"  # Gate's home datacenter
     cluster_id: str = "hyperscale"  # Cluster identifier for isolation
     environment_id: str = "default"  # Environment identifier for isolation
     active_jobs: int = 0  # Number of active jobs

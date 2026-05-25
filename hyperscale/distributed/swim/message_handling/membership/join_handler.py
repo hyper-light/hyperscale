@@ -103,21 +103,35 @@ class JoinHandler(BaseHandler):
             if is_rejoin and incarnation_tracker.is_potential_zombie(
                 target, claimed_incarnation
             ):
-                required_incarnation = (
-                    incarnation_tracker.get_required_rejoin_incarnation(target)
+                authorized_rejoin_incarnation = (
+                    await self._server.authorize_rejoin_reset(
+                        target,
+                        role,
+                        source_addr,
+                    )
                 )
-                self._server.increment_metric("joins_rejected_zombie")
-                self._server.audit_log.record(
-                    AuditEventType.NODE_REJOIN,
-                    node=target,
-                    source=source_addr,
-                    extra={
-                        "rejected": True,
-                        "reason": "potential_zombie",
-                        "required_incarnation": required_incarnation,
-                    },
-                )
-                return self._nack(b"zombie_rejected")
+                if authorized_rejoin_incarnation is not None:
+                    sent_incarnation = max(
+                        sent_incarnation or 0,
+                        authorized_rejoin_incarnation,
+                    )
+                    claimed_incarnation = sent_incarnation
+                else:
+                    required_incarnation = (
+                        incarnation_tracker.get_required_rejoin_incarnation(target)
+                    )
+                    self._server.increment_metric("joins_rejected_zombie")
+                    self._server.audit_log.record(
+                        AuditEventType.NODE_REJOIN,
+                        node=target,
+                        source=source_addr,
+                        extra={
+                            "rejected": True,
+                            "reason": "potential_zombie",
+                            "required_incarnation": required_incarnation,
+                        },
+                    )
+                    return self._nack(b"zombie_rejected")
 
             # SWIM canonical refutation contract: incarnations are owned
             # by the node they identify. The receiver MUST NOT synthesize

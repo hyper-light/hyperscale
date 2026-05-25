@@ -87,6 +87,15 @@ class ServerAdapter:
         """Record a peer's role on the underlying server."""
         self._server.record_peer_role(peer, role)
 
+    async def authorize_rejoin_reset(
+        self,
+        target: tuple[str, int],
+        role: str | None,
+        source_addr: tuple[str, int],
+    ) -> int | None:
+        """Delegate receiver-specific authoritative rejoin validation."""
+        return await self._server.authorize_rejoin_reset(target, role, source_addr)
+
     # === Node State ===
 
     async def update_node_state(

@@ -92,6 +92,15 @@ class ServerInterface(Protocol):
         """Return the registered node identity currently bound to ``addr``."""
         ...
 
+    async def authorize_rejoin_reset(
+        self,
+        target: tuple[str, int],
+        role: str | None,
+        source_addr: tuple[str, int],
+    ) -> int | None:
+        """Return a receiver-authorized rejoin incarnation for ``target`` if valid."""
+        ...
+
     # === Node State ===
 
     async def update_node_state(

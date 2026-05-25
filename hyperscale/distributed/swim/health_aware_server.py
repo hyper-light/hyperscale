@@ -1153,6 +1153,21 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
 
         return rejoin_incarnation
 
+    async def authorize_rejoin_reset(
+        self,
+        target: tuple[str, int],
+        role: str | None,
+        source_addr: tuple[str, int],
+    ) -> int | None:
+        """Authorize a receiver-side reset for a role-specific rejoin signal.
+
+        Most roles use an out-of-band TCP registration path and therefore
+        return ``None`` here. Roles without peer TCP registration can
+        override this to verify a first-party JOIN before clearing stale
+        death state.
+        """
+        return None
+
     # =========================================================================
     # Hierarchical Failure Detection
     # =========================================================================

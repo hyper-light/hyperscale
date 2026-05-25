@@ -6810,19 +6810,52 @@ class ManagerServer(HealthAwareServer):
                 tcp_port=registration.tcp_port,
                 udp_host=registration.udp_host,
                 udp_port=registration.udp_port,
+                datacenter=getattr(registration, "datacenter", "global"),
+                is_leader=registration.is_leader,
             )
-
-            self._registry.register_gate(gate_info)
 
             # Track gate addresses
             gate_tcp_addr = (registration.tcp_host, registration.tcp_port)
             gate_udp_addr = (registration.udp_host, registration.udp_port)
+            stale_gate_ids = [
+                gate_id
+                for gate_id, known_gate in self._manager_state.iter_known_gates()
+                if gate_id != registration.node_id
+                and (
+                    (known_gate.tcp_host, known_gate.tcp_port) == gate_tcp_addr
+                    or (known_gate.udp_host, known_gate.udp_port) == gate_udp_addr
+                )
+            ]
+            gate_node_state = self._incarnation_tracker.get_node_state(gate_udp_addr)
+            requires_rejoin_reset = (
+                bool(stale_gate_ids)
+                or (
+                    gate_node_state is not None
+                    and gate_node_state.status in (b"SUSPECT", b"DEAD")
+                )
+                or self._incarnation_tracker.get_required_rejoin_incarnation(
+                    gate_udp_addr
+                )
+                > 0
+                or self._manager_state.get_gate_unhealthy_since(registration.node_id)
+                is not None
+            )
+
+            self._registry.register_gate(gate_info)
             self._manager_state.set_gate_udp_to_tcp_mapping(
                 gate_udp_addr, gate_tcp_addr
             )
 
             # Add to SWIM probing
-            await self.add_unconfirmed_peer(gate_udp_addr)
+            if requires_rejoin_reset:
+                await self.reset_peer_for_rejoin(gate_udp_addr)
+                self._task_runner.run(
+                    self._handle_gate_peer_recovery,
+                    gate_udp_addr,
+                    gate_tcp_addr,
+                )
+            else:
+                await self.add_unconfirmed_peer(gate_udp_addr)
             self._probe_scheduler.add_member(gate_udp_addr)
             # Explicit registration handshake — see ``manager_peer_register``.
             self.register_peer(gate_udp_addr)

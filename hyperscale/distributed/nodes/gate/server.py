@@ -56,6 +56,7 @@ from hyperscale.distributed.swim.health import (
 from hyperscale.distributed.models import (
     GateInfo,
     GateState,
+    NodeRole,
     GateHeartbeat,
     GateRegistrationRequest,
     AggregatedJobStats,
@@ -109,6 +110,8 @@ from hyperscale.distributed.models import (
     JobLeaderTransfer,
     JobFinalStatus,
     WorkflowProgress,
+    PingRequest,
+    GatePingResponse,
 )
 from hyperscale.distributed.models.coordinates import NetworkCoordinate
 from hyperscale.distributed.swim.core import (
@@ -2993,6 +2996,152 @@ class GateServer(HealthAwareServer):
         """Get or create lock for a peer."""
         return self._modular_state.get_or_create_peer_lock_sync(peer_addr)
 
+    def _build_gate_info_from_ping(
+        self,
+        udp_addr: tuple[str, int],
+        response: GatePingResponse,
+    ) -> GateInfo:
+        """Build gate identity from a verified TCP ping response."""
+        return GateInfo(
+            node_id=response.gate_id,
+            tcp_host=response.host,
+            tcp_port=response.port,
+            udp_host=udp_addr[0],
+            udp_port=udp_addr[1],
+            datacenter=response.datacenter,
+            is_leader=response.is_leader,
+        )
+
+    async def _verify_gate_peer_rejoin(
+        self,
+        udp_addr: tuple[str, int],
+        tcp_addr: tuple[str, int],
+    ) -> GateInfo | None:
+        """Verify a configured gate peer is live at ``tcp_addr``."""
+        request_id = f"{self._node_id.full}:gate-rejoin:{time.monotonic_ns()}"
+        request = PingRequest(request_id=request_id)
+        try:
+            response, _clock = await self._send_tcp(
+                tcp_addr,
+                "receive_gate_ping",
+                request.dump(),
+                timeout=self._tcp_timeout_short,
+            )
+            if not response or response == b"error" or isinstance(response, Exception):
+                return None
+
+            parsed = GatePingResponse.load(response)
+            if parsed.request_id != request_id:
+                return None
+            if (parsed.host, parsed.port) != tcp_addr:
+                return None
+            if parsed.gate_id == self._node_id.full:
+                return None
+
+            return self._build_gate_info_from_ping(udp_addr, parsed)
+
+        except Exception as error:
+            await self._udp_logger.log(
+                ServerDebug(
+                    message=f"Gate peer rejoin verification failed for {tcp_addr}: {error}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            return None
+
+    async def authorize_rejoin_reset(
+        self,
+        target: tuple[str, int],
+        role: str | None,
+        source_addr: tuple[str, int],
+    ) -> int | None:
+        """Authorize configured gate-peer JOINs that prove liveness over TCP."""
+        if role != NodeRole.GATE.value:
+            return None
+        if source_addr != target:
+            return None
+        if target not in self._gate_udp_peers:
+            return None
+
+        tcp_addr = self._modular_state.get_tcp_addr_for_udp(target)
+        if tcp_addr is None:
+            return None
+
+        gate_info = await self._verify_gate_peer_rejoin(target, tcp_addr)
+        if gate_info is None:
+            return None
+
+        await self._ingest_gate_peer_info(gate_info)
+        return await self.reset_peer_for_rejoin(target)
+
+    def _get_registered_node_id_for_addr(self, addr: tuple[str, int]) -> str | None:
+        """Return the gate identity currently registered at ``addr``."""
+        if heartbeat := self._modular_state.get_gate_peer_heartbeat(addr):
+            return heartbeat.node_id
+
+        tcp_addr = self._modular_state.get_tcp_addr_for_udp(addr)
+        for gate_id, gate_info in self._modular_state.iter_known_gates():
+            gate_tcp_addr = (gate_info.tcp_host, gate_info.tcp_port)
+            gate_udp_addr = (gate_info.udp_host, gate_info.udp_port)
+            if addr == gate_udp_addr or addr == gate_tcp_addr or tcp_addr == gate_tcp_addr:
+                return gate_id
+
+        return None
+
+    async def _ingest_gate_peer_info(
+        self,
+        gate_info: GateInfo,
+        heartbeat: GateHeartbeat | None = None,
+    ) -> None:
+        """Apply gate peer identity while removing stale same-address IDs."""
+        if gate_info.node_id == self._node_id.full:
+            return
+
+        tcp_addr = (gate_info.tcp_host, gate_info.tcp_port)
+        udp_addr = (gate_info.udp_host, gate_info.udp_port)
+        stale_gate_ids: set[str] = set()
+
+        existing_heartbeat = self._modular_state.get_gate_peer_heartbeat(udp_addr)
+        if existing_heartbeat and existing_heartbeat.node_id != gate_info.node_id:
+            stale_gate_ids.add(existing_heartbeat.node_id)
+
+        for known_gate_id, known_gate in list(self._modular_state.iter_known_gates()):
+            if known_gate_id == gate_info.node_id:
+                continue
+            known_tcp_addr = (known_gate.tcp_host, known_gate.tcp_port)
+            known_udp_addr = (known_gate.udp_host, known_gate.udp_port)
+            if known_tcp_addr == tcp_addr or known_udp_addr == udp_addr:
+                stale_gate_ids.add(known_gate_id)
+
+        for stale_gate_id in stale_gate_ids:
+            self._modular_state.remove_known_gate(stale_gate_id)
+            self._modular_state._gate_peer_health.pop(stale_gate_id, None)
+            await self._versioned_clock.remove_entity(stale_gate_id)
+            await self._job_hash_ring.remove_node(stale_gate_id)
+            self._job_forwarding_tracker.unregister_peer(stale_gate_id)
+
+        self._modular_state.set_udp_to_tcp_mapping(udp_addr, tcp_addr)
+        self._modular_state.add_known_gate(gate_info.node_id, gate_info)
+        self._modular_state.mark_peer_healthy(tcp_addr)
+        self._dead_gate_addrs.discard(tcp_addr)
+        self.record_peer_role(udp_addr, NodeRole.GATE.value)
+
+        if heartbeat is not None:
+            self._modular_state.set_gate_peer_heartbeat(udp_addr, heartbeat)
+
+        await self._job_hash_ring.add_node(
+            node_id=gate_info.node_id,
+            tcp_host=gate_info.tcp_host,
+            tcp_port=gate_info.tcp_port,
+        )
+        self._job_forwarding_tracker.register_peer(
+            gate_id=gate_info.node_id,
+            tcp_host=gate_info.tcp_host,
+            tcp_port=gate_info.tcp_port,
+        )
+
     def _on_peer_confirmed(self, peer: tuple[str, int]) -> None:
         """Handle peer confirmation via SWIM (AD-29)."""
         tcp_addr = self._modular_state.get_tcp_addr_for_udp(peer)
@@ -3430,14 +3579,19 @@ class GateServer(HealthAwareServer):
         udp_addr: tuple[str, int],
     ) -> None:
         """Handle gate peer heartbeat from SWIM."""
-        self._modular_state.set_gate_peer_heartbeat(udp_addr, heartbeat)
-
         if heartbeat.node_id and heartbeat.tcp_host and heartbeat.tcp_port:
-            await self._job_hash_ring.add_node(
+            gate_info = GateInfo(
                 node_id=heartbeat.node_id,
                 tcp_host=heartbeat.tcp_host,
                 tcp_port=heartbeat.tcp_port,
+                udp_host=udp_addr[0],
+                udp_port=udp_addr[1],
+                datacenter=heartbeat.datacenter,
+                is_leader=heartbeat.is_leader,
             )
+            await self._ingest_gate_peer_info(gate_info, heartbeat)
+        else:
+            self._modular_state.set_gate_peer_heartbeat(udp_addr, heartbeat)
 
         # AD-19 addendum (Phase D): peer gates report their LHM in
         # GateHeartbeat. Feed it into cross_dc_correlation so a
@@ -3463,9 +3617,20 @@ class GateServer(HealthAwareServer):
                 )
         return result
 
-    def _get_known_gates_for_piggyback(self) -> list[GateInfo]:
+    def _get_known_gates_for_piggyback(self) -> dict[str, tuple[str, int, str, int]]:
         """Get known gates for SWIM piggyback."""
-        return self._modular_state.get_all_known_gates()
+        if self._peer_coordinator:
+            return self._peer_coordinator.get_known_gates_for_piggyback()
+
+        return {
+            gate_id: (
+                gate_info.tcp_host,
+                gate_info.tcp_port,
+                gate_info.udp_host,
+                gate_info.udp_port,
+            )
+            for gate_id, gate_info in self._modular_state.iter_known_gates()
+        }
 
     def _get_job_leaderships_for_piggyback(
         self,
@@ -5546,6 +5711,7 @@ class GateServer(HealthAwareServer):
                         is_leader=self.is_leader(),
                         term=self._leader_election.state.current_term,
                         state=self._gate_state.value,
+                        datacenter=self._node_id.datacenter,
                         cluster_id=self.env.CLUSTER_ID,
                         environment_id=self.env.ENVIRONMENT_ID,
                         active_jobs=self._job_manager.job_count(),
