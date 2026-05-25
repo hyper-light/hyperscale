@@ -608,6 +608,7 @@ class ManagerServer(HealthAwareServer):
         self._job_cleanup_task: asyncio.Task | None = None
         self._unified_timeout_task: asyncio.Task | None = None
         self._deadline_enforcement_task: asyncio.Task | None = None
+        self._manager_peer_registration_sync_task: asyncio.Task | None = None
         self._peer_job_state_sync_task: asyncio.Task | None = None
         self._resource_sample_task: asyncio.Task | None = None
 
@@ -978,7 +979,9 @@ class ManagerServer(HealthAwareServer):
             self._job_cleanup_task,
             self._unified_timeout_task,
             self._deadline_enforcement_task,
+            self._manager_peer_registration_sync_task,
             self._peer_job_state_sync_task,
+            self._resource_sample_task,
         ]
 
     def _start_background_tasks(self) -> None:
@@ -1014,6 +1017,10 @@ class ManagerServer(HealthAwareServer):
         )
         self._deadline_enforcement_task = self._create_background_task(
             self._deadline_enforcement_loop(), "deadline_enforcement"
+        )
+        self._manager_peer_registration_sync_task = self._create_background_task(
+            self._manager_peer_registration_sync_loop(),
+            "manager_peer_registration_sync",
         )
         self._peer_job_state_sync_task = self._create_background_task(
             self._peer_job_state_sync_loop(), "peer_job_state_sync"
@@ -1223,7 +1230,80 @@ class ManagerServer(HealthAwareServer):
                     )
                 )
 
-    async def _register_with_manager(self, manager_addr: tuple[str, int]) -> bool:
+    def _manager_peer_registration_targets(self) -> list[tuple[str, int]]:
+        """Return deduplicated manager TCP addrs for registration reconciliation."""
+        local_addr = (self._host, self._tcp_port)
+        target_addrs: list[tuple[str, int]] = []
+
+        for manager_addr in self._seed_managers:
+            if manager_addr != local_addr:
+                target_addrs.append(manager_addr)
+
+        for peer_info in self._manager_state.get_known_manager_peer_values():
+            manager_addr = (peer_info.tcp_host, peer_info.tcp_port)
+            if manager_addr != local_addr:
+                target_addrs.append(manager_addr)
+
+        return list(dict.fromkeys(target_addrs))
+
+    async def _sync_manager_peer_registrations(self) -> None:
+        """Reconcile manager peer registration against every known peer addr."""
+        manager_addrs = self._manager_peer_registration_targets()
+        if not manager_addrs:
+            return
+
+        await asyncio.gather(
+            *(
+                self._register_with_manager_under_recovery_limit(
+                    manager_addr,
+                    log_transient_errors=False,
+                )
+                for manager_addr in manager_addrs
+            )
+        )
+
+    async def _register_with_manager_under_recovery_limit(
+        self,
+        manager_addr: tuple[str, int],
+        *,
+        log_transient_errors: bool,
+    ) -> bool:
+        """Register with a manager peer under the recovery concurrency cap."""
+        async with self._recovery_semaphore:
+            return await self._register_with_manager(
+                manager_addr,
+                log_transient_errors=log_transient_errors,
+            )
+
+    async def _manager_peer_registration_sync_loop(self) -> None:
+        """Periodically re-run manager peer registration for missed rejoins."""
+        sync_interval = self._config.peer_sync_interval_seconds
+        if sync_interval <= 0:
+            return
+
+        while self._running:
+            try:
+                await self._sync_manager_peer_registrations()
+                await asyncio.sleep(sync_interval)
+            except asyncio.CancelledError:
+                break
+            except Exception as error:
+                await self._udp_logger.log(
+                    ServerError(
+                        message=f"Manager peer registration sync error: {error}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+                await asyncio.sleep(sync_interval)
+
+    async def _register_with_manager(
+        self,
+        manager_addr: tuple[str, int],
+        *,
+        log_transient_errors: bool = True,
+    ) -> bool:
         """Register with a single peer manager."""
         registration = ManagerPeerRegistration(
             node=self._build_manager_info(),
@@ -1261,8 +1341,12 @@ class ManagerServer(HealthAwareServer):
                     return True
 
         except Exception as error:
+            log_entry = ServerError
+            if not log_transient_errors:
+                log_entry = ServerDebug
+
             await self._udp_logger.log(
-                ServerError(
+                log_entry(
                     message=f"Manager registration error: {error}",
                     node_host=self._host,
                     node_port=self._tcp_port,
@@ -1353,6 +1437,11 @@ class ManagerServer(HealthAwareServer):
                 if (peer_info.udp_host, peer_info.udp_port) == node_addr:
                     self._raft.on_node_join(peer_id, manager_tcp_addr)
                     break
+            self._task_runner.run(
+                self._register_with_manager,
+                manager_tcp_addr,
+                log_transient_errors=False,
+            )
             self._task_runner.run(
                 self._handle_manager_peer_recovery, node_addr, manager_tcp_addr
             )
