@@ -499,6 +499,14 @@ class FaultMatrix:
         ):
             instance._start_background_tasks()
 
+        # Re-run the production manager TCP registration handshake before
+        # SWIM JOIN. Manager registration is the authoritative address-
+        # reuse signal that clears stale DEAD/incarnation state on peers.
+        if handle.kind is ServerKind.MANAGER and hasattr(
+            instance, "_register_with_peer_managers"
+        ):
+            await instance._register_with_peer_managers()
+
         # Re-announce membership to same-kind SWIM peers. While the
         # node was paused (and its peers' send_udp wrappers blocked by
         # the isolation rule), peers' SWIM probes timed out and the

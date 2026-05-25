@@ -1036,6 +1036,158 @@ class ManagerServer(HealthAwareServer):
     # Registration
     # =========================================================================
 
+    def _build_manager_info(self) -> ManagerInfo:
+        """Build this manager's peer-registration identity."""
+        return ManagerInfo(
+            node_id=self._node_id.full,
+            tcp_host=self._host,
+            tcp_port=self._tcp_port,
+            udp_host=self._host,
+            udp_port=self._udp_port,
+            datacenter=self._node_id.datacenter,
+            is_leader=self.is_leader(),
+        )
+
+    def _manager_udp_addr_for_tcp(
+        self,
+        tcp_addr: tuple[str, int],
+    ) -> tuple[str, int] | None:
+        """Resolve a configured or already-known manager UDP address from TCP."""
+        for peer_info in self._manager_state.get_known_manager_peer_values():
+            if (peer_info.tcp_host, peer_info.tcp_port) == tcp_addr:
+                return (peer_info.udp_host, peer_info.udp_port)
+
+        for seed_tcp_addr, seed_udp_addr in zip(
+            self._seed_managers,
+            self._manager_udp_peers,
+            strict=False,
+        ):
+            if seed_tcp_addr == tcp_addr:
+                return seed_udp_addr
+
+        return None
+
+    def _build_manager_info_from_registration_response(
+        self,
+        manager_addr: tuple[str, int],
+        response: ManagerPeerRegistrationResponse,
+    ) -> ManagerInfo | None:
+        """Build responder manager info from a registration response."""
+        manager_info = getattr(response, "manager_info", None)
+        if manager_info is not None:
+            return manager_info
+
+        udp_addr = self._manager_udp_addr_for_tcp(manager_addr)
+        if udp_addr is None:
+            return None
+
+        return ManagerInfo(
+            node_id=response.manager_id,
+            tcp_host=manager_addr[0],
+            tcp_port=manager_addr[1],
+            udp_host=udp_addr[0],
+            udp_port=udp_addr[1],
+            datacenter=self._node_id.datacenter,
+            is_leader=response.is_leader,
+        )
+
+    def _find_manager_peer_address_collisions(
+        self,
+        peer_info: ManagerInfo,
+    ) -> list[str]:
+        """Return registered manager peer IDs already bound to this peer's address."""
+        tcp_addr = (peer_info.tcp_host, peer_info.tcp_port)
+        udp_addr = (peer_info.udp_host, peer_info.udp_port)
+        return [
+            peer_id
+            for peer_id, known_peer in self._manager_state.iter_known_manager_peers()
+            if peer_id != peer_info.node_id
+            and (
+                (known_peer.tcp_host, known_peer.tcp_port) == tcp_addr
+                or (known_peer.udp_host, known_peer.udp_port) == udp_addr
+            )
+        ]
+
+    def _manager_peer_registration_requires_rejoin_reset(
+        self,
+        peer_info: ManagerInfo,
+        address_collision_peer_ids: list[str],
+    ) -> bool:
+        """Return True when manager TCP registration proves a stale SWIM peer rejoined."""
+        tcp_addr = (peer_info.tcp_host, peer_info.tcp_port)
+        udp_addr = (peer_info.udp_host, peer_info.udp_port)
+        node_state = self._incarnation_tracker.get_node_state(udp_addr)
+        has_dead_or_suspect_state = (
+            node_state is not None and node_state.status in (b"SUSPECT", b"DEAD")
+        )
+        has_death_record = (
+            self._incarnation_tracker.get_required_rejoin_incarnation(udp_addr) > 0
+        )
+        is_unhealthy = (
+            self._manager_state.get_manager_peer_unhealthy_since(peer_info.node_id)
+            is not None
+        )
+        return (
+            bool(address_collision_peer_ids)
+            or has_dead_or_suspect_state
+            or has_death_record
+            or tcp_addr in self._manager_state.get_dead_managers()
+            or is_unhealthy
+        )
+
+    async def _ingest_manager_peer_info(
+        self,
+        peer_info: ManagerInfo,
+        *,
+        authoritative_registration: bool,
+    ) -> bool:
+        """Apply manager peer identity to registry, SWIM, and recovery state."""
+        if peer_info.node_id == self._node_id.full:
+            return False
+
+        address_collision_peer_ids = self._find_manager_peer_address_collisions(
+            peer_info
+        )
+        if address_collision_peer_ids and not authoritative_registration:
+            return False
+
+        peer_tcp_addr = (peer_info.tcp_host, peer_info.tcp_port)
+        peer_udp_addr = (peer_info.udp_host, peer_info.udp_port)
+        requires_rejoin_reset = (
+            authoritative_registration
+            and self._manager_peer_registration_requires_rejoin_reset(
+                peer_info,
+                address_collision_peer_ids,
+            )
+        )
+        existing_peer_info = self._manager_state.get_known_manager_peer(
+            peer_info.node_id
+        )
+        should_update_registry = (
+            existing_peer_info is None
+            or bool(address_collision_peer_ids)
+            or existing_peer_info != peer_info
+        )
+
+        if should_update_registry:
+            self._registry.register_manager_peer(peer_info)
+        self._manager_state.set_manager_udp_to_tcp_mapping(peer_udp_addr, peer_tcp_addr)
+        self._probe_scheduler.add_member(peer_udp_addr)
+        self.record_peer_role(peer_udp_addr, NodeRole.MANAGER.value)
+
+        if authoritative_registration:
+            self.register_peer(peer_udp_addr)
+
+        if requires_rejoin_reset:
+            await self.reset_peer_for_rejoin(peer_udp_addr)
+            self._task_runner.run(
+                self._handle_manager_peer_recovery,
+                peer_udp_addr,
+                peer_tcp_addr,
+            )
+
+        return True
+
     async def _register_with_peer_managers(self) -> None:
         """Register with seed peer managers."""
         for seed_addr in self._seed_managers:
@@ -1053,17 +1205,8 @@ class ManagerServer(HealthAwareServer):
 
     async def _register_with_manager(self, manager_addr: tuple[str, int]) -> bool:
         """Register with a single peer manager."""
-        manager_info = ManagerInfo(
-            node_id=self._node_id.full,
-            tcp_host=self._host,
-            tcp_port=self._tcp_port,
-            udp_host=self._host,
-            udp_port=self._udp_port,
-            datacenter=self._node_id.datacenter,
-            is_leader=self.is_leader(),
-        )
         registration = ManagerPeerRegistration(
-            node=manager_info,
+            node=self._build_manager_info(),
             term=self._leader_election.state.current_term,
             is_leader=self.is_leader(),
             cluster_id=self._config.cluster_id,
@@ -1081,8 +1224,20 @@ class ManagerServer(HealthAwareServer):
             if response and not isinstance(response, Exception):
                 parsed = ManagerPeerRegistrationResponse.load(response)
                 if parsed.accepted:
+                    responder_info = self._build_manager_info_from_registration_response(
+                        manager_addr,
+                        parsed,
+                    )
+                    if responder_info is not None:
+                        await self._ingest_manager_peer_info(
+                            responder_info,
+                            authoritative_registration=True,
+                        )
                     for peer_info in parsed.known_peers:
-                        self._registry.register_manager_peer(peer_info)
+                        await self._ingest_manager_peer_info(
+                            peer_info,
+                            authoritative_registration=False,
+                        )
                     return True
 
         except Exception as error:
@@ -1666,6 +1821,10 @@ class ManagerServer(HealthAwareServer):
         udp_addr: tuple[str, int],
         tcp_addr: tuple[str, int],
     ) -> None:
+        node_state = self._incarnation_tracker.get_node_state(udp_addr)
+        if node_state is None or node_state.status != b"DEAD":
+            return
+
         # Resolve the peer's node_id from the address so we can update
         # both the address-keyed and id-keyed indices atomically. Without
         # the id, ``_active_manager_peer_ids`` keeps the dead peer until
@@ -2023,18 +2182,21 @@ class ManagerServer(HealthAwareServer):
         source_addr: tuple[str, int],
     ) -> None:
         peer_id = heartbeat.node_id
-
-        if not self._manager_state.has_known_manager_peer(peer_id):
-            peer_info = ManagerInfo(
-                node_id=peer_id,
-                tcp_host=heartbeat.tcp_host or source_addr[0],
-                tcp_port=heartbeat.tcp_port or source_addr[1] - 1,
-                udp_host=source_addr[0],
-                udp_port=source_addr[1],
-                datacenter=heartbeat.datacenter,
-                is_leader=heartbeat.is_leader,
-            )
-            self._registry.register_manager_peer(peer_info)
+        peer_info = ManagerInfo(
+            node_id=peer_id,
+            tcp_host=heartbeat.tcp_host or source_addr[0],
+            tcp_port=heartbeat.tcp_port or source_addr[1] - 1,
+            udp_host=source_addr[0],
+            udp_port=source_addr[1],
+            datacenter=heartbeat.datacenter,
+            is_leader=heartbeat.is_leader,
+        )
+        ingested = await self._ingest_manager_peer_info(
+            peer_info,
+            authoritative_registration=False,
+        )
+        if not ingested and not self._manager_state.has_known_manager_peer(peer_id):
+            return
 
         if heartbeat.is_leader:
             self._manager_state.set_dc_leader_manager_id(peer_id)
@@ -5158,6 +5320,7 @@ class ManagerServer(HealthAwareServer):
                     is_leader=self.is_leader(),
                     term=self._leader_election.state.current_term,
                     known_peers=self._manager_state.get_known_manager_peer_values(),
+                    manager_info=self._build_manager_info(),
                     error="Cluster isolation violation: manager cluster_id mismatch",
                 ).dump()
 
@@ -5178,6 +5341,7 @@ class ManagerServer(HealthAwareServer):
                     is_leader=self.is_leader(),
                     term=self._leader_election.state.current_term,
                     known_peers=self._manager_state.get_known_manager_peer_values(),
+                    manager_info=self._build_manager_info(),
                     error="Environment isolation violation: manager environment_id mismatch",
                 ).dump()
 
@@ -5193,24 +5357,14 @@ class ManagerServer(HealthAwareServer):
                     is_leader=self.is_leader(),
                     term=self._leader_election.state.current_term,
                     known_peers=self._manager_state.get_known_manager_peer_values(),
+                    manager_info=self._build_manager_info(),
                     error=mtls_error,
                 ).dump()
 
-            self._registry.register_manager_peer(registration.node)
-
-            # Add to SWIM
-            peer_udp_addr = (
-                registration.node.udp_host,
-                registration.node.udp_port,
+            await self._ingest_manager_peer_info(
+                registration.node,
+                authoritative_registration=True,
             )
-            self._manager_state.set_manager_udp_to_tcp_mapping(
-                peer_udp_addr, (registration.node.tcp_host, registration.node.tcp_port)
-            )
-            self._probe_scheduler.add_member(peer_udp_addr)
-            # Explicit registration handshake — the peer is now an
-            # authoritative cluster member from our perspective and
-            # SUSPECT may fire on them once probes detect a failure.
-            self.register_peer(peer_udp_addr)
 
             response = ManagerPeerRegistrationResponse(
                 accepted=True,
@@ -5218,6 +5372,7 @@ class ManagerServer(HealthAwareServer):
                 is_leader=self.is_leader(),
                 term=self._leader_election.state.current_term,
                 known_peers=self._manager_state.get_known_manager_peer_values(),
+                manager_info=self._build_manager_info(),
             )
 
             return response.dump()
@@ -5229,6 +5384,7 @@ class ManagerServer(HealthAwareServer):
                 is_leader=self.is_leader(),
                 term=self._leader_election.state.current_term,
                 known_peers=self._manager_state.get_known_manager_peer_values(),
+                manager_info=self._build_manager_info(),
                 error=str(error),
             ).dump()
 

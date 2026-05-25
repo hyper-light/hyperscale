@@ -318,6 +318,20 @@ class ManagerRegistry:
         Args:
             peer_info: Manager peer information
         """
+        tcp_addr = (peer_info.tcp_host, peer_info.tcp_port)
+        udp_addr = (peer_info.udp_host, peer_info.udp_port)
+        stale_peer_ids = [
+            peer_id
+            for peer_id, known_peer in self._state._known_manager_peers.items()
+            if peer_id != peer_info.node_id
+            and (
+                (known_peer.tcp_host, known_peer.tcp_port) == tcp_addr
+                or (known_peer.udp_host, known_peer.udp_port) == udp_addr
+            )
+        ]
+        for stale_peer_id in stale_peer_ids:
+            self.unregister_manager_peer(stale_peer_id)
+
         self._state._known_manager_peers[peer_info.node_id] = peer_info
 
         self._task_runner.run(

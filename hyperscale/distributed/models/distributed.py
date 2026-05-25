@@ -251,6 +251,7 @@ class ManagerPeerRegistrationResponse(Message):
     is_leader: bool  # Whether responding manager is leader
     term: int  # Responding manager's term
     known_peers: list[ManagerInfo]  # All known peer managers (for discovery)
+    manager_info: ManagerInfo | None = None  # Responding manager's full address/identity
     error: str | None = None  # Error message if not accepted
     # Protocol version fields (AD-25) - defaults for backwards compatibility
     protocol_version_major: int = 1
