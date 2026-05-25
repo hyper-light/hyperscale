@@ -188,6 +188,7 @@ from .peer_coordinator import GatePeerCoordinator
 from .health_coordinator import GateHealthCoordinator
 from .orphan_job_coordinator import GateOrphanJobCoordinator
 from .raft_integration import GateRaftIntegration
+from .replication_coordinator import GateJobReplicationCoordinator
 from .config import GateConfig, create_gate_config
 from .state import GateRuntimeState
 from .handlers import (
@@ -562,7 +563,10 @@ class GateServer(HealthAwareServer):
         # Initialize hierarchical failure detector (AD-30).
         # Gate bracket is deliberately wider than the manager's
         # ``SWIM_SUSPICION_*`` defaults — see ``GATE_SWIM_*`` rationale
-        # in ``env.py``.
+        # in ``env.py``. Global-layer death runs through the canonical
+        # ``_on_suspicion_expired`` pipeline (AD-31); per-peer side
+        # effects (circuit-breaker cleanup, dead-log emission) live in
+        # ``_on_node_dead`` registered via ``register_on_node_dead``.
         self.init_hierarchical_detector(
             config=HierarchicalConfig(
                 global_min_timeout=float(env.GATE_SWIM_GLOBAL_MIN_TIMEOUT),
@@ -570,7 +574,6 @@ class GateServer(HealthAwareServer):
                 job_min_timeout=float(env.GATE_SWIM_JOB_MIN_TIMEOUT),
                 job_max_timeout=float(env.GATE_SWIM_JOB_MAX_TIMEOUT),
             ),
-            on_global_death=self._on_manager_globally_dead,
             on_job_death=self._on_manager_dead_for_dc,
             get_job_n_members=self._get_dc_manager_count,
         )
@@ -646,6 +649,7 @@ class GateServer(HealthAwareServer):
         self._leadership_coordinator: GateLeadershipCoordinator | None = None
         self._peer_coordinator: GatePeerCoordinator | None = None
         self._health_coordinator: GateHealthCoordinator | None = None
+        self._replication_coordinator: GateJobReplicationCoordinator | None = None
 
         # Handlers (initialized in _init_handlers)
         self._ping_handler: GatePingHandler | None = None
@@ -786,6 +790,19 @@ class GateServer(HealthAwareServer):
             get_datacenter_candidates=self._get_datacenter_candidates_for_router,
         )
 
+        self._replication_coordinator = GateJobReplicationCoordinator(
+            logger=self._udp_logger,
+            task_runner=self._task_runner,
+            get_node_id=lambda: self._node_id,
+            get_node_addr=lambda: (self._host, self._tcp_port),
+            send_tcp=self._send_tcp,
+            apply_committed=self._apply_committed_replica,
+            drop_committed=self._drop_committed_replica,
+            prepared_ttl_seconds=float(self.env.GATE_SWIM_GLOBAL_MAX_TIMEOUT) * 2.0,
+            quorum_timeout_seconds=float(self.env.GATE_TCP_TIMEOUT_STANDARD),
+            peer_rpc_timeout_seconds=float(self.env.GATE_TCP_TIMEOUT_STANDARD),
+        )
+
         self._orphan_job_coordinator = GateOrphanJobCoordinator(
             state=self._modular_state,
             logger=self._udp_logger,
@@ -798,6 +815,7 @@ class GateServer(HealthAwareServer):
             send_tcp=self._send_tcp,
             get_active_peers=lambda: self._modular_state.get_active_peers(),
             forward_status_push_to_peers=self._forward_job_status_push_to_peers,
+            state_repair_callback=self._repair_orphan_job_state,
             orphan_check_interval_seconds=self._orphan_check_interval,
             orphan_grace_period_seconds=self._orphan_grace_period,
         )
@@ -865,6 +883,10 @@ class GateServer(HealthAwareServer):
             record_request_latency=self._record_request_latency,
             record_dc_job_stats=self._record_dc_job_stats,
             handle_update_by_tier=self._handle_update_by_tier,
+            replication_coordinator=self._replication_coordinator,
+            get_active_peer_addrs=lambda: list(
+                self._modular_state.get_active_peers_list()
+            ),
         )
 
         self._manager_handler = GateManagerHandler(
@@ -1376,13 +1398,13 @@ class GateServer(HealthAwareServer):
         try:
             result = JobFinalResult.load(data)
             success = result.status in ("COMPLETED", "completed")
-            latency_ms = self._dispatch_time_tracker.record_completion(
+            latency_ms = await self._dispatch_time_tracker.record_completion(
                 result.job_id,
                 result.datacenter,
                 success=success,
             )
             if latency_ms is not None:
-                self._observed_latency_tracker.record_job_latency(
+                await self._observed_latency_tracker.record_job_latency(
                     result.datacenter, latency_ms
                 )
         except Exception as route_learning_error:
@@ -1871,6 +1893,70 @@ class GateServer(HealthAwareServer):
             return b"error"
 
     @tcp.receive()
+    async def gate_job_replica_prepare(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ):
+        """Receive a prepare for the 2PC gate-job-replication protocol."""
+        if self._replication_coordinator is None:
+            return b"error"
+        try:
+            return await self._replication_coordinator.handle_prepare(data)
+        except Exception as error:
+            await self.handle_exception(error, "gate_job_replica_prepare")
+            return b"error"
+
+    @tcp.receive()
+    async def gate_job_replica_commit(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ):
+        """Promote a prepared replica into committed gate-job state."""
+        if self._replication_coordinator is None:
+            return b"error"
+        try:
+            return await self._replication_coordinator.handle_commit(data)
+        except Exception as error:
+            await self.handle_exception(error, "gate_job_replica_commit")
+            return b"error"
+
+    @tcp.receive()
+    async def gate_job_replica_abort(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ):
+        """Drop a prepared replica on leader-side quorum failure."""
+        if self._replication_coordinator is None:
+            return b"error"
+        try:
+            return await self._replication_coordinator.handle_abort(data)
+        except Exception as error:
+            await self.handle_exception(error, "gate_job_replica_abort")
+            return b"error"
+
+    @tcp.receive()
+    async def gate_job_replica_fetch(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ):
+        """Return the cached committed replica for orphan-state-repair."""
+        if self._replication_coordinator is None:
+            return b"error"
+        try:
+            return await self._replication_coordinator.handle_fetch(data)
+        except Exception as error:
+            await self.handle_exception(error, "gate_job_replica_fetch")
+            return b"error"
+
+    @tcp.receive()
     async def job_leadership_announcement(
         self,
         addr: tuple[str, int],
@@ -1976,7 +2062,10 @@ class GateServer(HealthAwareServer):
                 self._task_runner.run(
                     self._udp_logger.log,
                     ServerWarning(
-                        message=f"Received manager transfer for unknown job {transfer.job_id[:8]}... from {transfer.new_manager_id[:8]}...",
+                        message=(
+                            "Received manager transfer for unknown job "
+                            f"{transfer.job_id[:8]}... from {transfer.new_manager_id[:8]}..."
+                        ),
                         node_host=self._host,
                         node_port=self._tcp_port,
                         node_id=self._node_id.short,
@@ -2013,7 +2102,11 @@ class GateServer(HealthAwareServer):
                 self._task_runner.run(
                     self._udp_logger.log,
                     ServerDebug(
-                        message=f"Rejected stale manager transfer for job {transfer.job_id[:8]}... (fence {transfer.fence_token} <= {current_fence})",
+                        message=(
+                            "Rejected stale manager transfer for job "
+                            f"{transfer.job_id[:8]}... "
+                            f"(fence {transfer.fence_token} <= {current_fence})"
+                        ),
                         node_host=self._host,
                         node_port=self._tcp_port,
                         node_id=self._node_id.short,
@@ -2907,7 +3000,17 @@ class GateServer(HealthAwareServer):
             self._task_runner.run(self._modular_state.add_active_peer, tcp_addr)
 
     def _on_node_dead(self, node_addr: tuple[str, int]) -> None:
-        """Handle node death via SWIM."""
+        """Handle node death via SWIM.
+
+        Runs on every peer death — both peer gates (orphan-coordinator
+        + hash-ring removal flow) and DC managers the gate watches
+        (circuit-breaker cleanup). The dead-log emission and circuit-
+        breaker removal were previously gated by the HFD
+        ``on_global_death`` override; that override silently bypassed
+        the canonical post-DEAD pipeline and prevented the orphan
+        coordinator from ever firing. Both side effects now run
+        unconditionally on the canonical pipeline (AD-31).
+        """
         gate_tcp_addr = self._modular_state.get_tcp_addr_for_udp(node_addr)
         import sys as _sys
         _sys.stderr.write(
@@ -2915,6 +3018,19 @@ class GateServer(HealthAwareServer):
             f"dead_udp={node_addr} resolved_tcp={gate_tcp_addr}\n"
         )
         _sys.stderr.flush()
+        self._task_runner.run(
+            self._udp_logger.log,
+            ServerInfo(
+                message=f"Peer {node_addr} globally dead",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            ),
+        )
+        self._task_runner.run(
+            self._circuit_breaker_manager.remove_circuit,
+            node_addr,
+        )
         if gate_tcp_addr:
             self._dead_gate_addrs.add(gate_tcp_addr)
             if self._raft is not None:
@@ -2991,6 +3107,95 @@ class GateServer(HealthAwareServer):
             await self._peer_coordinator.handle_peer_recovery(udp_addr, tcp_addr)
         else:
             await self._modular_state.add_active_peer(tcp_addr)
+
+    async def _apply_committed_replica(self, replica) -> None:
+        """Apply a committed ``GateJobReplica`` to local gate state.
+
+        Called by the replication coordinator at commit time on both
+        leader and peers. Idempotent — repeated commits at the same
+        sequence overwrite identical values. On the leader the
+        ``leader_id`` matches our own node id and we ``assume_leadership``;
+        on peers ``leader_id`` is the accepting gate and we record the
+        external leadership claim with the replica's fencing token.
+        """
+        job = GlobalJobStatus(
+            job_id=replica.job_id,
+            status=replica.status_seed,
+            datacenters=[],
+            timestamp=replica.submitted_at,
+            fence_token=replica.fence_token,
+        )
+        self._job_manager.set_job(replica.job_id, job)
+        self._job_manager.set_target_dcs(
+            replica.job_id, set(replica.target_dcs)
+        )
+        self._job_manager.set_fence_token(replica.job_id, replica.fence_token)
+
+        if replica.callback_addr:
+            callback = tuple(replica.callback_addr)
+            self._job_manager.set_callback(replica.job_id, callback)
+            self._modular_state._progress_callbacks[replica.job_id] = callback
+
+        self._modular_state._job_workflow_ids[replica.job_id] = set(
+            replica.workflow_ids
+        )
+
+        if replica.submission_payload:
+            try:
+                submission = JobSubmission.load(replica.submission_payload)
+                self._modular_state._job_submissions[replica.job_id] = submission
+            except Exception:
+                pass
+
+        if replica.leader_id == self._node_id.full:
+            self._job_leadership_tracker.assume_leadership(
+                job_id=replica.job_id,
+                metadata=replica.target_dc_count,
+                initial_token=replica.fence_token,
+            )
+        else:
+            self._job_leadership_tracker.process_leadership_claim(
+                job_id=replica.job_id,
+                claimer_id=replica.leader_id,
+                claimer_addr=tuple(replica.leader_addr),
+                fencing_token=replica.fence_token,
+                metadata=replica.target_dc_count,
+            )
+
+        await self._modular_state.increment_state_version()
+
+    async def _drop_committed_replica(self, job_id: str) -> None:
+        """Remove all replicated state for ``job_id`` (failed-commit cleanup)."""
+        self._job_manager.delete_job(job_id)
+        self._modular_state._job_workflow_ids.pop(job_id, None)
+        self._modular_state._job_submissions.pop(job_id, None)
+        self._modular_state._progress_callbacks.pop(job_id, None)
+        self._job_leadership_tracker.release_leadership(job_id)
+        await self._modular_state.increment_state_version()
+
+    async def _repair_orphan_job_state(self, job_id: str) -> bool:
+        """Fetch and apply the committed replica for ``job_id`` from peers.
+
+        Called by the orphan coordinator when local ``get_job(job_id)``
+        returns ``None`` for a job whose leader has been declared dead.
+        Returns ``True`` when a peer returned a committed replica and
+        it was applied locally; ``False`` otherwise. A ``False`` return
+        does not abandon the orphan — the coordinator keeps it marked
+        and re-evaluates on the next scan tick until the orphan
+        timeout elapses.
+        """
+        if self._replication_coordinator is None:
+            return False
+        peer_addrs = list(self._modular_state.get_active_peers_list())
+        if not peer_addrs:
+            return False
+        replica = await self._replication_coordinator.fetch_committed_replica_from_peers(
+            job_id, peer_addrs
+        )
+        if replica is None:
+            return False
+        await self._apply_committed_replica(replica)
+        return True
 
     async def _handle_job_leader_failure(self, tcp_addr: tuple[str, int]) -> None:
         import sys as _sys
@@ -3131,33 +3336,23 @@ class GateServer(HealthAwareServer):
                 )
             )
 
-    def _on_manager_globally_dead(
-        self,
-        manager_addr: tuple[str, int],
-        incarnation: int,
-    ) -> None:
-        self._task_runner.run(
-            self._udp_logger.log,
-            ServerInfo(
-                message=f"Manager {manager_addr} globally dead",
-                node_host=self._host,
-                node_port=self._tcp_port,
-                node_id=self._node_id.short,
-            ),
-        )
-        self._task_runner.run(
-            self._circuit_breaker_manager.remove_circuit,
-            manager_addr,
-        )
-
     def _on_manager_dead_for_dc(
         self,
         dc_id: str,
         manager_addr: tuple[str, int],
         incarnation: int,
     ) -> None:
-        """Handle manager death for specific DC (AD-30)."""
-        self._circuit_breaker_manager.record_failure(manager_addr)
+        """Handle manager death for specific DC (AD-30).
+
+        Called synchronously from the HFD job-layer expiration handler;
+        the circuit-breaker write is async (asyncio.Lock-guarded), so
+        we route it through the TaskRunner per CLAUDE.md's no-orphan
+        rule rather than dropping the coroutine.
+        """
+        self._task_runner.run(
+            self._circuit_breaker_manager.record_failure,
+            manager_addr,
+        )
 
     def _get_dc_manager_count(self, dc_id: str) -> int:
         """Get manager count for a DC."""
@@ -3364,7 +3559,11 @@ class GateServer(HealthAwareServer):
         self._task_runner.run(
             self._udp_logger.log,
             ServerInfo(
-                message=f"Routed job {job_id[:8]}... to DCs {primary} (bucket={health_bucket}, reason={decision.reason}, fallbacks={fallback})",
+                message=(
+                    f"Routed job {job_id[:8]}... to DCs {primary} "
+                    f"(bucket={health_bucket}, reason={decision.reason}, "
+                    f"fallbacks={fallback})"
+                ),
                 node_host=self._host,
                 node_port=self._tcp_port,
                 node_id=self._node_id.short if self._node_id else "unknown",

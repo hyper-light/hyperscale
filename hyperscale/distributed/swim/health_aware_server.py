@@ -1160,7 +1160,6 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
     def init_hierarchical_detector(
         self,
         config: HierarchicalConfig | None = None,
-        on_global_death: Callable[[tuple[str, int], int], None] | None = None,
         on_job_death: Callable[[str, tuple[str, int], int], None] | None = None,
         get_job_n_members: Callable[[str], int] | None = None,
     ) -> HierarchicalFailureDetector:
@@ -1170,29 +1169,34 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         This is optional - subclasses that need job-layer detection should call
         this during their initialization.
 
+        ``on_global_death`` is **not** a parameter. The global-layer death
+        path is always ``_on_suspicion_expired`` — the canonical post-DEAD
+        pipeline that updates the incarnation tracker to DEAD, queues the
+        ``dead`` gossip update, refreshes the probe scheduler, and fans
+        into ``_on_node_dead_callbacks`` (where ``register_on_node_dead``
+        clients are wired). Any subclass behavior that should run on
+        peer death belongs in a callback registered via
+        ``register_on_node_dead``, not as a pipeline replacement.
+        Replacing the canonical pipeline silently disables AD-31's
+        gossip-informed callback contract and breaks gate-tier
+        leadership transfer; the API enforces the invariant by
+        construction rather than via convention.
+
+        ``on_job_death`` remains accepted — the job layer has no
+        canonical pipeline equivalent and per-job liveness is owned by
+        the subclass.
+
         Args:
             config: Configuration for hierarchical detection.
-            on_global_death: Callback when node is declared dead at global level.
             on_job_death: Callback when node is declared dead for specific job.
             get_job_n_members: Callback to get member count for a job.
 
         Returns:
             The initialized HierarchicalFailureDetector.
         """
-        # Calling ``init_hierarchical_detector`` replaces the HFD instance
-        # that ``HealthAwareServer.__init__`` already constructed with the
-        # canonical ``_on_suspicion_expired`` callback wired in. If the
-        # caller does not supply ``on_global_death`` we must re-wire the
-        # default here — otherwise the new HFD has ``None`` for
-        # ``on_global_death`` and wheel expirations fire but no callback
-        # runs: no DEAD log, no incarnation-tracker transition to DEAD,
-        # no ``dead`` gossip, no ``_on_node_dead_callbacks`` fan-out, no
-        # unregister. The bracket fires into the void.
-        if on_global_death is None:
-            on_global_death = self._on_suspicion_expired
         self._hierarchical_detector = HierarchicalFailureDetector(
             config=config,
-            on_global_death=on_global_death,
+            on_global_death=self._on_suspicion_expired,
             # Synchronous death record happens BEFORE the async DEAD
             # callback drains, so a concurrent ``reset_peer_for_rejoin``
             # can read the right rejoin threshold rather than defaulting
@@ -3363,7 +3367,21 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         # cancellation in the timeout path, then we explicitly cancel
         # and drain the pending set.
         if timeout:
-            tasks = [asyncio.ensure_future(c) for c in coros]
+            # ``asyncio.ensure_future(c)`` can raise during loop
+            # shutdown (e.g. cluster teardown). If it raises mid-
+            # comprehension the already-wrapped tasks are safe but
+            # the remaining raw coroutines are orphaned and surface
+            # as ``coroutine '...' was never awaited`` from the GC.
+            # CLAUDE.md forbids orphan coroutines: explicitly close
+            # any input coro we couldn't wrap into a Task.
+            tasks: list[asyncio.Task] = []
+            try:
+                for coro in coros:
+                    tasks.append(asyncio.ensure_future(coro))
+            except BaseException:
+                for unwrapped in coros[len(tasks):]:
+                    unwrapped.close()
+                raise
             done, pending = await asyncio.wait(tasks, timeout=timeout)
             for task in pending:
                 task.cancel()
@@ -3764,7 +3782,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             self._run_burst_failure_confirmation,
             self_addr,
             alias="ad53_burst_failure_confirmation",
-            keep=10,
+            keep=self.env.MERCURY_SYNC_TASK_RUNNER_KEEP,
             max_age="5m",
             keep_policy="COUNT_AND_AGE",
         )

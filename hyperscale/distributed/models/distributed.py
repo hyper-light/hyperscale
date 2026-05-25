@@ -952,6 +952,11 @@ class JobAck(Message):
     protocol_version_major: int = 1
     protocol_version_minor: int = 0
     capabilities: str = ""  # Comma-separated negotiated features
+    # Retry hint when ``accepted`` is False and the rejection is
+    # retryable (e.g., gate-replication quorum temporarily unavailable).
+    # 0.0 means "no retry hint provided" — caller may retry immediately
+    # or apply its own backoff.
+    retry_after_seconds: float = 0.0
 
 
 @dataclass(slots=True)

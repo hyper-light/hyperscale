@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Awaitable, Callable
 
 from hyperscale.distributed.models import (
     GateJobLeaderTransfer,
+    GateJobReplica,
     GlobalJobStatus,
     JobAck,
     JobLeaderGateTransfer,
@@ -59,6 +60,9 @@ if TYPE_CHECKING:
 
     from hyperscale.distributed.models import GateInfo
     from hyperscale.distributed.taskex import TaskRunner
+    from hyperscale.distributed.nodes.gate.replication_coordinator import (
+        GateJobReplicationCoordinator,
+    )
 
 
 class GateJobHandler:
@@ -98,6 +102,8 @@ class GateJobHandler:
         record_request_latency: Callable[[float], None],
         record_dc_job_stats: Callable,
         handle_update_by_tier: Callable,
+        replication_coordinator: "GateJobReplicationCoordinator | None" = None,
+        get_active_peer_addrs: Callable[[], list[tuple[str, int]]] | None = None,
     ) -> None:
         """
         Initialize the job handler.
@@ -162,6 +168,8 @@ class GateJobHandler:
         self._record_request_latency: Callable[[float], None] = record_request_latency
         self._record_dc_job_stats: Callable = record_dc_job_stats
         self._handle_update_by_tier: Callable = handle_update_by_tier
+        self._replication_coordinator = replication_coordinator
+        self._get_active_peer_addrs = get_active_peer_addrs
 
     def _is_terminal_status(self, status: str) -> bool:
         return status in (
@@ -472,25 +480,13 @@ class GateJobHandler:
                     error="No available datacenters - all unhealthy",
                 ).dump()
 
-            job = GlobalJobStatus(
-                job_id=submission.job_id,
-                status=JobStatus.SUBMITTED.value,
-                datacenters=[],
-                timestamp=time.monotonic(),
-                fence_token=fence_token,
-            )
-            self._job_manager.set_job(submission.job_id, job)
-            self._job_manager.set_target_dcs(submission.job_id, set(target_dcs))
-            self._job_manager.set_fence_token(submission.job_id, fence_token)
-
+            workflow_ids: set[str] = set()
             try:
                 workflows: list[tuple[str, list[str], object]] = cloudpickle.loads(
                     submission.workflows
                 )
                 workflow_ids = {wf_id for wf_id, _, _ in workflows}
-                self._state._job_workflow_ids[submission.job_id] = workflow_ids
             except Exception as workflow_parse_error:
-                self._state._job_workflow_ids[submission.job_id] = set()
                 self._task_runner.run(
                     self._logger.log,
                     ServerError(
@@ -501,25 +497,81 @@ class GateJobHandler:
                     ),
                 )
 
-            if submission.callback_addr:
-                self._job_manager.set_callback(
-                    submission.job_id, submission.callback_addr
-                )
-                self._state._progress_callbacks[submission.job_id] = (
-                    submission.callback_addr
-                )
-
-            if submission.reporting_configs:
-                self._state._job_submissions[submission.job_id] = submission
-
-            self._job_leadership_tracker.assume_leadership(
+            # Build the takeover capsule. ``submission_payload`` carries
+            # the raw serialized submission so peer gates that
+            # eventually take over leadership can dispatch the job
+            # without re-fetching from the client.
+            origin_addr = (self._get_host(), self._get_tcp_port())
+            replica_callback = (
+                tuple(submission.callback_addr)
+                if submission.callback_addr
+                else None
+            )
+            replica = GateJobReplica(
                 job_id=submission.job_id,
-                metadata=len(target_dcs),
-                initial_token=fence_token,
+                sequence=fence_token,
+                fence_token=fence_token,
+                leader_id=self._get_node_id().full,
+                leader_addr=origin_addr,
+                origin_gate_addr=origin_addr,
+                callback_addr=replica_callback,
+                target_dcs=list(target_dcs),
+                target_dc_count=len(target_dcs),
+                status_seed=JobStatus.SUBMITTED.value,
+                submitted_at=time.monotonic(),
+                workflow_ids=list(workflow_ids),
+                submission_payload=data,
             )
 
-            await self._state.increment_state_version()
+            # AD-31 takeover invariant: JobAck(accepted=True) must not
+            # return until the replica is durably replicated to a
+            # quorum of live gates. Single-gate clusters pass quorum
+            # with self alone (no peer round-trip); multi-gate
+            # clusters require ⌊N/2⌋ peer prepare-acks. On quorum
+            # failure the coordinator has already aborted any
+            # prepared peers; we release the lease, reject
+            # idempotency, and return a retry hint.
+            quorum_committed = False
+            if self._replication_coordinator is not None:
+                peer_addrs: list[tuple[str, int]] = (
+                    self._get_active_peer_addrs()
+                    if self._get_active_peer_addrs is not None
+                    else []
+                )
+                quorum_committed = (
+                    await self._replication_coordinator.replicate_with_quorum(
+                        replica=replica,
+                        peer_addrs=peer_addrs,
+                        quorum_size=self._quorum_size(),
+                    )
+                )
 
+            import sys as _sys
+            _sys.stderr.write(
+                f"[SUBMIT-2PC job={submission.job_id[:10]}] "
+                f"quorum_committed={quorum_committed}\n"
+            )
+            _sys.stderr.flush()
+
+            if not quorum_committed:
+                await self._release_job_lease(submission.job_id)
+                error_ack = JobAck(
+                    job_id=submission.job_id,
+                    accepted=False,
+                    error="gate_replication_quorum_unavailable",
+                    retry_after_seconds=2.0,
+                    protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+                    protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+                    capabilities=negotiated_caps_str,
+                ).dump()
+                if idempotency_key is not None and self._idempotency_cache is not None:
+                    await self._idempotency_cache.reject(idempotency_key, error_ack)
+                return error_ack
+
+            _sys.stderr.write(
+                f"[SUBMIT-2PC-POST job={submission.job_id[:10]}] broadcasting leadership\n"
+            )
+            _sys.stderr.flush()
             await self._broadcast_job_leadership(
                 submission.job_id,
                 len(target_dcs),
@@ -527,6 +579,11 @@ class GateJobHandler:
             )
 
             self._quorum_circuit.record_success()
+
+            _sys.stderr.write(
+                f"[SUBMIT-2PC-ACK job={submission.job_id[:10]}] returning accepted=True\n"
+            )
+            _sys.stderr.flush()
 
             ack_response = JobAck(
                 job_id=submission.job_id,
@@ -556,6 +613,11 @@ class GateJobHandler:
                 if run:
                     self._state._job_lease_renewal_tokens[submission.job_id] = run.token
 
+            _sys.stderr.write(
+                f"[SUBMIT-2PC-RETURN job={submission.job_id[:10]}] "
+                f"bytes={len(ack_response)}\n"
+            )
+            _sys.stderr.flush()
             return ack_response
 
         except QuorumCircuitOpenError as error:
@@ -584,6 +646,11 @@ class GateJobHandler:
                 await self._idempotency_cache.reject(idempotency_key, error_ack)
             return error_ack
         except Exception as error:
+            import sys as _sys, traceback as _tb
+            _sys.stderr.write(
+                f"[SUBMIT-EXC] {type(error).__name__}: {error}\n{_tb.format_exc()}\n"
+            )
+            _sys.stderr.flush()
             if lease_acquired and submission is not None:
                 await self._release_job_lease(submission.job_id)
             await self._logger.log(

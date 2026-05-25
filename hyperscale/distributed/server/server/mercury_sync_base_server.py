@@ -257,6 +257,7 @@ class MercurySyncBaseServer(Generic[T]):
         self._tcp_client_response_transports: dict[tuple[str, int], asyncio.Transport] = {}
         self.udp_client_response_models: dict[bytes, type[Message]] = {}
         self.udp_server_request_models: dict[bytes, type[Message]] = {}
+        self._udp_recv_arrived_count = 0
 
         self.tcp_handlers: dict[
             bytes,
@@ -710,10 +711,10 @@ class MercurySyncBaseServer(Generic[T]):
         }
 
         for hook in hooks.values():
-            hook_metadata = hook.__func__
+            # hook_metadata = hook.__func__
             hook = hook.__get__(self, self.__class__)
             setattr(self, hook.name, hook)
-            hook_metadata = getattr(hook, "__func__", hook)
+            # hook_metadata = getattr(hook, "__func__", hook)
 
             signature = inspect.signature(hook)
             encoded_hook_name = hook.name.encode()
@@ -1237,7 +1238,11 @@ class MercurySyncBaseServer(Generic[T]):
             priority,
             admission_group=admission_group,
         ):
-            # Load shedding - increment drop counter
+            # Load shedding - increment drop counter. Explicitly
+            # close the rejected coroutine so it does not surface as
+            # a "coroutine was never awaited" warning per CLAUDE.md's
+            # no-orphan rule.
+            coro.close()
             self._udp_drop_counter.increment_load_shed()
             if self._udp_drop_counter.load_shed % 10 == 0:
                 tracker = self._udp_in_flight_tracker
@@ -1299,7 +1304,10 @@ class MercurySyncBaseServer(Generic[T]):
         if not self._running:
             # Server stopped between schedule and execution; release
             # the priority slot we acquired in ``_spawn_udp_response``
-            # so the in-flight tracker doesn't leak it.
+            # so the in-flight tracker doesn't leak it. Close the
+            # deferred coroutine too so it does not surface as an
+            # orphan-coroutine warning per CLAUDE.md's no-orphan rule.
+            coro.close()
             self._udp_in_flight_tracker.release(
                 priority,
                 admission_group=admission_group,
@@ -1775,9 +1783,8 @@ class MercurySyncBaseServer(Generic[T]):
         transport: asyncio.DatagramTransport,
     ):
         if handler_name == b"receive":
-            self._udp_recv_arrived_count = (
-                getattr(self, "_udp_recv_arrived_count", 0) + 1
-            )
+
+            self._udp_recv_arrived_count += 1
             if self._udp_recv_arrived_count % 100 == 0:
                 tracker = self._udp_in_flight_tracker
                 await self._udp_logger.log(

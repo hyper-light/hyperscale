@@ -563,7 +563,7 @@ class GateDispatchCoordinator:
         Handles health-based routing: UNHEALTHY -> fail, DEGRADED/BUSY -> warn, HEALTHY -> proceed.
         """
         for datacenter_id in target_dcs:
-            self._dispatch_time_tracker.record_dispatch(
+            await self._dispatch_time_tracker.record_dispatch(
                 submission.job_id, datacenter_id
             )
 

@@ -216,3 +216,15 @@ from .client import (
     ClientWorkflowResult as ClientWorkflowResult,
     ClientJobResult as ClientJobResult,
 )
+
+# Gate-tier job-state replication (AD-31 takeover invariant)
+from .gate_replication import (
+    GateJobReplica as GateJobReplica,
+    GateJobReplicaAbort as GateJobReplicaAbort,
+    GateJobReplicaAck as GateJobReplicaAck,
+    GateJobReplicaCommit as GateJobReplicaCommit,
+    GateJobReplicaFetchRequest as GateJobReplicaFetchRequest,
+    GateJobReplicaFetchResponse as GateJobReplicaFetchResponse,
+    GateJobReplicaPrepare as GateJobReplicaPrepare,
+    GateJobReplicaStatus as GateJobReplicaStatus,
+)

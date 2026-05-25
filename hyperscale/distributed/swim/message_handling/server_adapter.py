@@ -429,8 +429,19 @@ class ServerAdapter:
     # === Leadership Broadcasting ===
 
     def broadcast_leadership_message(self, message: bytes) -> None:
-        """Broadcast a leadership message to all nodes."""
-        self._server._broadcast_leadership_message(message)
+        """Broadcast a leadership message to all nodes.
+
+        ``_broadcast_leadership_message`` is async (it iterates active
+        peers and awaits each TCP send); this wrapper is sync because
+        the leader-election callsite is a SWIM-layer sync callback.
+        Routing through the TaskRunner keeps the work tracked /
+        drainable rather than dropping the coroutine per CLAUDE.md's
+        no-orphan rule.
+        """
+        self._server._task_runner.run(
+            self._server._broadcast_leadership_message,
+            message,
+        )
 
     async def send_to_addr(
         self,

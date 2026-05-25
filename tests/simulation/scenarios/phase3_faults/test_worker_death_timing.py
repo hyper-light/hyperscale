@@ -71,23 +71,32 @@ async def test_worker_dies_mid_dispatch_before_ack() -> None:
         mode=ExecutionMode.REAL,
         scenario_name="worker_dies_mid_dispatch_before_ack",
     ) as cluster:
-        victim = cluster.workers("local")[0]
-        original_dispatch_handle = victim.instance._dispatch_handler.handle
+        manager = cluster.managers("local")[0]
+        dispatcher = manager.instance._workflow_dispatcher
+        original_send_dispatch = dispatcher._send_dispatch
         fault_landed = False
 
-        async def cancel_before_ack(
-            addr: tuple[str, int],
-            data: bytes,
-            clock_time: int,
-        ) -> bytes:
+        async def kill_selected_worker_before_ack(
+            worker_id: str,
+            dispatch: WorkflowDispatch,
+        ) -> bool:
             nonlocal fault_landed
             if not fault_landed:
-                fault_landed = True
-                await cluster.faults.kill(victim)
-                raise asyncio.CancelledError("harness cancelled dispatch before ack")
-            return await original_dispatch_handle(addr, data, clock_time)
+                selected_worker = next(
+                    (
+                        worker
+                        for worker in cluster.workers("local")
+                        if worker.instance._node_id.full == worker_id
+                    ),
+                    None,
+                )
+                if selected_worker is not None:
+                    fault_landed = True
+                    await cluster.faults.kill(selected_worker)
 
-        victim.instance._dispatch_handler.handle = cancel_before_ack
+            return await original_send_dispatch(worker_id, dispatch)
+
+        dispatcher._send_dispatch = kill_selected_worker_before_ack
         async with cluster.workload(_workload(SimpleWorkflow, 45.0)) as driver:
             await driver.submit_and_wait()
 

@@ -643,18 +643,9 @@ class ManagerServer(HealthAwareServer):
         # bracket past 45 s (the operator-budgeted detection envelope
         # for worker liveness). The job-layer override stays: jobs
         # need tighter detection than full SWIM probes because their
-        # liveness check is workflow-local.
-        #
-        # We deliberately do NOT pass ``on_global_death`` here. Passing
-        # a custom callback *replaces* ``HealthAwareServer._on_suspicion_expired``,
-        # which is the canonical post-DEAD pipeline: it updates the
-        # incarnation tracker to DEAD, queues the ``dead`` gossip
-        # update, refreshes the probe scheduler, and fans into the
-        # ``_on_node_dead_callbacks`` list (where ``_on_node_dead`` —
-        # the unregister path — is registered). With no override the
-        # pipeline runs end-to-end. Per-role post-DEAD work belongs in
-        # callbacks registered against that pipeline rather than in
-        # an HFD-level override.
+        # liveness check is workflow-local. ``on_global_death`` is no
+        # longer overridable (enforced by ``init_hierarchical_detector``);
+        # post-DEAD work runs through ``register_on_node_dead`` above.
         self.init_hierarchical_detector(
             config=HierarchicalConfig(
                 global_min_timeout=float(self._env.SWIM_SUSPICION_MIN_TIMEOUT),

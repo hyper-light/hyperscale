@@ -346,20 +346,60 @@ class ClientJobSubmitter:
                 timeout=10.0,
             )
 
+            import sys as _sys
+            _sys.stderr.write(
+                f"[CLIENT-SUBMIT job={job_id[:10]} target={target}] "
+                f"response_type={type(response).__name__} "
+                f"response_repr={response!r:.200}\n"
+            )
+            _sys.stderr.flush()
+
             if isinstance(response, Exception):
                 return str(response)  # Transient error
 
-            # Check for rate limiting response (AD-32)
+            # Check for rate limiting response (AD-32). ``Message.load``
+            # is intentionally lax about the deserialized type
+            # (it doubles as a restricted-unpickler shim for cloudpickled
+            # Workflow payloads that are not ``Message`` subclasses), so
+            # ``RateLimitResponse.load(jobAck_bytes)`` happily returns a
+            # ``JobAck`` typed as ``RateLimitResponse``. Without the
+            # ``isinstance`` guard below, any field shared between the
+            # two models (e.g. ``retry_after_seconds``) lets a successful
+            # ``JobAck`` silently masquerade as a rate-limit response,
+            # which broke submission retry semantics when
+            # ``gate_replication_quorum_unavailable`` retry hints were
+            # added to ``JobAck``. The narrow ``try`` scope around the
+            # load keeps real errors in the rate-limit branch
+            # (e.g. ``asyncio.sleep`` cancellation) from being silently
+            # swallowed.
+            rate_limit_response: RateLimitResponse | None = None
             try:
-                rate_limit_response = RateLimitResponse.load(response)
-                # Server is rate limiting - honor retry_after and treat as transient
+                candidate = RateLimitResponse.load(response)
+            except Exception:
+                candidate = None
+            if isinstance(candidate, RateLimitResponse):
+                rate_limit_response = candidate
+            if rate_limit_response is not None:
                 await asyncio.sleep(rate_limit_response.retry_after_seconds)
                 return rate_limit_response.error  # Transient error
-            except Exception:
-                # Not a RateLimitResponse, continue to parse as JobAck
-                pass
 
-            ack = JobAck.load(response)
+            import sys as _sys
+            try:
+                ack = JobAck.load(response)
+            except Exception as load_error:
+                import traceback as _tb
+                _sys.stderr.write(
+                    f"[CLIENT-ACK-LOAD-FAIL job={job_id[:10]} target={target}] "
+                    f"{type(load_error).__name__}: {load_error}\n{_tb.format_exc()}\n"
+                )
+                _sys.stderr.flush()
+                raise
+            _sys.stderr.write(
+                f"[CLIENT-ACK job={job_id[:10]} target={target}] "
+                f"accepted={ack.accepted} error={ack.error!r} "
+                f"leader_addr={ack.leader_addr}\n"
+            )
+            _sys.stderr.flush()
 
             if ack.accepted:
                 # Track which server accepted this job for future queries

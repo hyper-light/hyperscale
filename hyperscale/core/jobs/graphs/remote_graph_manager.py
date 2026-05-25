@@ -781,7 +781,7 @@ class RemoteGraphManager:
     ):
         await self._append_workflow_run_status(run_id, workflow.name, WorkflowStatus.QUEUED)
 
-        self._controller.create_context_from_external_store(
+        await self._controller.create_context_from_external_store(
             workflow.name,
             run_id,
             workflow_context,

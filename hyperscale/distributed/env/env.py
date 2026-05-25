@@ -22,6 +22,7 @@ class Env(BaseModel):
     MERCURY_SYNC_REQUEST_TIMEOUT: StrictStr = "30s"
     MERCURY_SYNC_LOG_LEVEL: StrictStr = "info"
     MERCURY_SYNC_TASK_RUNNER_MAX_THREADS: StrictInt = os.cpu_count() or 1
+    MERCURY_SYNC_TASK_RUNNER_KEEP: StrictInt = 100
     MERCURY_SYNC_MAX_REQUEST_CACHE_SIZE: StrictInt = 100
     MERCURY_SYNC_ENABLE_REQUEST_CACHING: StrictBool = False
     MERCURY_SYNC_TCP_SERVER_BACKLOG: StrictInt = 4096
@@ -788,6 +789,7 @@ class Env(BaseModel):
             "MERCURY_SYNC_REQUEST_TIMEOUT": str,
             "MERCURY_SYNC_LOG_LEVEL": str,
             "MERCURY_SYNC_TASK_RUNNER_MAX_THREADS": int,
+            "MERCURY_SYNC_TASK_RUNNER_KEEP": int,
             "MERCURY_SYNC_MAX_REQUEST_CACHE_SIZE": int,
             "MERCURY_SYNC_ENABLE_REQUEST_CACHING": str,
             "MERCURY_SYNC_UDP_SERVER_RCVBUF": int,

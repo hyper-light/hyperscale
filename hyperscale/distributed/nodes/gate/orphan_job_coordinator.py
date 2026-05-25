@@ -14,11 +14,11 @@ Key responsibilities:
 """
 
 import asyncio
-import random
 import time
 from typing import TYPE_CHECKING, Any, Callable, Awaitable
 
 from hyperscale.distributed.models import (
+    GlobalJobStatus,
     JobLeadershipAnnouncement,
     JobStatus,
     JobStatusPush,
@@ -79,6 +79,7 @@ class GateOrphanJobCoordinator:
         "_send_tcp",
         "_get_active_peers",
         "_forward_status_push_to_peers",
+        "_state_repair_callback",
         "_orphan_check_interval_seconds",
         "_orphan_grace_period_seconds",
         "_orphan_timeout_seconds",
@@ -104,6 +105,7 @@ class GateOrphanJobCoordinator:
         get_active_peers: Callable[[], set[tuple[str, int]]],
         forward_status_push_to_peers: Callable[[str, bytes], Awaitable[bool]]
         | None = None,
+        state_repair_callback: Callable[[str], Awaitable[bool]] | None = None,
         orphan_check_interval_seconds: float = 15.0,
         orphan_grace_period_seconds: float = 30.0,
         orphan_timeout_seconds: float = 300.0,
@@ -142,6 +144,7 @@ class GateOrphanJobCoordinator:
         self._send_tcp = send_tcp
         self._get_active_peers = get_active_peers
         self._forward_status_push_to_peers = forward_status_push_to_peers
+        self._state_repair_callback = state_repair_callback
         self._orphan_check_interval_seconds = orphan_check_interval_seconds
         self._orphan_grace_period_seconds = orphan_grace_period_seconds
         self._orphan_timeout_seconds = orphan_timeout_seconds
@@ -353,7 +356,10 @@ class GateOrphanJobCoordinator:
                 _sys.stderr.flush()
 
                 for job_id, orphaned_at in jobs_to_evaluate:
-                    await self._evaluate_orphan_takeover(job_id, orphaned_at)
+                    await self._evaluate_orphan_takeover_with_trace(
+                        job_id,
+                        orphaned_at,
+                    )
 
             except asyncio.CancelledError:
                 break
@@ -375,14 +381,16 @@ class GateOrphanJobCoordinator:
     ) -> None:
         import sys as _sys
         _sys.stderr.write(
-            f"[ORPHAN-EVAL self={self._get_node_addr()} job={job_id[:10]}] starting evaluation\n"
+            f"[ORPHAN-EVAL self={self._get_node_addr()} job={job_id[:10]}] "
+            "starting evaluation\n"
         )
         _sys.stderr.flush()
         try:
             await self._evaluate_orphan_takeover(job_id, orphaned_at)
-        except Exception as e:
+        except Exception as error:
             _sys.stderr.write(
-                f"[ORPHAN-EVAL-EXC job={job_id[:10]}] {type(e).__name__}: {e}\n"
+                f"[ORPHAN-EVAL-EXC job={job_id[:10]}] "
+                f"{type(error).__name__}: {error}\n"
             )
             _sys.stderr.flush()
             raise
@@ -410,8 +418,13 @@ class GateOrphanJobCoordinator:
         )
         _sys.stderr.flush()
         if not job:
-            self._state.clear_orphaned_job(job_id)
-            return
+            job = await self._get_or_repair_job(job_id)
+
+            if not job:
+                time_orphaned = time.monotonic() - orphaned_at
+                if time_orphaned >= self._orphan_timeout_seconds:
+                    self._state.clear_orphaned_job(job_id)
+                return
 
         if job.status in self._terminal_statuses:
             self._state.clear_orphaned_job(job_id)
@@ -495,43 +508,109 @@ class GateOrphanJobCoordinator:
 
         await self._execute_takeover(job_id)
 
+    async def _get_or_repair_job(self, job_id: str) -> GlobalJobStatus | None:
+        """Return local job state, fetching committed replica state if needed."""
+        job = self._job_manager.get_job(job_id)
+        if job is not None:
+            return job
+
+        if self._state_repair_callback is None:
+            return None
+
+        try:
+            repaired = await self._state_repair_callback(job_id)
+        except Exception as repair_error:
+            self._task_runner.run(
+                self._logger.log,
+                ServerDebug(
+                    message=(
+                        f"State repair for orphaned job {job_id[:8]}... "
+                        f"failed: {repair_error}"
+                    ),
+                    node_host=self._get_node_addr()[0],
+                    node_port=self._get_node_addr()[1],
+                    node_id=self._get_node_id().short,
+                ),
+            )
+            return None
+
+        if repaired:
+            return self._job_manager.get_job(job_id)
+
+        return None
+
     async def _execute_takeover(self, job_id: str) -> None:
         """
         Execute takeover of an orphaned job.
 
-        Applies jitter to prevent thundering herd, takes over leadership
-        with an incremented fencing token, and broadcasts the change.
+        Takes over leadership with an incremented fencing token and broadcasts
+        the change. Once the consistent hash ring elects a single owner, this
+        path intentionally does not sleep; delaying after owner selection lets
+        unrelated state cleanup clear the orphan before the elected owner can
+        fence the old leader.
 
         Args:
             job_id: The job ID to take over
         """
-        if self._takeover_jitter_max_seconds > 0:
-            jitter = random.uniform(
-                self._takeover_jitter_min_seconds,
-                self._takeover_jitter_max_seconds,
+        async with self._lock:
+            import sys as _sys
+            if not self._state.is_job_orphaned(job_id):
+                _sys.stderr.write(
+                    f"[ORPHAN-TAKEOVER-SKIP self={self._get_node_addr()} job={job_id[:10]}] "
+                    "reason=not_orphaned\n"
+                )
+                _sys.stderr.flush()
+                return
+
+            job = await self._get_or_repair_job(job_id)
+            if job is None:
+                _sys.stderr.write(
+                    f"[ORPHAN-TAKEOVER-SKIP self={self._get_node_addr()} job={job_id[:10]}] "
+                    "reason=missing_job\n"
+                )
+                _sys.stderr.flush()
+                return
+
+            if job.status in self._terminal_statuses:
+                self._state.clear_orphaned_job(job_id)
+                _sys.stderr.write(
+                    f"[ORPHAN-TAKEOVER-SKIP self={self._get_node_addr()} job={job_id[:10]}] "
+                    f"reason=terminal status={job.status}\n"
+                )
+                _sys.stderr.flush()
+                return
+
+            new_owner = await self._job_hash_ring.get_node(job_id)
+            my_node_id = self._get_node_id().full
+            if new_owner is None or new_owner.node_id != my_node_id:
+                _sys.stderr.write(
+                    f"[ORPHAN-TAKEOVER-SKIP self={self._get_node_addr()} job={job_id[:10]}] "
+                    f"reason=owner_changed new_owner={new_owner.node_id[:30] if new_owner else 'None'} "
+                    f"my_id={my_node_id[:30]}\n"
+                )
+                _sys.stderr.flush()
+                return
+
+            target_dc_count = len(self._job_manager.get_target_dcs(job_id))
+
+            new_token = await self._job_leadership_tracker.takeover_leadership_async(
+                job_id,
+                metadata=target_dc_count,
             )
-            await asyncio.sleep(jitter)
 
-        if not self._state.is_job_orphaned(job_id):
-            return
-
-        job = self._job_manager.get_job(job_id)
-        if not job or job.status in self._terminal_statuses:
             self._state.clear_orphaned_job(job_id)
-            return
-
-        target_dc_count = len(self._job_manager.get_target_dcs(job_id))
-
-        new_token = await self._job_leadership_tracker.takeover_leadership_async(
-            job_id,
-            metadata=target_dc_count,
-        )
-
-        self._state.clear_orphaned_job(job_id)
+            _sys.stderr.write(
+                f"[ORPHAN-TAKEOVER-COMMIT self={self._get_node_addr()} job={job_id[:10]}] "
+                f"fence_token={new_token} target_dcs={target_dc_count}\n"
+            )
+            _sys.stderr.flush()
 
         await self._logger.log(
             ServerInfo(
-                message=f"Took over orphaned job {job_id[:8]}... (fence_token={new_token}, target_dcs={target_dc_count})",
+                message=(
+                    f"Took over orphaned job {job_id[:8]}... "
+                    f"(fence_token={new_token}, target_dcs={target_dc_count})"
+                ),
                 node_host=self._get_node_addr()[0],
                 node_port=self._get_node_addr()[1],
                 node_id=self._get_node_id().short,
