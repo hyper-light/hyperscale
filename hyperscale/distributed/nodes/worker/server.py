@@ -1579,8 +1579,48 @@ class WorkerServer(HealthAwareServer):
                 self._worker_state.mark_workflow_orphaned(workflow_id)
 
     async def _handle_manager_recovery_async(self, manager_id: str) -> None:
-        """Handle manager recovery - mark as healthy."""
+        """Handle manager recovery - mark as healthy and re-register.
+
+        A manager rejoining the cluster after a DEAD detection may have
+        come back with empty in-memory state (the ``_workers`` registry
+        on the manager is not persisted across process restarts). SWIM
+        recovery only tells the manager that we exist as a *peer* —
+        the worker pool registry that powers job dispatch is
+        TCP-registration-driven. Without re-issuing ``worker_register``
+        here, an all-managers-die-then-quorum-returns scenario leaves
+        the returning quorum with an empty worker registry: workers
+        keep running but no manager knows they're available for work.
+
+        Idempotent on the manager side — re-registering an already-
+        known worker just refreshes the entry. Safe under concurrent
+        recovery events for multiple managers (each registers
+        independently against a single per-addr circuit/transport).
+        """
         await self._registry.mark_manager_healthy(manager_id)
+
+        manager_info = self._registry.get_manager(manager_id)
+        if (
+            manager_info is not None
+            and manager_info.tcp_host
+            and manager_info.tcp_port
+        ):
+            manager_addr = (manager_info.tcp_host, manager_info.tcp_port)
+            self._invalidate_tcp_client_transport(manager_addr)
+            self._registry.get_or_create_circuit_by_addr(manager_addr).reset()
+            try:
+                await self._register_with_manager(manager_addr)
+            except Exception as register_error:
+                await self._udp_logger.log(
+                    ServerWarning(
+                        message=(
+                            f"Re-registration with recovered manager "
+                            f"{manager_id[:8]}... failed: {register_error}"
+                        ),
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
 
         await self._udp_logger.log(
             ServerInfo(
