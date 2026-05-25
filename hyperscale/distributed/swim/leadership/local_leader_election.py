@@ -724,6 +724,8 @@ class LocalLeaderElection:
             candidate_lhm=candidate_lhm,
             max_leader_lhm=self.eligibility.max_leader_lhm,
         )
+        if not can_grant and self.state.current_leader and self.state.is_lease_valid():
+            self.state.abort_pre_vote()
         
         # Build response: pre-vote-resp:term:granted>candidate_addr
         granted = b'1' if can_grant else b'0'
