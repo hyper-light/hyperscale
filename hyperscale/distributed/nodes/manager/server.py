@@ -1073,9 +1073,8 @@ class ManagerServer(HealthAwareServer):
         response: ManagerPeerRegistrationResponse,
     ) -> ManagerInfo | None:
         """Build responder manager info from a registration response."""
-        manager_info = getattr(response, "manager_info", None)
-        if manager_info is not None:
-            return manager_info
+        if response.manager_info is not None:
+            return response.manager_info
 
         udp_addr = self._manager_udp_addr_for_tcp(manager_addr)
         if udp_addr is None:
@@ -1180,13 +1179,34 @@ class ManagerServer(HealthAwareServer):
 
         if requires_rejoin_reset:
             await self.reset_peer_for_rejoin(peer_udp_addr)
-            self._task_runner.run(
-                self._handle_manager_peer_recovery,
-                peer_udp_addr,
-                peer_tcp_addr,
+
+        if authoritative_registration:
+            await self._activate_registered_manager_peer(
+                peer_info,
+                bump_epoch=requires_rejoin_reset,
             )
 
         return True
+
+    async def _activate_registered_manager_peer(
+        self,
+        peer_info: ManagerInfo,
+        *,
+        bump_epoch: bool,
+    ) -> None:
+        """Mark a TCP-registered manager peer active across membership stores."""
+        tcp_addr = (peer_info.tcp_host, peer_info.tcp_port)
+        peer_lock = await self._manager_state.get_peer_state_lock(tcp_addr)
+
+        async with peer_lock:
+            if bump_epoch:
+                self._manager_state.increment_peer_state_epoch(tcp_addr)
+
+            await self._manager_state.add_active_peer(tcp_addr, peer_info.node_id)
+            self._manager_state.clear_manager_peer_unhealthy_since(peer_info.node_id)
+            self._manager_state.remove_dead_manager(tcp_addr)
+
+        self._raft.on_node_join(peer_info.node_id, tcp_addr)
 
     async def _register_with_peer_managers(self) -> None:
         """Register with seed peer managers."""
@@ -6810,7 +6830,9 @@ class ManagerServer(HealthAwareServer):
                 tcp_port=registration.tcp_port,
                 udp_host=registration.udp_host,
                 udp_port=registration.udp_port,
-                datacenter=getattr(registration, "datacenter", "global"),
+                datacenter=(
+                    registration.datacenter if registration.datacenter else "global"
+                ),
                 is_leader=registration.is_leader,
             )
 
