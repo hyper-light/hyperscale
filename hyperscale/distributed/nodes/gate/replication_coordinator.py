@@ -489,16 +489,18 @@ class GateJobReplicationCoordinator:
         Returns:
             ``ALREADY_COMMITTED`` when the committed sequence is at or
             above ``replica.sequence`` (idempotent replay).
-            ``REJECTED`` when a higher sequence is already committed
-            (a stale prepare arriving after a newer commit landed).
-            ``PREPARED`` otherwise.
+            ``REJECTED`` when a strictly newer prepare is already
+            in-flight for the same job.
+            ``PREPARED`` when ``replica.sequence`` is newer than the
+            committed sequence or no commit exists yet.
         """
         async with self._lock:
             committed_sequence = self._committed_sequence.get(replica.job_id)
-            if committed_sequence is not None:
-                if committed_sequence >= replica.sequence:
-                    return GateJobReplicaStatus.ALREADY_COMMITTED
-                return GateJobReplicaStatus.REJECTED
+            if (
+                committed_sequence is not None
+                and committed_sequence >= replica.sequence
+            ):
+                return GateJobReplicaStatus.ALREADY_COMMITTED
 
             existing = self._prepared.get(replica.job_id)
             if existing is not None and existing.sequence > replica.sequence:
