@@ -84,6 +84,7 @@ class LocalLeaderElection:
     # Background tasks
     _heartbeat_task: asyncio.Task | None = field(default=None, repr=False)
     _election_task: asyncio.Task | None = field(default=None, repr=False)
+    _election_wake_event: asyncio.Event | None = field(default=None, repr=False)
     _running: bool = False
     
     # Track fallback tasks created when TaskRunner not available
@@ -236,6 +237,7 @@ class LocalLeaderElection:
     async def start(self) -> None:
         """Start the leader election process."""
         self._running = True
+        self._election_wake_event = asyncio.Event()
         self._election_task = asyncio.create_task(self._election_loop())
     
     async def stop(self) -> None:
@@ -256,12 +258,39 @@ class LocalLeaderElection:
             except asyncio.CancelledError:
                 pass
             self._election_task = None
-        
+        self._election_wake_event = None
+
         # Cancel any pending error handler tasks
         for task in list(self._pending_error_tasks):
             if not task.done():
                 task.cancel()
         self._pending_error_tasks.clear()
+
+    def _wake_election_loop(self) -> None:
+        """Wake the election loop after leadership state changes."""
+        if self._election_wake_event is not None:
+            self._election_wake_event.set()
+
+    async def _wait_for_election_wake(self, timeout: float) -> None:
+        """Wait until either the election loop is woken or ``timeout`` elapses."""
+        if timeout <= 0:
+            return
+
+        if self._election_wake_event is None:
+            await asyncio.sleep(timeout)
+            return
+
+        event = self._election_wake_event
+        if event.is_set():
+            event.clear()
+            return
+
+        try:
+            await asyncio.wait_for(event.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            return
+        finally:
+            event.clear()
     
     async def _election_loop(self) -> None:
         """Main election monitoring loop."""
@@ -279,7 +308,9 @@ class LocalLeaderElection:
                         )
                         await self._step_down()
                     else:
-                        await asyncio.sleep(self.heartbeat_interval)
+                        await self._wait_for_election_wake(
+                            self.heartbeat_interval
+                        )
                         await self._send_heartbeat()
 
                 elif self.state.should_start_election():
@@ -291,7 +322,7 @@ class LocalLeaderElection:
                         await self._log_debug(
                             f"election delayed by flapping detector ({delay:.2f}s)"
                         )
-                        await asyncio.sleep(delay)
+                        await self._wait_for_election_wake(delay)
                         continue
 
                     eligible = self.is_self_eligible()
@@ -312,20 +343,24 @@ class LocalLeaderElection:
                                 max_lhm=self.eligibility.max_leader_lhm,
                             )
                         )
-                        await asyncio.sleep(self.get_election_timeout())
-                
+                        await self._wait_for_election_wake(
+                            self.get_election_timeout()
+                        )
+
                 else:
                     # Following a leader, wait for lease to expire
                     wait_time = self.state.time_until_lease_expiry()
-                    await asyncio.sleep(min(wait_time + 0.5, self.heartbeat_interval))
-                    
+                    await self._wait_for_election_wake(
+                        min(wait_time + 0.5, self.heartbeat_interval)
+                    )
+
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 await self._handle_error(
                     UnexpectedError(e, "election_loop")
                 )
-                await asyncio.sleep(1)
+                await self._wait_for_election_wake(1)
     
     async def _handle_error(self, error: ElectionError) -> None:
         """Handle an election error via callback or fallback to logging."""
@@ -419,7 +454,7 @@ class LocalLeaderElection:
             await self._broadcast_message(pre_vote_msg)
             
             # Wait for pre-votes with timeout protection
-            await asyncio.sleep(self.pre_vote_timeout)
+            await self._wait_for_election_wake(self.pre_vote_timeout)
             
             # Check if a valid leader was discovered during pre-vote
             # This prevents continuing with election if we've already
@@ -523,7 +558,7 @@ class LocalLeaderElection:
 
         # Wait for votes
         election_timeout = self.get_election_timeout()
-        await asyncio.sleep(election_timeout)
+        await self._wait_for_election_wake(election_timeout)
 
         # Check if we won
         if self.state.role == 'candidate':  # Still candidate
@@ -607,6 +642,7 @@ class LocalLeaderElection:
         
         await self._record_leader_change(self.self_addr, None, 'stepdown')
         self.state.become_follower(self.state.current_term)
+        self._wake_election_loop()
     
     def handle_claim(
         self,
@@ -661,8 +697,12 @@ class LocalLeaderElection:
         vote_count = self.state.record_vote(voter)
         n_members = self._get_member_count() if self._get_member_count else 1
         votes_needed = (n_members // 2) + 1
-        
-        return vote_count >= votes_needed
+
+        won = vote_count >= votes_needed
+        if won:
+            self._wake_election_loop()
+
+        return won
     
     async def handle_elected(self, leader: tuple[str, int], term: int) -> None:
         """Handle a leader-elected message."""
@@ -671,7 +711,8 @@ class LocalLeaderElection:
             self.state.become_follower(term, leader)
             if old_leader != leader:
                 await self._record_leader_change(old_leader, leader, 'elected')
-    
+            self._wake_election_loop()
+
     async def handle_heartbeat(self, leader: tuple[str, int], term: int) -> None:
         """Handle a leader-heartbeat message."""
         old_leader = self.state.current_leader
@@ -679,13 +720,14 @@ class LocalLeaderElection:
         # Record if this is first time seeing this leader
         if old_leader != leader and leader is not None:
             await self._record_leader_change(old_leader, leader, 'heartbeat')
-    
+            self._wake_election_loop()
+
     async def handle_stepdown(self, leader: tuple[str, int], term: int) -> None:
         """Handle a leader-stepdown message."""
         if leader == self.state.current_leader:
             await self._record_leader_change(leader, None, 'remote_stepdown')
             self.state.current_leader = None
-            # Will trigger election on next loop iteration
+            self._wake_election_loop()
     
     def handle_pre_vote_request(
         self,
@@ -756,6 +798,10 @@ class LocalLeaderElection:
         
         if granted:
             self.state.record_pre_vote(voter)
+            n_members = self._get_member_count() if self._get_member_count else 1
+            pre_votes_needed = max(1, (n_members // 2) + 1)
+            if len(self.state.pre_votes_received) >= pre_votes_needed:
+                self._wake_election_loop()
     
     def handle_discovered_leader(
         self,

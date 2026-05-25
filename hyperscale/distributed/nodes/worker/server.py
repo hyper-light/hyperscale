@@ -1426,6 +1426,23 @@ class WorkerServer(HealthAwareServer):
             base_delay=self._config.registration_base_delay_seconds,
         )
 
+    async def refresh_manager_registrations(self) -> bool:
+        """Refresh manager registration after a lifecycle-level connectivity change."""
+        registered_with_manager = False
+        manager_addr_candidates = dict.fromkeys(self._seed_managers)
+        for manager in self._registry.get_known_manager_values():
+            if manager.tcp_host and manager.tcp_port:
+                manager_addr_candidates[(manager.tcp_host, manager.tcp_port)] = None
+
+        for manager_addr in manager_addr_candidates:
+            self._invalidate_tcp_client_transport(manager_addr)
+            self._registry.get_or_create_circuit_by_addr(manager_addr).reset()
+            if await self._register_with_manager(manager_addr):
+                registered_with_manager = True
+
+        self._cluster_connection.update()
+        return registered_with_manager
+
     async def _send_registration(
         self,
         manager_addr: tuple[str, int],
@@ -1440,9 +1457,57 @@ class WorkerServer(HealthAwareServer):
                 data,
                 timeout=timeout,
             )
+            accepted, _ = await self._process_manager_registration_response(
+                response
+            )
+            if not accepted:
+                return RuntimeError(
+                    f"Manager {manager_addr} rejected worker registration"
+                )
             return response
         except Exception as error:
             return error
+
+    async def _process_manager_registration_response(
+        self,
+        data: bytes,
+    ) -> tuple[bool, str | None]:
+        """Apply a manager registration response to local worker state."""
+        accepted, primary_manager_id = (
+            await self._registration_handler.process_registration_response(
+                data=data,
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id_short=self._node_id.short,
+                add_unconfirmed_peer=self.add_unconfirmed_peer,
+                add_to_probe_scheduler=self.add_to_probe_scheduler,
+                mark_registered=self.register_peer,
+            )
+        )
+
+        if accepted and primary_manager_id:
+            # A successful registration round-trip is the strongest
+            # application-level liveness signal we get from a manager:
+            # the manager not only answered our TCP but accepted us
+            # into its worker registry. Record this as a heartbeat
+            # against every manager we now know is healthy so the
+            # cluster-connection watchdog does not immediately mark
+            # them stale before their first SWIM heartbeat arrives.
+            for manager_id in list(self._registry._healthy_manager_ids):
+                self._cluster_connection.record_heartbeat(manager_id)
+            await self._udp_logger.log(
+                ServerInfo(
+                    message=(
+                        "Registration accepted, primary manager: "
+                        f"{primary_manager_id[:8]}..."
+                    ),
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                ),
+            )
+
+        return accepted, primary_manager_id
 
     def _get_memory_mb(self) -> int:
         """Get total memory in MB."""
@@ -1968,37 +2033,7 @@ class WorkerServer(HealthAwareServer):
         This handler processes RegistrationResponse when managers push registration
         acknowledgments to workers.
         """
-        accepted, primary_manager_id = (
-            await self._registration_handler.process_registration_response(
-                data=data,
-                node_host=self._host,
-                node_port=self._tcp_port,
-                node_id_short=self._node_id.short,
-                add_unconfirmed_peer=self.add_unconfirmed_peer,
-                add_to_probe_scheduler=self.add_to_probe_scheduler,
-                mark_registered=self.register_peer,
-            )
-        )
-
-        if accepted and primary_manager_id:
-            # A successful registration round-trip is the strongest
-            # application-level liveness signal we get from a manager:
-            # the manager not only answered our TCP but accepted us
-            # into its worker registry. Record this as a heartbeat
-            # against every manager we now know is healthy so the
-            # cluster-connection watchdog does not immediately mark
-            # them stale before their first SWIM heartbeat arrives.
-            for manager_id in list(self._registry._healthy_manager_ids):
-                self._cluster_connection.record_heartbeat(manager_id)
-            self._task_runner.run(
-                self._udp_logger.log,
-                ServerInfo(
-                    message=f"Registration accepted, primary manager: {primary_manager_id[:8]}...",
-                    node_host=self._host,
-                    node_port=self._tcp_port,
-                    node_id=self._node_id.short,
-                ),
-            )
+        await self._process_manager_registration_response(data)
 
         return data
 

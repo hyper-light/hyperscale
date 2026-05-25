@@ -507,6 +507,14 @@ class FaultMatrix:
         ):
             await instance._register_with_peer_managers()
 
+        # Worker: re-run the production worker→manager TCP registration
+        # handshake after the pause partition is lifted. SWIM ALIVE gossip
+        # alone cannot restore a worker once managers have detached its
+        # WorkerRegistration and address mapping; worker_register is the
+        # authoritative recovery path for capacity, identity, and pool state.
+        if handle.kind is ServerKind.WORKER:
+            await instance.refresh_manager_registrations()
+
         # Re-announce membership to same-kind SWIM peers. While the
         # node was paused (and its peers' send_udp wrappers blocked by
         # the isolation rule), peers' SWIM probes timed out and the

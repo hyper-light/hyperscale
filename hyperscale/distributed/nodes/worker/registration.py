@@ -216,6 +216,18 @@ class WorkerRegistrationHandler:
             response = RegistrationResponse.load(data)
 
             if not response.accepted:
+                if self._logger:
+                    await self._logger.log(
+                        ServerWarning(
+                            message=(
+                                "Manager rejected worker registration: "
+                                f"{response.error or 'no error provided'}"
+                            ),
+                            node_host=node_host,
+                            node_port=node_port,
+                            node_id=node_id_short,
+                        )
+                    )
                 return (False, None)
 
             # Update known managers
@@ -225,6 +237,8 @@ class WorkerRegistrationHandler:
                 add_to_probe_scheduler,
                 mark_registered=mark_registered,
             )
+            for manager in response.healthy_managers:
+                await self._registry.mark_manager_healthy(manager.node_id)
 
             # Find primary manager (prefer leader)
             primary_manager_id = response.manager_id
@@ -257,7 +271,19 @@ class WorkerRegistrationHandler:
 
             return (True, primary_manager_id)
 
-        except Exception:
+        except Exception as error:
+            if self._logger:
+                await self._logger.log(
+                    ServerError(
+                        message=(
+                            "Failed to process manager registration response: "
+                            f"{type(error).__name__}: {error}"
+                        ),
+                        node_host=node_host,
+                        node_port=node_port,
+                        node_id=node_id_short,
+                    )
+                )
             return (False, None)
 
     async def process_manager_registration(
