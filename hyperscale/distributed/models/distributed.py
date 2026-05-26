@@ -1791,6 +1791,10 @@ class JobStateSyncMessage(Message):
     elapsed_seconds: float = 0.0
     timestamp: float = 0.0
     origin_gate_addr: tuple[str, int] | None = None
+    callback_addr: tuple[str, int] | None = None
+    leader_addr: tuple[str, int] | None = None
+    workflow_snapshots: dict[str, dict[str, Any]] = field(default_factory=dict)
+    sub_workflow_snapshots: dict[str, dict[str, Any]] = field(default_factory=dict)
     context_snapshot: dict[str, dict[str, Any]] = field(default_factory=dict)
     layer_version: int = 0
 
@@ -2419,6 +2423,7 @@ class ManagerStateSnapshot(Message):
     job_layer_versions: dict[str, int] = field(
         default_factory=dict
     )  # job_id -> layer version
+    job_states: dict[str, JobStateSyncMessage] = field(default_factory=dict)
     job_contexts: bytes = b""  # Serialized contexts (cloudpickle)
     # Pending stats checkpoint for recovery (Task 33)
     # List of (timestamp, value) tuples from the stats buffer

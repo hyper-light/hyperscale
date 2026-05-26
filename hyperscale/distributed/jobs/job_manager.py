@@ -332,6 +332,254 @@ class JobManager:
             self._jobs[job_token_str] = job
             return job
 
+    async def hydrate_remote_job_state(
+        self,
+        *,
+        job_id: str,
+        leader_node_id: str,
+        leader_addr: tuple[str, int],
+        status: str,
+        workflows_total: int,
+        workflows_completed: int,
+        workflows_failed: int,
+        fencing_token: int,
+        callback_addr: tuple[str, int] | None,
+        workflow_snapshots: dict[str, dict[str, Any]],
+        sub_workflow_snapshots: dict[str, dict[str, Any]],
+        layer_version: int,
+        elapsed_seconds: float,
+        timestamp: float,
+        replace_existing: bool = True,
+    ) -> JobInfo:
+        """Hydrate executable job state replicated from a peer manager.
+
+        Peer managers must preserve the original workflow/sub-workflow token
+        strings. Workers send terminal results using those dispatch-time
+        tokens, so recreating local-manager tokens during failover would make
+        the new leader authoritative but unable to record results.
+        """
+        job_token = self.create_job_token(job_id)
+        job_token_str = str(job_token)
+
+        async with self._global_lock:
+            job = self._jobs.get(job_token_str)
+            if job is None:
+                job = JobInfo(
+                    token=job_token,
+                    submission=None,
+                    status=status,
+                    timestamp=timestamp,
+                    leader_node_id=leader_node_id,
+                    leader_addr=leader_addr,
+                    fencing_token=fencing_token,
+                    callback_addr=callback_addr,
+                )
+                self._jobs[job_token_str] = job
+            else:
+                job.leader_node_id = leader_node_id
+                job.leader_addr = leader_addr
+                job.fencing_token = max(job.fencing_token, fencing_token)
+                if callback_addr is not None:
+                    job.callback_addr = callback_addr
+
+        async with job.lock:
+            terminal_statuses = {
+                JobStatus.COMPLETED.value,
+                JobStatus.FAILED.value,
+                JobStatus.CANCELLED.value,
+                JobStatus.TIMEOUT.value,
+            }
+            if replace_existing or job.status not in terminal_statuses:
+                job.status = status
+
+            if replace_existing:
+                job.workflows_total = workflows_total
+                job.workflows_completed = workflows_completed
+                job.workflows_failed = workflows_failed
+            else:
+                job.workflows_total = max(job.workflows_total, workflows_total)
+                job.workflows_completed = max(
+                    job.workflows_completed,
+                    workflows_completed,
+                )
+                job.workflows_failed = max(job.workflows_failed, workflows_failed)
+
+            job.timestamp = timestamp
+            job.layer_version = max(job.layer_version, layer_version)
+            if elapsed_seconds > 0:
+                hydrated_started_at = time.monotonic() - elapsed_seconds
+                if job.started_at == 0.0 or hydrated_started_at < job.started_at:
+                    job.started_at = hydrated_started_at
+
+            if replace_existing:
+                current_workflow_tokens = set(job.workflows)
+                snapshot_workflow_tokens = set(workflow_snapshots)
+                for stale_workflow_token in (
+                    current_workflow_tokens - snapshot_workflow_tokens
+                ):
+                    job.workflows.pop(stale_workflow_token, None)
+                    self._workflow_to_job.pop(stale_workflow_token, None)
+
+            for workflow_token_str, workflow_snapshot in workflow_snapshots.items():
+                workflow_token = TrackingToken.parse(
+                    str(workflow_snapshot["token"])
+                )
+                workflow_status = self._workflow_status_from_value(
+                    str(workflow_snapshot["status"])
+                )
+                workflow = job.workflows.get(workflow_token_str)
+                if workflow is None:
+                    workflow = WorkflowInfo(
+                        token=workflow_token,
+                        name=str(workflow_snapshot["name"]),
+                        workflow=None,
+                        status=workflow_status,
+                    )
+                    job.workflows[workflow_token_str] = workflow
+                else:
+                    workflow.name = str(workflow_snapshot["name"])
+                    workflow.status = workflow_status
+
+                workflow.sub_workflow_tokens = [
+                    str(token)
+                    for token in workflow_snapshot["sub_workflow_tokens"]
+                ]
+                workflow.error = workflow_snapshot["error"]
+                workflow.aggregation_error = workflow_snapshot["aggregation_error"]
+                workflow.terminal_pushed = bool(workflow_snapshot["terminal_pushed"])
+                workflow.terminal_status = workflow_snapshot["terminal_status"]
+                self._workflow_to_job[workflow_token_str] = job_token_str
+
+            if replace_existing:
+                current_sub_workflow_tokens = set(job.sub_workflows)
+                snapshot_sub_workflow_tokens = set(sub_workflow_snapshots)
+                for stale_sub_workflow_token in (
+                    current_sub_workflow_tokens - snapshot_sub_workflow_tokens
+                ):
+                    job.sub_workflows.pop(stale_sub_workflow_token, None)
+                    self._sub_workflow_to_job.pop(stale_sub_workflow_token, None)
+
+            for (
+                sub_workflow_token_str,
+                sub_workflow_snapshot,
+            ) in sub_workflow_snapshots.items():
+                sub_workflow_token = TrackingToken.parse(
+                    str(sub_workflow_snapshot["token"])
+                )
+                parent_token = TrackingToken.parse(
+                    str(sub_workflow_snapshot["parent_token"])
+                )
+                sub_workflow = job.sub_workflows.get(sub_workflow_token_str)
+                if sub_workflow is None:
+                    sub_workflow = SubWorkflowInfo(
+                        token=sub_workflow_token,
+                        parent_token=parent_token,
+                        cores_allocated=int(sub_workflow_snapshot["cores_allocated"]),
+                        fence_token=int(sub_workflow_snapshot["fence_token"]),
+                    )
+                    job.sub_workflows[sub_workflow_token_str] = sub_workflow
+                else:
+                    sub_workflow.parent_token = parent_token
+                    sub_workflow.cores_allocated = int(
+                        sub_workflow_snapshot["cores_allocated"]
+                    )
+                    sub_workflow.fence_token = int(sub_workflow_snapshot["fence_token"])
+
+                sub_workflow.progress = sub_workflow_snapshot["progress"]
+                sub_workflow.result = sub_workflow_snapshot["result"]
+                sub_workflow.dispatched_context = sub_workflow_snapshot[
+                    "dispatched_context"
+                ]
+                sub_workflow.dispatched_version = int(
+                    sub_workflow_snapshot["dispatched_version"]
+                )
+                sub_workflow.superseded = bool(sub_workflow_snapshot["superseded"])
+                self._sub_workflow_to_job[sub_workflow_token_str] = job_token_str
+
+                parent = job.workflows.get(str(parent_token))
+                if (
+                    parent is not None
+                    and sub_workflow_token_str not in parent.sub_workflow_tokens
+                ):
+                    parent.sub_workflow_tokens.append(sub_workflow_token_str)
+
+            job.workflows_total = max(job.workflows_total, len(job.workflows))
+
+        return job
+
+    async def hydrate_worker_active_workflow(
+        self,
+        *,
+        progress: WorkflowProgress,
+        worker_id: str,
+        leader_node_id: str,
+        leader_addr: tuple[str, int],
+        fencing_token: int,
+        callback_addr: tuple[str, int] | None,
+    ) -> JobInfo:
+        """Hydrate active workflow state from a worker-owned snapshot."""
+        sub_workflow_token = TrackingToken.parse(progress.workflow_id)
+        if not sub_workflow_token.workflow_id:
+            raise ValueError(
+                f"Worker {worker_id} active workflow has no parent workflow token: "
+                f"{progress.workflow_id}"
+            )
+
+        workflow_token = sub_workflow_token.to_parent_workflow_token()
+        cores_allocated = (
+            progress.worker_workflow_assigned_cores
+            or len(progress.assigned_cores)
+            or 1
+        )
+        workflow_snapshot = {
+            "token": str(workflow_token),
+            "name": progress.workflow_name,
+            "status": progress.status,
+            "sub_workflow_tokens": [progress.workflow_id],
+            "error": None,
+            "aggregation_error": None,
+            "terminal_pushed": False,
+            "terminal_status": None,
+        }
+        sub_workflow_snapshot = {
+            "token": progress.workflow_id,
+            "parent_token": str(workflow_token),
+            "cores_allocated": cores_allocated,
+            "fence_token": fencing_token,
+            "progress": progress,
+            "result": None,
+            "dispatched_context": b"",
+            "dispatched_version": 0,
+            "superseded": False,
+        }
+
+        return await self.hydrate_remote_job_state(
+            job_id=progress.job_id or sub_workflow_token.job_id,
+            leader_node_id=leader_node_id,
+            leader_addr=leader_addr,
+            status=JobStatus.RUNNING.value,
+            workflows_total=1,
+            workflows_completed=0,
+            workflows_failed=0,
+            fencing_token=fencing_token,
+            callback_addr=callback_addr,
+            workflow_snapshots={str(workflow_token): workflow_snapshot},
+            sub_workflow_snapshots={progress.workflow_id: sub_workflow_snapshot},
+            layer_version=0,
+            elapsed_seconds=0.0,
+            timestamp=time.time(),
+            replace_existing=False,
+        )
+
+    @staticmethod
+    def _workflow_status_from_value(status: str) -> WorkflowStatus:
+        """Convert a wire status value into ``WorkflowStatus``."""
+        for candidate in WorkflowStatus:
+            if candidate.value == status:
+                return candidate
+
+        raise ValueError(f"Unknown workflow status: {status}")
+
     def get_job(self, job_token_or_id: str | TrackingToken) -> JobInfo | None:
         """Get job info by token-string or bare job_id.
 

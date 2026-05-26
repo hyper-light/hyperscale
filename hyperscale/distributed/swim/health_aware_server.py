@@ -288,6 +288,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         )
         self._burst_failure_active: bool = False
         self._burst_failure_run: Run | None = None
+        self._burst_confirmed_dead: dict[tuple[str, int], tuple[int, float]] = {}
 
         # Hierarchical failure detector for multi-layer detection (AD-30)
         # - Global layer: Machine-level liveness (via timing wheel)
@@ -963,6 +964,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         """
         self._registered_peers.discard(peer)
         self._global_suspicion_started_at.pop(peer, None)
+        self._burst_confirmed_dead.pop(peer, None)
 
     def is_peer_registered(self, peer: tuple[str, int]) -> bool:
         """Whether ``peer`` has completed an explicit registration handshake."""
@@ -1121,6 +1123,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         self._unconfirmed_peers.discard(peer)
         self._unconfirmed_peer_added_at.pop(peer, None)
         self._global_suspicion_started_at.pop(peer, None)
+        self._burst_confirmed_dead.pop(peer, None)
         await self._incarnation_tracker.remove_node(peer)
         self._incarnation_tracker.clear_death_record(peer)
         self._peer_probe_reliability.remove_peer(peer)
@@ -2680,6 +2683,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             time.monotonic(),
         )
         self._global_suspicion_started_at.pop(node, None)
+        self._burst_confirmed_dead.pop(node, None)
         self._gossip_buffer.remove_node(node)
         self._probe_scheduler.add_member(node)
 
@@ -2699,6 +2703,9 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         suspicion_started_at: float,
     ) -> bool:
         """Return whether a no-witness SUSPECT expiry may become DEAD."""
+        if self._consume_burst_dead_confirmation(node, incarnation):
+            return True
+
         if not self._requires_unwitnessed_dead_confirmation(node):
             return True
 
@@ -2724,6 +2731,45 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             if attempt_number + 1 < attempt_count:
                 await asyncio.sleep(0)
 
+        return True
+
+    def _record_burst_dead_confirmation(
+        self,
+        node: tuple[str, int],
+        incarnation: int,
+    ) -> None:
+        """Record AD-53 confirmation that a burst target failed SWIM probes."""
+        proof_ttl = self._burst_failure_window_seconds
+        if self._hierarchical_detector is not None:
+            detector_config = self._hierarchical_detector.config
+            proof_ttl = max(
+                proof_ttl,
+                detector_config.global_max_timeout
+                + (
+                    detector_config.global_max_timeout
+                    - detector_config.global_min_timeout
+                ),
+            )
+        expires_at = time.monotonic() + proof_ttl
+        self._burst_confirmed_dead[node] = (incarnation, expires_at)
+
+    def _consume_burst_dead_confirmation(
+        self,
+        node: tuple[str, int],
+        incarnation: int,
+    ) -> bool:
+        """Consume a fresh AD-53 confirmation proof for a suspicion expiry."""
+        proof = self._burst_confirmed_dead.get(node)
+        if proof is None:
+            return False
+
+        proof_incarnation, expires_at = proof
+        now = time.monotonic()
+        if now > expires_at or proof_incarnation != incarnation:
+            self._burst_confirmed_dead.pop(node, None)
+            return False
+
+        self._burst_confirmed_dead.pop(node, None)
         return True
 
     def _get_election_member_count(self) -> int:
@@ -2756,6 +2802,50 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             1 for role in self._peer_roles.values() if role == self_role
         )
         return same_tier_peers + 1  # plus self
+
+    async def _commit_confirmed_global_death(
+        self,
+        node: tuple[str, int],
+        incarnation: int,
+        source: str,
+    ) -> bool:
+        """Commit a confirmed global DEAD transition through one pipeline."""
+        now = time.monotonic()
+        applied = await self.update_node_state(
+            node,
+            b"DEAD",
+            incarnation,
+            now,
+        )
+        if not applied:
+            self._metrics.increment("suspicions_expired_stale")
+            self._global_suspicion_started_at.pop(node, None)
+            self._burst_confirmed_dead.pop(node, None)
+            if self._hierarchical_detector is not None:
+                await self._hierarchical_detector.clear_global_suspicion(
+                    node,
+                    incarnation,
+                )
+            return False
+
+        self._metrics.increment("suspicions_expired")
+        self._global_suspicion_started_at.pop(node, None)
+        self._burst_confirmed_dead.pop(node, None)
+        self._audit_log.record(
+            AuditEventType.NODE_CONFIRMED_DEAD,
+            node=node,
+            incarnation=incarnation,
+        )
+
+        if self._hierarchical_detector is not None:
+            await self._hierarchical_detector.commit_global_death(
+                node,
+                incarnation,
+            )
+
+        self.queue_gossip_update("dead", node, incarnation)
+        self.notify_node_dead(node, incarnation, source)
+        return True
 
     async def _on_suspicion_expired(
         self, node: tuple[str, int], incarnation: int
@@ -2797,42 +2887,11 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         if not gate_allows:
             return
 
-        applied = await self._incarnation_tracker.update_node(
+        await self._commit_confirmed_global_death(
             node,
-            b"DEAD",
             incarnation,
-            now,
+            "suspicion_expired",
         )
-        if not applied:
-            # Stale wheel-expiration: the tracker has already moved
-            # past this incarnation (e.g. via rejoin). Discard the
-            # entire post-DEAD pipeline and make sure HFD does not retain
-            # a global-dead marker for an uncommitted DEAD transition.
-            self._metrics.increment("suspicions_expired_stale")
-            self._global_suspicion_started_at.pop(node, None)
-            if self._hierarchical_detector is not None:
-                await self._hierarchical_detector.clear_global_suspicion(
-                    node,
-                    incarnation,
-                )
-            return
-
-        self._metrics.increment("suspicions_expired")
-        self._global_suspicion_started_at.pop(node, None)
-        self._audit_log.record(
-            AuditEventType.NODE_CONFIRMED_DEAD,
-            node=node,
-            incarnation=incarnation,
-        )
-
-        if self._hierarchical_detector is not None:
-            await self._hierarchical_detector.commit_global_death(
-                node,
-                incarnation,
-            )
-
-        self.queue_gossip_update("dead", node, incarnation)
-        self.notify_node_dead(node, incarnation, "suspicion_expired")
 
     def _on_hierarchical_detector_error(
         self,
@@ -3946,6 +4005,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         if not self._running or self._is_target_already_suspect_or_dead(target):
             return False
 
+        self._record_burst_dead_confirmation(target, incarnation)
         await self.start_suspicion(target, incarnation, self_addr)
         self.queue_suspicion_update(target, incarnation)
         return False

@@ -847,6 +847,7 @@ class ManagerServer(HealthAwareServer):
             manager_id=self._node_id.full,
             datacenter=self._node_id.datacenter,
             send_dispatch=self._send_workflow_dispatch,
+            on_dispatch_state_registered=self._replicate_job_state_for_dispatch,
             env=self.env,
             max_concurrent_dispatches=self._config.dispatch_max_concurrent_workers,
         )
@@ -1462,7 +1463,7 @@ class ManagerServer(HealthAwareServer):
     def _on_manager_become_leader(self) -> None:
         """Handle becoming SWIM cluster leader."""
         self._task_runner.run(self._sync_state_from_workers)
-        self._task_runner.run(self._sync_state_from_manager_peers)
+        self._task_runner.run(self._sync_full_state_from_manager_peers)
         self._task_runner.run(self._scan_for_orphaned_jobs)
         self._task_runner.run(self._resume_timeout_tracking_for_all_jobs)
 
@@ -2179,6 +2180,8 @@ class ManagerServer(HealthAwareServer):
         if not accepted:
             return False
 
+        await self._hydrate_job_state_for_takeover(job_id)
+
         job = self._job_manager.get_job_by_id(job_id)
         workflow_names: list[str] = []
         if job is not None:
@@ -2207,6 +2210,21 @@ class ManagerServer(HealthAwareServer):
         # leader's persisted TimeoutTrackingState.
         self._replay_extension_state_for_job(job_id)
         return True
+
+    async def _hydrate_job_state_for_takeover(self, job_id: str) -> None:
+        """Hydrate executable job state before serving a taken-over job."""
+        await self._sync_state_from_manager_peers(force_full=True)
+        await self._sync_state_from_workers()
+
+        job = self._job_manager.get_job_by_id(job_id)
+        if job is None:
+            return
+
+        await self._sync_job_state_to_peers(
+            job_id,
+            job,
+            require_quorum=False,
+        )
 
     async def _notify_origin_gate_job_leader_transfer(
         self,
@@ -2697,10 +2715,9 @@ class ManagerServer(HealthAwareServer):
         probe walk reaches it — at large ``N`` that walk is the limiting
         factor on dead-detection latency. With this escalation the global
         layer treats the job-layer expiry as a peer-equivalent confirmation
-        and runs the standard ``update_node_state(DEAD) → notify_node_dead
-        → _on_node_dead`` chain so registry cleanup, reassignment, and the
-        SWIM ``dead`` gossip update fire identically to a probe-driven
-        death.
+        and runs the standard confirmed-DEAD commit chain so registry cleanup,
+        reassignment, HFD global-death state, and SWIM ``dead`` gossip fire
+        identically to a probe-driven death.
 
         Two gates protect against false positives:
 
@@ -2738,20 +2755,13 @@ class ManagerServer(HealthAwareServer):
             return
 
         incarnation = node_state.incarnation
-        updated = await self.update_node_state(
-            udp_addr,
-            b"DEAD",
-            incarnation,
-            time.monotonic(),
-        )
-        if not updated:
-            return
-
-        self.notify_node_dead(
+        updated = await self._commit_confirmed_global_death(
             udp_addr,
             incarnation,
             "ad30_job_layer_escalation",
         )
+        if not updated:
+            return
 
         await self._udp_logger.log(
             ServerWarning(
@@ -3118,9 +3128,24 @@ class ManagerServer(HealthAwareServer):
         self, job_id: str, job: JobInfo
     ) -> JobStateSyncMessage:
         elapsed_seconds = time.monotonic() - job.started_at if job.started_at else 0.0
-        origin_gate_addr = job.submission.origin_gate_addr if job.submission else None
+        origin_gate_addr = (
+            job.submission.origin_gate_addr
+            if job.submission and job.submission.origin_gate_addr
+            else self._manager_state.get_job_origin_gate(job_id)
+        )
+        callback_addr = self._get_job_callback_addr(job_id)
+        leader_id = (
+            self._manager_state.get_job_leader(job_id)
+            or job.leader_node_id
+            or self._node_id.full
+        )
+        leader_addr = (
+            self._manager_state.get_job_leader_addr(job_id)
+            or job.leader_addr
+            or (self._host, self._tcp_port)
+        )
         return JobStateSyncMessage(
-            leader_id=self._node_id.full,
+            leader_id=leader_id,
             job_id=job_id,
             status=job.status,
             fencing_token=self._leases.get_fence_token(job_id),
@@ -3133,21 +3158,83 @@ class ManagerServer(HealthAwareServer):
             elapsed_seconds=elapsed_seconds,
             timestamp=time.monotonic(),
             origin_gate_addr=origin_gate_addr,
+            callback_addr=callback_addr,
+            leader_addr=leader_addr,
+            workflow_snapshots=self._build_workflow_state_snapshots(job),
+            sub_workflow_snapshots=self._build_sub_workflow_state_snapshots(job),
             context_snapshot=job.context.dict(),
             layer_version=job.layer_version,
         )
 
-    async def _sync_job_state_to_peers(self, job_id: str, job: JobInfo) -> None:
-        sync_msg = self._build_job_state_sync_message(job_id, job)
+    def _build_workflow_state_snapshots(
+        self,
+        job: JobInfo,
+    ) -> dict[str, dict[str, object]]:
+        snapshots: dict[str, dict[str, object]] = {}
+        for workflow_token, workflow in job.workflows.items():
+            if isinstance(workflow.status, WorkflowStatus):
+                status = workflow.status.value
+            else:
+                status = str(workflow.status)
 
-        for peer_addr in self._manager_state.get_active_manager_peers():
+            snapshots[workflow_token] = {
+                "token": str(workflow.token),
+                "name": workflow.name,
+                "status": status,
+                "sub_workflow_tokens": list(workflow.sub_workflow_tokens),
+                "error": workflow.error,
+                "aggregation_error": workflow.aggregation_error,
+                "terminal_pushed": workflow.terminal_pushed,
+                "terminal_status": workflow.terminal_status,
+            }
+
+        return snapshots
+
+    def _build_sub_workflow_state_snapshots(
+        self,
+        job: JobInfo,
+    ) -> dict[str, dict[str, object]]:
+        snapshots: dict[str, dict[str, object]] = {}
+        for sub_workflow_token, sub_workflow in job.sub_workflows.items():
+            snapshots[sub_workflow_token] = {
+                "token": str(sub_workflow.token),
+                "parent_token": str(sub_workflow.parent_token),
+                "cores_allocated": sub_workflow.cores_allocated,
+                "fence_token": sub_workflow.fence_token,
+                "progress": sub_workflow.progress,
+                "result": sub_workflow.result,
+                "dispatched_context": sub_workflow.dispatched_context,
+                "dispatched_version": sub_workflow.dispatched_version,
+                "superseded": sub_workflow.superseded,
+            }
+
+        return snapshots
+
+    async def _sync_job_state_to_peers(
+        self,
+        job_id: str,
+        job: JobInfo,
+        *,
+        require_quorum: bool = False,
+    ) -> bool:
+        sync_msg = self._build_job_state_sync_message(job_id, job)
+        peer_addrs = list(self._manager_state.get_active_manager_peers())
+        if not peer_addrs:
+            return not require_quorum or self._quorum_size <= 1
+
+        async def send_sync(peer_addr: tuple[str, int]) -> bool:
             try:
-                await self._send_to_peer(
+                response = await self._send_to_peer(
                     peer_addr,
                     "job_state_sync",
                     sync_msg.dump(),
                     timeout=2.0,
                 )
+                if not response or isinstance(response, Exception):
+                    return False
+
+                ack = JobStateSyncAck.load(response)
+                return ack.accepted
             except Exception as sync_error:
                 await self._udp_logger.log(
                     ServerDebug(
@@ -3157,6 +3244,26 @@ class ManagerServer(HealthAwareServer):
                         node_id=self._node_id.short,
                     )
                 )
+                return False
+
+        results = await asyncio.gather(*(send_sync(peer_addr) for peer_addr in peer_addrs))
+        replicated_count = 1 + sum(1 for accepted in results if accepted)
+        if require_quorum:
+            return replicated_count >= self._quorum_size
+
+        return True
+
+    async def _replicate_job_state_for_dispatch(self, job_id: str) -> bool:
+        """Replicate executable job state before dispatch leaves this manager."""
+        job = self._job_manager.get_job_by_id(job_id)
+        if job is None:
+            return False
+
+        return await self._sync_job_state_to_peers(
+            job_id,
+            job,
+            require_quorum=True,
+        )
 
     async def _peer_job_state_sync_loop(self) -> None:
         """
@@ -3336,6 +3443,9 @@ class ManagerServer(HealthAwareServer):
                                 worker_reg.available_cores = (
                                     worker_snapshot.available_cores
                                 )
+                        await self._hydrate_active_workflows_from_worker_snapshot(
+                            worker_snapshot
+                        )
 
             except Exception as error:
                 await self._udp_logger.log(
@@ -3347,16 +3457,36 @@ class ManagerServer(HealthAwareServer):
                     )
                 )
 
-    async def _sync_state_from_manager_peers(self) -> None:
+    async def _hydrate_active_workflows_from_worker_snapshot(
+        self,
+        worker_snapshot: WorkerStateSnapshot,
+    ) -> None:
+        """Rebuild active job/sub-workflow indexes from worker-owned state."""
+        leader_addr = (self._host, self._tcp_port)
+        for progress in worker_snapshot.active_workflows.values():
+            if not self._leases.is_job_leader(progress.job_id):
+                continue
+
+            await self._job_manager.hydrate_worker_active_workflow(
+                progress=progress,
+                worker_id=worker_snapshot.node_id,
+                leader_node_id=self._node_id.full,
+                leader_addr=leader_addr,
+                fencing_token=self._leases.get_fence_token(progress.job_id),
+                callback_addr=self._get_job_callback_addr(progress.job_id),
+            )
+
+    async def _sync_state_from_manager_peers(self, *, force_full: bool = False) -> None:
         """Sync state from peer managers."""
         for peer_addr in self._manager_state.get_active_manager_peers():
             try:
+                since_version = -1 if force_full else self._manager_state.state_version
                 request = StateSyncRequest(
                     requester_id=self._node_id.full,
                     requester_role="manager",
                     cluster_id=self._config.cluster_id,
                     environment_id=self._config.environment_id,
-                    since_version=self._manager_state.state_version,
+                    since_version=since_version,
                 )
 
                 response, _clock = await self.send_tcp(
@@ -3382,6 +3512,11 @@ class ManagerServer(HealthAwareServer):
                                 fencing_token=fence_token,
                                 layer_version=peer_snapshot.job_layer_versions.get(job_id),
                             )
+                        for sync_msg in peer_snapshot.job_states.values():
+                            await self._apply_job_state_sync_message(
+                                sync_msg,
+                                peer_addr,
+                            )
 
             except Exception as error:
                 await self._udp_logger.log(
@@ -3392,6 +3527,10 @@ class ManagerServer(HealthAwareServer):
                         node_id=self._node_id.short,
                     )
                 )
+
+    async def _sync_full_state_from_manager_peers(self) -> None:
+        """Force a full peer-manager state sync after leadership changes."""
+        await self._sync_state_from_manager_peers(force_full=True)
 
     async def _scan_for_orphaned_jobs(self) -> None:
         """Scan for orphaned jobs from dead managers.
@@ -3483,17 +3622,13 @@ class ManagerServer(HealthAwareServer):
             if not worker_id:
                 continue
 
-            workflow_id = sub_workflow.parent_token.workflow_id
-            if not workflow_id:
-                workflow_id = sub_workflow.token.workflow_id
-            if not workflow_id:
-                continue
-
             workflow_info = job.workflows.get(str(sub_workflow.parent_token))
             if workflow_info and workflow_info.status != WorkflowStatus.RUNNING:
                 continue
 
-            workflow_ids_by_worker.setdefault(worker_id, set()).add(workflow_id)
+            workflow_ids_by_worker.setdefault(worker_id, set()).add(
+                str(sub_workflow.token)
+            )
 
         return {
             worker_id: list(workflow_ids)
@@ -6377,8 +6512,32 @@ class ManagerServer(HealthAwareServer):
             # actual job leader.
             if not self._leases.is_job_leader(job_id):
                 leader_addr = self._leases.get_job_leader_addr(job_id)
+                self_addr = (self._host, self._tcp_port)
+                if self.is_leader() and (leader_addr is None or leader_addr == self_addr):
+                    old_leader_id = self._manager_state.get_job_leader(job_id)
+                    taken_over = await self._take_over_job_leadership_as_cluster_leader(
+                        job_id,
+                        old_leader_id,
+                    )
+                    if taken_over:
+                        job = self._job_manager.get_job_by_id(job_id)
+                    else:
+                        return self._build_cancel_response(
+                            job_id,
+                            success=False,
+                            error="Job leader transition in progress",
+                            leader_addr=None,
+                        )
+
+                if self._leases.is_job_leader(job_id):
+                    leader_addr = None
+
+            if not self._leases.is_job_leader(job_id):
+                leader_addr = self._leases.get_job_leader_addr(job_id)
                 if leader_addr is None:
                     leader_addr = self._resolve_dc_leader_addr()
+                if leader_addr == (self._host, self._tcp_port):
+                    leader_addr = None
                 leader_hint = (
                     f"{leader_addr[0]}:{leader_addr[1]}"
                     if leader_addr
@@ -6687,6 +6846,10 @@ class ManagerServer(HealthAwareServer):
                 job_leader_addrs=dict(self._manager_state._job_leader_addrs),
                 job_fence_tokens=dict(self._manager_state._job_fencing_tokens),
                 job_layer_versions=dict(self._manager_state._job_layer_version),
+                job_states={
+                    job.job_id: self._build_job_state_sync_message(job.job_id, job)
+                    for job in self._job_manager.iter_jobs()
+                },
                 job_contexts=self._serialize_job_contexts(),
             )
 
@@ -8085,6 +8248,88 @@ class ManagerServer(HealthAwareServer):
             )
             return b"error"
 
+    async def _apply_job_state_sync_message(
+        self,
+        sync_msg: JobStateSyncMessage,
+        source_addr: tuple[str, int],
+    ) -> JobInfo:
+        """Apply peer-replicated executable job state to the local manager."""
+        leader_addr = (
+            tuple(sync_msg.leader_addr)
+            if sync_msg.leader_addr is not None
+            else source_addr
+        )
+        leader_id = sync_msg.leader_id
+        fencing_token = sync_msg.fencing_token
+        current_fencing_token = self._leases.get_fence_token(sync_msg.job_id)
+        current_leader_id = self._manager_state.get_job_leader(sync_msg.job_id)
+        current_leader_addr = self._manager_state.get_job_leader_addr(sync_msg.job_id)
+        if (
+            current_leader_id is not None
+            and current_leader_addr is not None
+            and current_fencing_token > sync_msg.fencing_token
+        ):
+            leader_id = current_leader_id
+            leader_addr = tuple(current_leader_addr)
+            fencing_token = current_fencing_token
+
+        callback_addr = (
+            tuple(sync_msg.callback_addr)
+            if sync_msg.callback_addr is not None
+            else None
+        )
+
+        accepted = self._leases.apply_job_leadership(
+            job_id=sync_msg.job_id,
+            leader_id=leader_id,
+            leader_addr=leader_addr,
+            fencing_token=fencing_token,
+            layer_version=sync_msg.layer_version,
+        )
+        if not accepted:
+            raise RuntimeError(
+                f"Rejected conflicting job state sync for {sync_msg.job_id} "
+                f"from leader {sync_msg.leader_id} at fence {sync_msg.fencing_token}"
+            )
+
+        job = await self._job_manager.hydrate_remote_job_state(
+            job_id=sync_msg.job_id,
+            leader_node_id=leader_id,
+            leader_addr=leader_addr,
+            status=sync_msg.status,
+            workflows_total=sync_msg.workflows_total,
+            workflows_completed=sync_msg.workflows_completed,
+            workflows_failed=sync_msg.workflows_failed,
+            fencing_token=fencing_token,
+            callback_addr=callback_addr,
+            workflow_snapshots=sync_msg.workflow_snapshots,
+            sub_workflow_snapshots=sync_msg.sub_workflow_snapshots,
+            layer_version=sync_msg.layer_version,
+            elapsed_seconds=sync_msg.elapsed_seconds,
+            timestamp=time.time(),
+        )
+
+        if sync_msg.context_snapshot and sync_msg.layer_version >= job.layer_version:
+            async with job.lock:
+                for workflow_name, values in sync_msg.context_snapshot.items():
+                    await job.context.from_dict(workflow_name, values)
+                job.layer_version = sync_msg.layer_version
+
+        self._leases.update_fence_token_if_higher(
+            sync_msg.job_id, fencing_token
+        )
+
+        if callback_addr is not None:
+            self._manager_state.set_job_callback(sync_msg.job_id, callback_addr)
+            self._manager_state.set_progress_callback(sync_msg.job_id, callback_addr)
+
+        if sync_msg.origin_gate_addr:
+            self._manager_state.set_job_origin_gate(
+                sync_msg.job_id, tuple(sync_msg.origin_gate_addr)
+            )
+
+        return job
+
     @tcp.receive()
     async def job_state_sync(
         self,
@@ -8098,37 +8343,19 @@ class ManagerServer(HealthAwareServer):
 
             # Only accept from actual job leader
             current_leader = self._manager_state.get_job_leader(sync_msg.job_id)
-            if current_leader and current_leader != sync_msg.leader_id:
+            current_fencing_token = self._leases.get_fence_token(sync_msg.job_id)
+            if (
+                current_leader
+                and current_leader != sync_msg.leader_id
+                and sync_msg.fencing_token <= current_fencing_token
+            ):
                 return JobStateSyncAck(
                     job_id=sync_msg.job_id,
                     responder_id=self._node_id.full,
                     accepted=False,
                 ).dump()
 
-            if job := self._job_manager.get_job(sync_msg.job_id):
-                job.status = sync_msg.status
-                job.workflows_total = sync_msg.workflows_total
-                job.workflows_completed = sync_msg.workflows_completed
-                job.workflows_failed = sync_msg.workflows_failed
-                job.timestamp = time.time()
-
-                if (
-                    sync_msg.context_snapshot
-                    and sync_msg.layer_version > job.layer_version
-                ):
-                    async with job.lock:
-                        for workflow_name, values in sync_msg.context_snapshot.items():
-                            await job.context.from_dict(workflow_name, values)
-                        job.layer_version = sync_msg.layer_version
-
-            self._leases.update_fence_token_if_higher(
-                sync_msg.job_id, sync_msg.fencing_token
-            )
-
-            if sync_msg.origin_gate_addr:
-                self._manager_state.set_job_origin_gate(
-                    sync_msg.job_id, sync_msg.origin_gate_addr
-                )
+            await self._apply_job_state_sync_message(sync_msg, addr)
 
             return JobStateSyncAck(
                 job_id=sync_msg.job_id,
@@ -8438,6 +8665,20 @@ class ManagerServer(HealthAwareServer):
                 workflows,
             )
             if registered:
+                job = self._job_manager.get_job_by_id(submission.job_id)
+                if job is None:
+                    raise RuntimeError(
+                        f"Registered workflows for missing job {submission.job_id}"
+                    )
+                replicated = await self._sync_job_state_to_peers(
+                    submission.job_id,
+                    job,
+                    require_quorum=True,
+                )
+                if not replicated:
+                    raise RuntimeError(
+                        f"Could not quorum-replicate job {submission.job_id} before dispatch"
+                    )
                 await self._workflow_dispatcher.start_job_dispatch(
                     submission.job_id, submission
                 )

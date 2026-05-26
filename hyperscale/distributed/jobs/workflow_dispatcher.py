@@ -81,6 +81,8 @@ class WorkflowDispatcher:
         | None = None,
         on_dispatch_failed: Callable[[str, str, str], Coroutine[Any, Any, None]]
         | None = None,
+        on_dispatch_state_registered: Callable[[str], Coroutine[Any, Any, bool]]
+        | None = None,
         get_leader_term: Callable[[], int] | None = None,
         retry_budget_manager: RetryBudgetManager | None = None,
         env: Env | None = None,
@@ -118,6 +120,7 @@ class WorkflowDispatcher:
         self._max_dispatch_attempts = max_dispatch_attempts
         self._on_workflow_evicted = on_workflow_evicted
         self._on_dispatch_failed = on_dispatch_failed
+        self._on_dispatch_state_registered = on_dispatch_state_registered
         self._get_leader_term = get_leader_term
         self._max_concurrent_dispatches = max(1, max_concurrent_dispatches)
         self._logger = Logger()
@@ -724,6 +727,23 @@ class WorkflowDispatcher:
                 )
 
                 dispatch_plans.append((worker_id, worker_cores, sub_token, dispatch))
+
+            if dispatch_plans and self._on_dispatch_state_registered is not None:
+                state_replicated = await self._on_dispatch_state_registered(
+                    pending.job_id
+                )
+                if not state_replicated:
+                    for worker_id, worker_cores, sub_token, _dispatch in dispatch_plans:
+                        await self._record_failed_dispatch_plan(
+                            worker_id=worker_id,
+                            worker_cores=worker_cores,
+                            sub_token=sub_token,
+                            failed_dispatches=failed_dispatches,
+                        )
+                    pending.dispatched = False
+                    pending.dispatched_at = 0.0
+                    self._apply_backoff(pending)
+                    return False
 
             dispatch_results = await self._send_dispatch_plans(
                 pending,
