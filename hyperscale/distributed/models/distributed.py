@@ -1795,6 +1795,7 @@ class JobStateSyncMessage(Message):
     leader_addr: tuple[str, int] | None = None
     workflow_snapshots: dict[str, dict[str, Any]] = field(default_factory=dict)
     sub_workflow_snapshots: dict[str, dict[str, Any]] = field(default_factory=dict)
+    replace_existing: bool = True
     context_snapshot: dict[str, dict[str, Any]] = field(default_factory=dict)
     layer_version: int = 0
 

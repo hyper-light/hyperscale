@@ -2170,7 +2170,34 @@ class ManagerServer(HealthAwareServer):
             )
             return False
 
+        await self._sync_state_from_manager_peers(force_full=True)
+        current_leader_id = self._manager_state.get_job_leader(job_id)
+        if current_leader_id == self._node_id.full and self._leases.is_job_leader(job_id):
+            return True
+        if (
+            current_leader_id is not None
+            and current_leader_id != self._node_id.full
+            and (old_leader_id is None or current_leader_id != old_leader_id)
+        ):
+            return False
+
         next_fencing_token = max(2, self._leases.get_fence_token(job_id) + 1)
+        job = self._job_manager.get_job_by_id(job_id)
+        takeover_claim = self._build_job_state_sync_message(
+            job_id,
+            job,
+            leader_id=self._node_id.full,
+            leader_addr=(self._host, self._tcp_port),
+            fencing_token=next_fencing_token,
+            replace_existing=job is not None,
+        )
+        replicated = await self._sync_job_state_message_to_peers(
+            takeover_claim,
+            require_quorum=True,
+        )
+        if not replicated:
+            return False
+
         accepted = self._leases.apply_job_leadership(
             job_id=job_id,
             leader_id=self._node_id.full,
@@ -3125,45 +3152,86 @@ class ManagerServer(HealthAwareServer):
                 )
 
     def _build_job_state_sync_message(
-        self, job_id: str, job: JobInfo
+        self,
+        job_id: str,
+        job: JobInfo | None,
+        *,
+        leader_id: str | None = None,
+        leader_addr: tuple[str, int] | None = None,
+        fencing_token: int | None = None,
+        replace_existing: bool = True,
     ) -> JobStateSyncMessage:
-        elapsed_seconds = time.monotonic() - job.started_at if job.started_at else 0.0
+        elapsed_seconds = (
+            time.monotonic() - job.started_at
+            if job is not None and job.started_at
+            else 0.0
+        )
         origin_gate_addr = (
             job.submission.origin_gate_addr
-            if job.submission and job.submission.origin_gate_addr
+            if job is not None
+            and job.submission
+            and job.submission.origin_gate_addr
             else self._manager_state.get_job_origin_gate(job_id)
         )
         callback_addr = self._get_job_callback_addr(job_id)
-        leader_id = (
-            self._manager_state.get_job_leader(job_id)
-            or job.leader_node_id
+        effective_leader_id = (
+            leader_id
+            or self._manager_state.get_job_leader(job_id)
+            or (job.leader_node_id if job is not None else None)
             or self._node_id.full
         )
-        leader_addr = (
-            self._manager_state.get_job_leader_addr(job_id)
-            or job.leader_addr
+        effective_leader_addr = (
+            leader_addr
+            or self._manager_state.get_job_leader_addr(job_id)
+            or (job.leader_addr if job is not None else None)
             or (self._host, self._tcp_port)
         )
-        return JobStateSyncMessage(
-            leader_id=leader_id,
-            job_id=job_id,
-            status=job.status,
-            fencing_token=self._leases.get_fence_token(job_id),
-            workflows_total=job.workflows_total,
-            workflows_completed=job.workflows_completed,
-            workflows_failed=job.workflows_failed,
-            workflow_statuses={
+        effective_fencing_token = (
+            fencing_token
+            if fencing_token is not None
+            else self._leases.get_fence_token(job_id)
+        )
+        workflow_statuses = {}
+        workflow_snapshots = {}
+        sub_workflow_snapshots = {}
+        context_snapshot = {}
+        job_status = JobStatus.RUNNING.value
+        workflows_total = 0
+        workflows_completed = 0
+        workflows_failed = 0
+        layer_version = self._manager_state.get_job_layer_version(job_id)
+        if job is not None:
+            workflow_statuses = {
                 wf_id: wf.status.value for wf_id, wf in job.workflows.items()
-            },
+            }
+            workflow_snapshots = self._build_workflow_state_snapshots(job)
+            sub_workflow_snapshots = self._build_sub_workflow_state_snapshots(job)
+            context_snapshot = job.context.dict()
+            job_status = job.status
+            workflows_total = job.workflows_total
+            workflows_completed = job.workflows_completed
+            workflows_failed = job.workflows_failed
+            layer_version = job.layer_version
+
+        return JobStateSyncMessage(
+            leader_id=effective_leader_id,
+            job_id=job_id,
+            status=job_status,
+            fencing_token=effective_fencing_token,
+            workflows_total=workflows_total,
+            workflows_completed=workflows_completed,
+            workflows_failed=workflows_failed,
+            workflow_statuses=workflow_statuses,
             elapsed_seconds=elapsed_seconds,
             timestamp=time.monotonic(),
             origin_gate_addr=origin_gate_addr,
             callback_addr=callback_addr,
-            leader_addr=leader_addr,
-            workflow_snapshots=self._build_workflow_state_snapshots(job),
-            sub_workflow_snapshots=self._build_sub_workflow_state_snapshots(job),
-            context_snapshot=job.context.dict(),
-            layer_version=job.layer_version,
+            leader_addr=effective_leader_addr,
+            workflow_snapshots=workflow_snapshots,
+            sub_workflow_snapshots=sub_workflow_snapshots,
+            replace_existing=replace_existing,
+            context_snapshot=context_snapshot,
+            layer_version=layer_version,
         )
 
     def _build_workflow_state_snapshots(
@@ -3213,11 +3281,22 @@ class ManagerServer(HealthAwareServer):
     async def _sync_job_state_to_peers(
         self,
         job_id: str,
-        job: JobInfo,
+        job: JobInfo | None,
         *,
         require_quorum: bool = False,
     ) -> bool:
         sync_msg = self._build_job_state_sync_message(job_id, job)
+        return await self._sync_job_state_message_to_peers(
+            sync_msg,
+            require_quorum=require_quorum,
+        )
+
+    async def _sync_job_state_message_to_peers(
+        self,
+        sync_msg: JobStateSyncMessage,
+        *,
+        require_quorum: bool = False,
+    ) -> bool:
         peer_addrs = list(self._manager_state.get_active_manager_peers())
         if not peer_addrs:
             return not require_quorum or self._quorum_size <= 1
@@ -4478,6 +4557,24 @@ class ManagerServer(HealthAwareServer):
                 continue
             if getattr(info, "is_leader", False):
                 return (info.tcp_host, info.tcp_port)
+
+        return None
+
+    def _resolve_job_cancel_redirect_addr(
+        self,
+        job_id: str,
+    ) -> tuple[str, int] | None:
+        """Resolve a non-self redirect target for job cancellation."""
+        self_addr = (self._host, self._tcp_port)
+        job_leader_addr = self._leases.get_job_leader_addr(job_id)
+        if job_leader_addr is not None:
+            job_leader_addr = tuple(job_leader_addr)
+            if job_leader_addr != self_addr:
+                return job_leader_addr
+
+        dc_leader_addr = self._resolve_dc_leader_addr()
+        if dc_leader_addr is not None and dc_leader_addr != self_addr:
+            return dc_leader_addr
 
         return None
 
@@ -6500,16 +6597,13 @@ class ManagerServer(HealthAwareServer):
             # leader instead. The client follows ``leader_addr`` via
             # its bounded redirect loop.
             #
-            # Resolution falls through job-leader-table → DC-leader
-            # resolver. The DC-leader fallback is correct here even
-            # though job-leadership and DC-leadership are
-            # technically distinct roles: in this codebase the job
-            # leader IS always a DC manager, and on rare paths
-            # (job leader transferred but local state hasn't synced
-            # the job-leader table yet) the DC leader is the best
-            # available redirect target — at minimum it knows about
-            # the job and can either own it or forward to the
-            # actual job leader.
+            # Resolution first gives the current job leader a chance
+            # to handle the request. If no job leader is known yet,
+            # only a non-self DC leader may be used as a convergence
+            # target. A DC leader that has not acquired the job lease
+            # must attempt the SWIM-leader takeover locally or return
+            # a transient "transition in progress" response; redirecting
+            # the client back to itself creates a bounded redirect cycle.
             if not self._leases.is_job_leader(job_id):
                 leader_addr = self._leases.get_job_leader_addr(job_id)
                 self_addr = (self._host, self._tcp_port)
@@ -6525,7 +6619,7 @@ class ManagerServer(HealthAwareServer):
                         return self._build_cancel_response(
                             job_id,
                             success=False,
-                            error="Job leader transition in progress",
+                            error="Not job leader; job leader transition in progress",
                             leader_addr=None,
                         )
 
@@ -6533,11 +6627,7 @@ class ManagerServer(HealthAwareServer):
                     leader_addr = None
 
             if not self._leases.is_job_leader(job_id):
-                leader_addr = self._leases.get_job_leader_addr(job_id)
-                if leader_addr is None:
-                    leader_addr = self._resolve_dc_leader_addr()
-                if leader_addr == (self._host, self._tcp_port):
-                    leader_addr = None
+                leader_addr = self._resolve_job_cancel_redirect_addr(job_id)
                 leader_hint = (
                     f"{leader_addr[0]}:{leader_addr[1]}"
                     if leader_addr
@@ -8307,6 +8397,7 @@ class ManagerServer(HealthAwareServer):
             layer_version=sync_msg.layer_version,
             elapsed_seconds=sync_msg.elapsed_seconds,
             timestamp=time.time(),
+            replace_existing=sync_msg.replace_existing,
         )
 
         if sync_msg.context_snapshot and sync_msg.layer_version >= job.layer_version:
