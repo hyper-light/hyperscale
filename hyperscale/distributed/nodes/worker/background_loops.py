@@ -109,6 +109,7 @@ class WorkerBackgroundLoops:
         node_id_short: str,
         task_runner_run: callable,
         is_running: callable,
+        is_seed_manager: callable | None = None,
     ) -> None:
         """
         Reap managers that have been unhealthy for too long.
@@ -119,6 +120,14 @@ class WorkerBackgroundLoops:
             node_id_short: This worker's short node ID
             task_runner_run: Function to run async tasks
             is_running: Function to check if worker is running
+            is_seed_manager: ``manager_id -> bool`` predicate. Managers
+                whose addresses match a configured seed are never reaped
+                — reaping them strands the worker's bootstrap path: the
+                SWIM ``_on_node_join`` recovery callback can no longer
+                map the seed's address to a known manager_id when the
+                seed rejoins, so the worker never re-registers. Pass
+                ``None`` to disable the exemption (legacy callers /
+                test scaffolds).
         """
         self._running = True
         while is_running() and self._running:
@@ -135,6 +144,8 @@ class WorkerBackgroundLoops:
                         current_time - unhealthy_since
                         >= self._dead_manager_reap_interval
                     ):
+                        if is_seed_manager is not None and is_seed_manager(manager_id):
+                            continue
                         managers_to_reap.append(manager_id)
 
                 for manager_id in managers_to_reap:

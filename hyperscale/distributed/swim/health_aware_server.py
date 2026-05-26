@@ -4462,7 +4462,9 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         )
 
         try:
-            await super().shutdown()
+            await super().shutdown(
+                drain_timeout=drain_timeout if drain_timeout > 0 else 5.0
+            )
 
         except Exception:
             import traceback

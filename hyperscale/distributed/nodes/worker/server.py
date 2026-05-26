@@ -245,6 +245,15 @@ class WorkerServer(HealthAwareServer):
         self._overload_poll_task: asyncio.Task | None = None
         self._pending_result_retry_task: asyncio.Task | None = None
         self._worker_pool_health_task: asyncio.Task | None = None
+        # Event-driven seed-recovery task. Started when
+        # ``_healthy_manager_ids`` transitions to empty and cancelled
+        # when it transitions back to non-empty. Re-issues TCP
+        # ``worker_register`` against configured seed_managers with
+        # exponential backoff until one accepts. Required because in
+        # the all-managers-die-then-quorum-returns scenario neither
+        # restarted manager has worker state to share via SWIM gossip
+        # — the worker must initiate recovery from its side.
+        self._manager_seed_recovery_task: asyncio.Task | None = None
         self._known_worker_pool_process_ids: set[int] = set()
         # Phase H4 — autonomous extension trigger background task
         self._extension_trigger_task: asyncio.Task | None = None
@@ -454,8 +463,13 @@ class WorkerServer(HealthAwareServer):
         )
         # Wire the registry's healthy-set-changed signal so every
         # mark_healthy / mark_unhealthy / remove_manager_state path
-        # flows through the connection state machine.
-        self._registry._on_healthy_set_changed = self._cluster_connection.update
+        # flows through the connection state machine AND drives the
+        # event-driven seed-recovery transition detector. Both
+        # consumers are idempotent so the wrapper can fire them
+        # unconditionally on each signal.
+        self._registry._on_healthy_set_changed = (
+            self._on_registry_healthy_changed
+        )
 
     def _wire_logger_to_modules(self) -> None:
         """Wire logger to all modules after parent init."""
@@ -669,7 +683,7 @@ class WorkerServer(HealthAwareServer):
         self._running = False
 
         if drain_timeout <= 0:
-            self.abort()
+            await self.abort_and_wait()
             return
 
         try:
@@ -689,7 +703,7 @@ class WorkerServer(HealthAwareServer):
                     node_id=self._node_id.short,
                 )
             )
-            self.abort()
+            await self.abort_and_wait()
             return
 
         await super().stop(drain_timeout=0.0, broadcast_leave=False)
@@ -839,6 +853,7 @@ class WorkerServer(HealthAwareServer):
                 node_id_short=self._node_id.short,
                 task_runner_run=self._task_runner.run,
                 is_running=lambda: self._running,
+                is_seed_manager=self._manager_id_is_seed,
             ),
             "dead_manager_reap",
         )
@@ -1410,6 +1425,114 @@ class WorkerServer(HealthAwareServer):
         except Exception:
             pass
 
+    def _on_registry_healthy_changed(self) -> None:
+        """Signal handler for ``WorkerRegistry._on_healthy_set_changed``.
+
+        Fires synchronously on every ``mark_manager_healthy`` /
+        ``mark_manager_unhealthy`` / ``remove_manager_state``
+        invocation. Forwards to the cluster-connection state machine
+        (preserves existing behaviour) and to the seed-recovery
+        transition detector (new: starts/cancels the seed-retry task
+        on N↔0 transitions).
+        """
+        self._cluster_connection.update()
+        self._reconcile_seed_recovery_task()
+
+    def _reconcile_seed_recovery_task(self) -> None:
+        """Start or stop the seed-recovery task to match current state.
+
+        Idempotent: every registry healthy-set mutation drives this,
+        so the task lifecycle follows the actual state regardless of
+        which mutation path triggered the signal.
+
+        * No healthy managers, no configured seeds → nothing to do.
+        * No healthy managers, seeds present, task not running → start it.
+        * At least one healthy manager, task running → cancel it.
+        """
+        has_healthy = bool(self._registry._healthy_manager_ids)
+        has_seeds = bool(self._seed_managers)
+        task_running = (
+            self._manager_seed_recovery_task is not None
+            and not self._manager_seed_recovery_task.done()
+        )
+
+        if not has_healthy and has_seeds and not task_running and self._running:
+            self._manager_seed_recovery_task = self._create_background_task(
+                self._run_manager_seed_recovery(),
+                "manager_seed_recovery",
+            )
+            self._lifecycle_manager.add_background_task(
+                self._manager_seed_recovery_task
+            )
+        elif has_healthy and task_running:
+            self._manager_seed_recovery_task.cancel()
+
+    async def _run_manager_seed_recovery(self) -> None:
+        """Retry ``refresh_manager_registrations`` until a manager accepts.
+
+        Started by ``_reconcile_seed_recovery_task`` when the worker
+        observes zero healthy managers. Each iteration calls
+        ``refresh_manager_registrations`` (re-issues TCP
+        ``worker_register`` against every configured seed plus every
+        known-but-currently-unhealthy manager). On the first
+        registration that succeeds, the registry's
+        ``mark_manager_healthy`` will fire and the transition
+        detector will cancel this task — so the loop ends naturally
+        on recovery without polling indefinitely.
+
+        Backoff schedule: 0 s, 1 s, 2 s, 4 s, 8 s, capped at 10 s.
+        Tight initial cadence keeps recovery latency low in the
+        all-managers-die-then-quorum-returns scenario; the cap
+        prevents pathological loops on a genuinely-isolated worker
+        from saturating the event loop.
+        """
+        backoff_seconds = 0.0
+        max_backoff_seconds = 10.0
+        try:
+            while self._running:
+                if backoff_seconds > 0:
+                    await asyncio.sleep(backoff_seconds)
+                try:
+                    succeeded = await self.refresh_manager_registrations()
+                except Exception as refresh_error:
+                    succeeded = False
+                    await self._udp_logger.log(
+                        ServerWarning(
+                            message=(
+                                f"Seed-recovery refresh raised: "
+                                f"{refresh_error}"
+                            ),
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
+                if succeeded and self._registry._healthy_manager_ids:
+                    return
+                backoff_seconds = min(
+                    max_backoff_seconds,
+                    backoff_seconds * 2 if backoff_seconds > 0 else 1.0,
+                )
+        except asyncio.CancelledError:
+            return
+
+    def _manager_id_is_seed(self, manager_id: str) -> bool:
+        """Return True iff ``manager_id`` is bound to a configured seed addr.
+
+        Seeds are the worker's bootstrap path to the cluster; their
+        ``_known_managers`` entry must survive arbitrary unhealthy
+        durations so the SWIM ``_on_node_join`` recovery callback can
+        still match an address to a manager_id when a previously-DEAD
+        seed manager rejoins. Reaping a seed strands the worker —
+        the registry forgets the manager_id, the recovery callback
+        finds nothing on rejoin, and the worker can't re-register
+        without external prompting.
+        """
+        manager_info = self._registry.get_manager(manager_id)
+        if manager_info is None:
+            return False
+        return (manager_info.tcp_host, manager_info.tcp_port) in self._seed_managers
+
     async def _register_with_manager(self, manager_addr: tuple[str, int]) -> bool:
         """Register this worker with a manager."""
         return await self._registration_handler.register_with_manager(
@@ -1428,17 +1551,31 @@ class WorkerServer(HealthAwareServer):
 
     async def refresh_manager_registrations(self) -> bool:
         """Refresh manager registration after a lifecycle-level connectivity change."""
-        registered_with_manager = False
         manager_addr_candidates = dict.fromkeys(self._seed_managers)
         for manager in self._registry.get_known_manager_values():
             if manager.tcp_host and manager.tcp_port:
                 manager_addr_candidates[(manager.tcp_host, manager.tcp_port)] = None
 
-        for manager_addr in manager_addr_candidates:
+        # Issue register attempts concurrently. Serial iteration here
+        # serialises a 5 s TCP timeout per dead candidate — with three
+        # candidates and one still-dead, the worker can wait ~20 s on
+        # the dead address before even trying the live ones, blowing
+        # the all-managers-die-quorum-returns recovery budget. The
+        # registration handler is per-manager-addressed and the
+        # invalidate/circuit-reset side effects are independent per
+        # address, so gathering is safe.
+        async def attempt(manager_addr: tuple[str, int]) -> bool:
             self._invalidate_tcp_client_transport(manager_addr)
             self._registry.get_or_create_circuit_by_addr(manager_addr).reset()
-            if await self._register_with_manager(manager_addr):
-                registered_with_manager = True
+            return await self._register_with_manager(manager_addr)
+
+        results = await asyncio.gather(
+            *(attempt(addr) for addr in manager_addr_candidates),
+            return_exceptions=True,
+        )
+        registered_with_manager = any(
+            result is True for result in results
+        )
 
         self._cluster_connection.update()
         return registered_with_manager

@@ -2070,14 +2070,8 @@ class MercurySyncBaseServer(Generic[T]):
                 except Exception:
                     pass  # Best effort logging
 
-    async def shutdown(self) -> None:
-        self._running = False
-
-        # Cooperative wakeup for the cleanup loops. Resolving the
-        # future causes ``wait_for`` to return without raising; the
-        # loop then re-checks ``_running`` (now False) and exits
-        # cleanly. Without this we'd rely on cancellation, which the
-        # loops historically swallowed and looped on indefinitely.
+    def _wake_cleanup_loops(self) -> None:
+        """Wake cleanup loops so they observe ``_running == False`` and exit."""
         for sleep_future in (
             self._tcp_server_sleep_task,
             self._udp_server_sleep_task,
@@ -2085,21 +2079,31 @@ class MercurySyncBaseServer(Generic[T]):
             if sleep_future is not None and not sleep_future.done():
                 sleep_future.set_result(None)
 
-        await self._task_runner.shutdown()
+    def _close_tcp_transports(self) -> None:
+        """Close every TCP transport owned by this server."""
+        transport_maps = (
+            self._tcp_client_transports,
+            self._tcp_client_response_transports,
+            self._tcp_server_request_transports,
+        )
+        for transport_map in transport_maps:
+            for transport in list(transport_map.values()):
+                if not transport.is_closing():
+                    transport.close()
+            transport_map.clear()
 
-        for client in self._tcp_client_transports.values():
-            client.abort()
+        if self._tcp_transport is not None and not self._tcp_transport.is_closing():
+            self._tcp_transport.close()
+        self._tcp_transport = None
 
-        # Close UDP transport to stop receiving datagrams. The
-        # transport's close is deferred via ``loop.call_soon``, so
-        # also close the underlying socket directly to release the
-        # bound port immediately. Same kill→restart race rationale
-        # as ``abort()``. ``OSError`` covers double-close after the
-        # transport already ran its deferred close.
+    def _close_udp_transport(self) -> None:
+        """Close the UDP transport and underlying socket."""
         if self._udp_transport is not None:
-            self._udp_transport.close()
+            if not self._udp_transport.is_closing():
+                self._udp_transport.close()
             self._udp_transport = None
             self._udp_connected = False
+
         if self._udp_server_socket is not None:
             try:
                 self._udp_server_socket.close()
@@ -2107,16 +2111,18 @@ class MercurySyncBaseServer(Generic[T]):
                 pass
             self._udp_server_socket = None
 
-        # Close TCP server to stop accepting connections
+    async def _close_tcp_server(self) -> None:
+        """Close the TCP listener and underlying socket."""
         if self._tcp_server is not None:
             self._tcp_server.abort_clients()
             self._tcp_server.close()
             try:
                 await self._tcp_server.wait_closed()
-            except (OSError, asyncio.CancelledError):
+            except OSError:
                 pass
             self._tcp_server = None
             self._tcp_connected = False
+
         if self._tcp_server_socket is not None:
             try:
                 self._tcp_server_socket.close()
@@ -2124,26 +2130,128 @@ class MercurySyncBaseServer(Generic[T]):
                 pass
             self._tcp_server_socket = None
 
-        # Cancel-and-await every server-owned background task in parallel.
-        # `cancel_and_release_task` only schedules a done-callback; without
-        # an actual await the tasks are still pending when callers (e.g. the
-        # simulation supervisor's leak detector) inspect `asyncio.all_tasks()`.
-        all_pending = (
-            [
-                self._drop_stats_task,
-                self._tcp_server_sleep_task,
-                self._tcp_server_cleanup_task,
-                self._udp_server_sleep_task,
-                self._udp_server_cleanup_task,
-            ]
-            + list(self._pending_tcp_server_responses)
-            + list(self._pending_udp_server_responses)
-        )
-        await asyncio.gather(
-            *(cancel(task) for task in all_pending if task is not None)
-        )
+    def _owned_shutdown_tasks(self) -> list[asyncio.Task | asyncio.Future]:
+        """Return server-owned futures/tasks that must be terminal at teardown."""
+        return [
+            task
+            for task in (
+                [
+                    self._drop_stats_task,
+                    self._tcp_server_sleep_task,
+                    self._tcp_server_cleanup_task,
+                    self._udp_server_sleep_task,
+                    self._udp_server_cleanup_task,
+                ]
+                + list(self._pending_tcp_server_responses)
+                + list(self._pending_udp_server_responses)
+            )
+            if task is not None
+        ]
+
+    async def _await_owned_shutdown_tasks(
+        self,
+        tasks: list[asyncio.Task | asyncio.Future],
+        drain_timeout: float,
+    ) -> int:
+        """Wait for server-owned tasks, then cancel any survivors."""
+        pending = [task for task in tasks if not task.done()]
+        if pending and drain_timeout > 0:
+            _done, pending_set = await asyncio.wait(
+                pending,
+                timeout=drain_timeout,
+            )
+            pending = list(pending_set)
+
+        for task in pending:
+            if not task.done():
+                task.cancel()
+
+        if pending:
+            await asyncio.gather(
+                *(cancel(task) for task in pending),
+                return_exceptions=True,
+            )
+
         self._pending_tcp_server_responses.clear()
         self._pending_udp_server_responses.clear()
+        return sum(1 for task in pending if not task.done())
+
+    async def _shutdown_task_runner(self, drain_timeout: float) -> bool:
+        """Shutdown the TaskRunner within the teardown budget."""
+        if self._task_runner is None:
+            return True
+
+        try:
+            if drain_timeout > 0:
+                await asyncio.wait_for(
+                    self._task_runner.shutdown(),
+                    timeout=drain_timeout,
+                )
+            else:
+                await self._task_runner.shutdown()
+            return True
+        except asyncio.TimeoutError:
+            self._task_runner.abort()
+            return False
+
+    def _count_unclosed_transports(self) -> int:
+        """Return count of transports still not closing after teardown."""
+        transports: list[asyncio.Transport] = []
+        transports.extend(self._tcp_client_transports.values())
+        transports.extend(self._tcp_client_response_transports.values())
+        transports.extend(self._tcp_server_request_transports.values())
+        if self._tcp_transport is not None:
+            transports.append(self._tcp_transport)
+        if self._udp_transport is not None:
+            transports.append(self._udp_transport)
+        return sum(1 for transport in transports if not transport.is_closing())
+
+    async def _await_quiescent(self, drain_timeout: float = 5.0) -> None:
+        """Block until server-owned transports and tasks are quiescent.
+
+        The method is the common stop barrier for every node type. It is
+        bounded by ``drain_timeout``; if cooperative TaskRunner shutdown
+        exceeds that budget we abort the runner, continue transport/task
+        cleanup, and emit a structured warning rather than letting
+        teardown hang indefinitely.
+        """
+        effective_timeout = drain_timeout if drain_timeout > 0 else 5.0
+
+        self._close_tcp_transports()
+        self._close_udp_transport()
+        await self._close_tcp_server()
+
+        task_runner_clean = await self._shutdown_task_runner(effective_timeout)
+        unfinished_tasks = await self._await_owned_shutdown_tasks(
+            self._owned_shutdown_tasks(),
+            effective_timeout,
+        )
+        unclosed_transports = self._count_unclosed_transports()
+
+        if task_runner_clean and unfinished_tasks == 0 and unclosed_transports == 0:
+            return
+
+        await self._udp_logger.log(
+            ServerWarning(
+                message=(
+                    "Server shutdown quiescence incomplete: "
+                    f"task_runner_clean={task_runner_clean} "
+                    f"unfinished_tasks={unfinished_tasks} "
+                    f"unclosed_transports={unclosed_transports}"
+                ),
+                node_host=self._host,
+                node_port=self._udp_port,
+                node_id=str(self._udp_port),
+            )
+        )
+
+    async def shutdown(self, drain_timeout: float = 5.0) -> None:
+        self._running = False
+
+        # Cooperative wakeup for cleanup loops; the quiescence barrier
+        # below owns the bounded drain/cancel/transport-close contract.
+        self._wake_cleanup_loops()
+        await self._await_quiescent(drain_timeout=drain_timeout)
 
     def abort(self) -> None:
         self._running = False
@@ -2284,3 +2392,4 @@ class MercurySyncBaseServer(Generic[T]):
         # broadcasts, etc.).
         await asyncio.sleep(0)
         await asyncio.sleep(0)
+        await self._await_quiescent()

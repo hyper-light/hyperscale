@@ -184,8 +184,10 @@ class Supervisor:
     async def _signal_server_stop(self, handle: ServerHandle) -> None:
         """Invoke ``stop`` once for a single handle. Errors recorded, not raised.
 
-        ``drain_timeout=0`` because the harness tear-down does not need to
-        wait for in-flight messages — quiescence handles that holistically.
+        ``drain_timeout=0`` skips protocol-level graceful drain. The
+        server's common stop path still performs its bounded quiescence
+        barrier before returning; supervisor-level task quiescence is
+        the final cross-node audit.
         """
         try:
             await handle.instance.stop(drain_timeout=0.0, broadcast_leave=False)
