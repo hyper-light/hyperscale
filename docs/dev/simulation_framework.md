@@ -357,6 +357,14 @@ class ClusterSpec:
     timeouts: HarnessTimeouts = HarnessTimeouts()
 ```
 
+Simulation ports are allocated by `PortAllocator` from a process-global
+active reservation table over a dedicated harness range. The range is
+independent of `ClusterSpec` so test files never coordinate port bases;
+worker allocations keep their logical spacing envelopes, but only the
+TCP/UDP ports the worker runtime actually binds are probe-checked during
+allocation and teardown. Ports are returned to the active pool only
+after teardown verification proves they are bindable again.
+
 `pytest.mark.parametrize` over `ClusterSpec` instances gives matrix testing.
 SIM mode adds `seed: int | None = None` to `ClusterSpec` once Phase 3 lands.
 

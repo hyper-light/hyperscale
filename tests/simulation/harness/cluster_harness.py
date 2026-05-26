@@ -305,11 +305,10 @@ class ClusterHarness:
                 self._allocate_pair() for _ in range(dc_spec.managers)
             ]
 
-        # Each worker owns a 500-port block: TCP at block base, UDP at
-        # block+10, plus headroom for the derived `udp + cores ** 2`
-        # subprocess UDP and any helper ports the local pool spawns.
-        # Mirrors the stride pattern used by the integration tests
-        # (see tests/integration/gates/test_gate_cross_dc_dispatch.py).
+        # Each worker owns a logical spacing envelope. The allocator probes
+        # and tracks the concrete TCP/UDP ports the worker runtime binds,
+        # while reserving the full envelope in-process so no later harness
+        # allocation can overlap it.
         worker_addrs_by_dc: dict[str, list[tuple[int, int]]] = {}
         for dc_id, dc_spec in self.spec.datacenters.items():
             worker_addrs_by_dc[dc_id] = [
@@ -653,23 +652,6 @@ class ClusterHarness:
 
     def _allocate_gate_addrs(self, _index: int) -> tuple[int, int]:
         return self._ports.reserve_pair()
-
-    def _reserve_specific(self, port: int) -> None:
-        """Reserve a specific port we have already implicitly committed to.
-
-        Used for worker-derived ports (`udp + cores ** 2`). The PortAllocator
-        does not know about these by default; this teaches it so the
-        post-teardown verifier checks them too.
-        """
-        # Reach into PortAllocator's reserved set deliberately. Adding a public
-        # method would invite misuse from scenario code.
-        if not self._ports._is_bindable(port):  # type: ignore[attr-defined]
-            from tests.simulation.harness.errors import PortConflictError
-
-            raise PortConflictError(
-                f"derived worker port {port} is already held by another process"
-            )
-        self._ports._reserved.add(port)  # type: ignore[attr-defined]
 
     def _build_env(
         self,

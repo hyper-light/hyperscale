@@ -5,7 +5,7 @@ Two scenarios at this level:
 
 1. ``test_l3_framework_structure`` — harness pieces only. Validates
    that a realistic L3 spec composes cleanly and reserves unique
-   kernel-selected ports.
+   harness ports.
 
 2. ``test_l3_cluster_lifecycle`` — full real-server stand-up of 3
    gates + 2 datacenters × (2 managers + 1 worker × 2 cores).
@@ -60,27 +60,27 @@ async def test_l3_framework_structure() -> None:
         assert dc.workers == 1
         assert dc.cores_per_worker == 2
 
-    # PortAllocator handles a realistic L3 reservation: gates need pairs,
-    # workers need triples (TCP + UDP + derived port range).
+    # PortAllocator handles a realistic L3 reservation: gates and managers
+    # need pairs, while workers need derived-port spacing envelopes.
     ports = PortAllocator(host=spec.host)
-    gate_pairs = [ports.reserve_pair() for _ in range(spec.gates)]
-    manager_pairs = [
-        ports.reserve_pair()
-        for dc in spec.datacenters.values()
-        for _ in range(dc.managers)
-    ]
-    worker_triples = [
-        ports.reserve_range(3)
-        for dc in spec.datacenters.values()
-        for _ in range(dc.workers)
-    ]
+    try:
+        for _ in range(spec.gates):
+            ports.reserve_pair()
+        for dc_spec in spec.datacenters.values():
+            for _ in range(dc_spec.managers):
+                ports.reserve_pair()
+            for _ in range(dc_spec.workers):
+                ports.reserve_worker_block(
+                    cores=dc_spec.cores_per_worker,
+                    block_size=dc_spec.worker_port_block_size,
+                )
 
-    all_ports = (
-        [p for pair in gate_pairs for p in pair]
-        + [p for pair in manager_pairs for p in pair]
-        + [p for triple in worker_triples for p in triple]
-    )
-    assert len(set(all_ports)) == len(all_ports), "ports must be unique across L3"
+        reserved_ports = ports.reserved_ports()
+        assert len(set(reserved_ports)) == len(reserved_ports), (
+            "ports must be unique across L3"
+        )
+    finally:
+        ports.release_all()
 
 
 @pytest.mark.asyncio

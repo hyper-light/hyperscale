@@ -19,11 +19,13 @@ class DCSpec:
     """Cores each worker advertises. Drives subprocess count."""
 
     worker_port_block_size: int = 500
-    """Contiguous port block reserved per worker.
+    """Spacing envelope between worker port bases.
 
-    Large topologies with one-core workers can set a smaller block to
-    avoid exhausting the local port range while retaining collision-free
-    derived worker-pool ports.
+    The allocator bind-probes only the concrete TCP/UDP ports the worker
+    derives from its base, while marking the full envelope as an active
+    harness reservation. Large topologies with one-core workers can set
+    a smaller value to avoid exhausting the local port range while
+    retaining collision-free derived worker-pool ports.
     """
 
     stabilization_lhm_max_score: int | None = 0
