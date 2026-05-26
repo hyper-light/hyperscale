@@ -34,7 +34,7 @@ from tests.simulation.harness import (
 )
 
 
-def _l1_spec(base_port: int, workers: int = 2) -> ClusterSpec:
+def _l1_spec(workers: int = 2) -> ClusterSpec:
     return ClusterSpec(
         gates=0,
         datacenters={
@@ -43,7 +43,6 @@ def _l1_spec(base_port: int, workers: int = 2) -> ClusterSpec:
             ),
         },
         env=EnvOverrides(request_timeout="5s", log_level="error"),
-        base_port=base_port,
         timeouts=HarnessTimeouts(stabilization_default=45.0),
     )
 
@@ -58,7 +57,7 @@ async def test_worker_kill_then_restart() -> None:
     killed, the manager's worker count drops to 1; after restart it
     returns to 2.
     """
-    spec = _l1_spec(base_port=20800, workers=2)
+    spec = _l1_spec(workers=2)
     async with ClusterHarness(
         spec,
         mode=ExecutionMode.REAL,
@@ -113,7 +112,7 @@ async def test_rapid_worker_churn() -> None:
     teardown is the actual leak check — if any kill/restart cycle leaves
     state behind, the supervisor's verifier catches it on harness exit.
     """
-    spec = _l1_spec(base_port=20900, workers=2)
+    spec = _l1_spec(workers=2)
     async with ClusterHarness(
         spec,
         mode=ExecutionMode.REAL,

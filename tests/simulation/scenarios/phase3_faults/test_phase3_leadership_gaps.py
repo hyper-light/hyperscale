@@ -28,14 +28,13 @@ from tests.simulation.harness import (
 )
 
 
-def _l2_spec(base_port: int) -> ClusterSpec:
+def _l2_spec() -> ClusterSpec:
     return ClusterSpec(
         gates=0,
         datacenters={
             "main": DCSpec(managers=3, workers=0),
         },
         env=EnvOverrides(request_timeout="5s", log_level="error"),
-        base_port=base_port,
         timeouts=HarnessTimeouts(stabilization_default=60.0),
     )
 
@@ -101,7 +100,7 @@ def _followers_observe_stable_leader(managers: list[ServerHandle]) -> bool:
 @pytest.mark.simulation
 async def test_pre_vote_rejected_during_stable_lease() -> None:
     """Follower rejects a pre-vote while a healthy leader lease is active."""
-    spec = _l2_spec(base_port=31500)
+    spec = _l2_spec()
     async with ClusterHarness(
         spec,
         mode=ExecutionMode.REAL,
@@ -147,7 +146,7 @@ async def test_pre_vote_rejected_during_stable_lease() -> None:
 @pytest.mark.simulation
 async def test_flapping_detector_backs_off_after_election_failures() -> None:
     """Repeated election failures trip flapping detection and delay elections."""
-    spec = _l2_spec(base_port=33000)
+    spec = _l2_spec()
     async with ClusterHarness(
         spec,
         mode=ExecutionMode.REAL,
@@ -205,7 +204,7 @@ async def test_term_exhaustion_bails_cleanly() -> None:
 @pytest.mark.simulation
 async def test_swim_leader_and_raft_job_leader_can_diverge_safely() -> None:
     """Per-job Raft leadership may differ from the SWIM DC leader without split brain."""
-    spec = _l2_spec(base_port=34500)
+    spec = _l2_spec()
     async with ClusterHarness(
         spec,
         mode=ExecutionMode.REAL,
@@ -296,7 +295,7 @@ async def test_dead_job_leader_failover_uses_swim_leader() -> None:
     recovery is intentionally centralized through the SWIM cluster leader so a
     busy manager tier does not split-brain job ownership under failover load.
     """
-    spec = _l2_spec(base_port=34700)
+    spec = _l2_spec()
     async with ClusterHarness(
         spec,
         mode=ExecutionMode.REAL,

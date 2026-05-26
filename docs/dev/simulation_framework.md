@@ -355,7 +355,6 @@ class ClusterSpec:
     per_node_env: dict[str, EnvOverrides] = field(default_factory=dict)
         # e.g. {"east.manager.1": EnvOverrides(request_timeout="1s")}
     timeouts: HarnessTimeouts = HarnessTimeouts()
-    base_port: int = 9000
 ```
 
 `pytest.mark.parametrize` over `ClusterSpec` instances gives matrix testing.

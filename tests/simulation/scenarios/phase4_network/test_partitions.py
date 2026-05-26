@@ -50,7 +50,7 @@ from tests.simulation.harness import (
 )
 
 
-def _l3_spec(base_port: int) -> ClusterSpec:
+def _l3_spec() -> ClusterSpec:
     """Two DCs × 2 managers × 1 worker, gated by 3 gates.
 
     The smaller-than-full L3 spec keeps test runtime reasonable
@@ -63,12 +63,11 @@ def _l3_spec(base_port: int) -> ClusterSpec:
             "west": DCSpec(managers=2, workers=1, cores_per_worker=1),
         },
         env=EnvOverrides(request_timeout="3s", log_level="error"),
-        base_port=base_port,
         timeouts=HarnessTimeouts(stabilization_default=90.0),
     )
 
 
-def _l2_spec(base_port: int) -> ClusterSpec:
+def _l2_spec() -> ClusterSpec:
     """Single-DC 3-manager cluster — for delay / drop tests that don't
     need cross-DC plumbing."""
     return ClusterSpec(
@@ -77,7 +76,6 @@ def _l2_spec(base_port: int) -> ClusterSpec:
             "main": DCSpec(managers=3, workers=1, cores_per_worker=1),
         },
         env=EnvOverrides(request_timeout="5s", log_level="error"),
-        base_port=base_port,
         timeouts=HarnessTimeouts(stabilization_default=60.0),
     )
 
@@ -104,7 +102,7 @@ async def test_dc_to_dc_partition_then_heal() -> None:
     Step 4: heal_partition. Cluster reconverges; cleanup verifies no
             partition rules left over.
     """
-    spec = _l3_spec(base_port=22000)
+    spec = _l3_spec()
     async with ClusterHarness(
         spec,
         mode=ExecutionMode.REAL,
@@ -160,7 +158,7 @@ async def test_one_way_drop_rate() -> None:
          doesn't double-count or block both directions.
       4. clear_network_faults to reset.
     """
-    spec = _l3_spec(base_port=22100)
+    spec = _l3_spec()
     async with ClusterHarness(
         spec,
         mode=ExecutionMode.REAL,
@@ -200,7 +198,7 @@ async def test_flapping_partition() -> None:
         flapping (split-brain detection would catch any window where
         both sides simultaneously elect leaders).
     """
-    spec = _l3_spec(base_port=22200)
+    spec = _l3_spec()
     async with ClusterHarness(
         spec,
         mode=ExecutionMode.REAL,
@@ -249,7 +247,7 @@ async def test_intra_dc_delay_does_not_break_quorum() -> None:
       2. dc_has_leader still holds after a few seconds.
       3. Cleanup is clean.
     """
-    spec = _l2_spec(base_port=22300)
+    spec = _l2_spec()
     async with ClusterHarness(
         spec,
         mode=ExecutionMode.REAL,

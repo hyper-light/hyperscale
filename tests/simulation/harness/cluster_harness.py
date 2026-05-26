@@ -102,7 +102,7 @@ class ClusterHarness:
                 "use ExecutionMode.REAL until then."
             )
 
-        self._ports = PortAllocator(host=self.spec.host, base_port=self.spec.base_port)
+        self._ports = PortAllocator(host=self.spec.host)
         self._expected_worker_count_by_dc = {
             dc_id: dc_spec.workers
             for dc_id, dc_spec in self.spec.datacenters.items()

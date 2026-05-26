@@ -463,9 +463,11 @@ class Supervisor:
             )
 
     async def _verify_ports_released(self) -> None:
-        held = await self.ports.verify_all_released()
+        held = await self.ports.verify_all_released(settle_seconds=0.0)
         if held:
             self.cleanup_errors.append(f"ports still held after teardown: {held}")
+            return
+        self.ports.release_all()
 
     async def _preflight_zombie_reap(self) -> None:
         """Find and kill processes left over from earlier harness runs.

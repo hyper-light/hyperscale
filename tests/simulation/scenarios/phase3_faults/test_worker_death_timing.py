@@ -31,14 +31,13 @@ from tests.simulation.harness import (
 )
 
 
-def _l1_spec(base_port: int, workers: int = 2) -> ClusterSpec:
+def _l1_spec(workers: int = 2) -> ClusterSpec:
     return ClusterSpec(
         gates=0,
         datacenters={
             "local": DCSpec(managers=1, workers=workers, cores_per_worker=2),
         },
         env=EnvOverrides(request_timeout="5s", log_level="error"),
-        base_port=base_port,
         timeouts=HarnessTimeouts(stabilization_default=60.0),
     )
 
@@ -81,7 +80,7 @@ def _worker_handle_by_node_id(
 @pytest.mark.simulation
 async def test_worker_dies_mid_dispatch_before_ack() -> None:
     """TCP dispatch loses the target worker before ack; manager dispatches remaining work."""
-    spec = _l1_spec(base_port=36000)
+    spec = _l1_spec()
     async with ClusterHarness(
         spec,
         mode=ExecutionMode.REAL,
@@ -129,7 +128,7 @@ async def test_worker_dies_mid_dispatch_before_ack() -> None:
 @pytest.mark.simulation
 async def test_worker_dies_post_ack_before_workload_finishes() -> None:
     """Worker accepts dispatch, then dies before producing a final result."""
-    spec = _l1_spec(base_port=37500)
+    spec = _l1_spec()
     async with ClusterHarness(
         spec,
         mode=ExecutionMode.REAL,
@@ -222,7 +221,7 @@ async def test_worker_dies_mid_execute() -> None:
     is restart-from-scratch (per SCENARIOS.md §2 contract), so the
     completion budget covers one full re-execution plus dispatch.
     """
-    spec = _l1_spec(base_port=38250)
+    spec = _l1_spec()
     async with ClusterHarness(
         spec,
         mode=ExecutionMode.REAL,
@@ -272,7 +271,7 @@ async def test_worker_dies_mid_execute() -> None:
 @pytest.mark.simulation
 async def test_worker_dies_post_execute_before_result_push() -> None:
     """Worker finishes execution but dies before pushing its final result."""
-    spec = _l1_spec(base_port=39000)
+    spec = _l1_spec()
     async with ClusterHarness(
         spec,
         mode=ExecutionMode.REAL,
@@ -344,7 +343,7 @@ async def test_worker_dies_post_execute_before_result_push() -> None:
 @pytest.mark.simulation
 async def test_worker_rejoins_same_process_refutes_stale_incarnation() -> None:
     """Paused worker resumes with the same identity and clears stale suspicion."""
-    spec = _l1_spec(base_port=40500)
+    spec = _l1_spec()
     async with ClusterHarness(
         spec,
         mode=ExecutionMode.REAL,
@@ -379,7 +378,7 @@ async def test_worker_rejoins_same_process_refutes_stale_incarnation() -> None:
 @pytest.mark.simulation
 async def test_worker_rejoins_new_incarnation_after_restart() -> None:
     """Killed worker restarts at the same ports with a fresh node incarnation."""
-    spec = _l1_spec(base_port=42000)
+    spec = _l1_spec()
     async with ClusterHarness(
         spec,
         mode=ExecutionMode.REAL,

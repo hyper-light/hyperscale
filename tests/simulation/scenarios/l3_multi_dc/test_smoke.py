@@ -4,8 +4,8 @@ L3 smoke scenarios — multi-datacenter through a gate cluster.
 Two scenarios at this level:
 
 1. ``test_l3_framework_structure`` — harness pieces only. Validates
-   that a realistic L3 spec composes cleanly and reserves a unique
-   contiguous port range.
+   that a realistic L3 spec composes cleanly and reserves unique
+   kernel-selected ports.
 
 2. ``test_l3_cluster_lifecycle`` — full real-server stand-up of 3
    gates + 2 datacenters × (2 managers + 1 worker × 2 cores).
@@ -39,7 +39,6 @@ def _l3_spec() -> ClusterSpec:
             "west": DCSpec(managers=2, workers=1, cores_per_worker=2),
         },
         env=EnvOverrides(request_timeout="5s", log_level="error"),
-        base_port=19400,
         timeouts=HarnessTimeouts(stabilization_default=75.0),
     )
 
@@ -63,7 +62,7 @@ async def test_l3_framework_structure() -> None:
 
     # PortAllocator handles a realistic L3 reservation: gates need pairs,
     # workers need triples (TCP + UDP + derived port range).
-    ports = PortAllocator(host=spec.host, base_port=spec.base_port)
+    ports = PortAllocator(host=spec.host)
     gate_pairs = [ports.reserve_pair() for _ in range(spec.gates)]
     manager_pairs = [
         ports.reserve_pair()

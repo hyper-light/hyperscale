@@ -1,52 +1,15 @@
-"""
-Port allocation with try-bind probing and contiguous-range reservation.
-
-Probes by binding ephemeral sockets before handing ports out, so the
-harness fails fast and clearly when prior-run zombies are squatting on
-ports — rather than letting a server later fail with an opaque
-`Address already in use`.
-"""
+"""Kernel-backed port allocation with contiguous-range reservation."""
 
 import asyncio
 import socket
-import time
 from dataclasses import dataclass, field
 
 from tests.simulation.harness.errors import PortConflictError
 
 
-_PROCESS_PORT_RETIRE_SECONDS = 300.0
-"""Do not reuse a harness port in the same test process for this long.
-
-Sequential simulation tests create and tear down clusters in one event
-loop. The OS may report a just-used port as bindable while asyncio
-transport cleanup and late UDP/TCP callbacks from the previous cluster
-are still draining. Reusing the same range immediately lets old traffic
-and stale transports interfere with the next cluster's startup. A
-process-local retirement table makes every new ``PortAllocator`` skip
-recently allocated ranges even when individual bind probes succeed.
-"""
-
-_PROCESS_RETIRED_PORTS: dict[int, float] = {}
-
-
-def _retire_port(port: int) -> None:
-    _PROCESS_RETIRED_PORTS[port] = time.monotonic() + _PROCESS_PORT_RETIRE_SECONDS
-
-
-def _is_process_retired(port: int) -> bool:
-    expires_at = _PROCESS_RETIRED_PORTS.get(port)
-    if expires_at is None:
-        return False
-    if expires_at <= time.monotonic():
-        _PROCESS_RETIRED_PORTS.pop(port, None)
-        return False
-    return True
-
-
 @dataclass(slots=True)
 class PortAllocator:
-    """Hand out ports the harness has verified are bindable.
+    """Hand out OS-selected ports the harness has verified are bindable.
 
     The allocator tracks every port it has issued in `_reserved` so the
     final post-teardown verification can re-bind each one and confirm the
@@ -55,22 +18,19 @@ class PortAllocator:
     """
 
     host: str = "127.0.0.1"
-    base_port: int = 9000
-    _next_port: int = field(init=False)
     _reserved: set[int] = field(default_factory=set, init=False)
-
-    def __post_init__(self) -> None:
-        self._next_port = self.base_port
 
     def reserve_pair(self) -> tuple[int, int]:
         """Reserve a (tcp, udp) pair on consecutive ports."""
-        return (self._reserve_one(), self._reserve_one())
+        block_base = self._reserve_block(2)
+        return block_base, block_base + 1
 
     def reserve_range(self, count: int) -> list[int]:
         """Reserve `count` consecutive ports, all verified bindable."""
         if count <= 0:
             return []
-        return [self._reserve_one() for _ in range(count)]
+        block_base = self._reserve_block(count)
+        return list(range(block_base, block_base + count))
 
     def reserve_worker_block(
         self,
@@ -100,53 +60,39 @@ class PortAllocator:
         return tcp, udp
 
     def _reserve_block(self, block_size: int) -> int:
-        """Reserve a contiguous block of ``block_size`` bindable ports.
+        """Reserve a contiguous block chosen from the OS ephemeral range."""
+        if block_size <= 0:
+            raise ValueError("block_size must be positive")
 
-        Returns the first port of the block. Probes block-aligned
-        candidates and verifies every port in the block is bindable
-        before committing — partial-block reservations would be useless
-        because the worker derives offsets from the block base.
-        """
-        attempts = 0
-        max_attempts = 10_000
-        while attempts < max_attempts:
-            block_base = self._next_port
-            attempts += 1
+        max_attempts = 50
+        for _attempt in range(max_attempts):
+            block_base = self._ephemeral_anchor()
+            if block_base + block_size - 1 > 65535:
+                continue
+
             block_ports = list(range(block_base, block_base + block_size))
-            if any(p in self._reserved or _is_process_retired(p) for p in block_ports):
-                self._next_port += 1
+            if any(port in self._reserved for port in block_ports):
                 continue
             if all(self._is_bindable(p) for p in block_ports):
                 for p in block_ports:
                     self._reserved.add(p)
-                    _retire_port(p)
-                self._next_port = block_base + block_size
                 return block_base
-            self._next_port += 1
 
         raise PortConflictError(
-            f"Could not find a bindable {block_size}-port block after "
-            f"{max_attempts} attempts starting from {self.base_port}"
+            f"Could not find a bindable {block_size}-port block via "
+            f"kernel ephemeral probing after {max_attempts} attempts"
         )
 
     def _reserve_one(self) -> int:
-        """Probe upward from `_next_port` until one binds; reserve and return it."""
-        attempts = 0
-        max_attempts = 10_000
-        while attempts < max_attempts:
-            candidate = self._next_port
-            self._next_port += 1
-            attempts += 1
-            if candidate in self._reserved or _is_process_retired(candidate):
-                continue
-            if self._is_bindable(candidate):
-                self._reserved.add(candidate)
-                _retire_port(candidate)
-                return candidate
-        raise PortConflictError(
-            f"Could not find a bindable port after {max_attempts} attempts"
-            f" starting from {self.base_port}"
-        )
+        """Reserve one bindable OS-selected port."""
+        return self._reserve_block(1)
+
+    def _ephemeral_anchor(self) -> int:
+        """Ask the kernel for a currently-free ephemeral TCP port."""
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as anchor:
+            anchor.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            anchor.bind((self.host, 0))
+            return int(anchor.getsockname()[1])
 
     def _is_bindable(self, port: int) -> bool:
         """Try to bind both TCP and UDP at this port; return True iff both succeed."""
@@ -156,7 +102,7 @@ class PortAllocator:
             return False
         return True
 
-    async def verify_all_released(self, settle_seconds: float = 0.5) -> list[int]:
+    async def verify_all_released(self, settle_seconds: float = 0.0) -> list[int]:
         """Verify every reserved port is bindable again.
 
         Returns the list of ports still held; an empty list means clean
@@ -169,6 +115,14 @@ class PortAllocator:
             if not self._is_bindable(port):
                 held.append(port)
         return held
+
+    def release(self, port: int) -> None:
+        """Release one harness reservation after teardown verification."""
+        self._reserved.discard(port)
+
+    def release_all(self) -> None:
+        """Release all harness reservations after teardown verification."""
+        self._reserved.clear()
 
     def reserved_ports(self) -> list[int]:
         return sorted(self._reserved)

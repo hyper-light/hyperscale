@@ -37,7 +37,6 @@ def _l2_spec() -> ClusterSpec:
             "main": DCSpec(managers=3, workers=2, cores_per_worker=2),
         },
         env=EnvOverrides(request_timeout="5s", log_level="error"),
-        base_port=19200,
         timeouts=HarnessTimeouts(stabilization_default=60.0),
     )
 
@@ -45,7 +44,7 @@ def _l2_spec() -> ClusterSpec:
 @pytest.mark.asyncio
 @pytest.mark.simulation
 async def test_l2_framework_structure() -> None:
-    """A 3-manager, 2-worker spec spends ports in a contiguous range.
+    """A 3-manager, 2-worker spec reserves unique kernel-selected ports.
 
     3 manager TCP/UDP pairs (6) + 2 worker (TCP/UDP/derived) triples (6)
     validates the PortAllocator under realistic L2 load without
@@ -54,7 +53,7 @@ async def test_l2_framework_structure() -> None:
     spec = _l2_spec()
     assert spec.total_node_count() == 5
 
-    ports = PortAllocator(host=spec.host, base_port=spec.base_port)
+    ports = PortAllocator(host=spec.host)
     pairs = [ports.reserve_pair() for _ in range(3)]
     triples = [ports.reserve_range(3) for _ in range(2)]
 
@@ -62,7 +61,6 @@ async def test_l2_framework_structure() -> None:
         p for triple in triples for p in triple
     ]
     assert len(set(flat)) == len(flat), "all reserved ports must be unique"
-    assert min(flat) >= spec.base_port
 
 
 @pytest.mark.asyncio

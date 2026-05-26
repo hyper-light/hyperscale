@@ -48,14 +48,13 @@ from tests.simulation.scenarios.phase3_faults.test_leader_faults import (
 )
 
 
-def _l2_spec(base_port: int) -> ClusterSpec:
+def _l2_spec() -> ClusterSpec:
     return ClusterSpec(
         gates=0,
         datacenters={
             "main": DCSpec(managers=3, workers=2, cores_per_worker=2),
         },
         env=EnvOverrides(request_timeout="3s", log_level="error"),
-        base_port=base_port,
         timeouts=HarnessTimeouts(stabilization_default=60.0),
     )
 
@@ -108,7 +107,7 @@ async def test_partition_grows_local_health_multiplier() -> None:
       4. Heal partition; victim's LHM should eventually return
          toward baseline as successful probes accumulate.
     """
-    spec = _l2_spec(base_port=22500)
+    spec = _l2_spec()
     async with ClusterHarness(
         spec,
         mode=ExecutionMode.REAL,
@@ -194,7 +193,7 @@ async def test_partition_during_workload_does_not_hang() -> None:
     results that won't arrive — the AD-26 H7/H8 + AD-34 timeout
     paths must surface the situation.
     """
-    spec = _l2_spec(base_port=22600)
+    spec = _l2_spec()
     workload = _simple_workload(timeout_seconds=20.0)
     async with ClusterHarness(
         spec,
@@ -247,7 +246,7 @@ async def test_leader_side_partition_vs_kill() -> None:
       5. Verify only one current leader is reported across all
          three managers.
     """
-    spec = _l2_spec(base_port=22700)
+    spec = _l2_spec()
     async with ClusterHarness(
         spec,
         mode=ExecutionMode.REAL,
@@ -332,7 +331,7 @@ async def test_high_loss_rate_triggers_lhm_growth() -> None:
          peer set — the peer is impaired, not declared DEAD.
       5. Clear faults; LHM decays back.
     """
-    spec = _l2_spec(base_port=22800)
+    spec = _l2_spec()
     async with ClusterHarness(
         spec,
         mode=ExecutionMode.REAL,

@@ -39,7 +39,7 @@ from tests.simulation.harness import (
 )
 
 
-def _l2_spec(base_port: int, workers: int = 1) -> ClusterSpec:
+def _l2_spec(workers: int = 1) -> ClusterSpec:
     """Single-DC 3-manager topology for Phase 4 link-fault tests."""
     return ClusterSpec(
         gates=0,
@@ -47,7 +47,6 @@ def _l2_spec(base_port: int, workers: int = 1) -> ClusterSpec:
             "main": DCSpec(managers=3, workers=workers, cores_per_worker=1),
         },
         env=EnvOverrides(request_timeout="4s", log_level="error"),
-        base_port=base_port,
         timeouts=HarnessTimeouts(stabilization_default=75.0),
     )
 
@@ -75,7 +74,7 @@ def _simple_workload(timeout_seconds: float = 45.0) -> WorkloadSpec:
 @pytest.mark.simulation
 async def test_latency_drift_link_delay_increases_and_clears() -> None:
     """Latency drift ramps from 10ms to 250ms and remains bounded."""
-    spec = _l2_spec(base_port=22900)
+    spec = _l2_spec()
     async with ClusterHarness(
         spec,
         mode=ExecutionMode.REAL,
@@ -118,15 +117,14 @@ async def test_latency_drift_link_delay_increases_and_clears() -> None:
 @pytest.mark.asyncio
 @pytest.mark.simulation
 @pytest.mark.parametrize(
-    ("probability", "base_port"),
-    [(0.01, 23000), (0.05, 23100), (0.20, 23200)],
+    "probability",
+    [0.01, 0.05, 0.20],
 )
 async def test_uniform_packet_drop_rates_preserve_swim_convergence(
     probability: float,
-    base_port: int,
 ) -> None:
     """Uniform 1%, 5%, and 20% manager-link loss preserves peer convergence."""
-    spec = _l2_spec(base_port=base_port)
+    spec = _l2_spec()
     async with ClusterHarness(
         spec,
         mode=ExecutionMode.REAL,
@@ -157,7 +155,7 @@ async def test_uniform_packet_drop_rates_preserve_swim_convergence(
 @pytest.mark.simulation
 async def test_drop_burst_expires_without_false_dead() -> None:
     """A 200ms full-loss burst expires and all managers keep peer convergence."""
-    spec = _l2_spec(base_port=23300)
+    spec = _l2_spec()
     async with ClusterHarness(
         spec,
         mode=ExecutionMode.REAL,
@@ -186,7 +184,7 @@ async def test_drop_burst_expires_without_false_dead() -> None:
 @pytest.mark.simulation
 async def test_bandwidth_cap_throttles_without_breaking_quorum() -> None:
     """A constrained manager link adds bounded delay and quorum remains available."""
-    spec = _l2_spec(base_port=23400)
+    spec = _l2_spec()
     async with ClusterHarness(
         spec,
         mode=ExecutionMode.REAL,
@@ -221,7 +219,7 @@ async def test_bandwidth_cap_throttles_without_breaking_quorum() -> None:
 @pytest.mark.simulation
 async def test_udp_reordering_and_duplication_keep_swim_converged() -> None:
     """UDP reordering and duplicate datagrams do not double-count or drop peers."""
-    spec = _l2_spec(base_port=23500)
+    spec = _l2_spec()
     async with ClusterHarness(
         spec,
         mode=ExecutionMode.REAL,
@@ -264,7 +262,7 @@ async def test_udp_reordering_and_duplication_keep_swim_converged() -> None:
 @pytest.mark.simulation
 async def test_tcp_mid_stream_reset_during_dispatch_recovers() -> None:
     """A TCP reset on the first workflow_dispatch is retried, not hung."""
-    spec = _l2_spec(base_port=23600, workers=2)
+    spec = _l2_spec(workers=2)
     workload = _simple_workload(timeout_seconds=60.0)
     async with ClusterHarness(
         spec,

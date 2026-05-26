@@ -27,9 +27,6 @@ class ClusterSpec:
 
     timeouts: HarnessTimeouts = field(default_factory=HarnessTimeouts)
 
-    base_port: int = 9000
-    """Lowest port the harness will allocate. PortAllocator probes upward from here."""
-
     host: str = "127.0.0.1"
     """All nodes bind to this host. Multi-host orchestration is a non-goal."""
 
