@@ -4560,20 +4560,85 @@ class ManagerServer(HealthAwareServer):
 
         return None
 
+    def _manager_tcp_addr_is_live(
+        self,
+        tcp_addr: tuple[str, int],
+    ) -> bool:
+        """Return False when a manager TCP address is believed not-live.
+
+        Liveness composes three signals so any one channel catching up
+        ahead of the others is sufficient:
+
+        1. ``_dead_managers`` — populated by SWIM peer-death handling.
+           This is the fastest local view once the death callback fires.
+        2. Per-peer ``unhealthy_since`` — set the moment a peer flips to
+           SUSPECT or DEAD; persists across reap windows.
+        3. ``IncarnationTracker`` state for the peer's UDP address —
+           ``SUSPECT`` or ``DEAD`` short-circuits well before the manager
+           death handler commits ``_dead_managers``.
+
+        A peer the resolver can't index in ``_known_manager_peers``
+        (never registered locally) is treated as live: the resolver
+        cannot disprove liveness without registry data, and the higher
+        layers (TCP send, client retry) will fail it over.
+        """
+        if tcp_addr in self._manager_state.get_dead_managers():
+            return False
+
+        for peer_id, info in self._manager_state.iter_known_manager_peers():
+            if (info.tcp_host, info.tcp_port) != tcp_addr:
+                continue
+            if (
+                self._manager_state.get_manager_peer_unhealthy_since(peer_id)
+                is not None
+            ):
+                return False
+            udp_addr = (info.udp_host, info.udp_port)
+            node_state = self._incarnation_tracker.get_node_state(udp_addr)
+            if (
+                node_state is not None
+                and node_state.status in (b"SUSPECT", b"DEAD")
+            ):
+                return False
+            return True
+
+        return True
+
     def _resolve_job_cancel_redirect_addr(
         self,
         job_id: str,
     ) -> tuple[str, int] | None:
-        """Resolve a non-self redirect target for job cancellation."""
+        """Resolve a non-self, live redirect target for job cancellation.
+
+        A new DC leader may receive a cancel before manager job-leader
+        takeover commits locally. The cached ``get_job_leader_addr``
+        still points at the dead prior leader; redirecting there sends
+        the client to a manager already in its ``tried`` set, which the
+        client surfaces as ``redirect cycles to already-tried target``.
+
+        Filter every candidate through ``_manager_tcp_addr_is_live`` so
+        we only redirect to peers we currently believe to be alive.
+        Returning ``None`` lets the client classify the response as
+        transient and round-robin to a live target instead of chasing
+        a known-dead leader address.
+        """
         self_addr = (self._host, self._tcp_port)
+
         job_leader_addr = self._leases.get_job_leader_addr(job_id)
         if job_leader_addr is not None:
             job_leader_addr = tuple(job_leader_addr)
-            if job_leader_addr != self_addr:
+            if (
+                job_leader_addr != self_addr
+                and self._manager_tcp_addr_is_live(job_leader_addr)
+            ):
                 return job_leader_addr
 
         dc_leader_addr = self._resolve_dc_leader_addr()
-        if dc_leader_addr is not None and dc_leader_addr != self_addr:
+        if (
+            dc_leader_addr is not None
+            and dc_leader_addr != self_addr
+            and self._manager_tcp_addr_is_live(dc_leader_addr)
+        ):
             return dc_leader_addr
 
         return None
