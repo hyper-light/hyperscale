@@ -465,10 +465,29 @@ class Supervisor:
             )
 
     async def _verify_ports_released(self) -> None:
+        """Drain harness reservations back to the process-global pool.
+
+        ``verify_all_released`` is best-effort: TCP TIME_WAIT residue or
+        a TCP/UDP probe race can leave a freshly-closed port briefly
+        non-bindable even after a fully successful teardown. Holding
+        the entire allocator's logical reservations hostage to those
+        transient stragglers — which is what skipping ``release_all``
+        used to do — leaks the *bindable* ports back to the process
+        pool too, because they stay flagged as reserved in
+        ``_PROCESS_RESERVED_PORTS_BY_HOST``. Across a long sequential
+        test run the harness range exhausts and every subsequent
+        cluster setup raises ``PortConflictError``.
+
+        Release every logical reservation back to the process pool
+        unconditionally. Surface the still-held set as a cleanup error
+        so genuine teardown regressions remain observable; the next
+        allocator pass will simply walk past any port that is still
+        non-bindable (the candidate scan already calls ``_is_bindable``
+        on every probe) and converge on the actual free ports.
+        """
         held = await self.ports.verify_all_released(settle_seconds=0.0)
         if held:
             self.cleanup_errors.append(f"ports still held after teardown: {held}")
-            return
         self.ports.release_all()
 
     async def _preflight_zombie_reap(self) -> None:
