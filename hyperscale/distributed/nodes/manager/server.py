@@ -6672,7 +6672,20 @@ class ManagerServer(HealthAwareServer):
             if not self._leases.is_job_leader(job_id):
                 leader_addr = self._leases.get_job_leader_addr(job_id)
                 self_addr = (self._host, self._tcp_port)
-                if self.is_leader() and (leader_addr is None or leader_addr == self_addr):
+                cached_leader_is_actionable_self = (
+                    leader_addr is None
+                    or leader_addr == self_addr
+                    or not self._manager_tcp_addr_is_live(leader_addr)
+                )
+                if self.is_leader() and cached_leader_is_actionable_self:
+                    # We are the DC leader and the cached job-leader
+                    # address is unknown, self, or a peer we believe to
+                    # be dead. Either way the lease must advance under
+                    # us; otherwise the redirect path below would hand
+                    # the client a stale dead-leader address that it has
+                    # already tried as the job-submission target,
+                    # producing ``redirect cycles to already-tried
+                    # target``. Attempt the SWIM-leader takeover here.
                     old_leader_id = self._manager_state.get_job_leader(job_id)
                     taken_over = await self._take_over_job_leadership_as_cluster_leader(
                         job_id,
