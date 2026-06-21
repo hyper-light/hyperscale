@@ -3579,6 +3579,7 @@ class ManagerServer(HealthAwareServer):
                     sync_response = StateSyncResponse.load(response)
                     if sync_response.manager_state and sync_response.responder_ready:
                         peer_snapshot = sync_response.manager_state
+                        self._apply_peer_worker_snapshots(peer_snapshot.workers)
                         for job_id, fence_token in peer_snapshot.job_fence_tokens.items():
                             leader_id = peer_snapshot.job_leaders.get(job_id)
                             leader_addr = peer_snapshot.job_leader_addrs.get(job_id)
@@ -3606,6 +3607,71 @@ class ManagerServer(HealthAwareServer):
                         node_id=self._node_id.short,
                     )
                 )
+
+    def _apply_peer_worker_snapshots(
+        self,
+        worker_snapshots: list[WorkerStateSnapshot],
+    ) -> None:
+        """Reconstruct worker registrations from a peer's state snapshot.
+
+        Workers register with managers via the ``worker_register`` RPC,
+        which is delivered only to the seed managers configured on each
+        worker. After a leader-kill the elected new leader may have
+        zero entries in ``_manager_state._workers`` until each surviving
+        worker independently re-registers — at minute-scale jitter.
+
+        ``ManagerStateSnapshot.workers`` is shipped on every peer sync
+        precisely so the new leader can recover that registry without
+        waiting for worker-side re-registration. Replicating the
+        snapshot to the registry is what makes the takeover-side
+        ``_get_running_workflows_to_cancel`` succeed: it resolves
+        ``sub_workflow.token.worker_id`` through
+        ``ManagerState.get_worker`` to obtain a worker address; without
+        a populated registry the lookup returns ``None``, every
+        running workflow is silently skipped, ``workflows_to_cancel``
+        ends up empty, no ``workflow_cancellation_complete`` ever
+        decrements the pending tracker to zero, and the client times
+        out on ``await_job_cancellation`` because the
+        ``job_cancellation_complete`` push that the manager fires only
+        from that zero-pending branch is never scheduled.
+
+        Only the snapshot fields the cancel and dispatch paths
+        actually consume are reconstructed: identity (host/tcp/udp
+        ports) for addressing, cores for capacity gating, and the
+        manager's own ``cluster_id`` / ``environment_id`` so a future
+        ``WorkerRegistration`` consumer that inspects them sees
+        consistent values. SWIM/probe/disseminator wiring deliberately
+        stays untouched — those channels rejoin under the worker's
+        own re-registration, where SWIM incarnation and rejoin gating
+        are authoritative.
+        """
+        if not worker_snapshots:
+            return
+
+        for snapshot in worker_snapshots:
+            if not snapshot.node_id or not snapshot.host or snapshot.tcp_port <= 0:
+                continue
+            if self._manager_state.has_worker(snapshot.node_id):
+                continue
+
+            node = NodeInfo(
+                node_id=snapshot.node_id,
+                role="worker",
+                host=snapshot.host,
+                port=snapshot.tcp_port,
+                datacenter=self._node_id.datacenter,
+                udp_port=snapshot.udp_port,
+                version=snapshot.version,
+            )
+            registration = WorkerRegistration(
+                node=node,
+                total_cores=snapshot.total_cores,
+                available_cores=snapshot.available_cores,
+                memory_mb=0,
+                cluster_id=self._config.cluster_id,
+                environment_id=self._config.environment_id,
+            )
+            self._registry.register_worker(registration)
 
     async def _sync_full_state_from_manager_peers(self) -> None:
         """Force a full peer-manager state sync after leadership changes."""
