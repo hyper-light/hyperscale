@@ -3557,7 +3557,17 @@ class ManagerServer(HealthAwareServer):
 
     async def _sync_state_from_manager_peers(self, *, force_full: bool = False) -> None:
         """Sync state from peer managers."""
-        for peer_addr in self._manager_state.get_active_manager_peers():
+        # Snapshot the live set before iterating. Each loop iteration
+        # awaits ``send_tcp`` and now also routes through
+        # ``_apply_peer_worker_snapshots``, both of which yield to the
+        # event loop. A concurrent ``_handle_manager_peer_death``
+        # (which calls ``remove_active_peer`` → ``discard``) can
+        # mutate ``_active_manager_peers`` mid-iteration and raise
+        # ``Set changed size during iteration``. The cancel handler
+        # catches that on the takeover path and the client surfaces
+        # it as ``Job cancellation failed: Set changed size during
+        # iteration`` — a permanent failure that aborts the request.
+        for peer_addr in list(self._manager_state.get_active_manager_peers()):
             try:
                 since_version = -1 if force_full else self._manager_state.state_version
                 request = StateSyncRequest(
@@ -8870,7 +8880,11 @@ class ManagerServer(HealthAwareServer):
             origin_gate_addr=origin_gate_addr,
         )
 
-        for peer_addr in self._manager_state.get_active_manager_peers():
+        # Snapshot before iterating — the loop body awaits send_tcp,
+        # so a concurrent peer-death handler removing from the live
+        # set would otherwise raise ``Set changed size during
+        # iteration`` mid-broadcast.
+        for peer_addr in list(self._manager_state.get_active_manager_peers()):
             try:
                 await self.send_tcp(
                     peer_addr,
