@@ -3881,7 +3881,7 @@ class ManagerServer(HealthAwareServer):
                 )
                 continue
 
-            if isinstance(response, Exception) or response is None:
+            if isinstance(response, Exception) or response is None or not response:
                 error_message = (
                     str(response) if isinstance(response, Exception) else "no response"
                 )
@@ -3898,7 +3898,34 @@ class ManagerServer(HealthAwareServer):
                 )
                 continue
 
-            ack = JobLeaderWorkerTransferAck.load(response)
+            try:
+                ack = JobLeaderWorkerTransferAck.load(response)
+            except Exception as decode_error:
+                # ``response`` passed the bytes / Exception / empty
+                # checks above but the payload still failed to
+                # deserialize — most commonly because the worker's
+                # TCP handler returned a framing error indicator
+                # rather than a valid ack. Treat as a transfer
+                # rejection that the worker will need to resolve on
+                # its next ``worker_register`` cycle. Letting the
+                # exception bubble would surface to the cancel
+                # handler's outer try/except as
+                # ``Job cancellation failed: unpickling stack
+                # underflow`` and abort an otherwise-recoverable
+                # cancellation.
+                await self._udp_logger.log(
+                    ServerWarning(
+                        message=(
+                            "Failed to decode leader transfer ack from worker "
+                            f"{worker_id[:8]}... for job {job_id[:8]}...: "
+                            f"{decode_error}"
+                        ),
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+                continue
             if not ack.accepted:
                 await self._udp_logger.log(
                     ServerWarning(
