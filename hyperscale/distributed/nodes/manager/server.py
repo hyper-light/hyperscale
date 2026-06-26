@@ -6960,6 +6960,62 @@ class ManagerServer(HealthAwareServer):
                 )
             )
 
+            # Forward to the actual job leader if we're not it. Workers
+            # push ``workflow_cancellation_complete`` to whichever address
+            # they have cached at ``get_workflow_job_leader(workflow_id)``;
+            # under leader failover that cache can still point at the
+            # dead old leader, and the worker-side fallback chain then
+            # iterates ``_healthy_manager_ids`` and lands at whichever
+            # surviving manager it picks first. The cancellation-pending
+            # tracker that drives the completion push lives ONLY on the
+            # current job leader (it's seeded inline by the takeover-side
+            # ``cancel_job`` right before ``_cancel_running_workflows``
+            # sends ``cancel_workflow`` to the worker). On a non-leader
+            # peer, ``get_cancellation_pending_workflows`` returns an
+            # empty set, the ``workflow_id in pending`` check below is
+            # False, the decrement no-ops, and the leader's tracker
+            # never reaches zero — the client times out on
+            # ``await_job_cancellation`` because the
+            # ``job_cancellation_complete`` push that only fires from
+            # the zero-pending branch is never scheduled. That's the
+            # exact failure shape ``test_cancel_during_leader_failover``
+            # surfaces about one run in three. Forwarding here closes
+            # the gap regardless of which manager the worker happens
+            # to land on.
+            if not self._leases.is_job_leader(job_id):
+                leader_addr = self._leases.get_job_leader_addr(job_id)
+                self_addr = (self._host, self._tcp_port)
+                if (
+                    leader_addr is not None
+                    and tuple(leader_addr) != self_addr
+                    and self._manager_tcp_addr_is_live(tuple(leader_addr))
+                ):
+                    try:
+                        response, _clock = await self.send_tcp(
+                            tuple(leader_addr),
+                            "workflow_cancellation_complete",
+                            data,
+                            timeout=self._config.tcp_timeout_standard_seconds,
+                        )
+                        if isinstance(response, bytes):
+                            return response
+                    except Exception as forward_error:
+                        await self._udp_logger.log(
+                            ServerWarning(
+                                message=(
+                                    "Failed to forward workflow_cancellation_complete "
+                                    f"for {workflow_id[:8]}... (job {job_id[:8]}...) "
+                                    f"to job leader {tuple(leader_addr)}: "
+                                    f"{forward_error}; falling back to coordinator-"
+                                    "side notify in case the callback is replicated "
+                                    "locally."
+                                ),
+                                node_host=self._host,
+                                node_port=self._tcp_port,
+                                node_id=self._node_id.short,
+                            )
+                        )
+
             # Track this workflow as complete
             pending = self._manager_state.get_cancellation_pending_workflows(job_id)
             if workflow_id in pending:
