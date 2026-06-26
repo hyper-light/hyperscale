@@ -42,12 +42,12 @@ predictive posterior.
 
 from __future__ import annotations
 
-import time
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Deque
 
+from hyperscale.distributed.runtime import Clock, RealClock
 from .bocpd import (
     BayesianOnlineChangePointDetector,
     BOCPDConfig,
@@ -177,7 +177,12 @@ class ThroughputWitness:
     serialises access through the existing per-job lock.
     """
 
-    def __init__(self, config: ThroughputWitnessConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: ThroughputWitnessConfig | None = None,
+        *,
+        clock: Clock | None = None,
+    ) -> None:
         self._config: ThroughputWitnessConfig = (
             config if config is not None else ThroughputWitnessConfig()
         )
@@ -185,6 +190,7 @@ class ThroughputWitness:
             self._config.alpha
         )
         self._streams: dict[tuple[str, str], _StreamState] = {}
+        self._clock: Clock = clock if clock is not None else RealClock()
 
     @property
     def config(self) -> ThroughputWitnessConfig:
@@ -254,7 +260,7 @@ class ThroughputWitness:
 
         posterior = stream.detector.observe(throughput)
         stream.history.append(throughput)
-        stream.last_observation_time = time.monotonic()
+        stream.last_observation_time = self._clock.monotonic()
 
         change_p = posterior.change_point_probability()
         predictive_mean_after = posterior.expected_predictive_mean(

@@ -25,10 +25,14 @@ Each probe can be configured with:
 """
 
 import asyncio
-import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Callable, Awaitable, Protocol
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 class ProbeResult(Enum):
@@ -47,7 +51,7 @@ class ProbeResponse:
     result: ProbeResult
     message: str = ""
     latency_ms: float = 0.0
-    timestamp: float = field(default_factory=time.monotonic)
+    timestamp: float = field(default_factory=_DEFAULT_CLOCK.monotonic)
     details: dict = field(default_factory=dict)
 
 
@@ -117,6 +121,8 @@ class HealthProbe:
         name: str,
         check: ProbeCheck,
         config: ProbeConfig | None = None,
+        *,
+        clock: Clock | None = None,
     ):
         """
         Initialize HealthProbe.
@@ -125,6 +131,10 @@ class HealthProbe:
             name: Name of this probe (for logging/metrics).
             check: Async function that returns (success, message).
             config: Probe configuration.
+            clock: Optional ``Clock`` injection; defaults to the
+                module-level ``RealClock``. Phase 6 SIM mode threads
+                a ``VirtualClock`` through to drive deterministic
+                probe scheduling.
         """
         self._name = name
         self._check = check
@@ -132,6 +142,7 @@ class HealthProbe:
         self._state = ProbeState()
         self._started = False
         self._periodic_task: asyncio.Task | None = None
+        self._clock: Clock = clock if clock is not None else _DEFAULT_CLOCK
 
     @property
     def name(self) -> str:
@@ -153,17 +164,17 @@ class HealthProbe:
         Returns:
             ProbeResponse with result and details.
         """
-        start_time = time.monotonic()
+        start_time = self._clock.monotonic()
         self._state.total_checks += 1
 
         try:
             # Run check with timeout
-            success, message = await asyncio.wait_for(
+            success, message = await self._clock.wait_for(
                 self._check(),
                 timeout=self._config.timeout_seconds,
             )
 
-            latency_ms = (time.monotonic() - start_time) * 1000
+            latency_ms = (self._clock.monotonic() - start_time) * 1000
 
             if success:
                 result = ProbeResult.SUCCESS
@@ -179,7 +190,7 @@ class HealthProbe:
             )
 
         except asyncio.TimeoutError:
-            latency_ms = (time.monotonic() - start_time) * 1000
+            latency_ms = (self._clock.monotonic() - start_time) * 1000
             message = f"Probe timed out after {self._config.timeout_seconds}s"
             self._record_failure(message)
 
@@ -190,7 +201,7 @@ class HealthProbe:
             )
 
         except Exception as exception:
-            latency_ms = (time.monotonic() - start_time) * 1000
+            latency_ms = (self._clock.monotonic() - start_time) * 1000
             message = f"Probe error: {exception}"
             self._record_failure(message)
 
@@ -204,7 +215,7 @@ class HealthProbe:
         """Record a successful check."""
         self._state.consecutive_successes += 1
         self._state.consecutive_failures = 0
-        self._state.last_check = time.monotonic()
+        self._state.last_check = self._clock.monotonic()
         self._state.last_result = ProbeResult.SUCCESS
         self._state.last_message = message
 
@@ -216,7 +227,7 @@ class HealthProbe:
         """Record a failed check."""
         self._state.consecutive_failures += 1
         self._state.consecutive_successes = 0
-        self._state.last_check = time.monotonic()
+        self._state.last_check = self._clock.monotonic()
         self._state.last_result = ProbeResult.FAILURE
         self._state.last_message = message
         self._state.total_failures += 1
@@ -234,7 +245,7 @@ class HealthProbe:
 
         # Initial delay
         if self._config.initial_delay_seconds > 0:
-            await asyncio.sleep(self._config.initial_delay_seconds)
+            await self._clock.sleep(self._config.initial_delay_seconds)
 
         self._periodic_task = asyncio.create_task(self._periodic_loop())
 
@@ -253,7 +264,7 @@ class HealthProbe:
         """Internal loop for periodic checks."""
         while self._started:
             await self.check()
-            await asyncio.sleep(self._config.period_seconds)
+            await self._clock.sleep(self._config.period_seconds)
 
     def reset(self) -> None:
         """Reset probe state."""
@@ -279,6 +290,8 @@ class LivenessProbe(HealthProbe):
         name: str = "liveness",
         check: ProbeCheck | None = None,
         config: ProbeConfig | None = None,
+        *,
+        clock: Clock | None = None,
     ):
         # Default liveness check just returns True
         if check is None:
@@ -297,7 +310,7 @@ class LivenessProbe(HealthProbe):
                 success_threshold=1,
             )
 
-        super().__init__(name=name, check=check, config=config)
+        super().__init__(name=name, check=check, config=config, clock=clock)
 
 
 class ReadinessProbe(HealthProbe):
@@ -326,6 +339,8 @@ class ReadinessProbe(HealthProbe):
         name: str = "readiness",
         check: ProbeCheck | None = None,
         config: ProbeConfig | None = None,
+        *,
+        clock: Clock | None = None,
     ):
         if check is None:
 
@@ -343,7 +358,7 @@ class ReadinessProbe(HealthProbe):
                 success_threshold=1,
             )
 
-        super().__init__(name=name, check=check, config=config)
+        super().__init__(name=name, check=check, config=config, clock=clock)
 
 
 class StartupProbe(HealthProbe):

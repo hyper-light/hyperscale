@@ -5,8 +5,12 @@ Tracks round-trip latency samples to detect network degradation
 within the gate cluster.
 """
 
-import time
 from dataclasses import dataclass
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 @dataclass(slots=True)
@@ -25,12 +29,14 @@ class LatencyTracker:
     gate failures.
     """
 
-    __slots__ = ('_samples', '_config')
+    __slots__ = ('_samples', '_config', '_clock')
 
     def __init__(
         self,
         sample_max_age: float = 60.0,
         sample_max_count: int = 100,
+        *,
+        clock: Clock | None = None,
     ):
         """
         Initialize the latency tracker.
@@ -38,12 +44,15 @@ class LatencyTracker:
         Args:
             sample_max_age: Maximum age of samples to keep (seconds).
             sample_max_count: Maximum number of samples per peer.
+            clock: Optional ``Clock`` injection; defaults to the
+                module-level ``RealClock``.
         """
         self._config = LatencyConfig(
             sample_max_age=sample_max_age,
             sample_max_count=sample_max_count,
         )
         self._samples: dict[str, list[tuple[float, float]]] = {}  # peer_id -> [(timestamp, latency_ms)]
+        self._clock: Clock = clock if clock is not None else _DEFAULT_CLOCK
 
     def record_latency(self, peer_id: str, latency_ms: float) -> None:
         """
@@ -53,7 +62,7 @@ class LatencyTracker:
             peer_id: The peer gate's node ID.
             latency_ms: Round-trip latency in milliseconds.
         """
-        now = time.monotonic()
+        now = self._clock.monotonic()
         samples = self._samples.setdefault(peer_id, [])
         samples.append((now, latency_ms))
 

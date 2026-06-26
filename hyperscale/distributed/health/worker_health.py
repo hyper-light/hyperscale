@@ -15,9 +15,13 @@ Routing decisions based on combined signals:
 - evict: Dead or stuck, remove from pool
 """
 
-import time
 from dataclasses import dataclass, field
 from enum import Enum
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 class ProgressState(Enum):
@@ -84,7 +88,7 @@ class WorkerHealthState:
     config: WorkerHealthConfig = field(default_factory=WorkerHealthConfig)
 
     # Signal 1: Liveness
-    last_liveness_response: float = field(default_factory=time.monotonic)
+    last_liveness_response: float = field(default_factory=_DEFAULT_CLOCK.monotonic)
     consecutive_liveness_failures: int = 0
 
     # Signal 2: Readiness
@@ -105,7 +109,7 @@ class WorkerHealthState:
         - Recent response within timeout window
         - Not too many consecutive failures
         """
-        time_since_response = time.monotonic() - self.last_liveness_response
+        time_since_response = _DEFAULT_CLOCK.monotonic() - self.last_liveness_response
         return (
             time_since_response < self.config.liveness_timeout_seconds
             and self.consecutive_liveness_failures < self.config.max_consecutive_liveness_failures
@@ -177,7 +181,7 @@ class WorkerHealthState:
             success: Whether the probe succeeded
         """
         if success:
-            self.last_liveness_response = time.monotonic()
+            self.last_liveness_response = _DEFAULT_CLOCK.monotonic()
             self.consecutive_liveness_failures = 0
         else:
             self.consecutive_liveness_failures += 1

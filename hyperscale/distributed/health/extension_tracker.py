@@ -13,7 +13,11 @@ Key concepts:
 """
 
 from dataclasses import dataclass, field
-import time
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 @dataclass(slots=True)
@@ -69,7 +73,7 @@ class ExtensionTracker:
     last_progress: float = 0.0
     last_completed_items: int | None = None  # AD-26 Issue 4: Track absolute metrics
     total_extended: float = 0.0
-    last_extension_time: float = field(default_factory=time.monotonic)
+    last_extension_time: float = field(default_factory=_DEFAULT_CLOCK.monotonic)
     exhaustion_time: float | None = None
     warning_sent: bool = False
 
@@ -122,7 +126,7 @@ class ExtensionTracker:
         if self.extension_count >= self.max_extensions:
             # Track exhaustion time for grace period
             if self.exhaustion_time is None:
-                self.exhaustion_time = time.monotonic()
+                self.exhaustion_time = _DEFAULT_CLOCK.monotonic()
             return (
                 False,
                 0.0,
@@ -167,7 +171,7 @@ class ExtensionTracker:
         if completed_items is not None:
             self.last_completed_items = completed_items
         self.total_extended += grant
-        self.last_extension_time = time.monotonic()
+        self.last_extension_time = _DEFAULT_CLOCK.monotonic()
 
         # Check if we should send a warning about impending exhaustion
         remaining = self.get_remaining_extensions()
@@ -188,7 +192,7 @@ class ExtensionTracker:
         self.last_progress = 0.0
         self.last_completed_items = None  # AD-26 Issue 4: Reset absolute metrics
         self.total_extended = 0.0
-        self.last_extension_time = time.monotonic()
+        self.last_extension_time = _DEFAULT_CLOCK.monotonic()
         self.exhaustion_time = None
         self.warning_sent = False
 
@@ -220,7 +224,7 @@ class ExtensionTracker:
         if completed_items is not None:
             self.last_completed_items = completed_items
         self.total_extended += grant_seconds
-        self.last_extension_time = time.monotonic()
+        self.last_extension_time = _DEFAULT_CLOCK.monotonic()
         # Track exhaustion warning, matching the existing semantics.
         remaining = self.get_remaining_extensions()
         if remaining <= self.warning_threshold and not self.warning_sent:
@@ -234,7 +238,7 @@ class ExtensionTracker:
         grace-period logic engages.
         """
         if code == "max_exhausted" and self.exhaustion_time is None:
-            self.exhaustion_time = time.monotonic()
+            self.exhaustion_time = _DEFAULT_CLOCK.monotonic()
 
     def get_remaining_extensions(self) -> int:
         """Get the number of remaining extension requests allowed."""
@@ -263,7 +267,7 @@ class ExtensionTracker:
         """Check if currently in grace period after exhaustion."""
         if self.exhaustion_time is None:
             return False
-        elapsed = time.monotonic() - self.exhaustion_time
+        elapsed = _DEFAULT_CLOCK.monotonic() - self.exhaustion_time
         return elapsed < self.grace_period
 
     @property
@@ -271,7 +275,7 @@ class ExtensionTracker:
         """Get seconds remaining in grace period (0 if not in grace period or expired)."""
         if self.exhaustion_time is None:
             return 0.0
-        elapsed = time.monotonic() - self.exhaustion_time
+        elapsed = _DEFAULT_CLOCK.monotonic() - self.exhaustion_time
         remaining = self.grace_period - elapsed
         return max(0.0, remaining)
 
@@ -288,7 +292,7 @@ class ExtensionTracker:
             return False
         if self.exhaustion_time is None:
             return False
-        elapsed = time.monotonic() - self.exhaustion_time
+        elapsed = _DEFAULT_CLOCK.monotonic() - self.exhaustion_time
         return elapsed >= self.grace_period
 
 

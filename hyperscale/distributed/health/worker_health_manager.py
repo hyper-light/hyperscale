@@ -12,7 +12,10 @@ Key responsibilities:
 """
 
 from dataclasses import dataclass, field
-import time
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 from typing import TYPE_CHECKING
 
 from hyperscale.distributed.health.alpha_posterior import (
@@ -105,6 +108,8 @@ class WorkerHealthManager:
         config: WorkerHealthManagerConfig | None = None,
         throughput_witness: ThroughputWitness | None = None,
         decision_config: ExtensionDecisionConfig | None = None,
+        *,
+        clock: Clock | None = None,
     ):
         """
         Initialize the WorkerHealthManager.
@@ -128,6 +133,11 @@ class WorkerHealthManager:
             warning_threshold=self._config.warning_threshold,
             grace_period=self._config.grace_period,
         )
+
+        # Phase 5 DI seam — every wall/monotonic read routes through
+        # ``self._clock`` so Phase 6 SIM mode can drive timestamps
+        # deterministically.
+        self._clock: Clock = clock if clock is not None else _DEFAULT_CLOCK
 
         # Per-worker extension trackers
         self._trackers: dict[str, ExtensionTracker] = {}
@@ -421,7 +431,7 @@ class WorkerHealthManager:
             cumulative_extended=post_cumulative,
             progress_snapshot=snapshot,
             fence_token=fence_token,
-            timestamp=time.monotonic(),
+            timestamp=self._clock.monotonic(),
             leader_term=leader_term,
         )
         self._ledger.record(event)

@@ -7,14 +7,17 @@ Provides reusable infrastructure for tracking health across any node type:
 - HealthPiggyback: Data structure for SWIM message embedding
 """
 
-import time
 from dataclasses import dataclass, field
 from typing import Generic, Protocol, TypeVar, Callable
 
+from hyperscale.distributed.runtime import Clock, RealClock
 from hyperscale.distributed.health.worker_health import (
     ProgressState,
     RoutingDecision,
 )
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 class HealthSignals(Protocol):
@@ -100,11 +103,17 @@ class NodeHealthTracker(Generic[T]):
                 pass
     """
 
-    def __init__(self, config: NodeHealthTrackerConfig | None = None):
+    def __init__(
+        self,
+        config: NodeHealthTrackerConfig | None = None,
+        *,
+        clock: Clock | None = None,
+    ):
         self._config = config or NodeHealthTrackerConfig()
         self._states: dict[str, T] = {}
         self._eviction_timestamps: dict[str, float] = {}  # node_id -> last eviction time
         self._failure_timestamps: dict[str, float] = {}  # node_id -> time when first marked for eviction
+        self._clock: Clock = clock if clock is not None else _DEFAULT_CLOCK
 
     def update_state(self, node_id: str, state: T) -> None:
         """
@@ -120,7 +129,7 @@ class NodeHealthTracker(Generic[T]):
         decision = state.get_routing_decision()
         if decision == RoutingDecision.EVICT:
             if node_id not in self._failure_timestamps:
-                self._failure_timestamps[node_id] = time.monotonic()
+                self._failure_timestamps[node_id] = self._clock.monotonic()
         else:
             # Node recovered, clear failure tracking
             self._failure_timestamps.pop(node_id, None)
@@ -231,7 +240,7 @@ class NodeHealthTracker(Generic[T]):
             )
 
         # Check eviction backoff
-        now = time.monotonic()
+        now = self._clock.monotonic()
         last_eviction = self._eviction_timestamps.get(node_id)
         if last_eviction and (now - last_eviction) < self._config.eviction_backoff_seconds:
             return EvictionDecision(
@@ -260,7 +269,7 @@ class NodeHealthTracker(Generic[T]):
         Returns True if multiple nodes entered evictable state
         within the correlation window.
         """
-        now = time.monotonic()
+        now = self._clock.monotonic()
         window_start = now - self._config.correlation_window_seconds
 
         # Count nodes that entered evictable state within the window
@@ -277,13 +286,13 @@ class NodeHealthTracker(Generic[T]):
 
         Records eviction timestamp for backoff tracking.
         """
-        self._eviction_timestamps[node_id] = time.monotonic()
+        self._eviction_timestamps[node_id] = self._clock.monotonic()
 
     def get_diagnostics(self) -> dict:
         """
         Get diagnostic information about all tracked nodes.
         """
-        now = time.monotonic()
+        now = self._clock.monotonic()
         nodes: dict[str, dict] = {}
 
         for node_id, state in self._states.items():
@@ -335,7 +344,7 @@ class HealthPiggyback:
     overload_state: str = "healthy"
 
     # Timestamp for staleness detection
-    timestamp: float = field(default_factory=time.monotonic)
+    timestamp: float = field(default_factory=_DEFAULT_CLOCK.monotonic)
 
     def to_dict(self) -> dict:
         """Serialize to dictionary for embedding."""
@@ -363,9 +372,9 @@ class HealthPiggyback:
             throughput=data.get("throughput", 0.0),
             expected_throughput=data.get("expected_throughput", 0.0),
             overload_state=data.get("overload_state", "healthy"),
-            timestamp=data.get("timestamp", time.monotonic()),
+            timestamp=data.get("timestamp", _DEFAULT_CLOCK.monotonic()),
         )
 
     def is_stale(self, max_age_seconds: float = 60.0) -> bool:
         """Check if this piggyback data is stale."""
-        return (time.monotonic() - self.timestamp) > max_age_seconds
+        return (_DEFAULT_CLOCK.monotonic() - self.timestamp) > max_age_seconds
