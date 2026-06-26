@@ -119,7 +119,6 @@ EXPECTED_RUNTIME_VIOLATIONS: frozenset[str] = frozenset(
     "hyperscale/distributed/reliability/backpressure.py",
     "hyperscale/distributed/reliability/best_effort_manager.py",
     "hyperscale/distributed/reliability/rate_limiting.py",
-    "hyperscale/distributed/reliability/retry.py",
     "hyperscale/distributed/resources/health_piggyback.py",
     "hyperscale/distributed/resources/node_health_tracker.py",
     "hyperscale/distributed/routing/dispatch_time_tracker.py",

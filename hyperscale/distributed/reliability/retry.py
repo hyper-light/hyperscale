@@ -5,15 +5,31 @@ Provides a consistent retry mechanism with exponential backoff and jitter
 for all network operations. Different jitter strategies suit different scenarios.
 
 Jitter prevents thundering herd when multiple clients retry simultaneously.
+
+Phase 5 DI: ``RetryExecutor``, ``calculate_jittered_delay`` and
+``add_jitter`` all accept ``Clock`` / ``Random`` instances so Phase 6
+SIM mode can drive deterministic retry timing and jitter. Default
+fall-back is the shared ``RealClock`` / ``RealRandom`` defined at
+module scope; behavior is byte-equivalent to the prior ``time`` /
+``asyncio`` / ``random`` calls.
 """
 
-import asyncio
-import random
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Awaitable, Callable, TypeVar
 
+from hyperscale.distributed.runtime import (
+    Clock,
+    Random,
+    RealClock,
+    RealRandom,
+)
+
 T = TypeVar("T")
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
+_DEFAULT_RANDOM: Random = RealRandom()
 
 
 class JitterStrategy(Enum):
@@ -76,9 +92,19 @@ class RetryExecutor:
         )
     """
 
-    def __init__(self, config: RetryConfig | None = None):
+    def __init__(
+        self,
+        config: RetryConfig | None = None,
+        *,
+        clock: Clock | None = None,
+        random_source: Random | None = None,
+    ):
         self._config = config or RetryConfig()
         self._previous_delay: float = self._config.base_delay
+        self._clock: Clock = clock if clock is not None else _DEFAULT_CLOCK
+        self._random: Random = (
+            random_source if random_source is not None else _DEFAULT_RANDOM
+        )
 
     def calculate_delay(self, attempt: int) -> float:
         """
@@ -97,16 +123,16 @@ class RetryExecutor:
         if jitter == JitterStrategy.FULL:
             # Full jitter: random(0, calculated_delay)
             temp = min(cap, base * (2**attempt))
-            return random.uniform(0, temp)
+            return self._random.uniform(0, temp)
 
         elif jitter == JitterStrategy.EQUAL:
             # Equal jitter: half deterministic, half random
             temp = min(cap, base * (2**attempt))
-            return temp / 2 + random.uniform(0, temp / 2)
+            return temp / 2 + self._random.uniform(0, temp / 2)
 
         elif jitter == JitterStrategy.DECORRELATED:
             # Decorrelated: each delay depends on previous
-            delay = random.uniform(base, self._previous_delay * 3)
+            delay = self._random.uniform(base, self._previous_delay * 3)
             delay = min(cap, delay)
             self._previous_delay = delay
             return delay
@@ -165,7 +191,7 @@ class RetryExecutor:
 
                 # Calculate and apply delay
                 delay = self.calculate_delay(attempt)
-                await asyncio.sleep(delay)
+                await self._clock.sleep(delay)
 
         # Should not reach here, but just in case
         if last_exception:
@@ -200,6 +226,8 @@ def calculate_jittered_delay(
     base_delay: float = 0.5,
     max_delay: float = 30.0,
     jitter: JitterStrategy = JitterStrategy.FULL,
+    *,
+    random_source: Random | None = None,
 ) -> float:
     """
     Standalone function to calculate a jittered delay.
@@ -211,22 +239,27 @@ def calculate_jittered_delay(
         base_delay: Base delay in seconds
         max_delay: Maximum delay cap in seconds
         jitter: Jitter strategy to use
+        random_source: Optional ``Random`` injection; defaults to the
+            module-level ``RealRandom`` so existing callers see
+            byte-identical behavior under Phase 5.
 
     Returns:
         Delay in seconds
     """
+    rng = random_source if random_source is not None else _DEFAULT_RANDOM
+
     if jitter == JitterStrategy.FULL:
         temp = min(max_delay, base_delay * (2**attempt))
-        return random.uniform(0, temp)
+        return rng.uniform(0, temp)
 
     elif jitter == JitterStrategy.EQUAL:
         temp = min(max_delay, base_delay * (2**attempt))
-        return temp / 2 + random.uniform(0, temp / 2)
+        return temp / 2 + rng.uniform(0, temp / 2)
 
     elif jitter == JitterStrategy.DECORRELATED:
         # For standalone use, treat as full jitter since we don't track state
         temp = min(max_delay, base_delay * (2**attempt))
-        return random.uniform(0, temp)
+        return rng.uniform(0, temp)
 
     else:  # NONE
         return min(max_delay, base_delay * (2**attempt))
@@ -235,6 +268,8 @@ def calculate_jittered_delay(
 def add_jitter(
     interval: float,
     jitter_factor: float = 0.1,
+    *,
+    random_source: Random | None = None,
 ) -> float:
     """
     Add jitter to a fixed interval.
@@ -245,6 +280,8 @@ def add_jitter(
     Args:
         interval: Base interval in seconds
         jitter_factor: Maximum jitter as fraction of interval (default 10%)
+        random_source: Optional ``Random`` injection; defaults to the
+            module-level ``RealRandom``.
 
     Returns:
         Interval with random jitter applied
@@ -253,5 +290,6 @@ def add_jitter(
         # 30 second heartbeat with 10% jitter (27-33 seconds)
         delay = add_jitter(30.0, jitter_factor=0.1)
     """
+    rng = random_source if random_source is not None else _DEFAULT_RANDOM
     jitter_amount = interval * jitter_factor
-    return interval + random.uniform(-jitter_amount, jitter_amount)
+    return interval + rng.uniform(-jitter_amount, jitter_amount)
