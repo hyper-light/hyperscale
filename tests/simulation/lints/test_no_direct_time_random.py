@@ -1,0 +1,202 @@
+"""
+Phase 5 guard test — enforces the exit criterion in
+``docs/dev/simulation_framework.md:868-870``: no production module
+under ``hyperscale/distributed/`` may call ``time.monotonic`` /
+``time.time`` / ``asyncio.sleep`` / ``asyncio.wait_for`` / non-crypto
+``random.X`` directly. Every such call must route through a
+``Clock`` or ``Random`` on ``self`` so Phase 6 SIM mode can swap the
+backing implementation.
+
+How the ratchet works
+---------------------
+
+The expected-violations snapshot lives in
+``expected_runtime_violations.txt`` next to this file. It records
+every production source path that currently uses one of the
+forbidden calls. The test fails when the discovered set differs
+from the expected set in *either* direction:
+
+* **Regression** — a file appears in actual but not expected:
+  someone added a direct ``time.X`` / ``asyncio.sleep`` / ``random.X``
+  call that should have used ``self._clock`` / ``self._random``.
+
+* **Stale entry** — a file appears in expected but not actual: a
+  Phase 5b–5d migration removed the last direct call from a module
+  but left the path in the snapshot. The snapshot must shrink
+  monotonically; every migration commit tightens the lint.
+
+Phase 5 final state (after 5e): the snapshot file contains only the
+two real-impl files (``runtime/real_clock.py``,
+``runtime/real_random.py``). Any other file in the snapshot means
+the migration is incomplete.
+
+What's NOT flagged
+------------------
+
+* ``secrets.X`` and ``os.urandom`` — cryptographic randomness,
+  out of scope.
+* ``time.perf_counter`` — measurement only, doesn't affect SIM
+  control flow. Producer modules can keep using it.
+* ``LamportClock`` and similar logical clocks — not wall time.
+"""
+
+from __future__ import annotations
+
+import ast
+from pathlib import Path
+from typing import Iterator
+
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+PRODUCTION_ROOT = REPO_ROOT / "hyperscale" / "distributed"
+EXPECTED_SNAPSHOT = Path(__file__).parent / "expected_runtime_violations.txt"
+
+
+# Pairs of (module_name, attribute) that are forbidden as direct
+# calls in production code. Phase 5b expands this set as each
+# subsystem migrates; Phase 5d completes the random axis.
+FORBIDDEN_ATTRIBUTE_CALLS: frozenset[tuple[str, str]] = frozenset({
+    ("time", "monotonic"),
+    ("time", "time"),
+    ("asyncio", "sleep"),
+    ("asyncio", "wait_for"),
+    ("random", "uniform"),
+    ("random", "random"),
+    ("random", "randrange"),
+    ("random", "choice"),
+    ("random", "choices"),
+    ("random", "sample"),
+})
+
+
+def _iter_python_files(root: Path) -> Iterator[Path]:
+    """Yield every ``.py`` file under ``root`` excluding caches."""
+    for path in root.rglob("*.py"):
+        if "__pycache__" in path.parts:
+            continue
+        yield path
+
+
+def _file_has_forbidden_call(path: Path) -> bool:
+    """Return True when ``path`` contains at least one forbidden
+    ``module.attr`` reference at AST-level.
+
+    This catches the dominant pattern (direct attribute call:
+    ``time.monotonic()``, ``asyncio.sleep(...)``, ``random.uniform(...)``).
+    Matching at attribute access — not just at ``Call`` — also catches
+    captured-callable forms (``field(default_factory=time.monotonic)``,
+    ``self._now = time.monotonic``), which the Phase 5 plan calls out
+    as the trickiest migration case at dataclass defaults.
+    """
+    # SyntaxError here means the file uses syntax newer than the
+    # interpreter running this test — typically a stale interpreter,
+    # not the file's fault. Re-raise so the failure is loud rather
+    # than silently skipping the file (which would mask violations).
+    tree = ast.parse(path.read_text())
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+            key = (node.value.id, node.attr)
+            if key in FORBIDDEN_ATTRIBUTE_CALLS:
+                return True
+
+    return False
+
+
+def _discover_violations() -> set[str]:
+    """Walk the production tree; return repo-relative paths of
+    files containing at least one forbidden call."""
+    return {
+        str(path.relative_to(REPO_ROOT))
+        for path in _iter_python_files(PRODUCTION_ROOT)
+        if _file_has_forbidden_call(path)
+    }
+
+
+def _load_expected_snapshot() -> set[str]:
+    """Load the ratcheted allowlist. Blank lines and ``#`` comments
+    are ignored so future maintainers can annotate the snapshot."""
+    raw = EXPECTED_SNAPSHOT.read_text().splitlines()
+    return {
+        line.strip()
+        for line in raw
+        if line.strip() and not line.startswith("#")
+    }
+
+
+def test_runtime_violation_set_matches_snapshot() -> None:
+    """Phase 5 ratchet: discovered violations must exactly equal the
+    expected snapshot.
+
+    Regression direction (actual − expected): someone added a direct
+    ``time.X`` / ``asyncio.sleep`` / non-crypto ``random.X`` call;
+    refactor it to go through ``self._clock`` / ``self._random``.
+
+    Stale-entry direction (expected − actual): a migration removed
+    the last direct call from a module but the snapshot wasn't
+    updated. Run::
+
+        python -c "
+        import ast
+        from pathlib import Path
+        from tests.simulation.lints.test_no_direct_time_random import (
+            _discover_violations,
+            EXPECTED_SNAPSHOT,
+        )
+        EXPECTED_SNAPSHOT.write_text(
+            '\\n'.join(sorted(_discover_violations())) + '\\n'
+        )
+        "
+
+    to regenerate the snapshot, then commit.
+    """
+    actual = _discover_violations()
+    expected = _load_expected_snapshot()
+
+    regressions = sorted(actual - expected)
+    stale = sorted(expected - actual)
+
+    diagnostic_parts: list[str] = []
+    if regressions:
+        diagnostic_parts.append(
+            "Regressions — new direct time/asyncio.sleep/random.X "
+            f"calls in production ({len(regressions)} file(s)):"
+        )
+        diagnostic_parts.extend(f"  + {path}" for path in regressions)
+
+    if stale:
+        diagnostic_parts.append(
+            "Stale snapshot entries — these files no longer contain "
+            f"forbidden calls ({len(stale)} file(s)); remove them "
+            f"from {EXPECTED_SNAPSHOT.name}:"
+        )
+        diagnostic_parts.extend(f"  - {path}" for path in stale)
+
+    if diagnostic_parts:
+        raise AssertionError("\n".join(diagnostic_parts))
+
+
+def test_runtime_module_is_clean() -> None:
+    """``hyperscale/distributed/runtime/`` must never re-acquire a
+    direct time/asyncio.sleep/random call outside the two real-impl
+    files. This is the structural invariant that defines the seam."""
+    runtime_root = PRODUCTION_ROOT / "runtime"
+    allowed = {
+        str((runtime_root / "real_clock.py").relative_to(REPO_ROOT)),
+        str((runtime_root / "real_random.py").relative_to(REPO_ROOT)),
+    }
+
+    offenders = sorted(
+        str(path.relative_to(REPO_ROOT))
+        for path in _iter_python_files(runtime_root)
+        if _file_has_forbidden_call(path)
+        and str(path.relative_to(REPO_ROOT)) not in allowed
+    )
+
+    if offenders:
+        raise AssertionError(
+            "Files under hyperscale/distributed/runtime/ may not "
+            "call time.X / asyncio.sleep / random.X directly outside "
+            f"the real-impl files ({sorted(allowed)}). Offenders:\n"
+            + "\n".join(f"  - {path}" for path in offenders)
+        )
