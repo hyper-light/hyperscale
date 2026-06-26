@@ -33,6 +33,12 @@ from hyperscale.distributed.models import (
     Error,
     Message,
 )
+from hyperscale.distributed.runtime import (
+    Clock,
+    Random,
+    RealClock,
+    RealRandom,
+)
 
 from hyperscale.distributed.server.protocol import (
     MercurySyncTCPProtocol,
@@ -96,7 +102,22 @@ class MercurySyncBaseServer(Generic[T]):
         tcp_port: int,
         udp_port: int,
         env: Env,
+        *,
+        clock: Clock | None = None,
+        random_source: Random | None = None,
     ) -> None:
+        # Phase 5 dependency-injection seams. ``clock`` covers every
+        # wall/monotonic read, ``asyncio.sleep``, and
+        # ``asyncio.wait_for`` in this class. ``random_source`` covers
+        # the non-crypto peer-selection sites (load balancing); the
+        # ``_secure_random`` field below remains for any future crypto
+        # use but no longer drives load-balancing under Phase 5.
+        # Defaults are stdlib-backed; Phase 6 SIM mode injects
+        # ``VirtualClock`` / ``SeededRandom`` here.
+        self._clock: Clock = clock if clock is not None else RealClock()
+        self._random: Random = (
+            random_source if random_source is not None else RealRandom()
+        )
         self._tcp_clock = LamportClock()
         self._udp_clock = LamportClock()
 
@@ -848,7 +869,7 @@ class MercurySyncBaseServer(Generic[T]):
             except ConnectionRefusedError as connection_error:
                 last_error = connection_error
 
-            await asyncio.sleep(1)
+            await self._clock.sleep(1)
 
         if last_error:
             raise last_error
@@ -928,7 +949,7 @@ class MercurySyncBaseServer(Generic[T]):
 
                 target = f"{host}:{port}".encode()
 
-                return await asyncio.wait_for(
+                return await self._clock.wait_for(
                     self._tcp_client_data[target][encoded_action].get(),
                     timeout=timeout,
                 )
@@ -958,10 +979,10 @@ class MercurySyncBaseServer(Generic[T]):
 
         match selection_method:
             case "random":
-                selection = [nodes[self._secure_random.randrange(0, node_max)]]
+                selection = [nodes[self._random.randrange(0, node_max)]]
 
             case "subset":
-                selection = self._secure_random.choices(nodes, k=max_nodes)
+                selection = self._random.choices(nodes, k=max_nodes)
 
             case "all":
                 selection = nodes
@@ -1071,7 +1092,7 @@ class MercurySyncBaseServer(Generic[T]):
 
                 target = f"{host}:{port}".encode()
 
-                return await asyncio.wait_for(
+                return await self._clock.wait_for(
                     self._udp_client_data[target][encoded_action].get(),
                     timeout=timeout,
                 )
@@ -1097,10 +1118,10 @@ class MercurySyncBaseServer(Generic[T]):
 
         match selection_method:
             case "random":
-                selection = [nodes[self._secure_random.randrange(0, node_max)]]
+                selection = [nodes[self._random.randrange(0, node_max)]]
 
             case "subset":
-                selection = self._secure_random.choices(nodes, k=max_nodes)
+                selection = self._random.choices(nodes, k=max_nodes)
 
             case "all":
                 selection = nodes
@@ -1144,7 +1165,7 @@ class MercurySyncBaseServer(Generic[T]):
         trace: str | None = None
 
         try:
-            self._tcp_client_transports[(host, port)] = await asyncio.wait_for(
+            self._tcp_client_transports[(host, port)] = await self._clock.wait_for(
                 self._connect_tcp_client(
                     (host, port),
                 ),
@@ -1971,7 +1992,7 @@ class MercurySyncBaseServer(Generic[T]):
             self._tcp_server_sleep_task = loop.create_future()
 
             try:
-                await asyncio.wait_for(
+                await self._clock.wait_for(
                     self._tcp_server_sleep_task,
                     timeout=self._cleanup_interval,
                 )
@@ -1995,7 +2016,7 @@ class MercurySyncBaseServer(Generic[T]):
             self._udp_server_sleep_task = loop.create_future()
 
             try:
-                await asyncio.wait_for(
+                await self._clock.wait_for(
                     self._udp_server_sleep_task,
                     timeout=self._cleanup_interval,
                 )
@@ -2018,7 +2039,7 @@ class MercurySyncBaseServer(Generic[T]):
         """Periodically log silent drop statistics for security monitoring."""
         while self._running:
             try:
-                await asyncio.sleep(self._drop_stats_interval)
+                await self._clock.sleep(self._drop_stats_interval)
             except (asyncio.CancelledError, Exception):
                 break
 
@@ -2183,7 +2204,7 @@ class MercurySyncBaseServer(Generic[T]):
 
         try:
             if drain_timeout > 0:
-                await asyncio.wait_for(
+                await self._clock.wait_for(
                     self._task_runner.shutdown(),
                     timeout=drain_timeout,
                 )
@@ -2390,6 +2411,6 @@ class MercurySyncBaseServer(Generic[T]):
         # CancelledError`` branch run; second lets the cancellation
         # propagate into nested awaits inside SWIM handlers (refutation
         # broadcasts, etc.).
-        await asyncio.sleep(0)
-        await asyncio.sleep(0)
+        await self._clock.sleep(0)
+        await self._clock.sleep(0)
         await self._await_quiescent()
