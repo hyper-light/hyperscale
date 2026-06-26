@@ -5,15 +5,18 @@ Detects rapid leadership changes that indicate cluster instability,
 network issues, or misconfiguration.
 """
 
-import time
 from dataclasses import dataclass, field
 from collections import deque
 from typing import Callable, Any
 
+from hyperscale.distributed.runtime import Clock, RealClock
 from hyperscale.logging.hyperscale_logging_models import ServerDebug
 
 
 from ..core.protocols import LoggerProtocol
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 @dataclass(slots=True)
@@ -32,7 +35,7 @@ class LeadershipChange:
     
     def __post_init__(self):
         if self.timestamp == 0:
-            self.timestamp = time.monotonic()
+            self.timestamp = _DEFAULT_CLOCK.monotonic()
 
 
 @dataclass(slots=True)
@@ -178,7 +181,7 @@ class FlappingDetector:
         Returns:
             True if this change triggered flapping detection.
         """
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
         
         change = LeadershipChange(
             timestamp=now,
@@ -250,7 +253,7 @@ class FlappingDetector:
         """Handle critical flapping level."""
         # Ensure we're in flapping state
         if not self._is_flapping:
-            await self._handle_flapping_detected(count, time.monotonic())
+            await self._handle_flapping_detected(count, _DEFAULT_CLOCK.monotonic())
         
         # Max out cooldown
         self._current_cooldown = self.max_cooldown
@@ -301,7 +304,7 @@ class FlappingDetector:
     @property
     def changes_in_window(self) -> int:
         """Get current count of changes in the window."""
-        return self._count_changes_in_window(time.monotonic())
+        return self._count_changes_in_window(_DEFAULT_CLOCK.monotonic())
     
     def get_recent_changes(self, count: int = 10) -> list[LeadershipChange]:
         """
@@ -333,7 +336,7 @@ class FlappingDetector:
             return (False, 0.0)
         
         # Check time since last detection
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
         time_since_detection = now - self._last_detection_time
         
         if time_since_detection < self._current_cooldown:

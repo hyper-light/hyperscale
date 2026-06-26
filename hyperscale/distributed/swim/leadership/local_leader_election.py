@@ -3,10 +3,10 @@ Local leader election with pre-voting and split-brain prevention.
 """
 
 import asyncio
-import random
 from dataclasses import dataclass, field
 from typing import Callable, Awaitable, Any
 
+from hyperscale.distributed.runtime import Clock, Random, RealClock, RealRandom
 from .leader_state import LeaderState
 from .leader_eligibility import LeaderEligibility
 from .flapping_detector import FlappingDetector
@@ -16,6 +16,10 @@ from hyperscale.logging.hyperscale_logging_models import ServerDebug
 
 
 from ..core.protocols import LoggerProtocol, TaskRunnerProtocol
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
+_DEFAULT_RANDOM: Random = RealRandom()
 
 
 @dataclass(slots=True)
@@ -96,7 +100,15 @@ class LocalLeaderElection:
     _node_host: str = ""
     _node_port: int = 0
     _node_id: int = 0
-    
+
+    # Phase 5 DI seams — every wall/monotonic read and randomized
+    # backoff draw routes through these so Phase 6 SIM mode can drive
+    # election timing deterministically. Defaults to module-level
+    # ``RealClock`` / ``RealRandom`` so existing callers see
+    # byte-identical behavior.
+    _clock: Clock = field(default_factory=lambda: _DEFAULT_CLOCK, repr=False)
+    _random: Random = field(default_factory=lambda: _DEFAULT_RANDOM, repr=False)
+
     def set_logger(
         self,
         logger: LoggerProtocol,
@@ -182,7 +194,7 @@ class LocalLeaderElection:
         if self.flapping_detector.is_flapping:
             base = max(base, self.flapping_detector.current_cooldown)
         
-        jitter = random.uniform(0, self.election_timeout_jitter)
+        jitter = self._random.uniform(0, self.election_timeout_jitter)
         return base + jitter
     
     async def _record_leader_change(
@@ -277,7 +289,7 @@ class LocalLeaderElection:
             return
 
         if self._election_wake_event is None:
-            await asyncio.sleep(timeout)
+            await self._clock.sleep(timeout)
             return
 
         event = self._election_wake_event
@@ -286,7 +298,7 @@ class LocalLeaderElection:
             return
 
         try:
-            await asyncio.wait_for(event.wait(), timeout=timeout)
+            await self._clock.wait_for(event.wait(), timeout=timeout)
         except asyncio.TimeoutError:
             return
         finally:

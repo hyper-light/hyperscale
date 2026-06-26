@@ -2,11 +2,14 @@
 Leader state tracking for Raft-like leadership with pre-voting.
 """
 
-import time
 from dataclasses import dataclass, field
 from typing import Callable
 
+from hyperscale.distributed.runtime import Clock, RealClock
 from ..core.types import LeaderRole
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 # Maximum term value - prevents overflow and wrap-around attacks
 # Using 2^53 - 1 to stay within JavaScript safe integer range for JSON serialization
@@ -110,12 +113,12 @@ class LeaderState:
         """Check if the current leader's lease is still valid."""
         if self.current_leader is None:
             return False
-        return time.monotonic() < self.leader_lease_start + self.lease_duration
+        return _DEFAULT_CLOCK.monotonic() < self.leader_lease_start + self.lease_duration
     
     def time_until_lease_expiry(self) -> float:
         """Get time until leader lease expires."""
         expiry = self.leader_lease_start + self.lease_duration
-        return max(0, expiry - time.monotonic())
+        return max(0, expiry - _DEFAULT_CLOCK.monotonic())
     
     def should_start_election(self) -> bool:
         """Check if we should start a new election."""
@@ -182,7 +185,7 @@ class LeaderState:
         self.role = 'leader'
         self.current_term = term
         self.leader_term = term
-        self.leader_lease_start = time.monotonic()
+        self.leader_lease_start = _DEFAULT_CLOCK.monotonic()
         self.current_leader = None  # We are the leader, set by caller
 
         # Clear vote sets to free memory - we're done with the election
@@ -206,7 +209,7 @@ class LeaderState:
         if leader:
             self.current_leader = leader
             self.leader_term = term
-            self.leader_lease_start = time.monotonic()
+            self.leader_lease_start = _DEFAULT_CLOCK.monotonic()
             self.abort_pre_vote()
         
         if was_leader and self._on_lose_leadership:
@@ -220,8 +223,8 @@ class LeaderState:
         if term >= self.leader_term:
             self.current_leader = leader
             self.leader_term = term
-            self.leader_lease_start = time.monotonic()
-            self.last_heartbeat_time = time.monotonic()
+            self.leader_lease_start = _DEFAULT_CLOCK.monotonic()
+            self.last_heartbeat_time = _DEFAULT_CLOCK.monotonic()
             self.abort_pre_vote()
             
             if self.role != 'follower':
@@ -230,7 +233,7 @@ class LeaderState:
     def renew_lease(self) -> None:
         """Renew leader lease (called by leader on heartbeat send)."""
         if self.role == 'leader':
-            self.leader_lease_start = time.monotonic()
+            self.leader_lease_start = _DEFAULT_CLOCK.monotonic()
     
     def can_vote_for(self, candidate: tuple[str, int], term: int) -> bool:
         """Check if we can vote for a candidate."""
