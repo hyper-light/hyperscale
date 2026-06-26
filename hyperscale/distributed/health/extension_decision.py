@@ -39,10 +39,14 @@ tracker state.
 
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass
 from enum import Enum
 from typing import Callable
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 from hyperscale.distributed.health.extension_tracker import ExtensionTracker
 from hyperscale.distributed.health.progress_witness import (
@@ -182,15 +186,21 @@ class ExtensionDecisionEvaluator:
         self,
         throughput_witness: ThroughputWitness,
         config: ExtensionDecisionConfig | None = None,
-        time_source: Callable[[], float] | None = None,
+        *,
+        clock: Clock | None = None,
     ) -> None:
+        # Phase 5 DI seam — replaces the prior ``time_source:
+        # Callable[[], float] | None`` parameter. ``clock.monotonic``
+        # is bound to ``self._now`` so the existing ``self._now()``
+        # call sites in ``decide`` keep working unchanged; Phase 6 SIM
+        # mode passes ``VirtualClock`` here and ``decide`` sees the
+        # simulated timeline.
         self._throughput_witness: ThroughputWitness = throughput_witness
         self._config: ExtensionDecisionConfig = (
             config if config is not None else ExtensionDecisionConfig()
         )
-        self._now: Callable[[], float] = (
-            time_source if time_source is not None else time.monotonic
-        )
+        self._clock: Clock = clock if clock is not None else _DEFAULT_CLOCK
+        self._now: Callable[[], float] = self._clock.monotonic
 
     @property
     def throughput_witness(self) -> ThroughputWitness:

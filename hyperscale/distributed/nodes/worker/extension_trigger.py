@@ -33,10 +33,10 @@ Design constraints honored:
 
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable
 
+from hyperscale.distributed.runtime import Clock, RealClock
 from hyperscale.distributed.health.workflow_progress_snapshot import (
     WorkflowProgressSnapshot,
 )
@@ -44,6 +44,9 @@ from hyperscale.distributed.nodes.worker.models.workflow_runtime_state import (
     WorkflowRuntimeState,
 )
 from hyperscale.distributed.taskex.util.time_parser import TimeParser
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 # ============================================================================
@@ -103,7 +106,9 @@ def default_snapshot_builder(
     Reads the H3 multi-dimensional counters (``cores_completed``,
     ``step_transitions``, ``actions_completed``) plus the workflow's
     nominal ``vus`` allocation as ``cores_total``. The snapshot
-    timestamp is captured from the worker's monotonic clock.
+    timestamp is captured from the module-level ``RealClock``; SIM
+    mode swaps in a deterministic builder via the ``snapshot_builder``
+    constructor parameter on ``ExtensionTrigger``.
     """
     return WorkflowProgressSnapshot(
         workflow_id=runtime.workflow_id,
@@ -111,7 +116,7 @@ def default_snapshot_builder(
         cores_total=runtime.vus,
         step_transitions=runtime.step_transitions,
         actions_completed=runtime.actions_completed,
-        snapshot_time=time.monotonic(),
+        snapshot_time=_DEFAULT_CLOCK.monotonic(),
     )
 
 
@@ -162,8 +167,15 @@ class ExtensionTrigger:
         request_extension: Callable[..., None],
         config: ExtensionTriggerConfig | None = None,
         snapshot_builder: SnapshotBuilder | None = None,
-        time_source: Callable[[], float] | None = None,
+        clock: Clock | None = None,
     ) -> None:
+        # Phase 5 DI seam — replaces the prior ``time_source:
+        # Callable[[], float] | None`` parameter. ``clock.monotonic``
+        # is bound to ``self._now`` so the existing call sites in
+        # ``tick`` keep working unchanged. The injected ``clock`` is
+        # NOT threaded into the snapshot builder by default: under
+        # SIM mode callers should provide a custom ``snapshot_builder``
+        # that captures simulated time on each call.
         self._active_runtimes_provider: Callable[
             [], list[WorkflowRuntimeState]
         ] = active_runtimes_provider
@@ -178,9 +190,8 @@ class ExtensionTrigger:
             if snapshot_builder is not None
             else default_snapshot_builder
         )
-        self._now: Callable[[], float] = (
-            time_source if time_source is not None else time.monotonic
-        )
+        self._clock: Clock = clock if clock is not None else _DEFAULT_CLOCK
+        self._now: Callable[[], float] = self._clock.monotonic
         self._workflows: dict[str, _PerWorkflowTriggerState] = {}
 
     @property
