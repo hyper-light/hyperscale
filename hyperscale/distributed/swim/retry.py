@@ -6,18 +6,34 @@ Provides robust retry logic for distributed systems with:
 - Jitter to prevent thundering herd on recovery
 - Retry budgets to limit total retry time
 - Category-specific retry policies
+
+Phase 5 DI: ``RetryPolicy.get_delay``, ``retry_with_backoff``, and
+``retry_with_result`` all accept ``Clock`` / ``Random`` instances so
+Phase 6 SIM mode can drive deterministic SWIM retry timing and
+jitter. Default fall-back is the shared ``RealClock`` /
+``RealRandom`` defined at module scope; behavior is byte-equivalent
+to the prior ``time`` / ``asyncio`` / ``random`` calls.
 """
 
 import asyncio
-import random
 from dataclasses import dataclass, field
 from typing import TypeVar, Callable, Awaitable, Any
 from enum import Enum, auto
 
+from hyperscale.distributed.runtime import (
+    Clock,
+    Random,
+    RealClock,
+    RealRandom,
+)
 from hyperscale.distributed.swim.core import SwimError, ErrorCategory, ErrorSeverity, NetworkError
 
 
 T = TypeVar('T')
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
+_DEFAULT_RANDOM: Random = RealRandom()
 
 
 class RetryDecision(Enum):
@@ -101,23 +117,35 @@ class RetryPolicy:
         
         return RetryDecision.RETRY  # Default to retry for unknown
     
-    def get_delay(self, attempt: int) -> float:
+    def get_delay(
+        self,
+        attempt: int,
+        *,
+        random_source: Random | None = None,
+    ) -> float:
         """
         Calculate delay for a given attempt number.
-        
+
         Uses exponential backoff with jitter.
+
+        ``random_source`` defaults to the module-level ``RealRandom``
+        so existing callers see identical behavior; Phase 6 SIM mode
+        threads a ``SeededRandom`` through to make backoff jitter
+        deterministic.
         """
+        rng = random_source if random_source is not None else _DEFAULT_RANDOM
+
         # Exponential backoff
         delay = min(
             self.base_delay * (self.exponential_base ** attempt),
             self.max_delay,
         )
-        
+
         # Add jitter to prevent thundering herd
         if self.jitter > 0:
             jitter_range = delay * self.jitter
-            delay += random.uniform(-jitter_range, jitter_range)
-        
+            delay += rng.uniform(-jitter_range, jitter_range)
+
         return max(0, delay)
 
 
@@ -176,6 +204,9 @@ async def retry_with_backoff(
     policy: RetryPolicy | None = None,
     on_retry: Callable[[int, Exception, float], Awaitable[None] | None] | None = None,
     on_success: Callable[[int], Awaitable[None] | None] | None = None,
+    *,
+    clock: Clock | None = None,
+    random_source: Random | None = None,
 ) -> T:
     """
     Retry an async function with exponential backoff.
@@ -204,59 +235,61 @@ async def retry_with_backoff(
     """
     if policy is None:
         policy = PROBE_RETRY_POLICY
-    
-    import time
-    start_time = time.monotonic()
+
+    active_clock = clock if clock is not None else _DEFAULT_CLOCK
+    active_random = random_source if random_source is not None else _DEFAULT_RANDOM
+
+    start_time = active_clock.monotonic()
     last_error: Exception | None = None
-    
+
     for attempt in range(policy.max_attempts):
         try:
             result = await fn()
-            
+
             if on_success:
                 callback_result = on_success(attempt + 1)
                 if asyncio.iscoroutine(callback_result):
                     await callback_result
-            
+
             return result
-            
+
         except Exception as e:
             last_error = e
-            
+
             # Check if we should retry
             decision = policy.should_retry(e)
             if decision == RetryDecision.ABORT:
                 raise
-            
+
             # Check if we're on last attempt
             if attempt == policy.max_attempts - 1:
                 raise
-            
+
             # Check budget
             if policy.budget_seconds is not None:
-                elapsed = time.monotonic() - start_time
+                elapsed = active_clock.monotonic() - start_time
                 if elapsed >= policy.budget_seconds:
                     raise
-            
+
             # Calculate delay
-            delay = policy.get_delay(attempt)
-            
+            delay = policy.get_delay(attempt, random_source=active_random)
+
             # Check budget again with delay
             if policy.budget_seconds is not None:
-                remaining = policy.budget_seconds - (time.monotonic() - start_time)
+                remaining = policy.budget_seconds - (active_clock.monotonic() - start_time)
                 if delay > remaining:
                     delay = max(0, remaining)
-            
+
             # Callback before retry
             if on_retry:
                 callback_result = on_retry(attempt + 1, e, delay)
                 if asyncio.iscoroutine(callback_result):
                     await callback_result
-            
+
             # Wait before retry
             if delay > 0 and decision != RetryDecision.IMMEDIATE:
-                await asyncio.sleep(delay)
-    
+                await active_clock.sleep(delay)
+
     # Should not reach here, but just in case
     if last_error:
         raise last_error
@@ -267,6 +300,9 @@ async def retry_with_result(
     fn: Callable[[], Awaitable[T]],
     policy: RetryPolicy | None = None,
     on_retry: Callable[[int, Exception, float], Awaitable[None] | None] | None = None,
+    *,
+    clock: Clock | None = None,
+    random_source: Random | None = None,
 ) -> RetryResult:
     """
     Retry an async function, returning detailed result.
@@ -287,11 +323,13 @@ async def retry_with_result(
     """
     if policy is None:
         policy = PROBE_RETRY_POLICY
-    
-    import time
-    start_time = time.monotonic()
+
+    active_clock = clock if clock is not None else _DEFAULT_CLOCK
+    active_random = random_source if random_source is not None else _DEFAULT_RANDOM
+
+    start_time = active_clock.monotonic()
     errors: list[Exception] = []
-    
+
     for attempt in range(policy.max_attempts):
         try:
             value = await fn()
@@ -299,45 +337,45 @@ async def retry_with_result(
                 success=True,
                 value=value,
                 attempts=attempt + 1,
-                total_time=time.monotonic() - start_time,
+                total_time=active_clock.monotonic() - start_time,
                 errors=errors,
             )
-            
+
         except Exception as e:
             errors.append(e)
-            
+
             # Check if we should retry
             decision = policy.should_retry(e)
             if decision == RetryDecision.ABORT:
                 break
-            
+
             # Check if we're on last attempt
             if attempt == policy.max_attempts - 1:
                 break
-            
+
             # Check budget
             if policy.budget_seconds is not None:
-                elapsed = time.monotonic() - start_time
+                elapsed = active_clock.monotonic() - start_time
                 if elapsed >= policy.budget_seconds:
                     break
-            
+
             # Calculate delay
-            delay = policy.get_delay(attempt)
-            
+            delay = policy.get_delay(attempt, random_source=active_random)
+
             # Callback before retry
             if on_retry:
                 callback_result = on_retry(attempt + 1, e, delay)
                 if asyncio.iscoroutine(callback_result):
                     await callback_result
-            
+
             # Wait before retry
             if delay > 0 and decision != RetryDecision.IMMEDIATE:
-                await asyncio.sleep(delay)
-    
+                await active_clock.sleep(delay)
+
     return RetryResult(
         success=False,
         attempts=len(errors),
-        total_time=time.monotonic() - start_time,
+        total_time=active_clock.monotonic() - start_time,
         last_error=errors[-1] if errors else None,
         errors=errors,
     )
