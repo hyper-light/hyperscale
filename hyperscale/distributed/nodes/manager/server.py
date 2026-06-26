@@ -6983,32 +6983,77 @@ class ManagerServer(HealthAwareServer):
             # the gap regardless of which manager the worker happens
             # to land on.
             if not self._leases.is_job_leader(job_id):
-                leader_addr = self._leases.get_job_leader_addr(job_id)
                 self_addr = (self._host, self._tcp_port)
+                # Compose the forward-target list in priority order:
+                # 1. The cached ``job_leader_addr`` for this job, when
+                #    SWIM still believes it's live. This wins when
+                #    ``_broadcast_job_leadership`` already replicated
+                #    the takeover to us — typical case after a clean
+                #    election.
+                # 2. The current DC leader's address, when election
+                #    state has converged but the job-leader broadcast
+                #    hadn't reached us before the worker push arrived.
+                #    After takeover the DC leader and the job leader
+                #    are the same manager; falling back here closes
+                #    the broadcast-dropped-at-this-peer window.
+                # 3. Every other active manager peer, blind-fanned-out
+                #    until one returns success. The worker only retries
+                #    a handful of fallback addresses (default
+                #    ``_healthy_manager_ids`` walk), and any one of
+                #    those landing on the leader is enough for the
+                #    pending tracker to decrement; serializing through
+                #    us guarantees at least one attempt regardless of
+                #    which peer the worker happened to pick.
+                forward_targets: list[tuple[str, int]] = []
+                cached_leader_addr = self._leases.get_job_leader_addr(job_id)
                 if (
-                    leader_addr is not None
-                    and tuple(leader_addr) != self_addr
-                    and self._manager_tcp_addr_is_live(tuple(leader_addr))
+                    cached_leader_addr is not None
+                    and tuple(cached_leader_addr) != self_addr
+                    and self._manager_tcp_addr_is_live(tuple(cached_leader_addr))
                 ):
+                    forward_targets.append(tuple(cached_leader_addr))
+
+                dc_leader_addr = self._resolve_dc_leader_addr()
+                if (
+                    dc_leader_addr is not None
+                    and tuple(dc_leader_addr) != self_addr
+                    and tuple(dc_leader_addr) not in forward_targets
+                    and self._manager_tcp_addr_is_live(tuple(dc_leader_addr))
+                ):
+                    forward_targets.append(tuple(dc_leader_addr))
+
+                for peer_addr in list(
+                    self._manager_state.get_active_manager_peers()
+                ):
+                    peer_tuple = tuple(peer_addr)
+                    if peer_tuple == self_addr or peer_tuple in forward_targets:
+                        continue
+                    if not self._manager_tcp_addr_is_live(peer_tuple):
+                        continue
+                    forward_targets.append(peer_tuple)
+
+                for target_addr in forward_targets:
                     try:
                         response, _clock = await self.send_tcp(
-                            tuple(leader_addr),
+                            target_addr,
                             "workflow_cancellation_complete",
                             data,
                             timeout=self._config.tcp_timeout_standard_seconds,
                         )
-                        if isinstance(response, bytes):
+                        if isinstance(response, bytes) and response not in (
+                            b"",
+                            b"ERROR",
+                        ):
                             return response
                     except Exception as forward_error:
                         await self._udp_logger.log(
                             ServerWarning(
                                 message=(
-                                    "Failed to forward workflow_cancellation_complete "
-                                    f"for {workflow_id[:8]}... (job {job_id[:8]}...) "
-                                    f"to job leader {tuple(leader_addr)}: "
-                                    f"{forward_error}; falling back to coordinator-"
-                                    "side notify in case the callback is replicated "
-                                    "locally."
+                                    "Failed to forward "
+                                    "workflow_cancellation_complete for "
+                                    f"{workflow_id[:8]}... (job {job_id[:8]}...) "
+                                    f"to {target_addr}: {forward_error}; "
+                                    "trying next forward target."
                                 ),
                                 node_host=self._host,
                                 node_port=self._tcp_port,
