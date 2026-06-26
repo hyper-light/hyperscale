@@ -11,9 +11,10 @@ How the ratchet works
 ---------------------
 
 The expected-violations snapshot lives in
-``expected_runtime_violations.txt`` next to this file. It records
-every production source path that currently uses one of the
-forbidden calls. The test fails when the discovered set differs
+``expected_runtime_violations.py`` next to this file (Python module,
+not text, so the project's ``*.txt`` gitignore doesn't hide it).
+It records every production source path that currently uses one of
+the forbidden calls. The test fails when the discovered set differs
 from the expected set in *either* direction:
 
 * **Regression** — a file appears in actual but not expected:
@@ -25,10 +26,8 @@ from the expected set in *either* direction:
   but left the path in the snapshot. The snapshot must shrink
   monotonically; every migration commit tightens the lint.
 
-Phase 5 final state (after 5e): the snapshot file contains only the
-two real-impl files (``runtime/real_clock.py``,
-``runtime/real_random.py``). Any other file in the snapshot means
-the migration is incomplete.
+Phase 5 final state (after 5e): the snapshot is empty. Any path in
+the snapshot means the migration is incomplete.
 
 What's NOT flagged
 ------------------
@@ -46,10 +45,13 @@ import ast
 from pathlib import Path
 from typing import Iterator
 
+from tests.simulation.lints.expected_runtime_violations import (
+    EXPECTED_RUNTIME_VIOLATIONS,
+)
+
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 PRODUCTION_ROOT = REPO_ROOT / "hyperscale" / "distributed"
-EXPECTED_SNAPSHOT = Path(__file__).parent / "expected_runtime_violations.txt"
 
 
 # Pairs of (module_name, attribute) that are forbidden as direct
@@ -114,14 +116,8 @@ def _discover_violations() -> set[str]:
 
 
 def _load_expected_snapshot() -> set[str]:
-    """Load the ratcheted allowlist. Blank lines and ``#`` comments
-    are ignored so future maintainers can annotate the snapshot."""
-    raw = EXPECTED_SNAPSHOT.read_text().splitlines()
-    return {
-        line.strip()
-        for line in raw
-        if line.strip() and not line.startswith("#")
-    }
+    """Return the ratcheted allowlist as a mutable set view."""
+    return set(EXPECTED_RUNTIME_VIOLATIONS)
 
 
 def test_runtime_violation_set_matches_snapshot() -> None:
@@ -134,21 +130,10 @@ def test_runtime_violation_set_matches_snapshot() -> None:
 
     Stale-entry direction (expected − actual): a migration removed
     the last direct call from a module but the snapshot wasn't
-    updated. Run::
-
-        python -c "
-        import ast
-        from pathlib import Path
-        from tests.simulation.lints.test_no_direct_time_random import (
-            _discover_violations,
-            EXPECTED_SNAPSHOT,
-        )
-        EXPECTED_SNAPSHOT.write_text(
-            '\\n'.join(sorted(_discover_violations())) + '\\n'
-        )
-        "
-
-    to regenerate the snapshot, then commit.
+    updated. Remove the offending file paths from
+    ``EXPECTED_RUNTIME_VIOLATIONS`` in
+    ``tests/simulation/lints/expected_runtime_violations.py``, then
+    commit.
     """
     actual = _discover_violations()
     expected = _load_expected_snapshot()
@@ -168,7 +153,8 @@ def test_runtime_violation_set_matches_snapshot() -> None:
         diagnostic_parts.append(
             "Stale snapshot entries — these files no longer contain "
             f"forbidden calls ({len(stale)} file(s)); remove them "
-            f"from {EXPECTED_SNAPSHOT.name}:"
+            "from EXPECTED_RUNTIME_VIOLATIONS in "
+            "expected_runtime_violations.py:"
         )
         diagnostic_parts.extend(f"  - {path}" for path in stale)
 
