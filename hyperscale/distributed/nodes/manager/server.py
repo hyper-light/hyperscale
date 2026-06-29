@@ -6906,6 +6906,32 @@ class ManagerServer(HealthAwareServer):
                     f"{total_errors} workflow(s) failed: {'; '.join(error_details)}"
                 )
 
+            # If no workflows were ever seeded into the pending tracker
+            # the ``workflow_cancellation_complete`` zero-pending branch
+            # (the canonical fire site for the client-direct
+            # ``job_cancellation_complete`` push) will never run, and the
+            # client's ``await_job_cancellation`` blocks on
+            # ``_cancellation_events[job_id]`` until its deadline elapses.
+            # The empty-pending case happens when
+            # ``_get_running_workflows_to_cancel`` finds no in-flight
+            # workflows on this manager — typical right after a
+            # leader-failover takeover whose peer/worker state-sync
+            # hadn't yet repopulated ``job.workflows`` with a cancellable
+            # status. The job IS marked CANCELLED above, so semantically
+            # the cancel is complete; fire the client-side push directly
+            # so ``test_cancel_during_leader_failover`` doesn't hang on
+            # the missing completion event. Safe under the leader-only
+            # gate: this branch only runs after the takeover-guarded
+            # ``if not is_job_leader(...)`` paths above were either
+            # skipped (we're the leader) or led to a successful takeover.
+            if not workflows_to_cancel and not pending_cancelled:
+                self._task_runner.run(
+                    self._push_cancellation_complete_to_origin,
+                    job_id,
+                    overall_success,
+                    list(workflow_errors.values()),
+                )
+
             return self._build_cancel_response(
                 job_id,
                 success=overall_success,
