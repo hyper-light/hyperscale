@@ -75,6 +75,7 @@ from .background_loops import WorkerBackgroundLoops
 from .handlers import (
     WorkflowDispatchHandler,
     WorkflowCancelHandler,
+    CancelJobWorkflowsHandler,
     JobLeaderTransferHandler,
     WorkflowProgressHandler,
     StateSyncHandler,
@@ -420,6 +421,9 @@ class WorkerServer(HealthAwareServer):
         # Initialize handlers
         self._dispatch_handler: WorkflowDispatchHandler = WorkflowDispatchHandler(self)
         self._cancel_handler: WorkflowCancelHandler = WorkflowCancelHandler(self)
+        self._cancel_job_handler: CancelJobWorkflowsHandler = (
+            CancelJobWorkflowsHandler(self)
+        )
         self._transfer_handler: JobLeaderTransferHandler = JobLeaderTransferHandler(
             self
         )
@@ -2154,6 +2158,22 @@ class WorkerServer(HealthAwareServer):
     ) -> bytes:
         """Handle workflow cancellation request."""
         return await self._cancel_handler.handle(addr, data, clock_time)
+
+    @tcp.receive()
+    async def cancel_job_workflows(
+        self, addr: tuple[str, int], data: bytes, clock_time: int
+    ) -> bytes:
+        """Handle job-scoped workflow cancellation request.
+
+        Used by the takeover-side cancel path on a new DC leader
+        whose ``job.workflows`` map wasn't fully repopulated by
+        peer/worker state-sync after failover. The worker iterates
+        its ``_active_workflows`` and cancels any workflow for the
+        requested ``job_id``, reporting back the set of workflow
+        ids it actually cancelled so the new leader can seed its
+        cancellation-pending tracker correctly.
+        """
+        return await self._cancel_job_handler.handle(addr, data, clock_time)
 
     @tcp.receive()
     async def job_leader_worker_transfer(

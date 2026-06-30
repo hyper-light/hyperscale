@@ -63,6 +63,8 @@ from hyperscale.distributed.models import (
     JobCancelRequest,
     JobCancelResponse,
     CancelJob,
+    CancelJobWorkflowsRequest,
+    CancelJobWorkflowsResponse,
     WorkflowCancelRequest,
     WorkflowCancelResponse,
     WorkflowCancellationComplete,
@@ -6698,6 +6700,109 @@ class ManagerServer(HealthAwareServer):
 
         return running_cancelled, workflow_errors
 
+    async def _broadcast_cancel_job_workflows_to_workers(
+        self,
+        *,
+        job_id: str,
+        requester_id: str,
+        timestamp: float,
+        reason: str,
+    ) -> tuple[list[str], list[str]]:
+        """Broadcast ``CancelJobWorkflowsRequest`` to every worker.
+
+        Used when ``_get_running_workflows_to_cancel`` returned empty
+        — typically right after a leader-failover takeover whose
+        post-takeover state-sync didn't fully populate
+        ``job.workflows`` on the new leader. Each worker iterates its
+        own ``_active_workflows`` for the requested ``job_id`` and
+        cancels any matches, returning the sub-workflow token strings
+        it actually cancelled.
+
+        The manager seeds those returned ids into
+        ``_cancellation_pending_workflows[job_id]`` so the canonical
+        ``workflow_cancellation_complete`` zero-pending branch fires
+        ``_push_cancellation_complete_to_origin`` when the workers'
+        async completion pushes land. This restores the proper
+        cancel contract — the client only sees success after the
+        workers actually stop running the workflows — without
+        requiring the new leader's local view to be perfectly
+        consistent at the moment ``cancel_job`` arrived.
+
+        Returns ``(cancelled_workflow_ids, broadcast_errors)``. The
+        cancelled ids are returned for caller-side bookkeeping (the
+        pending tracker is seeded inside this helper before
+        returning, so callers don't need to seed again).
+        """
+        worker_entries = self._manager_state.iter_workers()
+        if not worker_entries:
+            return [], []
+
+        async def dispatch_to_worker(
+            worker_id: str,
+            worker,
+        ) -> tuple[list[str], list[str]]:
+            worker_addr = (worker.node.host, worker.node.port)
+            request = CancelJobWorkflowsRequest(
+                job_id=job_id,
+                fence_token=self._leases.get_fence_token(job_id),
+                requester_id=requester_id,
+                timestamp=timestamp,
+                reason=reason,
+            )
+            try:
+                response = await self._send_to_worker(
+                    worker_addr,
+                    "cancel_job_workflows",
+                    request.dump(),
+                    timeout=self._env.CANCELLED_WORKFLOW_TIMEOUT,
+                )
+            except Exception as send_error:
+                return [], [f"worker {worker_id[:8]}...: {send_error}"]
+
+            if not isinstance(response, bytes) or not response:
+                return [], [
+                    f"worker {worker_id[:8]}...: no response from "
+                    "cancel_job_workflows"
+                ]
+
+            try:
+                decoded = CancelJobWorkflowsResponse.load(response)
+            except Exception as decode_error:
+                return [], [
+                    f"worker {worker_id[:8]}...: decode response: "
+                    f"{decode_error}"
+                ]
+
+            return list(decoded.cancelled_workflow_ids), list(decoded.errors)
+
+        results = await asyncio.gather(
+            *(
+                dispatch_to_worker(worker_id, worker)
+                for worker_id, worker in worker_entries
+            ),
+            return_exceptions=False,
+        )
+
+        cancelled_ids: list[str] = []
+        errors: list[str] = []
+        for per_worker_ids, per_worker_errors in results:
+            cancelled_ids.extend(per_worker_ids)
+            errors.extend(per_worker_errors)
+
+        # Seed the pending tracker BEFORE the worker's async
+        # ``workflow_cancellation_complete`` pushes can land. The
+        # workers already scheduled those pushes as fire-and-forget
+        # tasks inside their cancel handler, so a completion can
+        # race the manager's seed; seeding here under the cancel
+        # handler's natural lock matches the same discipline the
+        # non-empty-view ``_cancel_running_workflows`` path uses.
+        for workflow_id in cancelled_ids:
+            self._manager_state.add_cancellation_pending_workflow(
+                job_id, workflow_id
+            )
+
+        return cancelled_ids, errors
+
     @tcp.receive()
     async def cancel_job(
         self,
@@ -6904,31 +7009,86 @@ class ManagerServer(HealthAwareServer):
                     f"{total_errors} workflow(s) failed: {'; '.join(error_details)}"
                 )
 
-            # If no workflows were ever seeded into the pending tracker
-            # the ``workflow_cancellation_complete`` zero-pending branch
-            # (the canonical fire site for the client-direct
-            # ``job_cancellation_complete`` push) will never run, and the
-            # client's ``await_job_cancellation`` blocks on
-            # ``_cancellation_events[job_id]`` until its deadline elapses.
-            # The empty-pending case happens when
-            # ``_get_running_workflows_to_cancel`` finds no in-flight
-            # workflows on this manager — typical right after a
-            # leader-failover takeover whose peer/worker state-sync
-            # hadn't yet repopulated ``job.workflows`` with a cancellable
-            # status. The job IS marked CANCELLED above, so semantically
-            # the cancel is complete; fire the client-side push directly
-            # so ``test_cancel_during_leader_failover`` doesn't hang on
-            # the missing completion event. Safe under the leader-only
-            # gate: this branch only runs after the takeover-guarded
-            # ``if not is_job_leader(...)`` paths above were either
-            # skipped (we're the leader) or led to a successful takeover.
+            # Empty-view case: the local ``_get_running_workflows_to_cancel``
+            # found nothing — typical right after a leader-failover
+            # takeover whose peer/worker state-sync hadn't yet
+            # repopulated ``job.workflows`` with a cancellable
+            # status. The prior shortcut fired
+            # ``_push_cancellation_complete_to_origin`` speculatively
+            # so the client unblocked, but it didn't actually stop
+            # any workflow that might still be running on workers
+            # the leader hadn't fully seen. That violates the
+            # cancel contract: a successful ``cancel_job`` must
+            # mean every in-flight workflow for the job is being
+            # cancelled, not just that the client got a success
+            # response.
+            #
+            # Correct fix: broadcast ``CancelJobWorkflowsRequest`` to
+            # every worker we know about (including ones added by
+            # ``_apply_peer_worker_snapshots`` from peer state sync).
+            # Each worker iterates its ``_active_workflows`` for any
+            # workflow whose ``progress.job_id`` matches, cancels it
+            # via the same ``_cancel_workflow`` path the
+            # ``cancel_workflow`` RPC uses, and returns the set of
+            # sub-workflow token strings it actually cancelled. We
+            # seed the pending tracker from those responses so the
+            # canonical
+            # ``workflow_cancellation_complete`` → zero-pending →
+            # ``_push_cancellation_complete_to_origin`` chain
+            # drives the client-facing notification just like the
+            # non-empty path.
+            #
+            # The leader-only gate above already ensures we don't
+            # broadcast from a non-leader manager; the takeover
+            # path produces ``is_job_leader=True`` before reaching
+            # this branch.
             if not workflows_to_cancel and not pending_cancelled:
-                self._task_runner.run(
-                    self._push_cancellation_complete_to_origin,
-                    job_id,
-                    overall_success,
-                    list(workflow_errors.values()),
+                broadcast_cancelled, broadcast_errors = (
+                    await self._broadcast_cancel_job_workflows_to_workers(
+                        job_id=job_id,
+                        requester_id=requester_id,
+                        timestamp=timestamp,
+                        reason=reason,
+                    )
                 )
+                if broadcast_cancelled:
+                    # Workers reported real workflows cancelled.
+                    # Their ``workflow_cancellation_complete`` pushes
+                    # will arrive shortly and decrement the
+                    # pending tracker we just seeded — the canonical
+                    # push fires when the tracker reaches zero.
+                    total_cancelled += len(broadcast_cancelled)
+                else:
+                    # Nothing was actually running on workers
+                    # either. The job is correctly marked CANCELLED
+                    # locally and there's no in-flight work to
+                    # wait for — fire the completion push directly
+                    # so the client's ``await_job_cancellation``
+                    # doesn't block on an event that no
+                    # zero-pending handler will ever set.
+                    self._task_runner.run(
+                        self._push_cancellation_complete_to_origin,
+                        job_id,
+                        overall_success and not broadcast_errors,
+                        list(workflow_errors.values()) + broadcast_errors,
+                    )
+                if broadcast_errors:
+                    workflow_errors.update(
+                        {
+                            f"broadcast_error_{idx}": err
+                            for idx, err in enumerate(broadcast_errors)
+                        }
+                    )
+                    total_errors = len(workflow_errors)
+                    overall_success = total_errors == 0
+                    if workflow_errors and not error_str:
+                        error_str = (
+                            f"{total_errors} workflow(s) failed: "
+                            + "; ".join(
+                                f"{wf_id[:8]}...: {err}"
+                                for wf_id, err in workflow_errors.items()
+                            )
+                        )
 
             return self._build_cancel_response(
                 job_id,

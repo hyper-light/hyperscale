@@ -145,6 +145,8 @@ from .distributed import (
     # Cancellation
     CancelJob as CancelJob,
     CancelAck as CancelAck,
+    CancelJobWorkflowsRequest as CancelJobWorkflowsRequest,
+    CancelJobWorkflowsResponse as CancelJobWorkflowsResponse,
     WorkflowCancellationQuery as WorkflowCancellationQuery,
     WorkflowCancellationResponse as WorkflowCancellationResponse,
     # Lease
