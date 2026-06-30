@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from time import monotonic
 from typing import TYPE_CHECKING
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 if TYPE_CHECKING:
     from hyperscale.distributed.resources.manager_local_view import ManagerLocalView
@@ -26,4 +30,4 @@ class ManagerClusterResourceView:
     cpu_pressure: float = 0.0
     memory_pressure: float = 0.0
     vector_clock: dict[str, int] = field(default_factory=dict)
-    timestamp_monotonic: float = field(default_factory=monotonic)
+    timestamp_monotonic: float = field(default_factory=lambda: _DEFAULT_CLOCK._DEFAULT_CLOCK.monotonic())

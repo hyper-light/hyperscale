@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
-from time import monotonic
 
 from hyperscale.distributed.resources.manager_cluster_view import (
     ManagerClusterResourceView,
@@ -14,6 +13,11 @@ from hyperscale.distributed.resources.process_resource_monitor import (
 from hyperscale.distributed.resources.resource_metrics import ResourceMetrics
 from hyperscale.distributed.resources.worker_resource_report import WorkerResourceReport
 from hyperscale.logging import Logger
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 @dataclass(slots=True)
@@ -70,7 +74,7 @@ class ManagerResourceGossip:
             existing = self._peer_views.get(view.manager_node_id)
             existing_version = existing[0].version if existing else -1
             if existing is None or view.version > existing_version:
-                self._peer_views[view.manager_node_id] = (view, monotonic())
+                self._peer_views[view.manager_node_id] = (view, _DEFAULT_CLOCK.monotonic())
                 self._cached_cluster_view = None
                 return True
             return False
@@ -150,7 +154,7 @@ class ManagerResourceGossip:
 
         async with self._peer_lock:
             for manager_id, (view, received_at) in self._peer_views.items():
-                if (monotonic() - received_at) > self.staleness_threshold_seconds:
+                if (_DEFAULT_CLOCK.monotonic() - received_at) > self.staleness_threshold_seconds:
                     continue
                 views[manager_id] = view
 
@@ -196,5 +200,5 @@ class ManagerResourceGossip:
             cpu_pressure=cpu_pressure,
             memory_pressure=memory_pressure,
             vector_clock=vector_clock,
-            timestamp_monotonic=monotonic(),
+            timestamp_monotonic=_DEFAULT_CLOCK.monotonic(),
         )

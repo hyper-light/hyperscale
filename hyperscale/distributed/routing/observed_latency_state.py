@@ -5,12 +5,16 @@ Observed latency state for adaptive route learning (AD-45).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from time import monotonic
 
 
 import statistics
 from collections import deque
 from typing import Deque
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 @dataclass(slots=True)
@@ -56,7 +60,7 @@ class ObservedLatencyState:
             alpha: EWMA decay factor (0.0-1.0, higher = more responsive).
             now: Current monotonic time for testing.
         """
-        current_time = now or monotonic()
+        current_time = now or _DEFAULT_CLOCK.monotonic()
 
         if self.sample_count == 0:
             self.ewma_ms = latency_ms
@@ -116,7 +120,7 @@ class ObservedLatencyState:
 
     def is_stale(self, max_age_seconds: float, now: float | None = None) -> bool:
         """Return True when observations are stale."""
-        current_time = now or monotonic()
+        current_time = now or _DEFAULT_CLOCK.monotonic()
         if self.last_update == 0.0:
             return True
         return (current_time - self.last_update) > max_age_seconds

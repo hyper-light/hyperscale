@@ -73,7 +73,7 @@ class ExtensionTracker:
     last_progress: float = 0.0
     last_completed_items: int | None = None  # AD-26 Issue 4: Track absolute metrics
     total_extended: float = 0.0
-    last_extension_time: float = field(default_factory=_DEFAULT_CLOCK.monotonic)
+    last_extension_time: float = field(default_factory=lambda: _DEFAULT_CLOCK.monotonic())
     exhaustion_time: float | None = None
     warning_sent: bool = False
 

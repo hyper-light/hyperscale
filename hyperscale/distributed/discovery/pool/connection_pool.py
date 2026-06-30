@@ -34,10 +34,10 @@ class PooledConnection(Generic[T]):
     state: ConnectionState = ConnectionState.DISCONNECTED
     """Current connection state."""
 
-    created_at: float = field(default_factory=_DEFAULT_CLOCK.monotonic)
+    created_at: float = field(default_factory=lambda: _DEFAULT_CLOCK.monotonic())
     """When the connection was created."""
 
-    last_used: float = field(default_factory=_DEFAULT_CLOCK.monotonic)
+    last_used: float = field(default_factory=lambda: _DEFAULT_CLOCK.monotonic())
     """When the connection was last used."""
 
     use_count: int = 0

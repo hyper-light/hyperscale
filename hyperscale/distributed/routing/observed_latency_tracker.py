@@ -6,9 +6,13 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
-from time import monotonic
 
 from .observed_latency_state import ObservedLatencyState
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 @dataclass
@@ -52,7 +56,7 @@ class ObservedLatencyTracker:
         if state is None:
             return 0.0, 0.0
 
-        current_time = monotonic()
+        current_time = _DEFAULT_CLOCK.monotonic()
         confidence = self._get_effective_confidence(state, current_time)
         return state.ewma_ms, confidence
 
@@ -73,7 +77,7 @@ class ObservedLatencyTracker:
         """
         Return tracker metrics for observability.
         """
-        current_time = monotonic()
+        current_time = _DEFAULT_CLOCK.monotonic()
         per_datacenter: dict[str, dict[str, float | int | bool]] = {}
         for datacenter_id, state in self._latencies.items():
             confidence = self._get_effective_confidence(state, current_time)
@@ -117,7 +121,7 @@ class ObservedLatencyTracker:
     async def cleanup_stale_entries(
         self, cleanup_threshold_seconds: float = 600.0
     ) -> int:
-        current_time = monotonic()
+        current_time = _DEFAULT_CLOCK.monotonic()
         async with self._lock:
             stale_dc_ids = [
                 dc_id

@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from time import monotonic
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 @dataclass(slots=True)
@@ -18,4 +22,4 @@ class LatencyObservation:
 
     def is_stale(self, max_age_seconds: float) -> bool:
         """Return True when the observation is older than max_age_seconds."""
-        return (monotonic() - self.window_end) > max_age_seconds
+        return (_DEFAULT_CLOCK.monotonic() - self.window_end) > max_age_seconds

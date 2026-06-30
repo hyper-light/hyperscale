@@ -26,8 +26,28 @@ from the expected set in *either* direction:
   but left the path in the snapshot. The snapshot must shrink
   monotonically; every migration commit tightens the lint.
 
-Phase 5 final state (after 5e): the snapshot is empty. Any path in
-the snapshot means the migration is incomplete.
+Phase 5 final state (after 5e): the snapshot contains only the two
+seam-adapter files (``runtime/real_clock.py``,
+``runtime/real_random.py``) that are intentionally allowed to
+delegate to the stdlib.
+
+What's flagged
+--------------
+
+Two AST patterns are detected, NOT just one:
+
+1. **Attribute-access** form — ``time.monotonic()``, ``asyncio.sleep(...)``,
+   ``random.uniform(...)``. ``ast.Attribute(value=ast.Name)`` where the
+   module name matches the forbidden set. Also catches captured-callable
+   forms like ``field(default_factory=time.monotonic)``.
+
+2. **From-import** form — ``from time import monotonic; monotonic()``,
+   ``from asyncio import sleep, wait_for; await sleep(...)``,
+   ``from random import uniform; uniform(0, 1)``. The lint walker
+   tracks the names imported into each file from the forbidden modules
+   and flags ``ast.Call(func=ast.Name)`` where the name matches a
+   tracked import. This closes the alias-import bypass that hid
+   ``snowflake_generator.py`` from earlier passes.
 
 What's NOT flagged
 ------------------
@@ -37,6 +57,8 @@ What's NOT flagged
 * ``time.perf_counter`` — measurement only, doesn't affect SIM
   control flow. Producer modules can keep using it.
 * ``LamportClock`` and similar logical clocks — not wall time.
+* ``from secrets import token_bytes; token_bytes(8)`` — same crypto
+  carve-out as the attribute form.
 """
 
 from __future__ import annotations
@@ -55,8 +77,7 @@ PRODUCTION_ROOT = REPO_ROOT / "hyperscale" / "distributed"
 
 
 # Pairs of (module_name, attribute) that are forbidden as direct
-# calls in production code. Phase 5b expands this set as each
-# subsystem migrates; Phase 5d completes the random axis.
+# calls in production code.
 FORBIDDEN_ATTRIBUTE_CALLS: frozenset[tuple[str, str]] = frozenset({
     ("time", "monotonic"),
     ("time", "time"),
@@ -71,6 +92,18 @@ FORBIDDEN_ATTRIBUTE_CALLS: frozenset[tuple[str, str]] = frozenset({
 })
 
 
+# Per-module mapping of attribute names that are forbidden when
+# brought into scope via ``from <module> import <name>``. Reuses the
+# same forbidden set above; the index here just groups by source
+# module so the ``ImportFrom`` walker can resolve aliases quickly.
+FORBIDDEN_FROM_IMPORT_NAMES: dict[str, frozenset[str]] = {
+    "time": frozenset({"monotonic", "time"}),
+    "asyncio": frozenset({"sleep", "wait_for"}),
+    "random": frozenset({"uniform", "random", "randrange",
+                         "choice", "choices", "sample"}),
+}
+
+
 def _iter_python_files(root: Path) -> Iterator[Path]:
     """Yield every ``.py`` file under ``root`` excluding caches."""
     for path in root.rglob("*.py"):
@@ -79,28 +112,79 @@ def _iter_python_files(root: Path) -> Iterator[Path]:
         yield path
 
 
+def _collect_forbidden_aliases(tree: ast.Module) -> set[str]:
+    """Walk module-level ``ImportFrom`` nodes and return the set of
+    local names brought into scope from ``time`` / ``asyncio`` /
+    ``random`` that map to a forbidden attribute.
+
+    Captures the ``asname`` form too — ``from time import time as wall_now``
+    binds ``wall_now``, and a later ``wall_now()`` must still be
+    flagged. Only inspects top-level imports; in-function ``from X
+    import Y`` is rare and intentionally not tracked (any production
+    code doing that under Phase 5 is the bug to surface).
+    """
+    aliases: set[str] = set()
+    for node in tree.body:
+        if not isinstance(node, ast.ImportFrom):
+            continue
+        if node.module not in FORBIDDEN_FROM_IMPORT_NAMES:
+            continue
+        forbidden_names = FORBIDDEN_FROM_IMPORT_NAMES[node.module]
+        for alias in node.names:
+            if alias.name in forbidden_names:
+                # ``from time import time as wall_now`` → ``wall_now``;
+                # plain ``from time import time`` → ``time``.
+                aliases.add(alias.asname or alias.name)
+    return aliases
+
+
 def _file_has_forbidden_call(path: Path) -> bool:
     """Return True when ``path`` contains at least one forbidden
-    ``module.attr`` reference at AST-level.
+    direct call, in either of the two patterns documented in the
+    module docstring.
 
-    This catches the dominant pattern (direct attribute call:
-    ``time.monotonic()``, ``asyncio.sleep(...)``, ``random.uniform(...)``).
-    Matching at attribute access — not just at ``Call`` — also catches
-    captured-callable forms (``field(default_factory=time.monotonic)``,
-    ``self._now = time.monotonic``), which the Phase 5 plan calls out
-    as the trickiest migration case at dataclass defaults.
+    Pattern 1 (attribute-access): ``time.monotonic()``,
+    ``asyncio.sleep(...)``, ``random.uniform(...)`` — surfaces as
+    ``ast.Attribute(value=ast.Name)`` where the pair is in
+    ``FORBIDDEN_ATTRIBUTE_CALLS``. Also matches captured-callable
+    forms (``field(default_factory=time.monotonic)``,
+    ``self._now = time.monotonic``) which the Phase 5 plan calls out.
+
+    Pattern 2 (from-import aliasing): ``from time import time``
+    binds ``time`` as a bare name, then ``time()`` is a
+    ``ast.Call(func=ast.Name)`` whose name is in the alias set
+    returned by ``_collect_forbidden_aliases``. The dataclass
+    ``field(default_factory=monotonic)`` form is also caught because
+    the bare ``monotonic`` references as ``ast.Name`` outside a
+    ``ast.Call`` — we match ``Name`` nodes broadly, not only inside
+    ``Call``.
     """
     # SyntaxError here means the file uses syntax newer than the
     # interpreter running this test — typically a stale interpreter,
     # not the file's fault. Re-raise so the failure is loud rather
-    # than silently skipping the file (which would mask violations).
+    # than silently skipping the file.
     tree = ast.parse(path.read_text())
 
+    forbidden_aliases = _collect_forbidden_aliases(tree)
+
     for node in ast.walk(tree):
+        # Pattern 1: ``time.monotonic``, ``asyncio.sleep``, ``random.uniform``
         if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
             key = (node.value.id, node.attr)
             if key in FORBIDDEN_ATTRIBUTE_CALLS:
                 return True
+
+        # Pattern 2: bare ``Name`` references to an aliased import.
+        # We flag any ``Name`` (not only inside ``Call``) because
+        # ``field(default_factory=monotonic)`` captures the callable
+        # without an immediate ``Call`` — same regression the plan
+        # called out for ``field(default_factory=time.monotonic)``.
+        if (
+            isinstance(node, ast.Name)
+            and node.id in forbidden_aliases
+            and not isinstance(node.ctx, ast.Store)
+        ):
+            return True
 
     return False
 

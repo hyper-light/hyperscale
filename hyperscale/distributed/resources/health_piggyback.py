@@ -18,7 +18,7 @@ class HealthPiggyback:
     throughput: float = 0.0
     expected_throughput: float = 0.0
     overload_state: str = "healthy"
-    timestamp: float = field(default_factory=_DEFAULT_CLOCK.monotonic)
+    timestamp: float = field(default_factory=lambda: _DEFAULT_CLOCK.monotonic())
 
     def to_dict(self) -> dict:
         """Serialize the piggyback to a dictionary."""

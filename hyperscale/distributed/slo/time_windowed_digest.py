@@ -1,10 +1,14 @@
 from __future__ import annotations
 
-from time import monotonic
 
 from .latency_observation import LatencyObservation
 from .slo_config import SLOConfig
 from .tdigest import TDigest
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 class TimeWindowedTDigest:
@@ -48,7 +52,7 @@ class TimeWindowedTDigest:
         self, value: float, weight: float = 1.0, timestamp: float | None = None
     ) -> None:
         """Add a value to the current time window."""
-        event_time = timestamp if timestamp is not None else monotonic()
+        event_time = timestamp if timestamp is not None else _DEFAULT_CLOCK.monotonic()
         window_start = self._window_start_for_timestamp(event_time)
         self._register_window(window_start)
         self._windows[window_start].add(value, weight)
@@ -65,7 +69,7 @@ class TimeWindowedTDigest:
         now: float | None = None,
     ) -> LatencyObservation | None:
         """Aggregate recent windows into a latency observation."""
-        reference_time = now if now is not None else monotonic()
+        reference_time = now if now is not None else _DEFAULT_CLOCK.monotonic()
         self._prune_windows(reference_time)
         if not self._window_order:
             return None

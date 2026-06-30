@@ -51,7 +51,7 @@ class DNSSecurityEvent:
     details: str
     """Human-readable description of the violation."""
 
-    timestamp: float = field(default_factory=_DEFAULT_CLOCK.monotonic)
+    timestamp: float = field(default_factory=lambda: _DEFAULT_CLOCK.monotonic())
     """When this violation occurred."""
 
     previous_ip: str | None = None
@@ -71,7 +71,7 @@ class HostHistory:
     change_count: int = 0
     """Number of IP changes in the tracking window."""
 
-    window_start_time: float = field(default_factory=_DEFAULT_CLOCK.monotonic)
+    window_start_time: float = field(default_factory=lambda: _DEFAULT_CLOCK.monotonic())
     """Start of the current tracking window."""
 
 

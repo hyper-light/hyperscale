@@ -344,7 +344,7 @@ class HealthPiggyback:
     overload_state: str = "healthy"
 
     # Timestamp for staleness detection
-    timestamp: float = field(default_factory=_DEFAULT_CLOCK.monotonic)
+    timestamp: float = field(default_factory=lambda: _DEFAULT_CLOCK.monotonic())
 
     def to_dict(self) -> dict:
         """Serialize to dictionary for embedding."""

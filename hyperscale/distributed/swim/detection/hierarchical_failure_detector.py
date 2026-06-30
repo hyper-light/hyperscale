@@ -109,7 +109,7 @@ class FailureEvent:
     source: FailureSource
     job_id: JobId | None  # Only set for JOB source
     incarnation: int
-    timestamp: float = field(default_factory=_DEFAULT_CLOCK.monotonic)
+    timestamp: float = field(default_factory=lambda: _DEFAULT_CLOCK.monotonic())
 
 
 class HierarchicalFailureDetector:

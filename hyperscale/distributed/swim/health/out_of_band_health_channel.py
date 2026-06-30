@@ -123,7 +123,7 @@ class OutOfBandHealthChannel:
     # Rate limiting
     _last_probe_time: dict[tuple[str, int], float] = field(default_factory=dict)
     _global_probe_count: int = 0
-    _global_probe_window_start: float = field(default_factory=_DEFAULT_CLOCK.monotonic)
+    _global_probe_window_start: float = field(default_factory=lambda: _DEFAULT_CLOCK.monotonic())
 
     # Callback for when we receive a probe (to generate response)
     _is_overloaded: Callable[[], bool] | None = None

@@ -24,7 +24,7 @@ class WorkerDispatchRoutingState:
     consecutive_failures: int = 0
     suspended_until: float = 0.0
     last_failure_at: float = 0.0
-    last_success_at: float = field(default_factory=_DEFAULT_CLOCK.monotonic)
+    last_success_at: float = field(default_factory=lambda: _DEFAULT_CLOCK.monotonic())
     last_error: str = ""
 
     def is_routable(self, now: float | None = None) -> bool:

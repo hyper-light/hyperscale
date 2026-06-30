@@ -99,7 +99,7 @@ class DCLeaderAnnouncement(Message):
     leader_tcp_addr: tuple[str, int]
     leader_udp_addr: tuple[str, int]
     term: int
-    timestamp: float = field(default_factory=_DEFAULT_CLOCK.time)
+    timestamp: float = field(default_factory=lambda: _DEFAULT_CLOCK.time())
 
 
 @dataclass(slots=True)

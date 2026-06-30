@@ -17,7 +17,7 @@ class ForwardingMetrics:
     """Metrics for job forwarding throughput."""
 
     count: int = 0
-    interval_start: float = field(default_factory=_DEFAULT_CLOCK.monotonic)
+    interval_start: float = field(default_factory=lambda: _DEFAULT_CLOCK.monotonic())
     last_throughput: float = 0.0
     interval_seconds: float = 10.0
 

@@ -15,4 +15,4 @@ class WorkerDrainIntent:
     worker_id: str
     epoch: int
     reason: str
-    started_at: float = field(default_factory=_DEFAULT_CLOCK.monotonic)
+    started_at: float = field(default_factory=lambda: _DEFAULT_CLOCK.monotonic())

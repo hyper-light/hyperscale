@@ -83,7 +83,7 @@ class Metrics:
     messages_deduplicated: int = 0
     
     # Start time for uptime calculation
-    _start_time: float = field(default_factory=_DEFAULT_CLOCK.monotonic)
+    _start_time: float = field(default_factory=lambda: _DEFAULT_CLOCK.monotonic())
     
     # Logger for structured logging (optional)
     _logger: LoggerProtocol | None = None

@@ -105,7 +105,7 @@ class PeerInfo:
     """Total errors from this peer."""
 
     # ===== Timing =====
-    discovered_at: float = field(default_factory=_DEFAULT_CLOCK.monotonic)
+    discovered_at: float = field(default_factory=lambda: _DEFAULT_CLOCK.monotonic())
     """Timestamp when peer was discovered."""
 
     last_seen_at: float = 0.0

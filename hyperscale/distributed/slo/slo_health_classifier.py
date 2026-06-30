@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from time import monotonic
 
 from hyperscale.distributed.env import Env
 
 from .latency_observation import LatencyObservation
 from .latency_slo import LatencySLO
 from .slo_config import SLOConfig
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 @dataclass(slots=True)
@@ -40,7 +44,7 @@ class SLOHealthClassifier:
         observation: LatencyObservation,
     ) -> str:
         """Return HEALTHY, BUSY, DEGRADED, or UNHEALTHY."""
-        now = monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
         p50_ratio = observation.p50_ms / slo.p50_target_ms
         p95_ratio = observation.p95_ms / slo.p95_target_ms
         p99_ratio = observation.p99_ms / slo.p99_target_ms

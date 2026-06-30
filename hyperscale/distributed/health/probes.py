@@ -51,7 +51,7 @@ class ProbeResponse:
     result: ProbeResult
     message: str = ""
     latency_ms: float = 0.0
-    timestamp: float = field(default_factory=_DEFAULT_CLOCK.monotonic)
+    timestamp: float = field(default_factory=lambda: _DEFAULT_CLOCK.monotonic())
     details: dict = field(default_factory=dict)
 
 

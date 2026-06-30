@@ -53,7 +53,7 @@ class NetworkCoordinate:
     height: float
     adjustment: float
     error: float
-    updated_at: float = field(default_factory=_DEFAULT_CLOCK.monotonic)
+    updated_at: float = field(default_factory=lambda: _DEFAULT_CLOCK.monotonic())
     sample_count: int = 0
 
     def to_dict(self) -> dict[str, float | list[float] | int]:

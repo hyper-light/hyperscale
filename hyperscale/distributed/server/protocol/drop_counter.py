@@ -32,7 +32,7 @@ class DropCounter:
     malformed_message: int = 0
     replay_detected: int = 0
     load_shed: int = 0  # AD-32: Messages dropped due to backpressure
-    _last_reset: float = field(default_factory=_DEFAULT_CLOCK.monotonic)
+    _last_reset: float = field(default_factory=lambda: _DEFAULT_CLOCK.monotonic())
 
     def increment_rate_limited(self) -> None:
         self.rate_limited += 1

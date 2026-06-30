@@ -92,7 +92,7 @@ class ManagerHealthState:
     _state_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
     # Signal 1: Liveness
-    last_liveness_response: float = field(default_factory=_DEFAULT_CLOCK.monotonic)
+    last_liveness_response: float = field(default_factory=lambda: _DEFAULT_CLOCK.monotonic())
     consecutive_liveness_failures: int = 0
 
     # Signal 2: Readiness

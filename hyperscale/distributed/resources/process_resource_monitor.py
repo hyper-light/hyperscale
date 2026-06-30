@@ -3,12 +3,16 @@ from __future__ import annotations
 import asyncio
 import os
 from dataclasses import dataclass, field
-from time import monotonic
 
 import psutil
 
 from hyperscale.distributed.resources.adaptive_kalman_filter import AdaptiveKalmanFilter
 from hyperscale.distributed.resources.resource_metrics import ResourceMetrics
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 @dataclass(slots=True)
@@ -144,7 +148,7 @@ class ProcessResourceMonitor:
             memory_uncertainty=memory_uncertainty,
             memory_percent=memory_percent,
             file_descriptor_count=total_fds,
-            timestamp_monotonic=monotonic(),
+            timestamp_monotonic=_DEFAULT_CLOCK.monotonic(),
             sample_count=self._cpu_filter.get_sample_count(),
             process_count=live_count,
         )
@@ -157,7 +161,7 @@ class ProcessResourceMonitor:
             memory_uncertainty=0.0,
             memory_percent=0.0,
             file_descriptor_count=0,
-            timestamp_monotonic=monotonic(),
+            timestamp_monotonic=_DEFAULT_CLOCK.monotonic(),
             sample_count=0,
             process_count=0,
         )

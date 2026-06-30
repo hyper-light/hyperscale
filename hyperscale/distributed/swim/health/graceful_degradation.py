@@ -161,7 +161,7 @@ class GracefulDegradation:
     
     # Current state
     _current_level: DegradationLevel = DegradationLevel.NORMAL
-    _level_entered_at: float = field(default_factory=_DEFAULT_CLOCK.monotonic)
+    _level_entered_at: float = field(default_factory=lambda: _DEFAULT_CLOCK.monotonic())
     _min_level_duration: float = 5.0  # Min seconds at a level before changing
     
     # Callbacks

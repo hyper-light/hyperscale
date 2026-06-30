@@ -25,7 +25,7 @@ class ProvisionState:
     job_id: str
     worker_id: str
     cores_requested: int
-    initiated_at: float = field(default_factory=_DEFAULT_CLOCK.monotonic)
+    initiated_at: float = field(default_factory=lambda: _DEFAULT_CLOCK.monotonic())
     confirmed_nodes: frozenset[str] = field(default_factory=frozenset)
     timeout_seconds: float = 5.0
 

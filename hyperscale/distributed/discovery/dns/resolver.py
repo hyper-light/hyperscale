@@ -70,7 +70,7 @@ class DNSResult:
     ttl_seconds: float = 60.0
     """Time-to-live for this result."""
 
-    resolved_at: float = field(default_factory=_DEFAULT_CLOCK.monotonic)
+    resolved_at: float = field(default_factory=lambda: _DEFAULT_CLOCK.monotonic())
     """Timestamp when this result was resolved."""
 
     @property
