@@ -23,5 +23,22 @@ EXPECTED_RUNTIME_VIOLATIONS: frozenset[str] = frozenset(
     {
         "hyperscale/distributed/runtime/real_clock.py",
         "hyperscale/distributed/runtime/real_random.py",
+        # ``swim/health_aware_server.py`` is the SWIM dispatcher
+        # façade. The Phase 5c.4d migration that routed every
+        # ``time.X`` / ``asyncio.sleep`` / ``asyncio.wait_for`` /
+        # ``random.X`` call through ``self._clock`` / ``self._random``
+        # introduced a Phase 4 cluster-stabilization regression
+        # (managers stayed at non-baseline LHM for >60 s — confirmed
+        # by per-commit bisect). Even with a zero-overhead
+        # ``RealClock`` (``sleep`` / ``wait_for`` as plain methods
+        # returning the asyncio coroutines directly rather than
+        # ``async def`` wrappers), some timing-sensitive probe-ack
+        # race in this file's tight probe loop keeps the test
+        # failing after the migration but passes against the
+        # original direct calls. The functional reduction is left
+        # in place; this allowlist entry documents the intentional
+        # deferral until the regression can be diagnosed without
+        # blocking the rest of Phase 5.
+        "hyperscale/distributed/swim/health_aware_server.py",
     }
 )
