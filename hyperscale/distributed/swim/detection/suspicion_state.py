@@ -4,8 +4,12 @@ Suspicion state tracking for Lifeguard protocol.
 
 import asyncio
 import math
-import time
 from dataclasses import dataclass, field
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 # Maximum confirmers to track per suspicion
 # In practice, confirmers should never exceed cluster size
@@ -120,7 +124,7 @@ class SuspicionState:
     
     def time_remaining(self) -> float:
         """Calculate time remaining before suspicion expires."""
-        elapsed = time.monotonic() - self.start_time
+        elapsed = _DEFAULT_CLOCK.monotonic() - self.start_time
         timeout = self.calculate_timeout()
         return max(0, timeout - elapsed)
     

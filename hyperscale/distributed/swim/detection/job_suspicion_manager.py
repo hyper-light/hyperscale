@@ -14,13 +14,16 @@ Key features:
 
 import asyncio
 import math
-import time
 from dataclasses import dataclass, field
 from typing import Callable
 
+from hyperscale.distributed.runtime import Clock, RealClock
 from hyperscale.distributed.swim.core.protocols import LoggerProtocol
 
 from .suspicion_state import SuspicionState
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 # Type aliases
@@ -104,7 +107,7 @@ class JobSuspicion:
 
     def time_remaining(self, n_members: int) -> float:
         """Calculate time remaining before expiration."""
-        elapsed = time.monotonic() - self.start_time
+        elapsed = _DEFAULT_CLOCK.monotonic() - self.start_time
         timeout = self.calculate_timeout(n_members)
         return max(0, timeout - elapsed)
 
@@ -282,7 +285,7 @@ class JobSuspicionManager:
                 job_id=job_id,
                 node=node,
                 incarnation=incarnation,
-                start_time=time.monotonic(),
+                start_time=_DEFAULT_CLOCK.monotonic(),
                 min_timeout=min_timeout,
                 max_timeout=max_timeout,
             )
@@ -325,7 +328,7 @@ class JobSuspicionManager:
                 # Don't sleep longer than remaining time
                 sleep_time = min(poll_interval, remaining)
 
-                await asyncio.sleep(sleep_time)
+                await _DEFAULT_CLOCK.sleep(sleep_time)
 
         except asyncio.CancelledError:
             await self._log_error(

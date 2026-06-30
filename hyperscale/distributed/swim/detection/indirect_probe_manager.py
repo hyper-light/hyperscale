@@ -2,11 +2,14 @@
 Indirect probe management for SWIM protocol.
 """
 
-import time
 from dataclasses import dataclass, field
 
+from hyperscale.distributed.runtime import Clock, RealClock
 from .pending_indirect_probe import PendingIndirectProbe
 from ..core.protocols import LoggerProtocol
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 @dataclass(slots=True)
@@ -86,7 +89,7 @@ class IndirectProbeManager:
             target=target,
             requester=requester,
             request_id=request_id,
-            start_time=time.monotonic(),
+            start_time=_DEFAULT_CLOCK.monotonic(),
             timeout=timeout,
         )
         self.pending_probes[target] = probe
@@ -147,7 +150,7 @@ class IndirectProbeManager:
         Returns:
             Number of probes removed.
         """
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
         cutoff = now - self.probe_ttl
 
         to_remove = []

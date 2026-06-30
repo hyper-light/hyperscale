@@ -3,14 +3,17 @@ Suspicion management for Lifeguard protocol.
 """
 
 import asyncio
-import time
 from dataclasses import dataclass, field
 from typing import Callable, Any
 
+from hyperscale.distributed.runtime import Clock, RealClock
 from .suspicion_state import SuspicionState
 
 
 from ..core.protocols import LoggerProtocol
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 @dataclass
@@ -204,7 +207,7 @@ class SuspicionManager:
             state = SuspicionState(
                 node=node,
                 incarnation=incarnation,
-                start_time=time.monotonic(),
+                start_time=_DEFAULT_CLOCK.monotonic(),
                 min_timeout=self.min_timeout * lhm_multiplier,
                 max_timeout=self.max_timeout * lhm_multiplier,
                 n_members=self._get_n_members(),
@@ -223,7 +226,7 @@ class SuspicionManager:
 
         async def expire_suspicion():
             try:
-                await asyncio.sleep(timeout)
+                await _DEFAULT_CLOCK.sleep(timeout)
                 await self._handle_expiration(state)
             except asyncio.CancelledError:
                 raise
@@ -251,7 +254,7 @@ class SuspicionManager:
 
             async def expire_suspicion():
                 try:
-                    await asyncio.sleep(remaining)
+                    await _DEFAULT_CLOCK.sleep(remaining)
                     await self._handle_expiration(state)
                 except asyncio.CancelledError:
                     raise
@@ -403,7 +406,7 @@ class SuspicionManager:
         Returns:
             Tuple of (count, list of (node, incarnation) for expired nodes).
         """
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
         cutoff = now - self.orphaned_timeout
 
         to_remove = []

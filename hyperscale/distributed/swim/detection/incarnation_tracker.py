@@ -3,15 +3,18 @@ Incarnation number tracking for SWIM protocol.
 """
 
 import asyncio
-import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Callable
 
+from hyperscale.distributed.runtime import Clock, RealClock
 from hyperscale.distributed.swim.core.types import Status
 from hyperscale.distributed.swim.core.node_state import NodeState
 from hyperscale.distributed.swim.core.protocols import LoggerProtocol
 from hyperscale.logging.hyperscale_logging_models import ServerDebug
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 class MessageFreshness(Enum):
@@ -361,7 +364,7 @@ class IncarnationTracker:
         Returns:
             Number of nodes removed.
         """
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
         cutoff = now - self.dead_node_retention_seconds
 
         async with self._lock:
@@ -503,7 +506,7 @@ class IncarnationTracker:
             True if node was added, False if already exists with higher status
         """
         if timestamp is None:
-            timestamp = time.monotonic()
+            timestamp = _DEFAULT_CLOCK.monotonic()
 
         async with self._lock:
             existing = self.node_states.get(node)
@@ -541,7 +544,7 @@ class IncarnationTracker:
             True if node was confirmed, False if not found or already confirmed
         """
         if timestamp is None:
-            timestamp = time.monotonic()
+            timestamp = _DEFAULT_CLOCK.monotonic()
 
         async with self._lock:
             existing = self.node_states.get(node)
@@ -582,7 +585,7 @@ class IncarnationTracker:
         observed after the suspicion began.
         """
         if timestamp is None:
-            timestamp = time.monotonic()
+            timestamp = _DEFAULT_CLOCK.monotonic()
 
         async with self._lock:
             existing = self.node_states.get(node)
@@ -679,7 +682,7 @@ class IncarnationTracker:
             timestamp: Death timestamp (defaults to now)
         """
         if timestamp is None:
-            timestamp = time.monotonic()
+            timestamp = _DEFAULT_CLOCK.monotonic()
 
         self._death_timestamps[node] = timestamp
         self._death_incarnations[node] = incarnation_at_death
@@ -712,7 +715,7 @@ class IncarnationTracker:
         if death_timestamp is None:
             return False
 
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
         time_since_death = now - death_timestamp
 
         if time_since_death > self.zombie_detection_window_seconds:
@@ -747,7 +750,7 @@ class IncarnationTracker:
         Returns:
             Number of records cleaned up
         """
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
         cutoff = now - self.zombie_detection_window_seconds
         to_remove = [
             node

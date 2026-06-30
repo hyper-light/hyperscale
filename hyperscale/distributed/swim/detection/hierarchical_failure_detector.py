@@ -15,13 +15,16 @@ Key design decisions:
 
 import asyncio
 import inspect
-import time
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Callable
 
+from hyperscale.distributed.runtime import Clock, RealClock
 from .timing_wheel import TimingWheel, TimingWheelConfig
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 from .job_suspicion_manager import JobSuspicionManager, JobSuspicionConfig
 from .suspicion_state import SuspicionState
 from hyperscale.distributed.health.extension_tracker import (
@@ -106,7 +109,7 @@ class FailureEvent:
     source: FailureSource
     job_id: JobId | None  # Only set for JOB source
     incarnation: int
-    timestamp: float = field(default_factory=time.monotonic)
+    timestamp: float = field(default_factory=_DEFAULT_CLOCK.monotonic)
 
 
 class HierarchicalFailureDetector:
@@ -156,8 +159,11 @@ class HierarchicalFailureDetector:
             ]
             | None
         ) = None,
+        *,
+        clock: Clock | None = None,
     ) -> None:
         self._on_expiration_diagnostic = on_expiration_diagnostic
+        self._clock: Clock = clock if clock is not None else _DEFAULT_CLOCK
         if config is None:
             config = HierarchicalConfig()
 
@@ -520,7 +526,7 @@ class HierarchicalFailureDetector:
             state = SuspicionState(
                 node=node,
                 incarnation=incarnation,
-                start_time=time.monotonic(),
+                start_time=self._clock.monotonic(),
                 min_timeout=state_min_timeout,
                 max_timeout=state_max_timeout,
                 n_members=self._get_current_n_members(),
@@ -528,7 +534,7 @@ class HierarchicalFailureDetector:
             )
             state.add_confirmation(from_node)
 
-            expiration = time.monotonic() + state.calculate_timeout()
+            expiration = self._clock.monotonic() + state.calculate_timeout()
             return await self._global_wheel.add(node, state, expiration)
 
     def _get_no_witness_global_timeout(self, adjusted_max_timeout: float) -> float:
@@ -1024,7 +1030,7 @@ class HierarchicalFailureDetector:
             f"on_death_sync={self._on_global_death_sync is not None}]\n"
         )
         _sys.stderr.flush()
-        actual_age_seconds = time.monotonic() - state.start_time
+        actual_age_seconds = self._clock.monotonic() - state.start_time
         expected_timeout = state.calculate_timeout()
         if self._on_expiration_diagnostic is not None:
             try:
@@ -1232,7 +1238,7 @@ class HierarchicalFailureDetector:
         """
         while self._running:
             try:
-                await asyncio.sleep(self._config.reconciliation_interval_s)
+                await self._clock.sleep(self._config.reconciliation_interval_s)
                 await self._reconcile()
             except asyncio.CancelledError:
                 break

@@ -38,13 +38,16 @@ shims for callers that still import them.
 """
 
 import asyncio
-import time
 from dataclasses import dataclass
 from typing import Callable, Generic, TypeVar
 
+from hyperscale.distributed.runtime import Clock, RealClock
 from hyperscale.distributed.swim.core.protocols import LoggerProtocol
 
 from .suspicion_state import SuspicionState
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 # Type for node address
@@ -158,6 +161,8 @@ class TimingWheel:
         node_host: str = "",
         node_port: int = 0,
         node_id: str = "",
+        *,
+        clock: Clock | None = None,
     ) -> None:
         if config is None:
             config = TimingWheelConfig()
@@ -169,6 +174,7 @@ class TimingWheel:
         self._node_host = node_host
         self._node_port = node_port
         self._node_id = node_id
+        self._clock: Clock = clock if clock is not None else _DEFAULT_CLOCK
 
         self._entries: dict[NodeAddress, _Entry] = {}
         self._running: bool = False
@@ -204,7 +210,7 @@ class TimingWheel:
             return
         self._running = True
         # Schedule any entries that were added pre-start.
-        now = time.monotonic()
+        now = self._clock.monotonic()
         for node, entry in self._entries.items():
             if entry.timer_handle is None:
                 delay = max(0.0, entry.expiration_time - now)
@@ -237,7 +243,7 @@ class TimingWheel:
             return False
 
         entry = _Entry(state=state, expiration_time=expiration_time)
-        delay = max(0.0, expiration_time - time.monotonic())
+        delay = max(0.0, expiration_time - self._clock.monotonic())
         _sys.stderr.write(
             f"[WHEEL-ADD target={node}] delay={delay:.2f} running={self._running}\n"
         )
@@ -278,7 +284,7 @@ class TimingWheel:
             entry.timer_handle.cancel()
         entry.expiration_time = new_expiration_time
         if self._running:
-            delay = max(0.0, new_expiration_time - time.monotonic())
+            delay = max(0.0, new_expiration_time - self._clock.monotonic())
             entry.timer_handle = asyncio.get_event_loop().call_later(
                 delay, self._fire_expiration, node
             )
@@ -366,7 +372,7 @@ class TimingWheel:
             return 0
 
         adjusted = 0
-        now = time.monotonic()
+        now = self._clock.monotonic()
         for node, entry in list(self._entries.items()):
             remaining = entry.expiration_time - now
             new_remaining = remaining * multiplier

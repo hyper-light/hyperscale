@@ -18,9 +18,13 @@ mathematically bounded by the prob-OR composition in
 ``HierarchicalFailureDetector.suspect_global``.
 """
 
-import time
 from collections import deque
 from dataclasses import dataclass
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 NodeAddress = tuple[str, int]
 
@@ -76,11 +80,17 @@ class PeerProbeReliabilityTracker:
     only stale samples.
     """
 
-    def __init__(self, config: PeerProbeReliabilityConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: PeerProbeReliabilityConfig | None = None,
+        *,
+        clock: Clock | None = None,
+    ) -> None:
         if config is None:
             config = PeerProbeReliabilityConfig()
         self._config = config
         self._windows: dict[NodeAddress, deque[tuple[float, bool]]] = {}
+        self._clock: Clock = clock if clock is not None else _DEFAULT_CLOCK
 
     def record_probe_outcome(
         self,
@@ -94,7 +104,7 @@ class PeerProbeReliabilityTracker:
         existing peers continue to accumulate samples.
         """
         if now is None:
-            now = time.monotonic()
+            now = self._clock.monotonic()
         window = self._windows.get(peer)
         if window is None:
             if len(self._windows) >= self._config.max_tracked_peers:
@@ -149,7 +159,7 @@ class PeerProbeReliabilityTracker:
         if not window:
             return 1.0
         if now is None:
-            now = time.monotonic()
+            now = self._clock.monotonic()
         cutoff = now - self._config.sample_ttl_s
         successes = 0
         non_stale_total = 0
@@ -214,7 +224,7 @@ class PeerProbeReliabilityTracker:
         if not window:
             return False
         if now is None:
-            now = time.monotonic()
+            now = self._clock.monotonic()
         cutoff = now - within_seconds
         latest_time, latest_success = window[-1]
         if latest_time < cutoff:
@@ -240,7 +250,7 @@ class PeerProbeReliabilityTracker:
             return False
 
         if now is None:
-            now = time.monotonic()
+            now = self._clock.monotonic()
 
         cutoff = max(since, now - self._config.sample_ttl_s)
         latest_time, latest_success = window[-1]
@@ -260,7 +270,7 @@ class PeerProbeReliabilityTracker:
         long-term memory growth from peer churn.
         """
         if now is None:
-            now = time.monotonic()
+            now = self._clock.monotonic()
         cutoff = now - self._config.sample_ttl_s
         stale: list[NodeAddress] = []
         for peer, window in self._windows.items():

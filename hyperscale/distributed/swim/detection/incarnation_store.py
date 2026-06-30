@@ -15,10 +15,14 @@ Key features:
 
 import asyncio
 import json
-import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 from hyperscale.distributed.swim.core.protocols import LoggerProtocol
 from hyperscale.logging.hyperscale_logging_models import ServerDebug, ServerWarning
@@ -131,7 +135,7 @@ class IncarnationStore:
                 )
                 self._current_record = IncarnationRecord(
                     incarnation=new_incarnation,
-                    last_updated_at=time.time(),
+                    last_updated_at=_DEFAULT_CLOCK.time(),
                     node_address=self.node_address,
                 )
                 await self._save_to_disk(self._current_record)
@@ -143,7 +147,7 @@ class IncarnationStore:
                 # First time - start with restart_incarnation_bump
                 self._current_record = IncarnationRecord(
                     incarnation=self.restart_incarnation_bump,
-                    last_updated_at=time.time(),
+                    last_updated_at=_DEFAULT_CLOCK.time(),
                     node_address=self.node_address,
                 )
                 await self._save_to_disk(self._current_record)
@@ -182,7 +186,7 @@ class IncarnationStore:
 
             self._current_record = IncarnationRecord(
                 incarnation=new_incarnation,
-                last_updated_at=time.time(),
+                last_updated_at=_DEFAULT_CLOCK.time(),
                 node_address=self.node_address,
             )
 
