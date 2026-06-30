@@ -72,17 +72,60 @@ class ClientCancellationManager:
         job_id: str,
         response: JobCancelResponse,
     ) -> JobCancelResponse | None:
-        """Handle successful or already-completed responses. Returns response if handled."""
+        """Handle successful or already-completed responses. Returns response if handled.
+
+        For ``success`` (the canonical cancel-mid-flight path) the manager
+        sends an asynchronous ``job_cancellation_complete`` push after all
+        workers report in, which signals the cancellation event via
+        ``CancellationCompleteHandler``. For the two terminal-state
+        short-circuit branches — ``already_cancelled`` and
+        ``already_completed`` — no async push is ever sent, so any
+        caller awaiting ``await_job_cancellation`` would hang for the
+        full timeout. Synthesize the completion state in-place and
+        signal the event so the await returns immediately.
+        """
         if response.success:
             self._tracker.update_job_status(job_id, JobStatus.CANCELLED.value)
             return response
         if response.already_cancelled:
             self._tracker.update_job_status(job_id, JobStatus.CANCELLED.value)
+            self._signal_terminal_cancellation(job_id, success=True, errors=[])
             return response
         if response.already_completed:
             self._tracker.update_job_status(job_id, JobStatus.COMPLETED.value)
+            self._signal_terminal_cancellation(
+                job_id,
+                success=False,
+                errors=["Job already completed"],
+            )
             return response
         return None
+
+    def _signal_terminal_cancellation(
+        self,
+        job_id: str,
+        *,
+        success: bool,
+        errors: list[str],
+    ) -> None:
+        """Mark a cancellation as resolved without an async manager push.
+
+        The manager's ``cancel_job`` handler only emits the asynchronous
+        ``job_cancellation_complete`` push when it transitions the job
+        through the cancellation pipeline. For terminal-state responses
+        (``already_cancelled`` / ``already_completed``) the synchronous
+        response is the only signal the client ever receives; without
+        this signal, ``await_job_cancellation`` would block until its
+        timeout fires. Writing ``_cancellation_success`` /
+        ``_cancellation_errors`` before ``Event.set`` preserves the same
+        ordering invariant the inbound push handler relies on, so
+        either signal path produces a consistent post-event state.
+        """
+        self._state._cancellation_success[job_id] = success
+        self._state._cancellation_errors[job_id] = errors
+        event = self._state._cancellation_events.get(job_id)
+        if event is not None:
+            event.set()
 
     async def cancel_job(
         self,
