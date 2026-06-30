@@ -4,10 +4,14 @@ Datacenter capacity aggregation for gate routing (AD-43).
 
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass
 
 from hyperscale.distributed.models.distributed import ManagerHeartbeat
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 @dataclass(slots=True)
@@ -38,7 +42,7 @@ class DatacenterCapacity:
         """
         Aggregate capacity metrics from manager heartbeats.
         """
-        updated_time = last_updated if last_updated is not None else time.monotonic()
+        updated_time = last_updated if last_updated is not None else _DEFAULT_CLOCK.monotonic()
         if not heartbeats:
             return cls(
                 datacenter_id=datacenter_id,

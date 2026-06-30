@@ -17,11 +17,15 @@ Backpressure Levels:
 - REJECT: >95% fill, reject non-critical
 """
 
-import time
 from collections import deque
 from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Generic, TypeVar, Callable
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 class BackpressureLevel(IntEnum):
@@ -144,8 +148,8 @@ class StatsBuffer:
         self._archive_dirty: bool = True
 
         # Timestamps for tier promotion
-        self._last_warm_promotion: float = time.monotonic()
-        self._last_cold_promotion: float = time.monotonic()
+        self._last_warm_promotion: float = _DEFAULT_CLOCK.monotonic()
+        self._last_cold_promotion: float = _DEFAULT_CLOCK.monotonic()
 
         # Metrics
         self._total_recorded: int = 0
@@ -163,7 +167,7 @@ class StatsBuffer:
             True if recorded, False if dropped due to backpressure
         """
         if timestamp is None:
-            timestamp = time.monotonic()
+            timestamp = _DEFAULT_CLOCK.monotonic()
 
         # Check if we should drop due to backpressure
         level = self.get_backpressure_level()
@@ -247,7 +251,7 @@ class StatsBuffer:
         Returns:
             Average value, or None if no data in window
         """
-        cutoff = time.monotonic() - window_seconds
+        cutoff = _DEFAULT_CLOCK.monotonic() - window_seconds
         recent = [e for e in self._hot if e.timestamp >= cutoff]
 
         if not recent:
@@ -299,7 +303,7 @@ class StatsBuffer:
 
     def _maybe_promote_tiers(self) -> None:
         """Check and perform tier promotions if needed."""
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
 
         # HOT -> WARM promotion (every 10 seconds)
         if now - self._last_warm_promotion >= self._config.warm_aggregate_seconds:
@@ -313,7 +317,7 @@ class StatsBuffer:
 
     def _promote_hot_to_warm(self) -> None:
         """Aggregate old HOT entries and promote to WARM."""
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
         cutoff = now - self._config.hot_max_age_seconds
 
         # Find entries to promote (older than hot max age)
@@ -328,7 +332,7 @@ class StatsBuffer:
 
     def _promote_warm_to_cold(self) -> None:
         """Aggregate old WARM entries and promote to COLD."""
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
         cutoff = now - self._config.warm_max_age_seconds
 
         # Find entries to promote (older than warm max age)

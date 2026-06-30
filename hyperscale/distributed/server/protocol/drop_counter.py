@@ -7,9 +7,13 @@ and provides periodic logging summaries for security monitoring.
 from __future__ import annotations
 
 import asyncio
-import time
 from dataclasses import dataclass, field
 from typing import Literal
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 @dataclass(slots=True)
@@ -28,7 +32,7 @@ class DropCounter:
     malformed_message: int = 0
     replay_detected: int = 0
     load_shed: int = 0  # AD-32: Messages dropped due to backpressure
-    _last_reset: float = field(default_factory=time.monotonic)
+    _last_reset: float = field(default_factory=_DEFAULT_CLOCK.monotonic)
 
     def increment_rate_limited(self) -> None:
         self.rate_limited += 1
@@ -66,7 +70,7 @@ class DropCounter:
 
     @property
     def interval_seconds(self) -> float:
-        return time.monotonic() - self._last_reset
+        return _DEFAULT_CLOCK.monotonic() - self._last_reset
 
     def reset(self) -> "DropCounterSnapshot":
         """
@@ -93,7 +97,7 @@ class DropCounter:
         self.malformed_message = 0
         self.replay_detected = 0
         self.load_shed = 0
-        self._last_reset = time.monotonic()
+        self._last_reset = _DEFAULT_CLOCK.monotonic()
 
         return snapshot
 

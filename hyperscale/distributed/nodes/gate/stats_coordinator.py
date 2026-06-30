@@ -19,6 +19,11 @@ from hyperscale.distributed.models import (
 from hyperscale.distributed.jobs import WindowedStatsCollector
 from hyperscale.logging.hyperscale_logging_models import ServerDebug, ServerError
 
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
+
 if TYPE_CHECKING:
     from hyperscale.distributed.nodes.gate.state import GateRuntimeState
     from hyperscale.logging import Logger
@@ -200,7 +205,7 @@ class GateStatsCoordinator:
                         self.CALLBACK_PUSH_BASE_DELAY_SECONDS * (2**attempt),
                         self.CALLBACK_PUSH_MAX_DELAY_SECONDS,
                     )
-                    await asyncio.sleep(delay)
+                    await _DEFAULT_CLOCK.sleep(delay)
 
         if allow_peer_forwarding and self._forward_status_push_to_peers:
             peer_forward_attempted = True
@@ -249,7 +254,7 @@ class GateStatsCoordinator:
                         self.CALLBACK_PUSH_BASE_DELAY_SECONDS * (2**attempt),
                         self.CALLBACK_PUSH_MAX_DELAY_SECONDS,
                     )
-                    await asyncio.sleep(delay)
+                    await _DEFAULT_CLOCK.sleep(delay)
 
         await self._logger.log(
             ServerError(

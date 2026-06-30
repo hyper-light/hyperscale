@@ -5,7 +5,11 @@ Dispatch time tracking for gate-side job latency measurement (AD-45).
 from __future__ import annotations
 
 import asyncio
-import time
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 class DispatchTimeTracker:
@@ -19,7 +23,7 @@ class DispatchTimeTracker:
         self._stale_threshold_seconds = stale_threshold_seconds
 
     async def record_dispatch(self, job_id: str, datacenter_id: str) -> float:
-        dispatch_time = time.monotonic()
+        dispatch_time = _DEFAULT_CLOCK.monotonic()
         async with self._lock:
             self._dispatch_times[(job_id, datacenter_id)] = dispatch_time
         return dispatch_time
@@ -35,13 +39,13 @@ class DispatchTimeTracker:
         if dispatch_time is None:
             return None
 
-        latency_ms = (time.monotonic() - dispatch_time) * 1000.0
+        latency_ms = (_DEFAULT_CLOCK.monotonic() - dispatch_time) * 1000.0
         if not success:
             return None
         return latency_ms
 
     async def cleanup_stale_entries(self) -> int:
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
         stale_cutoff = now - self._stale_threshold_seconds
         async with self._lock:
             stale_keys = [

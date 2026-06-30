@@ -11,13 +11,17 @@ Key responsibilities:
 - Track dispatch success/failure for circuit breaking
 """
 
-import time
 from dataclasses import dataclass, field
 from typing import Protocol, Callable
 
 from hyperscale.distributed.models import (
     DatacenterHealth,
 )
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 class SendTcpProtocol(Protocol):
@@ -216,7 +220,7 @@ class ManagerDispatcher:
                 break
 
             attempts += 1
-            start_time = time.monotonic()
+            start_time = _DEFAULT_CLOCK.monotonic()
 
             try:
                 response, _ = await send_tcp(
@@ -226,7 +230,7 @@ class ManagerDispatcher:
                     self._dispatch_timeout,
                 )
 
-                latency_ms = (time.monotonic() - start_time) * 1000
+                latency_ms = (_DEFAULT_CLOCK.monotonic() - start_time) * 1000
 
                 # Success
                 self._record_success(dc_id, latency_ms)
@@ -387,7 +391,7 @@ class ManagerDispatcher:
         if dc_stats:
             dc_stats.total_dispatches += 1
             dc_stats.successful_dispatches += 1
-            dc_stats.last_dispatch_time = time.monotonic()
+            dc_stats.last_dispatch_time = _DEFAULT_CLOCK.monotonic()
             # Update running average latency
             if dc_stats.avg_latency_ms == 0:
                 dc_stats.avg_latency_ms = latency_ms
@@ -397,7 +401,7 @@ class ManagerDispatcher:
         # Update total stats
         self._total_stats.total_dispatches += 1
         self._total_stats.successful_dispatches += 1
-        self._total_stats.last_dispatch_time = time.monotonic()
+        self._total_stats.last_dispatch_time = _DEFAULT_CLOCK.monotonic()
 
     def _record_failure(self, dc_id: str) -> None:
         """Record a failed dispatch."""

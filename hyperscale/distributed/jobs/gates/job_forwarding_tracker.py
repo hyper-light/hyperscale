@@ -12,9 +12,13 @@ Key responsibilities:
 - Track forwarding statistics and failures
 """
 
-import time
 from dataclasses import dataclass, field
 from typing import Protocol, Callable, Awaitable
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 @dataclass(slots=True)
@@ -127,13 +131,13 @@ class JobForwardingTracker:
         if existing:
             existing.tcp_host = tcp_host
             existing.tcp_port = tcp_port
-            existing.last_seen = time.monotonic()
+            existing.last_seen = _DEFAULT_CLOCK.monotonic()
         else:
             self._peers[gate_id] = GatePeerInfo(
                 gate_id=gate_id,
                 tcp_host=tcp_host,
                 tcp_port=tcp_port,
-                last_seen=time.monotonic(),
+                last_seen=_DEFAULT_CLOCK.monotonic(),
             )
 
     def unregister_peer(self, gate_id: str) -> None:
@@ -259,7 +263,7 @@ class JobForwardingTracker:
 
                 # Success
                 peer.forward_successes += 1
-                peer.last_seen = time.monotonic()
+                peer.last_seen = _DEFAULT_CLOCK.monotonic()
                 self._successful_forwards += 1
 
                 return ForwardingResult(
@@ -328,7 +332,7 @@ class JobForwardingTracker:
 
         Returns list of removed gate IDs.
         """
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
         to_remove: list[str] = []
 
         for gate_id, peer in list(self._peers.items()):

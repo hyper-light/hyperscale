@@ -5,8 +5,6 @@ Handles job cancellation with retry logic, leader redirection, and completion tr
 """
 
 import asyncio
-import random
-import time
 
 from hyperscale.distributed.models import (
     JobCancelRequest,
@@ -17,6 +15,12 @@ from hyperscale.distributed.models import (
 from hyperscale.distributed.nodes.client.state import ClientState
 from hyperscale.distributed.nodes.client.config import ClientConfig, TRANSIENT_ERRORS
 from hyperscale.logging import Logger
+
+from hyperscale.distributed.runtime import Clock, RealClock, Random, RealRandom
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
+_DEFAULT_RANDOM: Random = RealRandom()
 
 
 class ClientCancellationManager:
@@ -60,8 +64,8 @@ class ClientCancellationManager:
         """Apply exponential backoff with jitter (AD-21) before retry."""
         if retry < max_retries:
             calculated_delay = base_delay * (2 ** retry)
-            jittered_delay = calculated_delay * (0.5 + random.random())
-            await asyncio.sleep(jittered_delay)
+            jittered_delay = calculated_delay * (0.5 + _DEFAULT_RANDOM.random())
+            await _DEFAULT_CLOCK.sleep(jittered_delay)
 
     def _handle_successful_response(
         self,
@@ -170,7 +174,7 @@ class ClientCancellationManager:
             request = JobCancelRequest(
                 job_id=job_id,
                 requester_id=f"client-{self._config.host}:{self._config.tcp_port}",
-                timestamp=time.time(),
+                timestamp=_DEFAULT_CLOCK.time(),
                 fence_token=0,
                 reason=reason,
             )
@@ -272,7 +276,7 @@ class ClientCancellationManager:
             rate_limit_delay = self._check_rate_limit(response_data)
             if rate_limit_delay is not None:
                 # Honor the server's retry_after; treat as transient.
-                await asyncio.sleep(rate_limit_delay)
+                await _DEFAULT_CLOCK.sleep(rate_limit_delay)
                 return "Rate limited"
 
             response = JobCancelResponse.load(response_data)
@@ -353,7 +357,7 @@ class ClientCancellationManager:
             # see the consistent post-notification state below.
             try:
                 if timeout is not None:
-                    await asyncio.wait_for(event.wait(), timeout=timeout)
+                    await _DEFAULT_CLOCK.wait_for(event.wait(), timeout=timeout)
                 else:
                     await event.wait()
             except asyncio.TimeoutError:

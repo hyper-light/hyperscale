@@ -4,12 +4,16 @@ Execution time estimation for capacity planning (AD-43).
 
 from __future__ import annotations
 
-import time
 
 from hyperscale.distributed.models.jobs import PendingWorkflow
 from hyperscale.distributed.taskex.util.time_parser import TimeParser
 
 from .active_dispatch import ActiveDispatch
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 class ExecutionTimeEstimator:
@@ -36,7 +40,7 @@ class ExecutionTimeEstimator:
         if self._total_cores <= 0:
             return float("inf")
 
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
         completions = self._get_completions(now)
         available_cores = self._get_available_cores()
 
@@ -64,7 +68,7 @@ class ExecutionTimeEstimator:
         """
         Sum remaining duration for all active dispatches.
         """
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
         return sum(
             dispatch.remaining_seconds(now) for dispatch in self._active.values()
         )

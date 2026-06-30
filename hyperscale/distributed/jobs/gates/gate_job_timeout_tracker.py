@@ -11,7 +11,6 @@ This is the gate-side counterpart to GateCoordinatedTimeout in manager.
 """
 
 import asyncio
-import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -27,6 +26,11 @@ from hyperscale.distributed.models.distributed import (
     JobLeaderTransfer,
     JobFinalStatus,
 )
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 if TYPE_CHECKING:
     from hyperscale.distributed.nodes.gate import GateServer
@@ -156,7 +160,7 @@ class GateJobTimeoutTracker:
         Called by gate when dispatching job to datacenters.
         """
         async with self._lock:
-            now = time.monotonic()
+            now = _DEFAULT_CLOCK.monotonic()
             self._tracked_jobs[job_id] = GateJobTrackingInfo(
                 job_id=job_id,
                 submitted_at=now,
@@ -311,7 +315,7 @@ class GateJobTimeoutTracker:
         """
         while self._running:
             try:
-                await asyncio.sleep(self._check_interval)
+                await _DEFAULT_CLOCK.sleep(self._check_interval)
 
                 # Check all tracked jobs
                 async with self._lock:
@@ -338,7 +342,7 @@ class GateJobTimeoutTracker:
 
         Returns (should_timeout, reason).
         """
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
 
         # Skip if already terminal
         terminal_statuses = {"completed", "failed", "cancelled", "timed_out", "timeout"}
@@ -425,7 +429,7 @@ class GateJobTimeoutTracker:
         timeout_msg = JobGlobalTimeout(
             job_id=job_id,
             reason=reason,
-            timed_out_at=time.monotonic(),
+            timed_out_at=_DEFAULT_CLOCK.monotonic(),
             fence_token=info.timeout_fence_token,
         )
 

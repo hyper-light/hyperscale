@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import time
 from typing import Generic, TypeVar
 
 from .idempotency_key import IdempotencyKey
 from .idempotency_status import IdempotencyStatus
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 T = TypeVar("T")
 
@@ -28,4 +32,4 @@ class IdempotencyEntry(Generic[T]):
 
     def age_seconds(self) -> float:
         """Get age of entry in seconds."""
-        return time.time() - self.created_at
+        return _DEFAULT_CLOCK.time() - self.created_at

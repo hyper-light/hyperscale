@@ -8,7 +8,6 @@ DNS cache poisoning, hijacking, and spoofing attacks.
 
 import asyncio
 import socket
-import time
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -20,6 +19,11 @@ from hyperscale.distributed.discovery.dns.security import (
     DNSSecurityEvent,
     DNSSecurityViolation,
 )
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 class DNSError(Exception):
@@ -66,13 +70,13 @@ class DNSResult:
     ttl_seconds: float = 60.0
     """Time-to-live for this result."""
 
-    resolved_at: float = field(default_factory=time.monotonic)
+    resolved_at: float = field(default_factory=_DEFAULT_CLOCK.monotonic)
     """Timestamp when this result was resolved."""
 
     @property
     def is_expired(self) -> bool:
         """Check if this result has expired."""
-        return time.monotonic() - self.resolved_at > self.ttl_seconds
+        return _DEFAULT_CLOCK.monotonic() - self.resolved_at > self.ttl_seconds
 
 
 @dataclass
@@ -202,7 +206,7 @@ class AsyncDNSResolver:
 
         try:
             # Query SRV records using aiodns
-            srv_results = await asyncio.wait_for(
+            srv_results = await _DEFAULT_CLOCK.wait_for(
                 self._aiodns_resolver.query(service_name, "SRV"),
                 timeout=self.resolution_timeout_seconds,
             )
@@ -350,7 +354,7 @@ class AsyncDNSResolver:
         async with self._resolution_semaphore:
             try:
                 # Use asyncio's getaddrinfo for async resolution
-                results = await asyncio.wait_for(
+                results = await _DEFAULT_CLOCK.wait_for(
                     asyncio.get_running_loop().getaddrinfo(
                         hostname,
                         port or 0,
@@ -551,7 +555,7 @@ class AsyncDNSResolver:
         Returns:
             Tuple of (positive entries removed, negative entries removed)
         """
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
 
         # Cleanup positive cache
         positive_expired = [

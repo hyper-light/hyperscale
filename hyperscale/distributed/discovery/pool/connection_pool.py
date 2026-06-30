@@ -5,13 +5,17 @@ Provides connection pooling with health tracking and automatic cleanup.
 """
 
 import asyncio
-import time
 from dataclasses import dataclass, field
 from typing import Generic, TypeVar, Callable, Awaitable
 
 from hyperscale.distributed.discovery.models.connection_state import (
     ConnectionState,
 )
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 T = TypeVar("T")  # Connection type
@@ -30,10 +34,10 @@ class PooledConnection(Generic[T]):
     state: ConnectionState = ConnectionState.DISCONNECTED
     """Current connection state."""
 
-    created_at: float = field(default_factory=time.monotonic)
+    created_at: float = field(default_factory=_DEFAULT_CLOCK.monotonic)
     """When the connection was created."""
 
-    last_used: float = field(default_factory=time.monotonic)
+    last_used: float = field(default_factory=_DEFAULT_CLOCK.monotonic)
     """When the connection was last used."""
 
     use_count: int = 0
@@ -184,7 +188,7 @@ class ConnectionPool(Generic[T]):
                 ):
                     # Found idle connection
                     self._in_use.add(conn_id)
-                    pooled.last_used = time.monotonic()
+                    pooled.last_used = _DEFAULT_CLOCK.monotonic()
                     pooled.use_count += 1
                     return pooled
 
@@ -210,7 +214,7 @@ class ConnectionPool(Generic[T]):
 
         # Create new connection (outside lock)
         try:
-            connection = await asyncio.wait_for(
+            connection = await _DEFAULT_CLOCK.wait_for(
                 self.connect_fn(peer_id),
                 timeout=timeout,
             )
@@ -271,7 +275,7 @@ class ConnectionPool(Generic[T]):
         """
         async with self._get_lock():
             pooled.consecutive_failures = 0
-            pooled.last_used = time.monotonic()
+            pooled.last_used = _DEFAULT_CLOCK.monotonic()
 
     async def mark_failure(self, pooled: PooledConnection[T]) -> None:
         """
@@ -285,7 +289,7 @@ class ConnectionPool(Generic[T]):
         """
         async with self._get_lock():
             pooled.consecutive_failures += 1
-            pooled.last_used = time.monotonic()
+            pooled.last_used = _DEFAULT_CLOCK.monotonic()
 
             if pooled.consecutive_failures >= self.config.max_consecutive_failures:
                 pooled.state = ConnectionState.FAILED
@@ -355,7 +359,7 @@ class ConnectionPool(Generic[T]):
         Returns:
             Tuple of (idle_evicted, aged_evicted, failed_evicted)
         """
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
         idle_evicted = 0
         aged_evicted = 0
         failed_evicted = 0

@@ -13,11 +13,15 @@ Pattern:
     4. All replicas see the same membership sequence
 """
 
-import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from .logging_models import RaftDebug, RaftInfo, RaftWarning
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 if TYPE_CHECKING:
     from hyperscale.logging import Logger
@@ -96,7 +100,7 @@ class ReplicatedMembershipLog:
             event_type=event_type,
             node_id=node_id,
             node_addr=node_addr,
-            timestamp=time.monotonic(),
+            timestamp=_DEFAULT_CLOCK.monotonic(),
         )
 
         pending = self._pending_events.get(job_id)
@@ -207,7 +211,7 @@ class ReplicatedMembershipLog:
             event_type=event_type,
             node_id=node_id,
             node_addr=node_addr,
-            timestamp=time.monotonic(),
+            timestamp=_DEFAULT_CLOCK.monotonic(),
         ))
 
         # Bounded history: evict oldest

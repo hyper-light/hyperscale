@@ -4,7 +4,6 @@ TCP handler for workflow result push notifications.
 Handles WorkflowResultPush messages with aggregated workflow completion results.
 """
 
-import time
 
 from hyperscale.distributed.models import (
     WorkflowResultPush,
@@ -14,6 +13,11 @@ from hyperscale.distributed.models import (
 from hyperscale.distributed.nodes.client.state import ClientState
 from hyperscale.logging import Logger
 from hyperscale.logging.hyperscale_logging_models import ServerWarning
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 class WorkflowResultPushHandler:
@@ -77,7 +81,7 @@ class WorkflowResultPushHandler:
 
                 # Use push.completed_at if provided, otherwise use current time
                 completed_at = (
-                    push.completed_at if push.completed_at > 0 else time.time()
+                    push.completed_at if push.completed_at > 0 else _DEFAULT_CLOCK.time()
                 )
 
                 job.workflow_results[push.workflow_id] = ClientWorkflowResult(

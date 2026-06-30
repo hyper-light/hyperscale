@@ -4,11 +4,15 @@ Sticky connection manager for maintaining affinity to peers.
 Provides connection stickiness with health-based eviction.
 """
 
-import time
 from dataclasses import dataclass, field
 from typing import Generic, TypeVar
 
 from hyperscale.distributed.discovery.models.peer_info import PeerHealth
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 T = TypeVar("T")  # Connection type
@@ -115,7 +119,7 @@ class StickyConnectionManager(Generic[T]):
         Returns:
             The created or updated binding
         """
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
 
         existing = self._bindings.get(key)
         if existing is not None:
@@ -177,7 +181,7 @@ class StickyConnectionManager(Generic[T]):
             return None
 
         # Check TTL
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
         if now - binding.created_at > self.config.binding_ttl_seconds:
             self._remove_binding(key)
             return None
@@ -217,7 +221,7 @@ class StickyConnectionManager(Generic[T]):
             return False
 
         # Check binding age
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
         if now - binding.created_at > self.config.binding_ttl_seconds:
             return False
 
@@ -290,7 +294,7 @@ class StickyConnectionManager(Generic[T]):
         Returns:
             Tuple of (expired_count, idle_count)
         """
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
         expired_count = 0
         idle_count = 0
 

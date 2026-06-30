@@ -4,8 +4,12 @@ Negative cache for DNS resolution failures.
 Prevents repeated lookups for known-failed hostnames.
 """
 
-import time
 from dataclasses import dataclass, field
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 @dataclass(slots=True)
@@ -64,7 +68,7 @@ class NegativeCache:
             return None
 
         ttl = self._compute_ttl(entry.failure_count)
-        if time.monotonic() - entry.cached_at > ttl:
+        if _DEFAULT_CLOCK.monotonic() - entry.cached_at > ttl:
             # Entry expired, remove it
             del self._entries[hostname]
             return None
@@ -107,7 +111,7 @@ class NegativeCache:
         entry = NegativeEntry(
             hostname=hostname,
             error_message=error_message,
-            cached_at=time.monotonic(),
+            cached_at=_DEFAULT_CLOCK.monotonic(),
             failure_count=failure_count,
         )
         self._entries[hostname] = entry
@@ -151,7 +155,7 @@ class NegativeCache:
         Returns:
             Number of entries removed
         """
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
         to_remove = []
 
         for hostname, entry in self._entries.items():
@@ -195,7 +199,7 @@ class NegativeCache:
             return None
 
         ttl = self._compute_ttl(entry.failure_count)
-        elapsed = time.monotonic() - entry.cached_at
+        elapsed = _DEFAULT_CLOCK.monotonic() - entry.cached_at
         remaining = ttl - elapsed
 
         if remaining <= 0:

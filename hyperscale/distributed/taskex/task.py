@@ -1,6 +1,5 @@
 import asyncio
 import pathlib
-import time
 import uuid
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
@@ -19,6 +18,11 @@ from .models import RunStatus, TaskType
 from .run import Run
 from .snowflake import SnowflakeGenerator
 from .util import TimeParser
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 T = TypeVar("T")
 
@@ -186,7 +190,7 @@ class Task(Generic[T]):
 
     async def _execute_age_policy(self):
         removed_runs: List[Run] = []
-        current_time = time.monotonic()
+        current_time = _DEFAULT_CLOCK.monotonic()
         for run_id, run in list(self._runs.items()):
             if current_time - run.start > self.max_age:
                 removed_runs.append(run)
@@ -358,7 +362,7 @@ class Task(Generic[T]):
             while self._schedule_running_statuses[run.run_id]:
                 run.execute(*args, **kwargs)
 
-                await asyncio.sleep(self.schedule)
+                await _DEFAULT_CLOCK.sleep(self.schedule)
                 run = Run(
                     Task.generate_id(),
                     self.name,
@@ -379,7 +383,7 @@ class Task(Generic[T]):
 
                 run.execute(*args, **kwargs)
 
-                await asyncio.sleep(self.schedule)
+                await _DEFAULT_CLOCK.sleep(self.schedule)
                 run = Run(
                     Task.generate_id(),
                     self.name,
@@ -413,7 +417,7 @@ class Task(Generic[T]):
                     poll_interval=poll_interval,
                 )
 
-                await asyncio.sleep(self.schedule)
+                await _DEFAULT_CLOCK.sleep(self.schedule)
                 run = Run(
                     Task.generate_id(),
                     self.name,
@@ -439,7 +443,7 @@ class Task(Generic[T]):
                     shell=shell,
                 )
 
-                await asyncio.sleep(self.schedule)
+                await _DEFAULT_CLOCK.sleep(self.schedule)
                 run = Run(
                     Task.generate_id(),
                     self.name,

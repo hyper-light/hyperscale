@@ -9,8 +9,6 @@ participate in every job's Raft group.
 """
 
 import asyncio
-import random
-import time
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING
 
@@ -22,6 +20,12 @@ from .models import (
     RequestVoteResponse,
 )
 from .raft_log import RaftLog
+
+from hyperscale.distributed.runtime import Clock, RealClock, Random, RealRandom
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
+_DEFAULT_RANDOM: Random = RealRandom()
 
 if TYPE_CHECKING:
     from hyperscale.logging import Logger
@@ -168,7 +172,7 @@ class RaftNode:
         pass  # Heartbeats sent via replicate_to_followers in consensus coordinator
 
     def _election_timed_out(self) -> bool:
-        return time.monotonic() >= self._election_deadline
+        return _DEFAULT_CLOCK.monotonic() >= self._election_deadline
 
     # =========================================================================
     # Election
@@ -294,7 +298,7 @@ class RaftNode:
         async with self._lock:
             if self._destroyed or self._role != "leader":
                 return
-            self._last_heartbeat_sent = time.monotonic()
+            self._last_heartbeat_sent = _DEFAULT_CLOCK.monotonic()
             for peer_id in self._members:
                 if peer_id == self._node_id:
                     continue
@@ -488,7 +492,7 @@ class RaftNode:
                 lsn = await self._clock.generate()
                 entry_timestamp = lsn.wall_clock / 1000.0
             else:
-                entry_timestamp = time.monotonic()
+                entry_timestamp = _DEFAULT_CLOCK.monotonic()
 
             entry = RaftLogEntry(
                 term=self._current_term,
@@ -504,7 +508,7 @@ class RaftNode:
             self._advance_commit_index()
 
         try:
-            committed = await asyncio.wait_for(
+            committed = await _DEFAULT_CLOCK.wait_for(
                 waiter,
                 timeout=self._proposal_timeout_seconds,
             )
@@ -618,5 +622,5 @@ class RaftNode:
     @staticmethod
     def _new_election_deadline() -> float:
         """Randomized election deadline to prevent split votes."""
-        timeout = random.uniform(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX)
-        return time.monotonic() + timeout
+        timeout = _DEFAULT_RANDOM.uniform(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX)
+        return _DEFAULT_CLOCK.monotonic() + timeout

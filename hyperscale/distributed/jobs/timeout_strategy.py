@@ -9,7 +9,6 @@ Integrates with AD-26 healthcheck extensions to respect legitimate long-running 
 """
 
 import asyncio
-import time
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING
 
@@ -25,6 +24,11 @@ from hyperscale.distributed.models.distributed import (
     JobTimeoutReport,
 )
 from hyperscale.distributed.models.jobs import TimeoutTrackingState
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 if TYPE_CHECKING:
     from hyperscale.distributed.nodes.manager import ManagerServer
@@ -207,7 +211,7 @@ class LocalAuthorityTimeout(TimeoutStrategy):
             return
 
         async with job.lock:
-            now = time.monotonic()
+            now = _DEFAULT_CLOCK.monotonic()
             job.timeout_tracking = TimeoutTrackingState(
                 strategy_type="local_authority",
                 gate_addr=None,
@@ -256,7 +260,7 @@ class LocalAuthorityTimeout(TimeoutStrategy):
             return
 
         async with job.lock:
-            job.timeout_tracking.last_progress_at = time.monotonic()
+            job.timeout_tracking.last_progress_at = _DEFAULT_CLOCK.monotonic()
 
     async def check_timeout(self, job_id: str) -> tuple[bool, str]:
         """
@@ -281,7 +285,7 @@ class LocalAuthorityTimeout(TimeoutStrategy):
         }:
             return False, ""
 
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
         tracking = job.timeout_tracking
 
         # Calculate effective timeout with extensions
@@ -358,11 +362,11 @@ class LocalAuthorityTimeout(TimeoutStrategy):
             tracking.max_worker_extension = max(
                 tracking.max_worker_extension, extension_seconds
             )
-            tracking.last_extension_at = time.monotonic()
+            tracking.last_extension_at = _DEFAULT_CLOCK.monotonic()
             tracking.active_workers_with_extensions.add(worker_id)
 
             # Extension = progress! Update last_progress_at
-            tracking.last_progress_at = time.monotonic()
+            tracking.last_progress_at = _DEFAULT_CLOCK.monotonic()
 
         await self._manager._udp_logger.log(
             ServerDebug(
@@ -457,7 +461,7 @@ class GateCoordinatedTimeout(TimeoutStrategy):
             return
 
         async with job.lock:
-            now = time.monotonic()
+            now = _DEFAULT_CLOCK.monotonic()
             job.timeout_tracking = TimeoutTrackingState(
                 strategy_type="gate_coordinated",
                 gate_addr=gate_addr,
@@ -497,7 +501,7 @@ class GateCoordinatedTimeout(TimeoutStrategy):
             return
 
         async with job.lock:
-            job.timeout_tracking.last_progress_at = time.monotonic()
+            job.timeout_tracking.last_progress_at = _DEFAULT_CLOCK.monotonic()
 
     async def check_timeout(self, job_id: str) -> tuple[bool, str]:
         """
@@ -516,7 +520,7 @@ class GateCoordinatedTimeout(TimeoutStrategy):
         if tracking.locally_timed_out:
             # Fallback: gate unresponsive for 5+ minutes
             if not tracking.globally_timed_out:
-                time_since_report = time.monotonic() - tracking.last_report_at
+                time_since_report = _DEFAULT_CLOCK.monotonic() - tracking.last_report_at
                 if time_since_report > 300.0:  # 5 minutes
                     await self._manager._udp_logger.log(
                         ServerWarning(
@@ -543,7 +547,7 @@ class GateCoordinatedTimeout(TimeoutStrategy):
         }:
             return False, ""
 
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
 
         # Send periodic progress reports
         if now - tracking.last_report_at > 10.0:
@@ -661,8 +665,8 @@ class GateCoordinatedTimeout(TimeoutStrategy):
             tracking.max_worker_extension = max(
                 tracking.max_worker_extension, extension_seconds
             )
-            tracking.last_extension_at = time.monotonic()
-            tracking.last_progress_at = time.monotonic()
+            tracking.last_extension_at = _DEFAULT_CLOCK.monotonic()
+            tracking.last_progress_at = _DEFAULT_CLOCK.monotonic()
             tracking.active_workers_with_extensions.add(worker_id)
 
         # Gate will learn about extensions via next JobProgressReport
@@ -740,9 +744,9 @@ class GateCoordinatedTimeout(TimeoutStrategy):
             workflows_completed=job.workflows_completed,
             workflows_failed=job.workflows_failed,
             has_recent_progress=(
-                time.monotonic() - job.timeout_tracking.last_progress_at < 10.0
+                _DEFAULT_CLOCK.monotonic() - job.timeout_tracking.last_progress_at < 10.0
             ),
-            timestamp=time.monotonic(),
+            timestamp=_DEFAULT_CLOCK.monotonic(),
             fence_token=job.timeout_tracking.timeout_fence_token,
             # Extension info
             total_extensions_granted=job.timeout_tracking.total_extensions_granted,
@@ -780,7 +784,7 @@ class GateCoordinatedTimeout(TimeoutStrategy):
             manager_host=self._manager._host,
             manager_port=self._manager._tcp_port,
             reason=reason,
-            elapsed_seconds=time.monotonic() - job.timeout_tracking.started_at,
+            elapsed_seconds=_DEFAULT_CLOCK.monotonic() - job.timeout_tracking.started_at,
             fence_token=job.timeout_tracking.timeout_fence_token,
         )
 
@@ -860,7 +864,7 @@ class GateCoordinatedTimeout(TimeoutStrategy):
             datacenter=self._manager._node_id.datacenter,
             manager_id=self._manager._node_id.short,
             status=status,
-            timestamp=time.monotonic(),
+            timestamp=_DEFAULT_CLOCK.monotonic(),
             fence_token=job.timeout_tracking.timeout_fence_token,
         )
 
@@ -890,7 +894,7 @@ class GateCoordinatedTimeout(TimeoutStrategy):
             datacenter=self._manager._node_id.datacenter,
             manager_id=self._manager._node_id.short,
             status=status,
-            timestamp=time.monotonic(),
+            timestamp=_DEFAULT_CLOCK.monotonic(),
             fence_token=job.timeout_tracking.timeout_fence_token,
         )
 

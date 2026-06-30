@@ -12,7 +12,6 @@ Key features:
 """
 
 import asyncio
-import time
 from dataclasses import dataclass, field
 
 from hyperscale.distributed.models import (
@@ -20,6 +19,11 @@ from hyperscale.distributed.models import (
     StepStats,
     Message,
 )
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 @dataclass(slots=True)
@@ -134,7 +138,7 @@ class WindowedStatsCollector:
         )
 
         async with self._lock:
-            now = time.time()
+            now = _DEFAULT_CLOCK.time()
             self._cleanup_seen_updates(now)
 
             if dedup_key in self._seen_updates:
@@ -184,7 +188,7 @@ class WindowedStatsCollector:
         Returns:
             List of WindowedStatsPush messages ready for client/gate.
         """
-        now = time.time()
+        now = _DEFAULT_CLOCK.time()
         results: list[WindowedStatsPush] = []
         keys_to_remove: list[tuple[str, str, int]] = []
 
@@ -410,7 +414,7 @@ class WindowedStatsCollector:
         Returns:
             List of WindowedStatsPush for closed windows belonging to this job.
         """
-        now = time.time()
+        now = _DEFAULT_CLOCK.time()
         results: list[WindowedStatsPush] = []
         keys_to_remove: list[tuple[str, str, int]] = []
 

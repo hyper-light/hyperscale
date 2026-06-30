@@ -44,7 +44,6 @@ overlapping submissions cannot race the prepared/committed registries.
 """
 
 import asyncio
-import time
 from typing import TYPE_CHECKING, Awaitable, Callable
 
 from hyperscale.distributed.models import (
@@ -62,6 +61,11 @@ from hyperscale.logging.hyperscale_logging_models import (
     ServerDebug,
     ServerWarning,
 )
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 if TYPE_CHECKING:
     from hyperscale.distributed.swim.core import NodeId
@@ -508,7 +512,7 @@ class GateJobReplicationCoordinator:
 
             self._prepared[replica.job_id] = replica
             self._prepared_expires_at[replica.job_id] = (
-                time.monotonic() + self._prepared_ttl_seconds
+                _DEFAULT_CLOCK.monotonic() + self._prepared_ttl_seconds
             )
             return GateJobReplicaStatus.PREPARED
 
@@ -602,7 +606,7 @@ class GateJobReplicationCoordinator:
             rollback_key = (replica.job_id, replica.sequence)
             self._commit_rollback_replicas.setdefault(rollback_key, previous)
             self._commit_rollback_expires_at[rollback_key] = (
-                time.monotonic() + self._prepared_ttl_seconds
+                _DEFAULT_CLOCK.monotonic() + self._prepared_ttl_seconds
             )
 
         if previous is not None:
@@ -673,7 +677,7 @@ class GateJobReplicationCoordinator:
         job_id: str,
     ) -> GateJobReplicaAck | None:
         try:
-            response_tuple = await asyncio.wait_for(
+            response_tuple = await _DEFAULT_CLOCK.wait_for(
                 self._send_tcp(
                     peer_addr,
                     "gate_job_replica_prepare",
@@ -712,7 +716,7 @@ class GateJobReplicationCoordinator:
         job_id: str,
     ) -> GateJobReplicaAck | None:
         try:
-            response_tuple = await asyncio.wait_for(
+            response_tuple = await _DEFAULT_CLOCK.wait_for(
                 self._send_tcp(
                     peer_addr,
                     "gate_job_replica_commit",
@@ -766,7 +770,7 @@ class GateJobReplicationCoordinator:
         job_id: str,
     ) -> None:
         try:
-            await asyncio.wait_for(
+            await _DEFAULT_CLOCK.wait_for(
                 self._send_tcp(
                     peer_addr,
                     "gate_job_replica_abort",
@@ -798,7 +802,7 @@ class GateJobReplicationCoordinator:
         expected_leader_addr: tuple[str, int] | None,
     ) -> GateJobReplicaFetchResponse | None:
         try:
-            response_tuple = await asyncio.wait_for(
+            response_tuple = await _DEFAULT_CLOCK.wait_for(
                 self._send_tcp(
                     peer_addr,
                     "gate_job_replica_fetch",
@@ -876,7 +880,7 @@ class GateJobReplicationCoordinator:
         prepared state held after a leader-died-mid-prepare event
         eventually frees memory even when no explicit abort arrives.
         """
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
         reaped: list[str] = []
         async with self._lock:
             for job_id, expires_at in list(self._prepared_expires_at.items()):

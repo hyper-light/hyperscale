@@ -4,7 +4,6 @@ import asyncio
 import os
 from pathlib import Path
 import struct
-import time
 from typing import Generic, TypeVar
 
 from hyperscale.distributed.taskex import TaskRunner
@@ -15,6 +14,11 @@ from .idempotency_config import IdempotencyConfig
 from .idempotency_key import IdempotencyKey
 from .idempotency_status import IdempotencyStatus
 from .ledger_entry import IdempotencyLedgerEntry
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 T = TypeVar("T")
 
@@ -86,7 +90,7 @@ class ManagerIdempotencyLedger(Generic[T]):
                 job_id=job_id,
                 status=IdempotencyStatus.PENDING,
                 result_serialized=None,
-                created_at=time.time(),
+                created_at=_DEFAULT_CLOCK.time(),
                 committed_at=None,
             )
             await self._persist_entry(entry)
@@ -108,7 +112,7 @@ class ManagerIdempotencyLedger(Generic[T]):
                 status=IdempotencyStatus.COMMITTED,
                 result_serialized=result_serialized,
                 created_at=entry.created_at,
-                committed_at=time.time(),
+                committed_at=_DEFAULT_CLOCK.time(),
             )
             await self._persist_entry(updated_entry)
             self._index[key] = updated_entry
@@ -127,7 +131,7 @@ class ManagerIdempotencyLedger(Generic[T]):
                 status=IdempotencyStatus.REJECTED,
                 result_serialized=result_serialized,
                 created_at=entry.created_at,
-                committed_at=time.time(),
+                committed_at=_DEFAULT_CLOCK.time(),
             )
             await self._persist_entry(updated_entry)
             self._index[key] = updated_entry
@@ -181,11 +185,11 @@ class ManagerIdempotencyLedger(Generic[T]):
 
     async def _cleanup_loop(self) -> None:
         while not self._closed:
-            await asyncio.sleep(self._config.cleanup_interval_seconds)
+            await _DEFAULT_CLOCK.sleep(self._config.cleanup_interval_seconds)
             await self._cleanup_expired()
 
     async def _cleanup_expired(self) -> None:
-        now = time.time()
+        now = _DEFAULT_CLOCK.time()
         async with self._lock:
             expired_entries = [
                 (key, entry)

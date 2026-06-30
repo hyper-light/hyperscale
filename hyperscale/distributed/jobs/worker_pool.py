@@ -13,7 +13,6 @@ Key responsibilities:
 """
 
 import asyncio
-import time
 from typing import Callable
 
 from hyperscale.distributed.models import (
@@ -41,6 +40,11 @@ from hyperscale.distributed.jobs.logging_models import (
     WorkerPoolCritical,
 )
 from hyperscale.logging import Logger
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 # Re-export for backwards compatibility
@@ -151,7 +155,7 @@ class WorkerPool:
                     self._addr_to_worker.pop(old_addr, None)
 
                 worker.registration = registration
-                worker.last_seen = time.monotonic()
+                worker.last_seen = _DEFAULT_CLOCK.monotonic()
                 worker.total_cores = registration.total_cores or 0
                 worker.available_cores = registration.available_cores or 0
                 worker.reserved_cores = 0
@@ -188,7 +192,7 @@ class WorkerPool:
                         else WorkerState.HEALTHY.value
                     ),
                     registration=registration,
-                    last_seen=time.monotonic(),
+                    last_seen=_DEFAULT_CLOCK.monotonic(),
                     total_cores=registration.total_cores or 0,
                     available_cores=registration.available_cores or 0,
                 )
@@ -419,7 +423,7 @@ class WorkerPool:
         }
 
     def _next_dispatch_routing_ready_delay(self) -> float | None:
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
         cooldown_delays = [
             routing_state.remaining_cooldown_seconds(now)
             for node_id, routing_state in self._dispatch_routing.items()
@@ -497,7 +501,7 @@ class WorkerPool:
             return True
 
         # Grace period for newly registered workers
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
         if (now - worker.last_seen) < self._health_grace_period:
             return True
 
@@ -703,7 +707,7 @@ class WorkerPool:
             was_healthy = self.is_worker_healthy(node_id)
             drain_intended = self.is_worker_drain_intended(node_id)
             worker.heartbeat = heartbeat
-            worker.last_seen = time.monotonic()
+            worker.last_seen = _DEFAULT_CLOCK.monotonic()
             if drain_intended:
                 worker.health = WorkerState.DRAINING
             else:
@@ -781,10 +785,10 @@ class WorkerPool:
             List of (node_id, cores) tuples, or None if timeout
         """
 
-        start_time = time.monotonic()
+        start_time = _DEFAULT_CLOCK.monotonic()
 
         while True:
-            elapsed = time.monotonic() - start_time
+            elapsed = _DEFAULT_CLOCK.monotonic() - start_time
             if elapsed >= timeout:
                 return None
 
@@ -834,7 +838,7 @@ class WorkerPool:
                     wait_timeout = min(wait_timeout, routing_ready_delay)
 
                 try:
-                    await asyncio.wait_for(
+                    await _DEFAULT_CLOCK.wait_for(
                         self._cores_condition.wait(),
                         timeout=wait_timeout,
                     )
@@ -1062,7 +1066,7 @@ class WorkerPool:
                     if update.state == "draining"
                     else WorkerState.HEALTHY
                 )
-                existing.last_seen = time.monotonic()
+                existing.last_seen = _DEFAULT_CLOCK.monotonic()
                 return True
 
             from hyperscale.distributed.models import NodeInfo
@@ -1091,7 +1095,7 @@ class WorkerPool:
                     else WorkerState.HEALTHY.value
                 ),
                 registration=registration,
-                last_seen=time.monotonic(),
+                last_seen=_DEFAULT_CLOCK.monotonic(),
                 total_cores=update.total_cores,
                 available_cores=update.available_cores,
                 is_remote=True,

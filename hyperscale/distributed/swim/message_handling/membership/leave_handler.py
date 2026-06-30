@@ -2,7 +2,6 @@
 Handler for LEAVE messages.
 """
 
-import time
 from typing import ClassVar
 
 from hyperscale.distributed.swim.core.audit import AuditEventType
@@ -12,6 +11,11 @@ from hyperscale.distributed.swim.message_handling.models import (
     ServerInterface,
 )
 from hyperscale.distributed.swim.message_handling.core import BaseHandler
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 class LeaveHandler(BaseHandler):
@@ -100,7 +104,7 @@ class LeaveHandler(BaseHandler):
                 target,
                 b"DEAD",
                 incarnation,
-                time.monotonic(),
+                _DEFAULT_CLOCK.monotonic(),
             )
             self._server.update_probe_scheduler_membership()
 
@@ -141,7 +145,7 @@ class LeaveHandler(BaseHandler):
             target,
             b"DEAD",
             incarnation,
-            time.monotonic(),
+            _DEFAULT_CLOCK.monotonic(),
         )
         self._server.update_probe_scheduler_membership()
 

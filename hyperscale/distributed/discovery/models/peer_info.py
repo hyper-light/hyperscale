@@ -2,10 +2,14 @@
 Peer information models for the discovery system.
 """
 
-import time
 from dataclasses import dataclass, field
 from enum import Enum
 from functools import total_ordering
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 @total_ordering
@@ -101,7 +105,7 @@ class PeerInfo:
     """Total errors from this peer."""
 
     # ===== Timing =====
-    discovered_at: float = field(default_factory=time.monotonic)
+    discovered_at: float = field(default_factory=_DEFAULT_CLOCK.monotonic)
     """Timestamp when peer was discovered."""
 
     last_seen_at: float = 0.0
@@ -137,7 +141,7 @@ class PeerInfo:
         """
         self.total_requests += 1
         self.consecutive_failures = 0
-        self.last_seen_at = time.monotonic()
+        self.last_seen_at = _DEFAULT_CLOCK.monotonic()
 
         # Update EWMA latency
         if self.ewma_latency_ms == 0.0:
@@ -159,7 +163,7 @@ class PeerInfo:
         self.total_requests += 1
         self.total_errors += 1
         self.consecutive_failures += 1
-        self.last_failure_at = time.monotonic()
+        self.last_failure_at = _DEFAULT_CLOCK.monotonic()
 
         # Update error rate
         error_increment = 1.0 / max(1, self.total_requests)

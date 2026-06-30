@@ -4,8 +4,12 @@ Exponentially Weighted Moving Average (EWMA) latency tracker.
 Tracks per-peer latency with exponential smoothing for load-aware selection.
 """
 
-import time
 from dataclasses import dataclass, field
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 @dataclass(slots=True)
@@ -118,7 +122,7 @@ class EWMATracker:
         # Update other stats
         stats.sample_count += 1
         stats.last_sample_ms = latency_ms
-        stats.last_updated = time.monotonic()
+        stats.last_updated = _DEFAULT_CLOCK.monotonic()
         stats.min_ms = min(stats.min_ms, latency_ms)
         stats.max_ms = max(stats.max_ms, latency_ms)
         stats.failure_count = 0  # Reset on success
@@ -139,7 +143,7 @@ class EWMATracker:
         """
         stats = self._get_or_create_stats(peer_id)
         stats.failure_count += 1
-        stats.last_updated = time.monotonic()
+        stats.last_updated = _DEFAULT_CLOCK.monotonic()
         return stats
 
     def get_effective_latency(self, peer_id: str) -> float:

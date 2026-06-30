@@ -15,6 +15,11 @@ from hyperscale.distributed.models import (
     JobCancellationComplete,
 )
 
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
+
 if TYPE_CHECKING:
     from hyperscale.distributed.nodes.gate.state import GateRuntimeState
     from hyperscale.logging import Logger
@@ -103,7 +108,7 @@ class GateCancellationCoordinator:
 
         # Wait for all DCs to respond (with timeout)
         try:
-            await asyncio.wait_for(event.wait(), timeout=30.0)
+            await _DEFAULT_CLOCK.wait_for(event.wait(), timeout=30.0)
         except asyncio.TimeoutError:
             self._state.add_cancellation_error(
                 job_id, "Timeout waiting for DC responses"

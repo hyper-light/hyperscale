@@ -1,9 +1,13 @@
 from __future__ import annotations
 
-import time
 from typing import Generic, Protocol, TypeVar
 
 from hyperscale.distributed.health.worker_health import ProgressState, RoutingDecision
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 class HealthSignals(Protocol):
@@ -44,7 +48,7 @@ class NodeHealthTracker(Generic[T]):
         """Update health state for a node."""
         self._states[node_id] = state
         if state.get_routing_decision() == RoutingDecision.EVICT:
-            self._failure_timestamps.setdefault(node_id, time.monotonic())
+            self._failure_timestamps.setdefault(node_id, _DEFAULT_CLOCK.monotonic())
         else:
             self._failure_timestamps.pop(node_id, None)
 
@@ -67,7 +71,7 @@ class NodeHealthTracker(Generic[T]):
 
     def mark_evicted(self, node_id: str) -> None:
         """Record eviction timestamp for backoff tracking."""
-        self._eviction_timestamps[node_id] = time.monotonic()
+        self._eviction_timestamps[node_id] = _DEFAULT_CLOCK.monotonic()
 
     def _evaluate_eviction(self, node_id: str) -> tuple[bool, str, bool]:
         if self._is_backoff_active(node_id):
@@ -80,10 +84,10 @@ class NodeHealthTracker(Generic[T]):
         last_eviction = self._eviction_timestamps.get(node_id)
         if last_eviction is None:
             return False
-        return (time.monotonic() - last_eviction) < self._eviction_backoff_seconds
+        return (_DEFAULT_CLOCK.monotonic() - last_eviction) < self._eviction_backoff_seconds
 
     def _has_correlated_failures(self) -> bool:
-        window_start = time.monotonic() - self._correlation_window_seconds
+        window_start = _DEFAULT_CLOCK.monotonic() - self._correlation_window_seconds
         recent_failures = sum(
             1
             for timestamp in self._failure_timestamps.values()

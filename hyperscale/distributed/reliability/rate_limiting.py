@@ -13,7 +13,6 @@ Components:
 """
 
 import asyncio
-import time
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -23,6 +22,11 @@ from hyperscale.distributed.reliability.overload import (
     OverloadState,
 )
 from hyperscale.distributed.reliability.priority import RequestPriority
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 @dataclass(slots=True)
@@ -61,7 +65,7 @@ class SlidingWindowCounter:
     _async_lock: asyncio.Lock = field(init=False)
 
     def __post_init__(self) -> None:
-        self._window_start = time.monotonic()
+        self._window_start = _DEFAULT_CLOCK.monotonic()
         self._async_lock = asyncio.Lock()
 
     def _maybe_rotate_window(self) -> float:
@@ -71,7 +75,7 @@ class SlidingWindowCounter:
         Returns:
             Window progress as float from 0.0 to 1.0
         """
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
         elapsed = now - self._window_start
 
         # Check if we've passed the window boundary
@@ -130,7 +134,7 @@ class SlidingWindowCounter:
         #
         # The wait time is: progress * window_size - elapsed_in_current_window
 
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
         elapsed_in_window = now - self._window_start
 
         # Total count that will become "previous" after rotation
@@ -216,7 +220,7 @@ class SlidingWindowCounter:
                 if actual_wait <= 0:
                     return False
 
-                await asyncio.sleep(actual_wait)
+                await _DEFAULT_CLOCK.sleep(actual_wait)
                 total_waited += actual_wait
 
             # Final attempt after exhausting max_wait
@@ -233,7 +237,7 @@ class SlidingWindowCounter:
         """Reset the counter to empty state."""
         self._current_count = 0
         self._previous_count = 0
-        self._window_start = time.monotonic()
+        self._window_start = _DEFAULT_CLOCK.monotonic()
 
 
 @dataclass(slots=True)
@@ -416,7 +420,7 @@ class AdaptiveRateLimiter:
             RateLimitResult indicating if request is allowed
         """
         self._total_requests += 1
-        self._client_last_activity[client_id] = time.monotonic()
+        self._client_last_activity[client_id] = _DEFAULT_CLOCK.monotonic()
 
         state = self._detector.get_state()
 
@@ -503,7 +507,7 @@ class AdaptiveRateLimiter:
                 if wait_time <= 0 or result.retry_after_seconds == float("inf"):
                     return result
 
-                await asyncio.sleep(wait_time)
+                await _DEFAULT_CLOCK.sleep(wait_time)
                 total_waited += wait_time
 
                 result = await self.check(client_id, operation, priority, tokens)
@@ -646,7 +650,7 @@ class AdaptiveRateLimiter:
         )
 
     async def cleanup_inactive_clients(self) -> int:
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
         cutoff = now - self._config.inactive_cleanup_seconds
 
         async with self._async_lock:
@@ -755,7 +759,7 @@ class TokenBucket:
 
     def __post_init__(self) -> None:
         self._tokens = float(self.bucket_size)
-        self._last_refill = time.monotonic()
+        self._last_refill = _DEFAULT_CLOCK.monotonic()
         self._async_lock = asyncio.Lock()
 
     def acquire(self, tokens: int = 1) -> bool:
@@ -826,12 +830,12 @@ class TokenBucket:
 
             # Wait while holding lock - prevents race where multiple waiters
             # all succeed after the wait
-            await asyncio.sleep(wait_time)
+            await _DEFAULT_CLOCK.sleep(wait_time)
             return self.acquire(tokens)
 
     def _refill(self) -> None:
         """Refill tokens based on elapsed time."""
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
         elapsed = now - self._last_refill
 
         # Add tokens based on elapsed time
@@ -848,7 +852,7 @@ class TokenBucket:
     def reset(self) -> None:
         """Reset bucket to full capacity."""
         self._tokens = float(self.bucket_size)
-        self._last_refill = time.monotonic()
+        self._last_refill = _DEFAULT_CLOCK.monotonic()
 
 
 @dataclass(slots=True)
@@ -1236,7 +1240,7 @@ class CooperativeRateLimiter:
             Time waited in seconds
         """
         blocked_until = self._blocked_until.get(operation, 0.0)
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
 
         if blocked_until <= now:
             return 0.0
@@ -1245,7 +1249,7 @@ class CooperativeRateLimiter:
         self._total_waits += 1
         self._total_wait_time += wait_time
 
-        await asyncio.sleep(wait_time)
+        await _DEFAULT_CLOCK.sleep(wait_time)
         return wait_time
 
     def handle_rate_limit(
@@ -1261,17 +1265,17 @@ class CooperativeRateLimiter:
             retry_after: Suggested retry time from server
         """
         delay = retry_after if retry_after is not None else self._default_backoff
-        self._blocked_until[operation] = time.monotonic() + delay
+        self._blocked_until[operation] = _DEFAULT_CLOCK.monotonic() + delay
 
     def is_blocked(self, operation: str) -> bool:
         """Check if operation is currently blocked."""
         blocked_until = self._blocked_until.get(operation, 0.0)
-        return time.monotonic() < blocked_until
+        return _DEFAULT_CLOCK.monotonic() < blocked_until
 
     def get_retry_after(self, operation: str) -> float:
         """Get remaining time until operation is unblocked."""
         blocked_until = self._blocked_until.get(operation, 0.0)
-        remaining = blocked_until - time.monotonic()
+        remaining = blocked_until - _DEFAULT_CLOCK.monotonic()
         return max(0.0, remaining)
 
     def clear(self, operation: str | None = None) -> None:
@@ -1444,7 +1448,7 @@ async def execute_with_rate_limit_retry(
 
     total_wait_time = 0.0
     retries = 0
-    start_time = time.monotonic()
+    start_time = _DEFAULT_CLOCK.monotonic()
 
     # Check if we're already blocked for this operation
     if limiter.is_blocked(operation_name):
@@ -1453,7 +1457,7 @@ async def execute_with_rate_limit_retry(
 
     while retries <= config.max_retries:
         # Check if we've exceeded max total wait time
-        elapsed = time.monotonic() - start_time
+        elapsed = _DEFAULT_CLOCK.monotonic() - start_time
         if elapsed >= config.max_total_wait:
             return RateLimitRetryResult(
                 success=False,
@@ -1493,7 +1497,7 @@ async def execute_with_rate_limit_retry(
 
                     # Wait and retry
                     limiter.handle_rate_limit(operation_name, retry_after)
-                    await asyncio.sleep(retry_after)
+                    await _DEFAULT_CLOCK.sleep(retry_after)
                     total_wait_time += retry_after
                     retries += 1
                     continue

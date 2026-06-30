@@ -24,7 +24,6 @@ Examples:
 """
 
 import asyncio
-import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -39,6 +38,11 @@ from hyperscale.distributed.models.distributed import (
     WorkflowFinalResult,
     WorkflowStatus,
 )
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 if TYPE_CHECKING:
     from hyperscale.distributed.health.extension_ledger import (
@@ -350,9 +354,9 @@ class JobInfo:
     workflows_total: int = 0
     workflows_completed: int = 0
     workflows_failed: int = 0
-    started_at: float = 0.0  # time.monotonic() when job started (local-only; do not compare across nodes)
-    completed_at: float = 0.0  # Wall-clock seconds; set from RaftLogEntry.timestamp (HLC) in apply, time.time() locally
-    timestamp: float = 0.0  # Wall-clock seconds of last update; same semantic as completed_at; compare with time.time()
+    started_at: float = 0.0  # _DEFAULT_CLOCK.monotonic() when job started (local-only; do not compare across nodes)
+    completed_at: float = 0.0  # Wall-clock seconds; set from RaftLogEntry.timestamp (HLC) in apply, _DEFAULT_CLOCK.time() locally
+    timestamp: float = 0.0  # Wall-clock seconds of last update; same semantic as completed_at; compare with _DEFAULT_CLOCK.time()
 
     # Workflow tracking - keyed by token string for fast lookup
     workflows: dict[str, WorkflowInfo] = field(
@@ -391,7 +395,7 @@ class JobInfo:
         """Calculate elapsed time since job started."""
         if self.started_at == 0.0:
             return 0.0
-        return time.monotonic() - self.started_at
+        return _DEFAULT_CLOCK.monotonic() - self.started_at
 
     def to_wire_progress(self, progress_sequence: int = 0) -> JobProgress:
         """
@@ -406,7 +410,7 @@ class JobInfo:
                              actual progress updates (not for state sync).
         """
         workflow_progresses = []
-        current_time = time.time()
+        current_time = _DEFAULT_CLOCK.time()
         for wf_token_str, wf_info in self.workflows.items():
             aggregated_completed_count = 0
             aggregated_failed_count = 0
@@ -477,8 +481,8 @@ class PendingWorkflow:
     ready_event: asyncio.Event = field(default_factory=_create_event)
 
     # Timeout tracking
-    registered_at: float = 0.0  # time.monotonic() when registered
-    dispatched_at: float = 0.0  # time.monotonic() when dispatched
+    registered_at: float = 0.0  # _DEFAULT_CLOCK.monotonic() when registered
+    dispatched_at: float = 0.0  # _DEFAULT_CLOCK.monotonic() when dispatched
     timeout_seconds: float = 300.0  # Max seconds before eviction
 
     # Dispatch attempt tracking (for the dispatch flag race fix)
@@ -486,7 +490,7 @@ class PendingWorkflow:
 
     # Retry tracking with exponential backoff
     dispatch_attempts: int = 0  # Number of dispatch attempts
-    last_dispatch_attempt: float = 0.0  # time.monotonic() of last attempt
+    last_dispatch_attempt: float = 0.0  # _DEFAULT_CLOCK.monotonic() of last attempt
     next_retry_delay: float = 1.0  # Seconds until next retry allowed
     max_dispatch_attempts: int = 5  # Max retries before marking failed
     excluded_worker_ids: set[str] = field(default_factory=set)

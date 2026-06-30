@@ -36,9 +36,13 @@ Usage:
     service.record_success(selection.peer_id, latency_ms=15.0)
 """
 
-import time
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Generic, TypeVar
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 T = TypeVar("T")  # Connection type for ConnectionPool
@@ -318,7 +322,7 @@ class DiscoveryService(Generic[T]):
                     self._metrics.record_dns_failure()
                     # Continue with other DNS names
 
-            self._last_discovery = time.monotonic()
+            self._last_discovery = _DEFAULT_CLOCK.monotonic()
 
         finally:
             self._discovery_in_progress = False
@@ -1069,7 +1073,7 @@ class DiscoveryService(Generic[T]):
             "healthy_peer_count": len(self.get_healthy_peers()),
             "health_distribution": health_counts,
             "dns_cache_stats": self._resolver.cache_stats,
-            "last_discovery_seconds_ago": time.monotonic() - self._last_discovery
+            "last_discovery_seconds_ago": _DEFAULT_CLOCK.monotonic() - self._last_discovery
             if self._last_discovery > 0
             else -1,
             "selector_peer_count": self._selector.peer_count,

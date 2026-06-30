@@ -14,7 +14,6 @@ Key responsibilities:
 """
 
 import asyncio
-import time
 import traceback
 from typing import Any, Callable, Coroutine
 
@@ -49,6 +48,11 @@ from hyperscale.distributed.reliability import (
 )
 from hyperscale.distributed.env import Env
 from hyperscale.logging import Logger
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 def _serialize_context(context_dict: dict) -> bytes:
@@ -247,7 +251,7 @@ class WorkflowDispatcher:
                 return False
 
         # Register pending workflows
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
         timeout = submission.timeout_seconds or self._default_timeout_seconds
 
         async with self._pending_lock:
@@ -436,7 +440,7 @@ class WorkflowDispatcher:
 
     def _get_ready_workflows(self, job_id: str) -> list[PendingWorkflow]:
         """Get workflows ready for dispatch (dependencies satisfied, not dispatched)."""
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
         ready = []
         for key, pending in self._pending.items():
             if pending.job_id != job_id:
@@ -607,7 +611,7 @@ class WorkflowDispatcher:
                     return False
 
             pending.dispatch_attempts += 1
-            pending.last_dispatch_attempt = time.monotonic()
+            pending.last_dispatch_attempt = _DEFAULT_CLOCK.monotonic()
 
             # Allocate cores from worker pool. The allocation budget is
             # capped at 30s regardless of per-job timeout — this is a
@@ -775,7 +779,7 @@ class WorkflowDispatcher:
                 return False
 
             pending.dispatched = True
-            pending.dispatched_at = time.monotonic()
+            pending.dispatched_at = _DEFAULT_CLOCK.monotonic()
 
             if len(failed_dispatches) > 0:
                 # PARTIAL success - some dispatches succeeded, some failed
@@ -940,7 +944,7 @@ class WorkflowDispatcher:
                     # Every tracked workflow has been accepted by a worker.
                     break
 
-                now = time.monotonic()
+                now = _DEFAULT_CLOCK.monotonic()
                 allocatable_pending = [
                     p
                     for p in job_pending
@@ -1100,7 +1104,7 @@ class WorkflowDispatcher:
 
         Returns list of (job_id, workflow_id, reason) for evicted/failed workflows.
         """
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
         evicted: list[tuple[str, str, str]] = []
         failed: list[tuple[str, str, str]] = []
 
@@ -1347,7 +1351,7 @@ class WorkflowDispatcher:
             dependencies: Set of workflow IDs this workflow depends on
             timeout_seconds: Timeout for this workflow
         """
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
         key = f"{job_id}:{workflow_id}"
 
         async with self._pending_lock:
@@ -1454,7 +1458,7 @@ class WorkflowDispatcher:
             if pending := self._pending.get(key):
                 pending.dispatched = True
                 pending.dispatch_in_progress = False
-                pending.dispatched_at = time.monotonic()
+                pending.dispatched_at = _DEFAULT_CLOCK.monotonic()
                 pending.clear_ready()
                 return True
             return False

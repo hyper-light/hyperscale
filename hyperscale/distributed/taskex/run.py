@@ -3,7 +3,6 @@ import functools
 import inspect
 import json
 import pathlib
-import time
 import traceback
 from asyncio.subprocess import Process
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
@@ -16,6 +15,11 @@ from .models import (
     TaskRun,
     TaskType,
 )
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 class Run:
@@ -68,7 +72,7 @@ class Run:
 
         self.error: Optional[str] = None
         self.trace: Optional[str] = None
-        self.start = time.monotonic()
+        self.start = _DEFAULT_CLOCK.monotonic()
         self.end = 0
         self.elapsed = 0
         self.timeout = timeout
@@ -201,7 +205,7 @@ class Run:
         await self._read_lock.acquire()
 
         try:
-            chunk = await asyncio.wait_for(
+            chunk = await _DEFAULT_CLOCK.wait_for(
                 self._process.stderr.read(self._buffer_size),
                 timeout=self._read_timeout,
             )
@@ -218,7 +222,7 @@ class Run:
         await self._read_lock.acquire()
 
         try:
-            chunk = await asyncio.wait_for(
+            chunk = await _DEFAULT_CLOCK.wait_for(
                 self._process.stdout.read(self._buffer_size),
                 timeout=self._read_timeout,
             )
@@ -256,7 +260,7 @@ class Run:
                 error=stderr,
                 result=stdout,
                 trace=self.trace,
-                elapsed=time.monotonic() - self.start,
+                elapsed=_DEFAULT_CLOCK.monotonic() - self.start,
             )
 
         return TaskRun(
@@ -267,13 +271,13 @@ class Run:
             trace=self.trace,
             start=self.start,
             end=self.end,
-            elapsed=time.monotonic() - self.start,
+            elapsed=_DEFAULT_CLOCK.monotonic() - self.start,
             result=self.result,
         )
 
     def update_status(self, status: RunStatus):
         self.status = status
-        self.elapsed = time.monotonic() - self.start
+        self.elapsed = _DEFAULT_CLOCK.monotonic() - self.start
 
     async def complete(self):
         completed = self.status in [RunStatus.COMPLETE, RunStatus.FAILED]
@@ -413,7 +417,7 @@ class Run:
 
         try:
             if timeout:
-                self._return_code = await asyncio.wait_for(
+                self._return_code = await _DEFAULT_CLOCK.wait_for(
                     self._process.wait(),
                     timeout=timeout,
                 )
@@ -446,7 +450,7 @@ class Run:
                 command_type=self._command_type,
                 error=error,
                 trace=self.trace,
-                elapsed=self.start - time.monotonic(),
+                elapsed=self.start - _DEFAULT_CLOCK.monotonic(),
             )
 
         except Exception as err:
@@ -466,7 +470,7 @@ class Run:
                 command_type=self._command_type,
                 error=error,
                 trace=self.trace,
-                elapsed=self.start - time.monotonic(),
+                elapsed=self.start - _DEFAULT_CLOCK.monotonic(),
             )
 
         self.result = stdout
@@ -494,7 +498,7 @@ class Run:
             error=self.error,
             result=self.result,
             trace=self.trace,
-            elapsed=self.start - time.monotonic(),
+            elapsed=self.start - _DEFAULT_CLOCK.monotonic(),
         )
 
     async def _execute(self, *args, **kwargs):
@@ -508,7 +512,7 @@ class Run:
             )
 
             if self.timeout and is_coroutine:
-                self.result = await asyncio.wait_for(
+                self.result = await _DEFAULT_CLOCK.wait_for(
                     self.call(*args, **kwargs), timeout=self.timeout
                 )
 
@@ -517,7 +521,7 @@ class Run:
 
             elif self.timeout:
                 await self._semaphore.acquire()
-                self.result = await asyncio.wait_for(
+                self.result = await _DEFAULT_CLOCK.wait_for(
                     self._loop.run_in_executor(
                         self._executor, 
                         functools.partial(
@@ -554,7 +558,7 @@ class Run:
             self.trace = traceback.format_exc()
             self.status = RunStatus.FAILED
 
-        self.end = time.monotonic()
+        self.end = _DEFAULT_CLOCK.monotonic()
         self.elapsed = self.end - self.start
 
         return TaskRun(
@@ -565,6 +569,6 @@ class Run:
             trace=self.trace,
             start=self.start,
             end=self.end,
-            elapsed=time.monotonic() - self.start,
+            elapsed=_DEFAULT_CLOCK.monotonic() - self.start,
             result=self.result,
         )

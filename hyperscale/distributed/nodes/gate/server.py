@@ -31,9 +31,7 @@ Module Structure:
 """
 
 import asyncio
-import random
 import statistics
-import time
 from collections import defaultdict
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
@@ -1016,14 +1014,14 @@ class GateServer(HealthAwareServer):
         # Leader election jitter
         jitter_max = self.env.LEADER_ELECTION_JITTER_MAX
         if jitter_max > 0 and len(self._gate_udp_peers) > 0:
-            jitter = random.uniform(0, jitter_max)
-            await asyncio.sleep(jitter)
+            jitter = self._random.uniform(0, jitter_max)
+            await self._clock.sleep(jitter)
 
         # Start leader election
         await self.start_leader_election()
 
         # Wait for election to stabilize
-        await asyncio.sleep(self.env.MANAGER_STARTUP_SYNC_DELAY)
+        await self._clock.sleep(self.env.MANAGER_STARTUP_SYNC_DELAY)
 
         # Complete startup sync
         await self._complete_startup_sync()
@@ -1824,7 +1822,7 @@ class GateServer(HealthAwareServer):
                 last_sequence,
             )
 
-            elapsed = time.monotonic() - job.timestamp if job.timestamp > 0 else 0.0
+            elapsed = self._clock.monotonic() - job.timestamp if job.timestamp > 0 else 0.0
 
             self._task_runner.run(
                 self._udp_logger.log,
@@ -2464,7 +2462,7 @@ class GateServer(HealthAwareServer):
                         * (2**attempt),
                         GateStatsCoordinator.CALLBACK_PUSH_MAX_DELAY_SECONDS,
                     )
-                    await asyncio.sleep(delay)
+                    await self._clock.sleep(delay)
 
         if log_failure:
             await self._udp_logger.log(
@@ -2759,7 +2757,7 @@ class GateServer(HealthAwareServer):
                     errors.append(reason)
                 job.errors = errors
             if job.timestamp > 0:
-                job.elapsed_seconds = time.monotonic() - job.timestamp
+                job.elapsed_seconds = self._clock.monotonic() - job.timestamp
 
             self._job_manager.set_job(job_id, job)
 
@@ -3870,7 +3868,7 @@ class GateServer(HealthAwareServer):
 
     def _get_forward_throughput(self) -> float:
         return self._modular_state.calculate_throughput(
-            time.monotonic(), self._forward_throughput_interval_seconds
+            self._clock.monotonic(), self._forward_throughput_interval_seconds
         )
 
     def _get_expected_forward_throughput(self) -> float:
@@ -4304,7 +4302,7 @@ class GateServer(HealthAwareServer):
             job_id=push.job_id,
             status=JobStatus.RUNNING.value,
             datacenters=[],
-            timestamp=time.monotonic(),
+            timestamp=self._clock.monotonic(),
             fence_token=push.fence_token,
         )
         self._job_manager.set_job(push.job_id, job)
@@ -4385,7 +4383,7 @@ class GateServer(HealthAwareServer):
         rate: float,
         status: str,
     ) -> None:
-        timestamp = int(time.monotonic() * 1000)
+        timestamp = int(self._clock.monotonic() * 1000)
 
         async with self._job_stats_crdt_lock:
             if job_id not in self._job_stats_crdt:
@@ -4571,7 +4569,7 @@ class GateServer(HealthAwareServer):
         manager-originated data-plane results against per-DC
         manager-leadership term.
         """
-        now = time.monotonic()
+        now = self._clock.monotonic()
 
         self._circuit_breaker_manager.record_success(manager_addr)
 
@@ -5259,7 +5257,7 @@ class GateServer(HealthAwareServer):
         workflow_id: str,
     ) -> None:
         try:
-            await asyncio.sleep(self._workflow_result_timeout_seconds)
+            await self._clock.sleep(self._workflow_result_timeout_seconds)
         except asyncio.CancelledError:
             return
 
@@ -5296,7 +5294,7 @@ class GateServer(HealthAwareServer):
             results=[],
             error=f"Timed out waiting for workflow result from DC {datacenter}",
             elapsed_seconds=0.0,
-            completed_at=time.time(),
+            completed_at=self._clock.time(),
             is_test=is_test_workflow,
             **self._data_plane_provenance(job_id),
         )
@@ -5848,7 +5846,7 @@ class GateServer(HealthAwareServer):
             error=error,
             elapsed_seconds=max_elapsed,
             per_dc_results=per_dc_results,
-            completed_at=time.time(),
+            completed_at=self._clock.time(),
             is_test=is_test_workflow,
             callback_addr=callback,
             is_client_ready=True,
@@ -5981,7 +5979,7 @@ class GateServer(HealthAwareServer):
 
         timeout = self.env.CLUSTER_STABILIZATION_TIMEOUT
         poll_interval = self.env.CLUSTER_STABILIZATION_POLL_INTERVAL
-        start_time = time.monotonic()
+        start_time = self._clock.monotonic()
 
         while True:
             self_addr = (self._host, self._udp_port)
@@ -5996,10 +5994,10 @@ class GateServer(HealthAwareServer):
             if visible_peers >= expected_peers:
                 return
 
-            if time.monotonic() - start_time >= timeout:
+            if self._clock.monotonic() - start_time >= timeout:
                 return
 
-            await asyncio.sleep(poll_interval)
+            await self._clock.sleep(poll_interval)
 
     async def _complete_startup_sync(self) -> None:
         """Complete startup sync and transition to ACTIVE."""
@@ -6139,10 +6137,10 @@ class GateServer(HealthAwareServer):
         """Periodically clean up expired leases."""
         while self._running:
             try:
-                await asyncio.sleep(self._lease_timeout / 2)
+                await self._clock.sleep(self._lease_timeout / 2)
                 self._dc_lease_manager.cleanup_expired()
 
-                now = time.monotonic()
+                now = self._clock.monotonic()
                 expired = [
                     key for key, lease in self._leases.items() if lease.expires_at < now
                 ]
@@ -6234,9 +6232,9 @@ class GateServer(HealthAwareServer):
     async def _job_cleanup_loop(self) -> None:
         while self._running:
             try:
-                await asyncio.sleep(self._job_cleanup_interval)
+                await self._clock.sleep(self._job_cleanup_interval)
 
-                now = time.monotonic()
+                now = self._clock.monotonic()
                 jobs_to_remove = self._get_expired_terminal_jobs(now)
 
                 for job_id in jobs_to_remove:
@@ -6251,7 +6249,7 @@ class GateServer(HealthAwareServer):
         """Periodically clean up rate limiter."""
         while self._running:
             try:
-                await asyncio.sleep(self._rate_limit_cleanup_interval)
+                await self._clock.sleep(self._rate_limit_cleanup_interval)
                 await self._rate_limiter.cleanup_inactive_clients()
             except asyncio.CancelledError:
                 break
@@ -6262,7 +6260,7 @@ class GateServer(HealthAwareServer):
         """Background loop for batch stats updates."""
         while self._running:
             try:
-                await asyncio.sleep(self._batch_stats_interval)
+                await self._clock.sleep(self._batch_stats_interval)
                 if not self._running:
                     break
                 await self._batch_stats_update()
@@ -6280,7 +6278,7 @@ class GateServer(HealthAwareServer):
         """Background loop for windowed stats push."""
         while self._running:
             try:
-                await asyncio.sleep(self._stats_push_interval_ms / 1000.0)
+                await self._clock.sleep(self._stats_push_interval_ms / 1000.0)
                 if not self._running:
                     break
                 if self._stats_coordinator:
@@ -6301,7 +6299,7 @@ class GateServer(HealthAwareServer):
 
         while self._running:
             try:
-                await asyncio.sleep(sample_interval)
+                await self._clock.sleep(sample_interval)
 
                 metrics = await self._resource_monitor.sample()
                 self._last_resource_metrics = metrics
@@ -6392,11 +6390,11 @@ class GateServer(HealthAwareServer):
         stale_manager_threshold = 300.0
         while self._running:
             try:
-                await asyncio.sleep(self._discovery_failure_decay_interval)
+                await self._clock.sleep(self._discovery_failure_decay_interval)
 
                 self._decay_discovery_failures()
 
-                now = time.monotonic()
+                now = self._clock.monotonic()
                 stale_cutoff = now - stale_manager_threshold
                 stale_manager_addrs = self._get_stale_manager_addrs(stale_cutoff)
 
@@ -6414,9 +6412,9 @@ class GateServer(HealthAwareServer):
     async def _dead_peer_reap_loop(self) -> None:
         while self._running:
             try:
-                await asyncio.sleep(self._dead_peer_check_interval)
+                await self._clock.sleep(self._dead_peer_check_interval)
 
-                now = time.monotonic()
+                now = self._clock.monotonic()
                 reap_threshold = now - self._dead_peer_reap_interval
 
                 peers_to_reap = [

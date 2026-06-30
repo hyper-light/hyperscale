@@ -9,8 +9,6 @@ Handles gate-to-gate peer management including:
 """
 
 import asyncio
-import random
-import time
 from typing import TYPE_CHECKING, Awaitable, Callable
 
 from hyperscale.distributed.models import (
@@ -27,6 +25,12 @@ from hyperscale.logging.hyperscale_logging_models import (
 )
 
 from .state import GateRuntimeState
+
+from hyperscale.distributed.runtime import Clock, RealClock, Random, RealRandom
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
+_DEFAULT_RANDOM: Random = RealRandom()
 
 if TYPE_CHECKING:
     from hyperscale.distributed.swim.core import NodeId
@@ -165,7 +169,7 @@ class GatePeerCoordinator:
         async with peer_lock:
             await self._state.increment_peer_epoch(tcp_addr)
             await self._state.remove_active_peer(tcp_addr)
-            self._state.mark_peer_unhealthy(tcp_addr, time.monotonic())
+            self._state.mark_peer_unhealthy(tcp_addr, _DEFAULT_CLOCK.monotonic())
 
             peer_host, peer_port = tcp_addr
             peer_id = f"{peer_host}:{peer_port}"
@@ -228,10 +232,10 @@ class GatePeerCoordinator:
 
         async with self._recovery_semaphore:
             if self._recovery_jitter_max > 0:
-                jitter = random.uniform(
+                jitter = _DEFAULT_RANDOM.uniform(
                     self._recovery_jitter_min, self._recovery_jitter_max
                 )
-                await asyncio.sleep(jitter)
+                await _DEFAULT_CLOCK.sleep(jitter)
 
             async with peer_lock:
                 current_epoch = await self._state.get_peer_epoch(tcp_addr)

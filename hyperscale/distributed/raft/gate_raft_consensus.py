@@ -6,7 +6,6 @@ Drives the Raft tick loop via TaskRunner for background execution.
 Bounded by max concurrent Raft instances with backpressure.
 """
 
-import time
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING
 
@@ -17,6 +16,11 @@ from .logging_models import RaftDebug, RaftInfo, RaftWarning
 from .models import GateRaftCommandType
 from .models.gate_commands import GateRaftCommand
 from .raft_node import HEARTBEAT_INTERVAL, RaftNode
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 if TYPE_CHECKING:
     from hyperscale.distributed.jobs.gates.gate_job_manager import GateJobManager
@@ -111,7 +115,7 @@ class GateRaftConsensus:
         import asyncio
 
         while self._tick_running:
-            tick_start = time.monotonic()
+            tick_start = _DEFAULT_CLOCK.monotonic()
 
             for job_id, node in list(self._nodes.items()):
                 await node.tick()
@@ -128,9 +132,9 @@ class GateRaftConsensus:
                         commit_index=node.commit_index,
                     ))
 
-            elapsed = time.monotonic() - tick_start
+            elapsed = _DEFAULT_CLOCK.monotonic() - tick_start
             sleep_time = max(0.0, HEARTBEAT_INTERVAL - elapsed)
-            await asyncio.sleep(sleep_time)
+            await _DEFAULT_CLOCK.sleep(sleep_time)
 
     # =========================================================================
     # Job Raft Management

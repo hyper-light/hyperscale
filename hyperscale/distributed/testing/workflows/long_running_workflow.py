@@ -16,6 +16,11 @@ import asyncio
 
 from hyperscale.graph import Workflow, step
 
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
+
 
 class LongRunningWorkflow(Workflow):
     """One-step workflow: sleep 30 s, return ``{"ok": True}``.
@@ -30,5 +35,5 @@ class LongRunningWorkflow(Workflow):
 
     @step()
     async def long_step(self) -> dict:
-        await asyncio.sleep(30.0)
+        await _DEFAULT_CLOCK.sleep(30.0)
         return {"ok": True}

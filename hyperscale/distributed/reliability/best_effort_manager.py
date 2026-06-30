@@ -3,7 +3,6 @@ Best-effort completion manager (AD-44).
 """
 
 import asyncio
-import time
 from typing import Awaitable, Callable
 
 from hyperscale.distributed.env import Env
@@ -11,6 +10,11 @@ from hyperscale.distributed.taskex import TaskRunner
 
 from .best_effort_state import BestEffortState
 from .reliability_config import ReliabilityConfig, create_reliability_config_from_env
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 CompletionHandler = Callable[[str, str, bool], Awaitable[None]]
 
@@ -53,7 +57,7 @@ class BestEffortManager:
         target_dcs: set[str],
     ):
         """Create and store best-effort state for a job."""
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
         effective_min_dcs = self._resolve_min_dcs(min_dcs, target_dcs)
         effective_deadline = self._resolve_deadline(deadline, now)
         state = BestEffortState(
@@ -77,7 +81,7 @@ class BestEffortManager:
 
     async def check_all_completions(self):
         """Check all best-effort states for completion conditions."""
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
         completions: list[tuple[str, str, bool]] = []
         async with self._lock:
             for job_id, state in self._states.items():

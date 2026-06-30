@@ -6,7 +6,6 @@ confirmed via bidirectional communication (ping/ack).
 """
 
 import asyncio
-import time
 from dataclasses import dataclass, field
 from typing import Callable, Awaitable
 
@@ -18,6 +17,11 @@ from hyperscale.distributed.swim.roles.confirmation_strategy import (
 from hyperscale.distributed.swim.coordinates.coordinate_tracker import (
     CoordinateTracker,
 )
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 @dataclass(slots=True)
@@ -128,7 +132,7 @@ class RoleAwareConfirmationManager:
             if peer_id in self._unconfirmed_peers:
                 return  # Already tracking
 
-            now = time.monotonic()
+            now = _DEFAULT_CLOCK.monotonic()
             strategy = get_strategy_for_role(role)
 
             state = UnconfirmedPeerState(
@@ -184,7 +188,7 @@ class RoleAwareConfirmationManager:
             List of confirmation/removal results
         """
         results: list[ConfirmationResult] = []
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
 
         async with self._lock:
             peers_to_process = list(self._unconfirmed_peers.items())

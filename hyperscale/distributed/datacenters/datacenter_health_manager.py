@@ -18,7 +18,6 @@ Key insight: BUSY ≠ UNHEALTHY
 See AD-16 in docs/architecture.md for full details.
 """
 
-import time
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -35,6 +34,11 @@ from hyperscale.distributed.datacenters.datacenter_overload_classifier import (
     DatacenterOverloadClassifier,
     DatacenterOverloadSignals,
 )
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 @dataclass(slots=True)
@@ -118,7 +122,7 @@ class DatacenterHealthManager:
 
         self._dc_manager_info[dc_id][manager_addr] = CachedManagerInfo(
             heartbeat=heartbeat,
-            last_seen=time.monotonic(),
+            last_seen=_DEFAULT_CLOCK.monotonic(),
             is_alive=True,
         )
 
@@ -198,7 +202,7 @@ class DatacenterHealthManager:
             queue_depth=getattr(best_heartbeat, "queue_depth", 0),
             manager_count=alive_count,
             worker_count=healthy_workers,
-            last_update=time.monotonic(),
+            last_update=_DEFAULT_CLOCK.monotonic(),
             overloaded_worker_count=getattr(
                 best_heartbeat, "overloaded_worker_count", 0
             ),
@@ -226,7 +230,7 @@ class DatacenterHealthManager:
             queue_depth=0,
             manager_count=manager_count,
             worker_count=worker_count,
-            last_update=time.monotonic(),
+            last_update=_DEFAULT_CLOCK.monotonic(),
         )
 
     def _extract_overload_signals(
@@ -259,7 +263,7 @@ class DatacenterHealthManager:
 
     def _aggregate_manager_health_states(self, dc_id: str) -> dict[str, int]:
         dc_managers = self._dc_manager_info.get(dc_id, {})
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
         counts: dict[str, int] = {
             "healthy": 0,
             "busy": 0,
@@ -352,7 +356,7 @@ class DatacenterHealthManager:
             (best_heartbeat, alive_manager_count, total_manager_count)
         """
         dc_managers = self._dc_manager_info.get(dc_id, {})
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
 
         best_heartbeat: ManagerHeartbeat | None = None
         leader_heartbeat: ManagerHeartbeat | None = None
@@ -426,7 +430,7 @@ class DatacenterHealthManager:
             (host, port) of the leader, or None if no leader found.
         """
         dc_managers = self._dc_manager_info.get(dc_id, {})
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
 
         for manager_addr, info in dc_managers.items():
             is_fresh = (now - info.last_seen) < self._heartbeat_timeout
@@ -438,7 +442,7 @@ class DatacenterHealthManager:
     def get_alive_managers(self, dc_id: str) -> list[tuple[str, int]]:
         """Get list of alive manager addresses in a datacenter."""
         dc_managers = self._dc_manager_info.get(dc_id, {})
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
 
         result: list[tuple[str, int]] = []
         for manager_addr, info in dc_managers.items():
@@ -490,7 +494,7 @@ class DatacenterHealthManager:
             Number of managers removed.
         """
         timeout = max_age_seconds or self._heartbeat_timeout
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
         removed = 0
 
         for dc_id in list(self._dc_manager_info.keys()):

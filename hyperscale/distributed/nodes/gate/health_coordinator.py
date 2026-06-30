@@ -10,7 +10,6 @@ Handles datacenter health monitoring and classification:
 """
 
 import asyncio
-import time
 from typing import TYPE_CHECKING, Callable
 
 from hyperscale.distributed.models import (
@@ -39,6 +38,11 @@ from hyperscale.logging import Logger
 from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerWarning
 
 from .state import GateRuntimeState
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 RecordManagerHeartbeat = Callable[
@@ -175,7 +179,7 @@ class GateHealthCoordinator:
             datacenter_id,
             resolved_manager_addr,
             heartbeat,
-            time.monotonic(),
+            _DEFAULT_CLOCK.monotonic(),
         )
 
         if self._capacity_aggregator is not None:
@@ -550,7 +554,7 @@ class GateHealthCoordinator:
             Tuple of (best_heartbeat, alive_manager_count, total_manager_count)
         """
         manager_statuses = self._state._datacenter_manager_status.get(datacenter_id, {})
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
         heartbeat_timeout = 30.0
 
         best_heartbeat: ManagerHeartbeat | None = None

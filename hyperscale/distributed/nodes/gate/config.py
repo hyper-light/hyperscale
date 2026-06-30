@@ -6,7 +6,6 @@ for timeouts, intervals, retry policies, and protocol negotiation.
 """
 
 from dataclasses import dataclass, field
-from pathlib import Path
 
 
 @dataclass(slots=True)

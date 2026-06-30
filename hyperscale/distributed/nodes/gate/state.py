@@ -6,7 +6,6 @@ datacenter health, leases, and metrics.
 """
 
 import asyncio
-import time
 from collections import defaultdict
 from typing import Callable
 
@@ -26,6 +25,11 @@ from hyperscale.distributed.health import (
     GateHealthState,
 )
 from hyperscale.distributed.reliability import BackpressureLevel
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 class GateRuntimeState:
@@ -554,7 +558,7 @@ class GateRuntimeState:
             sequence = self._job_update_sequences.get(job_id, 0) + 1
             self._job_update_sequences[job_id] = sequence
             history = self._job_update_history.setdefault(job_id, [])
-            history.append((sequence, message_type, payload, time.monotonic()))
+            history.append((sequence, message_type, payload, _DEFAULT_CLOCK.monotonic()))
             if self._client_update_history_limit > 0:
                 excess = len(history) - self._client_update_history_limit
                 if excess > 0:

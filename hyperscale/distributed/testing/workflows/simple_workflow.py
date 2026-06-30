@@ -11,6 +11,11 @@ import asyncio
 
 from hyperscale.graph import Workflow, step
 
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
+
 
 class SimpleWorkflow(Workflow):
     """One-step workflow: sleep 50 ms, return ``{"ok": True}``."""
@@ -20,5 +25,5 @@ class SimpleWorkflow(Workflow):
 
     @step()
     async def noop(self) -> dict:
-        await asyncio.sleep(0.05)
+        await _DEFAULT_CLOCK.sleep(0.05)
         return {"ok": True}

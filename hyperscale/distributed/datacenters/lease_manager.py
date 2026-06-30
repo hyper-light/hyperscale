@@ -15,7 +15,6 @@ Leases provide:
 - Ordered operations: Fence tokens reject out-of-order requests
 """
 
-import time
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -23,6 +22,11 @@ from hyperscale.distributed.models import (
     DatacenterLease,
     LeaseTransfer,
 )
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 @dataclass(slots=True)
@@ -132,9 +136,9 @@ class DatacenterLeaseManager:
         existing = self._leases.get(key)
 
         # If we have a valid lease, renew it
-        if existing and existing.expires_at > time.monotonic():
+        if existing and existing.expires_at > _DEFAULT_CLOCK.monotonic():
             if existing.lease_holder == self._node_id:
-                existing.expires_at = time.monotonic() + self._lease_timeout
+                existing.expires_at = _DEFAULT_CLOCK.monotonic() + self._lease_timeout
                 self._stats.total_renewed += 1
                 return existing
 
@@ -144,7 +148,7 @@ class DatacenterLeaseManager:
             datacenter=datacenter,
             lease_holder=self._node_id,
             fence_token=self._next_fence_token(),
-            expires_at=time.monotonic() + self._lease_timeout,
+            expires_at=_DEFAULT_CLOCK.monotonic() + self._lease_timeout,
             version=self._current_state_version(),
         )
 
@@ -174,7 +178,7 @@ class DatacenterLeaseManager:
         key = f"{job_id}:{datacenter}"
         lease = self._leases.get(key)
 
-        if lease and lease.expires_at > time.monotonic():
+        if lease and lease.expires_at > _DEFAULT_CLOCK.monotonic():
             return lease
 
         return None
@@ -303,7 +307,7 @@ class DatacenterLeaseManager:
             datacenter=transfer.datacenter,
             lease_holder=self._node_id,  # We're the new holder
             fence_token=transfer.new_fence_token,
-            expires_at=time.monotonic() + self._lease_timeout,
+            expires_at=_DEFAULT_CLOCK.monotonic() + self._lease_timeout,
             version=transfer.version,
         )
 
@@ -352,7 +356,7 @@ class DatacenterLeaseManager:
         Returns:
             Number of leases removed.
         """
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
         to_remove: list[str] = []
 
         for key, lease in self._leases.items():

@@ -13,7 +13,6 @@ Key responsibilities:
 """
 
 import asyncio
-import time
 from typing import TYPE_CHECKING, Any, Callable, Awaitable
 
 from hyperscale.distributed.models import (
@@ -30,6 +29,11 @@ from hyperscale.logging.hyperscale_logging_models import (
 )
 
 from .state import GateRuntimeState
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 if TYPE_CHECKING:
     from hyperscale.distributed.swim.core import NodeId
@@ -229,7 +233,7 @@ class GateOrphanJobCoordinator:
         )
         _sys.stderr.flush()
 
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
         for job_id in orphaned_job_ids:
             self._state.mark_job_orphaned(job_id, now)
 
@@ -302,7 +306,7 @@ class GateOrphanJobCoordinator:
         if owner_node == self._get_node_id().full:
             return
 
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
         if not self._state.is_job_orphaned(job_id):
             self._state.mark_job_orphaned(job_id, now)
 
@@ -341,7 +345,7 @@ class GateOrphanJobCoordinator:
                         self.CALLBACK_PUSH_BASE_DELAY_SECONDS * (2**attempt),
                         self.CALLBACK_PUSH_MAX_DELAY_SECONDS,
                     )
-                    await asyncio.sleep(delay)
+                    await _DEFAULT_CLOCK.sleep(delay)
 
         if allow_peer_forwarding and self._forward_status_push_to_peers:
             try:
@@ -376,7 +380,7 @@ class GateOrphanJobCoordinator:
         """
         while self._running:
             try:
-                await asyncio.sleep(self._orphan_check_interval_seconds)
+                await _DEFAULT_CLOCK.sleep(self._orphan_check_interval_seconds)
 
                 if not self._running:
                     break
@@ -385,7 +389,7 @@ class GateOrphanJobCoordinator:
                 if not orphaned_jobs:
                     continue
 
-                now = time.monotonic()
+                now = _DEFAULT_CLOCK.monotonic()
                 jobs_to_evaluate: list[tuple[str, float]] = []
 
                 for job_id, orphaned_at in orphaned_jobs.items():
@@ -482,7 +486,7 @@ class GateOrphanJobCoordinator:
             job = await self._get_or_repair_job(job_id)
 
             if not job:
-                time_orphaned = time.monotonic() - orphaned_at
+                time_orphaned = _DEFAULT_CLOCK.monotonic() - orphaned_at
                 if time_orphaned >= self._orphan_timeout_seconds:
                     self._clear_orphaned_job(job_id)
                 return
@@ -491,7 +495,7 @@ class GateOrphanJobCoordinator:
             self._clear_orphaned_job(job_id)
             return
 
-        time_orphaned = time.monotonic() - orphaned_at
+        time_orphaned = _DEFAULT_CLOCK.monotonic() - orphaned_at
         _sys.stderr.write(
             f"[ORPHAN-EVAL-OWNER self={self._get_node_addr()} job={job_id[:10]}] "
             f"is_cluster_leader={self._is_current_cluster_leader()} "
@@ -540,7 +544,7 @@ class GateOrphanJobCoordinator:
         """Fail an orphaned job that exceeded the takeover timeout."""
         job.status = JobStatus.FAILED.value
         if job.timestamp > 0:
-            job.elapsed_seconds = time.monotonic() - job.timestamp
+            job.elapsed_seconds = _DEFAULT_CLOCK.monotonic() - job.timestamp
         self._job_manager.set_job(job_id, job)
         self._clear_orphaned_job(job_id)
 
@@ -790,7 +794,7 @@ class GateOrphanJobCoordinator:
             Dict with orphan counts and timing information
         """
         orphaned_jobs = self._state.get_orphaned_jobs()
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
 
         past_grace_period = sum(
             1

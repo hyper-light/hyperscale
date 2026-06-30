@@ -5,7 +5,6 @@ Coordinates job submission and dispatch to datacenter managers.
 """
 
 import asyncio
-import time
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING
 
@@ -39,6 +38,11 @@ from hyperscale.logging.hyperscale_logging_models import (
     ServerInfo,
     ServerError,
 )
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 if TYPE_CHECKING:
     from hyperscale.distributed.nodes.gate.state import GateRuntimeState
@@ -219,7 +223,7 @@ class GateDispatchCoordinator:
         overall_rate = 0.0
         if job is not None:
             if job.timestamp > 0:
-                elapsed_seconds = max(0.0, time.monotonic() - job.timestamp)
+                elapsed_seconds = max(0.0, _DEFAULT_CLOCK.monotonic() - job.timestamp)
             total_completed = job.total_completed
             total_failed = job.total_failed
             overall_rate = job.overall_rate
@@ -273,7 +277,7 @@ class GateDispatchCoordinator:
 
         try:
             while True:
-                await asyncio.sleep(renewal_interval)
+                await _DEFAULT_CLOCK.sleep(renewal_interval)
                 job = self._job_manager.get_job(job_id)
                 if job is None or self._is_terminal_status(job.status):
                     await self._release_job_lease(job_id, cancel_renewal=False)
@@ -372,7 +376,7 @@ class GateDispatchCoordinator:
             job_id=submission.job_id,
             status=JobStatus.SUBMITTED.value,
             datacenters=[],
-            timestamp=time.monotonic(),
+            timestamp=_DEFAULT_CLOCK.monotonic(),
             fence_token=fence_token,
         )
         self._job_manager.set_job(submission.job_id, job)

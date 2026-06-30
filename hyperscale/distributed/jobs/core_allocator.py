@@ -31,6 +31,11 @@ from hyperscale.distributed.jobs.logging_models import (
 )
 from hyperscale.logging import Logger
 
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
+
 
 @dataclass(slots=True)
 class AllocationResult:
@@ -298,7 +303,7 @@ class CoreAllocator:
             True if cores are available, False on timeout
         """
         try:
-            await asyncio.wait_for(
+            await _DEFAULT_CLOCK.wait_for(
                 self._cores_available.wait(),
                 timeout=timeout,
             )

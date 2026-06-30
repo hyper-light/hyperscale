@@ -10,13 +10,17 @@ state changes, enabling stuck workflow detection and adaptive timeout handling.
 """
 
 import asyncio
-import time
 from dataclasses import dataclass
 from enum import Enum
 from typing import Callable, Awaitable
 
 from hyperscale.logging import Logger
 from hyperscale.logging.hyperscale_logging_models import ServerDebug, ServerWarning
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 # Type alias for progress callbacks (AD-34 Task 11.6.1)
@@ -186,9 +190,9 @@ class WorkflowStateMachine:
             if workflow_id in self._state_history and self._state_history[workflow_id]:
                 previous_transition_time = self._state_history[workflow_id][-1].timestamp
 
-            transition_duration_ms = (time.monotonic() - previous_transition_time) * 1000.0
+            transition_duration_ms = (_DEFAULT_CLOCK.monotonic() - previous_transition_time) * 1000.0
 
-            now = time.monotonic()
+            now = _DEFAULT_CLOCK.monotonic()
 
             # Record transition
             self._states[workflow_id] = to_state
@@ -342,7 +346,7 @@ class WorkflowStateMachine:
         last_progress = self._last_progress_time.get(workflow_id)
         if last_progress is None:
             return None
-        return time.monotonic() - last_progress
+        return _DEFAULT_CLOCK.monotonic() - last_progress
 
     def get_stuck_workflows(
         self,
@@ -370,7 +374,7 @@ class WorkflowStateMachine:
             WorkflowState.AGGREGATED,
         }
 
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
         stuck_workflows: list[tuple[str, WorkflowState, float]] = []
 
         for workflow_id, last_progress in self._last_progress_time.items():

@@ -19,6 +19,11 @@ from hyperscale.distributed.nodes.client.state import ClientState
 from hyperscale.logging import Logger
 from hyperscale.logging.hyperscale_logging_models import ServerDebug
 
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
+
 PollGateForStatusFunc = Callable[[str], Coroutine[Any, Any, GlobalJobStatus | None]]
 
 TERMINAL_STATUSES = frozenset(
@@ -157,7 +162,7 @@ class ClientJobTracker:
 
         async def poll_until_complete():
             while not event.is_set():
-                await asyncio.sleep(effective_poll_interval)
+                await _DEFAULT_CLOCK.sleep(effective_poll_interval)
                 if event.is_set():
                     break
                 await self._poll_and_update_status(job_id)
@@ -168,7 +173,7 @@ class ClientJobTracker:
 
         try:
             if timeout:
-                await asyncio.wait_for(event.wait(), timeout=timeout)
+                await _DEFAULT_CLOCK.wait_for(event.wait(), timeout=timeout)
             else:
                 await event.wait()
         finally:

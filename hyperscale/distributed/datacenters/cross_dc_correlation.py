@@ -32,10 +32,14 @@ See tracker.py for within-DC correlation (workers within a manager).
 """
 
 import sys
-import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Callable
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 class CorrelationSeverity(Enum):
@@ -282,14 +286,14 @@ class DCStateInfo:
         """Check if failure is confirmed (sustained long enough)."""
         if self.current_state not in (DCHealthState.FAILING, DCHealthState.FAILED):
             return False
-        elapsed = time.monotonic() - self.state_entered_at
+        elapsed = _DEFAULT_CLOCK.monotonic() - self.state_entered_at
         return elapsed >= confirmation_seconds
 
     def is_confirmed_recovered(self, confirmation_seconds: float) -> bool:
         """Check if recovery is confirmed (sustained long enough)."""
         if self.current_state != DCHealthState.RECOVERING:
             return self.current_state == DCHealthState.HEALTHY
-        elapsed = time.monotonic() - self.state_entered_at
+        elapsed = _DEFAULT_CLOCK.monotonic() - self.state_entered_at
         return elapsed >= confirmation_seconds
 
     def is_flapping(self, threshold: int, window_seconds: float) -> bool:
@@ -297,7 +301,7 @@ class DCStateInfo:
         if self.current_state == DCHealthState.FLAPPING:
             return True
         # Check if total transitions in window exceed threshold
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
         window_start = now - window_seconds
         if self.state_entered_at >= window_start:
             total_transitions = (
@@ -396,7 +400,7 @@ class CrossDCCorrelationDetector:
         if datacenter_id not in self._dc_states:
             self._dc_states[datacenter_id] = DCStateInfo(
                 datacenter_id=datacenter_id,
-                state_entered_at=time.monotonic(),
+                state_entered_at=_DEFAULT_CLOCK.monotonic(),
             )
 
     def remove_datacenter(self, datacenter_id: str) -> None:
@@ -425,7 +429,7 @@ class CrossDCCorrelationDetector:
             failure_type: Type of failure (unhealthy, timeout, unreachable).
             manager_count_affected: Number of managers affected.
         """
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
 
         # Ensure DC is tracked
         self._known_datacenters.add(datacenter_id)
@@ -504,7 +508,7 @@ class CrossDCCorrelationDetector:
         Args:
             datacenter_id: The recovering datacenter.
         """
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
 
         if datacenter_id not in self._dc_states:
             return
@@ -562,7 +566,7 @@ class CrossDCCorrelationDetector:
         if not self._config.enable_latency_correlation:
             return
 
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
 
         # Ensure DC is tracked
         self._known_datacenters.add(datacenter_id)
@@ -623,7 +627,7 @@ class CrossDCCorrelationDetector:
         if not self._config.enable_extension_correlation:
             return
 
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
 
         # Ensure DC is tracked
         self._known_datacenters.add(datacenter_id)
@@ -692,7 +696,7 @@ class CrossDCCorrelationDetector:
         if not self._config.enable_lhm_correlation:
             return
 
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
 
         # Ensure DC is tracked
         self._known_datacenters.add(datacenter_id)
@@ -727,7 +731,7 @@ class CrossDCCorrelationDetector:
         Returns:
             CorrelationDecision with severity and recommendation.
         """
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
         window_start = now - self._config.correlation_window_seconds
 
         # Check if we're still in backoff from previous correlation
@@ -1050,7 +1054,7 @@ class CrossDCCorrelationDetector:
         Returns:
             Number of failures within the correlation window.
         """
-        window_start = time.monotonic() - self._config.correlation_window_seconds
+        window_start = _DEFAULT_CLOCK.monotonic() - self._config.correlation_window_seconds
         records = self._failure_records.get(datacenter_id, [])
         return sum(1 for record in records if record.timestamp >= window_start)
 
@@ -1061,7 +1065,7 @@ class CrossDCCorrelationDetector:
         Returns:
             Number of records removed.
         """
-        window_start = time.monotonic() - self._config.correlation_window_seconds
+        window_start = _DEFAULT_CLOCK.monotonic() - self._config.correlation_window_seconds
         removed = 0
 
         for dc_id in list(self._failure_records.keys()):
@@ -1085,7 +1089,7 @@ class CrossDCCorrelationDetector:
         Returns:
             Dictionary with statistics.
         """
-        window_start = time.monotonic() - self._config.correlation_window_seconds
+        window_start = _DEFAULT_CLOCK.monotonic() - self._config.correlation_window_seconds
         recent_failing = self._get_recent_failing_dcs(window_start)
         confirmed_failing = self._get_confirmed_failing_dcs()
         flapping = self._get_flapping_dcs()
@@ -1119,7 +1123,7 @@ class CrossDCCorrelationDetector:
             "extension_correlation_events": self._extension_correlation_events,
             "lhm_correlation_events": self._lhm_correlation_events,
             "state_counts": state_counts,
-            "in_backoff": (time.monotonic() - self._last_correlation_time)
+            "in_backoff": (_DEFAULT_CLOCK.monotonic() - self._last_correlation_time)
             < self._config.correlation_backoff_seconds,
             # Secondary correlation current state
             "latency_correlated": latency_metrics["correlated"],
@@ -1200,7 +1204,7 @@ class CrossDCCorrelationDetector:
         if decision.severity in (CorrelationSeverity.MEDIUM, CorrelationSeverity.HIGH):
             return False
 
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
         self._was_in_partition = False
         self._last_partition_healed_time = now
         self._partition_healed_count += 1
@@ -1240,7 +1244,7 @@ class CrossDCCorrelationDetector:
         self._was_in_partition = True
 
         if not was_already_partitioned:
-            now = time.monotonic()
+            now = _DEFAULT_CLOCK.monotonic()
             for callback in self._partition_detected_callbacks:
                 try:
                     callback(affected_datacenters, now)
@@ -1274,4 +1278,4 @@ class CrossDCCorrelationDetector:
         """
         if self._last_partition_healed_time == 0.0:
             return None
-        return time.monotonic() - self._last_partition_healed_time
+        return _DEFAULT_CLOCK.monotonic() - self._last_partition_healed_time

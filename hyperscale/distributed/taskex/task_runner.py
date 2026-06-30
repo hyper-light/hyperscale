@@ -21,6 +21,11 @@ from .snowflake import SnowflakeGenerator
 from .task import Task
 from .util.time_parser import TimeParser
 
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
+
 T = TypeVar("T")
 
 
@@ -325,7 +330,7 @@ class TaskRunner:
                         f"Timeout waiting for task {token} after {timeout}s"
                     )
 
-            await asyncio.sleep(self._cleanup_interval)
+            await _DEFAULT_CLOCK.sleep(self._cleanup_interval)
             update = await self.tasks[task_name].get_run_update(run_id)
 
         return await self.tasks[task_name].complete(run_id)
@@ -390,7 +395,7 @@ class TaskRunner:
         self._run_cleanup = False
 
         # Cancel and AWAIT the cleanup task. The previous version only yielded
-        # control once via `asyncio.sleep(0)` after cancel, which is not
+        # control once via `_DEFAULT_CLOCK.sleep(0)` after cancel, which is not
         # enough — the cancelled task may still be alive when shutdown
         # returns and surfaces as a leaked asyncio task.
         if self._cleanup_task is not None and not self._cleanup_task.done():
@@ -430,7 +435,7 @@ class TaskRunner:
     async def _cleanup(self):
         while self._run_cleanup:
             await self._cleanup_scheduled_tasks()
-            await asyncio.sleep(self._cleanup_interval)
+            await _DEFAULT_CLOCK.sleep(self._cleanup_interval)
 
     async def _cleanup_scheduled_tasks(self):
         try:

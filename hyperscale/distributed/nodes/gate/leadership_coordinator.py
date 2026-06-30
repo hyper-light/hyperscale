@@ -21,6 +21,11 @@ from hyperscale.logging.hyperscale_logging_models import (
     ServerWarning,
 )
 
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
+
 if TYPE_CHECKING:
     from hyperscale.distributed.nodes.gate.state import GateRuntimeState
     from hyperscale.distributed.jobs import JobLeadershipTracker
@@ -429,9 +434,8 @@ class GateLeadershipCoordinator:
         Args:
             job_id: Job identifier
         """
-        import time
 
-        self._state.mark_job_orphaned(job_id, time.monotonic())
+        self._state.mark_job_orphaned(job_id, _DEFAULT_CLOCK.monotonic())
 
     def clear_orphaned_job(self, job_id: str) -> None:
         """

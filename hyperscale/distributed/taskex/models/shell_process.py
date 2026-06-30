@@ -1,4 +1,3 @@
-import time
 from pydantic import (
     BaseModel,
     StrictInt,
@@ -9,6 +8,11 @@ from pydantic import (
 from typing import Literal, Any, Dict, Tuple
 from .run_status import RunStatus
 from .task_type import TaskType
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 CommandType = Literal['shell', 'subprocess']
@@ -27,7 +31,7 @@ class ShellProcess(BaseModel):
     command_type: CommandType = 'subprocess'
     error: StrictStr | StrictBytes | None = None
     trace: StrictStr | StrictBytes | None = None
-    start: StrictInt | StrictFloat = time.monotonic()
+    start: StrictInt | StrictFloat = _DEFAULT_CLOCK.monotonic()
     end: StrictInt | StrictFloat | None = None
     elapsed: StrictInt | StrictFloat = 0
     result: StrictStr | StrictBytes | None = None

@@ -8,7 +8,6 @@ Handles manager-facing operations:
 """
 
 import asyncio
-import time
 from typing import TYPE_CHECKING, Awaitable, Callable
 
 from hyperscale.distributed.models import (
@@ -37,6 +36,11 @@ from hyperscale.logging.hyperscale_logging_models import (
 )
 
 from ..state import GateRuntimeState
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 RecordManagerHeartbeat = Callable[
     [str, tuple[str, int], str, int, int, bool],
@@ -209,7 +213,7 @@ class GateManagerHandler:
             datacenter_id,
             manager_addr,
             heartbeat,
-            time.monotonic(),
+            _DEFAULT_CLOCK.monotonic(),
         )
         self._record_manager_heartbeat(
             datacenter_id,

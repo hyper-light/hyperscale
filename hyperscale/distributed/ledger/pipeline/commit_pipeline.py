@@ -12,6 +12,11 @@ from ..durability_level import DurabilityLevel
 from ..wal.entry_state import TransitionResult
 from ..wal.wal_entry import WALEntry
 
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
+
 if TYPE_CHECKING:
     from hyperscale.logging import Logger
 
@@ -194,7 +199,7 @@ class CommitPipeline:
         if self._regional_replicator is None:
             return True
 
-        return await asyncio.wait_for(
+        return await _DEFAULT_CLOCK.wait_for(
             self._regional_replicator(entry),
             timeout=self._regional_timeout,
         )
@@ -203,7 +208,7 @@ class CommitPipeline:
         if self._global_replicator is None:
             return True
 
-        return await asyncio.wait_for(
+        return await _DEFAULT_CLOCK.wait_for(
             self._global_replicator(entry),
             timeout=self._global_timeout,
         )

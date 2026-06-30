@@ -18,6 +18,11 @@ from hyperscale.distributed.reliability.backpressure import (
 )
 from hyperscale.logging.hyperscale_logging_models import WALError
 
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
+
 if TYPE_CHECKING:
     from hyperscale.logging import Logger
 
@@ -202,7 +207,7 @@ class WALWriter:
 
         if self._writer_task is not None:
             try:
-                await asyncio.wait_for(self._writer_task, timeout=5.0)
+                await _DEFAULT_CLOCK.wait_for(self._writer_task, timeout=5.0)
             except asyncio.TimeoutError:
                 self._writer_task.cancel()
                 try:
@@ -378,7 +383,7 @@ class WALWriter:
         batch_timeout = self._config.batch_timeout_microseconds / 1_000_000
 
         try:
-            request = await asyncio.wait_for(
+            request = await _DEFAULT_CLOCK.wait_for(
                 self._queue.get(),
                 timeout=batch_timeout,
             )

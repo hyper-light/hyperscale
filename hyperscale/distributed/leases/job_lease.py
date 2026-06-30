@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import sys
-import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Callable
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 class LeaseState(Enum):
@@ -27,7 +31,7 @@ class JobLease:
     def is_expired(self) -> bool:
         if self.state == LeaseState.RELEASED:
             return True
-        return time.monotonic() >= self.expires_at
+        return _DEFAULT_CLOCK.monotonic() >= self.expires_at
 
     def is_active(self) -> bool:
         return not self.is_expired() and self.state == LeaseState.ACTIVE
@@ -35,12 +39,12 @@ class JobLease:
     def remaining_seconds(self) -> float:
         if self.is_expired():
             return 0.0
-        return max(0.0, self.expires_at - time.monotonic())
+        return max(0.0, self.expires_at - _DEFAULT_CLOCK.monotonic())
 
     def extend(self, duration: float | None = None) -> None:
         if duration is None:
             duration = self.lease_duration
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
         self.expires_at = now + duration
 
     def mark_released(self) -> None:
@@ -134,7 +138,7 @@ class JobLeaseManager:
                         expires_in=existing.remaining_seconds(),
                     )
 
-            now = time.monotonic()
+            now = _DEFAULT_CLOCK.monotonic()
             fence_token = self._get_next_fence_token(job_id)
 
             lease = JobLease(
@@ -238,7 +242,7 @@ class JobLeaseManager:
             if fence_token <= current_token:
                 return
 
-            now = time.monotonic()
+            now = _DEFAULT_CLOCK.monotonic()
             remaining = max(0.0, expires_at - now)
 
             lease = JobLease(
@@ -298,7 +302,7 @@ class JobLeaseManager:
                                             f"job_id={lease.job_id}",
                                             file=sys.stderr,
                                         )
-                    await asyncio.sleep(self._cleanup_interval)
+                    await _DEFAULT_CLOCK.sleep(self._cleanup_interval)
                 except asyncio.CancelledError:
                     break
                 except Exception as loop_error:
@@ -312,7 +316,7 @@ class JobLeaseManager:
                                 f"original_error={loop_error}",
                                 file=sys.stderr,
                             )
-                    await asyncio.sleep(self._cleanup_interval)
+                    await _DEFAULT_CLOCK.sleep(self._cleanup_interval)
 
         self._cleanup_task = asyncio.create_task(cleanup_loop())
 

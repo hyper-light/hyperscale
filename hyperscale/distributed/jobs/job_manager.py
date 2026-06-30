@@ -38,7 +38,6 @@ Benefits:
 """
 
 import asyncio
-import time
 from typing import Any, Callable, Coroutine
 
 import cloudpickle
@@ -65,6 +64,11 @@ from hyperscale.distributed.jobs.workflow_state_machine import (
     WorkflowStateMachine,
 )
 from hyperscale.logging import Logger
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 class JobManager:
@@ -287,7 +291,7 @@ class JobManager:
                 token=job_token,
                 submission=submission,
                 status=JobStatus.QUEUED.value,
-                timestamp=time.monotonic(),
+                timestamp=_DEFAULT_CLOCK.monotonic(),
                 callback_addr=callback_addr,
             )
 
@@ -324,7 +328,7 @@ class JobManager:
                 token=job_token,
                 submission=None,  # Non-leader doesn't have submission
                 status=JobStatus.QUEUED.value,
-                timestamp=time.monotonic(),
+                timestamp=_DEFAULT_CLOCK.monotonic(),
                 leader_node_id=leader_node_id,
                 leader_addr=leader_addr,
             )
@@ -407,7 +411,7 @@ class JobManager:
             job.timestamp = timestamp
             job.layer_version = max(job.layer_version, layer_version)
             if elapsed_seconds > 0:
-                hydrated_started_at = time.monotonic() - elapsed_seconds
+                hydrated_started_at = _DEFAULT_CLOCK.monotonic() - elapsed_seconds
                 if job.started_at == 0.0 or hydrated_started_at < job.started_at:
                     job.started_at = hydrated_started_at
 
@@ -567,7 +571,7 @@ class JobManager:
             sub_workflow_snapshots={progress.workflow_id: sub_workflow_snapshot},
             layer_version=0,
             elapsed_seconds=0.0,
-            timestamp=time.time(),
+            timestamp=_DEFAULT_CLOCK.time(),
             replace_existing=False,
         )
 
@@ -1659,9 +1663,9 @@ class JobManager:
         passes ``entry.timestamp`` (the HLC-derived value replicated in the log)
         so every follower converges on identical state. When called outside
         the apply path -- e.g. local manager handlers updating their own view --
-        the default ``time.time()`` records the current wall-clock seconds.
-        Never call ``time.monotonic()`` here: ``job.timestamp`` is a wall-clock
-        field, consumed by readers that compare against ``time.time()``.
+        the default ``_DEFAULT_CLOCK.time()`` records the current wall-clock seconds.
+        Never call ``_DEFAULT_CLOCK.monotonic()`` here: ``job.timestamp`` is a wall-clock
+        field, consumed by readers that compare against ``_DEFAULT_CLOCK.time()``.
         """
         job = self.get_job(job_token)
         if not job:
@@ -1669,7 +1673,7 @@ class JobManager:
 
         async with job.lock:
             job.status = status
-            job.timestamp = time.time() if timestamp is None else timestamp
+            job.timestamp = _DEFAULT_CLOCK.time() if timestamp is None else timestamp
             return True
 
     # =========================================================================

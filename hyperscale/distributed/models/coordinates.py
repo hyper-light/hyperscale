@@ -1,5 +1,9 @@
 from dataclasses import dataclass, field
-import time
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 @dataclass(slots=True)
@@ -49,7 +53,7 @@ class NetworkCoordinate:
     height: float
     adjustment: float
     error: float
-    updated_at: float = field(default_factory=time.monotonic)
+    updated_at: float = field(default_factory=_DEFAULT_CLOCK.monotonic)
     sample_count: int = 0
 
     def to_dict(self) -> dict[str, float | list[float] | int]:
@@ -83,6 +87,6 @@ class NetworkCoordinate:
             height=float(data.get("height", 0.0)),
             adjustment=float(data.get("adjustment", 0.0)),
             error=float(data.get("error", 1.0)),
-            updated_at=time.monotonic(),
+            updated_at=_DEFAULT_CLOCK.monotonic(),
             sample_count=int(data.get("sample_count", 0)),
         )

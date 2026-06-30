@@ -6,7 +6,6 @@ Implements AD-16 (Leadership Transfer) semantics.
 """
 
 import asyncio
-import time
 from collections.abc import Awaitable, Callable
 
 from hyperscale.distributed.models import (
@@ -17,6 +16,11 @@ from hyperscale.distributed.models import (
 from hyperscale.distributed.nodes.client.state import ClientState
 from hyperscale.logging import Logger
 from hyperscale.logging.hyperscale_logging_models import ServerWarning
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 class ClientLeadershipTracker:
@@ -74,7 +78,7 @@ class ClientLeadershipTracker:
         if not leader_info:
             return False
 
-        elapsed = time.monotonic() - leader_info.last_updated
+        elapsed = _DEFAULT_CLOCK.monotonic() - leader_info.last_updated
         return elapsed < self._leader_cache_ttl_seconds
 
     async def handle_not_leader_response(
@@ -241,7 +245,7 @@ class ClientLeadershipTracker:
         self._state._gate_job_leaders[job_id] = GateLeaderInfo(
             gate_addr=gate_addr,
             fence_token=fence_token,
-            last_updated=time.monotonic(),
+            last_updated=_DEFAULT_CLOCK.monotonic(),
         )
         # Clear orphan status if present
         self._state.clear_job_orphaned(job_id)
@@ -269,7 +273,7 @@ class ClientLeadershipTracker:
             manager_addr=manager_addr,
             fence_token=fence_token,
             datacenter_id=datacenter_id,
-            last_updated=time.monotonic(),
+            last_updated=_DEFAULT_CLOCK.monotonic(),
         )
 
     def mark_job_orphaned(
@@ -293,7 +297,7 @@ class ClientLeadershipTracker:
         """
         orphan_info = OrphanedJobInfo(
             job_id=job_id,
-            orphan_timestamp=time.monotonic(),
+            orphan_timestamp=_DEFAULT_CLOCK.monotonic(),
             last_known_gate=last_known_gate,
             last_known_manager=last_known_manager,
             datacenter_id=datacenter_id,
@@ -376,9 +380,9 @@ class ClientLeadershipTracker:
     ) -> None:
         while running_flag is None or running_flag.is_set():
             try:
-                await asyncio.sleep(check_interval_seconds)
+                await _DEFAULT_CLOCK.sleep(check_interval_seconds)
 
-                now = time.monotonic()
+                now = _DEFAULT_CLOCK.monotonic()
                 orphan_threshold = now - grace_period_seconds
 
                 for job_id, leader_info in list(self._state._gate_job_leaders.items()):

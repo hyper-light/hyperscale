@@ -5,7 +5,6 @@ Handles job submission with retry logic, leader redirection, and protocol negoti
 """
 
 import asyncio
-import random
 import secrets
 from typing import Callable
 
@@ -25,6 +24,12 @@ from hyperscale.distributed.protocol.version import CURRENT_PROTOCOL_VERSION
 from hyperscale.distributed.nodes.client.state import ClientState
 from hyperscale.distributed.nodes.client.config import ClientConfig, TRANSIENT_ERRORS
 from hyperscale.logging import Logger
+
+from hyperscale.distributed.runtime import Clock, RealClock, Random, RealRandom
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
+_DEFAULT_RANDOM: Random = RealRandom()
 
 
 class ClientJobSubmitter:
@@ -312,8 +317,8 @@ class ClientJobSubmitter:
             # Exponential backoff before retry with jitter (AD-21)
             if retry < max_retries and last_error:
                 base_delay = retry_base_delay * (2**retry)
-                delay = base_delay * (0.5 + random.random())  # Add 0-100% jitter
-                await asyncio.sleep(delay)
+                delay = base_delay * (0.5 + _DEFAULT_RANDOM.random())  # Add 0-100% jitter
+                await _DEFAULT_CLOCK.sleep(delay)
 
         # All retries exhausted
         raise RuntimeError(f"Job submission failed after {max_retries} retries: {last_error}")
@@ -370,7 +375,7 @@ class ClientJobSubmitter:
             # ``gate_replication_quorum_unavailable`` retry hints were
             # added to ``JobAck``. The narrow ``try`` scope around the
             # load keeps real errors in the rate-limit branch
-            # (e.g. ``asyncio.sleep`` cancellation) from being silently
+            # (e.g. ``_DEFAULT_CLOCK.sleep`` cancellation) from being silently
             # swallowed.
             rate_limit_response: RateLimitResponse | None = None
             try:
@@ -380,7 +385,7 @@ class ClientJobSubmitter:
             if isinstance(candidate, RateLimitResponse):
                 rate_limit_response = candidate
             if rate_limit_response is not None:
-                await asyncio.sleep(rate_limit_response.retry_after_seconds)
+                await _DEFAULT_CLOCK.sleep(rate_limit_response.retry_after_seconds)
                 return rate_limit_response.error  # Transient error
 
             import sys as _sys

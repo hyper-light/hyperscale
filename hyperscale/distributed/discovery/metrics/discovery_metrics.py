@@ -4,11 +4,15 @@ Discovery system metrics collection and reporting.
 Provides comprehensive observability for peer discovery operations.
 """
 
-import time
 from dataclasses import dataclass, field
 from typing import Callable
 
 from hyperscale.distributed.discovery.models.locality_info import LocalityTier
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 @dataclass(slots=True)
@@ -262,7 +266,7 @@ class DiscoveryMetrics:
         Returns:
             MetricsSnapshot with current metrics
         """
-        snapshot = MetricsSnapshot(timestamp=time.monotonic())
+        snapshot = MetricsSnapshot(timestamp=_DEFAULT_CLOCK.monotonic())
 
         # DNS metrics
         snapshot.dns_queries_total = self._dns_queries_total

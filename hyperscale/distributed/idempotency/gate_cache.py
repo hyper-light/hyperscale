@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 from collections import OrderedDict
-import time
 from typing import Generic, TypeVar
 
 from hyperscale.distributed.taskex import TaskRunner
@@ -13,6 +12,11 @@ from .idempotency_config import IdempotencyConfig
 from .idempotency_entry import IdempotencyEntry
 from .idempotency_key import IdempotencyKey
 from .idempotency_status import IdempotencyStatus
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 T = TypeVar("T")
 
@@ -91,7 +95,7 @@ class GateIdempotencyCache(Generic[T]):
                     status=IdempotencyStatus.PENDING,
                     job_id=job_id,
                     result=None,
-                    created_at=time.time(),
+                    created_at=_DEFAULT_CLOCK.time(),
                     committed_at=None,
                     source_gate_id=source_gate_id,
                 )
@@ -118,7 +122,7 @@ class GateIdempotencyCache(Generic[T]):
                 return
             entry.status = IdempotencyStatus.COMMITTED
             entry.result = result
-            entry.committed_at = time.time()
+            entry.committed_at = _DEFAULT_CLOCK.time()
             self._cache.move_to_end(key)
             waiters = self._pending_waiters.pop(key, [])
 
@@ -133,7 +137,7 @@ class GateIdempotencyCache(Generic[T]):
                 return
             entry.status = IdempotencyStatus.REJECTED
             entry.result = result
-            entry.committed_at = time.time()
+            entry.committed_at = _DEFAULT_CLOCK.time()
             self._cache.move_to_end(key)
             waiters = self._pending_waiters.pop(key, [])
 
@@ -176,7 +180,7 @@ class GateIdempotencyCache(Generic[T]):
             status=IdempotencyStatus.PENDING,
             job_id=job_id,
             result=None,
-            created_at=time.time(),
+            created_at=_DEFAULT_CLOCK.time(),
             committed_at=None,
             source_gate_id=source_gate_id,
         )
@@ -205,7 +209,7 @@ class GateIdempotencyCache(Generic[T]):
             self._pending_waiters.setdefault(key, []).append(future)
 
         try:
-            return await asyncio.wait_for(
+            return await _DEFAULT_CLOCK.wait_for(
                 future, timeout=self._config.pending_wait_timeout
             )
         except asyncio.TimeoutError:
@@ -232,11 +236,11 @@ class GateIdempotencyCache(Generic[T]):
 
     async def _cleanup_loop(self) -> None:
         while not self._closed:
-            await asyncio.sleep(self._config.cleanup_interval_seconds)
+            await _DEFAULT_CLOCK.sleep(self._config.cleanup_interval_seconds)
             await self._cleanup_expired()
 
     async def _cleanup_expired(self) -> None:
-        now = time.time()
+        now = _DEFAULT_CLOCK.time()
         expired_waiters: list[asyncio.Future[T]] = []
         async with self._lock:
             expired_keys = [

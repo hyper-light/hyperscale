@@ -4,13 +4,17 @@ Spillover evaluation logic for capacity-aware routing (AD-43).
 
 from __future__ import annotations
 
-import time
 
 from hyperscale.distributed.env.env import Env
 
 from .datacenter_capacity import DatacenterCapacity
 from .spillover_config import SpilloverConfig
 from .spillover_decision import SpilloverDecision
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 class SpilloverEvaluator:
@@ -142,5 +146,5 @@ class SpilloverEvaluator:
         )
 
     def _is_capacity_stale(self, capacity: DatacenterCapacity) -> bool:
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
         return capacity.is_stale(now, self._config.capacity_staleness_threshold_seconds)

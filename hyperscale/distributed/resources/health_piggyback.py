@@ -1,5 +1,9 @@
 from dataclasses import dataclass, field
-import time
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 @dataclass(slots=True)
@@ -14,7 +18,7 @@ class HealthPiggyback:
     throughput: float = 0.0
     expected_throughput: float = 0.0
     overload_state: str = "healthy"
-    timestamp: float = field(default_factory=time.monotonic)
+    timestamp: float = field(default_factory=_DEFAULT_CLOCK.monotonic)
 
     def to_dict(self) -> dict:
         """Serialize the piggyback to a dictionary."""
@@ -42,9 +46,9 @@ class HealthPiggyback:
             throughput=data.get("throughput", 0.0),
             expected_throughput=data.get("expected_throughput", 0.0),
             overload_state=data.get("overload_state", "healthy"),
-            timestamp=data.get("timestamp", time.monotonic()),
+            timestamp=data.get("timestamp", _DEFAULT_CLOCK.monotonic()),
         )
 
     def is_stale(self, max_age_seconds: float = 60.0) -> bool:
         """Return True if this piggyback is older than max_age_seconds."""
-        return (time.monotonic() - self.timestamp) > max_age_seconds
+        return (_DEFAULT_CLOCK.monotonic() - self.timestamp) > max_age_seconds

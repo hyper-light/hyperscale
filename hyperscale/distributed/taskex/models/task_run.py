@@ -1,4 +1,3 @@
-import time
 from typing import Any, Optional
 from pydantic import (
     BaseModel,
@@ -10,6 +9,11 @@ from pydantic import (
 from .run_status import RunStatus
 from .task_type import TaskType
 
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
+
 
 class TaskRun(BaseModel):
     run_id: StrictInt
@@ -17,7 +21,7 @@ class TaskRun(BaseModel):
     status: RunStatus
     error: Optional[StrictStr] = None
     trace: Optional[StrictStr] = None
-    start: StrictInt | StrictFloat = time.monotonic()
+    start: StrictInt | StrictFloat = _DEFAULT_CLOCK.monotonic()
     end: Optional[StrictInt | StrictFloat] = None
     elapsed: StrictInt | StrictFloat = 0
     result: Optional[Any] = None

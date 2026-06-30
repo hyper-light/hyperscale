@@ -2,11 +2,15 @@
 Datacenter capacity aggregation for gate routing (AD-43).
 """
 
-import time
 
 from hyperscale.distributed.models.distributed import ManagerHeartbeat
 
 from .datacenter_capacity import DatacenterCapacity
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 class DatacenterCapacityAggregator:
@@ -30,7 +34,7 @@ class DatacenterCapacityAggregator:
         ):
             self._evict_oldest()
 
-        self._manager_heartbeats[heartbeat.node_id] = (heartbeat, time.monotonic())
+        self._manager_heartbeats[heartbeat.node_id] = (heartbeat, _DEFAULT_CLOCK.monotonic())
 
     def _evict_oldest(self) -> None:
         if not self._manager_heartbeats:
@@ -48,7 +52,7 @@ class DatacenterCapacityAggregator:
         """
         Aggregate capacity metrics for a given datacenter.
         """
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
         self._prune_stale(now)
         heartbeats, last_updated = self._collect_heartbeats(datacenter_id)
         return DatacenterCapacity.aggregate(

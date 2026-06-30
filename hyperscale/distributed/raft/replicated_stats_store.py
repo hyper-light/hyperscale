@@ -12,10 +12,14 @@ Pattern:
     3. State machine applies aggregated window to all replicas
 """
 
-import time
 from typing import TYPE_CHECKING
 
 from .logging_models import RaftDebug, RaftWarning
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 if TYPE_CHECKING:
     from hyperscale.logging import Logger
@@ -74,7 +78,7 @@ class ReplicatedStatsStore:
         This is the hot path -- synchronous, no Raft, no I/O.
         Evicts oldest samples if buffer exceeds max size.
         """
-        sample_time = timestamp if timestamp is not None else time.monotonic()
+        sample_time = timestamp if timestamp is not None else _DEFAULT_CLOCK.monotonic()
 
         buffer = self._buffers.get(job_id)
         if buffer is None:
@@ -91,7 +95,7 @@ class ReplicatedStatsStore:
     def should_flush(self, job_id: str) -> bool:
         """Check if a job's buffer is due for flushing."""
         last_flush = self._last_flush_times.get(job_id, 0.0)
-        return (time.monotonic() - last_flush) >= self._flush_interval_seconds
+        return (_DEFAULT_CLOCK.monotonic() - last_flush) >= self._flush_interval_seconds
 
     def pending_count(self, job_id: str) -> int:
         """Number of buffered samples for a job."""
@@ -128,7 +132,7 @@ class ReplicatedStatsStore:
 
         if success:
             buffer.clear()
-            self._last_flush_times[job_id] = time.monotonic()
+            self._last_flush_times[job_id] = _DEFAULT_CLOCK.monotonic()
             await self._logger.log(RaftDebug(
                 message=f"Flushed {len(buffer)} stats samples for job {job_id}",
                 node_id=self._node_id,

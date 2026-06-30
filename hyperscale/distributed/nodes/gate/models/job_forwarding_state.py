@@ -4,8 +4,12 @@ Job forwarding state tracking.
 Tracks cross-gate job forwarding and throughput metrics.
 """
 
-import time
 from dataclasses import dataclass, field
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 @dataclass(slots=True)
@@ -13,7 +17,7 @@ class ForwardingMetrics:
     """Metrics for job forwarding throughput."""
 
     count: int = 0
-    interval_start: float = field(default_factory=time.monotonic)
+    interval_start: float = field(default_factory=_DEFAULT_CLOCK.monotonic)
     last_throughput: float = 0.0
     interval_seconds: float = 10.0
 
@@ -23,7 +27,7 @@ class ForwardingMetrics:
 
     def calculate_throughput(self) -> float:
         """Calculate and reset throughput for the current interval."""
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
         elapsed = now - self.interval_start
         if elapsed >= self.interval_seconds:
             self.last_throughput = self.count / elapsed if elapsed > 0 else 0.0

@@ -4,9 +4,13 @@ Routing state for tracking datacenter selection decisions (AD-36 Section 13.4).
 Provides per-job routing state for hysteresis and stickiness.
 """
 
-import time
 from dataclasses import dataclass, field
 from enum import Enum
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 class RoutingDecisionReason(str, Enum):
@@ -146,7 +150,7 @@ class JobRoutingState:
         Returns:
             (should_switch, reason)
         """
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
 
         # No current primary - always switch
         if self.primary_datacenter is None:
@@ -172,7 +176,7 @@ class JobRoutingState:
         reason: RoutingDecisionReason,
     ) -> None:
         """Mark that a forced switch is required."""
-        self.forced_switch_at = time.monotonic()
+        self.forced_switch_at = _DEFAULT_CLOCK.monotonic()
         self.primary_datacenter = None
 
     def reset_primary_selection(self) -> None:
@@ -180,7 +184,7 @@ class JobRoutingState:
         self.primary_datacenter = None
         self.primary_selected_at = 0.0
         self.last_score = 0.0
-        self.forced_switch_at = time.monotonic()
+        self.forced_switch_at = _DEFAULT_CLOCK.monotonic()
 
     def select_primary(
         self,
@@ -189,7 +193,7 @@ class JobRoutingState:
     ) -> None:
         """Record selection of a primary datacenter."""
         self.primary_datacenter = datacenter
-        self.primary_selected_at = time.monotonic()
+        self.primary_selected_at = _DEFAULT_CLOCK.monotonic()
         self.last_score = score
         self.switch_count += 1
         self.forced_switch_at = None
@@ -200,18 +204,18 @@ class JobRoutingState:
         cooldown_seconds: float = 120.0,
     ) -> None:
         """Record a dispatch failure to a datacenter."""
-        self.failed_datacenters[datacenter] = time.monotonic() + cooldown_seconds
+        self.failed_datacenters[datacenter] = _DEFAULT_CLOCK.monotonic() + cooldown_seconds
 
     def is_in_cooldown(self, datacenter: str) -> bool:
         """Check if a datacenter is in cooldown from recent failure."""
         cooldown_until = self.failed_datacenters.get(datacenter)
         if cooldown_until is None:
             return False
-        return time.monotonic() < cooldown_until
+        return _DEFAULT_CLOCK.monotonic() < cooldown_until
 
     def cleanup_expired_cooldowns(self) -> None:
         """Remove expired cooldowns."""
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
         expired = [dc for dc, until in self.failed_datacenters.items() if now >= until]
         for dc in expired:
             del self.failed_datacenters[dc]
@@ -264,7 +268,7 @@ class RoutingStateManager:
 
     def cleanup_stale_states(self, max_age_seconds: float = 3600.0) -> int:
         """Remove stale job states older than max_age."""
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
         stale = [
             job_id
             for job_id, state in self._job_states.items()

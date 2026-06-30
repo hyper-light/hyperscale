@@ -13,7 +13,6 @@ Key responsibilities:
 """
 
 import asyncio
-import time
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
@@ -22,6 +21,11 @@ from hyperscale.distributed.models import (
     JobFinalResult,
     JobStatus,
 )
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 class GateJobManager:
@@ -321,7 +325,7 @@ class GateJobManager:
 
         # Calculate elapsed time
         if job.timestamp > 0:
-            job.elapsed_seconds = time.monotonic() - job.timestamp
+            job.elapsed_seconds = _DEFAULT_CLOCK.monotonic() - job.timestamp
 
         # Determine overall status
         if should_resolve and normalized_statuses:
@@ -365,7 +369,7 @@ class GateJobManager:
         Returns list of cleaned up job IDs.
         Note: Caller should be careful about locking - this iterates all jobs.
         """
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
         terminal_statuses = {
             JobStatus.COMPLETED.value,
             JobStatus.FAILED.value,

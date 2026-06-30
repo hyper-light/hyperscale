@@ -10,9 +10,13 @@ See: https://dnsmadeeasy.com/resources/16-dns-attacks-you-should-know-about
 """
 
 import ipaddress
-import time
 from dataclasses import dataclass, field
 from enum import Enum
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 class DNSSecurityViolation(Enum):
@@ -47,7 +51,7 @@ class DNSSecurityEvent:
     details: str
     """Human-readable description of the violation."""
 
-    timestamp: float = field(default_factory=time.monotonic)
+    timestamp: float = field(default_factory=_DEFAULT_CLOCK.monotonic)
     """When this violation occurred."""
 
     previous_ip: str | None = None
@@ -67,7 +71,7 @@ class HostHistory:
     change_count: int = 0
     """Number of IP changes in the tracking window."""
 
-    window_start_time: float = field(default_factory=time.monotonic)
+    window_start_time: float = field(default_factory=_DEFAULT_CLOCK.monotonic)
     """Start of the current tracking window."""
 
 
@@ -301,7 +305,7 @@ class DNSSecurityValidator:
         - Unexpected IP changes (possible hijacking)
         - Rapid IP rotation (possible fast-flux)
         """
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
 
         # Get or create history for this host
         history = self._host_history.get(hostname)

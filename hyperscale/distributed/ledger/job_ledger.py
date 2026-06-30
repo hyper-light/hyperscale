@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import time
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Callable, Awaitable, Mapping
@@ -9,6 +8,11 @@ from typing import TYPE_CHECKING, Callable, Awaitable, Mapping
 from hyperscale.logging.lsn import HybridLamportClock
 
 from .archive.job_archive_store import JobArchiveStore
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 if TYPE_CHECKING:
     from hyperscale.logging import Logger
@@ -429,7 +433,7 @@ class JobLedger:
                 global_lsn=self._wal.last_synced_lsn,
                 hlc=hlc,
                 job_states=job_states,
-                created_at_ms=int(time.time() * 1000),
+                created_at_ms=int(_DEFAULT_CLOCK.time() * 1000),
             )
 
             path = await self._checkpoint_manager.save(checkpoint)
