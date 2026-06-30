@@ -6,8 +6,6 @@ All business logic is delegated to specialized coordinators.
 """
 
 import asyncio
-import random
-import time
 import traceback
 import cloudpickle
 from pathlib import Path
@@ -1290,7 +1288,7 @@ class ManagerServer(HealthAwareServer):
         while self._running:
             try:
                 await self._sync_manager_peer_registrations()
-                await asyncio.sleep(sync_interval)
+                await self._clock.sleep(sync_interval)
             except asyncio.CancelledError:
                 break
             except Exception as error:
@@ -1302,7 +1300,7 @@ class ManagerServer(HealthAwareServer):
                         node_id=self._node_id.short,
                     )
                 )
-                await asyncio.sleep(sync_interval)
+                await self._clock.sleep(sync_interval)
 
     async def _register_with_manager(
         self,
@@ -1942,14 +1940,14 @@ class ManagerServer(HealthAwareServer):
                 )
             else:
                 self._manager_state.remove_active_manager_peer(tcp_addr)
-            self._manager_state.add_dead_manager(tcp_addr, time.monotonic())
+            self._manager_state.add_dead_manager(tcp_addr, self._clock.monotonic())
 
         # Start the unhealthy-since clock so the reap path can later
         # fully unregister the peer (releasing peer-locks, latency
         # samples, etc.) once the reap interval elapses.
         if peer_id_for_addr is not None:
             self._manager_state.set_manager_peer_unhealthy_since(
-                peer_id_for_addr, time.monotonic()
+                peer_id_for_addr, self._clock.monotonic()
             )
 
         await self._udp_logger.log(
@@ -1975,11 +1973,11 @@ class ManagerServer(HealthAwareServer):
             initial_epoch = self._manager_state.get_peer_state_epoch(tcp_addr)
 
         async with self._recovery_semaphore:
-            jitter = random.uniform(
+            jitter = self._random.uniform(
                 self._config.recovery_jitter_min_seconds,
                 self._config.recovery_jitter_max_seconds,
             )
-            await asyncio.sleep(jitter)
+            await self._clock.sleep(jitter)
 
             async with peer_lock:
                 current_epoch = self._manager_state.get_peer_state_epoch(tcp_addr)
@@ -2053,7 +2051,7 @@ class ManagerServer(HealthAwareServer):
             # added to ``_active_manager_peer_ids`` even after SWIM
             # confirmed their liveness.
             ping_request = PingRequest(request_id=self._node_id.full)
-            response = await asyncio.wait_for(
+            response = await self._clock.wait_for(
                 self._send_to_peer(
                     tcp_addr,
                     "ping",
@@ -2343,7 +2341,7 @@ class ManagerServer(HealthAwareServer):
 
         leader_last_seen = self._leader_election.state.last_heartbeat_time
         leader_timeout = self._config.orphan_scan_interval_seconds * 3
-        return (time.monotonic() - leader_last_seen) > leader_timeout
+        return (self._clock.monotonic() - leader_last_seen) > leader_timeout
 
     # =========================================================================
     # Heartbeat Handlers
@@ -2536,9 +2534,9 @@ class ManagerServer(HealthAwareServer):
     async def _dead_node_reap_loop(self) -> None:
         while self._running:
             try:
-                await asyncio.sleep(self._config.dead_node_check_interval_seconds)
+                await self._clock.sleep(self._config.dead_node_check_interval_seconds)
 
-                now = time.monotonic()
+                now = self._clock.monotonic()
                 self._reap_dead_workers(now)
                 self._reap_dead_peers(now)
                 self._reap_dead_gates(now)
@@ -2639,7 +2637,7 @@ class ManagerServer(HealthAwareServer):
         """
         while self._running:
             try:
-                await asyncio.sleep(self._config.orphan_scan_interval_seconds)
+                await self._clock.sleep(self._config.orphan_scan_interval_seconds)
 
                 should_scan = self.is_leader() or self._should_backup_orphan_scan()
                 if not should_scan:
@@ -2700,7 +2698,7 @@ class ManagerServer(HealthAwareServer):
         """
         while self._running:
             try:
-                await asyncio.sleep(
+                await self._clock.sleep(
                     self._config.job_responsiveness_check_interval_seconds
                 )
 
@@ -2807,7 +2805,7 @@ class ManagerServer(HealthAwareServer):
         """Periodically push stats to gates/clients."""
         while self._running:
             try:
-                await asyncio.sleep(self._config.batch_push_interval_seconds)
+                await self._clock.sleep(self._config.batch_push_interval_seconds)
 
                 await self._stats.refresh_dispatch_throughput()
 
@@ -2831,7 +2829,7 @@ class ManagerServer(HealthAwareServer):
 
         while self._running:
             try:
-                await asyncio.sleep(flush_interval)
+                await self._clock.sleep(flush_interval)
                 if not self._running:
                     break
                 await self._flush_windowed_stats()
@@ -2908,7 +2906,7 @@ class ManagerServer(HealthAwareServer):
 
         while self._running:
             try:
-                await asyncio.sleep(heartbeat_interval)
+                await self._clock.sleep(heartbeat_interval)
 
                 heartbeat = self._build_manager_heartbeat()
 
@@ -2969,7 +2967,7 @@ class ManagerServer(HealthAwareServer):
 
         while self._running:
             try:
-                await asyncio.sleep(cleanup_interval)
+                await self._clock.sleep(cleanup_interval)
 
                 cleaned = await self._cleanup_inactive_rate_limit_clients()
 
@@ -3009,11 +3007,11 @@ class ManagerServer(HealthAwareServer):
 
         while self._running:
             try:
-                await asyncio.sleep(cleanup_interval)
+                await self._clock.sleep(cleanup_interval)
 
                 # Wall-clock seconds: matches the semantic of job.completed_at
-                # which is set from Raft entry.timestamp (HLC) or local time.time().
-                current_time = time.time()
+                # which is set from Raft entry.timestamp (HLC) or local self._clock.time().
+                current_time = self._clock.time()
                 jobs_cleaned = 0
 
                 for job in list(self._job_manager.iter_jobs()):
@@ -3064,7 +3062,7 @@ class ManagerServer(HealthAwareServer):
 
         while self._running:
             try:
-                await asyncio.sleep(check_interval)
+                await self._clock.sleep(check_interval)
 
                 # Only leader checks timeouts
                 if not self.is_leader():
@@ -3121,9 +3119,9 @@ class ManagerServer(HealthAwareServer):
 
         while self._running:
             try:
-                await asyncio.sleep(check_interval)
+                await self._clock.sleep(check_interval)
 
-                current_time = time.monotonic()
+                current_time = self._clock.monotonic()
                 grace_period = self._worker_health_manager.base_deadline
 
                 deadlines_snapshot = self._manager_state.iter_worker_deadlines()
@@ -3162,7 +3160,7 @@ class ManagerServer(HealthAwareServer):
         replace_existing: bool = True,
     ) -> JobStateSyncMessage:
         elapsed_seconds = (
-            time.monotonic() - job.started_at
+            self._clock.monotonic() - job.started_at
             if job is not None and job.started_at
             else 0.0
         )
@@ -3223,7 +3221,7 @@ class ManagerServer(HealthAwareServer):
             workflows_failed=workflows_failed,
             workflow_statuses=workflow_statuses,
             elapsed_seconds=elapsed_seconds,
-            timestamp=time.monotonic(),
+            timestamp=self._clock.monotonic(),
             origin_gate_addr=origin_gate_addr,
             callback_addr=callback_addr,
             leader_addr=effective_leader_addr,
@@ -3355,7 +3353,7 @@ class ManagerServer(HealthAwareServer):
 
         while self._running:
             try:
-                await asyncio.sleep(sync_interval)
+                await self._clock.sleep(sync_interval)
 
                 if not self.is_leader():
                     continue
@@ -3393,7 +3391,7 @@ class ManagerServer(HealthAwareServer):
 
         while self._running:
             try:
-                await asyncio.sleep(sample_interval)
+                await self._clock.sleep(sample_interval)
 
                 metrics = await self._resource_monitor.sample()
                 self._last_resource_metrics = metrics
@@ -3947,7 +3945,7 @@ class ManagerServer(HealthAwareServer):
 
     def _get_dispatch_throughput(self) -> float:
         """Get current dispatch throughput."""
-        current_time = time.monotonic()
+        current_time = self._clock.monotonic()
         interval_start = self._manager_state.dispatch_throughput_interval_start
         elapsed = current_time - interval_start
 
@@ -4497,7 +4495,7 @@ class ManagerServer(HealthAwareServer):
             return
 
         leader_term = self._leader_election.state.current_term
-        completed_at = time.monotonic()
+        completed_at = self._clock.monotonic()
         ledger = self._worker_health_manager.ledger
 
         for sub_info in list(job.sub_workflows.values()):
@@ -4600,7 +4598,7 @@ class ManagerServer(HealthAwareServer):
             worker_id=result.worker_id,
             outcome_kind=outcome_kind,
             final_progress_fraction=progress_fraction,
-            completed_at=time.monotonic(),
+            completed_at=self._clock.monotonic(),
             fence_token=fence_token,
             leader_term=leader_term,
         )
@@ -5149,7 +5147,7 @@ class ManagerServer(HealthAwareServer):
             return False
 
         timeout_reason = reason or "Job timed out"
-        timestamp = time.monotonic()
+        timestamp = self._clock.monotonic()
         pending_cancelled = await self._cancel_pending_workflows(
             job_id,
             timestamp,
@@ -5248,7 +5246,7 @@ class ManagerServer(HealthAwareServer):
                 return None
 
             job.status = JobStatus.TIMEOUT.value
-            job.completed_at = time.time()
+            job.completed_at = self._clock.time()
             job.timestamp = job.completed_at
             elapsed_seconds = job.elapsed_seconds()
 
@@ -5320,7 +5318,7 @@ class ManagerServer(HealthAwareServer):
             results=[],
             error=reason,
             elapsed_seconds=job.elapsed_seconds(),
-            completed_at=time.time(),
+            completed_at=self._clock.time(),
             callback_addr=callback_addr,
             target_dcs=target_dcs,
             target_dc_count=self._get_job_target_dc_count_for_push(
@@ -6192,7 +6190,7 @@ class ManagerServer(HealthAwareServer):
             results=push_results,
             error=push_error,
             elapsed_seconds=0.0,
-            completed_at=time.time(),
+            completed_at=self._clock.time(),
             callback_addr=callback_addr,
             target_dcs=target_dcs,
             target_dc_count=self._get_job_target_dc_count_for_push(
@@ -6266,7 +6264,7 @@ class ManagerServer(HealthAwareServer):
                     results=[],
                     error=error,
                     elapsed_seconds=0.0,
-                    completed_at=time.time(),
+                    completed_at=self._clock.time(),
                     callback_addr=callback_addr,
                     target_dcs=target_dcs,
                     target_dc_count=self._get_job_target_dc_count_for_push(
@@ -6515,7 +6513,7 @@ class ManagerServer(HealthAwareServer):
                 cancel.job_id,
                 cancel.fence_token,
                 f"{addr[0]}:{addr[1]}",
-                time.monotonic(),
+                self._clock.monotonic(),
                 "Legacy cancel request",
             )
 
@@ -6880,7 +6878,7 @@ class ManagerServer(HealthAwareServer):
                 await strategy.stop_tracking(job_id, "cancelled")
 
             job.status = JobStatus.CANCELLED.value
-            job.completed_at = time.time()
+            job.completed_at = self._clock.time()
             await self._manager_state.increment_state_version()
 
             # Phase F3: emit FAILED outcomes for any still-in-flight
@@ -7378,7 +7376,7 @@ class ManagerServer(HealthAwareServer):
         # Get current deadline (or set default)
         current_deadline = self._manager_state.get_worker_deadline(worker_id)
         if current_deadline is None:
-            current_deadline = time.monotonic() + 30.0
+            current_deadline = self._clock.monotonic() + 30.0
 
         # Phase F1: route through the H5 multi-witness path when
         # the request carries an H3 ``workflow_id`` (workers using
@@ -8510,7 +8508,7 @@ class ManagerServer(HealthAwareServer):
                 CancelledWorkflowInfo(
                     job_id=request.job_id,
                     workflow_id=request.workflow_id,
-                    cancelled_at=time.monotonic(),
+                    cancelled_at=self._clock.monotonic(),
                     request_id=request.request_id,
                     dependents=[],
                 ),
@@ -8553,7 +8551,7 @@ class ManagerServer(HealthAwareServer):
                         CancelledWorkflowInfo(
                             job_id=notification.job_id,
                             workflow_id=wf_id,
-                            cancelled_at=notification.timestamp or time.monotonic(),
+                            cancelled_at=notification.timestamp or self._clock.monotonic(),
                             request_id=notification.request_id,
                             dependents=[],
                         ),
@@ -8704,7 +8702,7 @@ class ManagerServer(HealthAwareServer):
             sub_workflow_snapshots=sync_msg.sub_workflow_snapshots,
             layer_version=sync_msg.layer_version,
             elapsed_seconds=sync_msg.elapsed_seconds,
-            timestamp=time.time(),
+            timestamp=self._clock.time(),
             replace_existing=sync_msg.replace_existing,
         )
 
@@ -8875,7 +8873,7 @@ class ManagerServer(HealthAwareServer):
             self._manager_state.set_progress_callback(job_id, request.callback_addr)
 
             # Calculate elapsed time (job.timestamp is wall-clock seconds set by Raft apply or local handlers)
-            elapsed = time.time() - job.timestamp if job.timestamp > 0 else 0.0
+            elapsed = self._clock.time() - job.timestamp if job.timestamp > 0 else 0.0
 
             # Aggregate completed/failed from sub-workflows (WorkflowInfo has no counts;
             # they live on SubWorkflowInfo.progress)
@@ -9213,7 +9211,7 @@ class ManagerServer(HealthAwareServer):
 
         async with job.lock:
             job.status = JobStatus.COMPLETED.value
-            job.completed_at = time.time()
+            job.completed_at = self._clock.time()
             elapsed_seconds = job.elapsed_seconds()
             final_status = self._determine_final_job_status(job)
             workflow_results, errors, total_completed, total_failed = (

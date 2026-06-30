@@ -6,7 +6,6 @@ integrating with the manager's HybridOverloadDetector.
 """
 
 import asyncio
-import time
 from typing import TYPE_CHECKING, Any
 
 from hyperscale.distributed.reliability.rate_limiting import (
@@ -19,6 +18,11 @@ from hyperscale.distributed.reliability.rate_limiting import (
 from hyperscale.distributed.reliability.overload import HybridOverloadDetector
 from hyperscale.distributed.reliability.priority import RequestPriority
 from hyperscale.logging.hyperscale_logging_models import ServerDebug, ServerWarning
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 if TYPE_CHECKING:
     from hyperscale.distributed.nodes.manager.state import ManagerState
@@ -100,7 +104,7 @@ class ManagerRateLimitingCoordinator:
         )
 
         # Metrics tracking
-        self._cleanup_last_run: float = time.monotonic()
+        self._cleanup_last_run: float = _DEFAULT_CLOCK.monotonic()
         self._cleanup_task: asyncio.Task | None = None
 
     async def check_rate_limit(
@@ -251,7 +255,7 @@ class ManagerRateLimitingCoordinator:
             interval = self._config.rate_limit_cleanup_interval_seconds
             while True:
                 try:
-                    await asyncio.sleep(interval)
+                    await _DEFAULT_CLOCK.sleep(interval)
                     await self.cleanup_inactive_clients()
                 except asyncio.CancelledError:
                     break

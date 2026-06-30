@@ -5,7 +5,6 @@ Provides centralized registration and tracking of workers, gates,
 and peer managers.
 """
 
-import time
 from typing import TYPE_CHECKING
 
 from hyperscale.distributed.models import (
@@ -15,6 +14,11 @@ from hyperscale.distributed.models import (
 )
 from hyperscale.distributed.swim.core import ErrorStats, CircuitState
 from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerDebug
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 if TYPE_CHECKING:
     from hyperscale.distributed.nodes.manager.state import ManagerState
@@ -317,7 +321,7 @@ class ManagerRegistry:
         """Mark a gate as unhealthy."""
         self._state._healthy_gate_ids.discard(gate_id)
         if gate_id not in self._state._gate_unhealthy_since:
-            self._state._gate_unhealthy_since[gate_id] = time.monotonic()
+            self._state._gate_unhealthy_since[gate_id] = _DEFAULT_CLOCK.monotonic()
 
     def mark_gate_healthy(self, gate_id: str) -> None:
         """Mark a gate as healthy."""

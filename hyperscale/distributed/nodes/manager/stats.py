@@ -5,7 +5,6 @@ Handles windowed stats aggregation, backpressure signaling, and
 throughput tracking per AD-19 and AD-23 specifications.
 """
 
-import time
 from collections.abc import Awaitable, Callable
 from enum import Enum
 from typing import TYPE_CHECKING, Any
@@ -16,6 +15,11 @@ from hyperscale.distributed.reliability import (
     StatsBuffer,
 )
 from hyperscale.logging.hyperscale_logging_models import ServerDebug, ServerWarning
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 if TYPE_CHECKING:
     from hyperscale.distributed.jobs import WindowedStatsCollector
@@ -84,7 +88,7 @@ class ManagerStatsCoordinator:
         self._send_to_callback: SendFunc | None = send_to_callback
 
         self._progress_state: ProgressState = ProgressState.NORMAL
-        self._progress_state_since: float = time.monotonic()
+        self._progress_state_since: float = _DEFAULT_CLOCK.monotonic()
 
         # AD-23: Stats buffer tracking for backpressure
         self._stats_buffer: StatsBuffer = stats_buffer
@@ -108,7 +112,7 @@ class ManagerStatsCoordinator:
         Returns:
             Dispatches per second over the current interval
         """
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
         interval_start = self._state._dispatch_throughput_interval_start
         interval_seconds = self._config.throughput_interval_seconds
 
@@ -157,7 +161,7 @@ class ManagerStatsCoordinator:
             return ProgressState.NORMAL
 
         ratio = actual / expected
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
 
         if ratio >= self._config.progress_normal_ratio:
             new_state = ProgressState.NORMAL
@@ -191,7 +195,7 @@ class ManagerStatsCoordinator:
         Returns:
             Duration in seconds
         """
-        return time.monotonic() - self._progress_state_since
+        return _DEFAULT_CLOCK.monotonic() - self._progress_state_since
 
     def should_apply_backpressure(self) -> bool:
         """

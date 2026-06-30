@@ -5,7 +5,11 @@ Tracks state for quorum-based workflow provisioning during dispatch.
 """
 
 from dataclasses import dataclass, field
-import time
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 
 @dataclass(slots=True)
@@ -21,7 +25,7 @@ class ProvisionState:
     job_id: str
     worker_id: str
     cores_requested: int
-    initiated_at: float = field(default_factory=time.monotonic)
+    initiated_at: float = field(default_factory=_DEFAULT_CLOCK.monotonic)
     confirmed_nodes: frozenset[str] = field(default_factory=frozenset)
     timeout_seconds: float = 5.0
 
@@ -48,7 +52,7 @@ class ProvisionState:
     @property
     def is_timed_out(self) -> bool:
         """Check if provision request has timed out."""
-        return (time.monotonic() - self.initiated_at) > self.timeout_seconds
+        return (_DEFAULT_CLOCK.monotonic() - self.initiated_at) > self.timeout_seconds
 
     @property
     def confirmation_count(self) -> int:

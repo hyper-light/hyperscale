@@ -3,7 +3,6 @@ Worker state dissemination for cross-manager visibility (AD-48).
 """
 
 import asyncio
-import time
 from typing import TYPE_CHECKING, Any, Callable, Coroutine
 
 from hyperscale.distributed.models import WorkerRegistration, WorkerState
@@ -22,6 +21,11 @@ from hyperscale.logging.hyperscale_logging_models import (
     ServerWarning,
     ServerError,
 )
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 if TYPE_CHECKING:
     from hyperscale.distributed.nodes.manager.state import ManagerState
@@ -104,7 +108,7 @@ class WorkerDisseminator:
             incarnation=incarnation,
             total_cores=registration.total_cores,
             available_cores=registration.available_cores,
-            timestamp=time.monotonic(),
+            timestamp=_DEFAULT_CLOCK.monotonic(),
             datacenter=self._datacenter,
         )
 
@@ -153,7 +157,7 @@ class WorkerDisseminator:
             incarnation=incarnation,
             total_cores=total_cores,
             available_cores=0,
-            timestamp=time.monotonic(),
+            timestamp=_DEFAULT_CLOCK.monotonic(),
             datacenter=self._datacenter,
         )
 
@@ -200,7 +204,7 @@ class WorkerDisseminator:
                     incarnation=incarnation,
                     total_cores=worker.total_cores,
                     available_cores=0,
-                    timestamp=time.monotonic(),
+                    timestamp=_DEFAULT_CLOCK.monotonic(),
                     datacenter=self._datacenter,
                 )
             )
@@ -239,7 +243,7 @@ class WorkerDisseminator:
 
         async def send_to_peer(peer_addr: tuple[str, int]) -> None:
             try:
-                await asyncio.wait_for(
+                await _DEFAULT_CLOCK.wait_for(
                     self._send_tcp(
                         peer_addr,
                         "worker_state_update",
@@ -354,7 +358,7 @@ class WorkerDisseminator:
 
         async def request_from_peer(peer_addr: tuple[str, int]) -> None:
             try:
-                response = await asyncio.wait_for(
+                response = await _DEFAULT_CLOCK.wait_for(
                     self._send_tcp(
                         peer_addr,
                         "list_workers",
@@ -470,7 +474,7 @@ class WorkerDisseminator:
 
         async def push_to_worker(worker_addr: tuple[str, int]) -> None:
             try:
-                await asyncio.wait_for(
+                await _DEFAULT_CLOCK.wait_for(
                     self._send_tcp(
                         worker_addr,
                         "manager_register",
@@ -543,7 +547,7 @@ class WorkerDisseminator:
                 incarnation=self.get_worker_incarnation(worker.worker_id),
                 total_cores=worker.total_cores,
                 available_cores=worker.available_cores,
-                timestamp=time.monotonic(),
+                timestamp=_DEFAULT_CLOCK.monotonic(),
                 datacenter=self._datacenter,
             )
             for worker in workers
@@ -572,7 +576,7 @@ class WorkerDisseminator:
             originating_manager_id=self._node_id,
             failed_worker_id=failed_worker_id,
             reason=reason,
-            timestamp=time.monotonic(),
+            timestamp=_DEFAULT_CLOCK.monotonic(),
             datacenter=self._datacenter,
             reassignments=reassignments,
         )
@@ -581,7 +585,7 @@ class WorkerDisseminator:
 
         async def send_to_peer(peer_addr: tuple[str, int]) -> None:
             try:
-                await asyncio.wait_for(
+                await _DEFAULT_CLOCK.wait_for(
                     self._send_tcp(
                         peer_addr,
                         "workflow_reassignment",

@@ -7,7 +7,6 @@ for retry delays to prevent thundering herd.
 """
 
 import asyncio
-import time
 from typing import Any, Callable, Coroutine, TYPE_CHECKING, cast
 
 from hyperscale.distributed.jobs.worker_pool import WorkerPool
@@ -32,6 +31,11 @@ from hyperscale.logging.hyperscale_logging_models import (
     ServerDebug,
     ServerWarning,
 )
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 if TYPE_CHECKING:
     from hyperscale.distributed.nodes.manager.state import ManagerState
@@ -213,7 +217,7 @@ class ManagerStateSync:
                     max_delay=max_delay,
                     jitter=JitterStrategy.FULL,
                 )
-                await asyncio.sleep(delay)
+                await _DEFAULT_CLOCK.sleep(delay)
 
         return None
 
@@ -354,7 +358,7 @@ class ManagerStateSync:
         async with worker_pool._cores_condition:
             old_available = worker_status.available_cores
             worker_status.heartbeat = heartbeat
-            worker_status.last_seen = time.monotonic()
+            worker_status.last_seen = _DEFAULT_CLOCK.monotonic()
             worker_status.state = snapshot.state
             worker_status.available_cores = snapshot.available_cores
             worker_status.total_cores = snapshot.total_cores
@@ -587,7 +591,7 @@ class ManagerStateSync:
                     max_delay=max_delay,
                     jitter=JitterStrategy.FULL,
                 )
-                await asyncio.sleep(delay)
+                await _DEFAULT_CLOCK.sleep(delay)
 
         return None
 

@@ -6,7 +6,6 @@ Implements AD-17 smart dispatch with health bucket selection.
 """
 
 import asyncio
-import time
 from typing import Any, Callable, Coroutine, TYPE_CHECKING
 
 from hyperscale.distributed.models import (
@@ -20,6 +19,11 @@ from hyperscale.logging.hyperscale_logging_models import (
     ServerDebug,
     ServerWarning,
 )
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 if TYPE_CHECKING:
     from hyperscale.distributed.nodes.manager.state import ManagerState
@@ -163,7 +167,7 @@ class ManagerDispatchCoordinator:
                             circuit.record_error()
                             if circuit.is_open():
                                 self._state.setdefault_worker_unhealthy_since(
-                                    worker_id, time.monotonic()
+                                    worker_id, _DEFAULT_CLOCK.monotonic()
                                 )
                     return ack
 
@@ -181,7 +185,7 @@ class ManagerDispatchCoordinator:
                     circuit.record_error()
                     if circuit.is_open():
                         self._state.setdefault_worker_unhealthy_since(
-                            worker_id, time.monotonic()
+                            worker_id, _DEFAULT_CLOCK.monotonic()
                         )
 
             except Exception as e:
@@ -199,7 +203,7 @@ class ManagerDispatchCoordinator:
                     circuit.record_error()
                     if circuit.is_open():
                         self._state.setdefault_worker_unhealthy_since(
-                            worker_id, time.monotonic()
+                            worker_id, _DEFAULT_CLOCK.monotonic()
                         )
 
         return None

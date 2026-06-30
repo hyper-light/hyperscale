@@ -4,7 +4,6 @@ TCP handlers for job and workflow cancellation.
 Handles cancellation requests and completion notifications (AD-20 compliance).
 """
 
-import time
 from typing import TYPE_CHECKING, Any, Callable, Coroutine
 
 from hyperscale.distributed.models import (
@@ -15,6 +14,11 @@ from hyperscale.distributed.models import (
     JobCancellationComplete,
 )
 from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerWarning
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 if TYPE_CHECKING:
     from hyperscale.distributed.nodes.manager.state import ManagerState
@@ -85,7 +89,7 @@ class CancelJobHandler:
             ad20_request = JobCancelRequest(
                 job_id=request.job_id,
                 requester_id=self._node_id,
-                timestamp=time.time(),
+                timestamp=_DEFAULT_CLOCK.time(),
                 reason=request.reason
                 if hasattr(request, "reason")
                 else "User requested",

@@ -10,6 +10,11 @@ from typing import TYPE_CHECKING
 
 from hyperscale.logging.hyperscale_logging_models import ServerDebug, ServerWarning
 
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
+
 if TYPE_CHECKING:
     from hyperscale.distributed.env import Env
     from hyperscale.distributed.nodes.manager.state import ManagerState
@@ -245,7 +250,7 @@ class ManagerDiscoveryCoordinator:
 
         while True:
             try:
-                await asyncio.sleep(interval)
+                await _DEFAULT_CLOCK.sleep(interval)
 
                 # Decay failure counts
                 self._worker_discovery.decay_failures()

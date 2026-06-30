@@ -6,13 +6,17 @@ AD-26 deadline extensions, and AD-30 hierarchical failure detection with job-lev
 """
 
 import asyncio
-import time
 from enum import Enum
 from typing import TYPE_CHECKING, Any
 
 from hyperscale.distributed.models import WorkerHeartbeat
 from hyperscale.distributed.reliability import HybridOverloadDetector
 from hyperscale.logging.hyperscale_logging_models import ServerDebug, ServerWarning
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 if TYPE_CHECKING:
     from hyperscale.distributed.nodes.manager.state import ManagerState
@@ -60,7 +64,7 @@ class JobSuspicion:
     ) -> None:
         self.job_id = job_id
         self.worker_id = worker_id
-        self.started_at = time.monotonic()
+        self.started_at = _DEFAULT_CLOCK.monotonic()
         self.confirmation_count = 0
         self.last_confirmation_at = self.started_at
         self.timeout_seconds = timeout_seconds
@@ -68,7 +72,7 @@ class JobSuspicion:
     def add_confirmation(self) -> None:
         """Add a confirmation (does NOT reschedule timer per AD-30)."""
         self.confirmation_count += 1
-        self.last_confirmation_at = time.monotonic()
+        self.last_confirmation_at = _DEFAULT_CLOCK.monotonic()
 
     def time_remaining(self, cluster_size: int) -> float:
         """
@@ -87,7 +91,7 @@ class JobSuspicion:
         shrink_factor = max(1, 1 + self.confirmation_count)
         effective_timeout = self.timeout_seconds / shrink_factor
 
-        elapsed = time.monotonic() - self.started_at
+        elapsed = _DEFAULT_CLOCK.monotonic() - self.started_at
         return max(0, effective_timeout - elapsed)
 
     def is_expired(self, cluster_size: int) -> bool:
@@ -198,7 +202,7 @@ class ManagerHealthMonitor:
         """
         async with self._health_state_lock:
             if worker_id not in self._state._worker_unhealthy_since:
-                self._state._worker_unhealthy_since[worker_id] = time.monotonic()
+                self._state._worker_unhealthy_since[worker_id] = _DEFAULT_CLOCK.monotonic()
 
         self._task_runner.run(
             self._logger.log,
@@ -246,7 +250,7 @@ class ManagerHealthMonitor:
             target_id: Target identifier
             latency_ms: Measured latency in milliseconds
         """
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
         sample = (now, latency_ms)
 
         if target_type == "worker":
@@ -265,7 +269,7 @@ class ManagerHealthMonitor:
 
     def _prune_latency_samples(self, samples: list[tuple[float, float]]) -> None:
         """Prune old latency samples."""
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
         cutoff = now - self._latency_max_age
 
         # Remove old samples
@@ -405,7 +409,7 @@ class ManagerHealthMonitor:
         if last_progress is None:
             return True  # No tracking yet, assume responsive
 
-        elapsed = time.monotonic() - last_progress
+        elapsed = _DEFAULT_CLOCK.monotonic() - last_progress
         return elapsed < self._config.job_responsiveness_threshold_seconds
 
     def record_job_progress(self, job_id: str, worker_id: str) -> None:
@@ -417,7 +421,7 @@ class ManagerHealthMonitor:
             worker_id: Worker ID
         """
         key = (job_id, worker_id)
-        self._state._worker_job_last_progress[key] = time.monotonic()
+        self._state._worker_job_last_progress[key] = _DEFAULT_CLOCK.monotonic()
 
     def cleanup_job_progress(self, job_id: str) -> None:
         """
@@ -564,7 +568,7 @@ class ManagerHealthMonitor:
         Excludes pairs that are already suspected or already declared
         job-dead so the loop is idempotent across ticks.
         """
-        now = time.monotonic()
+        now = _DEFAULT_CLOCK.monotonic()
         silent: list[tuple[str, str]] = []
         for key, last_progress in self._state._worker_job_last_progress.items():
             if key in self._job_suspicions:
@@ -987,7 +991,7 @@ class HealthcheckExtensionManager:
 
         if granted:
             current_deadline = self._worker_deadlines.get(
-                worker_id, time.monotonic() + 30.0
+                worker_id, _DEFAULT_CLOCK.monotonic() + 30.0
             )
             new_deadline = current_deadline + extension_seconds
             self._worker_deadlines[worker_id] = new_deadline

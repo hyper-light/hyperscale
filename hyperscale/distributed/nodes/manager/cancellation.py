@@ -5,7 +5,6 @@ Handles AD-20 compliant job and workflow cancellation coordination.
 """
 
 import asyncio
-import time
 from typing import Any, Callable, Coroutine, TYPE_CHECKING
 
 from hyperscale.distributed.models import (
@@ -19,6 +18,11 @@ from hyperscale.distributed.models import (
 )
 from hyperscale.distributed.models.jobs import TrackingToken
 from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerWarning
+
+from hyperscale.distributed.runtime import Clock, RealClock
+
+
+_DEFAULT_CLOCK: Clock = RealClock()
 
 if TYPE_CHECKING:
     from hyperscale.distributed.jobs.job_manager import JobManager
@@ -88,7 +92,7 @@ class ManagerCancellationCoordinator:
             ).dump()
 
         # Initialize cancellation tracking
-        self._state._cancellation_initiated_at[job_id] = time.monotonic()
+        self._state._cancellation_initiated_at[job_id] = _DEFAULT_CLOCK.monotonic()
         self._state._cancellation_completion_events[job_id] = asyncio.Event()
 
         # Get workflows to cancel from JobManager
@@ -145,7 +149,7 @@ class ManagerCancellationCoordinator:
             self._state._cancelled_workflows[workflow_id] = CancelledWorkflowInfo(
                 workflow_id=workflow_id,
                 job_id=job_id,
-                cancelled_at=time.time(),
+                cancelled_at=_DEFAULT_CLOCK.time(),
                 request_id=reason,
                 dependents=[],
             )
@@ -181,7 +185,7 @@ class ManagerCancellationCoordinator:
             job_id=job_id,
             workflow_id=workflow_id,
             requester_id=self._node_id,
-            timestamp=time.time(),
+            timestamp=_DEFAULT_CLOCK.time(),
             reason=reason,
         )
 
@@ -249,7 +253,7 @@ class ManagerCancellationCoordinator:
             workflow_id=workflow_id,
             success=success,
             errors=errors,
-            cancelled_at=time.monotonic(),
+            cancelled_at=_DEFAULT_CLOCK.monotonic(),
             node_id=self._node_id,
         )
         await self.handle_workflow_cancelled(notification)
@@ -399,7 +403,7 @@ class ManagerCancellationCoordinator:
         Returns:
             Number of records cleaned up
         """
-        now = time.time()
+        now = _DEFAULT_CLOCK.time()
         to_remove = [
             workflow_id
             for workflow_id, info in self._state._cancelled_workflows.items()
