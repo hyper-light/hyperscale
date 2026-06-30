@@ -115,7 +115,6 @@ EXPECTED_RUNTIME_VIOLATIONS: frozenset[str] = frozenset(
     "hyperscale/distributed/runtime/real_clock.py",
     "hyperscale/distributed/runtime/real_random.py",
     "hyperscale/distributed/server/protocol/drop_counter.py",
-    "hyperscale/distributed/swim/health_aware_server.py",
     "hyperscale/distributed/swim/message_handling/membership/ack_handler.py",
     "hyperscale/distributed/swim/message_handling/membership/join_handler.py",
     "hyperscale/distributed/swim/message_handling/membership/leave_handler.py",

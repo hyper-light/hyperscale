@@ -16,8 +16,6 @@ This server provides:
 import asyncio
 import collections
 import math
-import random
-import time
 from base64 import b64decode, b64encode
 from typing import Callable, Literal
 
@@ -757,7 +755,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         self._incarnation_tracker.record_node_death(
             node,
             incarnation,
-            time.monotonic(),
+            self._clock.monotonic(),
         )
         self._probe_scheduler.remove_member(node)
         self._peer_probe_reliability.remove_peer(node)
@@ -825,7 +823,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
 
         if peer not in self._unconfirmed_peers:
             self._unconfirmed_peers.add(peer)
-            self._unconfirmed_peer_added_at[peer] = time.monotonic()
+            self._unconfirmed_peer_added_at[peer] = self._clock.monotonic()
             # AD-29: Add to incarnation tracker with formal UNCONFIRMED state
             await self._incarnation_tracker.add_unconfirmed_node(peer)
 
@@ -1249,7 +1247,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         expiry poison the death history.
         """
         self._incarnation_tracker.record_node_death(
-            node, incarnation, time.monotonic()
+            node, incarnation, self._clock.monotonic()
         )
 
     async def start_hierarchical_detector(self) -> None:
@@ -2003,7 +2001,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             probe_start = self._pending_probe_start.get(source_addr)
             if probe_start is not None:
                 # Calculate RTT in milliseconds
-                rtt_seconds = time.monotonic() - probe_start
+                rtt_seconds = self._clock.monotonic() - probe_start
                 rtt_ms = rtt_seconds * 1000.0
 
                 # Update coordinate tracker with RTT measurement (AD-35 Task 12.2.6)
@@ -2018,7 +2016,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                 peer_id = f"{source_addr[0]}:{source_addr[1]}"
                 # Store coordinate without updating (no RTT measurement)
                 self._coordinate_tracker._peers[peer_id] = peer_coord
-                self._coordinate_tracker._peer_last_seen[peer_id] = time.monotonic()
+                self._coordinate_tracker._peer_last_seen[peer_id] = self._clock.monotonic()
 
         except Exception:
             # Invalid JSON or coordinate data - ignore silently
@@ -2144,7 +2142,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         """Run periodic cleanup of all SWIM state."""
         while self._running:
             try:
-                await asyncio.sleep(self._cleanup_interval)
+                await self._clock.sleep(self._cleanup_interval)
                 await self._run_cleanup()
             except asyncio.CancelledError:
                 break
@@ -2258,7 +2256,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         STALE_UNCONFIRMED_THRESHOLD = 60.0
 
         stale_count = 0
-        now = time.monotonic()
+        now = self._clock.monotonic()
 
         for peer, added_at in list(self._unconfirmed_peer_added_at.items()):
             age = now - added_at
@@ -2680,7 +2678,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         cleared = await self._incarnation_tracker.clear_suspicion_after_confirmation(
             node,
             incarnation,
-            time.monotonic(),
+            self._clock.monotonic(),
         )
         self._global_suspicion_started_at.pop(node, None)
         self._burst_confirmed_dead.pop(node, None)
@@ -2729,7 +2727,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                 return False
 
             if attempt_number + 1 < attempt_count:
-                await asyncio.sleep(0)
+                await self._clock.sleep(0)
 
         return True
 
@@ -2750,7 +2748,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                     - detector_config.global_min_timeout
                 ),
             )
-        expires_at = time.monotonic() + proof_ttl
+        expires_at = self._clock.monotonic() + proof_ttl
         self._burst_confirmed_dead[node] = (incarnation, expires_at)
 
     def _consume_burst_dead_confirmation(
@@ -2764,7 +2762,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             return False
 
         proof_incarnation, expires_at = proof
-        now = time.monotonic()
+        now = self._clock.monotonic()
         if now > expires_at or proof_incarnation != incarnation:
             self._burst_confirmed_dead.pop(node, None)
             return False
@@ -2810,7 +2808,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         source: str,
     ) -> bool:
         """Commit a confirmed global DEAD transition through one pipeline."""
-        now = time.monotonic()
+        now = self._clock.monotonic()
         applied = await self.update_node_state(
             node,
             b"DEAD",
@@ -2872,7 +2870,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             f"target={node} incarnation={incarnation}\n"
         )
         _sys.stderr.flush()
-        now = time.monotonic()
+        now = self._clock.monotonic()
         suspicion_started_at = self._global_suspicion_started_at.get(node, now)
         gate_allows = await self._should_apply_unwitnessed_dead_transition(
             node,
@@ -3450,7 +3448,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         if not coros:
             return [], []
 
-        # ``asyncio.wait_for`` over ``asyncio.gather`` is broken: on
+        # ``self._clock.wait_for`` over ``asyncio.gather`` is broken: on
         # timeout, ``wait_for`` cancels the inner gather, but the
         # gather's resulting CancelledError is never retrieved (Python
         # logs ``_GatheringFuture exception was never retrieved`` from
@@ -3716,7 +3714,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                 break
             except Exception as e:
                 await self.handle_exception(e, "probe_cycle")
-            await asyncio.sleep(protocol_period)
+            await self._clock.sleep(protocol_period)
 
     async def _run_probe_round(self) -> None:
         """Execute a single probe round in the SWIM protocol."""
@@ -3729,7 +3727,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             ErrorCategory.NETWORK
         ):
             # Network circuit is open - skip this round to let things recover
-            await asyncio.sleep(1.0)  # Brief pause before next attempt
+            await self._clock.sleep(1.0)  # Brief pause before next attempt
             return
 
         target = self._probe_scheduler.get_next_target()
@@ -3790,7 +3788,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                 return
 
             if indirect_sent:
-                await asyncio.sleep(timeout)
+                await self._clock.sleep(timeout)
 
                 # Exit early if shutting down
                 if not self._running:
@@ -3850,7 +3848,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         ordinary probe success clears the observation window; candidate
         successes refute only their own candidate.
         """
-        now = time.monotonic()
+        now = self._clock.monotonic()
         observations = self._burst_failure_observations
         observations.append((now, failed_target))
         cutoff = now - self._burst_failure_window_seconds
@@ -3987,7 +3985,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
 
         node_state = self._incarnation_tracker.get_node_state(target)
         incarnation = node_state.incarnation if node_state else 0
-        confirmation_started_at = time.monotonic()
+        confirmation_started_at = self._clock.monotonic()
 
         confirmed_alive = await self._confirm_peer_reachable_by_swim(
             target,
@@ -4045,7 +4043,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
 
         indirect_sent = await self.initiate_indirect_probe(target, incarnation)
         if indirect_sent:
-            await asyncio.sleep(timeout)
+            await self._clock.sleep(timeout)
             if not self._running:
                 return False
 
@@ -4176,13 +4174,13 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             return False
 
         budget = self._compute_direct_probe_budget(target, timeout)
-        deadline = time.monotonic() + budget
+        deadline = self._clock.monotonic() + budget
 
         while True:
             if not self._running:
                 return False
 
-            remaining = deadline - time.monotonic()
+            remaining = deadline - self._clock.monotonic()
             if remaining <= 0:
                 break
 
@@ -4197,19 +4195,19 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                     asyncio.get_event_loop().create_future()
                 )
                 self._pending_probe_acks[target] = ack_future
-                self._pending_probe_start[target] = time.monotonic()
+                self._pending_probe_start[target] = self._clock.monotonic()
                 request_id = self._build_direct_probe_request_id()
                 self._pending_probe_request_ids[target] = request_id
                 message = self._build_direct_probe_message(target, request_id)
 
                 await self.send(target, message, timeout=timeout)
 
-                attempt_window = min(timeout, deadline - time.monotonic())
+                attempt_window = min(timeout, deadline - self._clock.monotonic())
                 if attempt_window <= 0:
                     break
 
                 try:
-                    await asyncio.wait_for(ack_future, timeout=attempt_window)
+                    await self._clock.wait_for(ack_future, timeout=attempt_window)
                     self._metrics.increment("probes_received")
                     return True
                 except asyncio.TimeoutError:
@@ -4318,7 +4316,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
 
         # 3. Wait for drain period
         if drain_timeout > 0:
-            await asyncio.sleep(drain_timeout)
+            await self._clock.sleep(drain_timeout)
 
         # 4. Stop all background tasks in proper order
         # Stop probe cycle first (stops probing other nodes)
@@ -4919,7 +4917,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                 target,
                 b"OK",
                 incarnation,
-                time.monotonic(),
+                self._clock.monotonic(),
             )
 
     async def _parse_term_safe(
@@ -5115,7 +5113,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         """
         # Create hash from source + message content
         msg_hash = hash((addr, data))
-        now = time.monotonic()
+        now = self._clock.monotonic()
 
         if msg_hash in self._seen_messages:
             seen_time = self._seen_messages[msg_hash]
@@ -5156,7 +5154,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
 
         Returns True if allowed, False if rate limited.
         """
-        now = time.monotonic()
+        now = self._clock.monotonic()
         bucket_key = (addr[0], addr[1], admission_class)
         bucket_capacity, refill_rate = self._swim_rate_limit_profiles.get(
             admission_class,
@@ -5424,7 +5422,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             and previous_state.status == b"SUSPECT"
             and previous_state.incarnation >= incarnation
         )
-        now = time.monotonic()
+        now = self._clock.monotonic()
         result = await self._hierarchical_detector.suspect_global(
             node, incarnation, from_node
         )
@@ -5524,7 +5522,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                 node,
                 b"OK",
                 incarnation,
-                time.monotonic(),
+                self._clock.monotonic(),
             )
             self._global_suspicion_started_at.pop(node, None)
             return True
@@ -5586,20 +5584,20 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             return []
 
         if len(healthy_candidates) >= k:
-            return random.sample(healthy_candidates, k)
+            return self._random.sample(healthy_candidates, k)
         elif healthy_candidates:
             # Use all healthy + some stressed to fill
             result = healthy_candidates.copy()
             remaining = k - len(result)
             if remaining > 0 and stressed_candidates:
-                additional = random.sample(
+                additional = self._random.sample(
                     stressed_candidates, min(remaining, len(stressed_candidates))
                 )
                 result.extend(additional)
             return result
         else:
             # No healthy candidates, use stressed
-            return random.sample(stressed_candidates, min(k, len(stressed_candidates)))
+            return self._random.sample(stressed_candidates, min(k, len(stressed_candidates)))
 
     def _is_valid_indirect_probe_proxy(self, node: tuple[str, int]) -> bool:
         """Return True when ``node`` can add useful indirect-probe evidence."""
@@ -5624,7 +5622,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         """Sync callback from HFD wheel; route logging via TaskRunner."""
         started_at = self._global_suspicion_started_at.get(node)
         wall_age = (
-            time.monotonic() - started_at if started_at is not None else None
+            self._clock.monotonic() - started_at if started_at is not None else None
         )
         target_state = self._incarnation_tracker.get_node_state(node)
         target_status = target_state.status if target_state is not None else None
@@ -5845,7 +5843,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             return self._incarnation_tracker.get_self_incarnation()
 
         # Rate limiting check
-        now = time.monotonic()
+        now = self._clock.monotonic()
         window_elapsed = now - self._last_refutation_time
 
         if window_elapsed >= self._refutation_rate_limit_window:
@@ -6115,13 +6113,13 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
 
             ack_future: asyncio.Future[bool] = asyncio.get_event_loop().create_future()
             self._pending_probe_acks[target] = ack_future
-            self._pending_probe_start[target] = time.monotonic()
+            self._pending_probe_start[target] = self._clock.monotonic()
             request_id = self._build_direct_probe_request_id()
             self._pending_probe_request_ids[target] = request_id
             msg = self._build_direct_probe_message(target, request_id)
 
             await self.send(target, msg, timeout=timeout)
-            await asyncio.wait_for(ack_future, timeout=timeout)
+            await self._clock.wait_for(ack_future, timeout=timeout)
             return True
 
         except asyncio.TimeoutError:
@@ -6248,7 +6246,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         data: Message,
         clock_time: int,
     ) -> Message:
-        _t_entry = time.monotonic()
+        _t_entry = self._clock.monotonic()
         _t_rl_done = _t_pb_done = _t_dedup_done = _t_extract_done = 0.0
         _msg_prefix = data[:8] if data else b""
         try:
@@ -6305,13 +6303,13 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                         )
                 )
                 return b"nack>" + self._udp_addr_slug
-            _t_rl_done = time.monotonic()
+            _t_rl_done = self._clock.monotonic()
 
             process_piggybacks = await self._should_process_auxiliary_piggyback(
                 addr,
                 data,
             )
-            _t_pb_done = time.monotonic()
+            _t_pb_done = self._clock.monotonic()
 
             # Check for duplicate messages
             if self._is_duplicate_message(addr, data):
@@ -6329,7 +6327,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                     )
                 # Duplicate - still send ack but don't process
                 return b"ack>" + self._udp_addr_slug
-            _t_dedup_done = time.monotonic()
+            _t_dedup_done = self._clock.monotonic()
 
             # Strip ALL piggyback (vivaldi/worker_state/health/membership)
             # and any embedded #|s state, mirroring the layout produced by
@@ -6344,7 +6342,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                 addr,
                 process_piggybacks=process_piggybacks,
             )
-            _t_extract_done = time.monotonic()
+            _t_extract_done = self._clock.monotonic()
 
             if data.startswith((b"pre-vote", b"leader-claim", b"leader-elected",
                                 b"leader-heartbeat", b"leader-stepdown",
@@ -6362,7 +6360,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                 )
             # Delegate to the message dispatcher for handler-based processing
             result = await self._message_dispatcher.dispatch(addr, data, clock_time)
-            _t_dispatch_done = time.monotonic()
+            _t_dispatch_done = self._clock.monotonic()
             _total_ms = (_t_dispatch_done - _t_entry) * 1000.0
             if _total_ms > 100.0:
                 await self._udp_logger.log(
